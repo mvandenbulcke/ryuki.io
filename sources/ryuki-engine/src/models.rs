@@ -69,6 +69,9 @@ pub enum RequestType {
     ApplicationEnvironmentRetirement,
     VmDecommissionQuarantine,
     RequestPreflight,
+    VmDay2Change,
+    SnapshotGovernance,
+    BackupCoverageReport,
 }
 
 impl std::fmt::Display for RequestType {
@@ -87,6 +90,9 @@ impl std::fmt::Display for RequestType {
             }
             RequestType::VmDecommissionQuarantine => write!(f, "vm-decommission-quarantine"),
             RequestType::RequestPreflight => write!(f, "request-preflight"),
+            RequestType::VmDay2Change => write!(f, "vm-day2-change"),
+            RequestType::SnapshotGovernance => write!(f, "snapshot-governance"),
+            RequestType::BackupCoverageReport => write!(f, "backup-coverage-report"),
         }
     }
 }
@@ -436,6 +442,191 @@ impl std::fmt::Display for PolicyDecision {
             PolicyDecision::Warn => write!(f, "warn"),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2ChangeRequest {
+    pub id: String,
+    pub target_ci_key: String,
+    pub change_type: VmChangeType,
+    pub target_value: u32,
+    pub site: String,
+    pub environment: String,
+    pub owner: String,
+    pub maintenance_window: String,
+    pub status: VmChangeStatus,
+    pub plan: Option<VmDay2Plan>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VmChangeType {
+    ResizeCpu,
+    ResizeMemory,
+    AddDisk,
+    ExtendDisk,
+    MigrateHost,
+    MigrateStorage,
+}
+
+impl std::fmt::Display for VmChangeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmChangeType::ResizeCpu => write!(f, "resize-cpu"),
+            VmChangeType::ResizeMemory => write!(f, "resize-memory"),
+            VmChangeType::AddDisk => write!(f, "add-disk"),
+            VmChangeType::ExtendDisk => write!(f, "extend-disk"),
+            VmChangeType::MigrateHost => write!(f, "migrate-host"),
+            VmChangeType::MigrateStorage => write!(f, "migrate-storage"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VmChangeStatus {
+    Draft,
+    Validated,
+    Planned,
+    Approved,
+    Locked,
+    Executed,
+    Verified,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2Plan {
+    pub current_state: VmCurrentState,
+    pub desired_state: VmDesiredState,
+    pub capacity_impact: String,
+    pub backup_impact: String,
+    pub monitoring_impact: String,
+    pub rollback_notes: String,
+    pub verification_plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmCurrentState {
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+    pub host: String,
+    pub datastore: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDesiredState {
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRecord {
+    pub id: String,
+    pub platform_ci_key: String,
+    pub snapshot_purpose: String,
+    pub requested_expiry: String,
+    pub owner: String,
+    pub support_group: String,
+    pub change_context: String,
+    pub status: SnapshotStatus,
+    pub policy_decision: Option<String>,
+    pub backup_impact: Option<String>,
+    pub remediation_plan: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    Draft,
+    ReviewRequested,
+    ExpiryApproved,
+    StaleFlagged,
+    RemediationPlanned,
+    Expired,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupCoverageReport {
+    pub id: String,
+    pub site_scope: Vec<String>,
+    pub environment_scope: Vec<String>,
+    pub generation_time: String,
+    pub total_assets: u32,
+    pub covered_assets: u32,
+    pub missing_backup: u32,
+    pub missing_dr_replica: u32,
+    pub stale_policy: u32,
+    pub critical_gaps: Vec<String>,
+    pub coverage_percentage: f64,
+    pub status: CoverageReportStatus,
+    pub recommendations: Vec<String>,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CoverageReportStatus {
+    Generated,
+    Reviewing,
+    ActionRequired,
+    Accepted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreRequest {
+    pub id: String,
+    pub source_ci_key: String,
+    pub restore_type: RestoreType,
+    pub restore_point: String,
+    pub target_site: String,
+    pub target_environment: String,
+    pub verification_plan: String,
+    pub retention_need: String,
+    pub owner: String,
+    pub status: RestoreStatus,
+    pub dry_run_plan: Option<String>,
+    pub created_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestoreType {
+    FullVm,
+    FileLevel,
+    ApplicationItem,
+    InstantVmRecovery,
+}
+
+impl std::fmt::Display for RestoreType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreType::FullVm => write!(f, "full-vm"),
+            RestoreType::FileLevel => write!(f, "file-level"),
+            RestoreType::ApplicationItem => write!(f, "application-item"),
+            RestoreType::InstantVmRecovery => write!(f, "instant-vm-recovery"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestoreStatus {
+    Draft,
+    Validated,
+    Planned,
+    Approved,
+    Locked,
+    Executed,
+    Verified,
+    Completed,
+    Failed,
 }
 
 #[cfg(test)]

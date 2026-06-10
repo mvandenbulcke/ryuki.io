@@ -1,5 +1,6 @@
 pub mod adapter_framework;
 pub mod auth;
+pub mod backup_engine;
 pub mod cmdb_engine;
 pub mod evidence_pipeline;
 pub mod health_monitor;
@@ -7,3 +8,5 @@ pub mod inventory_sync;
 pub mod models;
 pub mod patch_engine;
 pub mod request_lifecycle;
+pub mod snapshot_engine;
+pub mod vm_operations;
