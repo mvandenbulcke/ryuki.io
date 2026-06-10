@@ -1,0 +1,117 @@
+# OS baseline compliance seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw scan output, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+complianceMode: drift-detection
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveRemediationAllowed: false
+rawScanOutputAllowed: false
+supportedFamilies:
+  - windows
+  - linux
+baselineDomains:
+  - tools
+  - vmware-tools
+  - hyper-v-integration-services
+  - proxmox-qemu-guest-agent
+  - agents
+  - local-groups
+  - firewall
+  - security-baseline
+  - hardening-state
+  - patch-state
+  - monitoring-agent
+  - backup-agent
+driftSignals:
+  - missing-agent
+  - vmware-tools-missing
+  - vmware-tools-unsupported
+  - hyper-v-integration-service-disabled
+  - proxmox-qemu-guest-agent-missing
+  - unsupported-version
+  - unauthorized-local-admin
+  - firewall-rule-drift
+  - hardening-rule-drift
+  - pending-reboot
+  - patch-level-drift
+  - evidence-missing
+requiredInputs:
+  - platformCiKey
+  - osFamily
+  - site
+  - environment
+  - owner
+  - supportGroup
+  - baselineProfile
+  - platformGuestToolingPosture
+  - inventoryFreshness
+  - evidenceManifest
+requiredGuards:
+  - inventory-coverage-current
+  - baseline-profile-known
+  - os-family-supported
+  - owner-known
+  - platform-guest-tooling-posture-known
+  - worker-capability-known
+  - remediation-plan-dry-run
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - complianceSummary
+  - baselineProfile
+  - platformGuestTooling
+  - driftFindings
+  - riskNotes
+  - remediationPlan
+  - approvalRoute
+  - handoverNotes
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - stale-inventory
+  - unsupported-os-family
+  - missing-baseline-profile
+  - owner-unknown
+  - platform-guest-tooling-posture-missing
+  - worker-capability-unknown
+  - remediation-plan-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Compliance summary
+  - Baseline profile
+  - Platform guest tooling posture
+  - Drift finding summary
+  - Inventory freshness
+  - Remediation dry-run plan
+  - Approval decisions
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-remediation
+    decision: block
+    requirement: OS baseline compliance reports drift and remediation plans only, never executing worker or provider actions.
+    evidence: Remediation dry-run plan
+  - id: baseline-profile-required
+    decision: block
+    requirement: Compliance decisions require a known baseline profile for the OS family and environment.
+    evidence: Baseline profile
+  - id: stale-inventory-blocks-compliance
+    decision: block
+    requirement: Stale or unknown inventory blocks compliance decisions until freshness is restored.
+    evidence: Inventory freshness
+  - id: platform-guest-tooling-posture-required
+    decision: block
+    requirement: VMware Tools, Hyper-V integration services, and Proxmox QEMU guest agent posture must be represented by normalized static evidence before compliance decisions are reported.
+    evidence: Platform guest tooling posture
+  - id: raw-scan-output-not-exposed
+    decision: block
+    requirement: Operators receive normalized drift summaries only, not raw scan output or logs.
+    evidence: Drift finding summary
+  - id: approval-required-for-remediation
+    decision: block
+    requirement: Any future remediation execution requires approval routing and redacted evidence first.
+    evidence: Approval decisions

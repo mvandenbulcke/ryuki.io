@@ -1,0 +1,260 @@
+# Access governance seed data only. Do not add credentials, tokens, tenant IDs, object IDs, private keys, live endpoints, or provider payloads.
+version: 1
+status: draft
+identityProvider: Microsoft Entra ID
+configurationBoundary: Deployment-specific identity app and group identifiers are runtime configuration only.
+roles:
+  - id: platform-admin
+    title: Platform Admin
+    visibility: all
+    canRequest: true
+    canApprove: true
+    canExecute: true
+    canAdmin: true
+    canAudit: true
+    executionDomains:
+      - platform
+      - governance
+      - emergency
+  - id: datacenter-approver
+    title: Datacenter Approver
+    visibility: site-scope
+    canRequest: true
+    canApprove: true
+    canExecute: false
+    canAdmin: false
+    canAudit: true
+    executionDomains:
+      - datacenter
+      - capacity
+      - live-execution-final
+  - id: vmware-operator
+    title: VMware Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: false
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - vmware
+      - placement
+      - lifecycle
+  - id: hyper-v-operator
+    title: Hyper-V Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: false
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - hyper-v
+      - placement
+      - lifecycle
+  - id: proxmox-operator
+    title: Proxmox Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: false
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - proxmox
+      - placement
+      - lifecycle
+  - id: wintel-linux-operator
+    title: Wintel/Linux Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: true
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - windows
+      - linux
+      - patching
+      - baseline
+  - id: backup-operator
+    title: Backup Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: true
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - backup
+      - restore
+      - dr
+  - id: monitoring-operator
+    title: Monitoring Operator
+    visibility: assigned-site-scope
+    canRequest: true
+    canApprove: true
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - monitoring
+      - alert-routing
+      - maintenance-window
+  - id: service-desk
+    title: Service Desk
+    visibility: ticket-scope
+    canRequest: true
+    canApprove: true
+    canExecute: true
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - approved-runbook
+      - incident-context
+      - handover
+  - id: auditor
+    title: Auditor
+    visibility: audit-scope
+    canRequest: false
+    canApprove: false
+    canExecute: false
+    canAdmin: false
+    canAudit: true
+    executionDomains:
+      - evidence-review
+      - export-review
+      - compliance
+  - id: requester
+    title: Requester
+    visibility: own-requests
+    canRequest: true
+    canApprove: false
+    canExecute: false
+    canAdmin: false
+    canAudit: false
+    executionDomains:
+      - request-intake
+      - evidence-view
+approvalActors:
+  - Platform Admin
+  - Datacenter Approver
+  - Application owner
+  - VMware Operator
+  - Hyper-V Operator
+  - Proxmox Operator
+  - Wintel/Linux Operator
+  - Backup Operator
+  - Monitoring Operator
+  - Service Desk
+  - Auditor
+approvalRoutes:
+  - id: p0-live-execution-default
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - patch-wave-planning
+      - controlled-restore-request
+      - zabbix-onboarding
+      - operator-runbook-launch
+    requiredActors:
+      - Datacenter Approver
+    conditionalActors:
+      - Application owner
+      - VMware Operator
+      - Hyper-V Operator
+      - Proxmox Operator
+      - Wintel/Linux Operator
+      - Backup Operator
+      - Monitoring Operator
+      - Service Desk
+    emergencyAllowed: true
+    evidence:
+      - Approval decisions
+      - Delegated authority
+      - Emergency flag
+      - Policy decision record
+  - id: p0-cmdb-file-exchange
+    appliesTo:
+      - cmdb-import
+      - cmdb-update-export
+    requiredActors:
+      - Datacenter Approver
+    conditionalActors:
+      - Application owner
+    emergencyAllowed: false
+    evidence:
+      - Approval decisions
+      - Reviewer approval
+      - File hash
+      - Accepted/rejected rows
+  - id: p0-platform-admin-readiness
+    appliesTo:
+      - platform-health-dashboard
+    requiredActors:
+      - Platform Admin
+    conditionalActors:
+      - Auditor
+    emergencyAllowed: false
+    evidence:
+      - Approval decisions
+      - Health snapshot
+      - Stale-data markers
+      - Dependency status
+  - id: p1-retirement-governance
+    appliesTo:
+      - vm-decommission-quarantine
+      - application-environment-retirement
+    requiredActors:
+      - Datacenter Approver
+      - Application owner
+    conditionalActors:
+      - Backup Operator
+      - Auditor
+    emergencyAllowed: true
+    evidence:
+      - Approval decisions
+      - Delegated authority
+      - Emergency flag
+      - Dependency review
+      - Backup retention proof
+      - Final evidence references
+executionGuards:
+  - id: validation-passed
+    decision: block
+    evidence: Validation result
+  - id: provider-safe-dry-run
+    decision: block
+    evidence: Provider-safe plan
+  - id: required-approvals
+    decision: block
+    evidence: Approval decisions
+  - id: active-lock
+    decision: block
+    evidence: Lock record
+  - id: redacted-evidence-ready
+    decision: block
+    evidence: Evidence manifest
+  - id: dependency-health-known
+    decision: block
+    evidence: Dependency status
+  - id: secret-reference-approved
+    decision: block
+    evidence: Reference configured state
+evidenceProfile:
+  id: redacted-approval-evidence
+  requiredRecords:
+    - Request payload summary
+    - Validation result
+    - Provider-safe plan
+    - Approval decisions
+    - Lock record
+    - Redacted execution log
+    - Evidence references
+  prohibitedContent:
+    - credential values
+    - bearer material
+    - private key material
+    - raw provider payloads
+    - unfiltered logs

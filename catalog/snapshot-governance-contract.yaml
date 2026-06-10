@@ -1,0 +1,135 @@
+# Snapshot governance seed data only. Do not add VM names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw inventory rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+governanceMode: dry-run-review
+dryRunRequired: true
+providerCallsEnabled: false
+liveSnapshotAllowed: false
+liveDeletionAllowed: false
+rawInventoryRowsAllowed: false
+supportedWorkflows:
+  - planned-snapshot-exception
+  - snapshot-expiry-review
+  - stale-snapshot-remediation
+  - owner-attestation
+  - backup-conflict-review
+hypervisorWorkflowParity:
+  - hypervisor: vmware
+    workflowEquivalents:
+      - planned-snapshot-exception
+      - snapshot-expiry-review
+      - stale-snapshot-remediation
+      - owner-attestation
+      - backup-conflict-review
+    actionMode: dry-run-review
+    providerCallsEnabled: false
+    liveSnapshotAllowed: false
+    liveDeletionAllowed: false
+    rawInventoryRowsAllowed: false
+    evidenceMode: redacted-summary
+  - hypervisor: hyper-v
+    workflowEquivalents:
+      - planned-snapshot-exception
+      - snapshot-expiry-review
+      - stale-snapshot-remediation
+      - owner-attestation
+      - backup-conflict-review
+    actionMode: dry-run-review
+    providerCallsEnabled: false
+    liveSnapshotAllowed: false
+    liveDeletionAllowed: false
+    rawInventoryRowsAllowed: false
+    evidenceMode: redacted-summary
+  - hypervisor: proxmox
+    workflowEquivalents:
+      - planned-snapshot-exception
+      - snapshot-expiry-review
+      - stale-snapshot-remediation
+      - owner-attestation
+      - backup-conflict-review
+    actionMode: dry-run-review
+    providerCallsEnabled: false
+    liveSnapshotAllowed: false
+    liveDeletionAllowed: false
+    rawInventoryRowsAllowed: false
+    evidenceMode: redacted-summary
+snapshotSignals:
+  - planned-exception
+  - expiry-due
+  - stale-snapshot
+  - owner-unknown
+  - backup-conflict
+  - policy-exception
+  - evidence-missing
+requiredInputs:
+  - platformCiKey
+  - snapshotPurpose
+  - requestedExpiry
+  - owner
+  - supportGroup
+  - changeContext
+  - backupState
+  - maintenanceWindow
+  - evidenceManifest
+requiredGuards:
+  - cmdb-ci-known
+  - owner-known
+  - backup-state-known
+  - expiry-policy-known
+  - approval-route-assigned
+  - lock-scope-defined
+  - rollback-notes-ready
+  - evidence-redacted
+planSections:
+  - snapshotSummary
+  - policyDecision
+  - expiryReview
+  - backupImpact
+  - remediationPlan
+  - approvalRoute
+  - lockPlan
+  - handoverNotes
+blockedReasons:
+  - provider-calls-disabled
+  - live-snapshot-disabled
+  - live-deletion-disabled
+  - stale-inventory
+  - missing-owner
+  - missing-expiry
+  - backup-conflict-unknown
+  - approval-missing
+  - lock-scope-missing
+  - rollback-notes-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Snapshot summary
+  - Policy decision
+  - Expiry review
+  - Backup impact
+  - Remediation dry-run plan
+  - Approval decisions
+  - Lock record
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-snapshot-action
+    decision: block
+    requirement: Snapshot governance produces review and remediation plans only, never creating or deleting snapshots.
+    evidence: Snapshot summary
+  - id: expiry-required
+    decision: block
+    requirement: Planned snapshot exceptions require an approved expiry before approval.
+    evidence: Expiry review
+  - id: backup-impact-required
+    decision: block
+    requirement: Snapshot plans require backup impact review before approval.
+    evidence: Backup impact
+  - id: stale-snapshot-requires-remediation-plan
+    decision: block
+    requirement: Stale snapshots require owner, policy decision, and remediation dry-run plan.
+    evidence: Remediation dry-run plan
+  - id: lock-and-evidence-required
+    decision: block
+    requirement: Lock scope and redacted evidence are required before any future execution can be considered.
+    evidence: Lock record

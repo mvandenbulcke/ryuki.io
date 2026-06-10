@@ -1,0 +1,113 @@
+# Platform release promotion seed data only. Do not add registry URLs, registry passwords, image digests, commit SHAs, pipeline run IDs, raw release identifiers, committed image refs, cluster names, namespace names, tenant IDs, object IDs, live endpoints, private IPs, serial numbers, credential values, secret values, access tokens, raw pipeline logs, raw registry payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+promotionMode: approval-evidence-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveDeploymentAllowed: false
+registryPushAllowed: false
+helmUpgradeAllowed: false
+kubectlApplyAllowed: false
+clusterMutationAllowed: false
+credentialValuesAllowed: false
+rawPipelineLogsAllowed: false
+rawRegistryPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+promotionStages:
+  - dev-render
+  - test-render
+  - release-candidate-review
+  - approval-gate
+  - prod-render
+  - evidence-export
+  - rollback-readiness
+  - publish-decision
+validationSignals:
+  - helm-lint
+  - helm-template-render
+  - kustomize-build-render
+  - image-reference-policy
+  - manifest-diff-review
+  - rollback-plan-ready
+  - approval-evidence-ready
+requiredInputs:
+  - releaseScope
+  - sourceVersionSummary
+  - environmentStage
+  - manifestRenderSummary
+  - chartLintSummary
+  - kustomizeBuildSummary
+  - approvalRoute
+  - rollbackPlan
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - release-scope-known
+  - source-version-summarized
+  - manifest-render-reviewed
+  - chart-lint-reviewed
+  - kustomize-build-reviewed
+  - image-reference-policy-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - releaseSummary
+  - sourceVersionSummary
+  - manifestRender
+  - chartLint
+  - kustomizeBuild
+  - manifestDiff
+  - approvalRoute
+  - rollbackReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-deployment-disabled
+  - registry-push-disabled
+  - helm-upgrade-disabled
+  - kubectl-apply-disabled
+  - cluster-mutation-disabled
+  - credential-values-disabled
+  - raw-pipeline-logs-disabled
+  - raw-registry-payloads-disabled
+  - raw-provider-payloads-disabled
+  - release-scope-missing
+  - manifest-render-missing
+  - chart-lint-missing
+  - kustomize-build-missing
+  - approval-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Release summary
+  - Source version summary
+  - Helm lint summary
+  - Helm template render summary
+  - Kustomize build summary
+  - Manifest diff review
+  - Approval route
+  - Rollback readiness
+  - Evidence references
+rules:
+  - id: no-live-release-deployment
+    decision: block
+    requirement: Platform release promotion records approval and evidence only and never deploys, upgrades, applies, or mutates clusters.
+    evidence: Release summary
+  - id: static-render-validation-required
+    decision: block
+    requirement: Helm lint, Helm template render, and Kustomize build summaries must be reviewed before promotion approval.
+    evidence: Manifest diff review
+  - id: no-registry-or-cluster-mutation
+    decision: block
+    requirement: Promotion review never pushes registry artifacts and never applies manifests to live clusters.
+    evidence: Release summary
+  - id: approval-and-rollback-required
+    decision: block
+    requirement: Approval route and rollback readiness must be present before a publish decision can be recorded.
+    evidence: Rollback readiness
+  - id: raw-release-data-not-exposed
+    decision: block
+    requirement: Release promotion evidence must use safe summaries only and must not expose registry URLs, image digests, commit SHAs, pipeline run IDs, raw release identifiers, committed image refs, cluster names, namespace names, tenant IDs, object IDs, private IPs, serial numbers, raw pipeline logs, raw registry payloads, credentials, secret values, access tokens, or provider payloads.
+    evidence: Evidence references

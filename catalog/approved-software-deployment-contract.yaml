@@ -1,0 +1,93 @@
+# Approved software deployment seed data only. Do not add package repository credentials, usernames, tokens, tenant IDs, object IDs, live endpoints, private IPs, hostnames, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+deploymentMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveInstallAllowed: false
+packageCatalogRequired: true
+supportedActions:
+  - install
+  - update
+  - remove
+  - verify-version
+  - reboot-required-review
+packageScopes:
+  - windows-package
+  - linux-package
+  - agent
+  - utility
+  - security-tool
+  - monitoring-tool
+requiredInputs:
+  - packageId
+  - action
+  - targetScope
+  - osFamily
+  - versionPolicy
+  - owner
+  - supportGroup
+  - changeContext
+  - evidenceManifest
+requiredGuards:
+  - package-approved
+  - version-policy-known
+  - target-scope-known
+  - os-family-supported
+  - worker-capability-known
+  - reboot-impact-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - deploymentSummary
+  - packagePolicy
+  - targetScope
+  - versionDecision
+  - rebootImpact
+  - rollbackPlan
+  - verificationPlan
+  - handoverNotes
+blockedReasons:
+  - package-not-approved
+  - unsupported-action
+  - target-scope-unknown
+  - version-policy-missing
+  - worker-execution-disabled
+  - reboot-impact-unknown
+  - approval-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request payload summary
+  - Package approval
+  - Version decision
+  - Deployment dry-run plan
+  - Reboot impact
+  - Rollback plan
+  - Verification plan
+  - Approval decisions
+  - Evidence references
+rules:
+  - id: approved-package-only
+    decision: block
+    requirement: Software deployment plans must reference an approved package catalog entry before approval.
+    evidence: Package approval
+  - id: no-live-install-execution
+    decision: block
+    requirement: This contract produces deployment plans only and never installs, updates, removes, or dispatches packages.
+    evidence: Deployment dry-run plan
+  - id: version-policy-required
+    decision: block
+    requirement: Install, update, and remove decisions require an approved version policy.
+    evidence: Version decision
+  - id: reboot-impact-reviewed
+    decision: block
+    requirement: Potential reboot impact must be reviewed before approval.
+    evidence: Reboot impact
+  - id: rollback-and-verification-required
+    decision: block
+    requirement: Rollback and verification plans are required before future execution can be considered.
+    evidence: Verification plan

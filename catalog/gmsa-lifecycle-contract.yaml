@@ -1,0 +1,143 @@
+# gMSA lifecycle seed data only. Do not add gMSA names, service account names, sAMAccountNames, DNS host names, SPNs, allowed password-retrieval principals, distinguished names, domain names, object GUIDs, object SIDs, security identifiers, principal IDs, hostnames, FQDNs, user names, group names, tenant IDs, object IDs, live endpoints, private IPs, managed password material, credentials, tokens, raw service account data, raw log content, raw rows, serial numbers, raw recipient data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+lifecycleMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveDirectoryChangesAllowed: false
+gmsaCreationAllowed: false
+gmsaAssignmentAllowed: false
+gmsaValidationAllowed: false
+gmsaRetireAllowed: false
+passwordRetrievalAllowed: false
+managedPasswordMaterialAllowed: false
+spnChangesAllowed: false
+delegationChangesAllowed: false
+rawServiceAccountDataAllowed: false
+rawLogContentAllowed: false
+rawRowsAllowed: false
+serialNumbersAllowed: false
+rawRecipientDataAllowed: false
+principalIdentifiersAllowed: false
+distinguishedNamesAllowed: false
+domainIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+securityIdentifiersAllowed: false
+targetIdentifiersAllowed: false
+credentialValuesAllowed: false
+rawProviderPayloadsAllowed: false
+lifecycleActions:
+  - gmsa-create-review
+  - gmsa-assign-review
+  - gmsa-validate-review
+  - gmsa-worker-use-review
+  - gmsa-delegation-review
+  - gmsa-retire-review
+reviewSignals:
+  - kds-root-key-readiness
+  - retrieval-scope-summary
+  - kerberos-encryption-policy
+  - spn-policy-match
+  - delegation-risk
+  - worker-capability-match
+  - approval-state
+  - evidence-redaction
+requiredInputs:
+  - lifecycleAction
+  - requestContext
+  - serviceAccountSummary
+  - retrievalScopeSummary
+  - workerUsageSummary
+  - kerberosPolicySummary
+  - spnPolicySummary
+  - delegationPolicySummary
+  - owner
+  - supportGroup
+  - approvalRoute
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - request-context-known
+  - service-account-scope-summarized
+  - kds-root-key-readiness-reviewed
+  - retrieval-scope-reviewed
+  - kerberos-policy-reviewed
+  - spn-policy-reviewed
+  - delegation-risk-reviewed
+  - worker-capability-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - recovery-readiness-reviewed
+  - evidence-redacted
+planSections:
+  - lifecycleSummary
+  - serviceAccountScope
+  - retrievalScopeReview
+  - kerberosPolicyReview
+  - spnPolicyReview
+  - delegationRiskReview
+  - workerRoutingReview
+  - approvalRoute
+  - rollbackPlan
+  - recoveryReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-directory-change-disabled
+  - gmsa-creation-disabled
+  - gmsa-assignment-disabled
+  - gmsa-validation-disabled
+  - gmsa-retire-disabled
+  - password-retrieval-disabled
+  - managed-password-material-disabled
+  - spn-change-disabled
+  - delegation-change-disabled
+  - raw-service-account-data-disabled
+  - raw-log-content-disabled
+  - raw-rows-disabled
+  - serial-numbers-disabled
+  - raw-recipient-data-disabled
+  - principal-identifiers-disabled
+  - distinguished-names-disabled
+  - domain-identifiers-disabled
+  - object-identifiers-disabled
+  - security-identifiers-disabled
+  - target-identifiers-disabled
+  - credential-values-disabled
+  - raw-provider-payloads-disabled
+  - approval-missing
+  - rollback-plan-missing
+  - recovery-readiness-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - gMSA lifecycle review summary
+  - Service account scope summary
+  - Password retrieval scope review
+  - Kerberos policy review
+  - SPN policy review
+  - Delegation risk review
+  - Worker usage review
+  - Approval route
+  - Rollback plan
+  - Recovery readiness
+  - Evidence references
+rules:
+  - id: no-live-gmsa-changes
+    decision: block
+    requirement: gMSA lifecycle records review plans only and never creates, assigns, validates, removes, delegates, changes SPNs, retrieves managed passwords, executes workers, or mutates directory service account objects.
+    evidence: gMSA lifecycle review summary
+  - id: retrieval-scope-review-required
+    decision: block
+    requirement: KDS root key readiness, password retrieval scope, worker usage, Kerberos policy, SPN policy, and delegation risk must be reviewed before any gMSA lifecycle decision can be accepted.
+    evidence: Password retrieval scope review
+  - id: approval-worker-and-rollback-required
+    decision: block
+    requirement: Approval route, worker capability review, rollback plan, and recovery readiness must be present before future directory execution can be considered.
+    evidence: Rollback plan
+  - id: raw-gmsa-data-not-exposed
+    decision: block
+    requirement: gMSA lifecycle evidence must use safe summaries only and must not expose gMSA names, service account names, sAMAccountNames, DNS host names, SPNs, allowed password-retrieval principals, distinguished names, domain names, object GUIDs, object SIDs, security identifiers, principal IDs, hostnames, FQDNs, user names, group names, tenant IDs, object IDs, private IPs, managed password material, credentials, secret values, access tokens, raw service account data, raw log content, raw rows, serial numbers, raw recipient data, or provider payloads.
+    evidence: Evidence references

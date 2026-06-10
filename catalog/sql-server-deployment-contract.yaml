@@ -1,0 +1,161 @@
+# SQL Server deployment seed data only. Do not add SQL instance names, database names, listener names, hostnames, FQDNs, IP addresses, port values, file paths, backup paths, runtime identity names, SPN values, principal IDs, tenant IDs, object IDs, credentials, tokens, raw SQL rows, raw backup rows, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+deploymentMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+deploymentExecutionAllowed: false
+liveVmwareChangesAllowed: false
+liveHyperVChangesAllowed: false
+liveProxmoxChangesAllowed: false
+liveSqlChangesAllowed: false
+liveDirectoryChangesAllowed: false
+liveDnsChangesAllowed: false
+liveBackupChangesAllowed: false
+liveMonitoringChangesAllowed: false
+liveCmdbChangesAllowed: false
+availabilityGroupChangesAllowed: false
+sqlRuntimeIdentityChangesAllowed: false
+spnChangesAllowed: false
+databaseCreationAllowed: false
+sqlAgentJobChangesAllowed: false
+rawSqlInstanceDataAllowed: false
+rawDatabaseDataAllowed: false
+rawPathDataAllowed: false
+rawBackupRowsAllowed: false
+rawProviderPayloadsAllowed: false
+principalIdentifiersAllowed: false
+hostIdentifiersAllowed: false
+listenerIdentifiersAllowed: false
+credentialValuesAllowed: false
+portValuesAllowed: false
+supportedPlans:
+  - standalone-instance-plan
+  - failover-cluster-plan
+  - availability-group-plan
+  - disk-layout-plan
+  - runtime-identity-plan
+  - spn-policy-review
+  - backup-policy-plan
+  - monitoring-plan
+  - cmdb-publication-plan
+deploymentTopologies:
+  - standalone
+  - failover-cluster
+  - availability-group
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+requiredInputs:
+  - businessPurpose
+  - sqlWorkloadProfile
+  - deploymentTopology
+  - hypervisorPlatform
+  - site
+  - environment
+  - criticality
+  - owner
+  - supportGroup
+  - diskLayoutSummary
+  - runtimeIdentitySummary
+  - spnPolicySummary
+  - backupPolicy
+  - monitoringProfile
+  - cmdbContext
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - request-preflight-ready
+  - topology-reviewed
+  - capacity-admission-ready
+  - disk-layout-reviewed
+  - runtime-identity-reviewed
+  - spn-policy-reviewed
+  - backup-plan-reviewed
+  - monitoring-plan-reviewed
+  - cmdb-publication-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - deploymentSummary
+  - topologyReview
+  - placementPlan
+  - diskLayoutPlan
+  - runtimeIdentityPlan
+  - spnPolicyReview
+  - backupPlan
+  - monitoringPlan
+  - cmdbPublicationPlan
+  - rollbackPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-deployment-disabled
+  - live-vmware-change-disabled
+  - live-hyperv-change-disabled
+  - live-proxmox-change-disabled
+  - live-sql-change-disabled
+  - live-directory-change-disabled
+  - live-dns-change-disabled
+  - live-backup-change-disabled
+  - live-monitoring-change-disabled
+  - live-cmdb-change-disabled
+  - availability-group-change-disabled
+  - sql-runtime-identity-change-disabled
+  - spn-change-disabled
+  - database-creation-disabled
+  - sql-agent-job-change-disabled
+  - raw-sql-instance-data-disabled
+  - raw-database-data-disabled
+  - raw-path-data-disabled
+  - raw-backup-rows-disabled
+  - raw-provider-payloads-disabled
+  - principal-identifiers-disabled
+  - sql-host-identifiers-disabled
+  - sql-listener-identifiers-disabled
+  - credential-values-disabled
+  - port-values-disabled
+  - topology-missing
+  - disk-layout-missing
+  - runtime-identity-missing
+  - spn-policy-missing
+  - backup-plan-missing
+  - monitoring-plan-missing
+  - cmdb-context-missing
+  - approval-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - SQL deployment summary
+  - Topology review
+  - Placement plan
+  - Disk layout plan
+  - Runtime identity review
+  - SPN policy review
+  - Backup policy plan
+  - Monitoring plan
+  - CMDB publication plan
+  - Rollback plan
+  - Evidence references
+rules:
+  - id: no-live-sql-deployment
+    decision: block
+    requirement: SQL Server deployment produces a dry-run plan only and never creates SQL instances, databases, availability groups, VMware, Hyper-V, or Proxmox workloads, runtime identities, Kerberos registration values, DNS records, backup jobs, monitoring objects, CMDB records, workers, or provider state.
+    evidence: SQL deployment summary
+  - id: layout-identity-protection-required
+    decision: block
+    requirement: Topology, placement, disk layout, runtime identity, Kerberos registration policy, backup, monitoring, and CMDB publication plans must be reviewed before SQL Server deployment approval.
+    evidence: Disk layout plan
+  - id: approval-rollback-required
+    decision: block
+    requirement: Owner, support group, approval route, rollback plan, and evidence references must be present before SQL Server deployment can be accepted.
+    evidence: Rollback plan
+  - id: raw-sql-deployment-data-not-exposed
+    decision: block
+    requirement: SQL Server deployment evidence must use safe summaries only and must not expose SQL deployment identifiers, network identifiers, path values, runtime identity details, Kerberos registration details, raw SQL evidence, raw backup evidence, unredacted operations data, sensitive values, or provider-returned content.
+    evidence: Evidence references

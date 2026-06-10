@@ -1,0 +1,97 @@
+# Dependency-aware maintenance calendar seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw recipient data, raw rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+calendarMode: aggregate-draft
+dryRunRequired: true
+providerCallsEnabled: false
+liveSchedulingAllowed: false
+liveNotificationAllowed: false
+rawRecipientDataAllowed: false
+supportedWorkflows:
+  - patch-calendar
+  - reboot-calendar
+  - sql-maintenance-calendar
+  - application-tier-maintenance
+  - outage-communications-draft
+  - conflict-review
+calendarDimensions:
+  - application
+  - environment
+  - site
+  - dependencyGroup
+  - maintenanceWindow
+  - criticality
+  - owner
+  - supportGroup
+  - changeContext
+requiredInputs:
+  - maintenanceWindow
+  - affectedServices
+  - dependencyGraphSummary
+  - owner
+  - supportGroup
+  - site
+  - environment
+  - changeContext
+  - evidenceManifest
+requiredGuards:
+  - cmdb-relationship-graph-ready
+  - patch-policy-imported
+  - maintenance-window-known
+  - dependency-order-known
+  - blackout-window-clear
+  - owner-known
+  - communications-draft-only
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - calendarSummary
+  - affectedServiceSummary
+  - dependencyOrder
+  - conflictReview
+  - communicationsDraft
+  - approvalRoute
+  - handoverNotes
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-scheduling-disabled
+  - live-notification-disabled
+  - missing-maintenance-window
+  - dependency-order-unknown
+  - blackout-window-conflict
+  - owner-unknown
+  - conflict-review-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Calendar summary
+  - Affected service summary
+  - Dependency order
+  - Conflict review
+  - Communication draft
+  - Approval decisions
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-calendar-action
+    decision: block
+    requirement: Dependency-aware maintenance calendar produces aggregate plans only and never schedules changes or sends notifications.
+    evidence: Calendar summary
+  - id: dependency-order-required
+    decision: block
+    requirement: Dependency order must be known before maintenance windows can be presented for approval.
+    evidence: Dependency order
+  - id: conflict-review-required
+    decision: block
+    requirement: Calendar conflicts, blackout windows, and tier overlaps must be reviewed before approval.
+    evidence: Conflict review
+  - id: communications-draft-only
+    decision: block
+    requirement: Outage communications remain draft-only until live notification approval exists.
+    evidence: Communication draft
+  - id: approval-and-evidence-required
+    decision: block
+    requirement: Approval route and redacted evidence are required before future execution can be considered.
+    evidence: Approval decisions

@@ -1,0 +1,78 @@
+# Patch policy import seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+integrationMode: file-based
+providerCallsEnabled: false
+liveApiEnabled: false
+normalizedFields:
+  - platformCiKey
+  - patchGroup
+  - maintenanceWindow
+  - rebootPolicy
+  - blackoutDates
+  - owner
+  - supportGroup
+  - site
+  - environment
+  - application
+  - criticality
+  - dependencyGroup
+decisions:
+  - accept
+  - reject
+  - review
+  - normalize
+  - export-exception
+requiredInputs:
+  - importBatch
+  - headerMapping
+  - platformCiKey
+  - patchGroup
+  - maintenanceWindow
+  - rebootPolicy
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - cmdb-file-contract-validated
+  - header-mapping-complete
+  - ci-identity-known
+  - maintenance-window-known
+  - reboot-policy-known
+  - owner-known
+  - evidence-redacted
+blockedReasons:
+  - live-api-disabled
+  - missing-ci-identity
+  - missing-patch-group
+  - missing-maintenance-window
+  - ambiguous-reboot-policy
+  - blackout-window-conflict
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - File hash
+  - Header mapping
+  - Validation result
+  - Accepted/rejected policy rows
+  - Maintenance window summary
+  - Reboot policy summary
+  - Wave seed summary
+  - Evidence references
+rules:
+  - id: no-live-servicenow-api
+    decision: block
+    requirement: Patch policy import uses file exports only and never calls live ServiceNow API.
+    evidence: Validation result
+  - id: maintenance-window-required
+    decision: block
+    requirement: Accepted policy rows must include a normalized maintenance window.
+    evidence: Maintenance window summary
+  - id: reboot-policy-required
+    decision: block
+    requirement: Reboot policy must be known before rows can seed patch waves.
+    evidence: Reboot policy summary
+  - id: accepted-rows-seed-patch-waves
+    decision: block
+    requirement: Only accepted and normalized rows can seed patch wave planning.
+    evidence: Wave seed summary

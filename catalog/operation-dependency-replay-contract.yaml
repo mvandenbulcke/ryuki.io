@@ -1,0 +1,102 @@
+version: 1
+status: draft
+source: static-seed
+operationDependencyReplayMode: static-dependency-replay
+dependencyGraphReadOnly: true
+replaySimulationDryRunOnly: true
+lockStateReadOnly: true
+liveReplayAllowed: false
+operationMutationAllowed: false
+childOperationMutationAllowed: false
+lockMutationAllowed: false
+retryMutationAllowed: false
+providerCallsAllowed: false
+workflowMutationAllowed: false
+rawOperationRowsAllowed: false
+rawExecutionLogsAllowed: false
+rawReplayPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+serialNumbersAllowed: false
+graphNodeTypes:
+  - operation-run
+  - child-operation
+  - lock-scope
+  - dependency
+  - blocked-reason
+  - evidence-reference
+  - retry-policy
+graphEdgeTypes:
+  - depends-on
+  - blocks
+  - owns-lock
+  - emits-evidence
+  - retries-after
+  - resolves-blocker
+replayPhases:
+  - snapshot-load
+  - dependency-sort
+  - lock-evaluation
+  - blocker-evaluation
+  - retry-evaluation
+  - evidence-preview
+  - decision-summary
+requiredGuards:
+  - graph-source-reviewed
+  - dependency-order-reviewed
+  - lock-scope-reviewed
+  - blocker-state-reviewed
+  - retry-policy-reviewed
+  - replay-dry-run-only
+  - evidence-redacted
+blockedReasons:
+  - operation-replay-live-disabled
+  - operation-mutation-disabled
+  - operation-child-mutation-disabled
+  - operation-lock-mutation-disabled
+  - operation-retry-mutation-disabled
+  - operation-provider-calls-disabled
+  - operation-workflow-mutation-disabled
+  - operation-raw-rows-disabled
+  - operation-raw-logs-disabled
+  - operation-raw-replay-payloads-disabled
+  - operation-raw-provider-payloads-disabled
+  - operation-raw-recipient-data-disabled
+  - operation-credential-values-disabled
+  - operation-tenant-identifiers-disabled
+  - operation-object-identifiers-disabled
+  - operation-private-network-values-disabled
+  - operation-serials-disabled
+  - dependency-graph-missing
+  - replay-snapshot-missing
+  - lock-scope-unknown
+  - blocker-state-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Dependency graph summary
+  - Replay phase summary
+  - Lock evaluation summary
+  - Blocked reason summary
+  - Retry policy summary
+  - Evidence references
+rules:
+  - id: dependency-graph-read-only
+    decision: block
+    requirement: Operation dependency graph summaries are read-only and must not mutate operation runs, child operations, locks, retries, or workflow state.
+    evidence: Dependency graph summary
+  - id: replay-simulation-dry-run-only
+    decision: block
+    requirement: Replay simulation uses static snapshots only and must not replay live work, call providers, or emit live execution steps.
+    evidence: Replay phase summary
+  - id: operation-mutations-disabled
+    decision: block
+    requirement: Dependency replay cannot create, update, retry, unlock, close, or re-order operation runs or child operations.
+    evidence: Lock evaluation summary
+  - id: raw-activity-data-not-exposed
+    decision: block
+    requirement: Operation dependency replay evidence must use safe summaries only and must not expose raw operation rows, raw execution logs, raw replay payloads, raw provider payloads, recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.
+    evidence: Evidence references

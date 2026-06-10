@@ -1,0 +1,76 @@
+# Image factory seed data only. Do not add image artifact names, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+livePromotionEnabled: false
+supportedFamilies:
+  - windows
+  - linux
+supportedDistributions:
+  - windows-server
+  - sles
+  - rhel
+  - rocky-linux
+  - alma-linux
+  - ubuntu
+  - debian
+requiredStages:
+  - intake
+  - build-plan
+  - patch
+  - scan
+  - test
+  - approve
+  - promote
+  - publish
+  - supersede
+requiredInputs:
+  - imageFamily
+  - distribution
+  - patchCycle
+  - baselineProfile
+  - hardeningProfile
+  - requester
+  - owner
+  - evidenceManifest
+promotionGuards:
+  - vulnerability-scan-clean
+  - baseline-test-passed
+  - agent-validation-passed
+  - approval-route-assigned
+  - rollback-image-available
+  - evidence-redacted
+blockedReasons:
+  - provider-calls-disabled
+  - missing-test-result
+  - scan-not-clean
+  - approval-missing
+  - rollback-image-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Image build summary
+  - Patch manifest
+  - Vulnerability scan summary
+  - Test result
+  - Approval decisions
+  - Promotion decision
+  - Evidence references
+rules:
+  - id: no-live-image-promotion
+    decision: block
+    requirement: Image factory contracts define promotion gates only; live image promotion remains disabled.
+    evidence: Promotion decision
+  - id: scan-and-test-before-approval
+    decision: block
+    requirement: Vulnerability scan and baseline tests must pass before promotion approval.
+    evidence: Vulnerability scan summary
+  - id: rollback-image-required
+    decision: block
+    requirement: Promotion plans must identify a rollback image before publish.
+    evidence: Image build summary
+  - id: evidence-redaction-required
+    decision: block
+    requirement: Image evidence must be redacted before audit or publish.
+    evidence: Evidence references

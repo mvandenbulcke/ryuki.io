@@ -1,0 +1,107 @@
+# Standard task seed data only. Do not add hostnames, usernames, recipient data, target identifiers, service names, file paths, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, worker payloads, provider payloads, or raw task data.
+version: 1
+status: draft
+source: static-seed
+taskMode: dry-run-plan-only
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveServiceChangesAllowed: false
+liveDiskChangesAllowed: false
+liveBackupActionsAllowed: false
+liveAlertSuppressionAllowed: false
+rawTargetDataAllowed: false
+rawLogContentAllowed: false
+rawRecipientDataAllowed: false
+rawWorkerPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+taskTypes:
+  - health-check-plan
+  - collect-logs-plan
+  - restart-service-plan
+  - clear-disk-plan
+  - trigger-backup-plan
+  - alert-suppression-plan
+taskScopes:
+  - windows-service
+  - linux-service
+  - filesystem-capacity
+  - log-collection
+  - backup-request
+  - monitoring-maintenance
+  - application-health
+requiredInputs:
+  - ticketContext
+  - requester
+  - taskType
+  - targetResourceSummary
+  - operatingSystemFamily
+  - site
+  - environment
+  - owner
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - ticket-context-known
+  - requester-authorized
+  - task-type-supported
+  - target-scope-summarized
+  - worker-capability-known
+  - dry-run-plan-reviewed
+  - approval-route-assigned
+  - maintenance-window-reviewed
+  - rollback-or-handover-ready
+  - evidence-redacted
+planSections:
+  - taskSummary
+  - targetScope
+  - workerRouting
+  - preChecks
+  - plannedActions
+  - riskAndImpact
+  - rollbackOrHandover
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-service-change-disabled
+  - live-disk-change-disabled
+  - live-backup-action-disabled
+  - live-alert-suppression-disabled
+  - raw-target-data-disabled
+  - raw-log-content-disabled
+  - raw-recipient-data-disabled
+  - raw-worker-payloads-disabled
+  - raw-provider-payloads-disabled
+  - unsupported-task-type
+  - requester-not-authorized
+  - approval-missing
+  - worker-capability-unknown
+  - maintenance-window-missing
+  - rollback-or-handover-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request summary
+  - Task plan summary
+  - Target scope summary
+  - Worker capability decision
+  - Approval route
+  - Risk and rollback notes
+  - Evidence references
+rules:
+  - id: no-live-standard-task-execution
+    decision: block
+    requirement: Standard L1 and L2 tasks produce dry-run plans only and never restart services, clear disks, collect live logs, trigger backups, suppress alerts, execute workers, or call providers.
+    evidence: Task plan summary
+  - id: role-approval-and-worker-required
+    decision: block
+    requirement: Standard tasks require requester authorization, approval route, and worker capability decision before execution can be considered.
+    evidence: Worker capability decision
+  - id: dry-run-plan-review-required
+    decision: block
+    requirement: Standard tasks require reviewed pre-checks, planned actions, risk notes, and rollback or handover guidance.
+    evidence: Risk and rollback notes
+  - id: raw-task-data-not-exposed
+    decision: block
+    requirement: Standard task evidence must use safe summaries only and must not expose hostnames, usernames, recipient data, target identifiers, service names, file paths, raw log content, raw target data, worker payloads, provider payloads, tenant IDs, object IDs, private IPs, credentials, secret values, or access tokens.
+    evidence: Evidence references

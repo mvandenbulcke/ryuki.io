@@ -1,0 +1,93 @@
+# Server lifecycle dry-run seed data only. Do not add VM names, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+liveExecutionAllowed: false
+supportedWorkflows:
+  - windows-server-deployment
+  - linux-server-deployment
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+supportedLinuxDistributions:
+  - sles
+  - rhel
+  - rocky-linux
+  - alma-linux
+  - ubuntu
+  - debian
+requiredInputs:
+  - businessPurpose
+  - requester
+  - owner
+  - site
+  - environment
+  - criticality
+  - hypervisorPlatform
+  - imageVersion
+  - vmSizing
+  - network
+  - backupPolicy
+  - monitoringProfile
+  - cmdbContext
+windowsAdditionalInputs:
+  - ouPlacement
+  - customizationSpec
+  - domainJoinMode
+linuxAdditionalInputs:
+  - distribution
+  - baselineProfile
+  - cloudInitProfile
+requiredGuards:
+  - request-preflight-ready
+  - capacity-admission-ready
+  - inventory-coverage-current
+  - approval-route-assigned
+  - evidence-redacted
+  - secret-reference-configured
+planSections:
+  - placementPlan
+  - osCustomizationPlan
+  - backupPlan
+  - monitoringPlan
+  - cmdbUpdatePlan
+  - riskNotes
+  - rollbackNotes
+blockedReasons:
+  - missing-required-input
+  - stale-inventory
+  - capacity-not-approved
+  - backup-policy-missing
+  - monitoring-profile-missing
+  - cmdb-context-ambiguous
+  - unsupported-hypervisor
+  - live-hypervisor-execution-disabled
+  - live-execution-disabled
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Provider-safe plan
+  - Capacity check summary
+  - Policy assignments
+  - CMDB export package
+  - Evidence references
+rules:
+  - id: no-live-provider-execution
+    decision: block
+    requirement: The contract produces plans only and never executes VMware, Hyper-V, Proxmox, OS, backup, monitoring, or CMDB changes.
+    evidence: Provider-safe plan
+  - id: dry-run-before-approval
+    decision: block
+    requirement: Approval cannot proceed until the dry-run plan has placement, OS, backup, monitoring, CMDB, risk, and rollback sections.
+    evidence: Provider-safe plan
+  - id: current-inventory-required
+    decision: block
+    requirement: Stale or unknown inventory coverage blocks server lifecycle approval.
+    evidence: Inventory snapshot
+  - id: protect-observe-publish-required
+    decision: block
+    requirement: Build plans must include backup, monitoring, and CMDB publication intent before approval.
+    evidence: Policy assignments

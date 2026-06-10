@@ -1,0 +1,90 @@
+# Repository capacity forecast seed data only. Do not add repository names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw repository rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+forecastMode: forecast-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveRemediationAllowed: false
+rawRepositoryRowsAllowed: false
+supportedWorkflows:
+  - capacity-forecast
+  - retention-risk-review
+  - growth-trend-review
+  - hub-spoke-capacity-review
+  - immutability-headroom-review
+forecastSignals:
+  - capacity-threshold-risk
+  - retention-risk
+  - growth-anomaly
+  - hub-capacity-risk
+  - stale-usage-data
+  - immutability-headroom-risk
+requiredInputs:
+  - repositoryScope
+  - site
+  - backupPolicy
+  - retentionPolicy
+  - growthTrend
+  - owner
+  - supportGroup
+  - forecastWindow
+  - evidenceManifest
+requiredGuards:
+  - repository-summary-known
+  - retention-policy-known
+  - growth-trend-known
+  - backup-policy-known
+  - site-pairing-known
+  - forecast-window-set
+  - owner-known
+  - evidence-redacted
+planSections:
+  - capacitySummary
+  - growthTrend
+  - retentionRisk
+  - hubSpokeImpact
+  - immutabilityHeadroom
+  - remediationOptions
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - repository-summary-missing
+  - retention-policy-missing
+  - growth-trend-unknown
+  - site-pairing-unknown
+  - forecast-window-missing
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Repository capacity summary
+  - Growth trend summary
+  - Retention risk
+  - Hub-spoke capacity impact
+  - Immutability headroom
+  - Remediation options
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-repository-remediation
+    decision: block
+    requirement: Repository capacity forecasting reports risk and options only, never mutating repositories or retention policy.
+    evidence: Remediation options
+  - id: forecast-window-required
+    decision: block
+    requirement: Capacity decisions require a declared forecast window.
+    evidence: Repository capacity summary
+  - id: retention-risk-required
+    decision: block
+    requirement: Retention risk must be evaluated before capacity status is trusted.
+    evidence: Retention risk
+  - id: hub-spoke-impact-required
+    decision: block
+    requirement: ESBUR1/BUR1 hub-spoke capacity impact must be visible for shared target planning.
+    evidence: Hub-spoke capacity impact
+  - id: raw-repository-rows-not-exposed
+    decision: block
+    requirement: Operators receive aggregate capacity summaries only, not raw repository rows or provider payloads.
+    evidence: Repository capacity summary

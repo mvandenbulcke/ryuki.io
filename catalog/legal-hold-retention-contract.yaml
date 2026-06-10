@@ -1,0 +1,104 @@
+# Legal hold retention seed data only. Do not add case identifiers, requester addresses, recipient data, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw backup rows, raw legal matter data, ServiceNow payloads, or Veeam payloads.
+version: 1
+status: draft
+source: static-seed
+exceptionMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveRetentionChangesAllowed: false
+veeamMutationAllowed: false
+serviceNowMutationAllowed: false
+rawCaseDataAllowed: false
+rawRecipientDataAllowed: false
+rawBackupRowsAllowed: false
+rawProviderPayloadsAllowed: false
+supportedWorkflows:
+  - legal-hold-intake-review
+  - extended-retention-exception
+  - protected-scope-review
+  - expiration-review
+  - release-readiness-review
+  - evidence-pack-review
+holdSignals:
+  - legal-hold-requested
+  - retention-extension-needed
+  - scope-ambiguity
+  - approval-missing
+  - expiry-missing
+  - release-review-due
+  - stale-evidence
+requiredInputs:
+  - holdScopeSummary
+  - businessReasonSummary
+  - retentionPolicy
+  - requestedRetentionClass
+  - startDate
+  - expiryDate
+  - reviewCadence
+  - owner
+  - supportGroup
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - hold-scope-summarized
+  - retention-policy-known
+  - approval-route-assigned
+  - backup-impact-reviewed
+  - expiry-date-set
+  - review-cadence-set
+  - release-process-defined
+  - evidence-redacted
+planSections:
+  - holdSummary
+  - scopeReview
+  - retentionDecision
+  - backupImpactReview
+  - approvalRoute
+  - expiryAndReview
+  - releaseReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-retention-change-disabled
+  - veeam-mutation-disabled
+  - servicenow-mutation-disabled
+  - raw-case-data-disabled
+  - raw-recipient-data-disabled
+  - raw-backup-rows-disabled
+  - raw-provider-payloads-disabled
+  - hold-scope-missing
+  - retention-policy-missing
+  - approval-missing
+  - expiry-missing
+  - release-process-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Legal hold summary
+  - Scope review
+  - Retention decision
+  - Backup impact review
+  - Approval route
+  - Expiry and review cadence
+  - Release readiness
+  - Evidence references
+rules:
+  - id: no-live-retention-actions
+    decision: block
+    requirement: Legal hold retention review reports approval and retention intent only and never mutates Veeam jobs, repositories, backups, ServiceNow records, or provider state.
+    evidence: Legal hold summary
+  - id: redacted-scope-required
+    decision: block
+    requirement: Hold scope must be summarized and redacted before a retention exception can be reviewed.
+    evidence: Scope review
+  - id: approval-and-expiry-required
+    decision: block
+    requirement: Legal hold retention exceptions require approval route, expiry date, review cadence, and owner before acceptance.
+    evidence: Approval route
+  - id: backup-impact-required
+    decision: block
+    requirement: Backup impact and release readiness must be reviewed before the exception is approved.
+    evidence: Backup impact review
+  - id: raw-legal-data-not-exposed
+    decision: block
+    requirement: Operators receive safe legal hold summaries only, not raw case data, recipient data, backup rows, ServiceNow payloads, Veeam payloads, or provider payloads.
+    evidence: Evidence references

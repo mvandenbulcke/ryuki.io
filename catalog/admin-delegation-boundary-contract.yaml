@@ -1,0 +1,114 @@
+version: 1
+status: draft
+source: static-seed
+delegationBoundaryMode: static-delegation-boundary
+siteDelegationReadOnly: true
+roleScopeReadOnly: true
+approvalRouteReadOnly: true
+breakGlassReviewOnly: true
+liveDelegationChangeAllowed: false
+roleAssignmentMutationAllowed: false
+approvalMutationAllowed: false
+policyMutationAllowed: false
+workflowMutationAllowed: false
+graphCallsAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawUserDataAllowed: false
+rawGroupDataAllowed: false
+rawDelegationRowsAllowed: false
+rawApprovalPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+privateNetworkValuesAllowed: false
+delegationDomains:
+  - catalog
+  - requests
+  - approvals
+  - operations
+  - inventory
+  - cmdb
+  - evidence
+  - admin
+delegationScopes:
+  - global-read
+  - site-admin
+  - site-approver
+  - workflow-delegate
+  - break-glass-review
+  - audit-review
+delegationStates:
+  - proposed
+  - pending-approval
+  - approved
+  - expired
+  - revoked
+  - blocked
+requiredGuards:
+  - delegate-role-known
+  - site-scope-known
+  - approval-route-assigned
+  - expiry-set
+  - separation-of-duties-reviewed
+  - break-glass-reviewed
+  - evidence-redacted
+  - live-delegation-blocked
+blockedReasons:
+  - delegation-live-change-disabled
+  - delegation-role-assignment-disabled
+  - delegation-approval-mutation-disabled
+  - delegation-policy-mutation-disabled
+  - delegation-workflow-mutation-disabled
+  - delegation-graph-calls-disabled
+  - delegation-provider-calls-disabled
+  - delegation-notification-dispatch-disabled
+  - delegation-raw-user-data-disabled
+  - delegation-raw-group-data-disabled
+  - delegation-raw-delegation-rows-disabled
+  - delegation-raw-approval-payloads-disabled
+  - delegation-raw-provider-payloads-disabled
+  - delegation-raw-recipient-data-disabled
+  - delegation-tenant-identifiers-disabled
+  - delegation-object-identifiers-disabled
+  - delegation-principal-identifiers-disabled
+  - delegation-group-identifiers-disabled
+  - delegation-credential-values-disabled
+  - delegation-token-values-disabled
+  - delegation-private-network-values-disabled
+  - delegate-role-missing
+  - site-scope-missing
+  - approval-route-missing
+  - expiry-missing
+  - separation-of-duties-missing
+  - break-glass-review-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Delegation boundary summary
+  - Site scope summary
+  - Role scope summary
+  - Approval route summary
+  - Expiry and review summary
+  - Evidence references
+rules:
+  - id: delegation-boundary-read-only
+    decision: block
+    requirement: Delegation boundary summaries are read-only and must not grant, revoke, mutate, or synchronize delegated authority.
+    evidence: Delegation boundary summary
+  - id: site-scope-and-expiry-required
+    decision: block
+    requirement: Delegation decisions require known site scope, delegate role, approval route, expiry, separation-of-duties review, and redacted evidence.
+    evidence: Site scope summary
+  - id: live-delegation-disabled
+    decision: block
+    requirement: Admin delegation boundary review cannot change live delegation, mutate role assignments, call Graph or providers, dispatch notifications, or mutate approval, policy, or workflow state.
+    evidence: Approval route summary
+  - id: raw-delegation-data-not-exposed
+    decision: block
+    requirement: Delegation boundary evidence must not expose raw user data, raw group data, raw delegation rows, raw approval payloads, raw provider payloads, recipient data, tenant identifiers, object identifiers, principal identifiers, group identifiers, credential values, token values, private network values, live endpoints, or URLs.
+    evidence: Evidence references

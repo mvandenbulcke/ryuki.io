@@ -1,0 +1,121 @@
+# Zabbix onboarding seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, Zabbix host IDs, host group IDs, template IDs, proxy IDs, maintenance IDs, action IDs, raw host rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+onboardingMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveOnboardingAllowed: false
+zabbixMutationAllowed: false
+rawHostRowsAllowed: false
+rawProviderPayloadsAllowed: false
+templateBaseline:
+  defaultPosture: default-built-in-templates
+  exceptionProfiles:
+    - lenovo-xcc-snmp
+  exceptionEvidence: Lenovo XCC SNMP
+supportedWorkflows:
+  - host-onboarding-intake
+  - host-group-template-selection
+  - proxy-or-server-selection
+  - maintenance-window-assignment
+  - owner-routing-review
+  - dry-run-onboarding-plan
+  - evidence-pack-review
+onboardingSignals:
+  - missing-zabbix-host
+  - host-group-required
+  - template-required
+  - proxy-or-server-required
+  - maintenance-window-required
+  - owner-required
+  - support-group-required
+  - stale-inventory-review
+requiredInputs:
+  - assetScope
+  - hostSummary
+  - site
+  - environment
+  - monitoringProfile
+  - hostGroupProfile
+  - templateProfile
+  - proxyOrServerProfile
+  - maintenanceWindow
+  - owner
+  - supportGroup
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - inventory-source-known
+  - monitoring-profile-known
+  - host-summary-known
+  - host-group-known
+  - template-known
+  - proxy-or-server-known
+  - maintenance-window-known
+  - owner-known
+  - support-group-known
+  - dry-run-plan-produced
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - onboardingSummary
+  - hostSummaryReview
+  - hostGroupTemplatePlan
+  - proxyOrServerPlan
+  - maintenanceWindowPlan
+  - ownerRouting
+  - approvalRoute
+  - dryRunOnboardingPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-onboarding-disabled
+  - zabbix-mutation-disabled
+  - raw-host-rows-disabled
+  - raw-provider-payloads-disabled
+  - host-summary-unknown
+  - monitoring-profile-missing
+  - host-group-missing
+  - template-missing
+  - proxy-or-server-unknown
+  - maintenance-window-missing
+  - owner-unknown
+  - support-group-unknown
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Onboarding summary
+  - Host summary review
+  - Host group and template plan
+  - Proxy or server plan
+  - Maintenance window plan
+  - Owner routing
+  - Approval route
+  - Dry-run onboarding plan
+  - Evidence references
+rules:
+  - id: no-live-zabbix-onboarding
+    decision: block
+    requirement: Zabbix onboarding produces dry-run plans only; it must not create or update hosts, link templates, assign groups or proxies, change maintenance windows, configure actions, or mutate Zabbix provider state.
+    evidence: Dry-run onboarding plan
+  - id: dry-run-plan-required
+    decision: block
+    requirement: A dry-run onboarding plan is required before any approval or future live integration can be considered.
+    evidence: Dry-run onboarding plan
+  - id: host-group-template-required
+    decision: block
+    requirement: Host group and template profile selections must be known before onboarding can be planned.
+    evidence: Host group and template plan
+  - id: proxy-maintenance-required
+    decision: block
+    requirement: Proxy or server assignment and maintenance-window intent must be reviewed before onboarding can be planned.
+    evidence: Proxy or server plan
+  - id: owner-routing-required
+    decision: block
+    requirement: Owner, support group, and approval route must be assigned before onboarding can be planned.
+    evidence: Owner routing
+  - id: raw-provider-data-not-exposed
+    decision: block
+    requirement: Operators receive onboarding summaries only, not raw host rows, object identifiers, or provider payloads.
+    evidence: Onboarding summary

@@ -1,0 +1,109 @@
+version: 1
+status: draft
+source: static-seed
+ownershipRiskMode: aggregate-safe
+ownershipScoreReadOnly: true
+staleAssetRiskReadOnly: true
+driftTimelineReadOnly: true
+liveProviderSyncAllowed: false
+liveOwnerLookupAllowed: false
+liveCmdbMutationAllowed: false
+remediationMutationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+rawInventoryRowsAllowed: false
+rawOwnerDataAllowed: false
+rawProviderPayloadsAllowed: false
+rawTimelineRowsAllowed: false
+rawLogContentAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+serialNumbersAllowed: false
+inventoryDomains:
+  - vm
+  - application
+  - cluster
+  - host
+  - network
+  - backup
+  - monitoring
+  - cmdb-ci
+scoreSignals:
+  - owner-present
+  - support-group-present
+  - cmdb-match
+  - backup-policy-match
+  - monitoring-profile-match
+  - freshness-current
+  - lifecycle-state-known
+riskBands:
+  - low
+  - medium
+  - high
+  - blocked
+timelineEvents:
+  - inventory-seen
+  - owner-changed
+  - cmdb-drift-detected
+  - backup-gap-detected
+  - monitoring-gap-detected
+  - stale-marker-set
+  - risk-band-changed
+requiredGuards:
+  - inventory-snapshot-reviewed
+  - ownership-summary-reviewed
+  - support-group-reviewed
+  - drift-timeline-reviewed
+  - stale-marker-reviewed
+  - risk-band-reviewed
+  - evidence-redacted
+blockedReasons:
+  - inventory-risk-provider-sync-disabled
+  - inventory-risk-owner-lookup-disabled
+  - inventory-risk-cmdb-mutation-disabled
+  - inventory-risk-remediation-mutation-disabled
+  - inventory-risk-workflow-mutation-disabled
+  - inventory-risk-provider-calls-disabled
+  - inventory-risk-raw-rows-disabled
+  - inventory-risk-raw-owner-data-disabled
+  - inventory-risk-raw-provider-payloads-disabled
+  - inventory-risk-raw-timeline-rows-disabled
+  - inventory-risk-raw-log-content-disabled
+  - inventory-risk-raw-recipient-data-disabled
+  - inventory-risk-credential-values-disabled
+  - inventory-risk-tenant-identifiers-disabled
+  - inventory-risk-object-identifiers-disabled
+  - inventory-risk-private-network-values-disabled
+  - inventory-risk-serials-disabled
+  - inventory-snapshot-missing
+  - ownership-summary-missing
+  - support-group-unknown
+  - stale-marker-missing
+  - risk-band-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Ownership score summary
+  - Stale asset risk summary
+  - Drift timeline summary
+  - Inventory freshness summary
+  - Evidence references
+rules:
+  - id: ownership-score-read-only
+    decision: block
+    requirement: Inventory ownership scores are aggregate summaries only and must not look up live owners, mutate CMDB records, or expose raw owner data.
+    evidence: Ownership score summary
+  - id: stale-asset-risk-read-only
+    decision: block
+    requirement: Stale asset risk uses static freshness summaries only and must not trigger live provider sync, remediation, or workflow mutation.
+    evidence: Stale asset risk summary
+  - id: drift-timeline-aggregate-only
+    decision: block
+    requirement: Inventory drift timelines expose safe event categories only and must not expose raw timeline rows, raw inventory rows, raw provider payloads, serial numbers, or object identifiers.
+    evidence: Drift timeline summary
+  - id: raw-inventory-risk-data-not-exposed
+    decision: block
+    requirement: Inventory ownership risk evidence must use safe summaries only and must not expose raw inventory rows, raw owner data, raw provider payloads, raw timeline rows, raw logs, raw recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.
+    evidence: Evidence references

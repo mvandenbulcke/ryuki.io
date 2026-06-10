@@ -1,0 +1,74 @@
+# Maintenance communication seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw recipient data, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+communicationMode: draft-only
+providerCallsEnabled: false
+liveNotificationAllowed: false
+rawRecipientDataAllowed: false
+messageTypes:
+  - planned-maintenance
+  - outage-advisory
+  - degraded-service
+  - completion-notice
+  - extension-notice
+  - cancellation-notice
+communicationChannels:
+  - portal-announcement
+  - email-draft
+  - service-desk-note
+  - handover-note
+  - cab-summary
+requiredInputs:
+  - maintenanceWindow
+  - affectedServices
+  - ciRelationshipSummary
+  - owner
+  - supportGroup
+  - audience
+  - messageType
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - maintenance-window-known
+  - affected-ci-known
+  - owner-known
+  - audience-approved
+  - message-template-approved
+  - approval-route-assigned
+  - evidence-redacted
+blockedReasons:
+  - maintenance-window-missing
+  - affected-ci-unknown
+  - owner-unknown
+  - audience-unapproved
+  - message-template-missing
+  - approval-missing
+  - raw-recipient-data
+  - evidence-not-redacted
+requiredEvidence:
+  - Communication draft
+  - Affected CI summary
+  - Audience decision
+  - Owner approval
+  - Maintenance window
+  - Channel plan
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-notification-send
+    decision: block
+    requirement: Maintenance communication contract creates drafts only and never sends live notifications.
+    evidence: Communication draft
+  - id: approved-audience-required
+    decision: block
+    requirement: Audience scope must be approved before communication can be published or exported.
+    evidence: Audience decision
+  - id: affected-ci-summary-required
+    decision: block
+    requirement: Affected CI and application relationship summary must exist before message generation.
+    evidence: Affected CI summary
+  - id: no-sensitive-recipient-data
+    decision: block
+    requirement: Drafts and channel plans must not expose raw recipient data, credentials, or provider payloads.
+    evidence: Channel plan

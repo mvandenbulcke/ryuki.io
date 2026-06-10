@@ -1,0 +1,45 @@
+# Synthetic inventory coverage fixture only. Do not add real inventory rows, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: fixture
+providerCallsEnabled: false
+resources:
+  - id: fixture-web-001
+    site: SAMPLE
+    environment: production
+    ownerPresent: true
+    expectedBackupPolicy: daily-standard
+    actualBackupPolicy: missing
+    expectedMonitoringProfile: linux-active-agent
+    actualMonitoringProfile: linux-active-agent
+    cmdbStatus: matched
+    freshnessState: current
+  - id: fixture-app-002
+    site: SAMPLE
+    environment: production
+    ownerPresent: true
+    expectedBackupPolicy: daily-standard
+    actualBackupPolicy: daily-standard
+    expectedMonitoringProfile: linux-active-agent
+    actualMonitoringProfile: missing
+    cmdbStatus: matched
+    freshnessState: current
+  - id: fixture-db-003
+    site: SAMPLE
+    environment: production
+    ownerPresent: false
+    expectedBackupPolicy: gold-retention
+    actualBackupPolicy: gold-retention
+    expectedMonitoringProfile: database-profile
+    actualMonitoringProfile: database-profile
+    cmdbStatus: drift
+    freshnessState: current
+  - id: fixture-ops-004
+    site: SAMPLE
+    environment: production
+    ownerPresent: true
+    expectedBackupPolicy: daily-standard
+    actualBackupPolicy: daily-standard
+    expectedMonitoringProfile: windows-default
+    actualMonitoringProfile: windows-default
+    cmdbStatus: matched
+    freshnessState: stale

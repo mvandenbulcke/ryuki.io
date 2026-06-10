@@ -1,0 +1,58 @@
+# Inventory coverage seed data only. Do not add inventory rows, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+inventorySyncMode: mock-contract
+providerCallsEnabled: false
+externalAccessBlocked: true
+liveExecutionAllowed: false
+coverageDomains:
+  - vmware
+  - hyperv
+  - proxmox
+  - veeam
+  - zabbix
+  - servicenow-cmdb
+  - site-catalog
+  - policy-catalog
+freshnessStates:
+  - current
+  - stale
+  - unknown
+  - blocked
+gapTypes:
+  - backup-coverage-gap
+  - monitoring-coverage-gap
+  - cmdb-drift
+  - stale-data
+  - ownership-gap
+  - policy-gap
+driftSignals:
+  - identity-mismatch
+  - owner-mismatch
+  - backup-policy-mismatch
+  - monitoring-profile-mismatch
+  - site-placement-mismatch
+requiredEvidence:
+  - Inventory snapshot
+  - Coverage gap list
+  - Stale-data markers
+  - CMDB reconciliation summary
+  - Evidence references
+rules:
+  - id: no-live-provider-inventory-sync
+    decision: block
+    requirement: Inventory coverage contracts use static or fixture-safe snapshots until provider sync is approved.
+    evidence: Inventory snapshot
+  - id: stale-inventory-blocks-execution
+    decision: block
+    requirement: Stale, unknown, or blocked inventory state prevents approval for live execution.
+    evidence: Stale-data markers
+  - id: backup-monitoring-gaps-require-review
+    decision: block
+    requirement: Backup and monitoring coverage gaps require owner review before protect or observe workflows proceed.
+    evidence: Coverage gap list
+  - id: cmdb-drift-requires-reconciliation
+    decision: block
+    requirement: CMDB identity, ownership, or placement drift routes to reconciliation before publish.
+    evidence: CMDB reconciliation summary

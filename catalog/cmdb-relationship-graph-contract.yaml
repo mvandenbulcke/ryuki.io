@@ -1,0 +1,78 @@
+# CMDB relationship graph seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+graphMode: aggregate-safe
+providerCallsEnabled: false
+liveApiEnabled: false
+rawProviderPayloadsAllowed: false
+nodeTypes:
+  - application
+  - environment
+  - vm
+  - database
+  - network
+  - storage
+  - backup-policy
+  - monitoring-profile
+  - owner
+edgeTypes:
+  - contains
+  - depends-on
+  - runs-on
+  - connects-to
+  - protected-by
+  - monitored-by
+  - owned-by
+  - supports
+requiredInputs:
+  - platformCiKey
+  - ciClass
+  - relationshipSource
+  - relationshipTarget
+  - relationshipType
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - cmdb-file-contract-validated
+  - ci-identity-known
+  - relationship-source-known
+  - relationship-direction-known
+  - stale-data-marked
+  - reviewer-approval-assigned
+  - evidence-redacted
+blockedReasons:
+  - live-api-disabled
+  - missing-ci-identity
+  - ambiguous-relationship
+  - relationship-source-unknown
+  - relationship-direction-unknown
+  - stale-data-unmarked
+  - reviewer-approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Relationship graph summary
+  - CI identity summary
+  - Relationship source
+  - Relationship direction
+  - Accepted/rejected edges
+  - Reviewer approval
+  - Evidence references
+rules:
+  - id: no-live-servicenow-api
+    decision: block
+    requirement: Relationship graph contract uses imported file state only and never calls live ServiceNow API.
+    evidence: Relationship graph summary
+  - id: deterministic-ci-key-required
+    decision: block
+    requirement: Every relationship edge must reference deterministic platform CI keys.
+    evidence: CI identity summary
+  - id: relationship-direction-required
+    decision: block
+    requirement: Relationship source, target, and direction must be explicit before graph edges are accepted.
+    evidence: Relationship direction
+  - id: ambiguous-relationship-requires-review
+    decision: block
+    requirement: Ambiguous or conflicting relationships must be rejected or routed to reviewer approval.
+    evidence: Accepted/rejected edges

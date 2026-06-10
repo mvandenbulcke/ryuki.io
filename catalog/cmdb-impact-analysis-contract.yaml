@@ -1,0 +1,108 @@
+version: 1
+status: draft
+source: static-seed
+impactAnalysisMode: aggregate-safe
+impactAnalysisReadOnly: true
+dependencyQualityReadOnly: true
+syncStateReadOnly: true
+liveServiceNowApiAllowed: false
+liveCmdbMutationAllowed: false
+liveRelationshipMutationAllowed: false
+providerCallsAllowed: false
+rawCmdbRowsAllowed: false
+rawRelationshipRowsAllowed: false
+rawImpactRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawLogContentAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+serialNumbersAllowed: false
+impactDomains:
+  - application
+  - environment
+  - vm
+  - database
+  - network
+  - storage
+  - backup
+  - monitoring
+  - owner
+  - service
+impactSignals:
+  - upstream-dependency
+  - downstream-dependency
+  - single-point-of-failure
+  - missing-owner
+  - stale-relationship
+  - criticality-mismatch
+  - monitoring-gap
+  - backup-gap
+qualitySignals:
+  - relationship-complete
+  - direction-known
+  - owner-known
+  - criticality-known
+  - source-current
+  - duplicate-free
+  - evidence-redacted
+syncStates:
+  - file-imported
+  - update-export-pending
+  - ready-for-review
+  - blocked
+  - future-api-disabled
+requiredGuards:
+  - cmdb-file-contract-validated
+  - relationship-graph-reviewed
+  - impact-scope-reviewed
+  - dependency-quality-reviewed
+  - sync-state-reviewed
+  - reviewer-approval-assigned
+  - evidence-redacted
+blockedReasons:
+  - cmdb-impact-live-api-disabled
+  - cmdb-impact-cmdb-mutation-disabled
+  - cmdb-impact-relationship-mutation-disabled
+  - cmdb-impact-provider-calls-disabled
+  - cmdb-impact-raw-rows-disabled
+  - cmdb-impact-raw-relationship-rows-disabled
+  - cmdb-impact-raw-impact-rows-disabled
+  - cmdb-impact-raw-provider-payloads-disabled
+  - cmdb-impact-raw-log-content-disabled
+  - cmdb-impact-raw-recipient-data-disabled
+  - cmdb-impact-credential-values-disabled
+  - cmdb-impact-tenant-identifiers-disabled
+  - cmdb-impact-object-identifiers-disabled
+  - cmdb-impact-private-network-values-disabled
+  - cmdb-impact-serials-disabled
+  - impact-scope-missing
+  - dependency-quality-unknown
+  - sync-state-unknown
+  - reviewer-approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Impact analysis summary
+  - App dependency quality summary
+  - ServiceNow sync state summary
+  - Relationship graph summary
+  - Evidence references
+rules:
+  - id: impact-analysis-read-only
+    decision: block
+    requirement: CMDB impact analysis exposes aggregate dependency signals only and must not call ServiceNow APIs, mutate CMDB records, or change relationships.
+    evidence: Impact analysis summary
+  - id: dependency-quality-read-only
+    decision: block
+    requirement: Application dependency quality is a review signal only and must not create, update, delete, merge, or re-order CMDB relationships.
+    evidence: App dependency quality summary
+  - id: future-api-sync-state-disabled
+    decision: block
+    requirement: ServiceNow sync state is readiness metadata only while future API integration remains disabled.
+    evidence: ServiceNow sync state summary
+  - id: raw-cmdb-impact-data-not-exposed
+    decision: block
+    requirement: CMDB impact evidence must use safe summaries only and must not expose raw CMDB rows, raw relationship rows, raw impact rows, raw provider payloads, raw logs, raw recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.
+    evidence: Evidence references

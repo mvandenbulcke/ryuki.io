@@ -1,0 +1,134 @@
+# Security baseline seed data only. Do not add tenant identifiers, object identifiers, private network details, sensitive auth material, direct provider routes, browser vendor endpoints, raw request content, raw provider content, raw evidence content, raw log content, stack traces, recipient details, or implementation internals.
+version: 1
+status: draft
+source: static-seed
+baselineMode: static-security-baseline
+noSecretPolicyRequired: true
+browserIsolationRequired: true
+networkIsolationRequired: true
+rbacApprovalRequired: true
+dryRunRequired: true
+redactedEvidenceRequired: true
+verificationGatesRequired: true
+providerCallsAllowed: false
+liveAuthenticationAllowed: false
+workflowMutationAllowed: false
+policyMutationAllowed: false
+approvalBypassAllowed: false
+rbacBypassAllowed: false
+browserVendorEndpointAllowed: false
+rawRequestPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawLogContentAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+accessTokenValuesAllowed: false
+rawRecipientDataAllowed: false
+securityControls:
+  - no-secrets
+  - identity-rbac-approval
+  - dry-run-first
+  - request-lifecycle-gates
+  - vault-secret-reference
+  - browser-isolation
+  - network-isolation
+  - evidence-redaction
+  - least-privilege-adapters
+  - safe-failure-degraded-mode
+  - verification-gates
+verificationGates:
+  - markdown-review
+  - no-secret-scan
+  - diff-check
+  - unit-tests
+  - contract-tests
+  - build
+  - container-build
+  - kubernetes-validation
+  - browser-checks
+requiredInputs:
+  - securityScope
+  - controlSummary
+  - rbacApprovalSummary
+  - dryRunSummary
+  - networkIsolationSummary
+  - evidenceRedactionSummary
+  - verificationSummary
+  - evidenceManifest
+requiredGuards:
+  - no-secret-scan-ready
+  - rbac-approval-reviewed
+  - dry-run-gates-reviewed
+  - browser-isolation-reviewed
+  - network-isolation-reviewed
+  - redaction-reviewed
+  - least-privilege-reviewed
+  - verification-gates-reviewed
+  - safe-failure-reviewed
+planSections:
+  - noSecretsPolicy
+  - identityRbacApproval
+  - dryRunLifecycle
+  - secretReferenceModel
+  - browserNetworkIsolation
+  - evidenceRedaction
+  - adapterLeastPrivilege
+  - degradedMode
+  - verificationGates
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-authentication-disabled
+  - workflow-mutation-disabled
+  - policy-mutation-disabled
+  - approval-bypass-disabled
+  - rbac-bypass-disabled
+  - browser-vendor-endpoint-disabled
+  - raw-request-payloads-disabled
+  - raw-provider-payloads-disabled
+  - raw-evidence-payloads-disabled
+  - raw-log-content-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - access-token-values-disabled
+  - raw-recipient-data-disabled
+  - no-secret-scan-missing
+  - rbac-approval-review-missing
+  - dry-run-gate-review-missing
+  - browser-isolation-review-missing
+  - network-isolation-review-missing
+  - redaction-review-missing
+  - verification-gates-missing
+requiredEvidence:
+  - Security baseline summary
+  - No-secret scan result
+  - RBAC and approval review
+  - Dry-run gate review
+  - Browser isolation review
+  - Network isolation review
+  - Evidence redaction review
+  - Least privilege review
+  - Verification gate review
+  - Evidence references
+rules:
+  - id: no-secrets-required
+    decision: block
+    requirement: Security baseline readiness requires no committed sensitive auth material, deployment-specific identifiers, private network details, direct provider routes, or raw provider content.
+    evidence: No-secret scan result
+  - id: rbac-approval-required
+    decision: block
+    requirement: Role mapping, least privilege, approval route, execution authority, and emergency handling must be reviewed before live execution can be considered.
+    evidence: RBAC and approval review
+  - id: dry-run-lifecycle-required
+    decision: block
+    requirement: Write-capable workflows must keep dry-run planning, approval, lock, verification, status callback, and redacted evidence gates before execution readiness.
+    evidence: Dry-run gate review
+  - id: browser-network-isolation-required
+    decision: block
+    requirement: Browser access must remain limited to portal-ui and platform-api while namespace traffic stays deny-by-default with reviewed allowances.
+    evidence: Network isolation review
+  - id: redaction-and-verification-required
+    decision: block
+    requirement: Evidence redaction and appropriate verification gates must pass before any implementation slice can be accepted.
+    evidence: Verification gate review

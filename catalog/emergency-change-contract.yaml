@@ -1,0 +1,77 @@
+# Emergency change seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+liveExecutionAllowed: false
+privilegedWorkerAllowed: false
+supportedModes:
+  - break-glass
+  - urgent-remediation
+  - incident-containment
+  - service-restoration
+requiredInputs:
+  - ticketContext
+  - emergencyReason
+  - requester
+  - affectedService
+  - targetScope
+  - businessImpact
+  - approver
+  - owner
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - emergency-role-authorized
+  - incident-or-ticket-linked
+  - emergency-approver-assigned
+  - scope-bounded
+  - dry-run-ready
+  - lock-record-ready
+  - evidence-redacted
+planSections:
+  - emergencySummary
+  - businessImpact
+  - targetScope
+  - riskJustification
+  - approvalPath
+  - rollbackNotes
+  - verificationPlan
+  - handoverNotes
+blockedReasons:
+  - live-execution-disabled
+  - privileged-worker-disabled
+  - role-not-authorized
+  - incident-context-missing
+  - approval-missing
+  - scope-too-broad
+  - lock-conflict
+  - evidence-not-redacted
+requiredEvidence:
+  - Emergency request summary
+  - Incident or ticket reference
+  - Approval decisions
+  - Delegated authority
+  - Scope and lock record
+  - Dry-run plan summary
+  - Verification result
+  - Privileged worker log reference
+  - Evidence references
+rules:
+  - id: no-live-emergency-execution
+    decision: block
+    requirement: Emergency changes remain dry-run only until live execution is explicitly enabled by policy.
+    evidence: Dry-run plan summary
+  - id: emergency-approval-required
+    decision: block
+    requirement: Emergency approval and delegated authority must be recorded before execution can be considered.
+    evidence: Approval decisions
+  - id: bounded-scope-required
+    decision: block
+    requirement: Emergency scope must be bounded and locked to avoid uncontrolled blast radius.
+    evidence: Scope and lock record
+  - id: audit-evidence-required
+    decision: block
+    requirement: Redacted evidence, verification, and privileged worker log references are mandatory for audit.
+    evidence: Evidence references

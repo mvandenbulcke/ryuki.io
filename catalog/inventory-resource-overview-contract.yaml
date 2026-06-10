@@ -1,0 +1,106 @@
+version: 1
+status: draft
+source: static-seed
+resourceOverviewMode: aggregate-resource-overview
+resourceOverviewReadOnly: true
+statusSummariesReadOnly: true
+liveProviderSyncAllowed: false
+liveInventoryQueryAllowed: false
+providerCallsAllowed: false
+inventoryMutationAllowed: false
+remediationMutationAllowed: false
+workflowMutationAllowed: false
+rawInventoryRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawOwnerDataAllowed: false
+rawLogContentAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+serialNumbersAllowed: false
+resourceTypes:
+  - site
+  - vm
+  - application
+  - cluster
+  - host
+  - network
+  - backup
+  - monitoring
+  - cmdb-ci
+statusSignals:
+  - inventory-freshness
+  - backup-status
+  - monitoring-status
+  - cmdb-status
+  - ownership-status
+  - lifecycle-state
+  - policy-state
+overviewViews:
+  - site-summary
+  - vm-summary
+  - application-summary
+  - cluster-summary
+  - host-summary
+  - network-summary
+  - protection-observability-summary
+  - cmdb-status-summary
+requiredGuards:
+  - inventory-snapshot-reviewed
+  - site-scope-reviewed
+  - resource-type-summary-reviewed
+  - freshness-state-reviewed
+  - backup-status-reviewed
+  - monitoring-status-reviewed
+  - cmdb-status-reviewed
+  - evidence-redacted
+blockedReasons:
+  - inventory-overview-live-sync-disabled
+  - inventory-overview-live-query-disabled
+  - inventory-overview-provider-calls-disabled
+  - inventory-overview-mutation-disabled
+  - inventory-overview-remediation-disabled
+  - inventory-overview-workflow-mutation-disabled
+  - inventory-overview-raw-rows-disabled
+  - inventory-overview-raw-provider-payloads-disabled
+  - inventory-overview-raw-owner-data-disabled
+  - inventory-overview-raw-log-content-disabled
+  - inventory-overview-raw-recipient-data-disabled
+  - inventory-overview-credential-values-disabled
+  - inventory-overview-token-values-disabled
+  - inventory-overview-tenant-identifiers-disabled
+  - inventory-overview-object-identifiers-disabled
+  - inventory-overview-principal-identifiers-disabled
+  - inventory-overview-private-network-values-disabled
+  - inventory-overview-serials-disabled
+  - scope-missing
+  - resource-type-summary-missing
+  - freshness-state-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Resource overview summary
+  - Site readiness summary
+  - Protection and observability summary
+  - CMDB status summary
+  - Evidence references
+rules:
+  - id: inventory-resource-overview-read-only
+    decision: block
+    requirement: Inventory resource overview summaries are aggregate-only and must not run live inventory queries, sync providers, call providers, or mutate inventory state.
+    evidence: Resource overview summary
+  - id: resource-type-summary-required
+    decision: block
+    requirement: Sites, VMs, applications, clusters, hosts, networks, backups, monitoring, and CMDB status must be represented as safe summary categories before the Inventory view is complete.
+    evidence: Site readiness summary
+  - id: protection-observability-status-required
+    decision: block
+    requirement: Backup, monitoring, ownership, lifecycle, freshness, and policy states must be summarized without opening raw provider rows.
+    evidence: Protection and observability summary
+  - id: raw-inventory-overview-data-not-exposed
+    decision: block
+    requirement: Inventory overview evidence must not expose raw inventory rows, raw provider payloads, raw owner data, raw logs, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, serial numbers, live endpoints, or URLs.
+    evidence: Evidence references

@@ -1,0 +1,169 @@
+# Immutability and air-gap compliance seed data only. Do not add repository names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw repository configuration, appliance details, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+complianceMode: evidence-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveRemediationAllowed: false
+repositoryMutationAllowed: false
+rawRepositoryConfigAllowed: false
+supportedWorkflows:
+  - immutability-posture-review
+  - air-gap-readiness-review
+  - retention-lock-review
+  - copy-isolation-review
+  - compliance-evidence-review
+  - repository-transition-readiness-review
+  - current-storeonce-posture-review
+  - hardened-linux-repository-readiness-review
+  - cutover-readiness-review
+  - capacity-runway-review
+  - rollback-fallback-review
+complianceSignals:
+  - immutability-disabled
+  - retention-lock-missing
+  - air-gap-gap
+  - policy-mismatch
+  - stale-evidence
+  - unsupported-repository-type
+  - repository-transition-risk
+  - backup-copy-isolation-gap
+  - immutable-retention-gap
+  - capacity-runway-risk
+  - rollback-fallback-gap
+repositoryPostureProfiles:
+  - current-storeonce-appliance
+  - planned-hardened-repository-2027
+repositoryTransitionStates:
+  - current-storeonce-protected
+  - hardened-repository-target-planned
+  - transition-readiness-review-required
+requiredInputs:
+  - repositoryScope
+  - repositoryPostureProfile
+  - repositoryTransitionState
+  - site
+  - backupPolicy
+  - retentionPolicy
+  - immutabilityPolicy
+  - airGapStrategy
+  - backupCopyIsolation
+  - immutableRetention
+  - capacityRunway
+  - rollbackFallbackPlan
+  - cutoverReadiness
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - repository-summary-known
+  - immutability-policy-known
+  - retention-policy-known
+  - air-gap-strategy-known
+  - repository-transition-reviewed
+  - isolation-path-reviewed
+  - backup-copy-isolation-known
+  - immutable-retention-known
+  - capacity-runway-known
+  - rollback-fallback-known
+  - cutover-readiness-reviewed
+  - owner-known
+  - evidence-redacted
+planSections:
+  - postureSummary
+  - currentStoreOncePosture
+  - hardenedLinuxRepositoryReadiness
+  - immutabilityControls
+  - airGapControls
+  - retentionLock
+  - isolationReview
+  - repositoryTransitionReadiness
+  - cutoverReadiness
+  - backupCopyIsolation
+  - immutableRetention
+  - capacityRunway
+  - rollbackFallback
+  - policyExceptions
+  - remediationOptions
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - repository-summary-missing
+  - immutability-policy-missing
+  - retention-policy-missing
+  - air-gap-strategy-missing
+  - repository-transition-review-missing
+  - isolation-path-unknown
+  - backup-copy-isolation-missing
+  - immutable-retention-missing
+  - capacity-runway-missing
+  - rollback-fallback-missing
+  - cutover-readiness-missing
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Repository posture summary
+  - Current StoreOnce posture
+  - Hardened Linux repository readiness
+  - Immutability policy
+  - Air-gap strategy
+  - Retention lock status
+  - Isolation review
+  - Repository transition readiness
+  - Cutover readiness
+  - Backup copy isolation
+  - Immutable retention
+  - Capacity runway
+  - Rollback or fallback plan
+  - Policy exceptions
+  - Remediation options
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-repository-remediation
+    decision: block
+    requirement: Immutability and air-gap compliance reports posture and options only, never mutating repositories, appliances, object storage, or retention settings.
+    evidence: Remediation options
+  - id: immutability-policy-required
+    decision: block
+    requirement: Compliance posture requires a known immutability policy before status is trusted.
+    evidence: Immutability policy
+  - id: air-gap-strategy-required
+    decision: block
+    requirement: Air-gap compliance requires an approved isolation strategy and review before approval.
+    evidence: Air-gap strategy
+  - id: retention-lock-required
+    decision: block
+    requirement: Retention lock or equivalent protection status must be summarized before compliance can pass.
+    evidence: Retention lock status
+  - id: storeonce-to-hardened-transition-reviewed
+    decision: block
+    requirement: Current StoreOnce appliance posture and planned 2027 hardened repository posture must be reviewed as aggregate repository classes before transition readiness can pass.
+    evidence: Repository transition readiness
+  - id: current-storeonce-posture-summarized
+    decision: block
+    requirement: Current StoreOnce appliance class, backup policy class, and protected-copy posture must be summarized without appliance details before transition planning can pass.
+    evidence: Current StoreOnce posture
+  - id: hardened-linux-transition-readiness-required
+    decision: block
+    requirement: Future Veeam hardened Linux repository class readiness must cover OS hardening posture, immutable retention intent, and acceptance criteria as aggregate planning data.
+    evidence: Hardened Linux repository readiness
+  - id: backup-copy-isolation-required
+    decision: block
+    requirement: Backup copy isolation must be reviewed before cutover planning can pass.
+    evidence: Backup copy isolation
+  - id: immutable-retention-capacity-runway-required
+    decision: block
+    requirement: Immutable retention and capacity runway must be reviewed before hardened repository transition readiness can pass.
+    evidence: Capacity runway
+  - id: rollback-fallback-required
+    decision: block
+    requirement: Rollback or fallback planning must preserve the current protected posture until acceptance criteria and restore evidence are reviewed.
+    evidence: Rollback or fallback plan
+  - id: raw-repository-config-not-exposed
+    decision: block
+    requirement: Operators receive aggregate posture summaries only, not raw repository configuration or provider payloads.
+    evidence: Repository posture summary

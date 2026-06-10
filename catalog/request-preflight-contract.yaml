@@ -1,0 +1,132 @@
+# Request preflight seed data only. Do not add raw request payloads, raw validation rows, raw provider payloads, raw inventory rows, raw CMDB rows, raw approval data, raw user data, raw recipient data, credentials, tokens, tenant IDs, object IDs, principal IDs, private network values, live endpoints, or URLs.
+version: 1
+status: draft
+source: static-seed
+preflightMode: static-preflight-readiness
+inputSchemaReadOnly: true
+dryRunDecisionRequired: true
+evidenceRedactionRequired: true
+liveSubmissionAllowed: false
+liveExecutionAllowed: false
+providerCallsAllowed: false
+providerValidationAllowed: false
+livePolicyEvaluationAllowed: false
+requestMutationAllowed: false
+workflowMutationAllowed: false
+approvalMutationAllowed: false
+workerDispatchAllowed: false
+rawRequestPayloadsAllowed: false
+rawValidationRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawInventoryRowsAllowed: false
+rawCmdbRowsAllowed: false
+rawApprovalDataAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+hypervisorScope:
+  - vmware
+  - hyperv
+  - proxmox
+preflightSurfaces:
+  - input-completeness
+  - catalog-policy-readiness
+  - site-context-readiness
+  - dependency-readiness
+  - approval-route-readiness
+  - dry-run-plan-readiness
+  - evidence-redaction-readiness
+validationStages:
+  - site
+  - owner
+  - capacity
+  - network
+  - backup
+  - monitoring
+  - cmdb
+  - approval
+  - dry-run
+  - evidence
+requiredInputs:
+  - requestedOffering
+  - owner
+  - site
+  - environment
+  - criticality
+  - dryRunPlan
+  - approvalRoute
+  - evidenceManifest
+  - secretReferenceState
+requiredGuards:
+  - requested-offering-known
+  - owner-known
+  - site-known
+  - environment-known
+  - criticality-known
+  - dry-run-plan-ready
+  - approval-route-assigned
+  - evidence-redacted
+  - secret-reference-configured
+  - provider-calls-blocked
+  - live-execution-blocked
+blockedReasons:
+  - missing-requested-offering
+  - owner-missing
+  - site-missing
+  - environment-missing
+  - criticality-missing
+  - provider-safe-dry-run-not-ready
+  - approval-route-missing
+  - redacted-evidence-not-ready
+  - secret-reference-not-configured
+  - provider-calls-disabled
+  - live-execution-disabled
+  - request-mutation-disabled
+  - workflow-mutation-disabled
+  - approval-mutation-disabled
+  - raw-request-payloads-disabled
+  - raw-validation-rows-disabled
+  - raw-provider-payloads-disabled
+  - raw-inventory-rows-disabled
+  - raw-cmdb-rows-disabled
+  - raw-approval-data-disabled
+  - raw-user-data-disabled
+  - raw-recipient-data-disabled
+  - credential-values-disabled
+  - token-values-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - private-network-values-disabled
+requiredEvidence:
+  - Request input summary
+  - Validation stage summary
+  - Provider-safe dry-run decision
+  - Approval route summary
+  - Redacted evidence manifest
+  - Secret reference state
+rules:
+  - id: no-live-provider-preflight
+    decision: block
+    requirement: Preflight readiness is static and must not call providers, validate live provider state, or query live inventory, CMDB, ticket, backup, monitoring, or identity systems.
+    evidence: Validation stage summary
+  - id: live-execution-disabled
+    decision: block
+    requirement: Preflight may return block or review readiness only and must never submit requests, start workflows, mutate approvals, dispatch workers, or run live execution.
+    evidence: Provider-safe dry-run decision
+  - id: required-inputs-and-guards-reviewed
+    decision: block
+    requirement: Requested offering, owner, site, environment, criticality, dry-run plan, approval route, evidence manifest, and secret reference state must be reviewed before approval readiness.
+    evidence: Request input summary
+  - id: redacted-evidence-required
+    decision: block
+    requirement: Preflight evidence must be redacted before any approval or lifecycle handoff.
+    evidence: Redacted evidence manifest
+  - id: raw-preflight-data-not-exposed
+    decision: block
+    requirement: Preflight evidence must use safe summaries only and must not expose raw request payloads, raw validation rows, raw provider payloads, raw inventory rows, raw CMDB rows, raw approval data, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Redacted evidence manifest

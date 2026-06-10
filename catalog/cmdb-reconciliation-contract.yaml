@@ -1,0 +1,85 @@
+# CMDB reconciliation seed data only. Do not add CMDB rows, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+integrationMode: file-based
+providerCallsEnabled: false
+liveApiEnabled: false
+supportedWorkflows:
+  - cmdb-import
+  - cmdb-update-export
+  - cmdb-ci-reconciliation
+requiredInputs:
+  - importBatch
+  - platformCiKey
+  - ciClass
+  - owner
+  - supportGroup
+  - site
+  - environment
+  - evidenceManifest
+reconciliationSignals:
+  - identity-match
+  - owner-match
+  - support-group-match
+  - site-placement-match
+  - backup-policy-match
+  - monitoring-profile-match
+  - relationship-match
+decisions:
+  - accept
+  - reject
+  - review
+  - export-update
+requiredGuards:
+  - cmdb-file-contract-validated
+  - header-mapping-complete
+  - inventory-coverage-current
+  - relationship-evidence-ready
+  - reviewer-approval-assigned
+  - evidence-redacted
+exportPackageFields:
+  - platformCiKey
+  - ciClass
+  - proposedLifecycleStatus
+  - proposedOwner
+  - proposedSupportGroup
+  - proposedSite
+  - proposedBackupPolicy
+  - proposedMonitoringProfile
+  - relationshipSummary
+  - evidenceReferences
+blockedReasons:
+  - live-api-disabled
+  - missing-ci-identity
+  - ambiguous-ci-identity
+  - stale-inventory
+  - relationship-evidence-missing
+  - reviewer-approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - File hash
+  - Header mapping
+  - Validation result
+  - CMDB reconciliation summary
+  - Accepted/rejected rows
+  - Export package
+  - Reviewer approval
+  - Evidence references
+rules:
+  - id: no-live-servicenow-api
+    decision: block
+    requirement: CMDB reconciliation uses file import and export only until live ServiceNow API integration is approved.
+    evidence: Validation result
+  - id: deterministic-ci-key-required
+    decision: block
+    requirement: Every accepted or exported CI requires a deterministic platform CI key.
+    evidence: CMDB reconciliation summary
+  - id: ambiguous-ci-requires-review
+    decision: block
+    requirement: Ambiguous CI identity must be rejected or routed for reviewer approval.
+    evidence: Accepted/rejected rows
+  - id: export-package-review-required
+    decision: block
+    requirement: CMDB update exports require reviewer approval and redacted evidence references.
+    evidence: Export package

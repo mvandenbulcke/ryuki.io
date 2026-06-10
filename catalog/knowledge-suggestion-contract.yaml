@@ -1,0 +1,103 @@
+# Knowledge suggestion seed data only. Do not add ticket IDs, incident IDs, change IDs, ServiceNow sys IDs, usernames, email addresses, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, serial numbers, raw operation rows, raw logs, raw error details, raw user data, raw recipient data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+suggestionMode: recommendation-export-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveKnowledgePublishAllowed: false
+liveTicketMutationAllowed: false
+rawOperationRowsAllowed: false
+rawLogPayloadsAllowed: false
+rawErrorDetailsAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+rawProviderPayloadsAllowed: false
+suggestionSources:
+  - failed-operation-pattern
+  - blocked-request-pattern
+  - repeat-incident-pattern
+  - runbook-gap
+  - evidence-gap
+  - handover-friction
+  - known-error-pattern
+suggestionSignals:
+  - repeated-failure
+  - common-blocker
+  - manual-workaround
+  - missing-runbook
+  - ambiguous-owner
+  - evidence-gap
+  - training-need
+requiredInputs:
+  - failurePatternSummary
+  - operationTaxonomy
+  - affectedWorkflow
+  - safeRecommendation
+  - owner
+  - supportGroup
+  - reviewer
+  - evidenceManifest
+requiredGuards:
+  - pattern-summary-redacted
+  - taxonomy-known
+  - frequency-threshold-met
+  - impact-summary-known
+  - reviewer-assigned
+  - recommendation-redacted
+  - export-package-ready
+  - evidence-redacted
+planSections:
+  - patternSummary
+  - taxonomyMapping
+  - impactSummary
+  - knowledgeCandidate
+  - runbookCandidate
+  - reviewRoute
+  - exportPackage
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-knowledge-publish-disabled
+  - live-ticket-mutation-disabled
+  - raw-operation-rows-disabled
+  - raw-log-payloads-disabled
+  - raw-error-details-disabled
+  - raw-user-data-disabled
+  - raw-recipient-data-disabled
+  - raw-provider-payloads-disabled
+  - pattern-summary-missing
+  - taxonomy-unknown
+  - reviewer-missing
+  - recommendation-not-redacted
+  - evidence-not-redacted
+requiredEvidence:
+  - Failure pattern summary
+  - Operation taxonomy
+  - Impact summary
+  - Knowledge candidate
+  - Runbook candidate
+  - Review route
+  - Recommendation export package
+  - Evidence references
+rules:
+  - id: no-live-knowledge-publish
+    decision: block
+    requirement: Knowledge suggestions create reviewable recommendation exports only and never publish knowledge articles or runbooks.
+    evidence: Knowledge candidate
+  - id: no-live-ticket-mutation
+    decision: block
+    requirement: Knowledge suggestions never create, update, or close ServiceNow tickets, incidents, changes, tasks, or knowledge records.
+    evidence: Review route
+  - id: safe-summaries-required
+    decision: block
+    requirement: Repeated failure patterns must be summarized and redacted before recommendation export.
+    evidence: Failure pattern summary
+  - id: reviewer-route-required
+    decision: block
+    requirement: Each suggestion requires an assigned reviewer and support group before export.
+    evidence: Review route
+  - id: raw-operation-data-not-exposed
+    decision: block
+    requirement: Knowledge suggestion evidence must use safe summaries only and must not expose raw operation rows, raw logs, raw error details, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, ServiceNow sys IDs, tenant IDs, object IDs, private IPs, serial numbers, or provider payloads.
+    evidence: Evidence references

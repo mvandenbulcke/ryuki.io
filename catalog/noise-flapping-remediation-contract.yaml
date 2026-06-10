@@ -1,0 +1,95 @@
+# Noise and flapping remediation seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw alert history, raw event payloads, alert details, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+remediationMode: dry-run-analysis
+dryRunRequired: true
+providerCallsEnabled: false
+liveRemediationAllowed: false
+alertSuppressionAllowed: false
+zabbixMutationAllowed: false
+rawAlertHistoryAllowed: false
+supportedWorkflows:
+  - flapping-pattern-review
+  - noise-threshold-review
+  - trigger-tuning-review
+  - suppression-window-review
+  - escalation-quality-review
+  - remediation-request-draft
+  - evidence-pack-review
+noiseSignals:
+  - repeated-alert
+  - flapping-trigger
+  - noisy-threshold
+  - stale-maintenance-window
+  - missing-owner
+  - escalation-loop
+  - policy-exception
+requiredInputs:
+  - platformCiKey
+  - alertPatternSummary
+  - site
+  - environment
+  - monitoringProfile
+  - owner
+  - supportGroup
+  - maintenanceWindow
+  - evidenceManifest
+requiredGuards:
+  - alert-pattern-summary-known
+  - monitoring-profile-known
+  - owner-known
+  - maintenance-window-reviewed
+  - remediation-request-dry-run
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - noiseSummary
+  - flappingPattern
+  - thresholdReview
+  - suppressionWindow
+  - escalationReview
+  - remediationRequest
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - alert-suppression-disabled
+  - zabbix-mutation-disabled
+  - raw-alert-history-disabled
+  - alert-pattern-unknown
+  - monitoring-profile-missing
+  - owner-unknown
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Noise summary
+  - Flapping pattern summary
+  - Threshold review
+  - Suppression window proposal
+  - Escalation review
+  - Remediation request draft
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-noise-remediation
+    decision: block
+    requirement: Noise and flapping remediation produces analysis and request drafts only, never mutating triggers, actions, maintenance windows, suppressions, or escalations.
+    evidence: Remediation request draft
+  - id: alert-pattern-summary-required
+    decision: block
+    requirement: Alert pattern summary must be aggregate-safe and known before remediation can be drafted.
+    evidence: Noise summary
+  - id: threshold-review-required
+    decision: block
+    requirement: Threshold and trigger-tuning proposals require review before approval.
+    evidence: Threshold review
+  - id: suppression-window-approval-required
+    decision: block
+    requirement: Suppression windows remain proposals until owner and monitoring approval are recorded.
+    evidence: Suppression window proposal
+  - id: raw-alert-history-not-exposed
+    decision: block
+    requirement: Operators receive noise summaries only, not raw alert history, raw event payloads, alert details, or provider output.
+    evidence: Flapping pattern summary

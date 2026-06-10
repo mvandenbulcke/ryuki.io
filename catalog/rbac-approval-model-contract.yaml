@@ -1,0 +1,265 @@
+# RBAC approval model seed data only. Do not add credentials, tokens, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, user records, claim payloads, group rows, approval payloads, ServiceNow payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+modelMode: static-rbac-approval-model
+identityProvider: Microsoft Entra ID
+configuredForProduction: false
+localMockAuthAllowed: true
+providerCallsAllowed: false
+liveAuthenticationAllowed: false
+graphCallsAllowed: false
+entraGroupLookupAllowed: false
+serviceNowApprovalMutationAllowed: false
+approvalExecutionAllowed: false
+roleAssignmentMutationAllowed: false
+policyMutationAllowed: false
+workflowMutationAllowed: false
+rawUserDataAllowed: false
+rawClaimPayloadsAllowed: false
+rawGroupRowsAllowed: false
+rawApprovalPayloadsAllowed: false
+tenantIdentifiersAllowed: false
+appIdentifiersAllowed: false
+clientIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+rawProviderPayloadsAllowed: false
+roles:
+  - platform-admin
+  - datacenter-approver
+  - vmware-operator
+  - hyper-v-operator
+  - proxmox-operator
+  - wintel-linux-operator
+  - backup-operator
+  - monitoring-operator
+  - service-desk
+  - auditor
+  - requester
+capabilities:
+  - request
+  - approve
+  - execute
+  - admin
+  - audit
+approvalRoutes:
+  - p0-live-execution-default
+  - p0-cmdb-file-exchange
+  - p0-platform-admin-readiness
+  - p1-retirement-governance
+executionGuards:
+  - validation-passed
+  - provider-safe-dry-run
+  - required-approvals
+  - active-lock
+  - redacted-evidence-ready
+  - dependency-health-known
+  - secret-reference-approved
+requiredInputs:
+  - roleActionMatrix
+  - approvalRouteSummary
+  - executionGuardSummary
+  - requestContext
+  - approvalDecisionSummary
+  - emergencyApprovalSummary
+  - evidenceManifest
+separationOfDutiesControls:
+  - requester-cannot-execute
+  - executor-cannot-final-approve-own-request
+  - datacenter-final-approval-required
+  - break-glass-audited
+  - auditor-read-only
+  - platform-admin-break-glass-reviewed
+blockedReasons:
+  - provider-calls-disabled
+  - live-authentication-disabled
+  - graph-lookup-disabled
+  - entra-group-lookup-disabled
+  - servicenow-mutation-disabled
+  - approval-execution-disabled
+  - role-assignment-mutation-disabled
+  - policy-mutation-disabled
+  - workflow-mutation-disabled
+  - raw-user-data-disabled
+  - raw-claim-payloads-disabled
+  - raw-group-rows-disabled
+  - raw-approval-payloads-disabled
+  - tenant-identifiers-disabled
+  - app-identifiers-disabled
+  - client-identifiers-disabled
+  - object-identifiers-disabled
+  - principal-identifiers-disabled
+  - group-identifiers-disabled
+  - credential-values-disabled
+  - token-values-disabled
+  - raw-provider-payloads-disabled
+  - missing-role-mapping
+  - missing-approval-route
+  - missing-execution-guard
+  - missing-separation-of-duties
+  - evidence-not-redacted
+requiredEvidence:
+  - RBAC model summary
+  - Role action matrix
+  - Approval route summary
+  - Execution guard summary
+  - Segregation of duties review
+  - Emergency approval review
+  - Evidence references
+portalRoleGroupProposals:
+  - role: PlatformAdmin
+    title: Platform Admins
+    modelRole: PlatformAdmin
+    placeholderGroupRef: group-ref:ryuki-portal-platform-admins
+    appRole: PlatformAdmin
+    capabilities:
+      - admin
+      - approve
+      - audit
+    approvalRouteRefs:
+      - p0-platform-admin-readiness
+    accessBoundary: Static portal administration proposal; Entra lookup and role assignment mutation stay disabled.
+  - role: DatacenterApprover
+    title: Approvers
+    modelRole: DatacenterApprover
+    placeholderGroupRef: group-ref:ryuki-portal-approvers
+    appRole: DatacenterApprover
+    capabilities:
+      - approve
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+      - p1-retirement-governance
+    accessBoundary: Static approval proposal; approval execution and ServiceNow mutation stay disabled.
+  - role: VMwareOperator
+    title: VMware Operators
+    modelRole: VMwareOperator
+    placeholderGroupRef: group-ref:ryuki-portal-vmware-operators
+    appRole: VMwareOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static virtualization execution proposal; provider calls stay disabled.
+  - role: HyperVOperator
+    title: Hyper-V Operators
+    modelRole: HyperVOperator
+    placeholderGroupRef: group-ref:ryuki-portal-hyper-v-operators
+    appRole: HyperVOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static virtualization execution proposal; provider calls stay disabled.
+  - role: ProxmoxOperator
+    title: Proxmox Operators
+    modelRole: ProxmoxOperator
+    placeholderGroupRef: group-ref:ryuki-portal-proxmox-operators
+    appRole: ProxmoxOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static virtualization execution proposal; provider calls stay disabled.
+  - role: WintelLinuxOperator
+    title: Wintel/Linux Operators
+    modelRole: WintelLinuxOperator
+    placeholderGroupRef: group-ref:ryuki-portal-wintel-linux-operators
+    appRole: WintelLinuxOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static operating system execution proposal; provider calls stay disabled.
+  - role: BackupOperator
+    title: Backup Operators
+    modelRole: BackupOperator
+    placeholderGroupRef: group-ref:ryuki-portal-backup-operators
+    appRole: BackupOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static backup execution proposal; provider calls stay disabled.
+  - role: MonitoringOperator
+    title: Monitoring Operators
+    modelRole: MonitoringOperator
+    placeholderGroupRef: group-ref:ryuki-portal-monitoring-operators
+    appRole: MonitoringOperator
+    capabilities:
+      - execute
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+    accessBoundary: Static monitoring execution proposal; provider calls stay disabled.
+  - role: ServiceDesk
+    title: Service Desk
+    modelRole: ServiceDesk
+    placeholderGroupRef: group-ref:ryuki-portal-service-desk
+    appRole: ServiceDesk
+    capabilities:
+      - request
+      - audit
+    approvalRouteRefs:
+      - p0-cmdb-file-exchange
+      - p1-retirement-governance
+    accessBoundary: Static triage proposal; approval execution and role assignment mutation stay disabled.
+  - role: Auditor
+    title: Auditor
+    modelRole: Auditor
+    placeholderGroupRef: group-ref:ryuki-portal-auditors
+    appRole: Auditor
+    capabilities:
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+      - p1-retirement-governance
+    accessBoundary: Static read-only audit proposal; execution, approval, and admin rights stay disabled.
+  - role: Requester
+    title: Requester
+    modelRole: Requester
+    placeholderGroupRef: group-ref:ryuki-portal-requesters
+    appRole: Requester
+    capabilities:
+      - request
+    approvalRouteRefs:
+      - p1-retirement-governance
+    accessBoundary: Static request-only proposal; approval, execution, and admin rights stay disabled.
+  - role: BreakGlassAdmin
+    title: Break-Glass
+    modelRole: BreakGlassAdmin
+    placeholderGroupRef: group-ref:ryuki-portal-break-glass
+    appRole: BreakGlassAdmin
+    capabilities:
+      - admin
+      - audit
+    approvalRouteRefs:
+      - p0-live-execution-default
+      - p0-platform-admin-readiness
+    accessBoundary: Static emergency access proposal; break-glass use requires audited emergency review and live integration stays disabled.
+rules:
+  - id: no-live-rbac-provider-execution
+    decision: block
+    requirement: RBAC approval model reports static readiness only and never calls identity providers, Microsoft Graph, ServiceNow, policy engines, approval systems, or provider APIs.
+    evidence: RBAC model summary
+  - id: access-catalog-alignment-required
+    decision: block
+    requirement: Model roles, capabilities, approval routes, execution guards, and evidence records must align with the static access-control catalog before workflow consumption.
+    evidence: Role action matrix
+  - id: separation-of-duties-required
+    decision: block
+    requirement: Requester, executor, approver, administrator, emergency, and audit duties must preserve least privilege and prevent approval or execution bypasses.
+    evidence: Segregation of duties review
+  - id: raw-rbac-data-not-exposed
+    decision: block
+    requirement: RBAC approval evidence must use safe summaries only and must not expose user records, claim payloads, group rows, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, credentials, tokens, approval payloads, ServiceNow payloads, or provider payloads.
+    evidence: Evidence references

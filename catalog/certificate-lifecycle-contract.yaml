@@ -1,0 +1,103 @@
+# Certificate lifecycle seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, certificate serials, thumbprints, private key material, CSR PEM, certificate PEM, PFX data, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+certificateMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveCertificateActionAllowed: false
+privateKeyMaterialAllowed: false
+certificateSerialAllowed: false
+certificateTargets:
+  - platform-ingress
+  - web-service
+  - iis-site
+  - vcenter-appliance
+  - hyperv-management-service
+  - proxmox-management-service
+  - infrastructure-appliance
+  - hardware-management
+  - database-listener
+certificateActions:
+  - request-plan
+  - renew-plan
+  - replace-plan
+  - install-plan
+  - revoke-plan
+  - evidence-review
+requiredInputs:
+  - certificateScope
+  - targetProfile
+  - issuerProfile
+  - subjectPolicy
+  - validityWindow
+  - owner
+  - supportGroup
+  - maintenanceWindow
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - certificate-scope-known
+  - target-profile-known
+  - issuer-profile-known
+  - subject-policy-reviewed
+  - private-key-material-blocked
+  - approval-route-assigned
+  - maintenance-window-known
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - certificateSummary
+  - scopeReview
+  - issuerReadiness
+  - subjectPolicyReview
+  - renewalOrReplacementPlan
+  - installationDryRun
+  - rollbackPlan
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-certificate-action-disabled
+  - certificate-scope-unknown
+  - target-profile-unknown
+  - issuer-profile-missing
+  - subject-policy-unreviewed
+  - private-key-material-present
+  - csr-pem-present
+  - certificate-identifier-present
+  - approval-missing
+  - maintenance-window-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Certificate lifecycle summary
+  - Scope review
+  - Issuer readiness
+  - Subject policy decision
+  - Renewal or replacement plan
+  - Installation dry-run plan
+  - Rollback plan
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-certificate-actions
+    decision: block
+    requirement: Certificate lifecycle creates dry-run plans only and never requests, renews, installs, revokes, or replaces certificates through live providers.
+    evidence: Renewal or replacement plan
+  - id: private-key-material-prohibited
+    decision: block
+    requirement: Private keys, CSR PEM, certificate PEM, PFX data, passwords, and credential material must never be committed or emitted in evidence.
+    evidence: Certificate lifecycle summary
+  - id: certificate-identifiers-prohibited
+    decision: block
+    requirement: Certificate serials, thumbprints, fingerprints, object identifiers, tenant identifiers, endpoint names, hostnames, and private network details must not be committed.
+    evidence: Scope review
+  - id: issuer-and-approval-required
+    decision: block
+    requirement: Issuer profile, owner, support group, maintenance window, and approval route must be known before a certificate plan is usable.
+    evidence: Approval route
+  - id: rollback-plan-required
+    decision: block
+    requirement: Installation and replacement plans require rollback notes and verification evidence before execution can be considered later.
+    evidence: Rollback plan

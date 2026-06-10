@@ -1,0 +1,78 @@
+# Patch maintenance seed data only. Do not add hostnames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+liveExecutionAllowed: false
+supportedWorkflows:
+  - patch-wave-planning
+  - reboot-orchestration
+requiredInputs:
+  - patchCycle
+  - siteScope
+  - applicationScope
+  - environmentScope
+  - criticality
+  - dependencyContext
+  - maintenanceWindow
+  - rebootPolicy
+  - blackoutDates
+waveDimensions:
+  - site
+  - application
+  - environment
+  - criticality
+  - dependencyGroup
+  - backupState
+  - maintenanceWindow
+requiredGuards:
+  - patch-policy-imported
+  - inventory-coverage-current
+  - backup-state-known
+  - monitoring-maintenance-ready
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - waveSummary
+  - dependencyOrder
+  - maintenanceWindows
+  - rebootQueue
+  - backupReadiness
+  - monitoringSuppression
+  - riskNotes
+  - rollbackNotes
+blockedReasons:
+  - provider-calls-disabled
+  - stale-inventory
+  - missing-maintenance-window
+  - backup-state-unknown
+  - dependency-context-missing
+  - blackout-window-conflict
+  - approval-missing
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Wave plan summary
+  - Reboot queue summary
+  - Risk notes
+  - Approval decisions
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-patch-execution
+    decision: block
+    requirement: Patch maintenance contracts produce plans only and never execute OS, monitoring, backup, or provider actions.
+    evidence: Wave plan summary
+  - id: maintenance-window-required
+    decision: block
+    requirement: Every wave and reboot batch must have an approved maintenance window outside blackout periods.
+    evidence: Validation result
+  - id: dependency-order-required
+    decision: block
+    requirement: Dependency order must be known before reboot orchestration can proceed.
+    evidence: Wave plan summary
+  - id: backup-monitoring-readiness-required
+    decision: block
+    requirement: Backup state and monitoring maintenance readiness must be known before approval.
+    evidence: Reboot queue summary

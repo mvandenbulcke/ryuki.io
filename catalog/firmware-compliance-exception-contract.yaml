@@ -1,0 +1,119 @@
+# Firmware compliance exception seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, endpoint names, private IPs, raw hardware inventory rows, exact observed firmware versions, serial numbers, asset tags, raw logs, or vendor payloads.
+version: 1
+status: draft
+source: static-seed
+exceptionMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveFirmwareChangesAllowed: false
+rawInventoryRowsAllowed: false
+hostIdentifiersAllowed: false
+serialNumbersAllowed: false
+exactFirmwareVersionsAllowed: false
+rawVendorPayloadsAllowed: false
+supportedProfiles:
+  - hpe-dl360-msa
+  - hpe-simplivity-dl380
+  - lenovo-sr
+  - lenovo-vx
+  - lenovo-mx
+exceptionTypes:
+  - firmware-baseline-deviation
+  - driver-baseline-deviation
+  - hardware-support-deviation
+  - compatibility-evidence-gap
+  - maintenance-window-deferral
+  - vendor-baseline-pending
+riskLevels:
+  - low
+  - medium
+  - high
+  - emergency
+requiredInputs:
+  - site
+  - hardwareProfile
+  - platformRole
+  - targetBaseline
+  - observedBaselineSummary
+  - exceptionReason
+  - clusterCriticality
+  - supportStatus
+  - remediationWindow
+  - expiryDate
+  - reviewCadence
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - hardware-profile-known
+  - target-baseline-known
+  - observed-baseline-summarized
+  - compatibility-impact-reviewed
+  - support-risk-reviewed
+  - cluster-criticality-reviewed
+  - maintenance-window-known
+  - exception-owner-assigned
+  - expiry-date-set
+  - remediation-plan-ready
+  - evidence-redacted
+planSections:
+  - exceptionSummary
+  - baselineDecision
+  - compatibilityImpact
+  - supportRisk
+  - clusterCriticality
+  - remediationPlan
+  - approvalRoute
+  - expiryAndReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-firmware-change-disabled
+  - raw-inventory-rows-disabled
+  - host-identifiers-disabled
+  - serial-numbers-disabled
+  - exact-firmware-versions-disabled
+  - raw-vendor-payloads-disabled
+  - site-unknown
+  - hardware-profile-unknown
+  - target-baseline-missing
+  - observed-baseline-missing
+  - compatibility-impact-unknown
+  - support-risk-unknown
+  - cluster-criticality-unknown
+  - expiry-missing
+  - remediation-plan-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Firmware exception summary
+  - Target baseline summary
+  - Observed baseline summary
+  - Compatibility impact review
+  - Support risk review
+  - Cluster criticality review
+  - Remediation plan
+  - Approval route
+  - Expiry and review date
+  - Evidence references
+rules:
+  - id: no-live-firmware-actions
+    decision: block
+    requirement: Firmware compliance exceptions report risk acceptance only and never patch firmware, remediate drivers, reconfigure hardware, or call live vendor tools.
+    evidence: Firmware exception summary
+  - id: baseline-evidence-required
+    decision: block
+    requirement: Target and observed baseline evidence must be summarized before a firmware exception can be reviewed.
+    evidence: Baseline summary
+  - id: compatibility-support-risk-required
+    decision: block
+    requirement: Compatibility impact, support status, and cluster criticality must be reviewed before exception approval.
+    evidence: Support risk review
+  - id: expiry-remediation-required
+    decision: block
+    requirement: Exceptions require owner, expiry date, remediation window, and review cadence before acceptance.
+    evidence: Expiry and review date
+  - id: raw-firmware-inventory-not-exposed
+    decision: block
+    requirement: Firmware exception evidence must use safe summaries only and must not expose host identifiers, endpoint names, private IPs, exact observed firmware versions, serials, asset tags, raw inventory rows, raw logs, or vendor payloads.
+    evidence: Evidence references

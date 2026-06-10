@@ -1,0 +1,13 @@
+.git
+.codex
+.codegraph
+.atl
+graphify-out
+.env
+target/
+**/target/
+*.log
+.env.*
+*.key
+*.pem
+*.crt

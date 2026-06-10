@@ -1,0 +1,116 @@
+# Dashboard risk heatmap seed data only. Do not add raw metric rows, raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, raw user data, raw recipient data, credentials, tokens, tenant IDs, object IDs, principal IDs, private network values, live endpoints, or URLs.
+version: 1
+status: draft
+source: static-seed
+riskHeatmapMode: static-dashboard-risk-heatmap
+heatmapReadOnly: true
+trendSummaryReadOnly: true
+riskBandSummaryOnly: true
+evidenceReferencesReadOnly: true
+liveMetricsQueryAllowed: false
+liveDashboardQueryAllowed: false
+dashboardMutationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawMetricRowsAllowed: false
+rawRequestRowsAllowed: false
+rawOperationRowsAllowed: false
+rawInventoryRowsAllowed: false
+rawCmdbRowsAllowed: false
+rawBackupRowsAllowed: false
+rawMonitoringRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+dimensions:
+  - site
+  - environment
+  - service-criticality
+  - owner-domain
+  - risk-domain
+  - time-window
+riskDomains:
+  - patch-risk
+  - backup-risk
+  - monitoring-risk
+  - cmdb-risk
+  - capacity-risk
+  - evidence-risk
+  - incident-risk
+trendWindows:
+  - now
+  - seven-day
+  - thirty-day
+  - quarter
+riskBands:
+  - healthy
+  - attention
+  - risk
+  - blocked
+  - stale
+  - unknown
+requiredGuards:
+  - aggregate-only
+  - stale-data-marked
+  - risk-band-reviewed
+  - trend-window-reviewed
+  - evidence-redacted
+  - live-query-blocked
+  - raw-detail-blocked
+blockedReasons:
+  - risk-heatmap-live-metrics-query-disabled
+  - risk-heatmap-live-dashboard-query-disabled
+  - risk-heatmap-dashboard-mutation-disabled
+  - risk-heatmap-workflow-mutation-disabled
+  - risk-heatmap-provider-calls-disabled
+  - risk-heatmap-notification-dispatch-disabled
+  - risk-heatmap-raw-metric-rows-disabled
+  - risk-heatmap-raw-request-rows-disabled
+  - risk-heatmap-raw-operation-rows-disabled
+  - risk-heatmap-raw-inventory-rows-disabled
+  - risk-heatmap-raw-cmdb-rows-disabled
+  - risk-heatmap-raw-backup-rows-disabled
+  - risk-heatmap-raw-monitoring-rows-disabled
+  - risk-heatmap-raw-provider-payloads-disabled
+  - risk-heatmap-raw-user-data-disabled
+  - risk-heatmap-raw-recipient-data-disabled
+  - risk-heatmap-credential-values-disabled
+  - risk-heatmap-token-values-disabled
+  - risk-heatmap-tenant-identifiers-disabled
+  - risk-heatmap-object-identifiers-disabled
+  - risk-heatmap-principal-identifiers-disabled
+  - risk-heatmap-private-network-values-disabled
+  - scope-missing
+  - trend-window-missing
+  - risk-band-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Risk heatmap summary
+  - Trend window summary
+  - Risk band summary
+  - Stale-data marker summary
+  - Evidence references
+rules:
+  - id: risk-heatmap-aggregate-only
+    decision: block
+    requirement: Risk heatmaps are aggregate-only and may not run live metrics queries or dashboard reads for operational mutation.
+    evidence: Risk heatmap summary
+  - id: trend-window-read-only
+    decision: block
+    requirement: Trend-window summaries are read-only and must be reviewed before any deployment or remediation planning.
+    evidence: Trend window summary
+  - id: stale-risk-markers-required
+    decision: block
+    requirement: Stale-data markers must be explicit for each risk band and trend window before trust.
+    evidence: Stale-data marker summary
+  - id: raw-risk-heatmap-data-not-exposed
+    decision: block
+    requirement: Risk heatmap evidence must expose only aggregate risk summaries and must not include raw metric rows, raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, provider payloads, or URLs.
+    evidence: Evidence references

@@ -1,0 +1,72 @@
+# Controlled restore seed data only. Do not add backup object names, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+liveRestoreAllowed: false
+supportedRestoreTypes:
+  - file
+  - vm
+  - application
+  - sql
+requiredInputs:
+  - businessPurpose
+  - requester
+  - restoreType
+  - sourceResource
+  - restorePoint
+  - targetSelection
+  - owner
+  - site
+  - environment
+  - verificationPlan
+  - retentionNeed
+requiredGuards:
+  - restore-point-known
+  - target-isolation-reviewed
+  - owner-approval-assigned
+  - backup-operator-approval-assigned
+  - verification-plan-ready
+  - evidence-redacted
+planSections:
+  - restoreScope
+  - restorePointSummary
+  - targetSelection
+  - isolationPlan
+  - verificationPlan
+  - riskNotes
+  - rollbackNotes
+blockedReasons:
+  - provider-calls-disabled
+  - restore-point-unknown
+  - target-selection-missing
+  - target-isolation-not-reviewed
+  - approval-missing
+  - verification-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Restore plan summary
+  - Approval decisions
+  - Lock record
+  - Verification result
+  - Evidence references
+rules:
+  - id: no-live-restore-execution
+    decision: block
+    requirement: Controlled restore contracts produce plans only and never execute restore actions.
+    evidence: Restore plan summary
+  - id: restore-point-required
+    decision: block
+    requirement: A restore point summary is required before approval.
+    evidence: Validation result
+  - id: target-isolation-required
+    decision: block
+    requirement: Restore target and isolation behavior must be reviewed before approval.
+    evidence: Restore plan summary
+  - id: verification-plan-required
+    decision: block
+    requirement: Restore requests must include a verification plan before approval.
+    evidence: Verification result

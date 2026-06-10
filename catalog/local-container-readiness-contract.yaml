@@ -1,0 +1,127 @@
+# Local container readiness seed data only. Do not add runtime endpoints, private network details, environment value material, registry material, organization-scope identifiers, provider-side identifiers, sensitive auth material, raw runtime payloads, or provider-returned content.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+runtimeProvider: Docker Compose
+deploymentTarget: local-compose-skeleton
+providerCallsEnabled: false
+dockerComposeUpAllowed: false
+dockerComposeBuildAllowed: false
+dockerRunAllowed: false
+imagePushAllowed: false
+registryAccessAllowed: false
+serviceMutationAllowed: false
+networkMutationAllowed: false
+portBindingMutationAllowed: false
+environmentValuesAllowed: false
+envFileAllowed: false
+volumeMountsAllowed: false
+providerServiceAllowed: false
+externalEgressAllowed: false
+rawRuntimePayloadsAllowed: false
+providerReturnedContentAllowed: false
+sensitiveAuthValuesAllowed: false
+runtimeIdentifiersAllowed: false
+readinessSurfaces:
+  - compose-file-readiness
+  - service-topology-readiness
+  - build-context-readiness
+  - local-port-readiness
+  - network-boundary-readiness
+  - dependency-readiness
+  - portal-runtime-boundary-readiness
+  - excluded-runtime-readiness
+  - evidence-redaction-readiness
+requiredInputs:
+  - composeSummary
+  - serviceTopologySummary
+  - buildContextSummary
+  - localPortSummary
+  - networkBoundarySummary
+  - dependencySummary
+  - portalRuntimeSummary
+  - excludedRuntimeSummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - compose-file-reviewed
+  - service-topology-reviewed
+  - build-context-reviewed
+  - local-port-reviewed
+  - network-boundary-reviewed
+  - dependency-reviewed
+  - portal-runtime-boundary-reviewed
+  - excluded-runtime-reviewed
+  - evidence-redacted
+planSections:
+  - localRuntimeSummary
+  - composeFileReview
+  - serviceTopology
+  - buildContextReview
+  - localPortReview
+  - networkBoundaryReview
+  - dependencyReview
+  - portalRuntimeBoundaryReview
+  - excludedRuntimeReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - docker-compose-up-disabled
+  - docker-compose-build-disabled
+  - docker-run-disabled
+  - image-push-disabled
+  - registry-access-disabled
+  - service-mutation-disabled
+  - network-mutation-disabled
+  - port-binding-mutation-disabled
+  - environment-values-disabled
+  - env-file-disabled
+  - volume-mounts-disabled
+  - provider-service-disabled
+  - external-egress-disabled
+  - raw-runtime-payloads-disabled
+  - provider-returned-content-disabled
+  - sensitive-auth-values-disabled
+  - runtime-identifiers-disabled
+  - compose-file-review-missing
+  - service-topology-missing
+  - build-context-review-missing
+  - local-port-review-missing
+  - network-boundary-review-missing
+  - dependency-review-missing
+  - portal-runtime-boundary-review-missing
+  - excluded-runtime-review-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Local container readiness summary
+  - Compose file review
+  - Service topology review
+  - Build context review
+  - Local port review
+  - Network boundary review
+  - Dependency review
+  - Portal runtime boundary review
+  - Excluded runtime review
+  - Evidence references
+rules:
+  - id: no-live-local-container-actions
+    decision: block
+    requirement: Local container readiness reports static readiness only and never calls providers, runs compose up, builds images, runs containers, pushes images, accesses registries, mutates services, mutates networks, changes local port bindings, enables environment value material, mounts volumes, creates provider-backed services, enables external egress, or changes runtime state.
+    evidence: Local container readiness summary
+  - id: two-service-local-topology-required
+    decision: block
+    requirement: Local compose posture must keep the browser-facing portal and server-side API as the only active services until worker, adapter, database, and Vault bootstrap slices are approved.
+    evidence: Service topology review
+  - id: local-routing-and-network-required
+    decision: block
+    requirement: Local port bindings, full-stack portal runtime boundary, service dependency order, and bridge-network boundary must be reviewed before local runtime readiness can be accepted.
+    evidence: Network boundary review
+  - id: runtime-expansion-excluded
+    decision: block
+    requirement: Database, Vault, provider adapters, worker execution, provider-backed resources, environment value material, local volume mounts, registry access, and external egress must stay excluded from the local skeleton until separately approved.
+    evidence: Excluded runtime review
+  - id: raw-local-runtime-data-not-exposed
+    decision: block
+    requirement: Local container readiness evidence must use safe summaries only and must not expose runtime endpoints, private network details, environment value material, registry material, organization-scope identifiers, provider-side identifiers, sensitive auth material, raw runtime payloads, or provider-returned content.
+    evidence: Evidence references

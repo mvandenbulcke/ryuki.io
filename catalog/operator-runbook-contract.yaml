@@ -1,0 +1,76 @@
+# Operator runbook seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+supportedWorkflows:
+  - operator-runbook-launch
+  - standard-l1-l2-task
+  - incident-context-review
+runbookPlanTypes:
+  - health-check-plan
+  - collect-logs-plan
+  - restart-service-plan
+  - clear-disk-plan
+  - trigger-backup-plan
+  - alert-suppression-plan
+requiredInputs:
+  - ticketContext
+  - requester
+  - targetResource
+  - runbookType
+  - owner
+  - site
+  - environment
+  - riskJustification
+  - evidenceManifest
+requiredGuards:
+  - role-authorized
+  - approval-route-assigned
+  - worker-capability-known
+  - dry-run-ready
+  - dependency-health-known
+  - evidence-redacted
+planSections:
+  - runbookSummary
+  - targetScope
+  - workerCapability
+  - expectedActions
+  - riskNotes
+  - rollbackNotes
+  - handoverNotes
+blockedReasons:
+  - worker-execution-disabled
+  - unsupported-runbook
+  - role-not-authorized
+  - approval-missing
+  - worker-capability-unknown
+  - dependency-health-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Runbook plan summary
+  - Approval decisions
+  - Worker capability decision
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-worker-execution
+    decision: block
+    requirement: Operator runbook contracts produce plans only and never execute worker or provider actions.
+    evidence: Runbook plan summary
+  - id: role-and-approval-required
+    decision: block
+    requirement: Runbook launch requires authorized role and approval route before execution can be considered.
+    evidence: Approval decisions
+  - id: worker-capability-required
+    decision: block
+    requirement: Target worker capability must be known before routing a runbook.
+    evidence: Worker capability decision
+  - id: handover-required-for-blocked-runbook
+    decision: block
+    requirement: Blocked runbooks require handover notes and evidence references.
+    evidence: Handover notes

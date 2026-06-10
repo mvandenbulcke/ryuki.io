@@ -1,0 +1,120 @@
+# Platform database readiness seed data only. Do not add database names, usernames, credentials, tokens, tenant IDs, object IDs, connection strings, endpoints, private IPs, raw database rows, raw Kubernetes payloads, raw backup payloads, object-storage payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+databaseProvider: CloudNativePG PostgreSQL
+providerCallsEnabled: false
+kubernetesApplyAllowed: false
+cnpgClusterCreationAllowed: false
+databaseMutationAllowed: false
+schemaMigrationAllowed: false
+backupExecutionAllowed: false
+restoreExecutionAllowed: false
+objectStorageAccessAllowed: false
+credentialValuesAllowed: false
+connectionStringsAllowed: false
+rawDatabaseRowsAllowed: false
+rawBackupPayloadsAllowed: false
+rawKubernetesPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+readinessSurfaces:
+  - cnpg-operator-readiness
+  - postgres-cluster-topology
+  - storage-class-readiness
+  - backup-archive-readiness
+  - restore-test-readiness
+  - monitoring-readiness
+  - vault-secret-reference-readiness
+  - network-policy-readiness
+  - failover-drain-readiness
+  - evidence-redaction-readiness
+requiredInputs:
+  - runtimeProfile
+  - clusterTopologySummary
+  - storageProfile
+  - backupArchiveSummary
+  - restoreTestSummary
+  - monitoringProfile
+  - vaultReferenceSummary
+  - networkPolicySummary
+  - maintenanceWindow
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - operator-install-reviewed
+  - three-instance-topology-reviewed
+  - storage-class-reviewed
+  - wal-archive-reviewed
+  - object-backup-reviewed
+  - restore-test-reviewed
+  - monitoring-reviewed
+  - vault-reference-reviewed
+  - network-policy-reviewed
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - clusterTopology
+  - storageReadiness
+  - backupArchiveReadiness
+  - restoreTestReadiness
+  - monitoringReadiness
+  - secretReferenceReadiness
+  - networkPolicyReadiness
+  - failoverMaintenanceReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - kubernetes-apply-disabled
+  - cnpg-cluster-creation-disabled
+  - database-mutation-disabled
+  - schema-migration-disabled
+  - backup-execution-disabled
+  - restore-execution-disabled
+  - object-storage-access-disabled
+  - credential-values-disabled
+  - connection-strings-disabled
+  - raw-database-rows-disabled
+  - raw-backup-payloads-disabled
+  - raw-kubernetes-payloads-disabled
+  - raw-provider-payloads-disabled
+  - operator-readiness-missing
+  - topology-review-missing
+  - storage-review-missing
+  - backup-archive-missing
+  - restore-test-missing
+  - monitoring-missing
+  - vault-reference-missing
+  - network-policy-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Database readiness summary
+  - Cluster topology review
+  - Storage readiness
+  - Backup archive review
+  - Restore test review
+  - Monitoring readiness
+  - Secret reference review
+  - Network policy review
+  - Evidence references
+rules:
+  - id: no-live-database-or-kubernetes-actions
+    decision: block
+    requirement: Platform database readiness reports static readiness only and never applies Kubernetes manifests, creates CloudNativePG clusters, mutates databases, runs schema migrations, executes backups, executes restores, accesses object storage, or changes provider state.
+    evidence: Database readiness summary
+  - id: ha-topology-and-storage-required
+    decision: block
+    requirement: Three-instance topology, storage class, anti-affinity posture, and maintenance behavior must be reviewed before production database readiness can be accepted.
+    evidence: Cluster topology review
+  - id: backup-restore-monitoring-required
+    decision: block
+    requirement: WAL archive, object backup, restore test, monitoring, and evidence readiness must be reviewed before database readiness can be accepted.
+    evidence: Restore test review
+  - id: secret-and-network-boundary-required
+    decision: block
+    requirement: Vault secret references and network policy posture must be reviewed before workloads can use the database.
+    evidence: Secret reference review
+  - id: raw-database-data-not-exposed
+    decision: block
+    requirement: Database readiness evidence must use safe summaries only and must not expose database names, usernames, credential values, connection strings, endpoints, private IPs, raw database rows, raw Kubernetes payloads, raw backup payloads, object-storage payloads, tokens, or provider payloads.
+    evidence: Evidence references

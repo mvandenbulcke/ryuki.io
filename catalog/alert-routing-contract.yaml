@@ -1,0 +1,75 @@
+# Alert routing seed data only. Do not add hostnames, group object IDs, credentials, tokens, tenant IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+dryRunRequired: true
+providerCallsEnabled: false
+liveRoutingAllowed: false
+supportedWorkflows:
+  - alert-routing-and-escalation
+  - zabbix-onboarding
+  - monitoring-coverage-gap-report
+routeDimensions:
+  - site
+  - environment
+  - application
+  - criticality
+  - supportGroup
+  - maintenanceWindow
+  - alertSeverity
+  - ownershipState
+requiredInputs:
+  - alertSource
+  - site
+  - environment
+  - application
+  - criticality
+  - supportGroup
+  - maintenanceWindow
+  - escalationPolicy
+requiredGuards:
+  - owner-known
+  - support-group-known
+  - maintenance-window-known
+  - alert-template-mapped
+  - escalation-policy-assigned
+  - evidence-redacted
+escalationStages:
+  - suppress-during-maintenance
+  - notify-support-group
+  - escalate-critical-service
+  - create-review-task
+  - handover-unresolved
+blockedReasons:
+  - provider-calls-disabled
+  - unknown-owner
+  - unknown-support-group
+  - missing-maintenance-window
+  - unmapped-alert-template
+  - escalation-policy-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Alert routing summary
+  - Validation result
+  - Support group mapping
+  - Maintenance window reference
+  - Escalation decision
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-alert-action
+    decision: block
+    requirement: Alert routing contracts produce routing plans only and never change Zabbix or ServiceNow actions.
+    evidence: Alert routing summary
+  - id: support-group-required
+    decision: block
+    requirement: Alert routing requires a known support group before escalation can proceed.
+    evidence: Support group mapping
+  - id: maintenance-window-respected
+    decision: block
+    requirement: Maintenance window state must be known before suppressing or escalating alerts.
+    evidence: Maintenance window reference
+  - id: escalation-policy-required
+    decision: block
+    requirement: Critical service escalation requires an assigned escalation policy.
+    evidence: Escalation decision

@@ -1,0 +1,116 @@
+version: 1
+status: draft
+source: static-seed
+activityOperationQueueMode: static-activity-operation-queue
+queueSummaryReadOnly: true
+childOperationSummaryReadOnly: true
+lockStateReadOnly: true
+retryStateReadOnly: true
+blockedReasonSummaryOnly: true
+liveQueueQueryAllowed: false
+operationMutationAllowed: false
+workflowMutationAllowed: false
+workerDispatchAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawOperationRowsAllowed: false
+rawChildOperationRowsAllowed: false
+rawLockRowsAllowed: false
+rawRetryRowsAllowed: false
+rawExecutionLogsAllowed: false
+rawProviderPayloadsAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+queueItemTypes:
+  - parent-operation
+  - child-operation
+  - lock
+  - retry
+  - blocked-reason
+  - handover-note
+  - evidence-reference
+queueStates:
+  - queued
+  - running
+  - blocked
+  - retrying
+  - waiting-approval
+  - completed
+  - failed
+  - canceled
+  - stale
+queueLenses:
+  - by-site
+  - by-workflow
+  - by-owner-domain
+  - by-priority
+  - by-risk
+  - by-staleness
+requiredGuards:
+  - operation-scope-known
+  - queue-state-known
+  - lock-state-known
+  - retry-policy-known
+  - blocked-reason-present
+  - stale-data-marked
+  - evidence-redacted
+  - live-query-blocked
+blockedReasons:
+  - activity-live-query-disabled
+  - activity-operation-mutation-disabled
+  - activity-workflow-mutation-disabled
+  - activity-worker-dispatch-disabled
+  - activity-provider-calls-disabled
+  - activity-notification-dispatch-disabled
+  - activity-raw-operation-rows-disabled
+  - activity-raw-child-operation-rows-disabled
+  - activity-raw-lock-rows-disabled
+  - activity-raw-retry-rows-disabled
+  - activity-raw-execution-logs-disabled
+  - activity-raw-provider-payloads-disabled
+  - activity-raw-user-data-disabled
+  - activity-raw-recipient-data-disabled
+  - activity-credential-values-disabled
+  - activity-token-values-disabled
+  - activity-tenant-identifiers-disabled
+  - activity-object-identifiers-disabled
+  - activity-principal-identifiers-disabled
+  - activity-private-network-values-disabled
+  - operation-scope-missing
+  - queue-state-unknown
+  - lock-state-unknown
+  - retry-policy-missing
+  - blocked-reason-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Activity queue summary
+  - Parent operation summary
+  - Child operation summary
+  - Lock state summary
+  - Retry state summary
+  - Blocked reason summary
+  - Handover notes
+  - Evidence references
+rules:
+  - id: activity-queue-read-only
+    decision: block
+    requirement: Activity queue summaries are read-only and must not run live queue queries, dispatch workers, call providers, or mutate operations.
+    evidence: Activity queue summary
+  - id: operation-state-not-mutated
+    decision: block
+    requirement: Parent operation, child operation, lock, retry, and workflow state must remain unchanged by the Activity queue view.
+    evidence: Parent operation summary
+  - id: blocked-reason-required
+    decision: block
+    requirement: Blocked and stale queue items require known operation scope, queue state, lock state, retry policy, blocked reason, and redacted evidence before handover.
+    evidence: Blocked reason summary
+  - id: raw-activity-queue-data-not-exposed
+    decision: block
+    requirement: Activity queue evidence must not expose raw operation rows, raw child operation rows, raw lock rows, raw retry rows, raw execution logs, raw provider payloads, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

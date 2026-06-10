@@ -1,0 +1,95 @@
+# Backup and DR assignment seed data only. Do not add VM names, repository names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw policy rows, replica identifiers, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+assignmentMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveAssignmentAllowed: false
+replicaCreationAllowed: false
+policyMutationAllowed: false
+rawPolicyRowsAllowed: false
+supportedWorkflows:
+  - backup-policy-assignment
+  - dr-replica-assignment
+  - tag-policy-mapping
+  - site-pairing-review
+  - exception-review
+  - evidence-pack-review
+assignmentSignals:
+  - missing-backup-policy
+  - missing-dr-replica
+  - tag-policy-mismatch
+  - site-pairing-mismatch
+  - retention-mismatch
+  - rpo-rto-mismatch
+  - stale-policy-evidence
+requiredInputs:
+  - platformCiKey
+  - application
+  - site
+  - environment
+  - criticality
+  - backupPolicy
+  - drPolicy
+  - tagSummary
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - policy-catalog-known
+  - site-pairing-known
+  - tags-reviewed
+  - owner-known
+  - backup-operator-review-assigned
+  - dr-impact-reviewed
+  - evidence-redacted
+planSections:
+  - assignmentSummary
+  - tagPolicyMapping
+  - backupPolicyDecision
+  - drReplicaDecision
+  - sitePairingImpact
+  - policyExceptions
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-assignment-disabled
+  - replica-creation-disabled
+  - policy-catalog-missing
+  - tag-policy-mapping-missing
+  - site-pairing-unknown
+  - owner-unknown
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Assignment summary
+  - Tag policy mapping
+  - Backup policy decision
+  - DR replica decision
+  - Site-pairing impact
+  - Policy exceptions
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-backup-or-dr-assignment
+    decision: block
+    requirement: Backup and DR assignment produces dry-run assignment decisions only, never mutating backup jobs, replica jobs, tags, repositories, or retention policy.
+    evidence: Assignment summary
+  - id: policy-catalog-required
+    decision: block
+    requirement: Assignment decisions require a known backup and DR policy catalog mapping.
+    evidence: Backup policy decision
+  - id: site-pairing-required
+    decision: block
+    requirement: DR assignment requires a known site-pairing decision before approval.
+    evidence: Site-pairing impact
+  - id: tag-policy-mapping-required
+    decision: block
+    requirement: Tag and policy mapping must be reviewed before assignment status is trusted.
+    evidence: Tag policy mapping
+  - id: raw-policy-rows-not-exposed
+    decision: block
+    requirement: Operators receive aggregate assignment summaries only, not raw policy rows, replica identifiers, or provider payloads.
+    evidence: Assignment summary

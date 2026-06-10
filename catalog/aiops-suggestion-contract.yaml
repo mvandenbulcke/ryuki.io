@@ -1,0 +1,102 @@
+# AIOps suggestion seed data only. Do not add ticket IDs, incident IDs, change IDs, usernames, email addresses, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, serial numbers, raw operation rows, raw health rows, raw logs, raw user data, raw recipient data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+suggestionMode: recommendation-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveCorrelationAllowed: false
+liveRemediationAllowed: false
+liveTicketMutationAllowed: false
+automationDispatchAllowed: false
+rawOperationRowsAllowed: false
+rawHealthRowsAllowed: false
+rawLogPayloadsAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+rawProviderPayloadsAllowed: false
+suggestionSources:
+  - operation-health-pattern
+  - platform-health-pattern
+  - incident-context-pattern
+  - shift-queue-pattern
+  - failed-run-pattern
+  - degradation-pattern
+  - evidence-gap-pattern
+suggestionSignals:
+  - repeat-failure
+  - blocked-workflow
+  - correlated-degradation
+  - rising-risk
+  - stale-data
+  - evidence-gap
+  - owner-unknown
+requiredInputs:
+  - signalSummary
+  - affectedWorkflow
+  - healthDomain
+  - impactBand
+  - owner
+  - supportGroup
+  - reviewer
+  - evidenceManifest
+requiredGuards:
+  - signal-summary-redacted
+  - correlation-static-only
+  - impact-band-known
+  - owner-route-known
+  - reviewer-assigned
+  - recommendation-redacted
+  - automation-disabled
+  - evidence-redacted
+planSections:
+  - signalSummary
+  - correlationSummary
+  - impactAssessment
+  - recommendationCandidate
+  - ownerRoute
+  - reviewRoute
+  - safeNextAction
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-correlation-disabled
+  - live-remediation-disabled
+  - live-ticket-mutation-disabled
+  - automation-dispatch-disabled
+  - raw-operation-rows-disabled
+  - raw-health-rows-disabled
+  - raw-log-payloads-disabled
+  - raw-user-data-disabled
+  - raw-recipient-data-disabled
+  - raw-provider-payloads-disabled
+  - signal-summary-missing
+  - reviewer-missing
+  - recommendation-not-redacted
+  - evidence-not-redacted
+requiredEvidence:
+  - AIOps signal summary
+  - Static correlation summary
+  - Impact assessment
+  - Recommendation candidate
+  - Owner route
+  - Review route
+  - Safe next action
+  - Evidence references
+rules:
+  - id: no-live-correlation
+    decision: block
+    requirement: AIOps suggestions use static, aggregate, or manually reviewed summaries only and never query live provider, ticket, monitoring, backup, inventory, or log systems.
+    evidence: Static correlation summary
+  - id: no-live-remediation
+    decision: block
+    requirement: AIOps suggestions recommend safe next actions only and never dispatch workers, mutate workflows, suppress alerts, restart services, remediate providers, or create tickets.
+    evidence: Safe next action
+  - id: reviewer-route-required
+    decision: block
+    requirement: Each suggestion requires a reviewer, owner route, support group, impact band, and redacted evidence before it can be exported or shown as actionable.
+    evidence: Review route
+  - id: raw-aiops-data-not-exposed
+    decision: block
+    requirement: AIOps suggestion evidence must use safe summaries only and must not expose raw operation rows, raw health rows, raw logs, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, tenant IDs, object IDs, private IPs, serial numbers, live endpoints, or provider payloads.
+    evidence: Evidence references

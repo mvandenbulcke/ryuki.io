@@ -1,0 +1,140 @@
+# Vault deployment readiness seed data only. Do not add Vault URLs, namespaces, mount paths, secret paths, policy names, role names, service account token data, TLS material, root tokens, recovery keys, unseal keys, audit log lines, storage class names, tenant IDs, object IDs, private IPs, credentials, tokens, raw Vault payloads, raw Kubernetes payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+vaultProvider: HashiCorp Vault
+deploymentTarget: Kubernetes Helm
+providerCallsEnabled: false
+vaultApiCallsAllowed: false
+helmInstallAllowed: false
+helmUpgradeAllowed: false
+kubectlApplyAllowed: false
+vaultInitAllowed: false
+vaultUnsealAllowed: false
+vaultPolicyMutationAllowed: false
+kubernetesAuthMutationAllowed: false
+secretWriteAllowed: false
+injectorMutationAllowed: false
+autoUnsealMutationAllowed: false
+auditLogReadAllowed: false
+rawVaultPayloadsAllowed: false
+rawKubernetesPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+secretValuesAllowed: false
+vaultIdentifiersAllowed: false
+readinessSurfaces:
+  - helm-chart-readiness
+  - ha-raft-topology-readiness
+  - tls-readiness
+  - persistent-storage-readiness
+  - audit-logging-readiness
+  - network-policy-readiness
+  - kubernetes-auth-readiness
+  - auto-unseal-overlay-readiness
+  - backup-restore-readiness
+  - workload-secret-delivery-readiness
+  - monitoring-readiness
+  - evidence-redaction-readiness
+requiredInputs:
+  - helmChartSummary
+  - valuesBaselineSummary
+  - haRaftTopologySummary
+  - tlsCertificateReferenceSummary
+  - storageClassSummary
+  - auditLoggingSummary
+  - networkPolicySummary
+  - kubernetesAuthSummary
+  - autoUnsealOverlaySummary
+  - backupRestoreSummary
+  - workloadSecretDeliverySummary
+  - monitoringSummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - helm-chart-reviewed
+  - ha-raft-reviewed
+  - tls-reviewed
+  - audit-storage-reviewed
+  - network-policy-reviewed
+  - kubernetes-auth-reviewed
+  - auto-unseal-overlay-reviewed
+  - backup-restore-reviewed
+  - workload-secret-delivery-reviewed
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - helmChartReview
+  - haRaftTopology
+  - tlsAndCertificateReview
+  - persistentStorageReview
+  - auditLoggingReview
+  - networkPolicyReview
+  - kubernetesAuthReview
+  - autoUnsealOverlayReview
+  - backupRestoreReview
+  - workloadSecretDeliveryReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - vault-api-calls-disabled
+  - helm-install-disabled
+  - helm-upgrade-disabled
+  - kubectl-apply-disabled
+  - vault-init-disabled
+  - vault-unseal-disabled
+  - vault-policy-mutation-disabled
+  - kubernetes-auth-mutation-disabled
+  - secret-write-disabled
+  - injector-mutation-disabled
+  - auto-unseal-mutation-disabled
+  - audit-log-read-disabled
+  - secret-values-disabled
+  - raw-vault-payloads-disabled
+  - raw-kubernetes-payloads-disabled
+  - raw-provider-payloads-disabled
+  - vault-identifiers-disabled
+  - helm-chart-review-missing
+  - ha-raft-review-missing
+  - tls-review-missing
+  - audit-storage-missing
+  - network-policy-missing
+  - kubernetes-auth-missing
+  - auto-unseal-overlay-missing
+  - backup-restore-missing
+  - workload-secret-delivery-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Vault deployment readiness summary
+  - Helm chart review
+  - HA Raft topology review
+  - TLS and certificate reference review
+  - Persistent storage review
+  - Audit logging review
+  - Network policy review
+  - Kubernetes auth review
+  - Auto-unseal overlay review
+  - Backup and restore review
+  - Workload secret delivery review
+  - Evidence references
+rules:
+  - id: no-live-vault-or-cluster-actions
+    decision: block
+    requirement: Vault deployment readiness reports static readiness only and never calls Vault APIs, installs or upgrades Helm releases, applies Kubernetes manifests, initializes or unseals Vault, mutates policies, mutates Kubernetes auth, writes secrets, changes injectors, changes auto-unseal, reads audit logs, or changes provider state.
+    evidence: Vault deployment readiness summary
+  - id: ha-raft-tls-audit-required
+    decision: block
+    requirement: Official Helm chart review, three-replica HA Raft topology, TLS posture, persistent storage, audit storage, PodDisruptionBudget, and anti-affinity posture must be reviewed before Vault deployment readiness can be accepted.
+    evidence: HA Raft topology review
+  - id: kubernetes-auth-and-workload-delivery-required
+    decision: block
+    requirement: Kubernetes auth, workload secret delivery, injector boundary, service account posture, and secret-reference behavior must be reviewed before workloads can depend on Vault.
+    evidence: Kubernetes auth review
+  - id: auto-unseal-backup-restore-required
+    decision: block
+    requirement: Production auto-unseal overlay, backup and restore runbooks, monitoring posture, and bootstrap evidence boundaries must be reviewed before production Vault readiness can be accepted.
+    evidence: Backup and restore review
+  - id: raw-vault-data-not-exposed
+    decision: block
+    requirement: Vault deployment readiness evidence must use safe summaries only and must not expose Vault URLs, namespaces, mount paths, secret paths, policy names, role names, service account token data, TLS material, root tokens, recovery keys, unseal keys, audit log lines, storage class names, tenant IDs, object IDs, private IPs, credentials, tokens, raw Vault payloads, raw Kubernetes payloads, or provider payloads.
+    evidence: Evidence references

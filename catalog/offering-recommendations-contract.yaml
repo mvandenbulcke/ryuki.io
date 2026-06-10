@@ -1,0 +1,111 @@
+version: 1
+status: draft
+source: static-seed
+recommendationMode: static-offering-recommendations
+recommendationsReadOnly: true
+roleDefaultsReadOnly: true
+siteDefaultsReadOnly: true
+evidenceReferencesReadOnly: true
+livePersonalizationAllowed: false
+liveCatalogQueryAllowed: false
+liveRequestCreationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+identityLookupAllowed: false
+rawUserDataAllowed: false
+rawApplicationDataAllowed: false
+rawSiteDataAllowed: false
+rawRequestPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+recommendedOfferingIds:
+  - windows-server-deployment
+  - request-preflight
+  - patch-wave-planning
+  - controlled-restore-request
+  - zabbix-onboarding
+  - cmdb-import
+  - operator-runbook-launch
+  - platform-health-dashboard
+recommendationDimensions:
+  - role
+  - application-profile
+  - site
+  - lifecycle-category
+  - risk-context
+  - freshness-state
+recommendationSignals:
+  - role-fit
+  - site-readiness
+  - service-lifecycle-fit
+  - dry-run-required
+  - approval-route-known
+  - evidence-profile-known
+recommendationViews:
+  - role-defaults
+  - application-profile-defaults
+  - site-defaults
+  - lifecycle-category-defaults
+  - safe-next-offerings
+requiredGuards:
+  - catalog-source-reviewed
+  - role-scope-summarized
+  - application-profile-summarized
+  - site-scope-summarized
+  - approval-route-known
+  - dry-run-required
+  - evidence-redacted
+  - live-personalization-blocked
+blockedReasons:
+  - catalog-recommendation-live-personalization-disabled
+  - catalog-live-query-disabled
+  - request-creation-disabled
+  - workflow-mutation-disabled
+  - provider-calls-disabled
+  - identity-lookup-disabled
+  - raw-user-data-disabled
+  - raw-application-data-disabled
+  - raw-site-data-disabled
+  - raw-request-payloads-disabled
+  - raw-provider-payloads-disabled
+  - raw-recipient-data-disabled
+  - credential-values-disabled
+  - token-values-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - principal-identifiers-disabled
+  - private-network-values-disabled
+  - role-scope-missing
+  - application-profile-missing
+  - site-scope-missing
+  - recommendation-signal-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Recommendation summary
+  - Role fit summary
+  - Application profile summary
+  - Site fit summary
+  - Evidence references
+rules:
+  - id: recommendations-read-only
+    decision: block
+    requirement: Offering recommendations are static summaries and must not perform live personalization, query live catalogs, create requests, call providers, or mutate workflows.
+    evidence: Recommendation summary
+  - id: catalog-source-alignment-required
+    decision: block
+    requirement: Recommended offering IDs must stay aligned to the static offering catalog and preserve dry-run, approval, and evidence expectations.
+    evidence: Recommendation summary
+  - id: role-app-site-summary-required
+    decision: block
+    requirement: Role, application profile, site, lifecycle category, risk context, freshness state, approval route, and evidence profile must be safe summaries before recommendations are shown.
+    evidence: Role fit summary
+  - id: raw-recommendation-data-not-exposed
+    decision: block
+    requirement: Offering recommendation evidence must not expose raw user data, raw application data, raw site data, raw request payloads, raw provider payloads, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

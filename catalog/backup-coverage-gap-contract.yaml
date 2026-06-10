@@ -1,0 +1,105 @@
+# Backup coverage gap seed data only. Do not add VM names, application names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, backup job names, repository names, restore point IDs, raw inventory rows, raw backup rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+reportMode: aggregate-gap-report
+providerCallsEnabled: false
+liveRemediationAllowed: false
+liveBackupChangesAllowed: false
+rawInventoryRowsAllowed: false
+rawBackupRowsAllowed: false
+rawProviderPayloadsAllowed: false
+supportedScopes:
+  - vm
+  - application
+  - policy
+  - site
+  - environment
+gapSignals:
+  - missing-backup-policy
+  - missing-restore-point-evidence
+  - missing-replica
+  - retention-mismatch
+  - criticality-policy-mismatch
+  - stale-backup-inventory
+  - owner-unknown
+  - cmdb-criticality-unknown
+requiredInputs:
+  - assetScope
+  - site
+  - environment
+  - criticality
+  - owner
+  - supportGroup
+  - backupPolicy
+  - retentionPolicy
+  - replicaRequirement
+  - evidenceManifest
+requiredGuards:
+  - inventory-coverage-current
+  - backup-policy-known
+  - retention-policy-known
+  - replica-requirement-reviewed
+  - criticality-known
+  - owner-known
+  - support-group-known
+  - stale-data-marked
+  - evidence-redacted
+planSections:
+  - coverageSummary
+  - gapClassification
+  - policyComparison
+  - retentionReview
+  - replicaReview
+  - ownerRouting
+  - remediationDraft
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - live-backup-changes-disabled
+  - raw-inventory-rows-disabled
+  - raw-backup-rows-disabled
+  - raw-provider-payloads-disabled
+  - asset-scope-unknown
+  - backup-policy-missing
+  - retention-policy-missing
+  - replica-requirement-unknown
+  - stale-backup-inventory
+  - owner-unknown
+  - support-group-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Backup coverage summary
+  - Gap classification
+  - Policy comparison
+  - Retention review
+  - Replica review
+  - Owner routing
+  - Remediation draft
+  - Evidence references
+rules:
+  - id: no-live-backup-remediation
+    decision: block
+    requirement: Backup coverage gap reporting must not mutate backup jobs, repositories, policies, replicas, or provider state.
+    evidence: Remediation draft
+  - id: aggregate-gap-report-only
+    decision: block
+    requirement: Operators receive aggregate gap summaries only, never raw inventory rows, backup rows, restore point identifiers, job names, repository names, or provider payloads.
+    evidence: Backup coverage summary
+  - id: policy-retention-required
+    decision: block
+    requirement: Backup policy and retention policy must be known before coverage status can be trusted.
+    evidence: Policy comparison
+  - id: replica-criticality-reviewed
+    decision: block
+    requirement: Replica requirement must be reviewed against workload criticality before a gap can be closed.
+    evidence: Replica review
+  - id: stale-backup-inventory-blocks
+    decision: block
+    requirement: Stale backup inventory blocks coverage decisions until refreshed or routed to review.
+    evidence: Backup coverage summary
+  - id: owner-routing-required
+    decision: block
+    requirement: Unknown owners or support groups must route to review before remediation can be proposed.
+    evidence: Owner routing

@@ -1,0 +1,92 @@
+# Zabbix drift remediation seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw event payloads, raw host rows, alert details, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+remediationMode: dry-run-request
+dryRunRequired: true
+providerCallsEnabled: false
+liveRemediationAllowed: false
+zabbixMutationAllowed: false
+rawEventPayloadsAllowed: false
+supportedWorkflows:
+  - host-group-drift-review
+  - template-drift-review
+  - proxy-drift-review
+  - maintenance-window-drift-review
+  - remediation-request-draft
+  - evidence-pack-review
+driftSignals:
+  - host-group-mismatch
+  - template-mismatch
+  - proxy-mismatch
+  - maintenance-window-mismatch
+  - owner-mismatch
+  - stale-monitoring-data
+  - policy-exception
+requiredInputs:
+  - platformCiKey
+  - hostSummary
+  - site
+  - environment
+  - monitoringProfile
+  - owner
+  - supportGroup
+  - maintenanceWindow
+  - evidenceManifest
+requiredGuards:
+  - monitoring-profile-known
+  - host-identity-known
+  - zabbix-mapping-reviewed
+  - owner-known
+  - remediation-request-dry-run
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - driftSummary
+  - expectedMapping
+  - observedMapping
+  - remediationRequest
+  - maintenanceImpact
+  - ownerReview
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - zabbix-mutation-disabled
+  - host-identity-unknown
+  - monitoring-profile-missing
+  - mapping-ambiguous
+  - owner-unknown
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Drift summary
+  - Expected mapping
+  - Observed mapping summary
+  - Remediation request draft
+  - Maintenance impact
+  - Owner review
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-zabbix-remediation
+    decision: block
+    requirement: Zabbix drift remediation produces review and request drafts only, never mutating host groups, templates, proxies, maintenance windows, actions, or alerts.
+    evidence: Remediation request draft
+  - id: monitoring-profile-required
+    decision: block
+    requirement: Expected monitoring profile must be known before drift decisions are trusted.
+    evidence: Expected mapping
+  - id: host-identity-required
+    decision: block
+    requirement: Host identity must be deterministic and aggregate-safe before drift remediation can be drafted.
+    evidence: Drift summary
+  - id: remediation-request-must-be-dry-run
+    decision: block
+    requirement: Remediation requests remain dry-run drafts until approval and live integration gates are implemented.
+    evidence: Remediation request draft
+  - id: raw-event-payloads-not-exposed
+    decision: block
+    requirement: Operators receive drift summaries only, not raw event payloads, raw host rows, alert details, or provider output.
+    evidence: Observed mapping summary

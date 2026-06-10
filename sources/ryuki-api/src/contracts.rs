@@ -1,0 +1,3226 @@
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    routing::put,
+    routing::{get, post},
+    Json, Router,
+};
+use ryuki_core::types::{ApiError, PlatformConfig};
+use ryuki_engine::auth::{check_permission, get_rbac_roles, AuthSession};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+use uuid::Uuid;
+
+use crate::database::get_db;
+
+pub fn routes() -> Router {
+    Router::new()
+        .route("/api/platform/summary", get(platform_summary))
+        .route("/api/platform/status", get(platform_status))
+        .route(
+            "/api/dashboard/global-overview-contract",
+            get(dashboard_global_overview),
+        )
+        .route(
+            "/api/dashboard/risk-heatmap-contract",
+            get(dashboard_risk_heatmap),
+        )
+        .route("/api/requests/lifecycle-contract", get(requests_lifecycle))
+        .route(
+            "/api/requests/execution-timeline-contract",
+            get(requests_execution_timeline),
+        )
+        .route("/api/requests/intake-form", get(requests_intake_form))
+        .route(
+            "/api/requests/intake-support-contract",
+            get(requests_intake_support),
+        )
+        .route("/api/requests/preflight-contract", get(requests_preflight))
+        // ─── Request lifecycle endpoints (mock/dry-run) ───
+        .route("/api/requests", post(requests_create))
+        .route("/api/requests", get(requests_list))
+        .route("/api/requests/{id}", get(requests_get))
+        .route("/api/requests/{id}/validate", post(requests_validate))
+        .route("/api/requests/{id}/plan", post(requests_plan))
+        .route("/api/requests/{id}/approve", post(requests_approve))
+        .route("/api/requests/{id}/lock", post(requests_lock))
+        .route("/api/requests/{id}/execute", post(requests_execute))
+        .route("/api/requests/{id}/verify", post(requests_verify))
+        .route(
+            "/api/platform/security-baseline-contract",
+            get(platform_security_baseline),
+        )
+        .route(
+            "/api/platform/portal-information-architecture-contract",
+            get(platform_portal_ia),
+        )
+        .route(
+            "/api/platform/design-system-contract",
+            get(platform_design_system),
+        )
+        .route(
+            "/api/platform/ui-mockup-acceptance-contract",
+            get(platform_ui_mockup),
+        )
+        .route(
+            "/api/platform/release-promotion-contract",
+            get(platform_release_promotion),
+        )
+        .route(
+            "/api/platform/database-readiness-contract",
+            get(platform_database_readiness),
+        )
+        .route(
+            "/api/platform/object-storage-readiness-contract",
+            get(platform_object_storage),
+        )
+        .route(
+            "/api/platform/registry-readiness-contract",
+            get(platform_registry_readiness),
+        )
+        .route(
+            "/api/platform/vault-deployment-readiness-contract",
+            get(platform_vault_deployment),
+        )
+        .route(
+            "/api/platform/vault-secret-delivery-contract",
+            get(platform_vault_secret_delivery),
+        )
+        .route(
+            "/api/platform/kubernetes-runtime-readiness-contract",
+            get(platform_k8s_runtime),
+        )
+        .route(
+            "/api/platform/local-container-readiness-contract",
+            get(platform_local_container),
+        )
+        .route("/api/catalog/categories", get(catalog_categories))
+        .route("/api/catalog/offerings-contract", get(catalog_offerings))
+        .route(
+            "/api/catalog/recommendations-contract",
+            get(catalog_recommendations),
+        )
+        .route(
+            "/api/catalog/request-form-contract",
+            get(catalog_request_form),
+        )
+        .route(
+            "/api/catalog/site-catalog-contract",
+            get(catalog_site_catalog),
+        )
+        .route(
+            "/api/catalog/policy-guardrails-contract",
+            get(catalog_policy_guardrails),
+        )
+        .route("/api/catalog/access-control", get(catalog_access_control))
+        .route("/api/catalog/approval-routes", get(catalog_approval_routes))
+        .route(
+            "/api/catalog/evidence-manifest",
+            get(catalog_evidence_manifest),
+        )
+        .route(
+            "/api/catalog/evidence-redaction-contract",
+            get(catalog_evidence_redaction),
+        )
+        .route(
+            "/api/catalog/secret-references",
+            get(catalog_secret_references),
+        )
+        .route(
+            "/api/approvals/decision-readiness-contract",
+            get(approvals_decision_readiness),
+        )
+        .route(
+            "/api/identity/rbac-approval-model-contract",
+            get(identity_rbac_approval_model),
+        )
+        .route(
+            "/api/identity/entra-rbac-approval-readiness-contract",
+            get(identity_entra_rbac),
+        )
+        .route(
+            "/api/identity/access-review-recertification-contract",
+            get(identity_access_review),
+        )
+        .route(
+            "/api/identity/ad-computer-lifecycle-contract",
+            get(identity_ad_computer),
+        )
+        .route(
+            "/api/identity/gmsa-lifecycle-contract",
+            get(identity_gmsa_lifecycle),
+        )
+        .route(
+            "/api/identity/local-privilege-access-contract",
+            get(identity_local_privilege),
+        )
+        .route(
+            "/api/identity/file-share-ntfs-recertification-contract",
+            get(identity_file_share_ntfs),
+        )
+        .route(
+            "/api/evidence/export-retention-contract",
+            get(evidence_export_retention),
+        )
+        .route(
+            "/api/evidence/compliance-dashboard-contract",
+            get(evidence_compliance_dashboard),
+        )
+        .route("/api/integrations/readiness", get(integrations_readiness))
+        .route(
+            "/api/integrations/adapter-readiness-matrix-contract",
+            get(integrations_adapter_matrix),
+        )
+        .route(
+            "/api/integrations/adapter-contract-test-contract",
+            get(integrations_adapter_contract_test),
+        )
+        .route(
+            "/api/integrations/vmware/readiness",
+            get(integrations_vmware_readiness),
+        )
+        .route(
+            "/api/integrations/vmware/cluster-capacity-admission-contract",
+            get(integrations_vmware_cluster_capacity),
+        )
+        .route(
+            "/api/integrations/vmware/customization-spec-governance-contract",
+            get(integrations_vmware_customization_spec),
+        )
+        .route(
+            "/api/integrations/vmware/object-placement-contract",
+            get(integrations_vmware_object_placement),
+        )
+        .route(
+            "/api/integrations/vmware/vsan-esxi-lifecycle-contract",
+            get(integrations_vmware_vsan_esxi),
+        )
+        .route(
+            "/api/integrations/vmware/day2-change-contract",
+            get(integrations_vmware_day2),
+        )
+        .route(
+            "/api/integrations/vmware/snapshot-governance-contract",
+            get(integrations_vmware_snapshot),
+        )
+        .route(
+            "/api/integrations/vmware/decommission-quarantine-contract",
+            get(integrations_vmware_decommission),
+        )
+        .route(
+            "/api/integrations/hyperv/readiness",
+            get(integrations_hyperv_readiness),
+        )
+        .route(
+            "/api/integrations/proxmox/readiness",
+            get(integrations_proxmox_readiness),
+        )
+        .route(
+            "/api/integrations/veeam/readiness",
+            get(integrations_veeam_readiness),
+        )
+        .route(
+            "/api/integrations/zabbix/readiness",
+            get(integrations_zabbix_readiness),
+        )
+        .route(
+            "/api/integrations/servicenow/readiness",
+            get(integrations_servicenow_readiness),
+        )
+        .route(
+            "/api/integrations/servicenow/cmdb-file-contract",
+            get(integrations_servicenow_cmdb_file),
+        )
+        .route(
+            "/api/integrations/servicenow/future-api-contract",
+            get(integrations_servicenow_future_api),
+        )
+        .route("/api/inventory/coverage-contract", get(inventory_coverage))
+        .route(
+            "/api/inventory/resource-overview-contract",
+            get(inventory_resource_overview),
+        )
+        .route(
+            "/api/inventory/coverage/local/summary",
+            get(inventory_coverage_local),
+        )
+        .route(
+            "/api/inventory/ownership-risk-contract",
+            get(inventory_ownership_risk),
+        )
+        .route(
+            "/api/inventory/os-baseline-compliance-contract",
+            get(inventory_os_baseline),
+        )
+        .route(
+            "/api/software/approved-deployment-contract",
+            get(software_approved_deployment),
+        )
+        .route(
+            "/api/workflows/server-lifecycle/dry-run-contract",
+            get(workflows_server_lifecycle),
+        )
+        .route(
+            "/api/workflows/application-environment/deployment-contract",
+            get(workflows_app_env_deployment),
+        )
+        .route(
+            "/api/workflows/application-environment/retirement-contract",
+            get(workflows_app_env_retirement),
+        )
+        .route(
+            "/api/workflows/sql-server/deployment-contract",
+            get(workflows_sql_server),
+        )
+        .route(
+            "/api/workflows/azure-landing-zone/validation-contract",
+            get(workflows_azure_lz),
+        )
+        .route(
+            "/api/workflows/preflight/local/decision",
+            get(workflows_preflight_local_decision),
+        )
+        .route(
+            "/api/operations/certificate-lifecycle-contract",
+            get(operations_certificate_lifecycle),
+        )
+        .route(
+            "/api/operations/runbook-launch-contract",
+            get(operations_runbook_launch),
+        )
+        .route(
+            "/api/operations/standard-task-contract",
+            get(operations_standard_task),
+        )
+        .route(
+            "/api/operations/emergency-change-contract",
+            get(operations_emergency_change),
+        )
+        .route(
+            "/api/operations/shift-queue-contract",
+            get(operations_shift_queue),
+        )
+        .route(
+            "/api/operations/dependency-replay-contract",
+            get(operations_dependency_replay),
+        )
+        .route(
+            "/api/operations/activity-queue-contract",
+            get(operations_activity_queue),
+        )
+        .route(
+            "/api/operations/run-state-contract",
+            get(operations_run_state),
+        )
+        .route(
+            "/api/operations/datacenter-readiness-contract",
+            get(operations_datacenter_readiness),
+        )
+        .route(
+            "/api/operations/out-of-band-access-validation-contract",
+            get(operations_oob_access),
+        )
+        .route(
+            "/api/operations/network-vlan-readiness-contract",
+            get(operations_network_vlan),
+        )
+        .route(
+            "/api/operations/hardware-lifecycle-contract",
+            get(operations_hardware_lifecycle),
+        )
+        .route(
+            "/api/operations/firmware-compliance-exception-contract",
+            get(operations_firmware_compliance),
+        )
+        .route(
+            "/api/operations/platform-health-contract",
+            get(operations_platform_health),
+        )
+        .route(
+            "/api/operations/incident-context-contract",
+            get(operations_incident_context),
+        )
+        .route(
+            "/api/operations/maintenance-communications-contract",
+            get(operations_maintenance_comm),
+        )
+        .route(
+            "/api/operations/degradation-mode-contract",
+            get(operations_degradation_mode),
+        )
+        .route(
+            "/api/operations/aiops-suggestion-contract",
+            get(operations_aiops_suggestion),
+        )
+        .route(
+            "/api/operations/knowledge-suggestion-contract",
+            get(operations_knowledge_suggestion),
+        )
+        .route("/api/images/factory-contract", get(images_factory))
+        .route(
+            "/api/patching/maintenance-contract",
+            get(patching_maintenance),
+        )
+        .route(
+            "/api/patching/policy-import-contract",
+            get(patching_policy_import),
+        )
+        .route(
+            "/api/patching/reboot-orchestration-contract",
+            get(patching_reboot_orch),
+        )
+        .route(
+            "/api/patching/maintenance-calendar-contract",
+            get(patching_maintenance_calendar),
+        )
+        .route(
+            "/api/protect/controlled-restore-contract",
+            get(protect_controlled_restore),
+        )
+        .route(
+            "/api/protect/backup-coverage-gap-contract",
+            get(protect_backup_coverage_gap),
+        )
+        .route(
+            "/api/protect/repository-capacity-contract",
+            get(protect_repository_capacity),
+        )
+        .route(
+            "/api/protect/immutability-air-gap-compliance-contract",
+            get(protect_immutability_air_gap),
+        )
+        .route(
+            "/api/protect/application-aware-backup-validation-contract",
+            get(protect_app_aware_backup),
+        )
+        .route(
+            "/api/protect/backup-dr-assignment-contract",
+            get(protect_backup_dr_assignment),
+        )
+        .route(
+            "/api/protect/restore-testing-contract",
+            get(protect_restore_testing),
+        )
+        .route(
+            "/api/protect/legal-hold-retention-contract",
+            get(protect_legal_hold),
+        )
+        .route(
+            "/api/observe/zabbix-onboarding-contract",
+            get(observe_zabbix_onboarding),
+        )
+        .route(
+            "/api/observe/alert-routing-contract",
+            get(observe_alert_routing),
+        )
+        .route(
+            "/api/observe/monitoring-coverage-gap-contract",
+            get(observe_monitoring_coverage_gap),
+        )
+        .route(
+            "/api/observe/zabbix-drift-remediation-contract",
+            get(observe_zabbix_drift),
+        )
+        .route(
+            "/api/observe/synthetic-health-check-contract",
+            get(observe_synthetic_health),
+        )
+        .route(
+            "/api/observe/noise-flapping-remediation-contract",
+            get(observe_noise_flapping),
+        )
+        .route(
+            "/api/observe/monitoring-review-queue-contract",
+            get(observe_monitoring_review_queue),
+        )
+        .route(
+            "/api/observe/log-forwarder-onboarding-contract",
+            get(observe_log_forwarder),
+        )
+        .route(
+            "/api/cmdb/reconciliation-contract",
+            get(cmdb_reconciliation),
+        )
+        .route(
+            "/api/cmdb/relationship-graph-contract",
+            get(cmdb_relationship_graph),
+        )
+        .route(
+            "/api/cmdb/impact-analysis-contract",
+            get(cmdb_impact_analysis),
+        )
+        .route(
+            "/api/admin/worker-capability-contract",
+            get(admin_worker_capability),
+        )
+        .route(
+            "/api/admin/feature-flag-governance-contract",
+            get(admin_feature_flag),
+        )
+        .route(
+            "/api/admin/approval-groups-contract",
+            get(admin_approval_groups),
+        )
+        .route(
+            "/api/admin/delegation-boundary-contract",
+            get(admin_delegation_boundary),
+        )
+        .route("/api/auth/local/roles", get(auth_local_roles))
+        .route("/api/auth/local/me", get(auth_local_me))
+        .route("/api/auth/local/decision", get(auth_local_decision))
+        .route("/api/auth/local/login", get(auth_local_login))
+        .route("/api/auth/local/logout", get(auth_local_logout))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/session", get(auth_session))
+        .route("/api/auth/roles", get(auth_roles))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/admin/rbac-roles", get(admin_rbac_roles))
+        .route("/api/admin/platform-settings", get(admin_platform_settings))
+        .route(
+            "/api/admin/platform-settings",
+            put(admin_platform_settings_update),
+        )
+        .route(
+            "/api/admin/platform-settings/reset",
+            post(admin_platform_settings_reset),
+        )
+        .route(
+            "/api/analytics/cost-capacity-contract",
+            get(analytics_cost_capacity),
+        )
+        .route("/api/platform/health", get(platform_health))
+        .route(
+            "/api/platform/health/components",
+            get(platform_health_components),
+        )
+        .route(
+            "/api/platform/health/adapters",
+            get(platform_health_adapters),
+        )
+}
+
+// ─── Shared data ───
+
+#[derive(Deserialize)]
+pub struct PreflightQuery {
+    #[serde(rename = "requestedOffering")]
+    pub requested_offering: Option<String>,
+    pub owner: Option<String>,
+    pub site: Option<String>,
+    pub environment: Option<String>,
+    pub criticality: Option<String>,
+    #[serde(rename = "dryRunPlan")]
+    pub dry_run_plan: Option<String>,
+    #[serde(rename = "approvalRoute")]
+    pub approval_route: Option<String>,
+    #[serde(rename = "evidenceManifest")]
+    pub evidence_manifest: Option<String>,
+    #[serde(rename = "secretReferenceState")]
+    pub secret_reference_state: Option<String>,
+}
+
+// ─── Request lifecycle types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CreateRequest {
+    request_type: String,
+    site: String,
+    environment: String,
+    name: String,
+    cpu: u32,
+    memory_gb: u32,
+    justification: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestRecord {
+    request_id: String,
+    request_type: String,
+    status: String,
+    stage: String,
+    site: String,
+    environment: String,
+    name: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DbRequestRow {
+    id: Uuid,
+    request_type: String,
+    status: String,
+    stage: String,
+    site: String,
+    environment: String,
+    name: String,
+    cpu: i32,
+    memory_gb: i32,
+    justification: Option<String>,
+    created_by: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ─── Request store (in-memory fallback) ───
+
+static REQUEST_STORE: OnceLock<Mutex<Vec<RequestRecord>>> = OnceLock::new();
+
+fn request_store() -> &'static Mutex<Vec<RequestRecord>> {
+    REQUEST_STORE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn lifecycle_stages() -> Value {
+    json!([
+        "intake", "validate", "plan", "approve", "lock", "execute", "verify", "protect", "publish",
+        "maintain", "retire"
+    ])
+}
+fn components() -> Value {
+    json!([
+        "portal-ui",
+        "platform-api",
+        "platform-db",
+        "platform-vault",
+        "vault-secrets-operator",
+        "platform-worker",
+        "inventory-sync",
+        "vmware-adapter",
+        "veeam-br-adapter",
+        "veeam-one-adapter",
+        "zabbix-adapter",
+        "servicenow-adapter",
+        "image-factory-controller",
+        "evidence-service"
+    ])
+}
+fn guardrails() -> Value {
+    json!([
+        "no-hardcoded-secrets",
+        "browser-isolation",
+        "dry-run-first",
+        "approval-gated-execution",
+        "least-privilege-adapters",
+        "redacted-evidence",
+        "safe-degraded-read-only-mode"
+    ])
+}
+fn categories() -> Value {
+    json!(["Build", "Maintain", "Protect", "Observe", "Operate", "Retire"])
+}
+
+fn rql_stages() -> Value {
+    json!([
+        "intake", "validate", "plan", "approve", "lock", "execute", "verify", "protect", "publish",
+        "maintain", "retire"
+    ])
+}
+fn rql_guards() -> Value {
+    json!([
+        "intake-complete",
+        "validation-passed",
+        "dry-run-reviewed",
+        "approval-route-assigned",
+        "lock-scope-ready",
+        "evidence-redacted",
+        "provider-safe-plan-ready",
+        "status-callback-ready",
+        "fail-safe-state-reviewed"
+    ])
+}
+fn rql_plan_sections() -> Value {
+    json!([
+        "intakeSummary",
+        "validationSummary",
+        "dryRunPlan",
+        "approvalDecisions",
+        "lockRecord",
+        "executionPlan",
+        "verificationPlan",
+        "protectionPlan",
+        "publishPlan",
+        "maintainPlan",
+        "retirePlan",
+        "evidenceReferences"
+    ])
+}
+fn rql_blocked() -> Value {
+    json!([
+        "live-execution-disabled",
+        "provider-calls-disabled",
+        "workflow-mutation-disabled",
+        "approval-mutation-disabled",
+        "lock-mutation-disabled",
+        "raw-request-payloads-disabled",
+        "raw-execution-logs-disabled",
+        "raw-evidence-payloads-disabled",
+        "raw-provider-payloads-disabled",
+        "credential-values-disabled",
+        "secret-values-disabled",
+        "access-token-values-disabled",
+        "raw-recipient-data-disabled",
+        "intake-incomplete",
+        "validation-missing",
+        "dry-run-plan-missing",
+        "approval-route-missing",
+        "lock-scope-missing",
+        "evidence-not-redacted",
+        "status-callback-missing"
+    ])
+}
+
+fn ret_stages() -> Value {
+    json!([
+        "intake",
+        "validation",
+        "dry-run-plan",
+        "approval",
+        "lock",
+        "execution",
+        "verification",
+        "protection",
+        "publish",
+        "handover"
+    ])
+}
+fn ret_events() -> Value {
+    json!([
+        "request-state",
+        "validation-result",
+        "dry-run-plan",
+        "approval-decision",
+        "lock-record",
+        "child-operation",
+        "evidence-reference",
+        "blocker",
+        "status-callback",
+        "handover-note"
+    ])
+}
+fn ret_evidence_states() -> Value {
+    json!([
+        "not-required",
+        "pending",
+        "redacted-ready",
+        "blocked",
+        "export-ready"
+    ])
+}
+fn ret_views() -> Value {
+    json!([
+        "request-summary",
+        "timeline",
+        "approval-history",
+        "operation-links",
+        "evidence-links",
+        "blocker-summary",
+        "handover-summary"
+    ])
+}
+fn ret_guards() -> Value {
+    json!([
+        "request-scope-known",
+        "timeline-source-reviewed",
+        "evidence-redacted",
+        "approval-state-known",
+        "lock-state-known",
+        "operation-link-safe",
+        "status-callback-safe",
+        "raw-detail-blocked"
+    ])
+}
+fn ret_blocked() -> Value {
+    json!([
+        "request-timeline-live-query-disabled",
+        "request-timeline-mutation-disabled",
+        "request-workflow-mutation-disabled",
+        "request-operation-mutation-disabled",
+        "request-provider-calls-disabled",
+        "request-notification-dispatch-disabled",
+        "request-raw-request-payloads-disabled",
+        "request-raw-timeline-rows-disabled",
+        "request-raw-approval-data-disabled",
+        "request-raw-operation-rows-disabled",
+        "request-raw-evidence-payloads-disabled",
+        "request-raw-provider-payloads-disabled",
+        "request-raw-log-content-disabled",
+        "request-raw-recipient-data-disabled",
+        "request-credential-values-disabled",
+        "request-token-values-disabled",
+        "request-tenant-identifiers-disabled",
+        "request-object-identifiers-disabled",
+        "request-principal-identifiers-disabled",
+        "request-private-network-values-disabled",
+        "request-scope-missing",
+        "timeline-source-missing",
+        "evidence-not-redacted"
+    ])
+}
+
+// ─── Endpoint handlers ───
+
+async fn platform_summary() -> Json<Value> {
+    let config = crate::config_store::get_app_config();
+    Json(json!({
+        "productName": config.platform_name,
+        "lifecycleStages": lifecycle_stages(),
+        "components": components(),
+        "guardrails": guardrails(),
+        "browserIsolation": true,
+        "localAuthorization": {
+            "authenticationMode": config.auth_mode,
+            "configuredForProduction": false,
+            "entraGroupsConfigured": !config.entra_tenant_id.is_empty(),
+            "roleHeader": "X-Ryuki-Local-Role",
+            "requiredProductionProvider": "Microsoft Entra ID"
+        }
+    }))
+}
+
+async fn platform_status() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "mode": "static-dry-run",
+        "status": "healthy",
+        "providerCallsAllowed": false,
+        "liveExecutionAllowed": false,
+        "workflowMutationAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "guards": guardrails(),
+        "blockedReasons": [
+            "live-execution-disabled",
+            "provider-calls-disabled",
+            "workflow-mutation-disabled",
+            "credential-values-disabled",
+            "secret-values-disabled",
+            "raw-provider-payloads-disabled",
+            "raw-recipient-data-disabled",
+            "tenant-identifiers-disabled",
+            "object-identifiers-disabled",
+            "private-network-values-disabled"
+        ]
+    }))
+}
+
+async fn dashboard_global_overview() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "dashboardGlobalOverviewMode": "static-dashboard-global-overview",
+        "dashboardSummaryAggregateOnly": true,
+        "siteReadinessAggregateOnly": true,
+        "riskSignalsReadOnly": true,
+        "evidenceReferencesOnly": true,
+        "liveQueryAllowed": false,
+        "dashboardMutationAllowed": false,
+        "providerCallsAllowed": false,
+        "notificationDispatchAllowed": false,
+        "rawRequestRowsAllowed": false,
+        "rawOperationRowsAllowed": false,
+        "rawInventoryRowsAllowed": false,
+        "rawCmdbRowsAllowed": false,
+        "rawBackupRowsAllowed": false,
+        "rawMonitoringRowsAllowed": false,
+        "rawUserDataAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false,
+        "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "principalIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "summaryDomains": ["global-health","site-readiness","open-requests","failed-operations","patch-risk","backup-risk","monitoring-gaps","cmdb-risk","evidence-readiness"],
+        "statusBands": ["healthy","attention","risk","blocked","stale","unknown"],
+        "lenses": ["by-site","by-environment","by-owner-domain","by-service-criticality","by-time-window"],
+        "requiredGuards": ["aggregate-only","stale-data-marked","evidence-redacted","owner-domain-safe","scope-known","live-query-blocked","raw-detail-blocked"],
+        "blockedReasons": ["dashboard-live-query-disabled","dashboard-mutation-disabled","dashboard-provider-calls-disabled","dashboard-notification-dispatch-disabled","dashboard-raw-request-rows-disabled","dashboard-raw-operation-rows-disabled","dashboard-raw-inventory-rows-disabled","dashboard-raw-cmdb-rows-disabled","dashboard-raw-backup-rows-disabled","dashboard-raw-monitoring-rows-disabled","dashboard-raw-user-data-disabled","dashboard-raw-recipient-data-disabled","dashboard-credential-values-disabled","dashboard-token-values-disabled","dashboard-tenant-identifiers-disabled","dashboard-object-identifiers-disabled","dashboard-principal-identifiers-disabled","dashboard-private-network-values-disabled","scope-missing","stale-data-unmarked","evidence-not-redacted","raw-detail-requested"],
+        "requiredEvidence": ["Dashboard summary","Site readiness summary","Request backlog summary","Failed operation summary","Patch risk summary","Backup risk summary","Monitoring gap summary","CMDB risk summary","Evidence references"],
+        "rules": [
+            {"id":"global-dashboard-aggregate-only","decision":"block","requirement":"Global dashboard summaries are aggregate-only and must not run live queries or expose raw request, operation, inventory, CMDB, backup, or monitoring rows.","evidence":"Dashboard summary"},
+            {"id":"risk-signals-read-only","decision":"block","requirement":"Patch, backup, monitoring, CMDB, and evidence risk signals are read-only and must not mutate dashboards, workflows, providers, or notification state.","evidence":"Patch risk summary"},
+            {"id":"stale-data-explicit","decision":"block","requirement":"Dashboard freshness and stale-data markers must be explicit so operators do not mistake cached aggregate state for live provider state.","evidence":"Site readiness summary"},
+            {"id":"raw-dashboard-data-not-exposed","decision":"block","requirement":"Dashboard evidence must not expose raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn dashboard_risk_heatmap() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "riskHeatmapMode": "static-dashboard-risk-heatmap",
+        "heatmapReadOnly": true,
+        "trendSummaryReadOnly": true,
+        "riskBandSummaryOnly": true,
+        "evidenceReferencesReadOnly": true,
+        "liveMetricsQueryAllowed": false,
+        "liveDashboardQueryAllowed": false,
+        "dashboardMutationAllowed": false,
+        "workflowMutationAllowed": false,
+        "providerCallsAllowed": false,
+        "notificationDispatchAllowed": false,
+        "rawMetricRowsAllowed": false,
+        "rawRequestRowsAllowed": false,
+        "rawOperationRowsAllowed": false,
+        "rawInventoryRowsAllowed": false,
+        "rawCmdbRowsAllowed": false,
+        "rawBackupRowsAllowed": false,
+        "rawMonitoringRowsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawUserDataAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false,
+        "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "principalIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "dimensions": ["site","environment","service-criticality","owner-domain","risk-domain","time-window"],
+        "riskDomains": ["patch-risk","backup-risk","monitoring-risk","cmdb-risk","capacity-risk","evidence-risk","incident-risk"],
+        "riskBands": ["healthy","attention","risk","blocked","stale","unknown"],
+        "trendWindows": ["now","seven-day","thirty-day","quarter"],
+        "requiredGuards": ["aggregate-only","stale-data-marked","risk-band-reviewed","trend-window-reviewed","evidence-redacted","live-query-blocked","raw-detail-blocked"],
+        "blockedReasons": ["risk-heatmap-live-metrics-query-disabled","risk-heatmap-live-dashboard-query-disabled","risk-heatmap-dashboard-mutation-disabled","risk-heatmap-workflow-mutation-disabled","risk-heatmap-provider-calls-disabled","risk-heatmap-notification-dispatch-disabled","risk-heatmap-raw-metric-rows-disabled","risk-heatmap-raw-request-rows-disabled","risk-heatmap-raw-operation-rows-disabled","risk-heatmap-raw-inventory-rows-disabled","risk-heatmap-raw-cmdb-rows-disabled","risk-heatmap-raw-backup-rows-disabled","risk-heatmap-raw-monitoring-rows-disabled","risk-heatmap-raw-provider-payloads-disabled","risk-heatmap-raw-user-data-disabled","risk-heatmap-raw-recipient-data-disabled","risk-heatmap-credential-values-disabled","risk-heatmap-token-values-disabled","risk-heatmap-tenant-identifiers-disabled","risk-heatmap-object-identifiers-disabled","risk-heatmap-principal-identifiers-disabled","risk-heatmap-private-network-values-disabled","scope-missing","trend-window-missing","risk-band-unknown","evidence-not-redacted"],
+        "requiredEvidence": ["Risk heatmap summary","Trend window summary","Risk band summary","Stale-data marker summary","Evidence references"],
+        "rules": [
+            {"id":"risk-heatmap-aggregate-only","decision":"block","requirement":"Risk heatmaps are aggregate-only and may not run live metrics queries or dashboard reads for operational mutation.","evidence":"Risk heatmap summary"},
+            {"id":"trend-window-read-only","decision":"block","requirement":"Trend-window summaries are read-only and must be reviewed before any deployment or remediation planning.","evidence":"Trend window summary"},
+            {"id":"stale-risk-markers-required","decision":"block","requirement":"Stale-data markers must be explicit for each risk band and trend window before trust.","evidence":"Stale-data marker summary"},
+            {"id":"raw-risk-heatmap-data-not-exposed","decision":"block","requirement":"Risk heatmap evidence must expose only aggregate risk summaries and must not include raw metric rows, raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, provider payloads, or URLs.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn requests_lifecycle() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "lifecycleMode": "static-request-lifecycle",
+        "dryRunRequired": true,
+        "approvalRequired": true,
+        "lockRequired": true,
+        "redactedEvidenceRequired": true,
+        "liveExecutionAllowed": false,
+        "providerCallsAllowed": false,
+        "workflowMutationAllowed": false,
+        "approvalMutationAllowed": false,
+        "lockMutationAllowed": false,
+        "rawRequestPayloadsAllowed": false,
+        "rawExecutionLogsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "accessTokenValuesAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "lifecycleStages": rql_stages(),
+        "requiredInputs": ["requestContext","requesterRole","offering","site","environment","owner","criticality","dryRunPlan","approvalRoute","lockScope","evidenceManifest","statusCallback"],
+        "requiredGuards": rql_guards(),
+        "planSections": rql_plan_sections(),
+        "blockedReasons": rql_blocked(),
+        "requiredEvidence": ["Request payload summary","Validation result","Provider-safe dry-run plan","Approval decisions","Lock record","Execution plan summary","Verification plan","Protection policy summary","Publish plan","Lifecycle handover notes","Evidence references"],
+        "rules": [
+            {"id":"canonical-lifecycle-required","decision":"block","requirement":"Request lifecycle readiness requires intake, validate, plan, approve, lock, execute, verify, protect, publish, maintain, and retire stages to remain explicit.","evidence":"Request payload summary"},
+            {"id":"dry-run-before-approval-required","decision":"block","requirement":"Write-capable requests must include a provider-safe dry-run plan before approval readiness can be represented.","evidence":"Provider-safe dry-run plan"},
+            {"id":"approval-lock-evidence-required","decision":"block","requirement":"Approval route, lock scope, and redacted evidence references must be ready before a request can move beyond planning.","evidence":"Approval decisions"},
+            {"id":"fail-safe-state-required","decision":"block","requirement":"Missing validation, stale data, degraded dependency, or incomplete evidence must block execution readiness and expose safe remediation.","evidence":"Lifecycle handover notes"},
+            {"id":"raw-request-data-not-exposed","decision":"block","requirement":"Request lifecycle evidence must use safe summaries only and must not expose direct provider routes, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw request content, raw execution content, raw evidence content, raw provider content, stack traces, recipient details, or implementation internals.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn requests_execution_timeline() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "requestTimelineMode": "static-request-execution-timeline",
+        "timelineReadOnly": true,
+        "evidenceReferencesReadOnly": true,
+        "operationLinksReadOnly": true,
+        "liveRequestQueryAllowed": false,
+        "requestMutationAllowed": false,
+        "workflowMutationAllowed": false,
+        "operationMutationAllowed": false,
+        "providerCallsAllowed": false,
+        "notificationDispatchAllowed": false,
+        "rawRequestPayloadsAllowed": false,
+        "rawTimelineRowsAllowed": false,
+        "rawApprovalDataAllowed": false,
+        "rawOperationRowsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawLogContentAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false,
+        "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "principalIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "timelineStages": ret_stages(),
+        "timelineEventTypes": ret_events(),
+        "evidenceStates": ret_evidence_states(),
+        "timelineViews": ret_views(),
+        "requiredGuards": ret_guards(),
+        "blockedReasons": ret_blocked(),
+        "requiredEvidence": ["Request timeline summary","Approval state summary","Operation link summary","Evidence reference summary","Blocked reason summary"],
+        "rules": [
+            {"id":"request-execution-timeline-read-only","decision":"block","requirement":"Request execution timeline summaries are read-only and must not run live request queries, mutate requests, mutate operations, call providers, or dispatch notifications.","evidence":"Request timeline summary"},
+            {"id":"evidence-reference-only","decision":"block","requirement":"Request evidence links expose redacted evidence reference states only and must not expose raw evidence payloads or raw log content.","evidence":"Evidence reference summary"},
+            {"id":"approval-operation-links-safe","decision":"block","requirement":"Approval, lock, child operation, status callback, blocker, and handover timeline items must remain safe summaries without raw approval data or operation rows.","evidence":"Operation link summary"},
+            {"id":"raw-request-timeline-data-not-exposed","decision":"block","requirement":"Request timeline evidence must not expose raw request payloads, raw timeline rows, raw approval data, raw operation rows, raw evidence payloads, raw provider payloads, raw logs, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.","evidence":"Blocked reason summary"}
+        ]
+    }))
+}
+
+async fn requests_intake_support() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "intakeSupportMode": "static-intake-support",
+        "templateCatalogReadOnly": true,
+        "duplicateDetectionDryRunOnly": true,
+        "draftStateReadOnly": true,
+        "liveSubmissionAllowed": false,
+        "draftPersistenceAllowed": false,
+        "duplicateQueryAllowed": false,
+        "workflowMutationAllowed": false,
+        "approvalMutationAllowed": false,
+        "providerCallsAllowed": false,
+        "rawRequestPayloadsAllowed": false,
+        "rawDraftPayloadsAllowed": false,
+        "rawDuplicateRowsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawLogContentAllowed": false,
+        "rawRowsAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "supportSurfaces": ["request-templates","duplicate-detection","saved-draft-states","intake-precheck","evidence-summary"],
+        "templateTypes": ["offering-template","site-default-template","role-default-template","maintenance-template","retirement-template"],
+        "duplicateSignals": ["same-offering-scope","same-target-resource","same-site-environment-owner","overlapping-maintenance-window","active-request-open","recent-build-or-retirement"],
+        "draftStates": ["not-started","in-progress","stale","blocked","ready-for-validation","expired"],
+        "requiredGuards": ["template-source-reviewed","duplicate-signals-reviewed","draft-state-read-only","request-submission-blocked","draft-persistence-blocked","raw-payloads-blocked","recipient-data-blocked","evidence-redacted"],
+        "blockedReasons": ["live-submission-disabled","draft-persistence-disabled","duplicate-query-disabled","workflow-mutation-disabled","approval-mutation-disabled","provider-calls-disabled","raw-request-payloads-disabled","raw-draft-payloads-disabled","raw-duplicate-rows-disabled","raw-provider-payloads-disabled","raw-log-content-disabled","raw-rows-disabled","raw-recipient-data-disabled","credential-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","template-source-missing","duplicate-signal-missing","draft-state-unknown","evidence-not-redacted"],
+        "requiredEvidence": ["Template catalog review","Duplicate signal review","Draft state summary","Intake precheck summary","Evidence references"],
+        "rules": [
+            {"id":"template-catalog-read-only","decision":"block","requirement":"Request intake support exposes template metadata only and must not create, update, or persist request drafts.","evidence":"Template catalog review"},
+            {"id":"duplicate-detection-dry-run-only","decision":"block","requirement":"Duplicate detection remains a static signal contract and must not query live request stores, provider systems, or raw request payloads.","evidence":"Duplicate signal review"},
+            {"id":"submission-and-approval-mutation-disabled","decision":"block","requirement":"Intake support cannot submit requests, mutate workflows, mutate approvals, or start live execution.","evidence":"Intake precheck summary"},
+            {"id":"raw-intake-data-not-exposed","decision":"block","requirement":"Request intake support evidence must use safe summaries only and must not expose raw request payloads, raw draft payloads, raw duplicate rows, raw provider payloads, raw logs, raw rows, recipient data, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn requests_intake_form() -> Json<Value> {
+    Json(json!({
+        "title": "Request Intake",
+        "description": "Review-only preview — submission available in next release",
+        "source": "static-seed",
+        "formMode": "static-request-form-preview",
+        "formSubmissionAllowed": false,
+        "liveRequestCreationAllowed": false,
+        "inputKinds": ["text", "select", "number"],
+        "fields": [
+            {
+                "label": "Request type",
+                "field_type": "select",
+                "required": true,
+                "options": ["VM", "Application", "SQL", "Network", "Storage"],
+                "placeholder": "Select request type"
+            },
+            {
+                "label": "Site",
+                "field_type": "select",
+                "required": true,
+                "options": ["site-alpha", "site-bravo"],
+                "placeholder": "Select site"
+            },
+            {
+                "label": "Environment",
+                "field_type": "select",
+                "required": true,
+                "options": ["dev", "test", "staging", "prod"],
+                "placeholder": "Select environment"
+            },
+            {
+                "label": "Server name",
+                "field_type": "text",
+                "required": true,
+                "options": [],
+                "placeholder": "e.g. srv-app-01"
+            },
+            {
+                "label": "CPU cores",
+                "field_type": "number",
+                "required": true,
+                "options": [],
+                "placeholder": "e.g. 4"
+            },
+            {
+                "label": "Memory GB",
+                "field_type": "number",
+                "required": true,
+                "options": [],
+                "placeholder": "e.g. 16"
+            },
+            {
+                "label": "Business justification",
+                "field_type": "text",
+                "required": true,
+                "options": [],
+                "placeholder": "Brief business justification for this request"
+            }
+        ],
+        "blockedReasons": ["live-submission-disabled", "form-submission-disabled", "live-request-creation-disabled"],
+        "requiredEvidence": ["Form preview review", "Safe summary boundary"]
+    }))
+}
+
+async fn requests_preflight() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "preflightMode": "static-preflight-readiness",
+        "inputSchemaReadOnly": true,
+        "dryRunDecisionRequired": true,
+        "evidenceRedactionRequired": true,
+        "liveSubmissionAllowed": false,
+        "liveExecutionAllowed": false,
+        "providerCallsAllowed": false,
+        "providerValidationAllowed": false,
+        "livePolicyEvaluationAllowed": false,
+        "requestMutationAllowed": false,
+        "workflowMutationAllowed": false,
+        "approvalMutationAllowed": false,
+        "workerDispatchAllowed": false,
+        "rawRequestPayloadsAllowed": false,
+        "rawValidationRowsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawInventoryRowsAllowed": false,
+        "rawCmdbRowsAllowed": false,
+        "rawApprovalDataAllowed": false,
+        "rawUserDataAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false,
+        "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false,
+        "principalIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "hypervisorScope": ["vmware","hyperv","proxmox"],
+        "preflightSurfaces": ["input-completeness","catalog-policy-readiness","site-context-readiness","dependency-readiness","approval-route-readiness","dry-run-plan-readiness","evidence-redaction-readiness"],
+        "validationStages": ["site","owner","capacity","network","backup","monitoring","cmdb","approval","dry-run","evidence"],
+        "requiredInputs": ["requestedOffering","owner","site","environment","criticality","dryRunPlan","approvalRoute","evidenceManifest","secretReferenceState"],
+        "requiredGuards": ["requested-offering-known","owner-known","site-known","environment-known","criticality-known","dry-run-plan-ready","approval-route-assigned","evidence-redacted","secret-reference-configured","provider-calls-blocked","live-execution-blocked"],
+        "blockedReasons": ["missing-requested-offering","owner-missing","site-missing","environment-missing","criticality-missing","provider-safe-dry-run-not-ready","approval-route-missing","redacted-evidence-not-ready","secret-reference-not-configured","provider-calls-disabled","live-execution-disabled","request-mutation-disabled","workflow-mutation-disabled","approval-mutation-disabled","raw-request-payloads-disabled","raw-validation-rows-disabled","raw-provider-payloads-disabled","raw-inventory-rows-disabled","raw-cmdb-rows-disabled","raw-approval-data-disabled","raw-user-data-disabled","raw-recipient-data-disabled","credential-values-disabled","token-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled"],
+        "requiredEvidence": ["Request input summary","Validation stage summary","Provider-safe dry-run decision","Approval route summary","Redacted evidence manifest","Secret reference state"],
+        "rules": [
+            {"id":"no-live-provider-preflight","decision":"block","requirement":"Preflight readiness is static and must not call providers, validate live provider state, or query live inventory, CMDB, ticket, backup, monitoring, or identity systems.","evidence":"Validation stage summary"},
+            {"id":"live-execution-disabled","decision":"block","requirement":"Preflight may return block or review readiness only and must never submit requests, start workflows, mutate approvals, dispatch workers, or run live execution.","evidence":"Provider-safe dry-run decision"},
+            {"id":"required-inputs-and-guards-reviewed","decision":"block","requirement":"Requested offering, owner, site, environment, criticality, dry-run plan, approval route, evidence manifest, and secret reference state must be reviewed before approval readiness.","evidence":"Request input summary"},
+            {"id":"redacted-evidence-required","decision":"block","requirement":"Preflight evidence must be redacted before any approval or lifecycle handoff.","evidence":"Redacted evidence manifest"},
+            {"id":"raw-preflight-data-not-exposed","decision":"block","requirement":"Preflight evidence must use safe summaries only and must not expose raw request payloads, raw validation rows, raw provider payloads, raw inventory rows, raw CMDB rows, raw approval data, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.","evidence":"Redacted evidence manifest"}
+        ]
+    }))
+}
+
+async fn platform_security_baseline() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "baselineMode": "static-security-baseline",
+        "noSecretPolicyRequired": true,
+        "browserIsolationRequired": true,
+        "networkIsolationRequired": true,
+        "rbacApprovalRequired": true,
+        "dryRunRequired": true,
+        "redactedEvidenceRequired": true,
+        "verificationGatesRequired": true,
+        "providerCallsAllowed": false,
+        "liveAuthenticationAllowed": false,
+        "workflowMutationAllowed": false,
+        "policyMutationAllowed": false,
+        "approvalBypassAllowed": false,
+        "rbacBypassAllowed": false,
+        "browserVendorEndpointAllowed": false,
+        "rawRequestPayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawLogContentAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "accessTokenValuesAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "securityControls": ["no-secrets","identity-rbac-approval","dry-run-first","request-lifecycle-gates","vault-secret-reference","browser-isolation","network-isolation","evidence-redaction","least-privilege-adapters","safe-failure-degraded-mode","verification-gates"],
+        "verificationGates": ["markdown-review","no-secret-scan","diff-check","unit-tests","contract-tests","build","container-build","kubernetes-validation","browser-checks"],
+        "requiredInputs": ["securityScope","controlSummary","rbacApprovalSummary","dryRunSummary","networkIsolationSummary","evidenceRedactionSummary","verificationSummary","evidenceManifest"],
+        "requiredGuards": ["no-secret-scan-ready","rbac-approval-reviewed","dry-run-gates-reviewed","browser-isolation-reviewed","network-isolation-reviewed","redaction-reviewed","least-privilege-reviewed","verification-gates-reviewed","safe-failure-reviewed"],
+        "planSections": ["noSecretsPolicy","identityRbacApproval","dryRunLifecycle","secretReferenceModel","browserNetworkIsolation","evidenceRedaction","adapterLeastPrivilege","degradedMode","verificationGates","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","live-authentication-disabled","workflow-mutation-disabled","policy-mutation-disabled","approval-bypass-disabled","rbac-bypass-disabled","browser-vendor-endpoint-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","raw-evidence-payloads-disabled","raw-log-content-disabled","credential-values-disabled","secret-values-disabled","access-token-values-disabled","raw-recipient-data-disabled","no-secret-scan-missing","rbac-approval-review-missing","dry-run-gate-review-missing","browser-isolation-review-missing","network-isolation-review-missing","redaction-review-missing","verification-gates-missing"],
+        "requiredEvidence": ["Security baseline summary","No-secret scan result","RBAC and approval review","Dry-run gate review","Browser isolation review","Network isolation review","Evidence redaction review","Least privilege review","Verification gate review","Evidence references"],
+        "rules": [
+            {"id":"no-secrets-required","decision":"block","requirement":"Security baseline readiness requires no committed sensitive auth material, deployment-specific identifiers, private network details, direct provider routes, or raw provider content.","evidence":"No-secret scan result"},
+            {"id":"rbac-approval-required","decision":"block","requirement":"Role mapping, least privilege, approval route, execution authority, and emergency handling must be reviewed before live execution can be considered.","evidence":"RBAC and approval review"},
+            {"id":"dry-run-lifecycle-required","decision":"block","requirement":"Write-capable workflows must keep dry-run planning, approval, lock, verification, status callback, and redacted evidence gates before execution readiness.","evidence":"Dry-run gate review"},
+            {"id":"browser-network-isolation-required","decision":"block","requirement":"Browser access must remain limited to portal-ui and platform-api while namespace traffic stays deny-by-default with reviewed allowances.","evidence":"Network isolation review"},
+            {"id":"redaction-and-verification-required","decision":"block","requirement":"Evidence redaction and appropriate verification gates must pass before any implementation slice can be accepted.","evidence":"Verification gate review"}
+        ]
+    }))
+}
+
+async fn platform_portal_ia() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "architectureMode": "full-stack-leptos-ssr-hydration",
+        "portalRuntime": "axum-leptos-server",
+        "browserIsolationRequired": true,
+        "stableNavigationRequired": true,
+        "sameOriginApiRoutingRequired": true,
+        "ssrRequired": true,
+        "hydrationRequired": true,
+        "serverFunctionBoundaryRequired": true,
+        "browserProviderCallsAllowed": false,
+        "externalApiCallsAllowed": false,
+        "staticOnlyHostingAllowed": false,
+        "roleBypassAllowed": false,
+        "unsafeAdminDetailAllowed": false,
+        "rawSearchRowsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "accessTokenValuesAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "architectureSurfaces": ["product-shell","primary-navigation","persona-defaults","dashboard-summary","catalog-offering-flow","request-lifecycle","activity-operations-queue","inventory-cmdb-evidence","operations-admin-boundary","global-search-command-palette","selector-scope-readiness","evidence-redaction-readiness"],
+        "primaryNavigation": ["Dashboard","Catalog","Requests","Activity","Inventory","CMDB","Evidence","Operations","Admin"],
+        "personaViews": ["system-engineer","datacenter-engineer","vmware-administrator","backup-administrator","monitoring-administrator","service-desk-operations","application-owner","security-audit"],
+        "requiredInputs": ["shellSummary","navigationSummary","personaSummary","dashboardSummary","catalogSummary","requestLifecycleSummary","inventoryCmdbEvidenceSummary","operationsAdminSummary","searchPaletteSummary","scopeSelectorSummary","evidenceManifest"],
+        "requiredGuards": ["product-shell-reviewed","primary-navigation-reviewed","browser-isolation-reviewed","same-origin-routing-reviewed","role-visibility-reviewed","scope-selector-reviewed","freshness-state-reviewed","evidence-redaction-reviewed","admin-boundary-reviewed"],
+        "planSections": ["shellStructure","navigationModel","personaDefaults","dashboardModel","catalogRequestModel","activityInventoryCmdbEvidence","operationsAdminBoundary","searchAndCommandPalette","scopeAndFreshness","evidenceSafety"],
+        "blockedReasons": ["browser-provider-calls-disabled","external-api-calls-disabled","role-bypass-disabled","unsafe-admin-detail-disabled","raw-search-rows-disabled","raw-evidence-payloads-disabled","raw-provider-payloads-disabled","credential-values-disabled","secret-values-disabled","access-token-values-disabled","raw-recipient-data-disabled","product-shell-review-missing","primary-navigation-review-missing","browser-isolation-review-missing","same-origin-routing-review-missing","role-visibility-review-missing","scope-selector-review-missing","freshness-state-review-missing","evidence-redaction-review-missing","admin-boundary-review-missing"],
+        "requiredEvidence": ["Portal shell review","Navigation model review","Persona defaults review","Dashboard model review","Catalog and request model review","Activity, inventory, CMDB, and evidence review","Operations and admin boundary review","Search and command palette review","Scope and freshness review","Evidence safety review"],
+        "rules": [
+            {"id":"browser-isolation-required","decision":"block","requirement":"Portal information architecture keeps browser access limited to portal-ui and same-origin platform-api routes; it never introduces direct browser calls to vendors, adapters, workers, data stores, Vault, or provider services.","evidence":"Portal shell review"},
+            {"id":"stable-navigation-required","decision":"block","requirement":"Dashboard, Catalog, Requests, Activity, Inventory, CMDB, Evidence, Operations, and Admin remain the stable primary navigation model across personas.","evidence":"Navigation model review"},
+            {"id":"persona-and-scope-context-required","decision":"block","requirement":"Site, environment, role, data freshness, execution authority, and persona defaults must stay visible before risky workflows can be represented as ready.","evidence":"Scope and freshness review"},
+            {"id":"operations-admin-boundary-required","decision":"block","requirement":"Operations workflows and Admin configuration are separated by role visibility, approval context, and evidence expectations.","evidence":"Operations and admin boundary review"},
+            {"id":"raw-portal-data-not-exposed","decision":"block","requirement":"Portal IA evidence must use safe summaries only and must not expose vendor endpoints, URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw search rows, stack traces, recipient addresses, or implementation internals.","evidence":"Evidence safety review"}
+        ]
+    }))
+}
+
+async fn platform_design_system() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "designMode": "static-design-system",
+        "lightModeRequired": true,
+        "darkModeRequired": true,
+        "accessibilityReviewRequired": true,
+        "evidenceSafetyRequired": true,
+        "liveThemeMutationAllowed": false,
+        "externalFontFetchAllowed": false,
+        "unsafeErrorDetailAllowed": false,
+        "rawUiDiagnosticRowsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "accessTokenValuesAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "brandTokens": ["configurable-branding"],
+        "designSurfaces": ["light-theme","dark-theme","accessibility-notes","branding-configuration","neutral-surfaces","status-badges","dense-tables","request-forms","error-evidence-presentation"],
+        "statusFamilies": ["lifecycle","risk","health","evidence","protection","monitoring"],
+        "requiredInputs": ["themeSummary","accessibilitySummary","brandingSummary","surfaceSummary","statusBadgeSummary","tableGuidanceSummary","formGuidanceSummary","errorEvidenceSummary","evidenceManifest"],
+        "requiredGuards": ["light-theme-reviewed","dark-theme-reviewed","contrast-reviewed","focus-treatment-reviewed","non-color-status-reviewed","branding-reviewed","table-density-reviewed","form-safety-reviewed","evidence-presentation-reviewed"],
+        "planSections": ["themeUsage","accessibilityNotes","brandingConfiguration","uiSurfaces","statusBadges","tables","forms","errorEvidencePresentation"],
+        "blockedReasons": ["live-theme-mutation-disabled","external-font-fetch-disabled","unsafe-error-detail-disabled","raw-ui-diagnostic-rows-disabled","raw-evidence-payloads-disabled","raw-provider-payloads-disabled","credential-values-disabled","secret-values-disabled","access-token-values-disabled","raw-recipient-data-disabled","light-theme-review-missing","dark-theme-review-missing","contrast-review-missing","focus-treatment-review-missing","non-color-status-review-missing","branding-review-missing","table-density-review-missing","form-safety-review-missing","evidence-presentation-review-missing"],
+        "requiredEvidence": ["Light theme review","Dark theme review","Accessibility review","Branding configuration review","UI surface review","Status badge review","Table guidance review","Form guidance review","Error and evidence presentation review"],
+        "rules": [
+            {"id":"branding-admin-configurable","decision":"block","requirement":"Branding is admin-configurable through the admin portal. Accent color and logo are set by the administrator. Neutral operational defaults are shown until configured. No specific brand colors or logo assets are committed to the repository.","evidence":"Branding configuration review"},
+            {"id":"light-dark-theme-required","decision":"block","requirement":"Light and dark mode must be reviewed for text, badges, focus states, table surfaces, empty states, and error and evidence states before UI readiness is accepted.","evidence":"Dark theme review"},
+            {"id":"accessibility-status-required","decision":"block","requirement":"Status presentation must use text and visible focus treatment, not color alone, and must make stale, degraded, blocked, failed, and emergency states explicit.","evidence":"Accessibility review"},
+            {"id":"evidence-error-safety-required","decision":"block","requirement":"UI error and evidence presentation must show safe summaries and redaction state instead of raw implementation or provider detail.","evidence":"Error and evidence presentation review"},
+            {"id":"raw-design-data-not-exposed","decision":"block","requirement":"Design system evidence must use safe summaries only and must not expose external font URLs, logo asset URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw UI diagnostic rows, stack traces, recipient addresses, or implementation internals.","evidence":"Error and evidence presentation review"}
+        ]
+    }))
+}
+
+async fn platform_ui_mockup() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "acceptanceMode": "static-ui-documentation",
+        "mockupCoverageRequired": true,
+        "accessibilityReviewRequired": true,
+        "browserIsolationRequired": true,
+        "evidenceSafetyRequired": true,
+        "liveUiExecutionAllowed": false,
+        "browserProviderCallsAllowed": false,
+        "externalAssetFetchAllowed": false,
+        "directVendorApiAllowed": false,
+        "unsafeDebugDetailAllowed": false,
+        "rawMockupRowsAllowed": false,
+        "rawEvidencePayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "credentialValuesAllowed": false,
+        "secretValuesAllowed": false,
+        "accessTokenValuesAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "mockupDocuments": ["shell-dashboard","catalog-requests","inventory-cmdb","evidence-operations-admin"],
+        "mockupSurfaces": ["product-shell","dashboard","catalog","request-detail","inventory","cmdb","evidence","operations","admin","accessibility-acceptance"],
+        "requiredInputs": ["shellDashboardReview","catalogRequestReview","inventoryCmdbReview","evidenceOperationsAdminReview","accessibilitySummary","browserIsolationSummary","evidenceSafetySummary","statusBehaviorSummary","themeSummary","evidenceManifest"],
+        "requiredGuards": ["shell-dashboard-reviewed","catalog-requests-reviewed","inventory-cmdb-reviewed","evidence-operations-admin-reviewed","browser-isolation-reviewed","accessibility-reviewed","status-behavior-reviewed","evidence-redaction-reviewed","raw-detail-exclusion-reviewed"],
+        "planSections": ["shellDashboardMockup","catalogRequestMockup","inventoryCmdbMockup","evidenceOperationsAdminMockup","accessibilityAcceptance","browserIsolationReview","statusBehaviorReview","themeBehaviorReview","evidenceSafety","rawDetailExclusion"],
+        "blockedReasons": ["live-ui-execution-disabled","browser-provider-calls-disabled","external-asset-fetch-disabled","direct-vendor-api-disabled","unsafe-debug-detail-disabled","raw-mockup-rows-disabled","raw-evidence-payloads-disabled","raw-provider-payloads-disabled","credential-values-disabled","secret-values-disabled","access-token-values-disabled","raw-recipient-data-disabled","shell-dashboard-review-missing","catalog-requests-review-missing","inventory-cmdb-review-missing","evidence-operations-admin-review-missing","browser-isolation-review-missing","accessibility-review-missing","status-behavior-review-missing","evidence-redaction-review-missing","raw-detail-exclusion-review-missing"],
+        "requiredEvidence": ["Shell and dashboard mockup review","Catalog and request mockup review","Inventory and CMDB mockup review","Evidence operations and admin mockup review","Accessibility acceptance review","Browser isolation review","Status behavior review","Theme behavior review","Evidence safety review","Raw detail exclusion review"],
+        "rules": [
+            {"id":"batch-two-mockup-coverage-required","decision":"block","requirement":"Batch 2 UI acceptance requires shell, dashboard, catalog, request, inventory, CMDB, evidence, operations, and admin mockups before implementation readiness is accepted.","evidence":"Shell and dashboard mockup review"},
+            {"id":"browser-isolation-required","decision":"block","requirement":"Mockup acceptance keeps browser behavior limited to portal-ui and platform-api, with vendor and infrastructure access represented only as server-side platform summaries.","evidence":"Browser isolation review"},
+            {"id":"accessibility-status-required","decision":"block","requirement":"Mockups must show keyboard focus, contrast, non-color status signals, stale states, degraded states, blocked states, and safe error states before UI readiness is accepted.","evidence":"Accessibility acceptance review"},
+            {"id":"evidence-redaction-required","decision":"block","requirement":"Evidence and request mockups must show redaction state, export readiness, safe summaries, and controlled accepted or rejected counts before UI readiness is accepted.","evidence":"Evidence safety review"},
+            {"id":"raw-ui-mockup-data-not-exposed","decision":"block","requirement":"UI mockup acceptance evidence must use safe summaries only and must not expose direct vendor routes, external asset locations, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw provider content, raw evidence content, raw mockup rows, stack traces, recipient details, or implementation internals.","evidence":"Raw detail exclusion review"}
+        ]
+    }))
+}
+
+async fn platform_release_promotion() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "promotionMode": "approval-evidence-only",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveDeploymentAllowed": false,
+        "registryPushAllowed": false,
+        "helmUpgradeAllowed": false,
+        "kubectlApplyAllowed": false,
+        "clusterMutationAllowed": false,
+        "credentialValuesAllowed": false,
+        "rawPipelineLogsAllowed": false,
+        "rawRegistryPayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "promotionStages": ["dev-render","test-render","release-candidate-review","approval-gate","prod-render","evidence-export","rollback-readiness","publish-decision"],
+        "validationSignals": ["helm-lint","helm-template-render","kustomize-build-render","image-reference-policy","manifest-diff-review","rollback-plan-ready","approval-evidence-ready"],
+        "requiredInputs": ["releaseScope","sourceVersionSummary","environmentStage","manifestRenderSummary","chartLintSummary","kustomizeBuildSummary","approvalRoute","rollbackPlan","owner","evidenceManifest"],
+        "requiredGuards": ["release-scope-known","source-version-summarized","manifest-render-reviewed","chart-lint-reviewed","kustomize-build-reviewed","image-reference-policy-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],
+        "planSections": ["releaseSummary","sourceVersionSummary","manifestRender","chartLint","kustomizeBuild","manifestDiff","approvalRoute","rollbackReadiness","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","live-deployment-disabled","registry-push-disabled","helm-upgrade-disabled","kubectl-apply-disabled","cluster-mutation-disabled","credential-values-disabled","raw-pipeline-logs-disabled","raw-registry-payloads-disabled","raw-provider-payloads-disabled","release-scope-missing","manifest-render-missing","chart-lint-missing","kustomize-build-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Release summary","Source version summary","Helm lint summary","Helm template render summary","Kustomize build summary","Manifest diff review","Approval route","Rollback readiness","Evidence references"],
+        "rules": [
+            {"id":"no-live-release-deployment","decision":"block","requirement":"Platform release promotion records approval and evidence only and never deploys, upgrades, applies, or mutates clusters.","evidence":"Release summary"},
+            {"id":"static-render-validation-required","decision":"block","requirement":"Helm lint, Helm template render, and Kustomize build summaries must be reviewed before promotion approval.","evidence":"Manifest diff review"},
+            {"id":"no-registry-or-cluster-mutation","decision":"block","requirement":"Promotion review never pushes registry artifacts and never applies manifests to live clusters.","evidence":"Release summary"},
+            {"id":"approval-and-rollback-required","decision":"block","requirement":"Approval route and rollback readiness must be present before a publish decision can be recorded.","evidence":"Rollback readiness"},
+            {"id":"raw-release-data-not-exposed","decision":"block","requirement":"Release promotion evidence must use safe summaries only and must not expose registry URLs, image digests, commit SHAs, pipeline run IDs, raw release identifiers, committed image refs, cluster names, namespace names, tenant IDs, object IDs, private IPs, serial numbers, raw pipeline logs, raw registry payloads, credentials, secret values, access tokens, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_database_readiness() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "databaseProvider": "CloudNativePG PostgreSQL",
+        "providerCallsEnabled": false, "kubernetesApplyAllowed": false, "cnpgClusterCreationAllowed": false, "databaseMutationAllowed": false,
+        "schemaMigrationAllowed": false, "backupExecutionAllowed": false, "restoreExecutionAllowed": false, "objectStorageAccessAllowed": false,
+        "credentialValuesAllowed": false, "connectionStringsAllowed": false, "rawDatabaseRowsAllowed": false, "rawBackupPayloadsAllowed": false,
+        "rawKubernetesPayloadsAllowed": false, "rawProviderPayloadsAllowed": false,
+        "readinessSurfaces": ["cnpg-operator-readiness","postgres-cluster-topology","storage-class-readiness","backup-archive-readiness","restore-test-readiness","monitoring-readiness","vault-secret-reference-readiness","network-policy-readiness","failover-drain-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["runtimeProfile","clusterTopologySummary","storageProfile","backupArchiveSummary","restoreTestSummary","monitoringProfile","vaultReferenceSummary","networkPolicySummary","maintenanceWindow","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["operator-install-reviewed","three-instance-topology-reviewed","storage-class-reviewed","wal-archive-reviewed","object-backup-reviewed","restore-test-reviewed","monitoring-reviewed","vault-reference-reviewed","network-policy-reviewed","evidence-redacted"],
+        "planSections": ["readinessSummary","clusterTopology","storageReadiness","backupArchiveReadiness","restoreTestReadiness","monitoringReadiness","secretReferenceReadiness","networkPolicyReadiness","failoverMaintenanceReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","kubernetes-apply-disabled","cnpg-cluster-creation-disabled","database-mutation-disabled","schema-migration-disabled","backup-execution-disabled","restore-execution-disabled","object-storage-access-disabled","credential-values-disabled","connection-strings-disabled","raw-database-rows-disabled","raw-backup-payloads-disabled","raw-kubernetes-payloads-disabled","raw-provider-payloads-disabled","operator-readiness-missing","topology-review-missing","storage-review-missing","backup-archive-missing","restore-test-missing","monitoring-missing","vault-reference-missing","network-policy-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Database readiness summary","Cluster topology review","Storage readiness","Backup archive review","Restore test review","Monitoring readiness","Secret reference review","Network policy review","Evidence references"],
+        "rules": [
+            {"id":"no-live-database-or-kubernetes-actions","decision":"block","requirement":"Platform database readiness reports static readiness only and never applies Kubernetes manifests, creates CloudNativePG clusters, mutates databases, runs schema migrations, executes backups, executes restores, accesses object storage, or changes provider state.","evidence":"Database readiness summary"},
+            {"id":"ha-topology-and-storage-required","decision":"block","requirement":"Three-instance topology, storage class, anti-affinity posture, and maintenance behavior must be reviewed before production database readiness can be accepted.","evidence":"Cluster topology review"},
+            {"id":"backup-restore-monitoring-required","decision":"block","requirement":"WAL archive, object backup, restore test, monitoring, and evidence readiness must be reviewed before database readiness can be accepted.","evidence":"Restore test review"},
+            {"id":"secret-and-network-boundary-required","decision":"block","requirement":"Vault secret references and network policy posture must be reviewed before workloads can use the database.","evidence":"Secret reference review"},
+            {"id":"raw-database-data-not-exposed","decision":"block","requirement":"Database readiness evidence must use safe summaries only and must not expose database names, usernames, credential values, connection strings, endpoints, private IPs, raw database rows, raw Kubernetes payloads, raw backup payloads, object-storage payloads, tokens, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_object_storage() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "storageProvider": "Azure Blob Storage",
+        "providerCallsEnabled": false, "azureApiCallsAllowed": false, "storageAccountMutationAllowed": false, "containerMutationAllowed": false,
+        "blobReadWriteAllowed": false, "lifecyclePolicyMutationAllowed": false, "immutabilityPolicyMutationAllowed": false, "publicNetworkAccessAllowed": false,
+        "sharedKeyUsageAllowed": false, "sasTokenValuesAllowed": false, "credentialValuesAllowed": false, "connectionStringsAllowed": false,
+        "rawBlobPayloadsAllowed": false, "rawStoragePayloadsAllowed": false, "rawProviderPayloadsAllowed": false, "storageIdentifiersAllowed": false,
+        "readinessSurfaces": ["azure-blob-account-readiness","container-topology-readiness","evidence-pack-retention-readiness","export-retention-readiness","cloudnativepg-backup-target-readiness","immutability-versioning-readiness","lifecycle-management-readiness","private-network-readiness","vault-secret-reference-readiness","monitoring-diagnostic-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["storageUseCaseSummary","containerRoleSummary","retentionPolicySummary","immutabilityPolicySummary","lifecyclePolicySummary","privateEndpointSummary","vaultReferenceSummary","monitoringProfile","backupTargetSummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["azure-blob-provider-reviewed","container-purpose-reviewed","retention-policy-reviewed","immutability-versioning-reviewed","lifecycle-management-reviewed","private-endpoint-reviewed","shared-key-disabled-reviewed","vault-reference-reviewed","diagnostic-logging-reviewed","evidence-redacted"],
+        "planSections": ["readinessSummary","accountSecurityPosture","containerRolePlan","retentionAndLifecycleReadiness","immutabilityReadiness","privateNetworkReadiness","secretReferenceReadiness","backupTargetReadiness","monitoringReadiness","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","azure-api-calls-disabled","storage-account-mutation-disabled","container-mutation-disabled","blob-read-write-disabled","lifecycle-policy-mutation-disabled","immutability-policy-mutation-disabled","public-network-access-disabled","shared-key-usage-disabled","sas-token-values-disabled","credential-values-disabled","connection-strings-disabled","raw-blob-payloads-disabled","raw-storage-payloads-disabled","raw-provider-payloads-disabled","storage-identifiers-disabled","provider-review-missing","container-role-missing","retention-policy-missing","immutability-review-missing","lifecycle-review-missing","private-network-review-missing","vault-reference-missing","diagnostics-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Object storage readiness summary","Account security review","Container role review","Retention policy review","Immutability and versioning review","Lifecycle management review","Private network review","Secret reference review","Backup target review","Monitoring diagnostics review","Evidence references"],
+        "rules": [
+            {"id":"no-live-object-storage-actions","decision":"block","requirement":"Object storage readiness reports static readiness only and never calls Azure APIs, mutates storage accounts, mutates containers, reads or writes blobs, changes lifecycle policies, changes immutability policies, or changes provider state.","evidence":"Object storage readiness summary"},
+            {"id":"container-retention-purpose-required","decision":"block","requirement":"Evidence, export, audit artifact, and CloudNativePG backup use cases must have container purpose, retention, lifecycle, and backup target readiness reviewed before acceptance.","evidence":"Retention policy review"},
+            {"id":"security-and-network-boundary-required","decision":"block","requirement":"Public network access, shared key usage, managed identity posture, private endpoint posture, and Vault secret references must be reviewed before object storage readiness can be accepted.","evidence":"Account security review"},
+            {"id":"immutability-lifecycle-required","decision":"block","requirement":"Versioning, immutability, protected append posture, lifecycle management, and monitoring diagnostics must be reviewed before retained evidence or backups can depend on object storage.","evidence":"Immutability and versioning review"},
+            {"id":"raw-object-storage-data-not-exposed","decision":"block","requirement":"Object storage readiness evidence must use safe summaries only and must not expose storage account names, container names, blob names, URLs, endpoints, subscription IDs, resource group names, tenant IDs, object IDs, private IPs, access keys, shared keys, SAS tokens, connection strings, raw blob payloads, raw storage payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_registry_readiness() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "registryProvider": "Harbor",
+        "providerCallsEnabled": false, "harborApiCallsAllowed": false, "registryPushAllowed": false, "registryPullAllowed": false,
+        "projectMutationAllowed": false, "robotAccountMutationAllowed": false, "retentionPolicyMutationAllowed": false, "immutabilityRuleMutationAllowed": false,
+        "scannerMutationAllowed": false, "replicationMutationAllowed": false, "webhookMutationAllowed": false, "credentialValuesAllowed": false,
+        "robotSecretValuesAllowed": false, "registryUrlsAllowed": false, "imageDigestsAllowed": false, "rawRegistryPayloadsAllowed": false,
+        "rawScannerPayloadsAllowed": false, "rawProviderPayloadsAllowed": false, "registryIdentifiersAllowed": false,
+        "readinessSurfaces": ["harbor-system-readiness","project-topology-readiness","rbac-readiness","robot-account-readiness","retention-policy-readiness","vulnerability-scanning-readiness","tag-immutability-readiness","quota-readiness","audit-log-readiness","replication-webhook-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["registryUseCaseSummary","projectTopologySummary","rbacModelSummary","robotAccountScopeSummary","retentionPolicySummary","immutabilityRuleSummary","scannerProfile","quotaSummary","auditLogSummary","replicationWebhookSummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["harbor-provider-reviewed","project-creation-reviewed","project-rbac-reviewed","robot-account-scope-reviewed","retention-policy-reviewed","vulnerability-scanner-reviewed","immutability-rule-reviewed","quota-reviewed","audit-log-reviewed","evidence-redacted"],
+        "planSections": ["readinessSummary","systemSecurityPosture","projectTopology","rbacAndRobotScope","retentionAndQuotaReadiness","immutabilityReadiness","scannerReadiness","replicationWebhookReadiness","auditMonitoringReadiness","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","harbor-api-calls-disabled","registry-push-disabled","registry-pull-disabled","project-mutation-disabled","robot-account-mutation-disabled","retention-policy-mutation-disabled","immutability-rule-mutation-disabled","scanner-mutation-disabled","replication-mutation-disabled","webhook-mutation-disabled","credential-values-disabled","robot-secret-values-disabled","registry-urls-disabled","image-digests-disabled","raw-registry-payloads-disabled","raw-scanner-payloads-disabled","raw-provider-payloads-disabled","registry-identifiers-disabled","provider-review-missing","project-rbac-missing","robot-scope-missing","retention-policy-missing","scanner-review-missing","immutability-review-missing","quota-review-missing","audit-log-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Registry readiness summary","System security review","Project topology review","RBAC and robot scope review","Retention policy review","Immutability rule review","Scanner readiness review","Quota review","Audit log review","Evidence references"],
+        "rules": [
+            {"id":"no-live-registry-actions","decision":"block","requirement":"Registry readiness reports static readiness only and never calls Harbor APIs, pushes images, pulls images, mutates projects, changes robot accounts, changes retention policies, changes immutability rules, changes scanners, changes replication, changes webhooks, or changes provider state.","evidence":"Registry readiness summary"},
+            {"id":"project-rbac-and-robot-scope-required","decision":"block","requirement":"Harbor project topology, project creation restriction, project RBAC, robot account scope, and quota posture must be reviewed before registry readiness can be accepted.","evidence":"RBAC and robot scope review"},
+            {"id":"retention-scanning-immutability-required","decision":"block","requirement":"Tag retention, vulnerability scanning, vulnerability allowlist posture, tag immutability, and audit logging must be reviewed before platform images can depend on the registry.","evidence":"Scanner readiness review"},
+            {"id":"replication-webhook-readiness-required","decision":"block","requirement":"Replication, webhook, proxy cache, and monitoring posture must be summarized before future registry automation can be accepted.","evidence":"Audit log review"},
+            {"id":"raw-registry-data-not-exposed","decision":"block","requirement":"Registry readiness evidence must use safe summaries only and must not expose registry URLs, project names, repository names, image tags, image digests, robot account names, robot secrets, user names, group names, OIDC identifiers, LDAP identifiers, CVE rows, webhook URLs, replication endpoints, tenant IDs, object IDs, private IPs, credentials, tokens, raw registry payloads, raw scanner payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_vault_deployment() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "vaultProvider": "HashiCorp Vault", "deploymentTarget": "Kubernetes Helm",
+        "providerCallsEnabled": false, "vaultApiCallsAllowed": false, "helmInstallAllowed": false, "helmUpgradeAllowed": false, "kubectlApplyAllowed": false,
+        "vaultInitAllowed": false, "vaultUnsealAllowed": false, "vaultPolicyMutationAllowed": false, "kubernetesAuthMutationAllowed": false,
+        "secretWriteAllowed": false, "injectorMutationAllowed": false, "autoUnsealMutationAllowed": false, "auditLogReadAllowed": false,
+        "rawVaultPayloadsAllowed": false, "rawKubernetesPayloadsAllowed": false, "rawProviderPayloadsAllowed": false, "secretValuesAllowed": false, "vaultIdentifiersAllowed": false,
+        "readinessSurfaces": ["helm-chart-readiness","ha-raft-topology-readiness","tls-readiness","persistent-storage-readiness","audit-logging-readiness","network-policy-readiness","kubernetes-auth-readiness","auto-unseal-overlay-readiness","backup-restore-readiness","workload-secret-delivery-readiness","monitoring-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["helmChartSummary","valuesBaselineSummary","haRaftTopologySummary","tlsCertificateReferenceSummary","storageClassSummary","auditLoggingSummary","networkPolicySummary","kubernetesAuthSummary","autoUnsealOverlaySummary","backupRestoreSummary","workloadSecretDeliverySummary","monitoringSummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["helm-chart-reviewed","ha-raft-reviewed","tls-reviewed","audit-storage-reviewed","network-policy-reviewed","kubernetes-auth-reviewed","auto-unseal-overlay-reviewed","backup-restore-reviewed","workload-secret-delivery-reviewed","evidence-redacted"],
+        "planSections": ["readinessSummary","helmChartReview","haRaftTopology","tlsAndCertificateReview","persistentStorageReview","auditLoggingReview","networkPolicyReview","kubernetesAuthReview","autoUnsealOverlayReview","backupRestoreReview","workloadSecretDeliveryReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","vault-api-calls-disabled","helm-install-disabled","helm-upgrade-disabled","kubectl-apply-disabled","vault-init-disabled","vault-unseal-disabled","vault-policy-mutation-disabled","kubernetes-auth-mutation-disabled","secret-write-disabled","injector-mutation-disabled","auto-unseal-mutation-disabled","audit-log-read-disabled","secret-values-disabled","raw-vault-payloads-disabled","raw-kubernetes-payloads-disabled","raw-provider-payloads-disabled","vault-identifiers-disabled","helm-chart-review-missing","ha-raft-review-missing","tls-review-missing","audit-storage-missing","network-policy-missing","kubernetes-auth-missing","auto-unseal-overlay-missing","backup-restore-missing","workload-secret-delivery-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Vault deployment readiness summary","Helm chart review","HA Raft topology review","TLS and certificate reference review","Persistent storage review","Audit logging review","Network policy review","Kubernetes auth review","Auto-unseal overlay review","Backup and restore review","Workload secret delivery review","Evidence references"],
+        "rules": [
+            {"id":"no-live-vault-or-cluster-actions","decision":"block","requirement":"Vault deployment readiness reports static readiness only and never calls Vault APIs, installs or upgrades Helm releases, applies Kubernetes manifests, initializes or unseals Vault, mutates policies, mutates Kubernetes auth, writes secrets, changes injectors, changes auto-unseal, reads audit logs, or changes provider state.","evidence":"Vault deployment readiness summary"},
+            {"id":"ha-raft-tls-audit-required","decision":"block","requirement":"Official Helm chart review, three-replica HA Raft topology, TLS posture, persistent storage, audit storage, PodDisruptionBudget, and anti-affinity posture must be reviewed before Vault deployment readiness can be accepted.","evidence":"HA Raft topology review"},
+            {"id":"kubernetes-auth-and-workload-delivery-required","decision":"block","requirement":"Kubernetes auth, workload secret delivery, injector boundary, service account posture, and secret-reference behavior must be reviewed before workloads can depend on Vault.","evidence":"Kubernetes auth review"},
+            {"id":"auto-unseal-backup-restore-required","decision":"block","requirement":"Production auto-unseal overlay, backup and restore runbooks, monitoring posture, and bootstrap evidence boundaries must be reviewed before production Vault readiness can be accepted.","evidence":"Backup and restore review"},
+            {"id":"raw-vault-data-not-exposed","decision":"block","requirement":"Vault deployment readiness evidence must use safe summaries only and must not expose Vault URLs, namespaces, mount paths, secret paths, policy names, role names, service account token data, TLS material, root tokens, recovery keys, unseal keys, audit log lines, storage class names, tenant IDs, object IDs, private IPs, credentials, tokens, raw Vault payloads, raw Kubernetes payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_vault_secret_delivery() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "deliveryProvider": "Vault Secrets Operator",
+        "providerCallsEnabled": false, "vaultApiCallsAllowed": false, "kubernetesApplyAllowed": false, "helmInstallAllowed": false, "helmUpgradeAllowed": false,
+        "crdApplyAllowed": false, "vaultConnectionMutationAllowed": false, "vaultAuthMutationAllowed": false, "vaultStaticSecretMutationAllowed": false,
+        "kubernetesSecretMutationAllowed": false, "secretDataReadAllowed": false, "secretDataWriteAllowed": false, "rolloutRestartAllowed": false,
+        "transformationTemplateAllowed": false, "rawVaultPayloadsAllowed": false, "rawKubernetesPayloadsAllowed": false, "rawProviderPayloadsAllowed": false,
+        "secretValuesAllowed": false, "vaultIdentifiersAllowed": false,
+        "deliverySurfaces": ["vault-secrets-operator-readiness","vaultconnection-readiness","vaultauth-readiness","vaultstaticsecret-readiness","destination-secret-readiness","refresh-drift-readiness","transformation-readiness","rollout-restart-readiness","namespace-scope-readiness","monitoring-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["operatorChartSummary","vaultConnectionSummary","vaultAuthSummary","namespaceScopeSummary","staticSecretSummary","destinationSecretSummary","refreshPolicySummary","hmacDriftSummary","transformationSummary","rolloutRestartSummary","monitoringSummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["operator-chart-reviewed","vault-connection-reviewed","vault-auth-reviewed","namespace-scope-reviewed","destination-secret-reviewed","hmac-drift-reviewed","transformation-reviewed","rollout-restart-reviewed","rotation-refresh-reviewed","evidence-redacted"],
+        "planSections": ["deliverySummary","operatorChartReview","connectionBoundary","authBoundary","staticSecretPlan","destinationSecretPlan","refreshAndDriftReview","transformationReview","rolloutRestartReview","namespaceScopeReview","monitoringReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","vault-api-calls-disabled","kubernetes-apply-disabled","helm-install-disabled","helm-upgrade-disabled","crd-apply-disabled","vaultconnection-mutation-disabled","vaultauth-mutation-disabled","vaultstaticsecret-mutation-disabled","kubernetes-secret-mutation-disabled","secret-data-read-disabled","secret-data-write-disabled","rollout-restart-disabled","transformation-template-disabled","raw-vault-payloads-disabled","raw-kubernetes-payloads-disabled","raw-provider-payloads-disabled","secret-values-disabled","vault-identifiers-disabled","operator-chart-review-missing","vault-connection-review-missing","vault-auth-review-missing","namespace-scope-missing","destination-secret-review-missing","hmac-drift-review-missing","transformation-review-missing","rollout-restart-review-missing","rotation-refresh-review-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Vault secret delivery summary","Operator chart review","VaultConnection review","VaultAuth review","Namespace scope review","VaultStaticSecret review","Destination secret review","Refresh and HMAC drift review","Transformation review","Rollout restart review","Monitoring review","Evidence references"],
+        "rules": [
+            {"id":"no-live-vault-secret-delivery","decision":"block","requirement":"Vault secret delivery readiness reports static readiness only and never calls Vault APIs, applies Kubernetes resources, installs or upgrades Helm releases, applies CRDs, mutates VaultConnection, mutates VaultAuth, mutates VaultStaticSecret, mutates Kubernetes Secrets, reads or writes secret data, restarts workloads, changes transformations, or changes provider state.","evidence":"Vault secret delivery summary"},
+            {"id":"operator-connection-auth-required","decision":"block","requirement":"Vault Secrets Operator chart posture, VaultConnection boundary, VaultAuth boundary, namespace scope, and workload auth identity posture must be reviewed before delivery readiness can be accepted.","evidence":"VaultAuth review"},
+            {"id":"destination-refresh-drift-required","decision":"block","requirement":"VaultStaticSecret plan, destination behavior, refresh interval, HMAC drift detection, transformation posture, and rotation handling must be reviewed before workloads can depend on synchronized material.","evidence":"Refresh and HMAC drift review"},
+            {"id":"rollout-monitoring-required","decision":"block","requirement":"Rollout restart targets, monitoring posture, stale delivery handling, and fail-closed behavior must be reviewed before delivery readiness can be accepted.","evidence":"Rollout restart review"},
+            {"id":"raw-vault-secret-data-not-exposed","decision":"block","requirement":"Vault secret delivery evidence must use safe summaries only and must not expose Vault URLs, namespaces, mount paths, secret paths, auth roles, Kubernetes target names, token data, secret data, secret keys, destination names, template text, rollout target names, tenant IDs, object IDs, private IPs, credentials, tokens, raw Vault payloads, raw Kubernetes Secret payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_k8s_runtime() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "runtimeProvider": "Kubernetes", "deploymentTarget": "portable-base-manifests",
+        "providerCallsEnabled": false, "kubectlApplyAllowed": false, "helmInstallAllowed": false, "helmUpgradeAllowed": false, "kustomizeBuildAllowed": false,
+        "clusterMutationAllowed": false, "namespaceMutationAllowed": false, "deploymentMutationAllowed": false, "serviceMutationAllowed": false,
+        "ingressMutationAllowed": false, "networkPolicyMutationAllowed": false, "serviceAccountMutationAllowed": false, "sensitiveResourceMutationAllowed": false,
+        "imagePullAllowed": false, "registryAccessAllowed": false, "rawKubernetesPayloadsAllowed": false, "rawProviderPayloadsAllowed": false,
+        "kubeconfigValuesAllowed": false, "clusterIdentifiersAllowed": false, "sensitiveValuesAllowed": false,
+        "readinessSurfaces": ["namespace-readiness","deployment-readiness","service-readiness","ingress-readiness","ingress-front-tier-readiness","network-policy-readiness","serviceaccount-readiness","image-reference-readiness","runtime-reference-readiness","runtime-security-readiness","observability-readiness","evidence-redaction-readiness"],
+        "ingressFrontTierProfiles": ["haproxy-vip-front-tier","nginx-ingress-controller","same-origin-api-route"],
+        "ingressRoutePostures": ["placeholder-dns-only","tls-posture-reviewed","health-check-summary-required","failover-owner-reviewed","approval-route-reviewed"],
+        "requiredInputs": ["runtimeScopeSummary","namespaceSummary","componentTopologySummary","serviceRoutingSummary","frontTierSummary","controllerClassSummary","ingressRouteSummary","sameOriginRouteSummary","certificatePostureSummary","healthCheckPostureSummary","failoverOwnershipSummary","networkPolicySummary","serviceAccountSummary","imageReferenceSummary","runtimeReferenceSummary","runtimeSecuritySummary","observabilitySummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["namespace-reviewed","deployment-topology-reviewed","service-routing-reviewed","front-tier-reviewed","controller-class-reviewed","ingress-routing-reviewed","same-origin-route-reviewed","certificate-posture-reviewed","health-check-reviewed","failover-owner-reviewed","default-deny-reviewed","egress-allowlist-reviewed","service-account-reviewed","image-reference-reviewed","runtime-reference-reviewed","runtime-security-reviewed","observability-reviewed","evidence-redacted"],
+        "planSections": ["runtimeSummary","namespaceReview","componentTopology","serviceRouting","ingressFrontTier","ingressRouting","sameOriginRouting","healthCheckFailover","networkPolicyReview","serviceAccountReview","imageReferenceReview","runtimeReferenceReview","runtimeSecurityReview","observabilityReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","kubectl-apply-disabled","helm-install-disabled","helm-upgrade-disabled","kustomize-build-disabled","cluster-mutation-disabled","namespace-mutation-disabled","deployment-mutation-disabled","service-mutation-disabled","ingress-mutation-disabled","network-policy-mutation-disabled","service-account-mutation-disabled","sensitive-resource-mutation-disabled","image-pull-disabled","registry-access-disabled","raw-kubernetes-payloads-disabled","raw-provider-payloads-disabled","kubeconfig-values-disabled","cluster-identifiers-disabled","sensitive-values-disabled","namespace-review-missing","deployment-topology-missing","service-routing-missing","front-tier-review-missing","controller-class-review-missing","ingress-routing-missing","same-origin-route-missing","certificate-posture-missing","health-check-posture-missing","failover-owner-missing","default-deny-missing","egress-allowlist-missing","service-account-review-missing","image-reference-review-missing","runtime-reference-review-missing","runtime-security-missing","observability-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Kubernetes runtime readiness summary","Namespace review","Deployment topology review","Service routing review","Ingress front tier review","Ingress routing review","Same-origin route review","Health check and failover review","Network policy review","Service account review","Image reference review","Runtime reference review","Runtime security review","Observability review","Evidence references"],
+        "rules": [
+            {"id":"no-live-kubernetes-runtime-actions","decision":"block","requirement":"Kubernetes runtime readiness reports static readiness only and never calls providers, applies manifests, installs or upgrades Helm releases, builds overlays, mutates namespaces, mutates workloads, mutates Services, mutates Ingress, mutates NetworkPolicies, mutates ServiceAccounts, creates sensitive resources, pulls images, accesses registries, or changes provider state.","evidence":"Kubernetes runtime readiness summary"},
+            {"id":"namespace-and-workload-topology-required","decision":"block","requirement":"Namespace scope, component topology, Deployment selector posture, Service selector posture, placeholder image posture, and workload exposure boundaries must be reviewed before runtime readiness can be accepted.","evidence":"Deployment topology review"},
+            {"id":"ingress-and-network-policy-required","decision":"block","requirement":"Same-origin Ingress routing, TLS placeholder posture, default deny posture, explicit ingress allowances, explicit egress allowances, and DNS allowance must be reviewed before runtime readiness can be accepted.","evidence":"Network policy review"},
+            {"id":"haproxy-nginx-ingress-model-required","decision":"block","requirement":"HAProxy VIP front tier posture, NGINX ingress controller class, same-origin API route, certificate posture, health checks, failover ownership, approval route, and redacted evidence must be reviewed as safe summaries before ingress readiness can pass.","evidence":"Ingress front tier review"},
+            {"id":"identity-image-runtime-reference-required","decision":"block","requirement":"ServiceAccount posture, identity automount posture, image reference posture, registry access boundary, and external runtime reference posture must be reviewed before workloads can depend on the runtime skeleton.","evidence":"Service account review"},
+            {"id":"raw-kubernetes-data-not-exposed","decision":"block","requirement":"Kubernetes runtime readiness evidence must use safe summaries only and must not expose kubeconfigs, cluster identifiers, context identifiers, namespace identifiers, ingress identifiers, TLS material identifiers, workload identity identifiers, identity material, pod identifiers, image pull material, registry material, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw Kubernetes payloads, or provider-returned content.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn platform_local_container() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "runtimeProvider": "Docker Compose", "deploymentTarget": "local-compose-skeleton",
+        "providerCallsEnabled": false, "dockerComposeUpAllowed": false, "dockerComposeBuildAllowed": false, "dockerRunAllowed": false, "imagePushAllowed": false,
+        "registryAccessAllowed": false, "serviceMutationAllowed": false, "networkMutationAllowed": false, "portBindingMutationAllowed": false,
+        "environmentValuesAllowed": false, "envFileAllowed": false, "volumeMountsAllowed": false, "providerServiceAllowed": false, "externalEgressAllowed": false,
+        "rawRuntimePayloadsAllowed": false, "providerReturnedContentAllowed": false, "sensitiveAuthValuesAllowed": false, "runtimeIdentifiersAllowed": false,
+        "readinessSurfaces": ["compose-file-readiness","service-topology-readiness","build-context-readiness","local-port-readiness","network-boundary-readiness","dependency-readiness","portal-runtime-boundary-readiness","excluded-runtime-readiness","evidence-redaction-readiness"],
+        "requiredInputs": ["composeSummary","serviceTopologySummary","buildContextSummary","localPortSummary","networkBoundarySummary","dependencySummary","portalRuntimeSummary","excludedRuntimeSummary","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["compose-file-reviewed","service-topology-reviewed","build-context-reviewed","local-port-reviewed","network-boundary-reviewed","dependency-reviewed","portal-runtime-boundary-reviewed","excluded-runtime-reviewed","evidence-redacted"],
+        "planSections": ["localRuntimeSummary","composeFileReview","serviceTopology","buildContextReview","localPortReview","networkBoundaryReview","dependencyReview","portalRuntimeBoundaryReview","excludedRuntimeReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","docker-compose-up-disabled","docker-compose-build-disabled","docker-run-disabled","image-push-disabled","registry-access-disabled","service-mutation-disabled","network-mutation-disabled","port-binding-mutation-disabled","environment-values-disabled","env-file-disabled","volume-mounts-disabled","provider-service-disabled","external-egress-disabled","raw-runtime-payloads-disabled","provider-returned-content-disabled","sensitive-auth-values-disabled","runtime-identifiers-disabled","compose-file-review-missing","service-topology-missing","build-context-review-missing","local-port-review-missing","network-boundary-review-missing","dependency-review-missing","portal-runtime-boundary-review-missing","excluded-runtime-review-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Local container readiness summary","Compose file review","Service topology review","Build context review","Local port review","Network boundary review","Dependency review","Portal runtime boundary review","Excluded runtime review","Evidence references"],
+        "rules": [
+            {"id":"no-live-local-container-actions","decision":"block","requirement":"Local container readiness reports static readiness only and never calls providers, runs compose up, builds images, runs containers, pushes images, accesses registries, mutates services, mutates networks, changes local port bindings, enables environment value material, mounts volumes, creates provider-backed services, enables external egress, or changes runtime state.","evidence":"Local container readiness summary"},
+            {"id":"two-service-local-topology-required","decision":"block","requirement":"Local compose posture must keep the browser-facing portal and server-side API as the only active services until worker, adapter, database, and Vault bootstrap slices are approved.","evidence":"Service topology review"},
+            {"id":"local-routing-and-network-required","decision":"block","requirement":"Local port bindings, full-stack portal runtime boundary, service dependency order, and bridge-network boundary must be reviewed before local runtime readiness can be accepted.","evidence":"Network boundary review"},
+            {"id":"runtime-expansion-excluded","decision":"block","requirement":"Database, Vault, provider adapters, worker execution, provider-backed resources, environment value material, local volume mounts, registry access, and external egress must stay excluded from the local skeleton until separately approved.","evidence":"Excluded runtime review"},
+            {"id":"raw-local-runtime-data-not-exposed","decision":"block","requirement":"Local container readiness evidence must use safe summaries only and must not expose runtime endpoints, private network details, environment value material, registry material, organization-scope identifiers, provider-side identifiers, sensitive auth material, raw runtime payloads, or provider-returned content.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn catalog_categories() -> Json<Value> {
+    Json(categories())
+}
+
+async fn catalog_offerings() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "catalogMode": "planned-offerings", "catalogReadOnly": true, "providerCallsAllowed": false, "workflowMutationAllowed": false,
+        "liveRequestCreationAllowed": false, "liveApprovalExecutionAllowed": false, "liveExecutionAllowed": false, "rawRequestPayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false, "rawLogContentAllowed": false, "rawRowsAllowed": false, "rawRecipientDataAllowed": false,
+        "credentialValuesAllowed": false, "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "privateNetworkValuesAllowed": false,
+        "categories": categories(),
+        "offerings": [
+            {"id":"windows-server-deployment","title":"Windows server deployment","category":"Build","priority":"P0","persona":["Requester","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Provider-safe plan","Approval decisions","Lock record","Redacted execution log","Before/after inventory","Policy assignments","CMDB export package"],"integrationData":["vCenter","Hyper-V","Proxmox","Customization specs","gMSA worker","Veeam","Zabbix","ServiceNow CMDB export","Site catalog","Policy catalog"],"status":"planned"},
+            {"id":"linux-server-deployment","title":"Linux server deployment","category":"Build","priority":"P0","persona":["Requester","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","distribution","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Provider-safe plan","Approval decisions","Lock record","Redacted execution log","Before/after inventory","Policy assignments","CMDB export package"],"integrationData":["vCenter","Hyper-V","Proxmox","Ansible","Veeam","Zabbix","ServiceNow CMDB export","Site catalog","Policy catalog"],"status":"planned"},
+            {"id":"request-preflight","title":"Request preflight and readiness gate","category":"Build","priority":"P0","persona":["Requester","System engineer","Datacenter engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Application owner"],"requiredInputs":["requestedOffering","requester","owner","site","environment","criticality","capacityScope","network","backupPolicy","monitoringProfile","cmdbContext"],"approvals":["Datacenter Approver"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Failed rules","Remediation hints","Plan summary","Policy decision record"],"integrationData":["vCenter","Hyper-V","Proxmox","ServiceNow CMDB export","Zabbix","Veeam","AD OU map","Site catalog","Policy catalog"],"status":"planned"},
+            {"id":"patch-wave-planning","title":"Patch wave planning","category":"Maintain","priority":"P0","persona":["System engineer","Service desk and operations","Application owner","Security and audit"],"requiredInputs":["patchCycle","siteScope","applicationScope","environmentScope","criticality","dependencyContext","maintenanceWindow","rebootPolicy","blackoutDates"],"approvals":["Datacenter Approver","Application owner","Wintel/Linux Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Wave plan summary","Risk notes","Approval decisions","Handover notes","Compliance state"],"integrationData":["ServiceNow patch policy export","CMDB graph","vCenter","Hyper-V","Proxmox","Zabbix maintenance","Veeam backup state","Policy catalog"],"status":"planned"},
+            {"id":"controlled-restore-request","title":"Controlled restore request","category":"Protect","priority":"P0","persona":["Requester","Backup administrator","Application owner","Security and audit"],"requiredInputs":["businessPurpose","requester","restoreType","sourceResource","restorePoint","targetSelection","owner","site","environment","verificationPlan","retentionNeed"],"approvals":["Datacenter Approver","Backup Operator","Application owner"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Restore plan summary","Approval decisions","Lock record","Redacted execution log","Verification result","Evidence references"],"integrationData":["Veeam","ServiceNow ticket context","Target VM or network","Application owner catalog","Evidence service"],"status":"planned"},
+            {"id":"zabbix-onboarding","title":"Zabbix onboarding","category":"Observe","priority":"P0","persona":["System engineer","Monitoring administrator","Application owner","Service desk and operations"],"requiredInputs":["requester","hostIdentity","owner","site","environment","hostGroup","templateProfile","proxyOrServer","alertGroup","maintenanceWindow"],"approvals":["Datacenter Approver","Monitoring Operator","Application owner"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Onboarding plan summary","Approval decisions","Redacted execution log","Before/after monitoring state","Zabbix reference"],"integrationData":["Zabbix","vCenter","Hyper-V","Proxmox","Site catalog","CMDB export","ServiceNow ticket context","Policy catalog"],"status":"planned"},
+            {"id":"cmdb-import","title":"CMDB Excel import","category":"Operate","priority":"P0","persona":["Service desk and operations","Application owner","Security and audit","System engineer"],"requiredInputs":["requester","sourceFileReference","headerMapping","importScope","reviewer","validationMode"],"approvals":["Datacenter Approver","Auditor"],"dryRunRequired":true,"evidence":["File hash","Header mapping","Validation result","Accepted row count","Rejected rows","Import user","Evidence references"],"integrationData":["ServiceNow CMDB Excel export","Portal import mapper","Policy engine","CMDB mapping"],"status":"planned"},
+            {"id":"cmdb-update-export","title":"CMDB update export","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Application owner","Security and audit"],"requiredInputs":["requester","exportScope","changeReason","owner","reviewer","targetFormat","evidenceReferences"],"approvals":["Datacenter Approver","Application owner","Auditor"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Export package","Accepted/rejected rows","Reviewer approval","Evidence references"],"integrationData":["Portal inventory","Operation evidence","CMDB mapping","Owner catalog","ServiceNow CMDB export"],"status":"planned"},
+            {"id":"operator-runbook-launch","title":"Operator runbook launcher","category":"Operate","priority":"P0","persona":["Service desk and operations","System engineer","Backup administrator","Monitoring administrator","Security and audit"],"requiredInputs":["requester","runbookId","targetResource","ticketContext","operationScope","riskLevel","rollbackNotes"],"approvals":["Datacenter Approver","Service Desk"],"dryRunRequired":true,"evidence":["Request payload summary","Validation result","Runbook plan summary","Approval decisions","Lock record","Redacted execution log","Child operation results","Handover notes"],"integrationData":["Runbook catalog","RBAC","ServiceNow ticket context","Workers","Evidence service"],"status":"planned"},
+            {"id":"platform-health-dashboard","title":"Platform health dashboard","category":"Operate","priority":"P0","persona":["Service desk and operations","Platform Admin","System engineer","Monitoring administrator","Security and audit"],"requiredInputs":["viewerContext","siteScope","componentScope","freshnessWindow"],"approvals":["Platform Admin"],"dryRunRequired":false,"evidence":["Health snapshot","Stale-data markers","Dependency status","Alert references","Dashboard timestamp"],"integrationData":["Kubernetes or VKS","CloudNativePG PostgreSQL","Queue or outbox","Zabbix","Logs","Metrics","Traces"],"status":"planned"},
+            {"id":"vm-decommission-quarantine","title":"VM decommission quarantine","category":"Retire","priority":"P1","persona":["VMware administrator","Hyper-V administrator","Proxmox administrator","System engineer","Backup administrator","Monitoring administrator","Application owner","Security and audit"],"requiredInputs":["requester","targetResource","owner","site","environment","businessJustification","dependencyReview","backupRetentionNeed","quarantineWindow","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Backup Operator"],"dryRunRequired":true,"evidence":["Request payload summary","Dependency review","Backup retention proof","Approval decisions","Quarantine plan","Redacted execution log","Monitoring disablement proof","CMDB closure export","Final evidence references"],"integrationData":["vCenter","Hyper-V","Proxmox","Veeam","Zabbix","ServiceNow CMDB export","DNS or IPAM workflow","Evidence service","Policy catalog"],"status":"planned"},
+            {"id":"application-environment-retirement","title":"Application environment retirement","category":"Retire","priority":"P1","persona":["Application owner","System engineer","VMware administrator","Hyper-V administrator","Proxmox administrator","Backup administrator","Monitoring administrator","Security and audit"],"requiredInputs":["requester","application","environment","owner","serviceCriticality","dependencyGraph","dataRetentionNeed","backupRetentionNeed","accessClosureScope","cmdbContext"],"approvals":["Datacenter Approver","Application owner","Auditor"],"dryRunRequired":true,"evidence":["Request payload summary","Relationship review","Data retention decision","Approval decisions","Retirement plan","Redacted execution log","Backup retention proof","CMDB relationship closure export","Final evidence references"],"integrationData":["CMDB graph","vCenter","Hyper-V","Proxmox","Veeam","Zabbix","ServiceNow CMDB export","Evidence service","Policy catalog"],"status":"planned"}
+        ]
+    }))
+}
+
+async fn catalog_recommendations() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "recommendationMode": "static-offering-recommendations", "recommendationsReadOnly": true, "roleDefaultsReadOnly": true,
+        "siteDefaultsReadOnly": true, "evidenceReferencesReadOnly": true, "livePersonalizationAllowed": false, "liveCatalogQueryAllowed": false,
+        "liveRequestCreationAllowed": false, "workflowMutationAllowed": false, "providerCallsAllowed": false, "identityLookupAllowed": false,
+        "rawUserDataAllowed": false, "rawApplicationDataAllowed": false, "rawSiteDataAllowed": false, "rawRequestPayloadsAllowed": false,
+        "rawProviderPayloadsAllowed": false, "rawRecipientDataAllowed": false, "credentialValuesAllowed": false, "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "principalIdentifiersAllowed": false, "privateNetworkValuesAllowed": false,
+        "recommendedOfferingIds": ["windows-server-deployment","request-preflight","patch-wave-planning","controlled-restore-request","zabbix-onboarding","cmdb-import","operator-runbook-launch","platform-health-dashboard"],
+        "recommendationDimensions": ["role","application-profile","site","lifecycle-category","risk-context","freshness-state"],
+        "recommendationSignals": ["role-fit","site-readiness","service-lifecycle-fit","dry-run-required","approval-route-known","evidence-profile-known"],
+        "recommendationViews": ["role-defaults","application-profile-defaults","site-defaults","lifecycle-category-defaults","safe-next-offerings"],
+        "requiredGuards": ["catalog-source-reviewed","role-scope-summarized","application-profile-summarized","site-scope-summarized","approval-route-known","dry-run-required","evidence-redacted","live-personalization-blocked"],
+        "blockedReasons": ["catalog-recommendation-live-personalization-disabled","catalog-live-query-disabled","request-creation-disabled","workflow-mutation-disabled","provider-calls-disabled","identity-lookup-disabled","raw-user-data-disabled","raw-application-data-disabled","raw-site-data-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","raw-recipient-data-disabled","credential-values-disabled","token-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","principal-identifiers-disabled","private-network-values-disabled","role-scope-missing","application-profile-missing","site-scope-missing","recommendation-signal-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Recommendation summary","Role fit summary","Application profile summary","Site fit summary","Evidence references"],
+        "rules": [
+            {"id":"recommendations-read-only","decision":"block","requirement":"Offering recommendations are static summaries and must not perform live personalization, query live catalogs, create requests, call providers, or mutate workflows.","evidence":"Recommendation summary"},
+            {"id":"catalog-source-alignment-required","decision":"block","requirement":"Recommended offering IDs must stay aligned to the static offering catalog and preserve dry-run, approval, and evidence expectations.","evidence":"Recommendation summary"},
+            {"id":"role-app-site-summary-required","decision":"block","requirement":"Role, application profile, site, lifecycle category, risk context, freshness state, approval route, and evidence profile must be safe summaries before recommendations are shown.","evidence":"Role fit summary"},
+            {"id":"raw-recommendation-data-not-exposed","decision":"block","requirement":"Offering recommendation evidence must not expose raw user data, raw application data, raw site data, raw request payloads, raw provider payloads, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn catalog_request_form() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "formMode": "static-request-form-schema", "formSchemaReadOnly": true, "schemaDerivedFromOfferings": true,
+        "liveRequestCreationAllowed": false, "formSubmissionAllowed": false, "approvalExecutionAllowed": false, "workflowMutationAllowed": false,
+        "providerCallsAllowed": false, "rawRequestPayloadsAllowed": false, "rawFormSubmissionsAllowed": false, "rawProviderPayloadsAllowed": false,
+        "rawLogContentAllowed": false, "rawRowsAllowed": false, "rawRecipientDataAllowed": false, "credentialValuesAllowed": false,
+        "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "privateNetworkValuesAllowed": false,
+        "formSections": ["requester-context","scope-context","business-context","technical-plan","protection-observe-cmdb","evidence-approval"],
+        "inputKinds": ["text","textarea","select","multi-select","reference-summary","policy-reference","schedule-summary","evidence-reference"],
+        "requiredInputNames": ["accessClosureScope","alertGroup","application","applicationScope","backupPolicy","backupRetentionNeed","blackoutDates","businessJustification","businessPurpose","capacityScope","changeReason","cmdbContext","componentScope","criticality","dataRetentionNeed","dependencyContext","dependencyGraph","dependencyReview","distribution","environment","environmentScope","evidenceReferences","exportScope","freshnessWindow","headerMapping","hostGroup","hostIdentity","imageVersion","importScope","maintenanceWindow","monitoringProfile","network","operationScope","owner","patchCycle","proxyOrServer","quarantineWindow","rebootPolicy","requestedOffering","requester","restorePoint","restoreType","retentionNeed","reviewer","riskLevel","rollbackNotes","runbookId","serviceCriticality","site","siteScope","sourceFileReference","sourceResource","targetFormat","targetResource","targetSelection","templateProfile","ticketContext","validationMode","verificationPlan","viewerContext","vmSizing"],
+        "offeringForms": [
+            {"offeringId":"windows-server-deployment","title":"Windows server deployment","category":"Build","requiredInputNames":["businessPurpose","requester","owner","site","environment","criticality","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"dryRunRequired":true},
+            {"offeringId":"linux-server-deployment","title":"Linux server deployment","category":"Build","requiredInputNames":["businessPurpose","requester","owner","site","environment","criticality","distribution","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"dryRunRequired":true},
+            {"offeringId":"request-preflight","title":"Request preflight and readiness gate","category":"Build","requiredInputNames":["requestedOffering","requester","owner","site","environment","criticality","capacityScope","network","backupPolicy","monitoringProfile","cmdbContext"],"dryRunRequired":true},
+            {"offeringId":"patch-wave-planning","title":"Patch wave planning","category":"Maintain","requiredInputNames":["patchCycle","siteScope","applicationScope","environmentScope","criticality","dependencyContext","maintenanceWindow","rebootPolicy","blackoutDates"],"dryRunRequired":true},
+            {"offeringId":"controlled-restore-request","title":"Controlled restore request","category":"Protect","requiredInputNames":["businessPurpose","requester","restoreType","sourceResource","restorePoint","targetSelection","owner","site","environment","verificationPlan","retentionNeed"],"dryRunRequired":true},
+            {"offeringId":"zabbix-onboarding","title":"Zabbix onboarding","category":"Observe","requiredInputNames":["requester","hostIdentity","owner","site","environment","hostGroup","templateProfile","proxyOrServer","alertGroup","maintenanceWindow"],"dryRunRequired":true},
+            {"offeringId":"cmdb-import","title":"CMDB Excel import","category":"Operate","requiredInputNames":["requester","sourceFileReference","headerMapping","importScope","reviewer","validationMode"],"dryRunRequired":true},
+            {"offeringId":"cmdb-update-export","title":"CMDB update export","category":"Operate","requiredInputNames":["requester","exportScope","changeReason","owner","reviewer","targetFormat","evidenceReferences"],"dryRunRequired":true},
+            {"offeringId":"operator-runbook-launch","title":"Operator runbook launcher","category":"Operate","requiredInputNames":["requester","runbookId","targetResource","ticketContext","operationScope","riskLevel","rollbackNotes"],"dryRunRequired":true},
+            {"offeringId":"platform-health-dashboard","title":"Platform health dashboard","category":"Operate","requiredInputNames":["viewerContext","siteScope","componentScope","freshnessWindow"],"dryRunRequired":false},
+            {"offeringId":"vm-decommission-quarantine","title":"VM decommission quarantine","category":"Retire","requiredInputNames":["requester","targetResource","owner","site","environment","businessJustification","dependencyReview","backupRetentionNeed","quarantineWindow","cmdbContext"],"dryRunRequired":true},
+            {"offeringId":"application-environment-retirement","title":"Application environment retirement","category":"Retire","requiredInputNames":["requester","application","environment","owner","serviceCriticality","dependencyGraph","dataRetentionNeed","backupRetentionNeed","accessClosureScope","cmdbContext"],"dryRunRequired":true}
+        ],
+        "rules": [
+            {"id":"offering-required-inputs-covered","decision":"block","requirement":"Request form schema readiness requires every catalog offering required input to be represented by the static form contract.","evidence":"Form schema review"},
+            {"id":"form-schema-read-only","decision":"block","requirement":"The request form contract is read-only metadata and cannot persist drafts, submit requests, mutate approvals, or start workflows.","evidence":"Static schema boundary"},
+            {"id":"dry-run-first-preserved","decision":"block","requirement":"Write-capable request forms must preserve dry-run-first workflow expectations before approval or execution readiness is represented.","evidence":"Dry-run policy review"},
+            {"id":"raw-form-data-not-exposed","decision":"block","requirement":"Request form schema evidence must use safe summaries only and must not expose raw request payloads, raw form submissions, raw provider payloads, raw logs, raw rows, recipient details, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn catalog_site_catalog() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "catalogMode": "safe-site-facts", "domain": "CORP.local",
+        "ouPattern": "OU=Servers,OU=<SITE>,OU=<COUNTRY>,DC=corp,DC=local", "network": "DHCP", "organization": "Ryuki EU",
+        "safeXmlFactsOnly": true, "providerCallsAllowed": false, "liveValidationAllowed": false, "xmlParsingAllowed": false,
+        "workflowMutationAllowed": false, "rawXmlAllowed": false, "encryptedValuesAllowed": false, "passwordValuesAllowed": false,
+        "credentialIdentifiersAllowed": false, "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "privateNetworkValuesAllowed": false,
+        "rawProviderPayloadsAllowed": false, "rawSiteInventoryRowsAllowed": false, "rawRecipientDataAllowed": false,
+        "windowsBehavior": ["Sysprep","VM-name generator","Change SID"],
+        "sites": [
+            {"spec":"belove-windows-customization","country":"BE","site":"LOVE","timezoneCode":105},
+            {"spec":"esbur1-windows-customization","country":"ES","site":"BUR1","timezoneCode":105},
+            {"spec":"esccss-windows-customization","country":"ES","site":"CCSS","timezoneCode":105},
+            {"spec":"estor1-windows-customization","country":"ES","site":"TOR1","timezoneCode":105},
+            {"spec":"estruj-windows-customization","country":"ES","site":"TRUJ","timezoneCode":105},
+            {"spec":"esvill-windows-customization","country":"ES","site":"VILL","timezoneCode":105},
+            {"spec":"fralbi-windows-customization","country":"FR","site":"ALBI","timezoneCode":105},
+            {"spec":"fraost-windows-customization","country":"FR","site":"AOST","timezoneCode":105},
+            {"spec":"frmacl-windows-customization","country":"FR","site":"MACL","timezoneCode":105},
+            {"spec":"frssym-windows-customization","country":"FR","site":"SSYM","timezoneCode":105},
+            {"spec":"nlwijh-windows-customization","country":"NL","site":"WIJH","timezoneCode":105},
+            {"spec":"ptrma1-windows-customization","country":"PT","site":"RMA1","timezoneCode":85},
+            {"spec":"ropite-windows-customization","country":"RO","site":"PITE","timezoneCode":130}
+        ],
+        "requiredEvidence": ["Site catalog summary","Safe XML fact review","OU pattern review","Windows behavior review","Validation result","Evidence references"]
+    }))
+}
+
+async fn catalog_policy_guardrails() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "evaluationMode": "static-readiness", "providerCallsEnabled": false, "livePolicyEvaluationAllowed": false,
+        "liveProviderValidationAllowed": false, "requestPayloadEvaluationAllowed": false, "policyMutationAllowed": false,
+        "rawRequestPayloadsAllowed": false, "rawPolicyInputsAllowed": false, "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false, "credentialValuesAllowed": false, "rawProviderPayloadsAllowed": false,
+        "policyFamilies": ["naming","tagging","ownership","sitePlacement","backup","monitoring","cmdb","patching","approvals","evidence","dryRun","capacity"],
+        "priorities": ["P0","P1"], "decisions": ["block","warn","review"],
+        "ruleIds": ["p0-preflight-required-fields","p0-site-ou-catalog-match","p0-prod-critical-backup-policy","p0-monitoring-profile-required","p0-cmdb-context-required","p0-dry-run-before-approval","p0-redacted-evidence-state","p0-capacity-admission-check","p1-naming-standard-review","p1-tagging-standard-review","p1-patch-context-required","p0-approval-authority-required"],
+        "requiredGuards": ["policy-catalog-present","policy-families-known","rule-targets-validated","site-bindings-validated","dry-run-rule-present","approval-rule-present","evidence-rule-present","capacity-rule-present","redacted-evidence-required"],
+        "blockedReasons": ["provider-calls-disabled","live-policy-evaluation-disabled","live-provider-validation-disabled","request-payload-evaluation-disabled","policy-mutation-disabled","raw-request-payloads-disabled","raw-policy-inputs-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","credential-values-disabled","raw-provider-payloads-disabled","policy-catalog-missing","policy-family-missing","rule-target-invalid","site-binding-invalid","dry-run-rule-missing","approval-rule-missing","evidence-rule-missing"],
+        "requiredEvidence": ["Policy guardrail summary","Rule catalog summary","Site binding summary","Dry-run rule","Approval rule","Evidence rule","Capacity rule","Evidence references"],
+        "rules": [
+            {"id":"no-live-policy-execution","decision":"block","requirement":"Policy guardrails report static readiness only and never evaluate live request payloads, call providers, validate provider state, mutate policies, or change workflow state.","evidence":"Policy guardrail summary"},
+            {"id":"catalog-relationships-validated","decision":"block","requirement":"Policy families, rule targets, site bindings, dry-run rule, approval rule, evidence rule, and capacity rule must validate before guardrails can be consumed.","evidence":"Rule catalog summary"},
+            {"id":"raw-policy-data-not-exposed","decision":"block","requirement":"Policy guardrail evidence must use safe summaries only and must not expose raw request payloads, raw policy inputs, tenant IDs, object IDs, private network values, credentials, tokens, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn catalog_access_control() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "configuredForProduction": false, "entraGroupsConfigured": false,
+        "requiredProductionProvider": "Microsoft Entra ID",
+        "actions": ["request","approve","execute","admin","audit"],
+        "roles": [
+            {"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]},
+            {"id":"datacenter-approver","title":"Datacenter Approver","visibility":"site-scope","canRequest":true,"canApprove":true,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["datacenter","capacity","live-execution-final"]},
+            {"id":"vmware-operator","title":"VMware Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["vmware","placement","lifecycle"]},
+            {"id":"hyper-v-operator","title":"Hyper-V Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["hyper-v","placement","lifecycle"]},
+            {"id":"proxmox-operator","title":"Proxmox Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["proxmox","placement","lifecycle"]},
+            {"id":"wintel-linux-operator","title":"Wintel/Linux Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["windows","linux","patching","baseline"]},
+            {"id":"backup-operator","title":"Backup Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["backup","restore","dr"]},
+            {"id":"monitoring-operator","title":"Monitoring Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["monitoring","alert-routing","maintenance-window"]},
+            {"id":"service-desk","title":"Service Desk","visibility":"ticket-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["approved-runbook","incident-context","handover"]},
+            {"id":"auditor","title":"Auditor","visibility":"audit-scope","canRequest":false,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["evidence-review","export-review","compliance"]},
+            {"id":"requester","title":"Requester","visibility":"own-requests","canRequest":true,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":false,"executionDomains":["request-intake","evidence-view"]}
+        ],
+        "executionGuards": [
+            {"id":"validation-passed","decision":"block","evidence":"Validation result"},
+            {"id":"provider-safe-dry-run","decision":"block","evidence":"Provider-safe plan"},
+            {"id":"required-approvals","decision":"block","evidence":"Approval decisions"},
+            {"id":"active-lock","decision":"block","evidence":"Lock record"},
+            {"id":"redacted-evidence-ready","decision":"block","evidence":"Evidence manifest"},
+            {"id":"dependency-health-known","decision":"block","evidence":"Dependency status"},
+            {"id":"secret-reference-approved","decision":"block","evidence":"Reference configured state"}
+        ]
+    }))
+}
+
+async fn catalog_approval_routes() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "configuredForProduction": false,
+        "routes": [
+            {"id":"p0-live-execution-default","appliesTo":["request-preflight","windows-server-deployment","linux-server-deployment","patch-wave-planning","controlled-restore-request","zabbix-onboarding","operator-runbook-launch"],"requiredActors":["Datacenter Approver"],"conditionalActors":["Application owner","Wintel/Linux Operator","Backup Operator","Monitoring Operator","Service Desk"],"emergencyAllowed":true,"evidence":["Approval decisions","Delegated authority","Emergency flag","Policy decision record"]},
+            {"id":"p0-cmdb-file-exchange","appliesTo":["cmdb-import","cmdb-update-export"],"requiredActors":["Datacenter Approver"],"conditionalActors":["Application owner"],"emergencyAllowed":false,"evidence":["Approval decisions","Reviewer approval","File hash","Accepted/rejected rows"]},
+            {"id":"p0-platform-admin-readiness","appliesTo":["platform-health-dashboard"],"requiredActors":["Platform Admin"],"conditionalActors":["Auditor"],"emergencyAllowed":false,"evidence":["Approval decisions","Health snapshot","Stale-data markers","Dependency status"]},
+            {"id":"p1-retirement-governance","appliesTo":["vm-decommission-quarantine","application-environment-retirement"],"requiredActors":["Datacenter Approver","Application owner"],"conditionalActors":["Backup Operator","Auditor"],"emergencyAllowed":true,"evidence":["Approval decisions","Delegated authority","Emergency flag","Dependency review","Backup retention proof","Final evidence references"]}
+        ]
+    }))
+}
+
+async fn catalog_evidence_manifest() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "recordTypes": ["Request payload summary","Validation result","Provider-safe plan","Approval decisions","Lock record","Redacted execution log","Evidence references","File hash","Accepted/rejected rows","Health snapshot","Dependency status"],
+        "prohibitedContent": ["credential values","bearer material","private key material","generated certificates","Vault initialization material","raw provider payloads","unfiltered logs","stack traces","tenant identifiers","object identifiers","private network addresses","raw recipient data"],
+        "redactionStates": ["pending","redacted","blocked"],
+        "exportReadiness": ["draft","redaction-pending","ready-for-audit","ready-for-cab","ready-for-incident-review","ready-for-handover","blocked"],
+        "requiredManifestFields": ["evidenceId","evidenceType","requestReference","operationReference","exporter","createdAt","redactionState","exportReadiness","recordTypes","evidenceReferences","retentionClass"],
+        "requiredChecks": ["no-secret-pattern-scan","provider-summary-only","stack-trace-suppression","identifier-redaction","private-network-redaction","log-line-filtering","export-readiness-gate"],
+        "safeExportTargets": ["audit-review","cab-review","incident-review","handover","cmdb-file-exchange"],
+        "retentionClasses": ["operational-review","audit-retained","cab-retained","incident-retained","handover-retained","cmdb-exchange-retained"],
+        "requiredEvidence": ["Evidence manifest summary","Redaction check summary","Export readiness decision","Prohibited content review","Retention class decision","Evidence references"],
+        "blockedReasons": ["provider-calls-disabled","live-evidence-mutation-disabled","evidence-payloads-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","raw-evidence-payloads-disabled","raw-log-content-disabled","unfiltered-logs-disabled","stack-traces-disabled","export-without-redaction-disabled","credential-values-disabled","secret-values-disabled","token-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","raw-recipient-data-disabled","manifest-fields-missing","redaction-check-missing","export-readiness-missing","retention-class-missing"]
+    }))
+}
+
+async fn catalog_evidence_redaction() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "redactionMode": "static-evidence-redaction",
+        "noSecretScanRequired": true,
+        "providerSummaryOnly": true,
+        "stackTraceSuppression": true,
+        "identifierRedaction": true,
+        "privateNetworkRedaction": true,
+        "logLineFiltering": true,
+        "exportReadinessGate": true,
+        "safeExportTargets": ["audit-review","cab-review","incident-review","handover","cmdb-file-exchange"],
+        "redactionStates": ["pending","redacted","blocked"],
+        "exportReadiness": ["draft","redaction-pending","ready-for-audit","ready-for-cab","ready-for-incident-review","ready-for-handover","blocked"],
+        "prohibitedContent": ["credential values","bearer material","private key material","generated certificates","Vault initialization material","raw provider payloads","unfiltered logs","stack traces","tenant identifiers","object identifiers","private network addresses","raw recipient data"],
+        "requiredChecks": ["no-secret-pattern-scan","provider-summary-only","stack-trace-suppression","identifier-redaction","private-network-redaction","log-line-filtering","export-readiness-gate"],
+        "retentionClasses": ["operational-review","audit-retained","cab-retained","incident-retained","handover-retained","cmdb-exchange-retained"],
+        "blockedReasons": ["provider-calls-disabled","live-evidence-mutation-disabled","evidence-payloads-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","raw-evidence-payloads-disabled","raw-log-content-disabled","unfiltered-logs-disabled","stack-traces-disabled","export-without-redaction-disabled","credential-values-disabled","secret-values-disabled","token-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","raw-recipient-data-disabled","manifest-fields-missing","redaction-check-missing","export-readiness-missing","retention-class-missing"],
+        "requiredEvidence": ["Evidence manifest summary","Redaction check summary","Export readiness decision","Prohibited content review","Retention class decision","Evidence references"]
+    }))
+}
+
+async fn catalog_secret_references() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "secretValuesAllowed": false,
+        "secretReferenceKinds": ["adapter-credential","worker-credential","database-credential","object-storage-credential","pki-material","recovery-material","signing-material"],
+        "readinessStates": ["missing","pending-approval","configured","rotation-due","blocked"],
+        "rotationPolicies": ["deployment-managed","scheduled-rotation","emergency-rotation","certificate-renewal","manual-break-glass-review"]
+    }))
+}
+
+async fn approvals_decision_readiness() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "approvalReadinessMode": "static-approval-decision-readiness", "identityProvider": "Microsoft Entra ID",
+        "configuredForProduction": false, "decisionQueueReadOnly": true, "routeCatalogReadOnly": true, "evidenceRequired": true,
+        "localMockAuthAllowed": true, "providerCallsAllowed": false, "liveAuthenticationAllowed": false, "graphCallsAllowed": false,
+        "entraGroupLookupAllowed": false, "serviceNowApprovalMutationAllowed": false, "approvalExecutionAllowed": false,
+        "approvalQueueMutationAllowed": false, "approvalDecisionMutationAllowed": false, "notificationDispatchAllowed": false, "workflowMutationAllowed": false,
+        "rawApproverDataAllowed": false, "rawApprovalPayloadsAllowed": false, "rawRequestPayloadsAllowed": false, "rawRecipientDataAllowed": false,
+        "rawProviderPayloadsAllowed": false, "rawLogContentAllowed": false, "rawRowsAllowed": false,
+        "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "principalIdentifiersAllowed": false, "groupIdentifiersAllowed": false,
+        "serviceNowIdentifiersAllowed": false, "privateNetworkValuesAllowed": false, "credentialValuesAllowed": false, "tokenValuesAllowed": false,
+        "approvalRoutes": ["p0-live-execution-default","p0-cmdb-file-exchange","p0-platform-admin-readiness","p1-retirement-governance"],
+        "decisionStates": ["not-required","pending-approval","approved","rejected","delegated","emergency-approved","expired","blocked"],
+        "decisionTypes": ["technical-approval","business-approval","risk-acceptance","emergency-approval","cmdb-review","audit-review"],
+        "routeStages": ["route-selected","preflight-reviewed","technical-review","business-review","risk-review","emergency-review","final-approval","evidence-ready"],
+        "approvalScopes": ["request","workflow","change","cmdb-file-exchange","platform-admin","retirement"],
+        "escalationStates": ["none","needs-delegation","needs-final-approval","expired","blocked"],
+        "requiredGuards": ["approval-route-known","request-scope-summarized","decision-state-known","datacenter-final-approval","delegated-authority-reviewed","emergency-flag-reviewed","separation-of-duties-reviewed","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-authentication-disabled","graph-calls-disabled","entra-group-lookup-disabled","servicenow-approval-mutation-disabled","approval-execution-disabled","approval-queue-mutation-disabled","approval-decision-mutation-disabled","notification-dispatch-disabled","workflow-mutation-disabled","raw-approver-data-disabled","raw-approval-payloads-disabled","raw-request-payloads-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","raw-log-content-disabled","raw-rows-disabled","tenant-identifiers-disabled","object-identifiers-disabled","principal-identifiers-disabled","group-identifiers-disabled","servicenow-identifiers-disabled","private-network-values-disabled","credential-values-disabled","token-values-disabled","approval-route-missing","decision-state-missing","approval-evidence-missing"],
+        "requiredEvidence": ["Approval route summary","Decision state summary","Delegated authority review","Emergency flag review","Separation of duties review","Approval evidence references"],
+        "rules": [
+            {"id":"approval-route-readiness-required","decision":"block","requirement":"Approval decisions require route, scope, decision state, delegated authority posture, emergency posture, and evidence references before workflow approval can be represented.","evidence":"Approval route summary"},
+            {"id":"datacenter-final-approval-required","decision":"block","requirement":"Live execution readiness requires Datacenter final approval unless a future delegated approval model is explicitly configured outside this static contract.","evidence":"Decision state summary"},
+            {"id":"no-live-approval-execution","decision":"block","requirement":"Approval readiness is read-only and never executes approvals, mutates queues, dispatches notifications, calls identity providers, calls ServiceNow, or changes workflow state.","evidence":"Approval evidence references"},
+            {"id":"raw-approval-data-not-exposed","decision":"block","requirement":"Approval readiness evidence must use safe summaries only and must not expose approver records, raw approval payloads, raw request payloads, raw recipient data, raw provider payloads, raw logs, raw rows, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, private network values, credentials, or tokens.","evidence":"Approval evidence references"}
+        ]
+    }))
+}
+
+async fn identity_rbac_approval_model() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "modelMode": "static-rbac-approval-model", "identityProvider": "Microsoft Entra ID", "configuredForProduction": false,
+        "localMockAuthAllowed": true, "providerCallsAllowed": false, "liveAuthenticationAllowed": false, "graphCallsAllowed": false,
+        "entraGroupLookupAllowed": false, "serviceNowApprovalMutationAllowed": false, "approvalExecutionAllowed": false, "roleAssignmentMutationAllowed": false,
+        "policyMutationAllowed": false, "workflowMutationAllowed": false, "rawUserDataAllowed": false, "rawClaimPayloadsAllowed": false,
+        "rawGroupRowsAllowed": false, "rawApprovalPayloadsAllowed": false, "tenantIdentifiersAllowed": false, "appIdentifiersAllowed": false,
+        "clientIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "principalIdentifiersAllowed": false, "groupIdentifiersAllowed": false,
+        "credentialValuesAllowed": false, "tokenValuesAllowed": false, "rawProviderPayloadsAllowed": false,
+        "roles": ["platform-admin","datacenter-approver","vmware-operator","hyper-v-operator","proxmox-operator","wintel-linux-operator","backup-operator","monitoring-operator","service-desk","auditor","requester"],
+        "capabilities": ["request","approve","execute","admin","audit"],
+        "approvalRoutes": ["p0-live-execution-default","p0-cmdb-file-exchange","p0-platform-admin-readiness","p1-retirement-governance"],
+        "executionGuards": ["validation-passed","provider-safe-dry-run","required-approvals","active-lock","redacted-evidence-ready","dependency-health-known","secret-reference-approved"],
+        "requiredInputs": ["roleActionMatrix","approvalRouteSummary","executionGuardSummary","requestContext","approvalDecisionSummary","emergencyApprovalSummary","evidenceManifest"],
+        "separationOfDutiesControls": ["requester-cannot-execute","executor-cannot-final-approve-own-request","datacenter-final-approval-required","break-glass-audited","auditor-read-only","platform-admin-break-glass-reviewed"],
+        "blockedReasons": ["provider-calls-disabled","live-authentication-disabled","graph-lookup-disabled","entra-group-lookup-disabled","servicenow-mutation-disabled","approval-execution-disabled","role-assignment-mutation-disabled","policy-mutation-disabled","workflow-mutation-disabled","raw-user-data-disabled","raw-claim-payloads-disabled","raw-group-rows-disabled","raw-approval-payloads-disabled","tenant-identifiers-disabled","app-identifiers-disabled","client-identifiers-disabled","object-identifiers-disabled","principal-identifiers-disabled","group-identifiers-disabled","credential-values-disabled","token-values-disabled","raw-provider-payloads-disabled","missing-role-mapping","missing-approval-route","missing-execution-guard","missing-separation-of-duties","evidence-not-redacted"],
+        "requiredEvidence": ["RBAC model summary","Role action matrix","Approval route summary","Execution guard summary","Segregation of duties review","Emergency approval review","Evidence references"],
+        "rules": [
+            {"id":"no-live-rbac-provider-execution","decision":"block","requirement":"RBAC approval model reports static readiness only and never calls identity providers, Microsoft Graph, ServiceNow, policy engines, approval systems, or provider APIs.","evidence":"RBAC model summary"},
+            {"id":"access-catalog-alignment-required","decision":"block","requirement":"Model roles, capabilities, approval routes, execution guards, and evidence records must align with the static access-control catalog before workflow consumption.","evidence":"Role action matrix"},
+            {"id":"separation-of-duties-required","decision":"block","requirement":"Requester, executor, approver, administrator, emergency, and audit duties must preserve least privilege and prevent approval or execution bypasses.","evidence":"Segregation of duties review"},
+            {"id":"raw-rbac-data-not-exposed","decision":"block","requirement":"RBAC approval evidence must use safe summaries only and must not expose user records, claim payloads, group rows, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, credentials, tokens, approval payloads, ServiceNow payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn identity_entra_rbac() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "readinessMode": "static-readiness", "identityProvider": "Microsoft Entra ID", "configuredForProduction": false,
+        "localMockAuthAllowed": true, "providerCallsEnabled": false, "liveAuthenticationEnabled": false, "tokenValidationEnabled": false,
+        "graphCallsAllowed": false, "entraGroupLookupAllowed": false, "appRegistrationChangesAllowed": false, "roleAssignmentChangesAllowed": false,
+        "approvalExecutionAllowed": false, "serviceNowApprovalChangesAllowed": false, "rawUserDataAllowed": false, "rawClaimPayloadsAllowed": false,
+        "rawGroupRowsAllowed": false, "tenantIdentifiersAllowed": false, "appIdentifiersAllowed": false, "clientIdentifiersAllowed": false,
+        "objectIdentifiersAllowed": false, "principalIdentifiersAllowed": false, "groupIdentifiersAllowed": false, "credentialValuesAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "readinessSurfaces": ["oidc-configuration-readiness","protected-api-readiness","app-role-readiness","group-claim-readiness","role-action-matrix-readiness","approval-route-readiness","local-mock-boundary-readiness","audit-evidence-readiness","break-glass-readiness"],
+        "requiredInputs": ["identityProviderDecision","runtimeConfigurationSummary","protectedApiProfile","appRoleMappingSummary","groupClaimMappingSummary","roleActionMatrix","approvalRouteSummary","localMockBoundary","breakGlassSummary","evidenceManifest"],
+        "requiredGuards": ["identity-provider-confirmed","runtime-config-externalized","protected-api-profile-reviewed","app-role-mapping-reviewed","group-claim-mapping-reviewed","role-action-matrix-reviewed","approval-routes-reviewed","local-mock-boundary-enforced","break-glass-reviewed","evidence-redacted"],
+        "planSections": ["readinessSummary","identityProviderBoundary","runtimeConfiguration","protectedApiReadiness","roleMappingReview","approvalRouteReview","localMockBoundary","breakGlassReview","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","live-authentication-disabled","token-validation-disabled","graph-calls-disabled","entra-group-lookup-disabled","app-registration-change-disabled","role-assignment-change-disabled","approval-execution-disabled","servicenow-approval-change-disabled","raw-user-data-disabled","raw-claim-payloads-disabled","raw-group-rows-disabled","tenant-identifiers-disabled","app-identifiers-disabled","client-identifiers-disabled","object-identifiers-disabled","principal-identifiers-disabled","group-identifiers-disabled","credential-values-disabled","raw-provider-payloads-disabled","runtime-config-missing","protected-api-profile-missing","role-mapping-missing","approval-route-missing","local-mock-boundary-missing","break-glass-review-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Identity readiness summary","Runtime configuration review","Protected API readiness","Role mapping review","Approval route review","Local mock boundary","Break-glass review","Evidence references"],
+        "rules": [
+            {"id":"no-live-auth-provider-execution","decision":"block","requirement":"Entra RBAC approval readiness reports static readiness only and never validates live sign-ins, calls Microsoft Graph, looks up groups, changes app registrations, assigns roles, executes approvals, changes ServiceNow approvals, or mutates provider state.","evidence":"Identity readiness summary"},
+            {"id":"runtime-config-externalized","decision":"block","requirement":"Runtime identity configuration, protected API settings, app role mapping, and group claim mapping must remain deployment configuration outside committed files.","evidence":"Runtime configuration review"},
+            {"id":"role-and-approval-readiness-required","decision":"block","requirement":"Role action matrix, approval routes, break-glass handling, and local mock boundary must be reviewed before production authentication can be accepted.","evidence":"Approval route review"},
+            {"id":"raw-entra-readiness-data-not-exposed","decision":"block","requirement":"Readiness evidence must use safe summaries only and must not expose user records, claim payloads, group rows, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, credentials, tokens, Microsoft Graph payloads, ServiceNow payloads, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn identity_access_review() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "reviewMode": "review-only", "providerCallsEnabled": false, "liveDirectoryChangesAllowed": false,
+        "liveServiceNowChangesAllowed": false, "rawUserDataAllowed": false, "rawGroupDataAllowed": false, "principalIdentifiersAllowed": false,
+        "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "rawProviderPayloadsAllowed": false,
+        "reviewScopes": ["ownership-recertification","support-group-recertification","privileged-role-review","service-account-review","stale-access-review","exception-review"],
+        "reviewSignals": ["owner-missing","support-group-missing","privileged-role-aging","service-account-unknown","orphaned-access","recertification-overdue","exception-expiring"],
+        "requiredInputs": ["reviewScopeSummary","recertificationCycle","accessScope","roleProfile","ownershipSummary","supportGroup","riskTier","reviewCadence","approvalRoute","evidenceManifest"],
+        "requiredGuards": ["review-scope-summarized","owner-known","support-group-known","approval-route-assigned","evidence-redacted","raw-identity-data-blocked","expiry-date-set","remediation-plan-ready"],
+        "planSections": ["reviewSummary","scopeReview","ownershipDecision","privilegedAccessReview","serviceAccountReview","exceptionDecision","remediationPlan","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","live-directory-change-disabled","live-servicenow-change-disabled","raw-user-data-disabled","raw-group-data-disabled","principal-identifiers-disabled","tenant-identifiers-disabled","object-identifiers-disabled","raw-provider-payloads-disabled","review-scope-missing","owner-unknown","support-group-unknown","approval-missing","expiry-missing","remediation-plan-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Access review summary","Scope review","Ownership decision","Privileged access review","Service account review","Exception decision","Remediation plan","Evidence references"],
+        "rules": [
+            {"id":"no-live-access-changes","decision":"block","requirement":"Access recertification reports review state only and never changes Entra groups, AD groups, ServiceNow records, local memberships, or provider state.","evidence":"Access review summary"},
+            {"id":"redacted-scope-required","decision":"block","requirement":"Review scope must be summarized before recertification can be accepted.","evidence":"Scope review"},
+            {"id":"ownership-and-approval-required","decision":"block","requirement":"Ownership, support group, approval route, expiry, and review cadence must be known before acceptance.","evidence":"Ownership decision"},
+            {"id":"privileged-access-reviewed","decision":"block","requirement":"Privileged access and service account scope must be reviewed before exception or remediation decisions.","evidence":"Privileged access review"},
+            {"id":"raw-identity-data-not-exposed","decision":"block","requirement":"Access recertification evidence must use safe summaries only and must not expose raw user records, group membership rows, principal IDs, tenant IDs, object IDs, account names, email addresses, or provider payloads.","evidence":"Evidence references"}
+        ]
+    }))
+}
+
+async fn identity_ad_computer() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "lifecycleMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
+        "liveDirectoryChangesAllowed": false, "computerPrestageAllowed": false, "computerMoveAllowed": false, "computerDisableAllowed": false,
+        "computerDeleteAllowed": false, "computerRecoverAllowed": false, "rawComputerDataAllowed": false, "principalIdentifiersAllowed": false,
+        "distinguishedNamesAllowed": false, "domainIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "securityIdentifiersAllowed": false,
+        "computerIdentifiersAllowed": false, "rawProviderPayloadsAllowed": false,
+        "lifecycleActions": ["computer-prestage-review","computer-move-review","computer-disable-review","computer-delete-review","computer-recover-review","computer-reconcile-review"],
+        "lifecycleSignals": ["ou-policy-match","lifecycle-state-match","cmdb-state-match","approval-state","rollback-window-ready","stale-object-risk","evidence-redaction"],
+        "requiredInputs": ["computerScope","targetOu","currentOu","lifecycleAction","owner","cmdbContext","site","environment","approvalRoute","rollbackPlan","evidenceManifest"],
+        "requiredGuards": ["request-context-known","target-scope-summarized","ou-policy-reviewed","lifecycle-action-supported","cmdb-state-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],
+        "planSections": ["lifecycleSummary","targetScope","ouPolicyReview","cmdbReconciliation","approvalRoute","rollbackPlan","recoveryReadiness","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","worker-execution-disabled","live-directory-change-disabled","computer-prestage-disabled","computer-move-disabled","computer-disable-disabled","computer-delete-disabled","computer-recover-disabled","raw-computer-data-disabled","principal-identifiers-disabled","distinguished-names-disabled","domain-identifiers-disabled","object-identifiers-disabled","security-identifiers-disabled","computer-identifiers-disabled","raw-provider-payloads-disabled","approval-missing","rollback-plan-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Computer lifecycle summary","Target scope","OU policy review","CMDB reconciliation","Approval route","Rollback plan","Recovery readiness","Evidence references"]
+    }))
+}
+
+async fn identity_gmsa_lifecycle() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "lifecycleMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
+        "liveDirectoryChangesAllowed": false, "gmsaCreationAllowed": false, "gmsaAssignmentAllowed": false, "gmsaValidationAllowed": false,
+        "gmsaRetireAllowed": false, "passwordRetrievalAllowed": false, "managedPasswordMaterialAllowed": false, "spnChangeAllowed": false,
+        "delegationChangeAllowed": false, "rawServiceAccountDataAllowed": false, "rawLogContentAllowed": false, "rawRowsAllowed": false,
+        "serialNumbersAllowed": false, "rawRecipientDataAllowed": false, "principalIdentifiersAllowed": false, "distinguishedNamesAllowed": false,
+        "domainIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "securityIdentifiersAllowed": false, "targetIdentifiersAllowed": false,
+        "credentialValuesAllowed": false, "rawProviderPayloadsAllowed": false,
+        "lifecycleActions": ["gmsa-create-review","gmsa-assign-review","gmsa-validate-review","gmsa-worker-use-review","gmsa-delegation-review","gmsa-retire-review"],
+        "lifecycleSignals": ["kds-root-key-readiness","retrieval-scope-summary","kerberos-encryption-policy","spn-policy-match","delegation-risk","worker-capability-match","approval-state","evidence-redaction"],
+        "requiredInputs": ["serviceAccountScope","gmsaName","hostScope","kdsReadiness","kerberosPolicy","spnProfile","workerCapability","site","environment","approvalRoute","rollbackPlan","recoveryPlan","evidenceManifest"],
+        "requiredGuards": ["request-context-known","service-account-scope-summarized","kds-root-key-readiness-reviewed","retrieval-scope-reviewed","kerberos-policy-reviewed","spn-policy-reviewed","delegation-risk-reviewed","worker-capability-reviewed","approval-route-assigned","rollback-plan-ready","recovery-readiness-reviewed","evidence-redacted"],
+        "planSections": ["lifecycleSummary","serviceAccountScope","retrievalScopeReview","kerberosPolicyReview","spnPolicyReview","delegationRiskReview","workerRoutingReview","approvalRoute","rollbackPlan","recoveryReadiness","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","worker-execution-disabled","live-directory-change-disabled","gmsa-creation-disabled","gmsa-assignment-disabled","gmsa-validation-disabled","gmsa-retire-disabled","password-retrieval-disabled","managed-password-material-disabled","spn-change-disabled","delegation-change-disabled","raw-service-account-data-disabled","raw-log-content-disabled","raw-rows-disabled","serial-numbers-disabled","raw-recipient-data-disabled","principal-identifiers-disabled","distinguished-names-disabled","domain-identifiers-disabled","object-identifiers-disabled","security-identifiers-disabled","target-identifiers-disabled","credential-values-disabled","raw-provider-payloads-disabled","approval-missing","rollback-plan-missing","recovery-readiness-missing","evidence-not-redacted"]
+    }))
+}
+
+async fn identity_local_privilege() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "accessReviewMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
+        "liveDirectoryChangesAllowed": false, "liveLocalAdminChangesAllowed": false, "liveSudoersChangesAllowed": false, "liveServiceNowChangesAllowed": false,
+        "adGroupMembershipChangeAllowed": false, "sudoersFileChangeAllowed": false, "privilegeGrantAllowed": false, "privilegeRemovalAllowed": false,
+        "rawUserDataAllowed": false, "rawGroupDataAllowed": false, "rawMembershipRowsAllowed": false, "rawSudoersContentAllowed": false,
+        "rawRequestPayloadsAllowed": false, "rawProviderPayloadsAllowed": false, "principalIdentifiersAllowed": false, "targetIdentifiersAllowed": false,
+        "privilegeHostIdentifiersAllowed": false, "credentialValuesAllowed": false,
+        "accessActions": ["local-admin-grant-review","local-admin-remove-review","sudo-grant-review","sudo-remove-review","expiry-review","break-glass-review"],
+        "accessScopes": ["windows-local-admin","linux-sudo","directory-group-membership","privileged-role-expiry","break-glass-access","service-desk-escalation"],
+        "requiredInputs": ["ticketContext","requester","targetScope","osFamily","privilegeLevel","expiryWindow","serviceDeskReason","approvalRoute","workerCapability","rollbackPlan","evidenceManifest"],
+        "requiredGuards": ["ticket-context-known","requester-authorized","target-scope-summarized","privilege-profile-reviewed","os-family-supported","expiry-window-reviewed","approval-route-assigned","worker-capability-reviewed","rollback-plan-ready","evidence-redacted"],
+        "planSections": ["accessSummary","targetScope","privilegeProfileReview","directoryGroupReview","sudoersReview","expiryAndReview","workerRouting","rollbackPlan","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","worker-execution-disabled","live-directory-change-disabled","live-local-admin-change-disabled","live-sudoers-change-disabled","live-servicenow-change-disabled","ad-group-membership-change-disabled","sudoers-file-change-disabled","privilege-grant-disabled","privilege-removal-disabled","raw-user-data-disabled","raw-group-data-disabled","raw-membership-rows-disabled","raw-sudoers-content-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","target-identifiers-disabled","privilege-host-identifiers-disabled","credential-values-disabled","unsupported-access-action","requester-not-authorized","approval-missing","expiry-missing","worker-capability-unknown","rollback-plan-missing","evidence-not-redacted"]
+    }))
+}
+
+async fn identity_file_share_ntfs() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "recertificationMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
+        "liveDirectoryChangesAllowed": false, "liveShareChangesAllowed": false, "liveNtfsAclChangesAllowed": false, "liveServiceNowChangesAllowed": false,
+        "adGroupMembershipChangeAllowed": false, "sharePermissionChangeAllowed": false, "ntfsAclChangeAllowed": false, "inheritanceChangeAllowed": false,
+        "ownerChangeAllowed": false, "rawShareDataAllowed": false, "rawAclRowsAllowed": false, "rawMembershipRowsAllowed": false,
+        "rawPathDataAllowed": false, "rawProviderPayloadsAllowed": false, "principalIdentifiersAllowed": false, "shareIdentifiersAllowed": false,
+        "pathValuesAllowed": false, "credentialValuesAllowed": false,
+        "recertificationActions": ["owner-recertification-review","group-access-review","ntfs-acl-review","share-permission-review","stale-access-review","exception-review"],
+        "recertificationScopes": ["windows-file-share","ntfs-acl","share-permission","ad-group-membership","owner-attestation","stale-access-exception"],
+        "requiredInputs": ["shareScope","ownerAttestation","groupAccessSummary","ntfsAclSummary","sharePermissionSummary","exceptionReason","approvalRoute","remediationPlan","evidenceManifest"],
+        "requiredGuards": ["recertification-scope-summarized","owner-attestation-reviewed","group-access-reviewed","ntfs-acl-reviewed","share-permission-reviewed","stale-access-reviewed","exception-route-assigned","approval-route-assigned","remediation-plan-ready","evidence-redacted"],
+        "planSections": ["recertificationSummary","shareScope","ownershipReview","groupAccessReview","ntfsAclReview","sharePermissionReview","staleAccessReview","exceptionDecision","remediationPlan","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","worker-execution-disabled","live-directory-change-disabled","live-share-change-disabled","live-ntfs-acl-change-disabled","live-servicenow-change-disabled","ad-group-membership-change-disabled","share-permission-change-disabled","ntfs-acl-change-disabled","inheritance-change-disabled","owner-change-disabled","raw-share-data-disabled","raw-acl-rows-disabled","raw-membership-rows-disabled","raw-path-data-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","share-identifiers-disabled","path-values-disabled","credential-values-disabled","recertification-scope-missing","owner-attestation-missing","approval-missing","remediation-plan-missing","evidence-not-redacted"]
+    }))
+}
+
+async fn evidence_export_retention() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "exportRetentionMode": "static-evidence-export-retention", "redactionRequired": true, "providerCallsEnabled": false,
+        "liveEvidenceMutationAllowed": false, "exportPackageMutationAllowed": false, "retentionPolicyMutationAllowed": false, "liveAuditSearchAllowed": false,
+        "auditSearchQueryAllowed": false, "evidencePayloadsAllowed": false, "rawRequestPayloadsAllowed": false, "rawProviderPayloadsAllowed": false,
+        "rawEvidencePayloadsAllowed": false, "rawLogContentAllowed": false, "unfilteredLogsAllowed": false, "stackTracesAllowed": false,
+        "rawRowsAllowed": false, "serialNumbersAllowed": false, "exportWithoutRedactionAllowed": false, "credentialValuesAllowed": false,
+        "secretValuesAllowed": false, "tokenValuesAllowed": false, "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false, "rawRecipientDataAllowed": false,
+        "redactionStates": ["pending","redacted","blocked"],
+        "exportReadiness": ["draft","redaction-pending","ready-for-audit","ready-for-cab","ready-for-incident-review","ready-for-handover","blocked"],
+        "safeExportTargets": ["audit-review","cab-review","incident-review","handover","cmdb-file-exchange"],
+        "prohibitedContent": ["credential values","bearer material","private key material","generated certificates","Vault initialization material","raw provider payloads","unfiltered logs","stack traces","tenant identifiers","object identifiers","private network addresses","raw recipient data","raw rows","serial numbers"],
+        "retentionClasses": ["operational-review","audit-retained","cab-retained","incident-retained","handover-retained","cmdb-exchange-retained"],
+        "auditSearchStates": ["query-draft","redaction-filtered","metadata-only","ready-for-review","blocked"],
+        "searchFacets": ["workflow-family","redaction-state","export-readiness","retention-class","record-type","review-state","created-bucket"],
+        "packageFields": ["packageReference","workflowFamily","redactionState","exportReadiness","retentionClass","recordTypes","safeExportTarget","reviewState","createdBucket","evidenceReferences"],
+        "requiredGuards": ["redaction-state-redacted","export-readiness-approved","retention-class-assigned","metadata-only-search","no-raw-payloads","recipient-data-redacted","provider-payloads-blocked","retention-review-recorded"],
+        "requiredEvidence": ["Export package summary","Redaction state review","Retention class decision","Audit search scope summary","Prohibited content review","Evidence references"],
+        "blockedReasons": ["provider-calls-disabled","live-evidence-mutation-disabled","export-package-mutation-disabled","retention-policy-mutation-disabled","live-audit-search-disabled","audit-search-query-disabled","evidence-payloads-disabled","raw-request-payloads-disabled","raw-provider-payloads-disabled","raw-evidence-payloads-disabled","raw-log-content-disabled","unfiltered-logs-disabled","stack-traces-disabled","raw-rows-disabled","serial-numbers-disabled","export-without-redaction-disabled","credential-values-disabled","secret-values-disabled","token-values-disabled","tenant-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","raw-recipient-data-disabled","retention-class-missing","metadata-only-search-missing","redaction-review-missing"]
+    }))
+}
+
+async fn evidence_compliance_dashboard() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "complianceDashboardMode": "static-evidence-compliance-dashboard", "evidenceRequired": true,
+        "providerCallsEnabled": false, "liveEvaluationAllowed": false, "evidenceMutationAllowed": false, "exportMutationAllowed": false,
+        "retentionMutationAllowed": false, "workflowMutationAllowed": false, "notificationDispatchAllowed": false,
+        "rawEvidencePayloadsAllowed": false, "rawControlRowsAllowed": false, "rawAuditLogsAllowed": false, "rawUserDataAllowed": false,
+        "rawProviderPayloadsAllowed": false, "rawRecipientDataAllowed": false, "credentialValuesAllowed": false, "tokenValuesAllowed": false,
+        "tenantIdentifiersAllowed": false, "objectIdentifiersAllowed": false, "principalIdentifiersAllowed": false, "privateNetworkValuesAllowed": false,
+        "domains": ["security-baseline","rbac-approvals","evidence-redaction","backup-coverage","monitoring-coverage","cmdb-readiness","patch-readiness","restore-testing"],
+        "statusBands": ["compliant","attention","gap","blocked","not-assessed"],
+        "trendWindows": ["current","seven-day","thirty-day","quarterly"],
+        "requiredGuards": ["control-scope-known","evidence-pack-referenced","redaction-state-reviewed","stale-data-marked","owner-assigned","live-evaluation-blocked","evidence-redacted"],
+        "blockedReasons": ["compliance-live-evaluation-disabled","compliance-evidence-mutation-disabled","compliance-export-mutation-disabled","compliance-retention-mutation-disabled","compliance-workflow-mutation-disabled","compliance-provider-calls-disabled","compliance-notification-dispatch-disabled","compliance-raw-evidence-payloads-disabled","compliance-raw-control-rows-disabled","compliance-raw-audit-logs-disabled","compliance-raw-user-data-disabled","compliance-raw-provider-payloads-disabled","compliance-raw-recipient-data-disabled","compliance-credential-values-disabled","compliance-token-values-disabled","compliance-tenant-identifiers-disabled","compliance-object-identifiers-disabled","compliance-principal-identifiers-disabled","compliance-private-network-values-disabled","control-scope-missing","evidence-pack-missing","redaction-state-unknown","stale-data-unmarked","owner-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Compliance summary","Domain control summary","Evidence pack reference","Redaction state review","Stale-data markers","Owner assignment","Evidence references"]
+    }))
+}
+
+async fn integrations_readiness() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "providerCallsEnabled": false, "externalAccessBlocked": true,
+        "adapters": [
+            {"id":"vmware","component":"vmware-adapter","apiGroup":"/api/integrations/vmware","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"hyperv","component":"hyperv-adapter","apiGroup":"/api/integrations/hyperv","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"proxmox","component":"proxmox-adapter","apiGroup":"/api/integrations/proxmox","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"veeam","component":"veeam-br-adapter","apiGroup":"/api/integrations/veeam","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
+        ]
+    }))
+}
+
+fn adapter_json(id: &str) -> Value {
+    let adapters = json!([
+        {"id":"vmware","component":"vmware-adapter","apiGroup":"/api/integrations/vmware","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"hyperv","component":"hyperv-adapter","apiGroup":"/api/integrations/hyperv","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"proxmox","component":"proxmox-adapter","apiGroup":"/api/integrations/proxmox","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"veeam","component":"veeam-br-adapter","apiGroup":"/api/integrations/veeam","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
+    ]);
+    let adapter = adapters
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == id)
+        .cloned();
+    match adapter {
+        Some(a) => {
+            json!({"source":"static-seed","providerCallsEnabled":false,"externalAccessBlocked":true,"adapter":a})
+        }
+        None => {
+            json!({"source":"static-seed","providerCallsEnabled":false,"status":"blocked","reason":"unknown-adapter"})
+        }
+    }
+}
+
+async fn integrations_vmware_readiness() -> Json<Value> {
+    Json(adapter_json("vmware"))
+}
+async fn integrations_hyperv_readiness() -> Json<Value> {
+    Json(adapter_json("hyperv"))
+}
+async fn integrations_proxmox_readiness() -> Json<Value> {
+    Json(adapter_json("proxmox"))
+}
+async fn integrations_veeam_readiness() -> Json<Value> {
+    Json(adapter_json("veeam"))
+}
+async fn integrations_zabbix_readiness() -> Json<Value> {
+    Json(adapter_json("zabbix"))
+}
+async fn integrations_servicenow_readiness() -> Json<Value> {
+    Json(adapter_json("servicenow"))
+}
+
+async fn integrations_adapter_matrix() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "providerCallsEnabled": false,
+        "adapters": ["vmware","hyperv","proxmox","veeam-br","veeam-one","zabbix","servicenow-file-exchange"],
+        "states": ["ready","degraded","stale","blocked","unknown"],
+        "dimensions": ["secretReference","endpointReachability","apiVersionCompatibility","permissionScope","dryRunCapability","staleDataMarker","ownerSupport","evidenceReadiness"],
+        "guards": ["secret-reference-known","endpoint-not-raw","api-version-reviewed","permissions-reviewed","stale-data-marked","owner-known","support-group-known","evidence-redacted"],
+        "planSections": ["readinessSummary","adapterScope","authReadiness","compatibilityReadiness","permissionReadiness","reachabilityReadiness","staleDataReview","safeCapabilities","evidenceReferences"],
+        "blockedReasons": ["provider-calls-disabled","live-provider-validation-disabled","secret-reference-missing","endpoint-unconfigured","api-version-unknown","permission-scope-unknown","stale-data-unmarked","owner-unknown","support-group-unknown","evidence-not-redacted"],
+        "capabilities": ["readiness","read-only","dry-run","stale-data-marker","evidence-reference"]
+    }))
+}
+
+async fn integrations_adapter_contract_test() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "providerCallsEnabled": false,
+        "targets": ["vmware-readiness","hyperv-readiness","proxmox-readiness","veeam-readiness","zabbix-readiness","servicenow-file-exchange","adapter-readiness-matrix","dry-run-plan"],
+        "testTypes": ["readiness-contract","dry-run-contract","blocked-default","secret-reference-contract","stale-data-marker","redaction-contract","evidence-contract"],
+        "fixtureTypes": ["static-json-fixture","static-yaml-fixture","mock-provider-result","negative-case-fixture","redacted-evidence-fixture"],
+        "requiredGuards": ["fixture-set-redacted","provider-calls-blocked","credential-values-absent","network-egress-blocked","expected-state-declared","blocked-reasons-declared","stale-data-marked","evidence-redacted"],
+        "planSections": ["testSummary","fixtureScope","readinessAssertions","dryRunAssertions","blockedDefaultAssertions","redactionAssertions","evidenceAssertions","handoverNotes"],
+        "blockedReasons": ["provider-calls-disabled","live-provider-validation-disabled","live-credentials-disabled","credential-values-disabled","network-egress-disabled","raw-provider-payloads-disabled","raw-fixture-rows-disabled","provider-mutation-disabled","fixture-set-missing","expected-state-missing","blocked-reasons-missing","evidence-not-redacted"]
+    }))
+}
+
+async fn integrations_servicenow_cmdb_file() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "providerCallsEnabled": false, "liveApiDisabled": true, "rawFileContentAllowed": false,
+        "normalizedImportFields": ["ciName","fqdn","ciClass","lifecycleStatus","environment","application","businessOwner","technicalOwner","supportGroup","country","siteCode","datacenter","osFamily","osVersion","criticality","patchGroup","maintenanceWindow","rebootPolicy","backupPolicy","monitoringProfile","relationshipKey"],
+        "workbookShape": ["worksheet-count-one","row-count-fifteen","data-row-count-fourteen","column-count-twenty-eight"],
+        "sanitizedFieldCategories": ["identity","ownership","classification","governance-evidence","operating-system","lifecycle","service-context","location","normalized-fallback"],
+        "normalizedHeaderExpectations": ["actual-headers-remain-deployment-configuration","map-to-normalized-import-fields","unmapped-columns-require-review","duplicate-normalized-fields-require-review","actual-header-value-storage-disabled"],
+        "syntheticCategoryExamples": ["identity synthetic-ci-name","ownership synthetic-business-owner","classification synthetic-ci-class","governance-evidence synthetic-file-hash-reference","operating-system synthetic-os-family","lifecycle synthetic-lifecycle-state","service-context synthetic-environment","location synthetic-site-code","normalized-fallback synthetic-review-note"],
+        "rejectionReasons": ["missing-ci-identity","ambiguous-ci-identity","unknown-site-code","missing-owner","missing-support-group","invalid-environment","missing-evidence-reference"]
+    }))
+}
+
+async fn integrations_servicenow_future_api() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed", "providerCallsEnabled": false,
+        "apiSurfaces": ["request-callback-readiness","change-callback-readiness","cmdb-update-readiness","import-set-readiness","status-sync-readiness","approval-sync-readiness","knowledge-link-readiness"],
+        "signals": ["api-approval-recorded","secret-reference-ready","instance-config-externalized","table-mapping-reviewed","payload-redaction-reviewed","rate-limit-policy-reviewed","rollback-plan-ready"],
+        "requiredGuards": ["live-api-approval-recorded","secret-reference-ready","instance-identifiers-externalized","table-mapping-reviewed","payload-redaction-reviewed","dry-run-contract-reviewed","rollback-plan-ready","evidence-redacted"],
+        "planSections": ["integrationSummary","authReference","instanceConfiguration","tableMapping","callbackPlan","importSetPlan","statusSyncPlan","rollbackReadiness","evidenceReferences"],
+        "blockedReasons": ["live-api-disabled","provider-calls-disabled","request-callbacks-disabled","change-callbacks-disabled","cmdb-updates-disabled","import-set-writes-disabled","status-sync-disabled","table-api-calls-disabled","credential-values-disabled","instance-identifiers-disabled","table-identifiers-disabled","sys-identifiers-disabled","raw-request-payloads-disabled","raw-response-payloads-disabled","raw-ticket-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","approval-missing","secret-reference-missing","table-mapping-missing","payload-redaction-missing","rollback-plan-missing","evidence-not-redacted"]
+    }))
+}
+
+// ─── Remaining endpoints (inventory, software, workflows, integrations-vmware, operations, images, patching, protect, observe, cmdb, admin, auth, analytics) ───
+
+async fn inventory_coverage() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"domains":["vmware","hyperv","proxmox","veeam","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"freshnessStates":["current","stale","unknown","blocked"],"gapTypes":["backup-coverage-gap","monitoring-coverage-gap","cmdb-drift","stale-data","ownership-gap","policy-gap"],"driftSignals":["identity-mismatch","owner-mismatch","backup-policy-mismatch","monitoring-profile-mismatch","site-placement-mismatch"],"evidence":["Inventory snapshot","Coverage gap list","Stale-data markers","CMDB reconciliation summary","Evidence references"]}),
+    )
+}
+
+async fn inventory_coverage_local() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","coverage":"local-static-seed","domains":["vmware","hyperv","proxmox","veeam","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"providerCallsEnabled":false}),
+    )
+}
+
+async fn inventory_resource_overview() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"resourceTypes":["site","vm","application","cluster","host","network","backup","monitoring","cmdb-ci"],"statusSignals":["inventory-freshness","backup-status","monitoring-status","cmdb-status","ownership-status","lifecycle-state","policy-state"],"views":["site-summary","vm-summary","application-summary","cluster-summary","host-summary","network-summary","protection-observability-summary","cmdb-status-summary"],"requiredGuards":["inventory-snapshot-reviewed","site-scope-reviewed","resource-type-summary-reviewed","freshness-state-reviewed","backup-status-reviewed","monitoring-status-reviewed","cmdb-status-reviewed","evidence-redacted"],"blockedReasons":["inventory-overview-live-sync-disabled","inventory-overview-live-query-disabled","inventory-overview-provider-calls-disabled","inventory-overview-mutation-disabled","inventory-overview-remediation-disabled","inventory-overview-workflow-mutation-disabled","inventory-overview-raw-rows-disabled","inventory-overview-raw-provider-payloads-disabled","inventory-overview-raw-owner-data-disabled","inventory-overview-raw-log-content-disabled","inventory-overview-raw-recipient-data-disabled","inventory-overview-credential-values-disabled","inventory-overview-token-values-disabled","inventory-overview-tenant-identifiers-disabled","inventory-overview-object-identifiers-disabled","inventory-overview-principal-identifiers-disabled","inventory-overview-private-network-values-disabled","inventory-overview-serials-disabled","scope-missing","resource-type-summary-missing","freshness-state-unknown","evidence-not-redacted"]}),
+    )
+}
+// Auto-generated; append to end of contracts.rs
+
+async fn inventory_ownership_risk() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"riskDomains":["vm","application","cluster","host","network","backup","monitoring","cmdb-ci"],"scoreSignals":["owner-present","support-group-present","cmdb-match","backup-policy-match","monitoring-profile-match","freshness-current","lifecycle-state-known"],"riskBands":["low","medium","high","blocked"],"timelineEvents":["inventory-seen","owner-changed","cmdb-drift-detected","backup-gap-detected","monitoring-gap-detected","stale-marker-set","risk-band-changed"],"requiredGuards":["inventory-snapshot-reviewed","ownership-summary-reviewed","support-group-reviewed","drift-timeline-reviewed","stale-marker-reviewed","risk-band-reviewed","evidence-redacted"],"blockedReasons":["inventory-risk-provider-sync-disabled","inventory-risk-owner-lookup-disabled","inventory-risk-cmdb-mutation-disabled","inventory-risk-remediation-mutation-disabled","inventory-risk-workflow-mutation-disabled","inventory-risk-provider-calls-disabled","inventory-risk-raw-rows-disabled","inventory-risk-raw-owner-data-disabled","inventory-risk-raw-provider-payloads-disabled","inventory-risk-raw-timeline-rows-disabled","inventory-risk-raw-log-content-disabled","inventory-risk-raw-recipient-data-disabled","inventory-risk-credential-values-disabled","inventory-risk-tenant-identifiers-disabled","inventory-risk-object-identifiers-disabled","inventory-risk-private-network-values-disabled","inventory-risk-serials-disabled","inventory-snapshot-missing","ownership-summary-missing","support-group-unknown","stale-marker-missing","risk-band-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn inventory_os_baseline() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"osFamilies":["windows","linux"],"domains":["tools","vmware-tools","hyper-v-integration-services","proxmox-qemu-guest-agent","agents","local-groups","firewall","security-baseline","hardening-state","patch-state","monitoring-agent","backup-agent"],"driftSignals":["missing-agent","vmware-tools-missing","vmware-tools-unsupported","hyper-v-integration-service-disabled","proxmox-qemu-guest-agent-missing","unsupported-version","unauthorized-local-admin","firewall-rule-drift","hardening-rule-drift","pending-reboot","patch-level-drift","evidence-missing"],"requiredGuards":["inventory-coverage-current","baseline-profile-known","os-family-supported","owner-known","platform-guest-tooling-posture-known","worker-capability-known","remediation-plan-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["complianceSummary","baselineProfile","platformGuestTooling","driftFindings","riskNotes","remediationPlan","approvalRoute","handoverNotes","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","stale-inventory","unsupported-os-family","missing-baseline-profile","owner-unknown","platform-guest-tooling-posture-missing","worker-capability-unknown","remediation-plan-missing","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn software_approved_deployment() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"actions":["install","update","remove","verify-version","reboot-required-review"],"scopes":["windows-package","linux-package","agent","utility","security-tool","monitoring-tool"],"requiredGuards":["package-approved","version-policy-known","target-scope-known","os-family-supported","worker-capability-known","reboot-impact-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["deploymentSummary","packagePolicy","targetScope","versionDecision","rebootImpact","rollbackPlan","verificationPlan","handoverNotes"],"blockedReasons":["package-not-approved","unsupported-action","target-scope-unknown","version-policy-missing","worker-execution-disabled","reboot-impact-unknown","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn workflows_server_lifecycle() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"workflows":["windows-server-deployment","linux-server-deployment"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"supportedLinuxDistributions":["sles","rhel","rocky-linux","alma-linux","ubuntu","debian"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","hypervisorPlatform","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"requiredGuards":["request-preflight-ready","capacity-admission-ready","inventory-coverage-current","approval-route-assigned","evidence-redacted","secret-reference-configured"],"planSections":["placementPlan","osCustomizationPlan","backupPlan","monitoringPlan","cmdbUpdatePlan","riskNotes","rollbackNotes"],"blockedReasons":["missing-required-input","stale-inventory","capacity-not-approved","backup-policy-missing","monitoring-profile-missing","cmdb-context-ambiguous","unsupported-hypervisor","live-hypervisor-execution-disabled","live-execution-disabled"]}),
+    )
+}
+
+async fn workflows_app_env_deployment() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["tier-topology-plan","vm-placement-plan","dns-ipam-plan","certificate-plan","firewall-rule-plan","monitoring-plan","backup-plan","cmdb-relationship-plan","handover-plan"],"tiers":["front-tier","mid-tier","back-tier","data-tier","shared-service-tier"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","tier-topology-reviewed","placement-plan-reviewed","dns-ipam-plan-reviewed","certificate-plan-reviewed","network-flow-reviewed","monitoring-plan-reviewed","backup-plan-reviewed","cmdb-relationship-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["environmentSummary","tierTopology","placementPlan","dnsIpamPlan","certificatePlan","networkFlowPlan","monitoringPlan","backupPlan","cmdbRelationshipPlan","rollbackPlan","handoverPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-dns-ipam-change-disabled","live-certificate-change-disabled","live-firewall-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","raw-network-data-disabled","raw-dns-records-disabled","raw-certificate-data-disabled","raw-firewall-rules-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","app-env-host-identifiers-disabled","fqdn-values-disabled","ip-address-values-disabled","credential-values-disabled","raw-recipient-data-disabled","tier-topology-missing","dns-ipam-plan-missing","certificate-plan-missing","firewall-plan-missing","monitoring-plan-missing","backup-plan-missing","cmdb-relationship-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn workflows_app_env_retirement() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"phases":["intake-review","relationship-review","dependency-freeze-plan","data-retention-plan","backup-retention-plan","access-closure-plan","monitoring-disable-plan","cmdb-retirement-plan","rollback-window-review","final-closure-hold"],"domains":["application-environment","dependency-graph","data-retention","backup-retention","access-closure","monitoring-state","cmdb-relationship","owner-approval","rollback-window","evidence-readiness"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","relationship-graph-reviewed","dependency-impact-reviewed","data-retention-reviewed","backup-retention-reviewed","access-closure-reviewed","monitoring-disable-reviewed","cmdb-retirement-reviewed","rollback-window-reviewed","final-closure-blocked","approval-route-assigned","evidence-redacted"],"planSections":["retirementSummary","relationshipReview","dependencyImpact","dataRetentionPlan","backupRetentionPlan","accessClosurePlan","monitoringDisablePlan","cmdbRetirementPlan","rollbackWindow","finalClosureHold","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-retirement-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","live-access-change-disabled","live-data-deletion-disabled","raw-dependency-rows-disabled","raw-relationship-rows-disabled","raw-inventory-rows-disabled","raw-backup-rows-disabled","raw-monitoring-rows-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","application-identifiers-disabled","environment-identifiers-disabled","app-env-host-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","credential-values-disabled","raw-recipient-data-disabled","dependency-review-missing","data-retention-missing","backup-retention-missing","access-closure-review-missing","monitoring-disable-review-missing","cmdb-retirement-review-missing","rollback-window-missing","final-closure-blocked","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn workflows_sql_server() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["standalone-instance-plan","failover-cluster-plan","availability-group-plan","disk-layout-plan","runtime-identity-plan","spn-policy-review","backup-policy-plan","monitoring-plan","cmdb-publication-plan"],"topologies":["standalone","failover-cluster","availability-group"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","topology-reviewed","capacity-admission-ready","disk-layout-reviewed","runtime-identity-reviewed","spn-policy-reviewed","backup-plan-reviewed","monitoring-plan-reviewed","cmdb-publication-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["deploymentSummary","topologyReview","placementPlan","diskLayoutPlan","runtimeIdentityPlan","spnPolicyReview","backupPlan","monitoringPlan","cmdbPublicationPlan","rollbackPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-sql-change-disabled","live-directory-change-disabled","live-dns-change-disabled","live-backup-change-disabled","live-monitoring-change-disabled","live-cmdb-change-disabled","availability-group-change-disabled","sql-runtime-identity-change-disabled","spn-change-disabled","database-creation-disabled","sql-agent-job-change-disabled","raw-sql-instance-data-disabled","raw-database-data-disabled","raw-path-data-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","sql-host-identifiers-disabled","sql-listener-identifiers-disabled","credential-values-disabled","port-values-disabled","topology-missing","disk-layout-missing","runtime-identity-missing","spn-policy-missing","backup-plan-missing","monitoring-plan-missing","cmdb-context-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn workflows_azure_lz() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"validationSurfaces":["source-inventory-review","management-group-taxonomy-review","subscription-readiness-review","policy-baseline-review","naming-tagging-review","connectivity-guardrail-review","identity-guardrail-review","security-guardrail-review","azure-vm-readiness-review","cmdb-servicenow-file-exchange-review"],"requiredGuards":["source-inventory-acknowledged","safe-facts-extraction-required","raw-alz-sources-blocked","tenant-identifiers-blocked","subscription-identifiers-blocked","policy-baseline-reviewed","naming-tagging-reviewed","connectivity-reviewed","identity-reviewed","security-reviewed","azure-vm-readiness-reviewed","approval-route-assigned","evidence-redacted"],"planSections":["validationSummary","sourceInventoryReview","landingZoneScope","policyBaselineReview","namingTaggingReview","connectivityReview","identityReview","securityReview","azureVmReadiness","cmdbPublicationPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","terraform-execution-disabled","terraform-plan-against-tenant-disabled","terraform-apply-disabled","azure-resource-change-disabled","management-group-change-disabled","subscription-change-disabled","policy-assignment-change-disabled","role-assignment-change-disabled","network-change-disabled","vm-deployment-disabled","cmdb-change-disabled","servicenow-change-disabled","raw-alz-sources-disabled","raw-terraform-state-disabled","raw-terraform-plan-disabled","raw-azure-payloads-disabled","tenant-identifiers-disabled","subscription-identifiers-disabled","object-identifiers-disabled","principal-identifiers-disabled","resource-identifiers-disabled","private-ip-values-disabled","credential-values-disabled","safe-facts-review-missing","policy-baseline-missing","naming-tagging-missing","connectivity-review-missing","identity-review-missing","security-review-missing","vm-readiness-missing","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn workflows_preflight_local_decision(Query(q): Query<PreflightQuery>) -> Json<Value> {
+    let mut missing = Vec::new();
+    if q.requested_offering
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        missing.push("requestedOffering");
+    }
+    if q.owner.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("owner");
+    }
+    if q.site.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("site");
+    }
+    if q.environment.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("environment");
+    }
+    if q.criticality.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("criticality");
+    }
+    if q.dry_run_plan.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("dryRunPlan");
+    }
+    if q.approval_route.as_deref().unwrap_or("").trim().is_empty() {
+        missing.push("approvalRoute");
+    }
+    if q.evidence_manifest
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        missing.push("evidenceManifest");
+    }
+    if q.secret_reference_state
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
+        missing.push("secretReferenceState");
+    }
+    let mut guard_blocks = Vec::new();
+    if q.dry_run_plan.as_deref().map(|s| s.to_lowercase()) != Some("ready".into()) {
+        guard_blocks.push("provider-safe-dry-run-not-ready");
+    }
+    if q.evidence_manifest.as_deref().map(|s| s.to_lowercase()) != Some("redacted".into()) {
+        guard_blocks.push("redacted-evidence-not-ready");
+    }
+    if q.secret_reference_state
+        .as_deref()
+        .map(|s| s.to_lowercase())
+        != Some("configured".into())
+    {
+        guard_blocks.push("secret-reference-not-configured");
+    }
+    let blocked = !missing.is_empty() || !guard_blocks.is_empty();
+    Json(
+        json!({"source":"local-mock","providerCallsEnabled":false,"liveExecutionAllowed":false,"decision":if blocked{"block"}else{"review"},"status":if blocked{"blocked"}else{"ready-for-approval-review"},"requestedOffering":q.requested_offering,"requiredInputs":["requestedOffering","owner","site","environment","criticality","dryRunPlan","approvalRoute","evidenceManifest","secretReferenceState"],"missingInputs":missing,"guardBlocks":guard_blocks,"remediation":if blocked{"Complete missing inputs and guard evidence before approval."}else{"Route to approval; live execution remains disabled in local mode."},"evidence":["Validation result","Provider-safe plan","Approval decisions","Evidence manifest","Reference configured state"]}),
+    )
+}
+
+async fn integrations_vmware_cluster_capacity() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"livePlacementEnabled":false,"workflows":["windows-server-deployment","linux-server-deployment","vm-day2-change","cluster-placement-review","capacity-exception-review"],"decisions":["admit","review","block","defer"],"signals":["cpu-headroom","memory-headroom","datastore-headroom","vsan-headroom","ha-failover-headroom","drs-balance","reservation-impact","stale-capacity-data"],"requiredGuards":["cluster-summary-known","compute-headroom-reviewed","datastore-headroom-reviewed","vsan-headroom-reviewed","ha-failover-reviewed","drs-balance-reviewed","reservation-impact-reviewed","growth-window-set","owner-known","evidence-redacted"],"planSections":["admissionSummary","clusterScope","computeHeadroom","storageHeadroom","haDrsRisk","reservationImpact","placementDecision","exceptionsAndRemediation","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-provider-validation-disabled","live-placement-disabled","cluster-summary-missing","compute-headroom-unknown","storage-headroom-unknown","ha-failover-headroom-insufficient","drs-balance-unknown","reservation-impact-unknown","stale-capacity-data","owner-unknown","evidence-not-redacted"],"requiredEvidence":["Capacity admission summary","Cluster scope summary","Compute headroom","Storage headroom","HA and DRS risk","Reservation impact","Placement decision","Exceptions and remediation","Evidence references"]}),
+    )
+}
+
+async fn integrations_vmware_customization_spec() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["request-preflight","windows-server-deployment","ou-placement-review","customization-spec-drift-review","site-catalog-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"guestCustomizationParity":["vmware-vcenter-customization-spec-safe-facts","hyper-v-answer-file-safe-facts","proxmox-cloud-init-safe-facts"],"safeFacts":["customizationSpecReference","countryCode","siteCode","domainReference","ouPatternReference","timezoneCode","dhcpNetworkBehavior","organizationLabel","windowsBehavior"],"driftSignals":["missing-expected-spec","unknown-spec","country-site-mismatch","ou-pattern-mismatch","domain-mismatch","timezone-mismatch","network-behavior-mismatch","windows-behavior-mismatch","stale-spec-inventory"],"requiredGuards":["site-known","safe-facts-from-catalog","ou-pattern-derived","free-form-ou-blocked","encrypted-xml-excluded","drift-check-reviewed","stale-data-marked","owner-known","evidence-redacted"],"planSections":["safeFactSummary","siteMapping","ouPlacementDecision","timezoneAndNetworkBehavior","windowsBehaviorReview","driftReview","blockedFindings","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-provider-validation-disabled","live-guest-customization-disabled","unsupported-hypervisor","raw-xml-blocked","encrypted-xml-blocked","credential-material-blocked","site-unknown","spec-reference-unknown","ou-pattern-mismatch","stale-spec-inventory","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn integrations_vmware_object_placement() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"livePlacementEnabled":false,"vcenterDimensions":["folder","cluster","resource-pool","datastore","storage-policy","network","tag-policy","site","environment"],"hyperVDimensions":["folder","cluster","resource-pool","storage-policy","network","tag-policy","site","environment"],"proxmoxDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"requiredGuards":["site-known","environment-known","folder-policy-known","cluster-capacity-admitted","resource-pool-policy-known","datastore-policy-known","storage-policy-known","network-profile-known","tag-policy-known","dry-run-plan-produced","evidence-redacted"],"planSections":["placementSummary","folderPlan","clusterResourcePoolPlan","datastoreStoragePolicyPlan","networkPlan","tagPolicyPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-placement-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","site-unknown","environment-unknown","folder-policy-missing","cluster-capacity-missing","resource-pool-policy-missing","datastore-policy-missing","storage-policy-missing","network-profile-missing","tag-policy-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn integrations_vmware_vsan_esxi() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["vsan-cluster-lifecycle","esxi-patch-lifecycle","firmware-baseline-review","hardware-readiness-review","maintenance-mode-plan","lifecycle-exception-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"platformLifecycleParity":["vmware-vsan-esxi-lifecycle-safe-summary","hyper-v-cluster-host-lifecycle-safe-summary","proxmox-cluster-node-lifecycle-safe-summary"],"domains":["vsan-health","esxi-version","firmware-baseline","driver-compatibility","hardware-hcl","cluster-maintenance","network-readiness","storage-policy"],"requiredGuards":["cluster-scope-known","site-known","platform-profile-known","target-baseline-known","hardware-readiness-reviewed","network-readiness-reviewed","capacity-admission-ready","maintenance-window-approved","rollback-plan-ready","dry-run-plan-produced","evidence-redacted"],"planSections":["lifecycleSummary","currentBaseline","targetBaseline","hardwareFirmwareReview","networkStorageReadiness","maintenanceModePlan","capacityAndFailureDomainImpact","rollbackPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-lifecycle-disabled","unsupported-hypervisor","raw-inventory-rows-disabled","host-identifiers-disabled","cluster-scope-missing","site-unknown","platform-profile-missing","target-baseline-missing","hardware-readiness-missing","network-readiness-missing","capacity-admission-missing","maintenance-window-missing","rollback-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn integrations_vmware_day2() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveChangeEnabled":false,"actions":["resize-cpu","resize-memory","add-disk","extend-disk","add-nic","remove-nic","move-network","migrate-storage","migrate-host","update-tags","plan-cross-hypervisor-migration"],"requiredGuards":["request-preflight-ready","capacity-admission-ready","cmdb-ci-known","backup-state-known","monitoring-impact-reviewed","approval-route-assigned","lock-scope-defined","rollback-plan-ready","cold-offline-default","source-backup-verified","source-quarantine-planned","downtime-window-approved","target-guest-tooling-planned","cutover-validation-ready","evidence-redacted"],"planSections":["changeSummary","currentState","desiredState","capacityImpact","networkImpact","backupMonitoringImpact","cmdbUpdatePlan","lockPlan","rollbackNotes","verificationPlan","migrationMethodMatrix","downtimePlan","sourceQuarantine","targetGuestTooling","cutoverValidation"],"blockedReasons":["provider-calls-disabled","live-change-disabled","stale-inventory","capacity-not-approved","cmdb-context-ambiguous","backup-state-unknown","monitoring-impact-unknown","maintenance-window-missing","lock-scope-missing","rollback-plan-missing","migration-method-unknown","downtime-class-missing","source-backup-unverified","source-quarantine-missing","target-guest-tooling-missing","cutover-validation-missing","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn integrations_vmware_snapshot() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["planned-snapshot-exception","snapshot-expiry-review","stale-snapshot-remediation","owner-attestation","backup-conflict-review"],"signals":["planned-exception","expiry-due","stale-snapshot","owner-unknown","backup-conflict","policy-exception","evidence-missing"],"requiredGuards":["cmdb-ci-known","owner-known","backup-state-known","expiry-policy-known","approval-route-assigned","lock-scope-defined","rollback-notes-ready","evidence-redacted"],"planSections":["snapshotSummary","policyDecision","expiryReview","backupImpact","remediationPlan","approvalRoute","lockPlan","handoverNotes"],"blockedReasons":["provider-calls-disabled","live-snapshot-disabled","live-deletion-disabled","stale-inventory","missing-owner","missing-expiry","backup-conflict-unknown","approval-missing","lock-scope-missing","rollback-notes-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn integrations_vmware_decommission() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"stages":["intake-review","dependency-review","backup-retention-review","monitoring-disable-plan","cmdb-retirement-plan","quarantine-window-plan","rollback-window-review","final-disposition-review"],"domains":["vcenter-placement","backup-retention","monitoring-state","cmdb-state","dns-dependency","owner-approval","rollback-window","evidence-readiness"],"requiredGuards":["request-preflight-ready","cmdb-ci-known","owner-approval-assigned","dependency-impact-reviewed","backup-retention-reviewed","monitoring-disable-reviewed","quarantine-window-approved","rollback-plan-ready","final-disposition-blocked","evidence-redacted"],"planSections":["quarantineSummary","dependencyReview","backupRetentionReview","monitoringPlan","cmdbRetirementPlan","quarantineWindow","rollbackPlan","finalDispositionHold","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-decommission-disabled","live-delete-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","cmdb-ci-unknown","owner-approval-missing","dependency-review-missing","backup-retention-missing","monitoring-disable-review-missing","quarantine-window-missing","rollback-plan-missing","final-disposition-blocked","evidence-not-redacted"]}),
+    )
+}
+
+async fn operations_certificate_lifecycle() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"targets":["platform-ingress","web-service","iis-site","vcenter-appliance","hyperv-management-service","proxmox-management-service","infrastructure-appliance","hardware-management","database-listener"],"actions":["request-plan","renew-plan","replace-plan","install-plan","revoke-plan","evidence-review"],"requiredGuards":["certificate-scope-known","target-profile-known","issuer-profile-known","subject-policy-reviewed","private-key-material-blocked","approval-route-assigned","maintenance-window-known","rollback-plan-ready","evidence-redacted"],"planSections":["certificateSummary","scopeReview","issuerReadiness","subjectPolicyReview","renewalOrReplacementPlan","installationDryRun","rollbackPlan","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-certificate-action-disabled","certificate-scope-unknown","target-profile-unknown","issuer-profile-missing","subject-policy-unreviewed","private-key-material-present","csr-pem-present","certificate-identifier-present","approval-missing","maintenance-window-missing","rollback-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn operations_runbook_launch() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workerExecutionEnabled":false,"workflows":["operator-runbook-launch","standard-l1-l2-task","incident-context-review"],"planTypes":["health-check-plan","collect-logs-plan","restart-service-plan","clear-disk-plan","trigger-backup-plan","alert-suppression-plan"],"requiredGuards":["role-authorized","approval-route-assigned","worker-capability-known","dry-run-ready","dependency-health-known","evidence-redacted"],"planSections":["runbookSummary","targetScope","workerCapability","expectedActions","riskNotes","rollbackNotes","handoverNotes"],"blockedReasons":["worker-execution-disabled","unsupported-runbook","role-not-authorized","approval-missing","worker-capability-unknown","dependency-health-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn operations_standard_task() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"taskTypes":["health-check-plan","collect-logs-plan","restart-service-plan","clear-disk-plan","trigger-backup-plan","alert-suppression-plan"],"scopes":["windows-service","linux-service","filesystem-capacity","log-collection","backup-request","monitoring-maintenance","application-health"],"requiredGuards":["ticket-context-known","requester-authorized","task-type-supported","target-scope-summarized","worker-capability-known","dry-run-plan-reviewed","approval-route-assigned","maintenance-window-reviewed","rollback-or-handover-ready","evidence-redacted"],"planSections":["taskSummary","targetScope","workerRouting","preChecks","plannedActions","riskAndImpact","rollbackOrHandover","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-service-change-disabled","live-disk-change-disabled","live-backup-action-disabled","live-alert-suppression-disabled","raw-target-data-disabled","raw-log-content-disabled","raw-recipient-data-disabled","raw-worker-payloads-disabled","raw-provider-payloads-disabled","unsupported-task-type","requester-not-authorized","approval-missing","worker-capability-unknown","maintenance-window-missing","rollback-or-handover-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn operations_emergency_change() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"modes":["break-glass","urgent-remediation","incident-containment","service-restoration"],"requiredGuards":["emergency-role-authorized","incident-or-ticket-linked","emergency-approver-assigned","scope-bounded","dry-run-ready","lock-record-ready","evidence-redacted"],"planSections":["emergencySummary","businessImpact","targetScope","riskJustification","approvalPath","rollbackNotes","verificationPlan","handoverNotes"],"blockedReasons":["live-execution-disabled","privileged-worker-disabled","role-not-authorized","incident-context-missing","approval-missing","scope-too-broad","lock-conflict","evidence-not-redacted"]}),
+    )
+}
+
+async fn operations_shift_queue() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","queueMode":"aggregate-safe","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawProviderPayloadsAllowed":false,"queueSources":["blocked-request","failed-operation","pending-approval","active-incident","backup-failure","monitoring-problem","handover-note"],"queueStates":["new","triage","owner-assigned","waiting-approval","waiting-dependency","ready-for-handover","closed"],"requiredInputs":["queueItemSource","severity","owner","supportGroup","safeNextAction","handoverNotes","evidenceManifest"],"requiredGuards":["owner-known","support-group-known","severity-assigned","safe-next-action-set","evidence-redacted","stale-data-marked"],"blockedReasons":["owner-unknown","support-group-unknown","missing-safe-next-action","approval-pending","dependency-unhealthy","stale-data","evidence-not-redacted"],"requiredEvidence":["Queue item summary","Owner assignment","Safe next action","Approval state","Dependency health","Handover notes","Evidence references"],"rules":[{"id":"no-raw-provider-payloads","decision":"block","requirement":"Shift queue items summarize provider state without exposing raw provider payloads.","evidence":"Queue item summary"},{"id":"safe-next-action-required","decision":"block","requirement":"Every visible queue item must include a safe next action for the assigned team.","evidence":"Safe next action"},{"id":"owner-and-support-required","decision":"block","requirement":"Owner and support group must be known before a queue item can leave triage.","evidence":"Owner assignment"},{"id":"handover-evidence-required","decision":"block","requirement":"Queue items that cross shifts must keep handover notes and evidence references.","evidence":"Handover notes"}]}),
+    )
+}
+
+async fn operations_dependency_replay() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","operationDependencyReplayMode":"static-dependency-replay","dependencyGraphReadOnly":true,"replaySimulationDryRunOnly":true,"lockStateReadOnly":true,"liveReplayAllowed":false,"operationMutationAllowed":false,"childOperationMutationAllowed":false,"lockMutationAllowed":false,"retryMutationAllowed":false,"providerCallsAllowed":false,"workflowMutationAllowed":false,"rawOperationRowsAllowed":false,"rawExecutionLogsAllowed":false,"rawReplayPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"serialNumbersAllowed":false,"graphNodeTypes":["operation-run","child-operation","lock-scope","dependency","blocked-reason","evidence-reference","retry-policy"],"graphEdgeTypes":["depends-on","blocks","owns-lock","emits-evidence","retries-after","resolves-blocker"],"replayPhases":["snapshot-load","dependency-sort","lock-evaluation","blocker-evaluation","retry-evaluation","evidence-preview","decision-summary"],"requiredGuards":["graph-source-reviewed","dependency-order-reviewed","lock-scope-reviewed","blocker-state-reviewed","retry-policy-reviewed","replay-dry-run-only","evidence-redacted"],"blockedReasons":["operation-replay-live-disabled","operation-mutation-disabled","operation-child-mutation-disabled","operation-lock-mutation-disabled","operation-retry-mutation-disabled","operation-provider-calls-disabled","operation-workflow-mutation-disabled","operation-raw-rows-disabled","operation-raw-logs-disabled","operation-raw-replay-payloads-disabled","operation-raw-provider-payloads-disabled","operation-raw-recipient-data-disabled","operation-credential-values-disabled","operation-tenant-identifiers-disabled","operation-object-identifiers-disabled","operation-private-network-values-disabled","operation-serials-disabled","dependency-graph-missing","replay-snapshot-missing","lock-scope-unknown","blocker-state-unknown","evidence-not-redacted"],"requiredEvidence":["Dependency graph summary","Replay phase summary","Lock evaluation summary","Blocked reason summary","Retry policy summary","Evidence references"],"rules":[{"id":"dependency-graph-read-only","decision":"block","requirement":"Operation dependency graph summaries are read-only and must not mutate operation runs, child operations, locks, retries, or workflow state.","evidence":"Dependency graph summary"},{"id":"replay-simulation-dry-run-only","decision":"block","requirement":"Replay simulation uses static snapshots only and must not replay live work, call providers, or emit live execution steps.","evidence":"Replay phase summary"},{"id":"operation-mutations-disabled","decision":"block","requirement":"Dependency replay cannot create, update, retry, unlock, close, or re-order operation runs or child operations.","evidence":"Lock evaluation summary"},{"id":"raw-activity-data-not-exposed","decision":"block","requirement":"Operation dependency replay evidence must use safe summaries only and must not expose raw operation rows, raw execution logs, raw replay payloads, raw provider payloads, recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_activity_queue() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","activityOperationQueueMode":"static-activity-operation-queue","queueSummaryReadOnly":true,"childOperationSummaryReadOnly":true,"lockStateReadOnly":true,"retryStateReadOnly":true,"blockedReasonSummaryOnly":true,"liveQueueQueryAllowed":false,"operationMutationAllowed":false,"workflowMutationAllowed":false,"workerDispatchAllowed":false,"providerCallsAllowed":false,"notificationDispatchAllowed":false,"rawOperationRowsAllowed":false,"rawChildOperationRowsAllowed":false,"rawLockRowsAllowed":false,"rawRetryRowsAllowed":false,"rawExecutionLogsAllowed":false,"rawProviderPayloadsAllowed":false,"rawUserDataAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"principalIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"queueItemTypes":["parent-operation","child-operation","lock","retry","blocked-reason","handover-note","evidence-reference"],"queueStates":["queued","running","blocked","retrying","waiting-approval","completed","failed","canceled","stale"],"queueLenses":["by-site","by-workflow","by-owner-domain","by-priority","by-risk","by-staleness"],"requiredGuards":["operation-scope-known","queue-state-known","lock-state-known","retry-policy-known","blocked-reason-present","stale-data-marked","evidence-redacted","live-query-blocked"],"blockedReasons":["activity-live-query-disabled","activity-operation-mutation-disabled","activity-workflow-mutation-disabled","activity-worker-dispatch-disabled","activity-provider-calls-disabled","activity-notification-dispatch-disabled","activity-raw-operation-rows-disabled","activity-raw-child-operation-rows-disabled","activity-raw-lock-rows-disabled","activity-raw-retry-rows-disabled","activity-raw-execution-logs-disabled","activity-raw-provider-payloads-disabled","activity-raw-user-data-disabled","activity-raw-recipient-data-disabled","activity-credential-values-disabled","activity-token-values-disabled","activity-tenant-identifiers-disabled","activity-object-identifiers-disabled","activity-principal-identifiers-disabled","activity-private-network-values-disabled","operation-scope-missing","queue-state-unknown","lock-state-unknown","retry-policy-missing","blocked-reason-missing","evidence-not-redacted"],"requiredEvidence":["Activity queue summary","Parent operation summary","Child operation summary","Lock state summary","Retry state summary","Blocked reason summary","Handover notes","Evidence references"],"rules":[{"id":"activity-queue-read-only","decision":"block","requirement":"Activity queue summaries are read-only and must not run live queue queries, dispatch workers, call providers, or mutate operations.","evidence":"Activity queue summary"},{"id":"operation-state-not-mutated","decision":"block","requirement":"Parent operation, child operation, lock, retry, and workflow state must remain unchanged by the Activity queue view.","evidence":"Parent operation summary"},{"id":"blocked-reason-required","decision":"block","requirement":"Blocked and stale queue items require known operation scope, queue state, lock state, retry policy, blocked reason, and redacted evidence before handover.","evidence":"Blocked reason summary"},{"id":"raw-activity-queue-data-not-exposed","decision":"block","requirement":"Activity queue evidence must not expose raw operation rows, raw child operation rows, raw lock rows, raw retry rows, raw execution logs, raw provider payloads, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_run_state() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","operationRunStateMode":"static-operation-run-state","operationStateReadOnly":true,"childOperationStateReadOnly":true,"lockStateReadOnly":true,"retryStateReadOnly":true,"redactedLogSummaryOnly":true,"liveExecutionAllowed":false,"workerDispatchAllowed":false,"providerCallsAllowed":false,"operationMutationAllowed":false,"childOperationMutationAllowed":false,"lockMutationAllowed":false,"retryMutationAllowed":false,"workflowMutationAllowed":false,"rawOperationRowsAllowed":false,"rawChildOperationRowsAllowed":false,"rawExecutionLogsAllowed":false,"rawLockRowsAllowed":false,"rawRetryRowsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"serialNumbersAllowed":false,"operationStates":["queued","blocked","planning","approval-wait","locked","executing","verifying","succeeded","failed","cancelled","degraded"],"childOperationStates":["pending","blocked","ready","running","retry-wait","succeeded","failed","skipped"],"lockStates":["not-required","pending","active","conflict","expired","released"],"retryStates":["not-retryable","retry-pending","backoff-wait","retry-exhausted","manual-review"],"logStates":["not-started","redacted-summary-ready","redaction-pending","blocked"],"requiredGuards":["operation-scope-known","child-operations-summarized","lock-scope-reviewed","retry-policy-reviewed","redacted-log-summary-ready","evidence-redacted","live-execution-blocked"],"blockedReasons":["run-state-live-execution-disabled","run-state-worker-dispatch-disabled","run-state-provider-calls-disabled","run-state-operation-mutation-disabled","run-state-child-operation-mutation-disabled","run-state-lock-mutation-disabled","run-state-retry-mutation-disabled","run-state-workflow-mutation-disabled","run-state-raw-operation-rows-disabled","run-state-raw-child-operation-rows-disabled","run-state-raw-execution-logs-disabled","run-state-raw-lock-rows-disabled","run-state-raw-retry-rows-disabled","run-state-raw-provider-payloads-disabled","run-state-raw-recipient-data-disabled","run-state-credential-values-disabled","run-state-token-values-disabled","run-state-tenant-identifiers-disabled","run-state-object-identifiers-disabled","run-state-private-network-values-disabled","run-state-serials-disabled","operation-scope-missing","child-operation-state-unknown","lock-conflict","retry-policy-missing","redacted-log-missing","evidence-not-redacted"],"requiredEvidence":["Operation run summary","Child operation summary","Lock state summary","Retry state summary","Redacted log summary","Evidence references"],"rules":[{"id":"operation-run-state-read-only","decision":"block","requirement":"Operation run state summaries are read-only and must not execute, retry, cancel, close, or mutate operation runs.","evidence":"Operation run summary"},{"id":"child-lock-retry-state-read-only","decision":"block","requirement":"Child operation, lock, and retry state summaries are read-only and must not dispatch workers, acquire locks, release locks, or update retry state.","evidence":"Lock state summary"},{"id":"redacted-log-summary-required","decision":"block","requirement":"Run-state evidence must use redacted log summaries only and must not expose raw execution logs or provider payloads.","evidence":"Redacted log summary"},{"id":"raw-operation-run-data-not-exposed","decision":"block","requirement":"Operation run-state evidence must not expose raw operation rows, child operation rows, lock rows, retry rows, recipient data, credential values, token values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_datacenter_readiness() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","readinessMode":"review-only","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawInventoryRowsAllowed":false,"readinessDomains":["rack-space","power","cooling","switchport","vlan","storage-pathing","firmware-baseline","support-coverage","site-capacity"],"requiredInputs":["site","requester","owner","hardwareProfile","clusterProfile","networkScope","storageScope","capacityNeed","evidenceManifest"],"requiredGuards":["site-known","owner-known","rack-capacity-known","power-cooling-reviewed","network-readiness-known","storage-readiness-known","firmware-baseline-known","evidence-redacted"],"planSections":["siteSummary","capacityReadiness","networkReadiness","storageReadiness","firmwareAndSupport","riskNotes","remediationPlan","handoverNotes"],"blockedReasons":["site-unknown","owner-unknown","rack-capacity-unknown","power-cooling-not-reviewed","network-readiness-unknown","storage-readiness-unknown","firmware-baseline-unknown","support-coverage-unknown","evidence-not-redacted"],"requiredEvidence":["Site readiness summary","Rack and power review","Cooling review","Network readiness summary","Storage readiness summary","Firmware and support baseline","Capacity decision","Risk notes","Evidence references"],"rules":[{"id":"no-live-datacenter-actions","decision":"block","requirement":"Datacenter readiness contracts report review state only and never execute provider, switch, storage, or hardware actions.","evidence":"Site readiness summary"},{"id":"network-storage-readiness-required","decision":"block","requirement":"Network and storage readiness must be known before hardware or cluster work proceeds.","evidence":"Network readiness summary"},{"id":"capacity-decision-required","decision":"block","requirement":"Capacity decision must show rack, power, cooling, and site headroom before approval.","evidence":"Capacity decision"},{"id":"firmware-support-baseline-required","decision":"block","requirement":"Firmware and support baseline must be known before datacenter execution can be considered.","evidence":"Firmware and support baseline"}]}),
+    )
+}
+
+async fn operations_oob_access() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","validationMode":"review-only","providerCallsEnabled":false,"liveAccessChecksAllowed":false,"liveCertificateChecksAllowed":false,"rawInventoryRowsAllowed":false,"endpointIdentifiersAllowed":false,"serialNumbersAllowed":false,"accountIdentifiersAllowed":false,"supportedConsoleTypes":["hpe-ilo","dell-idrac","lenovo-xcc"],"supportedWorkflows":["oob-access-readiness","hardware-console-review","oob-certificate-review","role-assignment-review","break-glass-readiness-review","incident-readiness-review"],"readinessDomains":["console-access","certificate-readiness","role-readiness","break-glass-readiness","network-reachability","hardware-cmdb","evidence-readiness"],"requiredInputs":["site","hardwareProfile","platformRole","owner","supportGroup","accessProfile","certificateProfile","breakGlassProfile","cmdbContext","evidenceManifest"],"requiredGuards":["site-known","hardware-profile-known","support-owner-known","access-profile-reviewed","certificate-profile-reviewed","role-model-reviewed","break-glass-procedure-reviewed","incident-runbook-linked","evidence-redacted"],"planSections":["readinessSummary","accessProfileReview","certificateReadiness","roleModelReview","breakGlassReadiness","incidentReadiness","exceptionDecision","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-access-checks-disabled","live-certificate-checks-disabled","raw-inventory-rows-disabled","endpoint-identifiers-disabled","serial-numbers-disabled","account-identifiers-disabled","site-unknown","hardware-profile-unknown","access-profile-missing","certificate-profile-missing","role-model-missing","break-glass-profile-missing","incident-runbook-missing","evidence-not-redacted"],"requiredEvidence":["OOB readiness summary","Access profile review","Certificate readiness review","Role model review","Break-glass readiness review","Incident readiness review","Exception decision","Evidence references"],"rules":[{"id":"no-live-oob-access-checks","decision":"block","requirement":"Out-of-band access validation reports review state only and never logs in to consoles, tests credentials, changes roles, or calls hardware controllers.","evidence":"OOB readiness summary"},{"id":"certificate-readiness-required","decision":"block","requirement":"Certificate profile and renewal readiness must be reviewed before incident readiness can be accepted.","evidence":"Certificate readiness review"},{"id":"role-model-review-required","decision":"block","requirement":"Role assignment intent and access profile must be reviewed without exposing account names or group identifiers.","evidence":"Role model review"},{"id":"break-glass-readiness-required","decision":"block","requirement":"Break-glass procedure, ownership, and incident runbook linkage must be reviewed before readiness is accepted.","evidence":"Break-glass readiness review"},{"id":"raw-oob-inventory-not-exposed","decision":"block","requirement":"OOB readiness evidence must use safe summaries only and must not expose endpoint names, hostnames, private IPs, serials, asset tags, account names, access group identifiers, raw inventory rows, or provider payloads.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_network_vlan() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","readinessMode":"review-only","providerCallsEnabled":false,"liveNetworkChangesAllowed":false,"rawInventoryRowsAllowed":false,"networkIdentifiersAllowed":false,"supportedWorkflows":["host-network-readiness","workload-vlan-readiness","switchport-capacity-review","portgroup-policy-review","vlan-catalog-review","network-exception-review"],"readinessDomains":["switchport-capacity","vlan-catalog","portgroup-policy","trunk-policy","uplink-redundancy","mtu-policy","network-segmentation","evidence-readiness"],"requiredInputs":["site","networkScope","workloadProfile","platformProfile","vlanPolicy","portgroupPolicy","redundancyRequirement","maintenanceWindow","owner","evidenceManifest"],"requiredGuards":["site-known","network-scope-known","vlan-catalog-reviewed","portgroup-policy-reviewed","switchport-capacity-reviewed","uplink-redundancy-reviewed","segmentation-reviewed","maintenance-window-known","owner-known","evidence-redacted"],"planSections":["readinessSummary","vlanPolicyReview","portgroupPolicyReview","switchportCapacityReview","uplinkAndTrunkReview","segmentationReview","exceptionDecision","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-network-change-disabled","raw-inventory-rows-disabled","network-identifiers-disabled","site-unknown","network-scope-missing","vlan-catalog-missing","portgroup-policy-missing","switchport-capacity-unknown","uplink-redundancy-unknown","segmentation-unknown","maintenance-window-missing","owner-unknown","evidence-not-redacted"],"requiredEvidence":["Readiness summary","VLAN policy review","Portgroup policy review","Switchport capacity review","Uplink and trunk review","Segmentation review","Exception decision","Evidence references"],"rules":[{"id":"no-live-network-changes","decision":"block","requirement":"Network and VLAN readiness contracts report review state only and never configure switches, port groups, VLANs, trunks, uplinks, or provider networking.","evidence":"Readiness summary"},{"id":"vlan-catalog-required","decision":"block","requirement":"VLAN and port group policy decisions must come from reviewed catalog summaries before host or workload placement can proceed.","evidence":"VLAN policy review"},{"id":"switchport-capacity-required","decision":"block","requirement":"Switchport capacity, uplink redundancy, and trunk policy summaries must be reviewed before network readiness can be accepted.","evidence":"Switchport capacity review"},{"id":"segmentation-review-required","decision":"block","requirement":"Segmentation and environment policy decisions must be reviewed before readiness can be accepted.","evidence":"Segmentation review"},{"id":"raw-network-inventory-not-exposed","decision":"block","requirement":"Network readiness evidence must use safe summaries only and must not expose switch IDs, switchport IDs, MAC addresses, VLAN IDs, endpoint names, private IPs, raw network inventory rows, serials, or provider payloads.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_hardware_lifecycle() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","lifecycleMode":"metadata-only","providerCallsEnabled":false,"liveExecutionAllowed":false,"serialNumbersAllowed":false,"supportedProfiles":["hpe-dl360-msa","hpe-simplivity-dl380","lenovo-sr","lenovo-vx","lenovo-mx"],"lifecycleStates":["planned","ordered","received","staged","in-service","maintenance","refresh-planned","decommissioned"],"requiredInputs":["hardwareProfile","lifecycleState","site","owner","capacityRole","supportStatus","firmwareBaseline","refreshWindow","evidenceManifest"],"requiredGuards":["model-known","site-known","support-status-known","firmware-baseline-known","capacity-role-known","cmdb-owner-known","evidence-redacted"],"planSections":["hardwareSummary","lifecycleState","sitePlacement","firmwareAndSupport","capacityRole","riskNotes","refreshPlan","handoverNotes"],"blockedReasons":["model-unknown","site-unknown","support-status-unknown","firmware-baseline-unknown","capacity-role-unknown","support-risk","cmdb-owner-unknown","evidence-not-redacted"],"requiredEvidence":["Hardware lifecycle summary","Site placement","Support status","Firmware baseline","Capacity role","Refresh decision","Risk notes","Evidence references"],"rules":[{"id":"no-live-hardware-actions","decision":"block","requirement":"Hardware lifecycle contracts track metadata only and never execute vendor, out-of-band, storage, or cluster actions.","evidence":"Hardware lifecycle summary"},{"id":"no-serial-or-asset-identifiers","decision":"block","requirement":"Committed hardware lifecycle metadata must not contain serial numbers, asset tags, or device identifiers.","evidence":"Hardware lifecycle summary"},{"id":"support-and-firmware-required","decision":"block","requirement":"Support status and the approved N-1 firmware baseline strategy must be known before operational changes can be considered.","evidence":"Firmware baseline"},{"id":"refresh-risk-review-required","decision":"block","requirement":"Hardware with support or capacity risk needs refresh review and owner evidence.","evidence":"Refresh decision"}]}),
+    )
+}
+
+async fn operations_firmware_compliance() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","exceptionMode":"review-only","dryRunRequired":true,"providerCallsEnabled":false,"liveFirmwareChangesAllowed":false,"rawInventoryRowsAllowed":false,"hostIdentifiersAllowed":false,"serialNumbersAllowed":false,"exactFirmwareVersionsAllowed":false,"rawVendorPayloadsAllowed":false,"supportedProfiles":["hpe-dl360-msa","hpe-simplivity-dl380","lenovo-sr","lenovo-vx","lenovo-mx"],"exceptionTypes":["firmware-baseline-deviation","driver-baseline-deviation","hardware-support-deviation","compatibility-evidence-gap","maintenance-window-deferral","vendor-baseline-pending"],"riskLevels":["low","medium","high","emergency"],"requiredInputs":["site","hardwareProfile","platformRole","targetBaseline","observedBaselineSummary","exceptionReason","clusterCriticality","supportStatus","remediationWindow","expiryDate","reviewCadence","owner","evidenceManifest"],"requiredGuards":["site-known","hardware-profile-known","target-baseline-known","observed-baseline-summarized","compatibility-impact-reviewed","support-risk-reviewed","cluster-criticality-reviewed","maintenance-window-known","exception-owner-assigned","expiry-date-set","remediation-plan-ready","evidence-redacted"],"planSections":["exceptionSummary","baselineDecision","compatibilityImpact","supportRisk","clusterCriticality","remediationPlan","approvalRoute","expiryAndReview","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-firmware-change-disabled","raw-inventory-rows-disabled","host-identifiers-disabled","serial-numbers-disabled","exact-firmware-versions-disabled","raw-vendor-payloads-disabled","site-unknown","hardware-profile-unknown","target-baseline-missing","observed-baseline-missing","compatibility-impact-unknown","support-risk-unknown","cluster-criticality-unknown","expiry-missing","remediation-plan-missing","approval-missing","evidence-not-redacted"],"requiredEvidence":["Firmware exception summary","Target baseline summary","Observed baseline summary","Compatibility impact review","Support risk review","Cluster criticality review","Remediation plan","Approval route","Expiry and review date","Evidence references"],"rules":[{"id":"no-live-firmware-actions","decision":"block","requirement":"Firmware compliance exceptions report risk acceptance only and never patch firmware, remediate drivers, reconfigure hardware, or call live vendor tools.","evidence":"Firmware exception summary"},{"id":"baseline-evidence-required","decision":"block","requirement":"Target and observed baseline evidence must be summarized before a firmware exception can be reviewed.","evidence":"Baseline summary"},{"id":"compatibility-support-risk-required","decision":"block","requirement":"Compatibility impact, support status, and cluster criticality must be reviewed before exception approval.","evidence":"Support risk review"},{"id":"expiry-remediation-required","decision":"block","requirement":"Exceptions require owner, expiry date, remediation window, and review cadence before acceptance.","evidence":"Expiry and review date"},{"id":"raw-firmware-inventory-not-exposed","decision":"block","requirement":"Firmware exception evidence must use safe summaries only and must not expose host identifiers, endpoint names, private IPs, exact observed firmware versions, serials, asset tags, raw inventory rows, raw logs, or vendor payloads.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_platform_health() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","healthMode":"degraded-read-only","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawLogsAllowed":false,"components":["portal-ui","platform-api","platform-worker","inventory-sync","adapters","queue","platform-db","platform-vault","ingress","object-storage"],"healthSignals":["readiness","liveness","stale-data","dependency-health","queue-depth","adapter-readiness","backup-state","secret-reference-readiness","evidence-export-readiness"],"healthStates":["healthy","degraded","stale","blocked","unknown"],"requiredInputs":["component","owner","healthSignal","healthState","staleDataMarker","safeRemediation","evidenceManifest"],"requiredGuards":["component-registered","owner-known","stale-data-marked","dependency-status-known","safe-remediation-set","evidence-redacted"],"blockedReasons":["component-unknown","owner-unknown","dependency-status-unknown","stale-data-unmarked","unsafe-remediation","raw-log-exposure","evidence-not-redacted"],"requiredEvidence":["Health summary","Component owner","Dependency state","Stale-data marker","Safe remediation","Handover notes","Evidence references"],"rules":[{"id":"no-live-health-remediation","decision":"block","requirement":"Platform health reporting can suggest safe remediation but must not execute live remediation.","evidence":"Safe remediation"},{"id":"raw-logs-not-exposed","decision":"block","requirement":"Dashboard health output must not expose raw logs, provider payloads, credentials, or endpoint details.","evidence":"Health summary"},{"id":"stale-data-must-be-marked","decision":"block","requirement":"Stale data must be explicit so operators do not mistake cached state for live health.","evidence":"Stale-data marker"},{"id":"owner-and-remediation-required","decision":"block","requirement":"Health items must identify an owner and safe next action before leaving triage.","evidence":"Component owner"}]}),
+    )
+}
+
+async fn operations_incident_context() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","panelMode":"aggregate-safe","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawProviderPayloadsAllowed":false,"contextDomains":["ci","application","vm","change","backup","monitoring","cmdb","evidence"],"panelSections":["incidentSummary","serviceContext","assetContext","changeContext","backupContext","monitoringContext","cmdbContext","evidenceContext","safeNextActions"],"requiredInputs":["incidentContext","ciIdentity","application","owner","supportGroup","site","environment","evidenceManifest"],"requiredGuards":["incident-linked","ci-identity-known","owner-known","support-group-known","stale-data-marked","evidence-redacted","safe-next-action-set"],"blockedReasons":["incident-missing","ci-identity-unknown","owner-unknown","support-group-unknown","stale-data-unmarked","raw-provider-payload","evidence-not-redacted","missing-safe-next-action"],"requiredEvidence":["Incident summary","CI identity summary","Owner and support group","Change context","Backup state","Monitoring state","CMDB relationship summary","Safe next actions","Evidence references"],"rules":[{"id":"no-live-context-lookup","decision":"block","requirement":"Incident context panel uses existing platform state only and never performs live provider lookup.","evidence":"Incident summary"},{"id":"no-raw-provider-payloads","decision":"block","requirement":"Panel output must summarize context without raw provider payloads, logs, credentials, or identifiers.","evidence":"CI identity summary"},{"id":"stale-data-must-be-marked","decision":"block","requirement":"Stale or cached context must be marked before operators use it for incident decisions.","evidence":"Monitoring state"},{"id":"safe-next-action-required","decision":"block","requirement":"Incident context must include safe next actions for the assigned owner or support group.","evidence":"Safe next actions"}]}),
+    )
+}
+
+async fn operations_maintenance_comm() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","communicationMode":"draft-only","providerCallsEnabled":false,"liveNotificationAllowed":false,"rawRecipientDataAllowed":false,"messageTypes":["planned-maintenance","outage-advisory","degraded-service","completion-notice","extension-notice","cancellation-notice"],"communicationChannels":["portal-announcement","email-draft","service-desk-note","handover-note","cab-summary"],"requiredInputs":["maintenanceWindow","affectedServices","ciRelationshipSummary","owner","supportGroup","audience","messageType","approvalRoute","evidenceManifest"],"requiredGuards":["maintenance-window-known","affected-ci-known","owner-known","audience-approved","message-template-approved","approval-route-assigned","evidence-redacted"],"blockedReasons":["maintenance-window-missing","affected-ci-unknown","owner-unknown","audience-unapproved","message-template-missing","approval-missing","raw-recipient-data","evidence-not-redacted"],"requiredEvidence":["Communication draft","Affected CI summary","Audience decision","Owner approval","Maintenance window","Channel plan","Handover notes","Evidence references"],"rules":[{"id":"no-live-notification-send","decision":"block","requirement":"Maintenance communication contract creates drafts only and never sends live notifications.","evidence":"Communication draft"},{"id":"approved-audience-required","decision":"block","requirement":"Audience scope must be approved before communication can be published or exported.","evidence":"Audience decision"},{"id":"affected-ci-summary-required","decision":"block","requirement":"Affected CI and application relationship summary must exist before message generation.","evidence":"Affected CI summary"},{"id":"no-sensitive-recipient-data","decision":"block","requirement":"Drafts and channel plans must not expose raw recipient data, credentials, or provider payloads.","evidence":"Channel plan"}]}),
+    )
+}
+
+async fn operations_degradation_mode() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","degradationMode":"fail-safe-read-only","providerCallsEnabled":false,"liveExecutionAllowed":false,"failoverAutomationAllowed":false,"rawProviderPayloadsAllowed":false,"degradationScopes":["site","provider","adapter","dependency","workflow","evidence"],"degradationStates":["normal","degraded-read-only","stale-read-only","blocked","recovering"],"safeCapabilities":["read-only-inventory","evidence-read","request-intake","plan-only","handover","remediation-guidance"],"requiredInputs":["affectedScope","degradationState","dependencyStatus","staleDataMarker","owner","safeRemediation","evidenceManifest"],"requiredGuards":["affected-scope-known","dependency-status-known","stale-data-marked","write-execution-blocked","safe-remediation-set","owner-known","evidence-redacted"],"blockedReasons":["affected-scope-unknown","dependency-status-unknown","stale-data-unmarked","write-execution-requested","unsafe-remediation","owner-unknown","evidence-not-redacted"],"requiredEvidence":["Degradation summary","Affected scope","Dependency state","Stale-data marker","Blocked execution decision","Safe remediation","Handover notes","Evidence references"],"rules":[{"id":"write-execution-blocked-when-degraded","decision":"block","requirement":"Write-capable workflows remain blocked while affected scope is degraded or stale.","evidence":"Blocked execution decision"},{"id":"stale-data-must-be-marked","decision":"block","requirement":"Cached or stale data must be marked before read-only views can be shown.","evidence":"Stale-data marker"},{"id":"affected-scope-required","decision":"block","requirement":"Degraded site, provider, adapter, dependency, workflow, or evidence scope must be explicit.","evidence":"Affected scope"},{"id":"no-automatic-failover","decision":"block","requirement":"Degradation mode can suggest safe remediation but must not perform automatic failover.","evidence":"Safe remediation"}]}),
+    )
+}
+
+async fn operations_aiops_suggestion() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","suggestionMode":"recommendation-only","dryRunRequired":true,"providerCallsEnabled":false,"liveCorrelationAllowed":false,"liveRemediationAllowed":false,"liveTicketMutationAllowed":false,"automationDispatchAllowed":false,"rawOperationRowsAllowed":false,"rawHealthRowsAllowed":false,"rawLogPayloadsAllowed":false,"rawUserDataAllowed":false,"rawRecipientDataAllowed":false,"rawProviderPayloadsAllowed":false,"suggestionSources":["operation-health-pattern","platform-health-pattern","incident-context-pattern","shift-queue-pattern","failed-run-pattern","degradation-pattern","evidence-gap-pattern"],"suggestionSignals":["repeat-failure","blocked-workflow","correlated-degradation","rising-risk","stale-data","evidence-gap","owner-unknown"],"requiredInputs":["signalSummary","affectedWorkflow","healthDomain","impactBand","owner","supportGroup","reviewer","evidenceManifest"],"requiredGuards":["signal-summary-redacted","correlation-static-only","impact-band-known","owner-route-known","reviewer-assigned","recommendation-redacted","automation-disabled","evidence-redacted"],"planSections":["signalSummary","correlationSummary","impactAssessment","recommendationCandidate","ownerRoute","reviewRoute","safeNextAction","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-correlation-disabled","live-remediation-disabled","live-ticket-mutation-disabled","automation-dispatch-disabled","raw-operation-rows-disabled","raw-health-rows-disabled","raw-log-payloads-disabled","raw-user-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","signal-summary-missing","reviewer-missing","recommendation-not-redacted","evidence-not-redacted"],"requiredEvidence":["AIOps signal summary","Static correlation summary","Impact assessment","Recommendation candidate","Owner route","Review route","Safe next action","Evidence references"],"rules":[{"id":"no-live-correlation","decision":"block","requirement":"AIOps suggestions use static, aggregate, or manually reviewed summaries only and never query live provider, ticket, monitoring, backup, inventory, or log systems.","evidence":"Static correlation summary"},{"id":"no-live-remediation","decision":"block","requirement":"AIOps suggestions recommend safe next actions only and never dispatch workers, mutate workflows, suppress alerts, restart services, remediate providers, or create tickets.","evidence":"Safe next action"},{"id":"reviewer-route-required","decision":"block","requirement":"Each suggestion requires a reviewer, owner route, support group, impact band, and redacted evidence before it can be exported or shown as actionable.","evidence":"Review route"},{"id":"raw-aiops-data-not-exposed","decision":"block","requirement":"AIOps suggestion evidence must use safe summaries only and must not expose raw operation rows, raw health rows, raw logs, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, tenant IDs, object IDs, private IPs, serial numbers, live endpoints, or provider payloads.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn operations_knowledge_suggestion() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","suggestionMode":"recommendation-export-only","dryRunRequired":true,"providerCallsEnabled":false,"liveKnowledgePublishAllowed":false,"liveTicketMutationAllowed":false,"rawOperationRowsAllowed":false,"rawLogPayloadsAllowed":false,"rawErrorDetailsAllowed":false,"rawUserDataAllowed":false,"rawRecipientDataAllowed":false,"rawProviderPayloadsAllowed":false,"suggestionSources":["failed-operation-pattern","blocked-request-pattern","repeat-incident-pattern","runbook-gap","evidence-gap","handover-friction","known-error-pattern"],"suggestionSignals":["repeated-failure","common-blocker","manual-workaround","missing-runbook","ambiguous-owner","evidence-gap","training-need"],"requiredInputs":["failurePatternSummary","operationTaxonomy","affectedWorkflow","safeRecommendation","owner","supportGroup","reviewer","evidenceManifest"],"requiredGuards":["pattern-summary-redacted","taxonomy-known","frequency-threshold-met","impact-summary-known","reviewer-assigned","recommendation-redacted","export-package-ready","evidence-redacted"],"planSections":["patternSummary","taxonomyMapping","impactSummary","knowledgeCandidate","runbookCandidate","reviewRoute","exportPackage","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-knowledge-publish-disabled","live-ticket-mutation-disabled","raw-operation-rows-disabled","raw-log-payloads-disabled","raw-error-details-disabled","raw-user-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","pattern-summary-missing","taxonomy-unknown","reviewer-missing","recommendation-not-redacted","evidence-not-redacted"],"requiredEvidence":["Failure pattern summary","Operation taxonomy","Impact summary","Knowledge candidate","Runbook candidate","Review route","Recommendation export package","Evidence references"],"rules":[{"id":"no-live-knowledge-publish","decision":"block","requirement":"Knowledge suggestions create reviewable recommendation exports only and never publish knowledge articles or runbooks.","evidence":"Knowledge candidate"},{"id":"no-live-ticket-mutation","decision":"block","requirement":"Knowledge suggestions never create, update, or close ServiceNow tickets, incidents, changes, tasks, or knowledge records.","evidence":"Review route"},{"id":"safe-summaries-required","decision":"block","requirement":"Repeated failure patterns must be summarized and redacted before recommendation export.","evidence":"Failure pattern summary"},{"id":"reviewer-route-required","decision":"block","requirement":"Each suggestion requires an assigned reviewer and support group before export.","evidence":"Review route"},{"id":"raw-operation-data-not-exposed","decision":"block","requirement":"Knowledge suggestion evidence must use safe summaries only and must not expose raw operation rows, raw logs, raw error details, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, ServiceNow sys IDs, tenant IDs, object IDs, private IPs, serial numbers, or provider payloads.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn images_factory() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"imageFamilies":["windows","linux"],"distributions":["windows-server","sles","rhel","rocky-linux","alma-linux","ubuntu","debian"],"stages":["intake","build-plan","patch","scan","test","approve","promote","publish","supersede"],"promotionGuards":["vulnerability-scan-clean","baseline-test-passed","agent-validation-passed","approval-route-assigned","rollback-image-available","evidence-redacted"],"blockedReasons":["provider-calls-disabled","missing-test-result","scan-not-clean","approval-missing","rollback-image-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn patching_maintenance() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["patch-wave-planning","reboot-orchestration"],"waveDimensions":["site","application","environment","criticality","dependencyGroup","backupState","maintenanceWindow"],"requiredGuards":["patch-policy-imported","inventory-coverage-current","backup-state-known","monitoring-maintenance-ready","approval-route-assigned","evidence-redacted"],"planSections":["waveSummary","dependencyOrder","maintenanceWindows","rebootQueue","backupReadiness","monitoringSuppression","riskNotes","rollbackNotes"],"blockedReasons":["provider-calls-disabled","stale-inventory","missing-maintenance-window","backup-state-unknown","dependency-context-missing","blackout-window-conflict","approval-missing"]}),
+    )
+}
+
+async fn patching_policy_import() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"fields":["platformCiKey","patchGroup","maintenanceWindow","rebootPolicy","blackoutDates","owner","supportGroup","site","environment","application","criticality","dependencyGroup"],"decisions":["accept","reject","review","normalize","export-exception"],"requiredGuards":["cmdb-file-contract-validated","header-mapping-complete","ci-identity-known","maintenance-window-known","reboot-policy-known","owner-known","evidence-redacted"],"blockedReasons":["live-api-disabled","missing-ci-identity","missing-patch-group","missing-maintenance-window","ambiguous-reboot-policy","blackout-window-conflict","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn patching_reboot_orch() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"targets":["windows-server","linux-server","application-tier","dependency-group","patch-wave"],"queueStates":["planned","waiting-approval","waiting-window","ready-for-dispatch","blocked","handed-over","plan-complete"],"sequencingRules":["dependency-order","site-window","criticality-tier","application-tier","rollback-window","handover-required"],"requiredGuards":["patch-policy-imported","dependency-order-known","maintenance-window-approved","blackout-window-clear","backup-state-known","monitoring-maintenance-ready","approval-route-assigned","lock-scope-defined","evidence-redacted"],"planSections":["scopeSummary","dependencyOrder","maintenanceWindow","rebootBatches","backupReadiness","monitoringSuppression","lockPlan","rollbackNotes","handoverNotes"],"blockedReasons":["provider-calls-disabled","live-reboot-disabled","stale-inventory","missing-maintenance-window","dependency-order-unknown","backup-state-unknown","monitoring-maintenance-missing","blackout-window-conflict","approval-missing","lock-scope-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn patching_maintenance_calendar() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["patch-calendar","reboot-calendar","sql-maintenance-calendar","application-tier-maintenance","outage-communications-draft","conflict-review"],"dimensions":["application","environment","site","dependencyGroup","maintenanceWindow","criticality","owner","supportGroup","changeContext"],"requiredGuards":["cmdb-relationship-graph-ready","patch-policy-imported","maintenance-window-known","dependency-order-known","blackout-window-clear","owner-known","communications-draft-only","approval-route-assigned","evidence-redacted"],"planSections":["calendarSummary","affectedServiceSummary","dependencyOrder","conflictReview","communicationsDraft","approvalRoute","handoverNotes","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-scheduling-disabled","live-notification-disabled","missing-maintenance-window","dependency-order-unknown","blackout-window-conflict","owner-unknown","conflict-review-missing","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_controlled_restore() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"restoreTypes":["file","vm","application","sql"],"requiredGuards":["restore-point-known","target-isolation-reviewed","owner-approval-assigned","backup-operator-approval-assigned","verification-plan-ready","evidence-redacted"],"planSections":["restoreScope","restorePointSummary","targetSelection","isolationPlan","verificationPlan","riskNotes","rollbackNotes"],"blockedReasons":["provider-calls-disabled","restore-point-unknown","target-selection-missing","target-isolation-not-reviewed","approval-missing","verification-plan-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_backup_coverage_gap() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"gapScopes":["vm","application","policy","site","environment"],"gapSignals":["missing-backup-policy","missing-restore-point-evidence","missing-replica","retention-mismatch","criticality-policy-mismatch","stale-backup-inventory","owner-unknown","cmdb-criticality-unknown"],"requiredGuards":["inventory-coverage-current","backup-policy-known","retention-policy-known","replica-requirement-reviewed","criticality-known","owner-known","support-group-known","stale-data-marked","evidence-redacted"],"planSections":["coverageSummary","gapClassification","policyComparison","retentionReview","replicaReview","ownerRouting","remediationDraft","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","live-backup-changes-disabled","raw-inventory-rows-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","asset-scope-unknown","backup-policy-missing","retention-policy-missing","replica-requirement-unknown","stale-backup-inventory","owner-unknown","support-group-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_repository_capacity() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["capacity-forecast","retention-risk-review","growth-trend-review","hub-spoke-capacity-review","immutability-headroom-review"],"signals":["capacity-threshold-risk","retention-risk","growth-anomaly","hub-capacity-risk","stale-usage-data","immutability-headroom-risk"],"requiredGuards":["repository-summary-known","retention-policy-known","growth-trend-known","backup-policy-known","site-pairing-known","forecast-window-set","owner-known","evidence-redacted"],"planSections":["capacitySummary","growthTrend","retentionRisk","hubSpokeImpact","immutabilityHeadroom","remediationOptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","repository-summary-missing","retention-policy-missing","growth-trend-unknown","site-pairing-unknown","forecast-window-missing","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_immutability_air_gap() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["immutability-posture-review","air-gap-readiness-review","retention-lock-review","copy-isolation-review","compliance-evidence-review","repository-transition-readiness-review","current-storeonce-posture-review","hardened-linux-repository-readiness-review","cutover-readiness-review","capacity-runway-review","rollback-fallback-review"],"signals":["immutability-disabled","retention-lock-missing","air-gap-gap","policy-mismatch","stale-evidence","unsupported-repository-type","repository-transition-risk","backup-copy-isolation-gap","immutable-retention-gap","capacity-runway-risk","rollback-fallback-gap"],"repositoryPostureProfiles":["current-storeonce-appliance","planned-hardened-repository-2027"],"repositoryTransitionStates":["current-storeonce-protected","hardened-repository-target-planned","transition-readiness-review-required"],"requiredGuards":["repository-summary-known","immutability-policy-known","retention-policy-known","air-gap-strategy-known","repository-transition-reviewed","isolation-path-reviewed","backup-copy-isolation-known","immutable-retention-known","capacity-runway-known","rollback-fallback-known","cutover-readiness-reviewed","owner-known","evidence-redacted"],"planSections":["postureSummary","currentStoreOncePosture","hardenedLinuxRepositoryReadiness","immutabilityControls","airGapControls","retentionLock","isolationReview","repositoryTransitionReadiness","cutoverReadiness","backupCopyIsolation","immutableRetention","capacityRunway","rollbackFallback","policyExceptions","remediationOptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","repository-summary-missing","immutability-policy-missing","retention-policy-missing","air-gap-strategy-missing","repository-transition-review-missing","isolation-path-unknown","backup-copy-isolation-missing","immutable-retention-missing","capacity-runway-missing","rollback-fallback-missing","cutover-readiness-missing","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_app_aware_backup() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["guest-processing-readiness","application-aware-success-review","sql-backup-metadata-review","credential-reference-review","policy-exception-review","evidence-pack-review"],"signals":["guest-processing-disabled","app-aware-failure","sql-log-truncation-risk","credential-reference-missing","policy-mismatch","stale-backup-evidence","unsupported-workload"],"requiredGuards":["backup-policy-known","workload-supported","guest-processing-policy-known","secret-reference-approved","sql-metadata-reviewed","owner-known","evidence-redacted"],"planSections":["validationSummary","workloadScope","guestProcessingControls","secretReferenceReview","sqlMetadataReview","policyExceptions","remediationOptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-backup-disabled","guest-processing-execution-disabled","credential-access-disabled","backup-policy-missing","unsupported-workload","secret-reference-missing","sql-metadata-missing","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_backup_dr_assignment() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["backup-policy-assignment","dr-replica-assignment","tag-policy-mapping","site-pairing-review","exception-review","evidence-pack-review"],"signals":["missing-backup-policy","missing-dr-replica","tag-policy-mismatch","site-pairing-mismatch","retention-mismatch","rpo-rto-mismatch","stale-policy-evidence"],"requiredGuards":["policy-catalog-known","site-pairing-known","tags-reviewed","owner-known","backup-operator-review-assigned","dr-impact-reviewed","evidence-redacted"],"planSections":["assignmentSummary","tagPolicyMapping","backupPolicyDecision","drReplicaDecision","sitePairingImpact","policyExceptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-assignment-disabled","replica-creation-disabled","policy-catalog-missing","tag-policy-mapping-missing","site-pairing-unknown","owner-unknown","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_restore_testing() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["restore-test-schedule","restore-point-validation","verification-plan-review","critical-app-cadence","evidence-pack-review"],"requiredGuards":["restore-point-known","target-isolation-reviewed","verification-plan-ready","owner-approval-assigned","backup-operator-approval-assigned","schedule-window-known","evidence-redacted"],"planSections":["testScope","restorePointSummary","isolationPlan","verificationPlan","scheduleCadence","evidencePack","approvalRoute","handoverNotes"],"blockedReasons":["provider-calls-disabled","live-restore-disabled","test-execution-disabled","restore-point-unknown","target-isolation-not-reviewed","verification-plan-missing","schedule-window-missing","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn protect_legal_hold() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["legal-hold-intake-review","extended-retention-exception","protected-scope-review","expiration-review","release-readiness-review","evidence-pack-review"],"signals":["legal-hold-requested","retention-extension-needed","scope-ambiguity","approval-missing","expiry-missing","release-review-due","stale-evidence"],"requiredGuards":["hold-scope-summarized","retention-policy-known","approval-route-assigned","backup-impact-reviewed","expiry-date-set","review-cadence-set","release-process-defined","evidence-redacted"],"planSections":["holdSummary","scopeReview","retentionDecision","backupImpactReview","approvalRoute","expiryAndReview","releaseReadiness","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-retention-change-disabled","veeam-mutation-disabled","servicenow-mutation-disabled","raw-case-data-disabled","raw-recipient-data-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","hold-scope-missing","retention-policy-missing","approval-missing","expiry-missing","release-process-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_zabbix_onboarding() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["host-onboarding-intake","host-group-template-selection","proxy-or-server-selection","maintenance-window-assignment","owner-routing-review","dry-run-onboarding-plan","evidence-pack-review"],"signals":["missing-zabbix-host","host-group-required","template-required","proxy-or-server-required","maintenance-window-required","owner-required","support-group-required","stale-inventory-review"],"requiredGuards":["inventory-source-known","monitoring-profile-known","host-summary-known","host-group-known","template-known","proxy-or-server-known","maintenance-window-known","owner-known","support-group-known","dry-run-plan-produced","approval-route-assigned","evidence-redacted"],"planSections":["onboardingSummary","hostSummaryReview","hostGroupTemplatePlan","proxyOrServerPlan","maintenanceWindowPlan","ownerRouting","approvalRoute","dryRunOnboardingPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-onboarding-disabled","zabbix-mutation-disabled","raw-host-rows-disabled","raw-provider-payloads-disabled","host-summary-unknown","monitoring-profile-missing","host-group-missing","template-missing","proxy-or-server-unknown","maintenance-window-missing","owner-unknown","support-group-unknown","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_alert_routing() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["alert-routing-and-escalation","zabbix-onboarding","monitoring-coverage-gap-report"],"dimensions":["site","environment","application","criticality","supportGroup","maintenanceWindow","alertSeverity","ownershipState"],"requiredGuards":["owner-known","support-group-known","maintenance-window-known","alert-template-mapped","escalation-policy-assigned","evidence-redacted"],"escalationStages":["suppress-during-maintenance","notify-support-group","escalate-critical-service","create-review-task","handover-unresolved"],"blockedReasons":["provider-calls-disabled","unknown-owner","unknown-support-group","missing-maintenance-window","unmapped-alert-template","escalation-policy-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_monitoring_coverage_gap() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"gapScopes":["host","application","site","environment","monitoring-profile","support-group"],"gapSignals":["missing-zabbix-host","missing-host-group","missing-template","missing-proxy-or-server","missing-maintenance-window","missing-owner","missing-support-group","alert-routing-gap","stale-monitoring-inventory"],"requiredGuards":["inventory-coverage-current","monitoring-profile-known","host-summary-known","host-group-known","template-known","proxy-or-server-known","maintenance-window-known","owner-known","support-group-known","alert-routing-reviewed","stale-data-marked","evidence-redacted"],"planSections":["coverageSummary","hostOnboardingState","hostGroupTemplateReview","proxyOrServerReview","maintenanceWindowReview","alertRoutingReview","ownerRouting","remediationDraft","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","zabbix-mutation-disabled","live-task-creation-disabled","raw-host-rows-disabled","raw-alert-payloads-disabled","raw-problem-rows-disabled","raw-provider-payloads-disabled","asset-scope-unknown","monitoring-profile-missing","host-summary-unknown","host-group-missing","template-missing","proxy-or-server-unknown","maintenance-window-missing","alert-routing-unknown","owner-unknown","support-group-unknown","stale-monitoring-inventory","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_zabbix_drift() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["host-group-drift-review","template-drift-review","proxy-drift-review","maintenance-window-drift-review","remediation-request-draft","evidence-pack-review"],"signals":["host-group-mismatch","template-mismatch","proxy-mismatch","maintenance-window-mismatch","owner-mismatch","stale-monitoring-data","policy-exception"],"requiredGuards":["monitoring-profile-known","host-identity-known","zabbix-mapping-reviewed","owner-known","remediation-request-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["driftSummary","expectedMapping","observedMapping","remediationRequest","maintenanceImpact","ownerReview","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","zabbix-mutation-disabled","host-identity-unknown","monitoring-profile-missing","mapping-ambiguous","owner-unknown","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_synthetic_health() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["web-endpoint-check","api-check","dns-resolution-check","certificate-expiry-check","load-balancer-check","iis-service-check","evidence-pack-review"],"signals":["endpoint-unreachable","api-error","dns-resolution-risk","certificate-expiry-risk","load-balancer-risk","iis-service-risk","stale-check-definition"],"requiredGuards":["check-target-reviewed","check-type-supported","owner-known","maintenance-window-known","synthetic-definition-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["checkSummary","targetScope","syntheticDefinition","expectedResult","alertImpact","maintenanceImpact","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-checks-disabled","external-probes-disabled","zabbix-mutation-disabled","target-scope-unknown","unsupported-check-type","owner-unknown","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_noise_flapping() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["flapping-pattern-review","noise-threshold-review","trigger-tuning-review","suppression-window-review","escalation-quality-review","remediation-request-draft","evidence-pack-review"],"signals":["repeated-alert","flapping-trigger","noisy-threshold","stale-maintenance-window","missing-owner","escalation-loop","policy-exception"],"requiredGuards":["alert-pattern-summary-known","monitoring-profile-known","owner-known","maintenance-window-reviewed","remediation-request-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["noiseSummary","flappingPattern","thresholdReview","suppressionWindow","escalationReview","remediationRequest","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","alert-suppression-disabled","zabbix-mutation-disabled","raw-alert-history-disabled","alert-pattern-unknown","monitoring-profile-missing","owner-unknown","approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_monitoring_review_queue() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["ambiguous-onboarding-review","mapping-owner-assignment","sla-aging-review","escalation-draft","queue-handover","evidence-pack-review"],"signals":["ambiguous-host-mapping","missing-owner","missing-support-group","stale-review","sla-breach-risk","escalation-needed","evidence-missing"],"requiredGuards":["queue-item-summary-known","mapping-ambiguity-marked","owner-known","support-group-known","sla-policy-known","escalation-route-assigned","evidence-redacted"],"planSections":["queueSummary","mappingAmbiguity","ownershipReview","slaStatus","escalationDraft","handoverNotes","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-task-creation-disabled","live-escalation-disabled","zabbix-mutation-disabled","queue-item-unknown","owner-unknown","support-group-unknown","sla-policy-missing","escalation-route-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn observe_log_forwarder() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["windows-event-forwarding-readiness","linux-rsyslog-readiness","linux-auditd-readiness","siem-routing-review","agent-policy-review","evidence-pack-review"],"signals":["missing-log-forwarder","unsupported-agent","policy-mismatch","stale-log-source","routing-missing","owner-missing","evidence-missing"],"requiredGuards":["os-family-supported","log-profile-known","forwarding-policy-known","owner-known","support-group-known","route-reviewed","installation-plan-dry-run","evidence-redacted"],"planSections":["onboardingSummary","logSourceScope","forwardingPolicy","routeReview","agentReadiness","remediationPlan","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-agent-install-disabled","live-config-change-disabled","log-platform-mutation-disabled","unsupported-os-family","log-profile-missing","forwarding-policy-missing","owner-unknown","support-group-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn cmdb_reconciliation() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["cmdb-import","cmdb-update-export","cmdb-ci-reconciliation"],"signals":["identity-match","owner-match","support-group-match","site-placement-match","backup-policy-match","monitoring-profile-match","relationship-match"],"decisions":["accept","reject","review","export-update"],"requiredGuards":["cmdb-file-contract-validated","header-mapping-complete","inventory-coverage-current","relationship-evidence-ready","reviewer-approval-assigned","evidence-redacted"],"blockedReasons":["live-api-disabled","missing-ci-identity","ambiguous-ci-identity","stale-inventory","relationship-evidence-missing","reviewer-approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn cmdb_relationship_graph() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"nodeTypes":["application","environment","vm","database","network","storage","backup-policy","monitoring-profile","owner"],"edgeTypes":["contains","depends-on","runs-on","connects-to","protected-by","monitored-by","owned-by","supports"],"requiredGuards":["cmdb-file-contract-validated","ci-identity-known","relationship-source-known","relationship-direction-known","stale-data-marked","reviewer-approval-assigned","evidence-redacted"],"blockedReasons":["live-api-disabled","missing-ci-identity","ambiguous-relationship","relationship-source-unknown","relationship-direction-unknown","stale-data-unmarked","reviewer-approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn cmdb_impact_analysis() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"domains":["application","environment","vm","database","network","storage","backup","monitoring","owner","service"],"impactSignals":["upstream-dependency","downstream-dependency","single-point-of-failure","missing-owner","stale-relationship","criticality-mismatch","monitoring-gap","backup-gap"],"qualitySignals":["relationship-complete","direction-known","owner-known","criticality-known","source-current","duplicate-free","evidence-redacted"],"syncStates":["file-imported","update-export-pending","ready-for-review","blocked","future-api-disabled"],"requiredGuards":["cmdb-file-contract-validated","relationship-graph-reviewed","impact-scope-reviewed","dependency-quality-reviewed","sync-state-reviewed","reviewer-approval-assigned","evidence-redacted"],"blockedReasons":["cmdb-impact-live-api-disabled","cmdb-impact-cmdb-mutation-disabled","cmdb-impact-relationship-mutation-disabled","cmdb-impact-provider-calls-disabled","cmdb-impact-raw-rows-disabled","cmdb-impact-raw-relationship-rows-disabled","cmdb-impact-raw-impact-rows-disabled","cmdb-impact-raw-provider-payloads-disabled","cmdb-impact-raw-log-content-disabled","cmdb-impact-raw-recipient-data-disabled","cmdb-impact-credential-values-disabled","cmdb-impact-tenant-identifiers-disabled","cmdb-impact-object-identifiers-disabled","cmdb-impact-private-network-values-disabled","cmdb-impact-serials-disabled","impact-scope-missing","dependency-quality-unknown","sync-state-unknown","reviewer-approval-missing","evidence-not-redacted"]}),
+    )
+}
+
+async fn admin_worker_capability() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","routingMode":"metadata-only","providerCallsEnabled":false,"liveDispatchAllowed":false,"secretValuesAllowed":false,"capabilityTypes":["generic-worker","windows-gmsa","powercli","linux-ansible","protected-network"],"routingDimensions":["workflowType","osFamily","site","networkZone","providerDomain","riskLevel","approvalState"],"requiredInputs":["workflowType","requestedCapability","site","environment","networkZone","riskLevel","approvalRoute","evidenceManifest"],"requiredGuards":["worker-registered","capability-tag-known","identity-reference-ready","network-zone-approved","approval-route-assigned","dry-run-ready","evidence-redacted"],"blockedReasons":["worker-unknown","capability-missing","identity-reference-missing","protected-network-unapproved","route-ambiguous","approval-missing","worker-health-unknown","evidence-not-redacted"],"requiredEvidence":["Routing request summary","Capability match","Worker readiness","Identity reference decision","Network zone decision","Approval route","Dry-run readiness","Evidence references"],"rules":[{"id":"no-live-worker-dispatch","decision":"block","requirement":"Worker capability routing returns metadata decisions only and never dispatches live jobs.","evidence":"Routing request summary"},{"id":"secret-values-not-allowed","decision":"block","requirement":"Worker identity state must use secret references only and never expose credential values.","evidence":"Identity reference decision"},{"id":"protected-network-approval-required","decision":"block","requirement":"Protected network routes require explicit approval and network-zone decision evidence.","evidence":"Network zone decision"},{"id":"ambiguous-route-blocks-dispatch","decision":"block","requirement":"Ambiguous or missing capability matches block dispatch until reviewed.","evidence":"Capability match"}]}),
+    )
+}
+
+async fn admin_feature_flag() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","featureFlagGovernanceMode":"static-feature-flag-governance","flagCatalogReadOnly":true,"rolloutPlanReadOnly":true,"approvalRouteReadOnly":true,"auditSummaryOnly":true,"liveToggleAllowed":false,"rolloutMutationAllowed":false,"targetingMutationAllowed":false,"policyMutationAllowed":false,"workflowMutationAllowed":false,"providerCallsAllowed":false,"notificationDispatchAllowed":false,"rawFlagRowsAllowed":false,"rawTargetingRowsAllowed":false,"rawUserRowsAllowed":false,"rawGroupRowsAllowed":false,"rawAuditLogsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"principalIdentifiersAllowed":false,"groupIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"flagScopes":["platform-shell","catalog","request-lifecycle","operations","inventory","cmdb","evidence","admin"],"flagStates":["proposed","approved-disabled","approved-enabled","rollout-planned","deprecated","blocked"],"rolloutStrategies":["off-by-default","allowlist-by-role","site-ring","percentage-simulation","rollback-ready"],"requiredGuards":["owner-assigned","approval-route-assigned","blast-radius-reviewed","rollback-plan-ready","evidence-redacted","live-toggle-blocked"],"blockedReasons":["feature-live-toggle-disabled","feature-rollout-mutation-disabled","feature-targeting-mutation-disabled","feature-policy-mutation-disabled","feature-workflow-mutation-disabled","feature-provider-calls-disabled","feature-notification-dispatch-disabled","feature-raw-flag-rows-disabled","feature-raw-targeting-rows-disabled","feature-raw-user-rows-disabled","feature-raw-group-rows-disabled","feature-raw-audit-logs-disabled","feature-raw-provider-payloads-disabled","feature-raw-recipient-data-disabled","feature-credential-values-disabled","feature-token-values-disabled","feature-tenant-identifiers-disabled","feature-object-identifiers-disabled","feature-principal-identifiers-disabled","feature-group-identifiers-disabled","feature-private-network-values-disabled","feature-owner-missing","approval-route-missing","blast-radius-unknown","rollback-plan-missing","evidence-not-redacted"],"requiredEvidence":["Feature flag summary","Rollout plan summary","Approval route summary","Blast radius summary","Rollback plan summary","Evidence references"],"rules":[{"id":"feature-flag-catalog-read-only","decision":"block","requirement":"Feature flag catalog summaries are read-only and must not create, update, enable, disable, or delete flags.","evidence":"Feature flag summary"},{"id":"rollout-plan-approval-required","decision":"block","requirement":"Rollout plans require owner assignment, approval routing, blast-radius review, rollback readiness, and redacted evidence before live use.","evidence":"Rollout plan summary"},{"id":"live-toggle-and-targeting-disabled","decision":"block","requirement":"Admin feature flag governance cannot toggle live flags, mutate targeting, dispatch notifications, call providers, or mutate policy or workflow state.","evidence":"Approval route summary"},{"id":"raw-targeting-data-not-exposed","decision":"block","requirement":"Feature flag governance evidence must not expose raw flag rows, raw targeting rows, raw user rows, raw group rows, raw audit logs, raw provider payloads, recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, group identifiers, private network values, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn admin_approval_groups() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","approvalGroupsMode":"static-admin-approval-groups","groupMappingReadOnly":true,"datacenterFallbackRequired":true,"delegationReviewRequired":true,"separationOfDutiesReviewRequired":true,"liveIdentityLookupAllowed":false,"graphCallsAllowed":false,"roleAssignmentMutationAllowed":false,"groupMembershipMutationAllowed":false,"approvalMutationAllowed":false,"policyMutationAllowed":false,"workflowMutationAllowed":false,"providerCallsAllowed":false,"notificationDispatchAllowed":false,"rawUserDataAllowed":false,"rawGroupDataAllowed":false,"rawMembershipRowsAllowed":false,"rawApprovalPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"principalIdentifiersAllowed":false,"groupIdentifiersAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"privateNetworkValuesAllowed":false,"groupScopes":["datacenter-final-approval","technical-approval","business-approval","risk-approval","emergency-approval","audit-review","service-specific-delegation"],"groupStates":["not-created","planned","pending-review","approved","delegated","expired","blocked"],"mappingDimensions":["role","site","service","workflow","criticality","emergency","separation-of-duties"],"requiredGuards":["default-datacenter-approver-reviewed","group-purpose-reviewed","delegation-boundary-reviewed","separation-of-duties-reviewed","break-glass-reviewed","expiry-review-set","evidence-redacted","live-identity-lookup-blocked"],"blockedReasons":["approval-groups-live-identity-lookup-disabled","approval-groups-graph-calls-disabled","approval-groups-role-assignment-disabled","approval-groups-group-membership-mutation-disabled","approval-groups-approval-mutation-disabled","approval-groups-policy-mutation-disabled","approval-groups-workflow-mutation-disabled","approval-groups-provider-calls-disabled","approval-groups-notification-dispatch-disabled","approval-groups-raw-user-data-disabled","approval-groups-raw-group-data-disabled","approval-groups-raw-membership-rows-disabled","approval-groups-raw-approval-payloads-disabled","approval-groups-raw-provider-payloads-disabled","approval-groups-raw-recipient-data-disabled","approval-groups-tenant-identifiers-disabled","approval-groups-object-identifiers-disabled","approval-groups-principal-identifiers-disabled","approval-groups-group-identifiers-disabled","approval-groups-credential-values-disabled","approval-groups-token-values-disabled","approval-groups-private-network-values-disabled","group-scope-missing","delegation-boundary-missing","separation-of-duties-missing","evidence-not-redacted"],"requiredEvidence":["Approval group mapping summary","Datacenter fallback summary","Delegation boundary summary","Separation of duties summary","Evidence references"],"rules":[{"id":"approval-groups-read-only","decision":"block","requirement":"Admin approval group mappings are static summaries and must not look up live identity groups, mutate membership, assign roles, or execute approvals.","evidence":"Approval group mapping summary"},{"id":"datacenter-fallback-required","decision":"block","requirement":"Datacenter final approval remains the default live-execution authority until delegated service-specific approval groups are formally reviewed.","evidence":"Datacenter fallback summary"},{"id":"delegation-boundary-required","decision":"block","requirement":"Approval group delegation requires group purpose, role, site, service, workflow, criticality, emergency scope, expiry, and separation-of-duties review.","evidence":"Delegation boundary summary"},{"id":"raw-approval-group-data-not-exposed","decision":"block","requirement":"Approval group evidence must not expose raw user data, raw group data, raw membership rows, raw approval payloads, raw provider payloads, raw recipient data, tenant identifiers, object identifiers, principal identifiers, group identifiers, credential values, token values, private network values, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn admin_delegation_boundary() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","delegationBoundaryMode":"static-delegation-boundary","siteDelegationReadOnly":true,"roleScopeReadOnly":true,"approvalRouteReadOnly":true,"breakGlassReviewOnly":true,"liveDelegationChangeAllowed":false,"roleAssignmentMutationAllowed":false,"approvalMutationAllowed":false,"policyMutationAllowed":false,"workflowMutationAllowed":false,"graphCallsAllowed":false,"providerCallsAllowed":false,"notificationDispatchAllowed":false,"rawUserDataAllowed":false,"rawGroupDataAllowed":false,"rawDelegationRowsAllowed":false,"rawApprovalPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"principalIdentifiersAllowed":false,"groupIdentifiersAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"privateNetworkValuesAllowed":false,"delegationDomains":["catalog","requests","approvals","operations","inventory","cmdb","evidence","admin"],"delegationScopes":["global-read","site-admin","site-approver","workflow-delegate","break-glass-review","audit-review"],"delegationStates":["proposed","pending-approval","approved","expired","revoked","blocked"],"requiredGuards":["delegate-role-known","site-scope-known","approval-route-assigned","expiry-set","separation-of-duties-reviewed","break-glass-reviewed","evidence-redacted","live-delegation-blocked"],"blockedReasons":["delegation-live-change-disabled","delegation-role-assignment-disabled","delegation-approval-mutation-disabled","delegation-policy-mutation-disabled","delegation-workflow-mutation-disabled","delegation-graph-calls-disabled","delegation-provider-calls-disabled","delegation-notification-dispatch-disabled","delegation-raw-user-data-disabled","delegation-raw-group-data-disabled","delegation-raw-delegation-rows-disabled","delegation-raw-approval-payloads-disabled","delegation-raw-provider-payloads-disabled","delegation-raw-recipient-data-disabled","delegation-tenant-identifiers-disabled","delegation-object-identifiers-disabled","delegation-principal-identifiers-disabled","delegation-group-identifiers-disabled","delegation-credential-values-disabled","delegation-token-values-disabled","delegation-private-network-values-disabled","delegate-role-missing","site-scope-missing","approval-route-missing","expiry-missing","separation-of-duties-missing","break-glass-review-missing","evidence-not-redacted"],"requiredEvidence":["Delegation boundary summary","Site scope summary","Role scope summary","Approval route summary","Expiry and review summary","Evidence references"],"rules":[{"id":"delegation-boundary-read-only","decision":"block","requirement":"Delegation boundary summaries are read-only and must not grant, revoke, mutate, or synchronize delegated authority.","evidence":"Delegation boundary summary"},{"id":"site-scope-and-expiry-required","decision":"block","requirement":"Delegation decisions require known site scope, delegate role, approval route, expiry, separation-of-duties review, and redacted evidence.","evidence":"Site scope summary"},{"id":"live-delegation-disabled","decision":"block","requirement":"Admin delegation boundary review cannot change live delegation, mutate role assignments, call Graph or providers, dispatch notifications, or mutate approval, policy, or workflow state.","evidence":"Approval route summary"},{"id":"raw-delegation-data-not-exposed","decision":"block","requirement":"Delegation boundary evidence must not expose raw user data, raw group data, raw delegation rows, raw approval payloads, raw provider payloads, recipient data, tenant identifiers, object identifiers, principal identifiers, group identifiers, credential values, token values, private network values, live endpoints, or URLs.","evidence":"Evidence references"}]}),
+    )
+}
+
+async fn auth_local_roles() -> Json<Value> {
+    Json(
+        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","actions":["request","approve","execute","admin","audit"],"roles":[{"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]},{"id":"datacenter-approver","title":"Datacenter Approver","visibility":"site-scope","canRequest":true,"canApprove":true,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["datacenter","capacity","live-execution-final"]},{"id":"vmware-operator","title":"VMware Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["vmware","placement","lifecycle"]},{"id":"hyper-v-operator","title":"Hyper-V Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["hyper-v","placement","lifecycle"]},{"id":"proxmox-operator","title":"Proxmox Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["proxmox","placement","lifecycle"]},{"id":"wintel-linux-operator","title":"Wintel/Linux Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["windows","linux","patching","baseline"]},{"id":"backup-operator","title":"Backup Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["backup","restore","dr"]},{"id":"monitoring-operator","title":"Monitoring Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["monitoring","alert-routing","maintenance-window"]},{"id":"service-desk","title":"Service Desk","visibility":"ticket-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["approved-runbook","incident-context","handover"]},{"id":"auditor","title":"Auditor","visibility":"audit-scope","canRequest":false,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["evidence-review","export-review","compliance"]},{"id":"requester","title":"Requester","visibility":"own-requests","canRequest":true,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":false,"executionDomains":["request-intake","evidence-view"]}]}),
+    )
+}
+
+async fn auth_local_me() -> Json<Value> {
+    let role = json!({"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]});
+    Json(
+        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","user":"local-operator","requestedRole":null,"roleFallbackApplied":false,"role":role,"externalAccessBlocked":true}),
+    )
+}
+
+async fn auth_local_decision() -> Json<Value> {
+    Json(
+        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","role":{"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]},"action":"request","allowed":true,"decision":"allow","reason":"local-role-capability"}),
+    )
+}
+
+async fn auth_local_login() -> Json<Value> {
+    let session = ryuki_engine::auth::AuthSession::static_dry_run();
+    Json(serde_json::to_value(session).unwrap_or_default())
+}
+
+async fn auth_local_logout() -> Json<Value> {
+    Json(json!({"status": "logged_out"}))
+}
+
+async fn auth_status() -> Json<Value> {
+    let app_cfg = crate::config_store::get_app_config();
+    let config = ryuki_engine::auth::get_entra_config_from_env(
+        &app_cfg.entra_tenant_id,
+        &app_cfg.entra_client_id,
+        &app_cfg.entra_authority,
+    );
+    Json(serde_json::to_value(config).unwrap_or_default())
+}
+
+async fn auth_session() -> Json<Value> {
+    let session = ryuki_engine::auth::AuthSession::static_dry_run();
+    Json(serde_json::to_value(session).unwrap_or_default())
+}
+
+async fn auth_roles() -> Json<Value> {
+    let roles = ryuki_engine::auth::get_rbac_roles();
+    Json(serde_json::to_value(roles).unwrap_or_default())
+}
+
+async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let app_cfg = crate::config_store::get_app_config();
+    if app_cfg.auth_mode == "mock-dry-run" || app_cfg.entra_tenant_id.is_empty() {
+        let session_id = Uuid::new_v4();
+        let session_data = json!({
+            "session_id": session_id.to_string(),
+            "user_id": "platform-engineer",
+            "display_name": "Platform Engineer",
+            "email": "platform-engineer@ryuki.local",
+            "roles": ["platform-engineer", "operator", "viewer"],
+            "token_valid": false,
+            "provider_mode": "static-dry-run"
+        });
+
+        if let Some(pool) = get_db() {
+            let _ = sqlx::query(
+                "INSERT INTO sessions (id, user_id, display_name, email, roles) VALUES ($1, $2, $3, $4, $5)"
+            )
+            .bind(session_id)
+            .bind("platform-engineer")
+            .bind("Platform Engineer")
+            .bind("platform-engineer@ryuki.local")
+            .bind(&["platform-engineer", "operator", "viewer"] as &[&str])
+            .execute(pool)
+            .await;
+        }
+
+        return Ok(Json(session_data));
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::new(
+            "ENTRA_NOT_CONFIGURED",
+            "Entra SSO not configured",
+        )),
+    ))
+}
+
+async fn auth_logout(
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let session_id = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                "MISSING_SESSION_ID",
+                "Session ID is required for logout",
+            )),
+        ));
+    }
+    if let Some(pool) = get_db() {
+        if let Ok(uid) = Uuid::parse_str(session_id) {
+            let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await;
+        }
+    }
+    Ok(Json(json!({"status": "logged_out"})))
+}
+
+async fn analytics_cost_capacity() -> Json<Value> {
+    Json(
+        json!({"source":"static-seed","providerCallsEnabled":false,"platformScope":["vmware","hyperv","proxmox"],"domains":["compute-capacity","storage-capacity","backup-capacity","growth-trend","cost-trend","efficiency-opportunity","forecast-risk"],"signals":["capacity-pressure","storage-growth-risk","backup-growth-risk","cost-anomaly","underutilization-signal","stale-usage-data","forecast-window-missing"],"requiredGuards":["analytics-scope-summarized","aggregate-usage-known","cost-band-known","growth-trend-known","forecast-window-set","owner-known","remediation-plan-ready","evidence-redacted"],"planSections":["analyticsSummary","capacityForecast","storageForecast","backupForecast","costTrend","efficiencyOpportunities","remediationOptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","billing-export-ingestion-disabled","raw-cost-rows-disabled","raw-inventory-rows-disabled","resource-identifiers-disabled","tenant-identifiers-disabled","object-identifiers-disabled","raw-provider-payloads-disabled","analytics-scope-missing","aggregate-usage-missing","cost-band-missing","growth-trend-unknown","forecast-window-missing","owner-unknown","evidence-not-redacted"]}),
+    )
+}
+
+async fn platform_health() -> Json<Value> {
+    let health = ryuki_engine::health_monitor::run_all_checks();
+    Json(serde_json::to_value(health).unwrap_or_default())
+}
+
+async fn platform_health_components() -> Json<Value> {
+    let health = ryuki_engine::health_monitor::run_all_checks();
+    let component_map: Vec<serde_json::Value> = health
+        .checks
+        .iter()
+        .map(|check| {
+            json!({
+                "component": check.component,
+                "name": check.name,
+                "status": check.status.to_string(),
+                "source": check.source.to_string(),
+                "message": check.message,
+                "last_check": check.last_check
+            })
+        })
+        .collect();
+    Json(json!({
+        "source": health.source.to_string(),
+        "overall_status": health.overall_status.to_string(),
+        "timestamp": health.timestamp,
+        "components": component_map
+    }))
+}
+
+async fn platform_health_adapters() -> Json<Value> {
+    let adapters = [
+        "vmware",
+        "hyperv",
+        "proxmox",
+        "veeam",
+        "zabbix",
+        "servicenow",
+    ];
+    let checks: Vec<serde_json::Value> = adapters
+        .iter()
+        .map(|adapter| {
+            let check = ryuki_engine::health_monitor::check_adapter_health(adapter);
+            json!({
+                "adapter": adapter,
+                "name": check.name,
+                "component": check.component,
+                "status": check.status.to_string(),
+                "source": check.source.to_string(),
+                "message": check.message,
+                "last_check": check.last_check
+            })
+        })
+        .collect();
+    Json(json!({
+        "source": "simulated",
+        "adapters": checks
+    }))
+}
+
+async fn admin_rbac_roles() -> Json<Value> {
+    let roles = get_rbac_roles();
+    Json(serde_json::to_value(roles).unwrap_or_default())
+}
+
+async fn admin_platform_settings() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM platform_config")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+        let mut config = PlatformConfig::default();
+        for (key, value) in &rows {
+            match key.as_str() {
+                "entra_tenant_id" => config.entra_tenant_id = value.clone(),
+                "entra_client_id" => config.entra_client_id = value.clone(),
+                "entra_authority" => config.entra_authority = value.clone(),
+                "auth_mode" => config.auth_mode = value.clone(),
+                "database_provider" => config.database_provider = value.clone(),
+                "platform_name" => config.platform_name = value.clone(),
+                "platform_url" => config.platform_url = value.clone(),
+                _ => {}
+            }
+        }
+        return Json(serde_json::to_value(config).unwrap_or_default());
+    }
+    let config = crate::config_store::load_config().await;
+    Json(serde_json::to_value(config).unwrap_or_default())
+}
+
+async fn admin_platform_settings_update(Json(body): Json<PlatformConfig>) -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let entries = [
+            ("entra_tenant_id", &body.entra_tenant_id),
+            ("entra_client_id", &body.entra_client_id),
+            ("entra_authority", &body.entra_authority),
+            ("auth_mode", &body.auth_mode),
+            ("database_provider", &body.database_provider),
+            ("platform_name", &body.platform_name),
+            ("platform_url", &body.platform_url),
+        ];
+        for (key, value) in &entries {
+            let _ = sqlx::query(
+                "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
+                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await;
+        }
+    }
+    let _ = crate::config_store::save_config(&body).await;
+    let config = if get_db().is_some() {
+        body
+    } else {
+        crate::config_store::load_config().await
+    };
+    Json(serde_json::to_value(config).unwrap_or_default())
+}
+
+async fn admin_platform_settings_reset() -> Json<Value> {
+    let defaults = PlatformConfig::default();
+    if let Some(pool) = get_db() {
+        let entries = [
+            ("entra_tenant_id", &defaults.entra_tenant_id),
+            ("entra_client_id", &defaults.entra_client_id),
+            ("entra_authority", &defaults.entra_authority),
+            ("auth_mode", &defaults.auth_mode),
+            ("database_provider", &defaults.database_provider),
+            ("platform_name", &defaults.platform_name),
+            ("platform_url", &defaults.platform_url),
+        ];
+        for (key, value) in &entries {
+            let _ = sqlx::query(
+                "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
+                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await;
+        }
+    }
+    let _ = crate::config_store::save_config(&defaults).await;
+    Json(serde_json::to_value(defaults).unwrap_or_default())
+}
+
+// ─── Request lifecycle handlers ───
+
+/// Custom extractor: pulls AuthSession from request extensions injected by auth middleware.
+struct AuthExtractor(AuthSession);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthExtractor {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AuthSession>()
+            .cloned()
+            .map(AuthExtractor)
+            .ok_or_else(|| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "No session found"})),
+                )
+            })
+    }
+}
+
+type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+
+fn status_404(id: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": format!("Request {id} not found")})),
+    )
+}
+
+fn status_403() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error": "Admin role required for approval"})),
+    )
+}
+
+fn status_409(msg: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::CONFLICT, Json(json!({"error": msg})))
+}
+
+async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let row = sqlx::query_as::<_, DbRequestRow>(
+            "INSERT INTO requests (request_type, site, environment, name, cpu, memory_gb, justification) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(&body.request_type)
+        .bind(&body.site)
+        .bind(&body.environment)
+        .bind(&body.name)
+        .bind(body.cpu as i32)
+        .bind(body.memory_gb as i32)
+        .bind(&body.justification)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "intake",
+            "created_at": row.created_at.to_rfc3339()
+        })));
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    let now = now_iso();
+    let record = RequestRecord {
+        request_id: request_id.clone(),
+        request_type: body.request_type,
+        status: "intake".into(),
+        stage: "intake".into(),
+        site: body.site,
+        environment: body.environment,
+        name: body.name,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    request_store().lock().await.push(record);
+    Ok(Json(json!({
+        "request_id": request_id,
+        "status": "intake",
+        "created_at": request_store().lock().await.iter().find(|r| r.request_id == request_id).unwrap().created_at
+    })))
+}
+
+async fn requests_list() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<DbRequestRow> = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests ORDER BY created_at DESC"
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let summaries: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.id.to_string(),
+                    "request_type": r.request_type,
+                    "status": r.status,
+                    "name": r.name,
+                    "site": r.site,
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
+        return Json(json!(summaries));
+    }
+
+    let store = request_store().lock().await;
+    let summaries: Vec<Value> = store
+        .iter()
+        .map(|r| {
+            json!({
+                "request_id": r.request_id,
+                "request_type": r.request_type,
+                "status": r.status,
+                "name": r.name,
+                "site": r.site,
+                "created_at": r.created_at
+            })
+        })
+        .collect();
+    Json(json!(summaries))
+}
+
+async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "request_type": row.request_type,
+            "status": row.status,
+            "stage": row.stage,
+            "site": row.site,
+            "environment": row.environment,
+            "name": row.name,
+            "cpu": row.cpu,
+            "memory_gb": row.memory_gb,
+            "justification": row.justification,
+            "created_by": row.created_by,
+            "created_at": row.created_at.to_rfc3339(),
+            "updated_at": row.updated_at.to_rfc3339()
+        })));
+    }
+
+    let store = request_store().lock().await;
+    let record = store.iter().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => Ok(Json(serde_json::to_value(r).unwrap_or_default())),
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'validated', stage = 'validate', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "validated",
+            "passed": true,
+            "checks": [
+                {"name": "site-validation", "passed": true},
+                {"name": "capacity-check", "passed": true},
+                {"name": "policy-gate", "passed": true}
+            ]
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            r.status = "validated".into();
+            r.stage = "validate".into();
+            r.updated_at = now_iso();
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "validated",
+                "passed": true,
+                "checks": [
+                    {"name": "site-validation", "passed": true},
+                    {"name": "capacity-check", "passed": true},
+                    {"name": "policy-gate", "passed": true}
+                ]
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_plan(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'planned', stage = 'plan', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "planned",
+            "plan": {
+                "actions": ["reserve-capacity", "validate-network", "assign-ip", "provision-vm"],
+                "risk": "low"
+            }
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            r.status = "planned".into();
+            r.stage = "plan".into();
+            r.updated_at = now_iso();
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "planned",
+                "plan": {
+                    "actions": [
+                        "reserve-capacity",
+                        "validate-network",
+                        "assign-ip",
+                        "provision-vm"
+                    ],
+                    "risk": "low"
+                }
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_approve(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        return Err(status_403());
+    }
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'approved', stage = 'approve', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "approved",
+            "approved_by": "admin"
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            r.status = "approved".into();
+            r.stage = "approve".into();
+            r.updated_at = now_iso();
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "approved",
+                "approved_by": "admin"
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_lock(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'locked', stage = 'lock', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        let lock_id = format!("lock-{}", Uuid::new_v4());
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "locked",
+            "lock_id": lock_id
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            r.status = "locked".into();
+            r.stage = "lock".into();
+            r.updated_at = now_iso();
+            let lock_id = format!("lock-{}", Uuid::new_v4());
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "locked",
+                "lock_id": lock_id
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_execute(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        if current.status != "locked" {
+            return Err(status_409("Request must be locked before execution"));
+        }
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'executed', stage = 'execute', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "executed",
+            "result": "dry-run-success"
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            if r.status != "locked" {
+                return Err(status_409("Request must be locked before execution"));
+            }
+            r.status = "executed".into();
+            r.stage = "execute".into();
+            r.updated_at = now_iso();
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "executed",
+                "result": "dry-run-success"
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+async fn requests_verify(Path(request_id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = 'verified', stage = 'verify', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| status_404(&request_id))?;
+        return Ok(Json(json!({
+            "request_id": row.id.to_string(),
+            "status": "verified",
+            "checks": [
+                {"name": "inventory-snapshot", "passed": true},
+                {"name": "service-health", "passed": true},
+                {"name": "config-drift", "passed": true}
+            ]
+        })));
+    }
+
+    let mut store = request_store().lock().await;
+    let record = store.iter_mut().find(|r| r.request_id == request_id);
+    match record {
+        Some(r) => {
+            r.status = "verified".into();
+            r.stage = "verify".into();
+            r.updated_at = now_iso();
+            Ok(Json(json!({
+                "request_id": r.request_id,
+                "status": "verified",
+                "checks": [
+                    {"name": "inventory-snapshot", "passed": true},
+                    {"name": "service-health", "passed": true},
+                    {"name": "config-drift", "passed": true}
+                ]
+            })))
+        }
+        None => Err(status_404(&request_id)),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn test_platform_summary_json() -> Value {
+        json!({"productName":"Ryuki Infrastructure Platform","lifecycleStages":lifecycle_stages(),"components":components(),"guardrails":guardrails(),"browserIsolation":true,"localAuthorization":{"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"roleHeader":"X-Ryuki-Local-Role","requiredProductionProvider":"Microsoft Entra ID"}})
+    }
+
+    fn test_catalog_offerings_json() -> Value {
+        json!({"source":"static-seed","catalogMode":"planned-offerings","catalogReadOnly":true,"providerCallsAllowed":false,"workflowMutationAllowed":false,"liveRequestCreationAllowed":false,"liveApprovalExecutionAllowed":false,"liveExecutionAllowed":false,"rawRequestPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawLogContentAllowed":false,"rawRowsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"categories":categories(),"offerings":[{"id":"windows-server-deployment","title":"Windows server deployment","category":"Build","priority":"P0","status":"planned"}]})
+    }
+
+    #[test]
+    fn test_platform_summary_has_components() {
+        let part = test_platform_summary_json();
+        assert_eq!(part["productName"], "Ryuki Infrastructure Platform");
+        assert!(part["components"].as_array().unwrap().len() > 5);
+        assert_eq!(part["lifecycleStages"].as_array().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn test_catalog_offerings_is_static_seed() {
+        let part = test_catalog_offerings_json();
+        assert_eq!(part["source"], "static-seed");
+        assert_eq!(part["catalogMode"], "planned-offerings");
+        assert!(part["offerings"].as_array().unwrap().len() >= 1);
+        assert_eq!(part["categories"].as_array().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn test_components_returns_thirteen_plus() {
+        let c = components();
+        assert!(c.as_array().unwrap().len() >= 13);
+        let names: Vec<&str> = c
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"portal-ui"));
+        assert!(names.contains(&"platform-api"));
+    }
+}

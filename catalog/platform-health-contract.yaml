@@ -1,0 +1,83 @@
+# Platform health seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+healthMode: degraded-read-only
+providerCallsEnabled: false
+liveExecutionAllowed: false
+rawLogsAllowed: false
+components:
+  - portal-ui
+  - platform-api
+  - platform-worker
+  - inventory-sync
+  - adapters
+  - queue
+  - platform-db
+  - platform-vault
+  - ingress
+  - object-storage
+healthSignals:
+  - readiness
+  - liveness
+  - stale-data
+  - dependency-health
+  - queue-depth
+  - adapter-readiness
+  - backup-state
+  - secret-reference-readiness
+  - evidence-export-readiness
+healthStates:
+  - healthy
+  - degraded
+  - stale
+  - blocked
+  - unknown
+requiredInputs:
+  - component
+  - owner
+  - healthSignal
+  - healthState
+  - staleDataMarker
+  - safeRemediation
+  - evidenceManifest
+requiredGuards:
+  - component-registered
+  - owner-known
+  - stale-data-marked
+  - dependency-status-known
+  - safe-remediation-set
+  - evidence-redacted
+blockedReasons:
+  - component-unknown
+  - owner-unknown
+  - dependency-status-unknown
+  - stale-data-unmarked
+  - unsafe-remediation
+  - raw-log-exposure
+  - evidence-not-redacted
+requiredEvidence:
+  - Health summary
+  - Component owner
+  - Dependency state
+  - Stale-data marker
+  - Safe remediation
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-health-remediation
+    decision: block
+    requirement: Platform health reporting can suggest safe remediation but must not execute live remediation.
+    evidence: Safe remediation
+  - id: raw-logs-not-exposed
+    decision: block
+    requirement: Dashboard health output must not expose raw logs, provider payloads, credentials, or endpoint details.
+    evidence: Health summary
+  - id: stale-data-must-be-marked
+    decision: block
+    requirement: Stale data must be explicit so operators do not mistake cached state for live health.
+    evidence: Stale-data marker
+  - id: owner-and-remediation-required
+    decision: block
+    requirement: Health items must identify an owner and safe next action before leaving triage.
+    evidence: Component owner

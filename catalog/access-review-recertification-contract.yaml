@@ -1,0 +1,105 @@
+# Access review recertification seed data only. Do not add user names, account names, group names, email addresses, UPNs, principal IDs, tenant IDs, object IDs, raw membership rows, credentials, tokens, raw logs, ServiceNow payloads, Entra payloads, AD payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+reviewMode: review-only
+providerCallsEnabled: false
+liveDirectoryChangesAllowed: false
+liveServiceNowChangesAllowed: false
+rawUserDataAllowed: false
+rawGroupDataAllowed: false
+principalIdentifiersAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+rawProviderPayloadsAllowed: false
+reviewScopes:
+  - ownership-recertification
+  - support-group-recertification
+  - privileged-role-review
+  - service-account-review
+  - stale-access-review
+  - exception-review
+reviewSignals:
+  - owner-missing
+  - support-group-missing
+  - privileged-role-aging
+  - service-account-unknown
+  - orphaned-access
+  - recertification-overdue
+  - exception-expiring
+requiredInputs:
+  - reviewScopeSummary
+  - recertificationCycle
+  - accessScope
+  - roleProfile
+  - ownershipSummary
+  - supportGroup
+  - riskTier
+  - reviewCadence
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - review-scope-summarized
+  - owner-known
+  - support-group-known
+  - approval-route-assigned
+  - evidence-redacted
+  - raw-identity-data-blocked
+  - expiry-date-set
+  - remediation-plan-ready
+planSections:
+  - reviewSummary
+  - scopeReview
+  - ownershipDecision
+  - privilegedAccessReview
+  - serviceAccountReview
+  - exceptionDecision
+  - remediationPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-directory-change-disabled
+  - live-servicenow-change-disabled
+  - raw-user-data-disabled
+  - raw-group-data-disabled
+  - principal-identifiers-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - raw-provider-payloads-disabled
+  - review-scope-missing
+  - owner-unknown
+  - support-group-unknown
+  - approval-missing
+  - expiry-missing
+  - remediation-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Access review summary
+  - Scope review
+  - Ownership decision
+  - Privileged access review
+  - Service account review
+  - Exception decision
+  - Remediation plan
+  - Evidence references
+rules:
+  - id: no-live-access-changes
+    decision: block
+    requirement: Access recertification reports review state only and never changes Entra groups, AD groups, ServiceNow records, local memberships, or provider state.
+    evidence: Access review summary
+  - id: redacted-scope-required
+    decision: block
+    requirement: Review scope must be summarized before recertification can be accepted.
+    evidence: Scope review
+  - id: ownership-and-approval-required
+    decision: block
+    requirement: Ownership, support group, approval route, expiry, and review cadence must be known before acceptance.
+    evidence: Ownership decision
+  - id: privileged-access-reviewed
+    decision: block
+    requirement: Privileged access and service account scope must be reviewed before exception or remediation decisions.
+    evidence: Privileged access review
+  - id: raw-identity-data-not-exposed
+    decision: block
+    requirement: Access recertification evidence must use safe summaries only and must not expose raw user records, group membership rows, principal IDs, tenant IDs, object IDs, account names, email addresses, or provider payloads.
+    evidence: Evidence references

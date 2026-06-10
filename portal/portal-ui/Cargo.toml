@@ -1,0 +1,45 @@
+[package]
+name = "ryuki-portal-ui"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+axum = { version = "0.8", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+leptos = "0.8.9"
+leptos_axum = { version = "0.8.9", optional = true }
+leptos_meta = "0.8.6"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ryuki-core = { path = "../../sources/ryuki-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+hydrate = [
+    "dep:console_error_panic_hook",
+    "dep:wasm-bindgen",
+    "leptos/hydrate",
+]
+ssr = [
+    "dep:axum",
+    "dep:leptos_axum",
+    "dep:tokio",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+]
+
+[package.metadata.leptos]
+bin-features = ["ssr"]
+lib-features = ["hydrate"]
+lib-profile-release = "wasm-release"
+output-name = "ryuki-portal-ui"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+site-addr = "0.0.0.0:8080"
+style-file = "styles.css"

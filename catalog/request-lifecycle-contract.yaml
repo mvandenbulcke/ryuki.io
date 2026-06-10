@@ -1,0 +1,124 @@
+# Request lifecycle seed data only. Do not add direct provider routes, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw request content, raw execution content, raw evidence content, raw provider content, stack traces, recipient details, or implementation internals.
+version: 1
+status: draft
+source: static-seed
+lifecycleMode: static-request-lifecycle
+dryRunRequired: true
+approvalRequired: true
+lockRequired: true
+redactedEvidenceRequired: true
+liveExecutionAllowed: false
+providerCallsAllowed: false
+workflowMutationAllowed: false
+approvalMutationAllowed: false
+lockMutationAllowed: false
+rawRequestPayloadsAllowed: false
+rawExecutionLogsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+accessTokenValuesAllowed: false
+rawRecipientDataAllowed: false
+lifecycleStages:
+  - intake
+  - validate
+  - plan
+  - approve
+  - lock
+  - execute
+  - verify
+  - protect
+  - publish
+  - maintain
+  - retire
+requiredInputs:
+  - requestContext
+  - requesterRole
+  - offering
+  - site
+  - environment
+  - owner
+  - criticality
+  - dryRunPlan
+  - approvalRoute
+  - lockScope
+  - evidenceManifest
+  - statusCallback
+requiredGuards:
+  - intake-complete
+  - validation-passed
+  - dry-run-reviewed
+  - approval-route-assigned
+  - lock-scope-ready
+  - evidence-redacted
+  - provider-safe-plan-ready
+  - status-callback-ready
+  - fail-safe-state-reviewed
+planSections:
+  - intakeSummary
+  - validationSummary
+  - dryRunPlan
+  - approvalDecisions
+  - lockRecord
+  - executionPlan
+  - verificationPlan
+  - protectionPlan
+  - publishPlan
+  - maintainPlan
+  - retirePlan
+  - evidenceReferences
+blockedReasons:
+  - live-execution-disabled
+  - provider-calls-disabled
+  - workflow-mutation-disabled
+  - approval-mutation-disabled
+  - lock-mutation-disabled
+  - raw-request-payloads-disabled
+  - raw-execution-logs-disabled
+  - raw-evidence-payloads-disabled
+  - raw-provider-payloads-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - access-token-values-disabled
+  - raw-recipient-data-disabled
+  - intake-incomplete
+  - validation-missing
+  - dry-run-plan-missing
+  - approval-route-missing
+  - lock-scope-missing
+  - evidence-not-redacted
+  - status-callback-missing
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Provider-safe dry-run plan
+  - Approval decisions
+  - Lock record
+  - Execution plan summary
+  - Verification plan
+  - Protection policy summary
+  - Publish plan
+  - Lifecycle handover notes
+  - Evidence references
+rules:
+  - id: canonical-lifecycle-required
+    decision: block
+    requirement: Request lifecycle readiness requires intake, validate, plan, approve, lock, execute, verify, protect, publish, maintain, and retire stages to remain explicit.
+    evidence: Request payload summary
+  - id: dry-run-before-approval-required
+    decision: block
+    requirement: Write-capable requests must include a provider-safe dry-run plan before approval readiness can be represented.
+    evidence: Provider-safe dry-run plan
+  - id: approval-lock-evidence-required
+    decision: block
+    requirement: Approval route, lock scope, and redacted evidence references must be ready before a request can move beyond planning.
+    evidence: Approval decisions
+  - id: fail-safe-state-required
+    decision: block
+    requirement: Missing validation, stale data, degraded dependency, or incomplete evidence must block execution readiness and expose safe remediation.
+    evidence: Lifecycle handover notes
+  - id: raw-request-data-not-exposed
+    decision: block
+    requirement: Request lifecycle evidence must use safe summaries only and must not expose direct provider routes, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw request content, raw execution content, raw evidence content, raw provider content, stack traces, recipient details, or implementation internals.
+    evidence: Evidence references

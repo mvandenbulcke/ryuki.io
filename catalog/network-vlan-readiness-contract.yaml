@@ -1,0 +1,101 @@
+# Network and VLAN readiness seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, switch IDs, switchport IDs, MAC addresses, VLAN IDs, endpoint names, private IPs, raw network inventory rows, serials, asset tags, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: review-only
+providerCallsEnabled: false
+liveNetworkChangesAllowed: false
+rawInventoryRowsAllowed: false
+networkIdentifiersAllowed: false
+supportedWorkflows:
+  - host-network-readiness
+  - workload-vlan-readiness
+  - switchport-capacity-review
+  - portgroup-policy-review
+  - vlan-catalog-review
+  - network-exception-review
+readinessDomains:
+  - switchport-capacity
+  - vlan-catalog
+  - portgroup-policy
+  - trunk-policy
+  - uplink-redundancy
+  - mtu-policy
+  - network-segmentation
+  - evidence-readiness
+requiredInputs:
+  - site
+  - networkScope
+  - workloadProfile
+  - platformProfile
+  - vlanPolicy
+  - portgroupPolicy
+  - redundancyRequirement
+  - maintenanceWindow
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - network-scope-known
+  - vlan-catalog-reviewed
+  - portgroup-policy-reviewed
+  - switchport-capacity-reviewed
+  - uplink-redundancy-reviewed
+  - segmentation-reviewed
+  - maintenance-window-known
+  - owner-known
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - vlanPolicyReview
+  - portgroupPolicyReview
+  - switchportCapacityReview
+  - uplinkAndTrunkReview
+  - segmentationReview
+  - exceptionDecision
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-network-change-disabled
+  - raw-inventory-rows-disabled
+  - network-identifiers-disabled
+  - site-unknown
+  - network-scope-missing
+  - vlan-catalog-missing
+  - portgroup-policy-missing
+  - switchport-capacity-unknown
+  - uplink-redundancy-unknown
+  - segmentation-unknown
+  - maintenance-window-missing
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Readiness summary
+  - VLAN policy review
+  - Portgroup policy review
+  - Switchport capacity review
+  - Uplink and trunk review
+  - Segmentation review
+  - Exception decision
+  - Evidence references
+rules:
+  - id: no-live-network-changes
+    decision: block
+    requirement: Network and VLAN readiness contracts report review state only and never configure switches, port groups, VLANs, trunks, uplinks, or provider networking.
+    evidence: Readiness summary
+  - id: vlan-catalog-required
+    decision: block
+    requirement: VLAN and port group policy decisions must come from reviewed catalog summaries before host or workload placement can proceed.
+    evidence: VLAN policy review
+  - id: switchport-capacity-required
+    decision: block
+    requirement: Switchport capacity, uplink redundancy, and trunk policy summaries must be reviewed before network readiness can be accepted.
+    evidence: Switchport capacity review
+  - id: segmentation-review-required
+    decision: block
+    requirement: Segmentation and environment policy decisions must be reviewed before readiness can be accepted.
+    evidence: Segmentation review
+  - id: raw-network-inventory-not-exposed
+    decision: block
+    requirement: Network readiness evidence must use safe summaries only and must not expose switch IDs, switchport IDs, MAC addresses, VLAN IDs, endpoint names, private IPs, raw network inventory rows, serials, or provider payloads.
+    evidence: Evidence references

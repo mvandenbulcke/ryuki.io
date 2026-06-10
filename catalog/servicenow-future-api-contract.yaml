@@ -1,0 +1,123 @@
+# ServiceNow future API seed data only. Do not add instance URLs, instance names, table names, sys IDs, request IDs, incident IDs, change IDs, catalog task IDs, import set IDs, user records, recipient data, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw request payloads, raw response payloads, raw ticket data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+apiMode: approval-readiness-only
+dryRunRequired: true
+liveApiEnabled: false
+providerCallsEnabled: false
+requestCallbacksAllowed: false
+changeCallbacksAllowed: false
+cmdbUpdatesAllowed: false
+importSetWritesAllowed: false
+statusSyncAllowed: false
+tableApiCallsAllowed: false
+credentialValuesAllowed: false
+instanceIdentifiersAllowed: false
+tableIdentifiersAllowed: false
+sysIdentifiersAllowed: false
+rawRequestPayloadsAllowed: false
+rawResponsePayloadsAllowed: false
+rawTicketDataAllowed: false
+rawRecipientDataAllowed: false
+rawProviderPayloadsAllowed: false
+integrationSurfaces:
+  - request-callback-readiness
+  - change-callback-readiness
+  - cmdb-update-readiness
+  - import-set-readiness
+  - status-sync-readiness
+  - approval-sync-readiness
+  - knowledge-link-readiness
+readinessSignals:
+  - api-approval-recorded
+  - secret-reference-ready
+  - instance-config-externalized
+  - table-mapping-reviewed
+  - payload-redaction-reviewed
+  - rate-limit-policy-reviewed
+  - rollback-plan-ready
+requiredInputs:
+  - integrationScope
+  - approvalRecord
+  - secretReference
+  - instanceProfile
+  - tableMappingSummary
+  - callbackPlan
+  - importSetPlan
+  - statusSyncPlan
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - live-api-approval-recorded
+  - secret-reference-ready
+  - instance-identifiers-externalized
+  - table-mapping-reviewed
+  - payload-redaction-reviewed
+  - dry-run-contract-reviewed
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - integrationSummary
+  - authReference
+  - instanceConfiguration
+  - tableMapping
+  - callbackPlan
+  - importSetPlan
+  - statusSyncPlan
+  - rollbackReadiness
+  - evidenceReferences
+blockedReasons:
+  - live-api-disabled
+  - provider-calls-disabled
+  - request-callbacks-disabled
+  - change-callbacks-disabled
+  - cmdb-updates-disabled
+  - import-set-writes-disabled
+  - status-sync-disabled
+  - table-api-calls-disabled
+  - credential-values-disabled
+  - instance-identifiers-disabled
+  - table-identifiers-disabled
+  - sys-identifiers-disabled
+  - raw-request-payloads-disabled
+  - raw-response-payloads-disabled
+  - raw-ticket-data-disabled
+  - raw-recipient-data-disabled
+  - raw-provider-payloads-disabled
+  - approval-missing
+  - secret-reference-missing
+  - table-mapping-missing
+  - payload-redaction-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - API readiness summary
+  - Approval record
+  - Secret reference decision
+  - Instance configuration summary
+  - Table mapping summary
+  - Payload redaction review
+  - Rollback readiness
+  - Evidence references
+rules:
+  - id: no-live-servicenow-api-calls
+    decision: block
+    requirement: Future ServiceNow API integration records readiness only and never calls ServiceNow APIs, writes import sets, updates CMDB records, mutates tickets, or synchronizes status.
+    evidence: API readiness summary
+  - id: approval-before-api-enablement
+    decision: block
+    requirement: Live ServiceNow API enablement requires explicit approval record, externalized instance configuration, reviewed table mapping, and rollback readiness.
+    evidence: Approval record
+  - id: secret-reference-only
+    decision: block
+    requirement: API authentication evidence may reference secret handles only and must never expose credential values, secret values, or access tokens.
+    evidence: Secret reference decision
+  - id: payload-redaction-required
+    decision: block
+    requirement: Request, response, ticket, recipient, and provider payload handling must be redaction-reviewed before any future live integration.
+    evidence: Payload redaction review
+  - id: raw-servicenow-data-not-exposed
+    decision: block
+    requirement: ServiceNow API readiness evidence must use safe summaries only and must not expose instance URLs, instance names, table names, sys IDs, request IDs, incident IDs, change IDs, catalog task IDs, import set IDs, user records, recipient data, raw request payloads, raw response payloads, raw ticket data, credentials, secret values, access tokens, tenant IDs, object IDs, private IPs, or provider payloads.
+    evidence: Evidence references

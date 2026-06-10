@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ryuki-platform
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - platform.example.invalid
+      secretName: platform-tls-placeholder
+  rules:
+    - host: platform.example.invalid
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: platform-api
+                port:
+                  number: 8080
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: portal-ui
+                port:
+                  number: 8080

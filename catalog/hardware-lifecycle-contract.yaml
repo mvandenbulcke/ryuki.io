@@ -1,0 +1,110 @@
+# Hardware lifecycle seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, serial numbers, asset tags, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+lifecycleMode: metadata-only
+providerCallsEnabled: false
+liveExecutionAllowed: false
+serialNumbersAllowed: false
+firmwareBaselineStrategy:
+  releaseTrainPolicy: prior-vendor-recommended-release-train
+  baselineReleaseTrain: n-1
+  exactFirmwareVersionsAllowed: false
+  liveProviderLookupsAllowed: false
+  rawInventoryAllowed: false
+  providerDataAllowed: false
+  vendorRecommendationSets:
+    hpe:
+      appliesToProfiles:
+        - hpe-dl360-msa
+        - hpe-simplivity-dl380
+      recommendationSet:
+        - prior-applicable-hpe-spp
+        - prior-applicable-hpe-msa
+        - prior-applicable-hpe-simplivity
+    lenovo:
+      appliesToProfiles:
+        - lenovo-sr
+        - lenovo-vx
+        - lenovo-mx
+      recommendationSet:
+        - prior-recommended-lenovo-sr-recipe
+        - prior-recommended-lenovo-vx-recipe
+        - prior-recommended-lenovo-mx-recipe
+supportedProfiles:
+  - hpe-dl360-msa
+  - hpe-simplivity-dl380
+  - lenovo-sr
+  - lenovo-vx
+  - lenovo-mx
+lifecycleStates:
+  - planned
+  - ordered
+  - received
+  - staged
+  - in-service
+  - maintenance
+  - refresh-planned
+  - decommissioned
+requiredInputs:
+  - hardwareProfile
+  - lifecycleState
+  - site
+  - owner
+  - capacityRole
+  - supportStatus
+  - firmwareBaseline
+  - refreshWindow
+  - evidenceManifest
+requiredGuards:
+  - model-known
+  - site-known
+  - support-status-known
+  - firmware-baseline-known
+  - capacity-role-known
+  - cmdb-owner-known
+  - evidence-redacted
+planSections:
+  - hardwareSummary
+  - lifecycleState
+  - sitePlacement
+  - firmwareAndSupport
+  - capacityRole
+  - riskNotes
+  - refreshPlan
+  - handoverNotes
+blockedReasons:
+  - model-unknown
+  - site-unknown
+  - support-status-unknown
+  - firmware-baseline-unknown
+  - capacity-role-unknown
+  - support-risk
+  - cmdb-owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Hardware lifecycle summary
+  - Site placement
+  - Support status
+  - Firmware baseline
+  - Capacity role
+  - Refresh decision
+  - Risk notes
+  - Evidence references
+rules:
+  - id: no-live-hardware-actions
+    decision: block
+    requirement: Hardware lifecycle contracts track metadata only and never execute vendor, out-of-band, storage, or cluster actions.
+    evidence: Hardware lifecycle summary
+  - id: no-serial-or-asset-identifiers
+    decision: block
+    requirement: Committed hardware lifecycle metadata must not contain serial numbers, asset tags, or device identifiers.
+    evidence: Hardware lifecycle summary
+  - id: support-and-firmware-required
+    decision: block
+    requirement: Support status and the approved N-1 firmware baseline strategy must be known before operational changes can be considered.
+    evidence: Firmware baseline
+  - id: refresh-risk-review-required
+    decision: block
+    requirement: Hardware with support or capacity risk needs refresh review and owner evidence.
+    evidence: Refresh decision

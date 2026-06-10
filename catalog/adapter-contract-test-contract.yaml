@@ -1,0 +1,113 @@
+# Adapter contract test seed data only. Do not add provider endpoints, credential values, secret values, access tokens, tenant IDs, object IDs, hostnames, private IPs, serial numbers, raw provider payloads, raw fixture rows, raw logs, provider responses, live endpoints, or credentials.
+version: 1
+status: draft
+source: static-seed
+testMode: mock-contract-tests
+dryRunRequired: true
+providerCallsEnabled: false
+liveProviderValidationAllowed: false
+liveCredentialsAllowed: false
+credentialValuesAllowed: false
+networkEgressAllowed: false
+providerMutationAllowed: false
+rawProviderPayloadsAllowed: false
+rawFixtureRowsAllowed: false
+testTargets:
+  - vmware-readiness
+  - hyperv-readiness
+  - proxmox-readiness
+  - veeam-readiness
+  - zabbix-readiness
+  - servicenow-file-exchange
+  - adapter-readiness-matrix
+  - dry-run-plan
+testTypes:
+  - readiness-contract
+  - dry-run-contract
+  - blocked-default
+  - secret-reference-contract
+  - stale-data-marker
+  - redaction-contract
+  - evidence-contract
+fixtureTypes:
+  - static-json-fixture
+  - static-yaml-fixture
+  - mock-provider-result
+  - negative-case-fixture
+  - redacted-evidence-fixture
+requiredInputs:
+  - adapterDomain
+  - contractScope
+  - fixtureSet
+  - expectedState
+  - blockedReasonSet
+  - secretReferenceState
+  - dryRunCapabilityState
+  - staleDataMarker
+  - owner
+  - evidenceManifest
+requiredGuards:
+  - fixture-set-redacted
+  - provider-calls-blocked
+  - credential-values-absent
+  - network-egress-blocked
+  - expected-state-declared
+  - blocked-reasons-declared
+  - stale-data-marked
+  - evidence-redacted
+planSections:
+  - testSummary
+  - fixtureScope
+  - readinessAssertions
+  - dryRunAssertions
+  - blockedDefaultAssertions
+  - redactionAssertions
+  - evidenceAssertions
+  - handoverNotes
+blockedReasons:
+  - provider-calls-disabled
+  - live-provider-validation-disabled
+  - live-credentials-disabled
+  - credential-values-disabled
+  - network-egress-disabled
+  - raw-provider-payloads-disabled
+  - raw-fixture-rows-disabled
+  - provider-mutation-disabled
+  - fixture-set-missing
+  - expected-state-missing
+  - blocked-reasons-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Contract test summary
+  - Fixture scope
+  - Readiness assertions
+  - Dry-run assertions
+  - Blocked default assertions
+  - Redaction assertions
+  - Evidence assertions
+  - Handover notes
+rules:
+  - id: no-live-provider-contract-tests
+    decision: block
+    requirement: Adapter contract tests use static fixtures and mock results only and never call provider APIs.
+    evidence: Contract test summary
+  - id: mock-fixtures-only
+    decision: block
+    requirement: Contract fixtures must be static, redacted, and safe to commit before any assertion can run.
+    evidence: Fixture scope
+  - id: credential-values-not-accepted
+    decision: block
+    requirement: Contract tests accept secret reference states only and never accept credential values, secret values, tokens, or provider endpoint identifiers.
+    evidence: Redaction assertions
+  - id: blocked-default-required
+    decision: block
+    requirement: Adapter readiness contracts must prove blocked-default behavior when readiness, credentials, stale-data markers, or approval routes are missing.
+    evidence: Blocked default assertions
+  - id: dry-run-readiness-required
+    decision: block
+    requirement: Adapter contract tests must prove dry-run and readiness behavior before any future provider integration can be considered.
+    evidence: Dry-run assertions
+  - id: raw-provider-data-not-exposed
+    decision: block
+    requirement: Adapter contract test evidence must use safe summaries only and must not expose provider endpoints, credential values, tenant IDs, object IDs, hostnames, private IPs, serial numbers, raw provider payloads, raw fixture rows, raw logs, or provider responses.
+    evidence: Evidence assertions

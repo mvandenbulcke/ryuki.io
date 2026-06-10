@@ -1,0 +1,142 @@
+# Request form contract seed data only. Do not add secrets, tenant IDs, object IDs, private network values, live endpoints, raw submissions, raw rows, recipient details, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+formMode: static-request-form-schema
+formSchemaReadOnly: true
+schemaDerivedFromOfferings: true
+liveRequestCreationAllowed: false
+formSubmissionAllowed: false
+approvalExecutionAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+rawRequestPayloadsAllowed: false
+rawFormSubmissionsAllowed: false
+rawProviderPayloadsAllowed: false
+rawLogContentAllowed: false
+rawRowsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+formSections:
+  - requester-context
+  - scope-context
+  - business-context
+  - technical-plan
+  - protection-observe-cmdb
+  - evidence-approval
+inputKinds:
+  - text
+  - textarea
+  - select
+  - multi-select
+  - reference-summary
+  - policy-reference
+  - schedule-summary
+  - evidence-reference
+requiredInputNames:
+  - accessClosureScope
+  - alertGroup
+  - application
+  - applicationScope
+  - backupPolicy
+  - backupRetentionNeed
+  - blackoutDates
+  - businessJustification
+  - businessPurpose
+  - capacityScope
+  - changeReason
+  - cmdbContext
+  - componentScope
+  - criticality
+  - dataRetentionNeed
+  - dependencyContext
+  - dependencyGraph
+  - dependencyReview
+  - distribution
+  - environment
+  - environmentScope
+  - evidenceReferences
+  - exportScope
+  - freshnessWindow
+  - headerMapping
+  - hostGroup
+  - hostIdentity
+  - imageVersion
+  - importScope
+  - maintenanceWindow
+  - monitoringProfile
+  - network
+  - operationScope
+  - owner
+  - patchCycle
+  - proxyOrServer
+  - quarantineWindow
+  - rebootPolicy
+  - requestedOffering
+  - requester
+  - restorePoint
+  - restoreType
+  - retentionNeed
+  - reviewer
+  - riskLevel
+  - rollbackNotes
+  - runbookId
+  - serviceCriticality
+  - site
+  - siteScope
+  - sourceFileReference
+  - sourceResource
+  - targetFormat
+  - targetResource
+  - targetSelection
+  - templateProfile
+  - ticketContext
+  - validationMode
+  - verificationPlan
+  - viewerContext
+  - vmSizing
+blockedReasons:
+  - live-request-creation-disabled
+  - form-submission-disabled
+  - approval-execution-disabled
+  - workflow-mutation-disabled
+  - provider-calls-disabled
+  - raw-request-payloads-disabled
+  - raw-form-submissions-disabled
+  - raw-provider-payloads-disabled
+  - raw-log-content-disabled
+  - raw-rows-disabled
+  - raw-recipient-data-disabled
+  - credential-values-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - private-network-values-disabled
+  - required-input-missing
+  - offering-catalog-drift
+  - evidence-not-redacted
+requiredEvidence:
+  - Form schema review
+  - Offering input coverage review
+  - Static schema boundary
+  - Dry-run policy review
+  - Evidence references
+rules:
+  - id: offering-required-inputs-covered
+    decision: block
+    requirement: Request form schema readiness requires every catalog offering required input to be represented by the static form contract.
+    evidence: Form schema review
+  - id: form-schema-read-only
+    decision: block
+    requirement: The request form contract is read-only metadata and cannot persist drafts, submit requests, mutate approvals, or start workflows.
+    evidence: Static schema boundary
+  - id: dry-run-first-preserved
+    decision: block
+    requirement: Write-capable request forms must preserve dry-run-first workflow expectations before approval or execution readiness is represented.
+    evidence: Dry-run policy review
+  - id: raw-form-data-not-exposed
+    decision: block
+    requirement: Request form schema evidence must use safe summaries only and must not expose raw request payloads, raw form submissions, raw provider payloads, raw logs, raw rows, recipient details, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

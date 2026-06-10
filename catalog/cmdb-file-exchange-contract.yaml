@@ -1,0 +1,127 @@
+# CMDB file exchange seed data only. Do not add CMDB rows, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+integrationMode: file-based
+liveApiEnabled: false
+providerCallsEnabled: false
+sourceSystem: ServiceNow CMDB export
+targetUse: import-preview-validate-export
+sourceWorkbookPolicy:
+  sourceRef: source-ref-deployment-servicenow-cmdb-workbook
+  sourceFoundState: source-found
+  sourceMissingState: source-missing
+  missingSourceDecision: block
+  headerMappingReview: normalized-field-review
+  fileHashEvidence: required-before-preview
+  sourceRowCaptureEnabled: false
+  actualHeaderValueStorage: disabled
+workbookShape:
+  - worksheet-count-one
+  - row-count-fifteen
+  - data-row-count-fourteen
+  - column-count-twenty-eight
+sanitizedFieldCategories:
+  - identity
+  - ownership
+  - classification
+  - governance-evidence
+  - operating-system
+  - lifecycle
+  - service-context
+  - location
+  - normalized-fallback
+normalizedHeaderExpectations:
+  - actual-headers-remain-deployment-configuration
+  - map-to-normalized-import-fields
+  - unmapped-columns-require-review
+  - duplicate-normalized-fields-require-review
+  - actual-header-value-storage-disabled
+syntheticCategoryExamples:
+  - identity synthetic-ci-name
+  - ownership synthetic-business-owner
+  - classification synthetic-ci-class
+  - governance-evidence synthetic-file-hash-reference
+  - operating-system synthetic-os-family
+  - lifecycle synthetic-lifecycle-state
+  - service-context synthetic-environment
+  - location synthetic-site-code
+  - normalized-fallback synthetic-review-note
+normalizedImportFields:
+  - ciName
+  - fqdn
+  - ciClass
+  - lifecycleStatus
+  - environment
+  - application
+  - businessOwner
+  - technicalOwner
+  - supportGroup
+  - country
+  - siteCode
+  - datacenter
+  - osFamily
+  - osVersion
+  - criticality
+  - patchGroup
+  - maintenanceWindow
+  - rebootPolicy
+  - backupPolicy
+  - monitoringProfile
+  - relationshipKey
+requiredImportEvidence:
+  - File hash
+  - Header mapping
+  - Validation result
+  - Accepted row count
+  - Rejected rows
+  - Import user
+  - Evidence references
+exportPackageFields:
+  - ciName
+  - changeReason
+  - proposedLifecycleStatus
+  - proposedOwner
+  - proposedSupportGroup
+  - proposedBackupPolicy
+  - proposedMonitoringProfile
+  - evidenceReferences
+requiredExportEvidence:
+  - Request payload summary
+  - Validation result
+  - Export package
+  - Accepted/rejected rows
+  - Reviewer approval
+  - Evidence references
+rejectionReasons:
+  - missing-ci-identity
+  - ambiguous-ci-identity
+  - unknown-site-code
+  - missing-owner
+  - missing-support-group
+  - invalid-environment
+  - missing-evidence-reference
+rules:
+  - id: no-live-servicenow-api
+    decision: block
+    requirement: CMDB exchange uses files only until live ServiceNow API integration is approved.
+    evidence: Validation result
+  - id: header-mapping-required
+    decision: block
+    requirement: Actual spreadsheet headers must map to normalized fields before preview or import.
+    evidence: Header mapping
+  - id: row-level-evidence-required
+    decision: block
+    requirement: Accepted and rejected rows must be counted and preserved as redacted evidence references.
+    evidence: Accepted/rejected rows
+  - id: source-reference-only
+    decision: block
+    requirement: Supplied CMDB Excel source must be referenced only by sourceRef with file hash evidence and normalized header mapping review.
+    evidence: File hash
+  - id: source-missing-blocker
+    decision: block
+    requirement: Missing CMDB Excel source must produce source-missing and block preview or import.
+    evidence: Validation result
+  - id: workbook-row-capture-disabled
+    decision: block
+    requirement: Workbook row capture remains disabled for source-found and source-missing handling.
+    evidence: Validation result

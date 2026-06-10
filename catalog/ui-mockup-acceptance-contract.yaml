@@ -1,0 +1,123 @@
+# UI mockup acceptance seed data only. Do not add direct vendor routes, external asset locations, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw provider content, raw evidence content, raw mockup rows, stack traces, recipient details, or implementation internals.
+version: 1
+status: draft
+source: static-seed
+acceptanceMode: static-ui-documentation
+mockupCoverageRequired: true
+accessibilityReviewRequired: true
+browserIsolationRequired: true
+evidenceSafetyRequired: true
+liveUiExecutionAllowed: false
+browserProviderCallsAllowed: false
+externalAssetFetchAllowed: false
+directVendorApiAllowed: false
+unsafeDebugDetailAllowed: false
+rawMockupRowsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+accessTokenValuesAllowed: false
+rawRecipientDataAllowed: false
+mockupDocuments:
+  - shell-dashboard
+  - catalog-requests
+  - inventory-cmdb
+  - evidence-operations-admin
+mockupSurfaces:
+  - product-shell
+  - dashboard
+  - catalog
+  - request-detail
+  - inventory
+  - cmdb
+  - evidence
+  - operations
+  - admin
+  - accessibility-acceptance
+requiredInputs:
+  - shellDashboardReview
+  - catalogRequestReview
+  - inventoryCmdbReview
+  - evidenceOperationsAdminReview
+  - accessibilitySummary
+  - browserIsolationSummary
+  - evidenceSafetySummary
+  - statusBehaviorSummary
+  - themeSummary
+  - evidenceManifest
+requiredGuards:
+  - shell-dashboard-reviewed
+  - catalog-requests-reviewed
+  - inventory-cmdb-reviewed
+  - evidence-operations-admin-reviewed
+  - browser-isolation-reviewed
+  - accessibility-reviewed
+  - status-behavior-reviewed
+  - evidence-redaction-reviewed
+  - raw-detail-exclusion-reviewed
+planSections:
+  - shellDashboardMockup
+  - catalogRequestMockup
+  - inventoryCmdbMockup
+  - evidenceOperationsAdminMockup
+  - accessibilityAcceptance
+  - browserIsolationReview
+  - statusBehaviorReview
+  - themeBehaviorReview
+  - evidenceSafety
+  - rawDetailExclusion
+blockedReasons:
+  - live-ui-execution-disabled
+  - browser-provider-calls-disabled
+  - external-asset-fetch-disabled
+  - direct-vendor-api-disabled
+  - unsafe-debug-detail-disabled
+  - raw-mockup-rows-disabled
+  - raw-evidence-payloads-disabled
+  - raw-provider-payloads-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - access-token-values-disabled
+  - raw-recipient-data-disabled
+  - shell-dashboard-review-missing
+  - catalog-requests-review-missing
+  - inventory-cmdb-review-missing
+  - evidence-operations-admin-review-missing
+  - browser-isolation-review-missing
+  - accessibility-review-missing
+  - status-behavior-review-missing
+  - evidence-redaction-review-missing
+  - raw-detail-exclusion-review-missing
+requiredEvidence:
+  - Shell and dashboard mockup review
+  - Catalog and request mockup review
+  - Inventory and CMDB mockup review
+  - Evidence operations and admin mockup review
+  - Accessibility acceptance review
+  - Browser isolation review
+  - Status behavior review
+  - Theme behavior review
+  - Evidence safety review
+  - Raw detail exclusion review
+rules:
+  - id: batch-two-mockup-coverage-required
+    decision: block
+    requirement: Batch 2 UI acceptance requires shell, dashboard, catalog, request, inventory, CMDB, evidence, operations, and admin mockups before implementation readiness is accepted.
+    evidence: Shell and dashboard mockup review
+  - id: browser-isolation-required
+    decision: block
+    requirement: Mockup acceptance keeps browser behavior limited to portal-ui and platform-api, with vendor and infrastructure access represented only as server-side platform summaries.
+    evidence: Browser isolation review
+  - id: accessibility-status-required
+    decision: block
+    requirement: Mockups must show keyboard focus, contrast, non-color status signals, stale states, degraded states, blocked states, and safe error states before UI readiness is accepted.
+    evidence: Accessibility acceptance review
+  - id: evidence-redaction-required
+    decision: block
+    requirement: Evidence and request mockups must show redaction state, export readiness, safe summaries, and controlled accepted or rejected counts before UI readiness is accepted.
+    evidence: Evidence safety review
+  - id: raw-ui-mockup-data-not-exposed
+    decision: block
+    requirement: UI mockup acceptance evidence must use safe summaries only and must not expose direct vendor routes, external asset locations, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw provider content, raw evidence content, raw mockup rows, stack traces, recipient details, or implementation internals.
+    evidence: Raw detail exclusion review

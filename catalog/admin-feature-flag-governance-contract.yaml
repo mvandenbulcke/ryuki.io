@@ -1,0 +1,109 @@
+version: 1
+status: draft
+source: static-seed
+featureFlagGovernanceMode: static-feature-flag-governance
+flagCatalogReadOnly: true
+rolloutPlanReadOnly: true
+approvalRouteReadOnly: true
+auditSummaryOnly: true
+liveToggleAllowed: false
+rolloutMutationAllowed: false
+targetingMutationAllowed: false
+policyMutationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawFlagRowsAllowed: false
+rawTargetingRowsAllowed: false
+rawUserRowsAllowed: false
+rawGroupRowsAllowed: false
+rawAuditLogsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+flagScopes:
+  - platform-shell
+  - catalog
+  - request-lifecycle
+  - operations
+  - inventory
+  - cmdb
+  - evidence
+  - admin
+flagStates:
+  - proposed
+  - approved-disabled
+  - approved-enabled
+  - rollout-planned
+  - deprecated
+  - blocked
+rolloutStrategies:
+  - off-by-default
+  - allowlist-by-role
+  - site-ring
+  - percentage-simulation
+  - rollback-ready
+requiredGuards:
+  - owner-assigned
+  - approval-route-assigned
+  - blast-radius-reviewed
+  - rollback-plan-ready
+  - evidence-redacted
+  - live-toggle-blocked
+blockedReasons:
+  - feature-live-toggle-disabled
+  - feature-rollout-mutation-disabled
+  - feature-targeting-mutation-disabled
+  - feature-policy-mutation-disabled
+  - feature-workflow-mutation-disabled
+  - feature-provider-calls-disabled
+  - feature-notification-dispatch-disabled
+  - feature-raw-flag-rows-disabled
+  - feature-raw-targeting-rows-disabled
+  - feature-raw-user-rows-disabled
+  - feature-raw-group-rows-disabled
+  - feature-raw-audit-logs-disabled
+  - feature-raw-provider-payloads-disabled
+  - feature-raw-recipient-data-disabled
+  - feature-credential-values-disabled
+  - feature-token-values-disabled
+  - feature-tenant-identifiers-disabled
+  - feature-object-identifiers-disabled
+  - feature-principal-identifiers-disabled
+  - feature-group-identifiers-disabled
+  - feature-private-network-values-disabled
+  - feature-owner-missing
+  - approval-route-missing
+  - blast-radius-unknown
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Feature flag summary
+  - Rollout plan summary
+  - Approval route summary
+  - Blast radius summary
+  - Rollback plan summary
+  - Evidence references
+rules:
+  - id: feature-flag-catalog-read-only
+    decision: block
+    requirement: Feature flag catalog summaries are read-only and must not create, update, enable, disable, or delete flags.
+    evidence: Feature flag summary
+  - id: rollout-plan-approval-required
+    decision: block
+    requirement: Rollout plans require owner assignment, approval routing, blast-radius review, rollback readiness, and redacted evidence before live use.
+    evidence: Rollout plan summary
+  - id: live-toggle-and-targeting-disabled
+    decision: block
+    requirement: Admin feature flag governance cannot toggle live flags, mutate targeting, dispatch notifications, call providers, or mutate policy or workflow state.
+    evidence: Approval route summary
+  - id: raw-targeting-data-not-exposed
+    decision: block
+    requirement: Feature flag governance evidence must not expose raw flag rows, raw targeting rows, raw user rows, raw group rows, raw audit logs, raw provider payloads, recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, group identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

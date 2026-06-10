@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ai_provider:
+        description: 'AI co-author provider'
+        required: false
+        type: choice
+        options:
+          - none
+          - claude
+          - deepseek
+          - openai
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Format check
+        run: cargo fmt --check --all
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Secret scan
+        run: ./scripts/no-secret-scan.sh
+
+      - name: Validator
+        run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all
+
+      - name: Add AI co-author
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ai_provider != 'none' }}
+        run: |
+          PROVIDER="${{ github.event.inputs.ai_provider }}"
+          case "$PROVIDER" in
+            claude)    NAME="Claude"; EMAIL="noreply@anthropic.com" ;;
+            deepseek)  NAME="DeepSeek"; EMAIL="noreply@deepseek.com" ;;
+            openai)    NAME="OpenAI"; EMAIL="noreply@openai.com" ;;
+            *)         echo "Unknown provider"; exit 1 ;;
+          esac
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "ci: automated validation pass
+
+          Co-authored-by: $NAME <$EMAIL>"
+          git push

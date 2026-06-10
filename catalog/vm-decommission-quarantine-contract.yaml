@@ -1,0 +1,137 @@
+# VM decommission quarantine seed data only. Do not add VM names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, MoRefs, UUIDs, endpoints, private IPs, raw inventory rows, datastore paths, serials, asset tags, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+quarantineMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveDecommissionAllowed: false
+liveDeletionAllowed: false
+rawInventoryRowsAllowed: false
+objectIdentifiersAllowed: false
+quarantineStages:
+  - intake-review
+  - dependency-review
+  - backup-retention-review
+  - monitoring-disable-plan
+  - cmdb-retirement-plan
+  - quarantine-window-plan
+  - rollback-window-review
+  - final-disposition-review
+quarantineDomains:
+  - vcenter-placement
+  - backup-retention
+  - monitoring-state
+  - cmdb-state
+  - dns-dependency
+  - owner-approval
+  - rollback-window
+  - evidence-readiness
+hypervisorParityCoverage:
+  - platform: vmware
+    placementReview: vcenter-placement-review
+    dependencyReview: dependency-review
+    backupReview: backup-retention-review
+    monitoringReview: monitoring-disable-plan
+    retirementReview: cmdb-retirement-plan
+    executionBoundary: dry-run-plan-only
+    evidenceBoundary: safe-summary-only
+  - platform: hyper-v
+    placementReview: failover-cluster-placement-review
+    dependencyReview: dependency-review
+    backupReview: backup-retention-review
+    monitoringReview: monitoring-disable-plan
+    retirementReview: cmdb-retirement-plan
+    executionBoundary: dry-run-plan-only
+    evidenceBoundary: safe-summary-only
+  - platform: proxmox
+    placementReview: cluster-node-placement-review
+    dependencyReview: dependency-review
+    backupReview: backup-retention-review
+    monitoringReview: monitoring-disable-plan
+    retirementReview: cmdb-retirement-plan
+    executionBoundary: dry-run-plan-only
+    evidenceBoundary: safe-summary-only
+requiredInputs:
+  - platformCiKey
+  - targetScope
+  - site
+  - environment
+  - owner
+  - businessJustification
+  - dependencyReview
+  - backupRetentionNeed
+  - quarantineWindow
+  - cmdbContext
+  - evidenceManifest
+requiredGuards:
+  - request-preflight-ready
+  - cmdb-ci-known
+  - owner-approval-assigned
+  - dependency-impact-reviewed
+  - backup-retention-reviewed
+  - monitoring-disable-reviewed
+  - quarantine-window-approved
+  - rollback-plan-ready
+  - final-disposition-blocked
+  - evidence-redacted
+planSections:
+  - quarantineSummary
+  - dependencyReview
+  - backupRetentionReview
+  - monitoringPlan
+  - cmdbRetirementPlan
+  - quarantineWindow
+  - rollbackPlan
+  - finalDispositionHold
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-decommission-disabled
+  - live-delete-disabled
+  - raw-inventory-rows-disabled
+  - object-identifiers-disabled
+  - cmdb-ci-unknown
+  - owner-approval-missing
+  - dependency-review-missing
+  - backup-retention-missing
+  - monitoring-disable-review-missing
+  - quarantine-window-missing
+  - rollback-plan-missing
+  - final-disposition-blocked
+  - evidence-not-redacted
+requiredEvidence:
+  - Quarantine summary
+  - Dependency review
+  - Backup retention review
+  - Monitoring disable plan
+  - CMDB retirement plan
+  - Quarantine window
+  - Rollback plan
+  - Final disposition hold
+  - Evidence references
+rules:
+  - id: no-live-vm-decommission
+    decision: block
+    requirement: VM decommission quarantine produces dry-run plans only and never moves, tags, disables, deletes, or retires live infrastructure records.
+    evidence: Quarantine summary
+  - id: backup-retention-required
+    decision: block
+    requirement: Backup retention need and recovery expectations must be reviewed before any quarantine window can be approved.
+    evidence: Backup retention review
+  - id: dependency-review-required
+    decision: block
+    requirement: Application, DNS, monitoring, backup, and CMDB dependencies must be reviewed before quarantine planning continues.
+    evidence: Dependency review
+  - id: monitoring-cmdb-plan-required
+    decision: block
+    requirement: Monitoring disablement and CMDB retirement must be represented as review plans only until separate live change approval exists.
+    evidence: Monitoring disable plan
+  - id: final-delete-blocked
+    decision: block
+    requirement: Final disposition remains blocked in this contract; deletion requires a later separately approved execution workflow.
+    evidence: Final disposition hold
+  - id: raw-vm-inventory-not-exposed
+    decision: block
+    requirement: Quarantine evidence must use safe summaries only and must not expose raw VM inventory rows, object identifiers, endpoint names, hostnames, datastore paths, serials, or provider payloads.
+    evidence: Evidence references

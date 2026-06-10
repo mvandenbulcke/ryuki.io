@@ -1,0 +1,142 @@
+# Portal information architecture seed data only. Do not add vendor endpoints, URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw search rows, stack traces, recipient addresses, or implementation internals.
+version: 1
+status: draft
+source: static-seed
+architectureMode: full-stack-leptos-ssr-hydration
+portalRuntime: axum-leptos-server
+browserIsolationRequired: true
+stableNavigationRequired: true
+sameOriginApiRoutingRequired: true
+ssrRequired: true
+hydrationRequired: true
+serverFunctionBoundaryRequired: true
+browserProviderCallsAllowed: false
+externalApiCallsAllowed: false
+staticOnlyHostingAllowed: false
+roleBypassAllowed: false
+unsafeAdminDetailAllowed: false
+rawSearchRowsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+accessTokenValuesAllowed: false
+rawRecipientDataAllowed: false
+architectureSurfaces:
+  - product-shell
+  - primary-navigation
+  - persona-defaults
+  - dashboard-summary
+  - catalog-offering-flow
+  - request-lifecycle
+  - activity-operations-queue
+  - inventory-cmdb-evidence
+  - operations-admin-boundary
+  - global-search-command-palette
+  - selector-scope-readiness
+  - evidence-redaction-readiness
+primaryNavigation:
+  - Dashboard
+  - Catalog
+  - Requests
+  - Activity
+  - Inventory
+  - CMDB
+  - Evidence
+  - Operations
+  - Admin
+personaViews:
+  - system-engineer
+  - datacenter-engineer
+  - vmware-administrator
+  - backup-administrator
+  - monitoring-administrator
+  - service-desk-operations
+  - application-owner
+  - security-audit
+requiredInputs:
+  - shellSummary
+  - navigationSummary
+  - personaSummary
+  - dashboardSummary
+  - catalogSummary
+  - requestLifecycleSummary
+  - inventoryCmdbEvidenceSummary
+  - operationsAdminSummary
+  - searchPaletteSummary
+  - scopeSelectorSummary
+  - evidenceManifest
+requiredGuards:
+  - product-shell-reviewed
+  - primary-navigation-reviewed
+  - browser-isolation-reviewed
+  - same-origin-routing-reviewed
+  - role-visibility-reviewed
+  - scope-selector-reviewed
+  - freshness-state-reviewed
+  - evidence-redaction-reviewed
+  - admin-boundary-reviewed
+planSections:
+  - shellStructure
+  - navigationModel
+  - personaDefaults
+  - dashboardModel
+  - catalogRequestModel
+  - activityInventoryCmdbEvidence
+  - operationsAdminBoundary
+  - searchAndCommandPalette
+  - scopeAndFreshness
+  - evidenceSafety
+blockedReasons:
+  - browser-provider-calls-disabled
+  - external-api-calls-disabled
+  - role-bypass-disabled
+  - unsafe-admin-detail-disabled
+  - raw-search-rows-disabled
+  - raw-evidence-payloads-disabled
+  - raw-provider-payloads-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - access-token-values-disabled
+  - raw-recipient-data-disabled
+  - product-shell-review-missing
+  - primary-navigation-review-missing
+  - browser-isolation-review-missing
+  - same-origin-routing-review-missing
+  - role-visibility-review-missing
+  - scope-selector-review-missing
+  - freshness-state-review-missing
+  - evidence-redaction-review-missing
+  - admin-boundary-review-missing
+requiredEvidence:
+  - Portal shell review
+  - Navigation model review
+  - Persona defaults review
+  - Dashboard model review
+  - Catalog and request model review
+  - Activity, inventory, CMDB, and evidence review
+  - Operations and admin boundary review
+  - Search and command palette review
+  - Scope and freshness review
+  - Evidence safety review
+rules:
+  - id: browser-isolation-required
+    decision: block
+    requirement: Portal information architecture keeps browser access limited to portal-ui and same-origin platform-api routes; it never introduces direct browser calls to vendors, adapters, workers, data stores, Vault, or provider services.
+    evidence: Portal shell review
+  - id: stable-navigation-required
+    decision: block
+    requirement: Dashboard, Catalog, Requests, Activity, Inventory, CMDB, Evidence, Operations, and Admin remain the stable primary navigation model across personas.
+    evidence: Navigation model review
+  - id: persona-and-scope-context-required
+    decision: block
+    requirement: Site, environment, role, data freshness, execution authority, and persona defaults must stay visible before risky workflows can be represented as ready.
+    evidence: Scope and freshness review
+  - id: operations-admin-boundary-required
+    decision: block
+    requirement: Operations workflows and Admin configuration are separated by role visibility, approval context, and evidence expectations.
+    evidence: Operations and admin boundary review
+  - id: raw-portal-data-not-exposed
+    decision: block
+    requirement: Portal IA evidence must use safe summaries only and must not expose vendor endpoints, URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw search rows, stack traces, recipient addresses, or implementation internals.
+    evidence: Evidence safety review

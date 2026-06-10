@@ -1,0 +1,171 @@
+# Application environment retirement seed data only. Do not add application names, environment names, hostnames, FQDNs, IP addresses, dependency rows, relationship rows, inventory rows, backup rows, monitoring rows, CMDB rows, recipient data, credentials, tokens, tenant IDs, object IDs, private network values, live endpoints, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+retirementMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+retirementExecutionAllowed: false
+liveVmwareChangesAllowed: false
+liveHyperVChangesAllowed: false
+liveProxmoxChangesAllowed: false
+liveMonitoringChangesAllowed: false
+liveBackupChangesAllowed: false
+liveCmdbChangesAllowed: false
+liveAccessChangesAllowed: false
+liveDataDeletionAllowed: false
+rawDependencyRowsAllowed: false
+rawRelationshipRowsAllowed: false
+rawInventoryRowsAllowed: false
+rawBackupRowsAllowed: false
+rawMonitoringRowsAllowed: false
+rawCmdbRowsAllowed: false
+rawProviderPayloadsAllowed: false
+applicationIdentifiersAllowed: false
+environmentIdentifiersAllowed: false
+hostIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+credentialValuesAllowed: false
+rawRecipientDataAllowed: false
+retirementPhases:
+  - intake-review
+  - relationship-review
+  - dependency-freeze-plan
+  - data-retention-plan
+  - backup-retention-plan
+  - access-closure-plan
+  - monitoring-disable-plan
+  - cmdb-retirement-plan
+  - rollback-window-review
+  - final-closure-hold
+retirementDomains:
+  - application-environment
+  - dependency-graph
+  - data-retention
+  - backup-retention
+  - access-closure
+  - monitoring-state
+  - cmdb-relationship
+  - owner-approval
+  - rollback-window
+  - evidence-readiness
+requiredInputs:
+  - requester
+  - application
+  - environment
+  - owner
+  - serviceCriticality
+  - dependencyGraph
+  - dataRetentionNeed
+  - backupRetentionNeed
+  - accessClosureScope
+  - cmdbContext
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - request-preflight-ready
+  - relationship-graph-reviewed
+  - dependency-impact-reviewed
+  - data-retention-reviewed
+  - backup-retention-reviewed
+  - access-closure-reviewed
+  - monitoring-disable-reviewed
+  - cmdb-retirement-reviewed
+  - rollback-window-reviewed
+  - final-closure-blocked
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - retirementSummary
+  - relationshipReview
+  - dependencyImpact
+  - dataRetentionPlan
+  - backupRetentionPlan
+  - accessClosurePlan
+  - monitoringDisablePlan
+  - cmdbRetirementPlan
+  - rollbackWindow
+  - finalClosureHold
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-retirement-disabled
+  - live-vmware-change-disabled
+  - live-hyperv-change-disabled
+  - live-proxmox-change-disabled
+  - live-monitoring-change-disabled
+  - live-backup-change-disabled
+  - live-cmdb-change-disabled
+  - live-access-change-disabled
+  - live-data-deletion-disabled
+  - raw-dependency-rows-disabled
+  - raw-relationship-rows-disabled
+  - raw-inventory-rows-disabled
+  - raw-backup-rows-disabled
+  - raw-monitoring-rows-disabled
+  - raw-cmdb-rows-disabled
+  - raw-provider-payloads-disabled
+  - application-identifiers-disabled
+  - environment-identifiers-disabled
+  - app-env-host-identifiers-disabled
+  - object-identifiers-disabled
+  - private-network-values-disabled
+  - credential-values-disabled
+  - raw-recipient-data-disabled
+  - dependency-review-missing
+  - data-retention-missing
+  - backup-retention-missing
+  - access-closure-review-missing
+  - monitoring-disable-review-missing
+  - cmdb-retirement-review-missing
+  - rollback-window-missing
+  - final-closure-blocked
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Retirement summary
+  - Relationship review
+  - Dependency impact
+  - Data retention plan
+  - Backup retention plan
+  - Access closure plan
+  - Monitoring disable plan
+  - CMDB retirement plan
+  - Rollback window
+  - Final closure hold
+  - Evidence references
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+hypervisorParity:
+  - platform: VMware
+    dryRunSummary: vmware-retirement-dry-run-summary
+  - platform: Hyper-V
+    dryRunSummary: hyperv-retirement-dry-run-summary
+  - platform: Proxmox
+    dryRunSummary: proxmox-retirement-dry-run-summary
+rules:
+  - id: no-live-environment-retirement
+    decision: block
+    requirement: Application environment retirement produces a dry-run plan only and never changes VMware, Hyper-V, or Proxmox workloads, monitoring objects, backup policies, CMDB records, access state, data retention state, workers, or provider state.
+    evidence: Retirement summary
+  - id: relationship-retention-required
+    decision: block
+    requirement: Dependency graph, data retention, backup retention, and relationship closure plans must be reviewed before retirement approval.
+    evidence: Relationship review
+  - id: access-monitoring-cmdb-review-required
+    decision: block
+    requirement: Access closure, monitoring disablement, and CMDB retirement must remain review plans until separate live change approval exists.
+    evidence: Access closure plan
+  - id: final-closure-blocked
+    decision: block
+    requirement: Final closure remains blocked in this contract; deletion, access removal, CMDB closure, and provider changes require later separately approved execution workflows.
+    evidence: Final closure hold
+  - id: raw-retirement-data-not-exposed
+    decision: block
+    requirement: Application environment retirement evidence must use safe summaries only and must not expose application identifiers, environment identifiers, host identifiers, object identifiers, private network values, raw dependency rows, raw relationship rows, raw inventory rows, raw backup rows, raw monitoring rows, raw CMDB rows, recipient data, credentials, secret values, access tokens, live endpoints, or provider payloads.
+    evidence: Evidence references

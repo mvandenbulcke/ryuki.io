@@ -1,0 +1,5 @@
+# Site catalog stub.
+# Site configuration is managed through the portal and stored in the database.
+version: 1
+status: stub
+note: Site data is database-driven. This file is a placeholder; real site records are managed via the portal admin UI and stored in the platform database.

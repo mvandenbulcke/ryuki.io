@@ -1,0 +1,120 @@
+# Adapter readiness seed data only. Do not add credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+providerCallsEnabled: false
+readinessStates:
+  - missing-secret-reference
+  - pending-approval
+  - blocked
+  - degraded-read-only
+  - ready-read-only
+  - ready-dry-run
+adapters:
+  - id: vmware
+    component: vmware-adapter
+    apiGroup: /api/integrations/vmware
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - dry-run-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - provider-endpoint-unconfigured
+      - approval-route-required
+  - id: hyperv
+    component: hyperv-adapter
+    apiGroup: /api/integrations/hyperv
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - dry-run-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - provider-endpoint-unconfigured
+      - approval-route-required
+  - id: proxmox
+    component: proxmox-adapter
+    apiGroup: /api/integrations/proxmox
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - dry-run-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - provider-endpoint-unconfigured
+      - approval-route-required
+  - id: veeam
+    component: veeam-br-adapter
+    apiGroup: /api/integrations/veeam
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - dry-run-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - provider-endpoint-unconfigured
+      - approval-route-required
+  - id: zabbix
+    component: zabbix-adapter
+    apiGroup: /api/integrations/zabbix
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - dry-run-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - provider-endpoint-unconfigured
+      - approval-route-required
+  - id: servicenow
+    component: servicenow-adapter
+    apiGroup: /api/integrations/servicenow
+    status: blocked
+    readinessState: missing-secret-reference
+    providerCallsEnabled: false
+    dryRunOnly: true
+    requiresSecretReference: true
+    requiresApproval: true
+    safeCapabilities:
+      - readiness
+      - file-exchange-contract
+      - stale-data-marker
+    blockedReasons:
+      - secret-reference-missing
+      - live-api-not-approved
+      - approval-route-required
+evidence:
+  - Dependency status
+  - Stale-data markers
+  - Reference configured state
+  - Provider-safe plan
+  - Approval decisions

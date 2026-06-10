@@ -1,0 +1,128 @@
+# File share and NTFS recertification seed data only. Do not add share names, UNC paths, file paths, folder paths, ACL entries, ACE entries, NTFS permissions, user names, account names, group names, email addresses, UPNs, sAMAccountNames, hostnames, FQDNs, principal IDs, tenant IDs, object IDs, private IPs, raw share data, raw ACL rows, raw membership rows, raw path data, credentials, tokens, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+recertificationMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveDirectoryChangesAllowed: false
+liveShareChangesAllowed: false
+liveNtfsAclChangesAllowed: false
+liveServiceNowChangesAllowed: false
+adGroupMembershipChangesAllowed: false
+sharePermissionChangesAllowed: false
+ntfsAclChangesAllowed: false
+inheritanceChangesAllowed: false
+ownerChangesAllowed: false
+rawShareDataAllowed: false
+rawAclRowsAllowed: false
+rawMembershipRowsAllowed: false
+rawPathDataAllowed: false
+rawProviderPayloadsAllowed: false
+principalIdentifiersAllowed: false
+shareIdentifiersAllowed: false
+pathValuesAllowed: false
+credentialValuesAllowed: false
+recertificationActions:
+  - owner-recertification-review
+  - group-access-review
+  - ntfs-acl-review
+  - share-permission-review
+  - stale-access-review
+  - exception-review
+recertificationScopes:
+  - windows-file-share
+  - ntfs-acl
+  - share-permission
+  - ad-group-membership
+  - owner-attestation
+  - stale-access-exception
+requiredInputs:
+  - recertificationCycle
+  - shareScopeSummary
+  - permissionSummary
+  - ownershipSummary
+  - groupAccessSummary
+  - staleAccessSummary
+  - exceptionSummary
+  - owner
+  - supportGroup
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - recertification-scope-summarized
+  - owner-attestation-reviewed
+  - group-access-reviewed
+  - ntfs-acl-reviewed
+  - share-permission-reviewed
+  - stale-access-reviewed
+  - exception-route-assigned
+  - approval-route-assigned
+  - remediation-plan-ready
+  - evidence-redacted
+planSections:
+  - recertificationSummary
+  - shareScope
+  - ownershipReview
+  - groupAccessReview
+  - ntfsAclReview
+  - sharePermissionReview
+  - staleAccessReview
+  - exceptionDecision
+  - remediationPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-directory-change-disabled
+  - live-share-change-disabled
+  - live-ntfs-acl-change-disabled
+  - live-servicenow-change-disabled
+  - ad-group-membership-change-disabled
+  - share-permission-change-disabled
+  - ntfs-acl-change-disabled
+  - inheritance-change-disabled
+  - owner-change-disabled
+  - raw-share-data-disabled
+  - raw-acl-rows-disabled
+  - raw-membership-rows-disabled
+  - raw-path-data-disabled
+  - raw-provider-payloads-disabled
+  - principal-identifiers-disabled
+  - share-identifiers-disabled
+  - path-values-disabled
+  - credential-values-disabled
+  - recertification-scope-missing
+  - owner-attestation-missing
+  - approval-missing
+  - remediation-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Recertification summary
+  - Share scope summary
+  - Ownership attestation
+  - Group access summary
+  - NTFS ACL review
+  - Share permission review
+  - Stale access review
+  - Exception decision
+  - Remediation plan
+  - Evidence references
+rules:
+  - id: no-live-share-acl-changes
+    decision: block
+    requirement: File share and NTFS recertification records review state only and never changes share permissions, NTFS ACLs, inheritance, ownership, AD group membership, ServiceNow records, workers, or provider state.
+    evidence: Recertification summary
+  - id: owner-approval-and-remediation-required
+    decision: block
+    requirement: Owner attestation, support group review, approval route, exception decision, and remediation plan must be present before recertification can be accepted.
+    evidence: Ownership attestation
+  - id: share-and-ntfs-review-required
+    decision: block
+    requirement: Share scope, share permissions, NTFS ACL posture, AD group access, stale access, and exceptions must be reviewed before remediation can be proposed.
+    evidence: NTFS ACL review
+  - id: raw-share-ntfs-data-not-exposed
+    decision: block
+    requirement: File share and NTFS recertification evidence must use safe summaries only and must not expose share names, UNC paths, file paths, folder paths, ACL entries, ACE entries, NTFS permissions, user names, account names, group names, email addresses, UPNs, sAMAccountNames, principal IDs, tenant IDs, object IDs, hostnames, FQDNs, private IPs, raw share data, raw ACL rows, raw membership rows, raw path data, credentials, secret values, access tokens, or provider payloads.
+    evidence: Evidence references

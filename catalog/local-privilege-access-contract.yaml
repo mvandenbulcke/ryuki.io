@@ -1,0 +1,130 @@
+# Local privilege access seed data only. Do not add user names, account names, group names, email addresses, UPNs, sAMAccountNames, hostnames, FQDNs, target identifiers, principal IDs, tenant IDs, object IDs, private IPs, raw membership rows, raw sudoers content, sudoers lines, sudo commands, credentials, tokens, raw request payloads, raw logs, raw recipient data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+accessMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveDirectoryChangesAllowed: false
+liveLocalAdminChangesAllowed: false
+liveSudoersChangesAllowed: false
+liveServiceNowChangesAllowed: false
+adGroupMembershipChangesAllowed: false
+sudoersFileChangesAllowed: false
+privilegeGrantAllowed: false
+privilegeRemovalAllowed: false
+rawUserDataAllowed: false
+rawGroupDataAllowed: false
+rawMembershipRowsAllowed: false
+rawSudoersContentAllowed: false
+rawRequestPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+principalIdentifiersAllowed: false
+targetIdentifiersAllowed: false
+hostIdentifiersAllowed: false
+credentialValuesAllowed: false
+accessActions:
+  - local-admin-grant-review
+  - local-admin-remove-review
+  - sudo-grant-review
+  - sudo-remove-review
+  - expiry-review
+  - break-glass-review
+accessScopes:
+  - windows-local-admin
+  - linux-sudo
+  - directory-group-membership
+  - privileged-role-expiry
+  - break-glass-access
+  - service-desk-escalation
+requiredInputs:
+  - ticketContext
+  - requesterSummary
+  - accessAction
+  - targetScopeSummary
+  - privilegeProfile
+  - operatingSystemFamily
+  - expiryWindow
+  - owner
+  - supportGroup
+  - approvalRoute
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - ticket-context-known
+  - requester-authorized
+  - target-scope-summarized
+  - privilege-profile-reviewed
+  - os-family-supported
+  - expiry-window-reviewed
+  - approval-route-assigned
+  - worker-capability-reviewed
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - accessSummary
+  - targetScope
+  - privilegeProfileReview
+  - directoryGroupReview
+  - sudoersReview
+  - expiryAndReview
+  - workerRouting
+  - rollbackPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-directory-change-disabled
+  - live-local-admin-change-disabled
+  - live-sudoers-change-disabled
+  - live-servicenow-change-disabled
+  - ad-group-membership-change-disabled
+  - sudoers-file-change-disabled
+  - privilege-grant-disabled
+  - privilege-removal-disabled
+  - raw-user-data-disabled
+  - raw-group-data-disabled
+  - raw-membership-rows-disabled
+  - raw-sudoers-content-disabled
+  - raw-request-payloads-disabled
+  - raw-provider-payloads-disabled
+  - principal-identifiers-disabled
+  - target-identifiers-disabled
+  - privilege-host-identifiers-disabled
+  - credential-values-disabled
+  - unsupported-access-action
+  - requester-not-authorized
+  - approval-missing
+  - expiry-missing
+  - worker-capability-unknown
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Privilege request summary
+  - Target scope summary
+  - Privilege profile review
+  - Directory group review
+  - Sudoers review
+  - Expiry and review window
+  - Worker capability decision
+  - Approval route
+  - Rollback plan
+  - Evidence references
+rules:
+  - id: no-live-privilege-changes
+    decision: block
+    requirement: Local privilege access requests produce review plans only and never grant, remove, or modify local administrator membership, AD group membership, sudoers files, ServiceNow records, workers, or provider state.
+    evidence: Privilege request summary
+  - id: approval-expiry-and-worker-required
+    decision: block
+    requirement: Requester authorization, approval route, expiry window, worker capability review, and rollback plan must be present before future privilege execution can be considered.
+    evidence: Approval route
+  - id: directory-and-sudoers-review-required
+    decision: block
+    requirement: Directory group impact, local administrator scope, sudoers policy, operating system family, and target scope must be reviewed before accepting a privilege request.
+    evidence: Privilege profile review
+  - id: raw-privilege-data-not-exposed
+    decision: block
+    requirement: Local privilege access evidence must use safe summaries only and must not expose user names, account names, group names, email addresses, UPNs, sAMAccountNames, principal IDs, tenant IDs, object IDs, hostnames, FQDNs, target identifiers, raw membership rows, raw sudoers content, sudoers lines, sudo commands, raw request payloads, raw log content, raw recipient data, private IPs, credentials, secret values, access tokens, or provider payloads.
+    evidence: Evidence references

@@ -1,0 +1,95 @@
+# Log forwarder onboarding seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw log samples, collector identifiers, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+onboardingMode: dry-run-readiness
+dryRunRequired: true
+providerCallsEnabled: false
+liveAgentInstallAllowed: false
+liveConfigChangeAllowed: false
+logPlatformMutationAllowed: false
+rawLogSamplesAllowed: false
+supportedWorkflows:
+  - windows-event-forwarding-readiness
+  - linux-rsyslog-readiness
+  - linux-auditd-readiness
+  - siem-routing-review
+  - agent-policy-review
+  - evidence-pack-review
+logSignals:
+  - missing-log-forwarder
+  - unsupported-agent
+  - policy-mismatch
+  - stale-log-source
+  - routing-missing
+  - owner-missing
+  - evidence-missing
+requiredInputs:
+  - platformCiKey
+  - osFamily
+  - site
+  - environment
+  - logProfile
+  - forwardingPolicy
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - os-family-supported
+  - log-profile-known
+  - forwarding-policy-known
+  - owner-known
+  - support-group-known
+  - route-reviewed
+  - installation-plan-dry-run
+  - evidence-redacted
+planSections:
+  - onboardingSummary
+  - logSourceScope
+  - forwardingPolicy
+  - routeReview
+  - agentReadiness
+  - remediationPlan
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-agent-install-disabled
+  - live-config-change-disabled
+  - log-platform-mutation-disabled
+  - unsupported-os-family
+  - log-profile-missing
+  - forwarding-policy-missing
+  - owner-unknown
+  - support-group-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Onboarding summary
+  - Log source scope
+  - Forwarding policy
+  - Route review
+  - Agent readiness
+  - Remediation dry-run plan
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-log-forwarder-changes
+    decision: block
+    requirement: Log forwarder onboarding produces readiness and dry-run plans only, never installing agents, changing collectors, or mutating log platform routes.
+    evidence: Remediation dry-run plan
+  - id: log-profile-required
+    decision: block
+    requirement: Log forwarding decisions require a known log profile for the workload and operating system family.
+    evidence: Forwarding policy
+  - id: route-review-required
+    decision: block
+    requirement: SIEM or operations log routing must be reviewed before onboarding can pass.
+    evidence: Route review
+  - id: dry-run-installation-plan-required
+    decision: block
+    requirement: Any missing forwarder requires a dry-run installation or configuration plan before approval.
+    evidence: Remediation dry-run plan
+  - id: raw-log-samples-not-exposed
+    decision: block
+    requirement: Operators receive log onboarding summaries only, not raw log samples, collector identifiers, or provider output.
+    evidence: Onboarding summary

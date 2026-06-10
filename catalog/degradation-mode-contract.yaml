@@ -1,0 +1,79 @@
+# Degradation mode seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+degradationMode: fail-safe-read-only
+providerCallsEnabled: false
+liveExecutionAllowed: false
+failoverAutomationAllowed: false
+rawProviderPayloadsAllowed: false
+degradationScopes:
+  - site
+  - provider
+  - adapter
+  - dependency
+  - workflow
+  - evidence
+degradationStates:
+  - normal
+  - degraded-read-only
+  - stale-read-only
+  - blocked
+  - recovering
+safeCapabilities:
+  - read-only-inventory
+  - evidence-read
+  - request-intake
+  - plan-only
+  - handover
+  - remediation-guidance
+requiredInputs:
+  - affectedScope
+  - degradationState
+  - dependencyStatus
+  - staleDataMarker
+  - owner
+  - safeRemediation
+  - evidenceManifest
+requiredGuards:
+  - affected-scope-known
+  - dependency-status-known
+  - stale-data-marked
+  - write-execution-blocked
+  - safe-remediation-set
+  - owner-known
+  - evidence-redacted
+blockedReasons:
+  - affected-scope-unknown
+  - dependency-status-unknown
+  - stale-data-unmarked
+  - write-execution-requested
+  - unsafe-remediation
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Degradation summary
+  - Affected scope
+  - Dependency state
+  - Stale-data marker
+  - Blocked execution decision
+  - Safe remediation
+  - Handover notes
+  - Evidence references
+rules:
+  - id: write-execution-blocked-when-degraded
+    decision: block
+    requirement: Write-capable workflows remain blocked while affected scope is degraded or stale.
+    evidence: Blocked execution decision
+  - id: stale-data-must-be-marked
+    decision: block
+    requirement: Cached or stale data must be marked before read-only views can be shown.
+    evidence: Stale-data marker
+  - id: affected-scope-required
+    decision: block
+    requirement: Degraded site, provider, adapter, dependency, workflow, or evidence scope must be explicit.
+    evidence: Affected scope
+  - id: no-automatic-failover
+    decision: block
+    requirement: Degradation mode can suggest safe remediation but must not perform automatic failover.
+    evidence: Safe remediation

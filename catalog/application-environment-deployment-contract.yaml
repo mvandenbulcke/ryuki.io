@@ -1,0 +1,163 @@
+# Application environment deployment seed data only. Do not add application names, environment names, hostnames, FQDNs, IP addresses, DNS records, certificate subjects, subject alternative names, firewall rules, CMDB rows, recipient data, credentials, tokens, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+deploymentMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+deploymentExecutionAllowed: false
+liveVmwareChangesAllowed: false
+liveHyperVChangesAllowed: false
+liveProxmoxChangesAllowed: false
+liveDnsIpamChangesAllowed: false
+liveCertificateChangesAllowed: false
+liveFirewallChangesAllowed: false
+liveMonitoringChangesAllowed: false
+liveBackupChangesAllowed: false
+liveCmdbChangesAllowed: false
+rawNetworkDataAllowed: false
+rawDnsRecordsAllowed: false
+rawCertificateDataAllowed: false
+rawFirewallRulesAllowed: false
+rawCmdbRowsAllowed: false
+rawProviderPayloadsAllowed: false
+hostIdentifiersAllowed: false
+fqdnValuesAllowed: false
+ipAddressValuesAllowed: false
+credentialValuesAllowed: false
+rawRecipientDataAllowed: false
+supportedPlans:
+  - tier-topology-plan
+  - vm-placement-plan
+  - dns-ipam-plan
+  - certificate-plan
+  - firewall-rule-plan
+  - monitoring-plan
+  - backup-plan
+  - cmdb-relationship-plan
+  - handover-plan
+environmentTiers:
+  - front-tier
+  - mid-tier
+  - back-tier
+  - data-tier
+  - shared-service-tier
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+hypervisorParity:
+  - platform: VMware
+    dryRunSummary: vmware-placement-dry-run-summary
+  - platform: Hyper-V
+    dryRunSummary: hyperv-placement-dry-run-summary
+  - platform: Proxmox
+    dryRunSummary: proxmox-placement-dry-run-summary
+requiredInputs:
+  - businessPurpose
+  - applicationProfile
+  - environmentProfile
+  - tierProfile
+  - site
+  - criticality
+  - owner
+  - supportGroup
+  - dnsIpamSummary
+  - certificateSummary
+  - networkFlowSummary
+  - monitoringProfile
+  - backupPolicy
+  - cmdbRelationshipSummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - request-preflight-ready
+  - tier-topology-reviewed
+  - placement-plan-reviewed
+  - dns-ipam-plan-reviewed
+  - certificate-plan-reviewed
+  - network-flow-reviewed
+  - monitoring-plan-reviewed
+  - backup-plan-reviewed
+  - cmdb-relationship-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - environmentSummary
+  - tierTopology
+  - placementPlan
+  - dnsIpamPlan
+  - certificatePlan
+  - networkFlowPlan
+  - monitoringPlan
+  - backupPlan
+  - cmdbRelationshipPlan
+  - rollbackPlan
+  - handoverPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-deployment-disabled
+  - live-vmware-change-disabled
+  - live-hyperv-change-disabled
+  - live-proxmox-change-disabled
+  - live-dns-ipam-change-disabled
+  - live-certificate-change-disabled
+  - live-firewall-change-disabled
+  - live-monitoring-change-disabled
+  - live-backup-change-disabled
+  - live-cmdb-change-disabled
+  - raw-network-data-disabled
+  - raw-dns-records-disabled
+  - raw-certificate-data-disabled
+  - raw-firewall-rules-disabled
+  - raw-cmdb-rows-disabled
+  - raw-provider-payloads-disabled
+  - app-env-host-identifiers-disabled
+  - fqdn-values-disabled
+  - ip-address-values-disabled
+  - credential-values-disabled
+  - raw-recipient-data-disabled
+  - tier-topology-missing
+  - dns-ipam-plan-missing
+  - certificate-plan-missing
+  - firewall-plan-missing
+  - monitoring-plan-missing
+  - backup-plan-missing
+  - cmdb-relationship-missing
+  - approval-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Environment summary
+  - Tier topology
+  - Placement plan
+  - DNS and IPAM plan
+  - Certificate plan
+  - Network flow plan
+  - Monitoring plan
+  - Backup plan
+  - CMDB relationship plan
+  - Rollback plan
+  - Handover plan
+  - Evidence references
+rules:
+  - id: no-live-environment-deployment
+    decision: block
+    requirement: Application environment deployment produces a dry-run plan only and never creates, updates, or deletes VMware, Hyper-V, or Proxmox workloads, DNS and IPAM records, certificate records, firewall rules, monitoring objects, backup policies, CMDB records, workers, or provider state.
+    evidence: Environment summary
+  - id: dependency-plans-required
+    decision: block
+    requirement: Tier topology, placement, DNS and IPAM, certificate, network flow, monitoring, backup, and CMDB relationship plans must be reviewed before application environment approval.
+    evidence: Tier topology
+  - id: approval-rollback-handover-required
+    decision: block
+    requirement: Owner, support group, approval route, rollback plan, handover plan, and evidence references must be present before application environment deployment can be accepted.
+    evidence: Rollback plan
+  - id: raw-application-environment-data-not-exposed
+    decision: block
+    requirement: Application environment deployment evidence must use safe summaries only and must not expose application names, environment names, hostnames, FQDNs, IP addresses, DNS records, certificate subjects, subject alternative names, firewall rules, CMDB rows, recipient data, credentials, secret values, access tokens, or provider payloads.
+    evidence: Evidence references

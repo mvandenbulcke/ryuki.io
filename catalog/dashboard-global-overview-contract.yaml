@@ -1,0 +1,108 @@
+# Dashboard global overview seed data only. Do not add raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, user data, recipient data, credentials, tokens, tenant IDs, object IDs, private network values, live endpoints, or URLs.
+version: 1
+status: draft
+source: static-seed
+dashboardGlobalOverviewMode: static-dashboard-global-overview
+dashboardSummaryAggregateOnly: true
+siteReadinessAggregateOnly: true
+riskSignalsReadOnly: true
+evidenceReferencesOnly: true
+liveQueryAllowed: false
+dashboardMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawRequestRowsAllowed: false
+rawOperationRowsAllowed: false
+rawInventoryRowsAllowed: false
+rawCmdbRowsAllowed: false
+rawBackupRowsAllowed: false
+rawMonitoringRowsAllowed: false
+rawUserDataAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+summaryDomains:
+  - global-health
+  - site-readiness
+  - open-requests
+  - failed-operations
+  - patch-risk
+  - backup-risk
+  - monitoring-gaps
+  - cmdb-risk
+  - evidence-readiness
+statusBands:
+  - healthy
+  - attention
+  - risk
+  - blocked
+  - stale
+  - unknown
+lenses:
+  - by-site
+  - by-environment
+  - by-owner-domain
+  - by-service-criticality
+  - by-time-window
+requiredGuards:
+  - aggregate-only
+  - stale-data-marked
+  - evidence-redacted
+  - owner-domain-safe
+  - scope-known
+  - live-query-blocked
+  - raw-detail-blocked
+blockedReasons:
+  - dashboard-live-query-disabled
+  - dashboard-mutation-disabled
+  - dashboard-provider-calls-disabled
+  - dashboard-notification-dispatch-disabled
+  - dashboard-raw-request-rows-disabled
+  - dashboard-raw-operation-rows-disabled
+  - dashboard-raw-inventory-rows-disabled
+  - dashboard-raw-cmdb-rows-disabled
+  - dashboard-raw-backup-rows-disabled
+  - dashboard-raw-monitoring-rows-disabled
+  - dashboard-raw-user-data-disabled
+  - dashboard-raw-recipient-data-disabled
+  - dashboard-credential-values-disabled
+  - dashboard-token-values-disabled
+  - dashboard-tenant-identifiers-disabled
+  - dashboard-object-identifiers-disabled
+  - dashboard-principal-identifiers-disabled
+  - dashboard-private-network-values-disabled
+  - scope-missing
+  - stale-data-unmarked
+  - evidence-not-redacted
+  - raw-detail-requested
+requiredEvidence:
+  - Dashboard summary
+  - Site readiness summary
+  - Request backlog summary
+  - Failed operation summary
+  - Patch risk summary
+  - Backup risk summary
+  - Monitoring gap summary
+  - CMDB risk summary
+  - Evidence references
+rules:
+  - id: global-dashboard-aggregate-only
+    decision: block
+    requirement: Global dashboard summaries are aggregate-only and must not run live queries or expose raw request, operation, inventory, CMDB, backup, or monitoring rows.
+    evidence: Dashboard summary
+  - id: risk-signals-read-only
+    decision: block
+    requirement: Patch, backup, monitoring, CMDB, and evidence risk signals are read-only and must not mutate dashboards, workflows, providers, or notification state.
+    evidence: Patch risk summary
+  - id: stale-data-explicit
+    decision: block
+    requirement: Dashboard freshness and stale-data markers must be explicit so operators do not mistake cached aggregate state for live provider state.
+    evidence: Site readiness summary
+  - id: raw-dashboard-data-not-exposed
+    decision: block
+    requirement: Dashboard evidence must not expose raw request rows, raw operation rows, raw inventory rows, raw CMDB rows, raw backup rows, raw monitoring rows, raw user data, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

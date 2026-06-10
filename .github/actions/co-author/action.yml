@@ -1,0 +1,28 @@
+name: 'AI Co-Author'
+description: 'Add an AI co-author trailer to the latest commit'
+inputs:
+  provider:
+    description: 'AI provider'
+    required: true
+    default: 'claude'
+    type: choice
+    options:
+      - claude
+      - deepseek
+      - openai
+runs:
+  using: composite
+  steps:
+    - name: Add co-author trailer
+      shell: bash
+      run: |
+        case "${{ inputs.provider }}" in
+          claude)   NAME="Claude"; EMAIL="noreply@anthropic.com" ;;
+          deepseek) NAME="DeepSeek"; EMAIL="noreply@deepseek.com" ;;
+          openai)   NAME="OpenAI"; EMAIL="noreply@openai.com" ;;
+          *) echo "Unknown provider: ${{ inputs.provider }}"; exit 1 ;;
+        esac
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git commit --amend --no-edit --trailer "Co-authored-by: $NAME <$EMAIL>"
+        git push --force-with-lease

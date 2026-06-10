@@ -1,0 +1,119 @@
+version: 1
+status: draft
+source: static-seed
+requestTimelineMode: static-request-execution-timeline
+timelineReadOnly: true
+evidenceReferencesReadOnly: true
+operationLinksReadOnly: true
+liveRequestQueryAllowed: false
+requestMutationAllowed: false
+workflowMutationAllowed: false
+operationMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawRequestPayloadsAllowed: false
+rawTimelineRowsAllowed: false
+rawApprovalDataAllowed: false
+rawOperationRowsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawLogContentAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+timelineStages:
+  - intake
+  - validation
+  - dry-run-plan
+  - approval
+  - lock
+  - execution
+  - verification
+  - protection
+  - publish
+  - handover
+timelineEventTypes:
+  - request-state
+  - validation-result
+  - dry-run-plan
+  - approval-decision
+  - lock-record
+  - child-operation
+  - evidence-reference
+  - blocker
+  - status-callback
+  - handover-note
+evidenceStates:
+  - not-required
+  - pending
+  - redacted-ready
+  - blocked
+  - export-ready
+timelineViews:
+  - request-summary
+  - timeline
+  - approval-history
+  - operation-links
+  - evidence-links
+  - blocker-summary
+  - handover-summary
+requiredGuards:
+  - request-scope-known
+  - timeline-source-reviewed
+  - evidence-redacted
+  - approval-state-known
+  - lock-state-known
+  - operation-link-safe
+  - status-callback-safe
+  - raw-detail-blocked
+blockedReasons:
+  - request-timeline-live-query-disabled
+  - request-timeline-mutation-disabled
+  - request-workflow-mutation-disabled
+  - request-operation-mutation-disabled
+  - request-provider-calls-disabled
+  - request-notification-dispatch-disabled
+  - request-raw-request-payloads-disabled
+  - request-raw-timeline-rows-disabled
+  - request-raw-approval-data-disabled
+  - request-raw-operation-rows-disabled
+  - request-raw-evidence-payloads-disabled
+  - request-raw-provider-payloads-disabled
+  - request-raw-log-content-disabled
+  - request-raw-recipient-data-disabled
+  - request-credential-values-disabled
+  - request-token-values-disabled
+  - request-tenant-identifiers-disabled
+  - request-object-identifiers-disabled
+  - request-principal-identifiers-disabled
+  - request-private-network-values-disabled
+  - request-scope-missing
+  - timeline-source-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request timeline summary
+  - Approval state summary
+  - Operation link summary
+  - Evidence reference summary
+  - Blocked reason summary
+rules:
+  - id: request-execution-timeline-read-only
+    decision: block
+    requirement: Request execution timeline summaries are read-only and must not run live request queries, mutate requests, mutate operations, call providers, or dispatch notifications.
+    evidence: Request timeline summary
+  - id: evidence-reference-only
+    decision: block
+    requirement: Request evidence links expose redacted evidence reference states only and must not expose raw evidence payloads or raw log content.
+    evidence: Evidence reference summary
+  - id: approval-operation-links-safe
+    decision: block
+    requirement: Approval, lock, child operation, status callback, blocker, and handover timeline items must remain safe summaries without raw approval data or operation rows.
+    evidence: Operation link summary
+  - id: raw-request-timeline-data-not-exposed
+    decision: block
+    requirement: Request timeline evidence must not expose raw request payloads, raw timeline rows, raw approval data, raw operation rows, raw evidence payloads, raw provider payloads, raw logs, raw recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Blocked reason summary

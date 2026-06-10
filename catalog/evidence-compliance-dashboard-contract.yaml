@@ -1,0 +1,106 @@
+version: 1
+status: draft
+source: static-seed
+evidenceComplianceDashboardMode: static-evidence-compliance-dashboard
+complianceSummaryAggregateOnly: true
+controlStatusReadOnly: true
+evidencePackReferenceOnly: true
+auditTrendAggregateOnly: true
+liveComplianceEvaluationAllowed: false
+evidenceMutationAllowed: false
+exportMutationAllowed: false
+retentionMutationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawEvidencePayloadsAllowed: false
+rawControlRowsAllowed: false
+rawAuditLogsAllowed: false
+rawUserDataAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+complianceDomains:
+  - security-baseline
+  - rbac-approvals
+  - evidence-redaction
+  - backup-coverage
+  - monitoring-coverage
+  - cmdb-readiness
+  - patch-readiness
+  - restore-testing
+statusBands:
+  - compliant
+  - attention
+  - gap
+  - blocked
+  - not-assessed
+trendWindows:
+  - current
+  - seven-day
+  - thirty-day
+  - quarterly
+requiredGuards:
+  - control-scope-known
+  - evidence-pack-referenced
+  - redaction-state-reviewed
+  - stale-data-marked
+  - owner-assigned
+  - live-evaluation-blocked
+  - evidence-redacted
+blockedReasons:
+  - compliance-live-evaluation-disabled
+  - compliance-evidence-mutation-disabled
+  - compliance-export-mutation-disabled
+  - compliance-retention-mutation-disabled
+  - compliance-workflow-mutation-disabled
+  - compliance-provider-calls-disabled
+  - compliance-notification-dispatch-disabled
+  - compliance-raw-evidence-payloads-disabled
+  - compliance-raw-control-rows-disabled
+  - compliance-raw-audit-logs-disabled
+  - compliance-raw-user-data-disabled
+  - compliance-raw-provider-payloads-disabled
+  - compliance-raw-recipient-data-disabled
+  - compliance-credential-values-disabled
+  - compliance-token-values-disabled
+  - compliance-tenant-identifiers-disabled
+  - compliance-object-identifiers-disabled
+  - compliance-principal-identifiers-disabled
+  - compliance-private-network-values-disabled
+  - control-scope-missing
+  - evidence-pack-missing
+  - redaction-state-unknown
+  - stale-data-unmarked
+  - owner-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Compliance dashboard summary
+  - Control status summary
+  - Evidence pack references
+  - Redaction summary
+  - Stale data summary
+  - Owner review summary
+  - Evidence references
+rules:
+  - id: aggregate-compliance-only
+    decision: block
+    requirement: Compliance dashboard summaries are aggregate-only and must not run live compliance evaluation or expose raw control rows.
+    evidence: Compliance dashboard summary
+  - id: control-status-read-only
+    decision: block
+    requirement: Control status, trend windows, stale-data markers, and owner review summaries are read-only and must not mutate evidence, export, retention, or workflow state.
+    evidence: Control status summary
+  - id: evidence-pack-reference-only
+    decision: block
+    requirement: Dashboard evidence uses evidence pack references and redaction summaries only; it must not copy raw evidence payloads or audit logs.
+    evidence: Evidence pack references
+  - id: raw-compliance-data-not-exposed
+    decision: block
+    requirement: Evidence compliance dashboard evidence must not expose raw evidence payloads, raw control rows, raw audit logs, raw user data, raw provider payloads, recipient data, credential values, token values, tenant identifiers, object identifiers, principal identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

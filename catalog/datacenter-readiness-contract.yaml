@@ -1,0 +1,83 @@
+# Datacenter readiness seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, serial numbers, asset tags, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: review-only
+providerCallsEnabled: false
+liveExecutionAllowed: false
+rawInventoryRowsAllowed: false
+readinessDomains:
+  - rack-space
+  - power
+  - cooling
+  - switchport
+  - vlan
+  - storage-pathing
+  - firmware-baseline
+  - support-coverage
+  - site-capacity
+requiredInputs:
+  - site
+  - requester
+  - owner
+  - hardwareProfile
+  - clusterProfile
+  - networkScope
+  - storageScope
+  - capacityNeed
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - owner-known
+  - rack-capacity-known
+  - power-cooling-reviewed
+  - network-readiness-known
+  - storage-readiness-known
+  - firmware-baseline-known
+  - evidence-redacted
+planSections:
+  - siteSummary
+  - capacityReadiness
+  - networkReadiness
+  - storageReadiness
+  - firmwareAndSupport
+  - riskNotes
+  - remediationPlan
+  - handoverNotes
+blockedReasons:
+  - site-unknown
+  - owner-unknown
+  - rack-capacity-unknown
+  - power-cooling-not-reviewed
+  - network-readiness-unknown
+  - storage-readiness-unknown
+  - firmware-baseline-unknown
+  - support-coverage-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Site readiness summary
+  - Rack and power review
+  - Cooling review
+  - Network readiness summary
+  - Storage readiness summary
+  - Firmware and support baseline
+  - Capacity decision
+  - Risk notes
+  - Evidence references
+rules:
+  - id: no-live-datacenter-actions
+    decision: block
+    requirement: Datacenter readiness contracts report review state only and never execute provider, switch, storage, or hardware actions.
+    evidence: Site readiness summary
+  - id: network-storage-readiness-required
+    decision: block
+    requirement: Network and storage readiness must be known before hardware or cluster work proceeds.
+    evidence: Network readiness summary
+  - id: capacity-decision-required
+    decision: block
+    requirement: Capacity decision must show rack, power, cooling, and site headroom before approval.
+    evidence: Capacity decision
+  - id: firmware-support-baseline-required
+    decision: block
+    requirement: Firmware and support baseline must be known before datacenter execution can be considered.
+    evidence: Firmware and support baseline

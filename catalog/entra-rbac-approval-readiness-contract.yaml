@@ -1,0 +1,124 @@
+# Entra RBAC approval readiness seed data only. Do not add credentials, tokens, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, user records, claim payloads, group rows, app-registration payloads, Microsoft Graph payloads, ServiceNow payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+identityProvider: Microsoft Entra ID
+configuredForProduction: false
+localMockAuthAllowed: true
+providerCallsEnabled: false
+liveAuthenticationEnabled: false
+tokenValidationEnabled: false
+graphCallsAllowed: false
+entraGroupLookupAllowed: false
+appRegistrationChangesAllowed: false
+roleAssignmentChangesAllowed: false
+approvalExecutionAllowed: false
+serviceNowApprovalChangesAllowed: false
+rawUserDataAllowed: false
+rawClaimPayloadsAllowed: false
+rawGroupRowsAllowed: false
+tenantIdentifiersAllowed: false
+appIdentifiersAllowed: false
+clientIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+credentialValuesAllowed: false
+rawProviderPayloadsAllowed: false
+readinessSurfaces:
+  - oidc-configuration-readiness
+  - protected-api-readiness
+  - app-role-readiness
+  - group-claim-readiness
+  - role-action-matrix-readiness
+  - approval-route-readiness
+  - local-mock-boundary-readiness
+  - audit-evidence-readiness
+  - break-glass-readiness
+requiredInputs:
+  - identityProviderDecision
+  - runtimeConfigurationSummary
+  - protectedApiProfile
+  - appRoleMappingSummary
+  - groupClaimMappingSummary
+  - roleActionMatrix
+  - approvalRouteSummary
+  - localMockBoundary
+  - breakGlassSummary
+  - evidenceManifest
+requiredGuards:
+  - identity-provider-confirmed
+  - runtime-config-externalized
+  - protected-api-profile-reviewed
+  - app-role-mapping-reviewed
+  - group-claim-mapping-reviewed
+  - role-action-matrix-reviewed
+  - approval-routes-reviewed
+  - local-mock-boundary-enforced
+  - break-glass-reviewed
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - identityProviderBoundary
+  - runtimeConfiguration
+  - protectedApiReadiness
+  - roleMappingReview
+  - approvalRouteReview
+  - localMockBoundary
+  - breakGlassReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-authentication-disabled
+  - token-validation-disabled
+  - graph-calls-disabled
+  - entra-group-lookup-disabled
+  - app-registration-change-disabled
+  - role-assignment-change-disabled
+  - approval-execution-disabled
+  - servicenow-approval-change-disabled
+  - raw-user-data-disabled
+  - raw-claim-payloads-disabled
+  - raw-group-rows-disabled
+  - tenant-identifiers-disabled
+  - app-identifiers-disabled
+  - client-identifiers-disabled
+  - object-identifiers-disabled
+  - principal-identifiers-disabled
+  - group-identifiers-disabled
+  - credential-values-disabled
+  - raw-provider-payloads-disabled
+  - runtime-config-missing
+  - protected-api-profile-missing
+  - role-mapping-missing
+  - approval-route-missing
+  - local-mock-boundary-missing
+  - break-glass-review-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Identity readiness summary
+  - Runtime configuration review
+  - Protected API readiness
+  - Role mapping review
+  - Approval route review
+  - Local mock boundary
+  - Break-glass review
+  - Evidence references
+rules:
+  - id: no-live-auth-provider-execution
+    decision: block
+    requirement: Entra RBAC approval readiness reports static readiness only and never validates live sign-ins, calls Microsoft Graph, looks up groups, changes app registrations, assigns roles, executes approvals, changes ServiceNow approvals, or mutates provider state.
+    evidence: Identity readiness summary
+  - id: runtime-config-externalized
+    decision: block
+    requirement: Runtime identity configuration, protected API settings, app role mapping, and group claim mapping must remain deployment configuration outside committed files.
+    evidence: Runtime configuration review
+  - id: role-and-approval-readiness-required
+    decision: block
+    requirement: Role action matrix, approval routes, break-glass handling, and local mock boundary must be reviewed before production authentication can be accepted.
+    evidence: Approval route review
+  - id: raw-entra-readiness-data-not-exposed
+    decision: block
+    requirement: Readiness evidence must use safe summaries only and must not expose user records, claim payloads, group rows, tenant IDs, app IDs, client IDs, object IDs, principal IDs, group IDs, credentials, tokens, Microsoft Graph payloads, ServiceNow payloads, or provider payloads.
+    evidence: Evidence references

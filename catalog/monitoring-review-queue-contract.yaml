@@ -1,0 +1,94 @@
+# Monitoring review queue seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw queue rows, raw alert payloads, task identifiers, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+queueMode: aggregate-sla
+dryRunRequired: true
+providerCallsEnabled: false
+liveTaskCreationAllowed: false
+liveEscalationAllowed: false
+zabbixMutationAllowed: false
+rawQueueRowsAllowed: false
+supportedWorkflows:
+  - ambiguous-onboarding-review
+  - mapping-owner-assignment
+  - sla-aging-review
+  - escalation-draft
+  - queue-handover
+  - evidence-pack-review
+queueSignals:
+  - ambiguous-host-mapping
+  - missing-owner
+  - missing-support-group
+  - stale-review
+  - sla-breach-risk
+  - escalation-needed
+  - evidence-missing
+requiredInputs:
+  - queueItemSummary
+  - platformCiKey
+  - site
+  - environment
+  - monitoringProfile
+  - owner
+  - supportGroup
+  - slaPolicy
+  - evidenceManifest
+requiredGuards:
+  - queue-item-summary-known
+  - mapping-ambiguity-marked
+  - owner-known
+  - support-group-known
+  - sla-policy-known
+  - escalation-route-assigned
+  - evidence-redacted
+planSections:
+  - queueSummary
+  - mappingAmbiguity
+  - ownershipReview
+  - slaStatus
+  - escalationDraft
+  - handoverNotes
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-task-creation-disabled
+  - live-escalation-disabled
+  - zabbix-mutation-disabled
+  - queue-item-unknown
+  - owner-unknown
+  - support-group-unknown
+  - sla-policy-missing
+  - escalation-route-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Queue summary
+  - Mapping ambiguity
+  - Ownership review
+  - SLA status
+  - Escalation draft
+  - Handover notes
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-review-task-creation
+    decision: block
+    requirement: Monitoring review queue produces aggregate SLA and escalation drafts only, never creating ServiceNow tasks or mutating Zabbix mappings.
+    evidence: Queue summary
+  - id: ambiguous-mapping-marked
+    decision: block
+    requirement: Ambiguous onboarding or monitoring mappings must be explicitly marked before queue SLA status is trusted.
+    evidence: Mapping ambiguity
+  - id: sla-policy-required
+    decision: block
+    requirement: Review queue aging requires a known SLA policy before breach risk is shown.
+    evidence: SLA status
+  - id: escalation-draft-required
+    decision: block
+    requirement: Breach-risk queue items require a draft escalation route before handover.
+    evidence: Escalation draft
+  - id: raw-queue-rows-not-exposed
+    decision: block
+    requirement: Operators receive aggregate queue summaries only, not raw queue rows, raw alert payloads, task identifiers, or provider output.
+    evidence: Queue summary

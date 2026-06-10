@@ -1,0 +1,72 @@
+# Shift queue seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+queueMode: aggregate-safe
+providerCallsEnabled: false
+liveExecutionAllowed: false
+rawProviderPayloadsAllowed: false
+queueSources:
+  - blocked-request
+  - failed-operation
+  - pending-approval
+  - active-incident
+  - backup-failure
+  - monitoring-problem
+  - handover-note
+queueStates:
+  - new
+  - triage
+  - owner-assigned
+  - waiting-approval
+  - waiting-dependency
+  - ready-for-handover
+  - closed
+requiredInputs:
+  - queueItemSource
+  - severity
+  - owner
+  - supportGroup
+  - safeNextAction
+  - handoverNotes
+  - evidenceManifest
+requiredGuards:
+  - owner-known
+  - support-group-known
+  - severity-assigned
+  - safe-next-action-set
+  - evidence-redacted
+  - stale-data-marked
+blockedReasons:
+  - owner-unknown
+  - support-group-unknown
+  - missing-safe-next-action
+  - approval-pending
+  - dependency-unhealthy
+  - stale-data
+  - evidence-not-redacted
+requiredEvidence:
+  - Queue item summary
+  - Owner assignment
+  - Safe next action
+  - Approval state
+  - Dependency health
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-raw-provider-payloads
+    decision: block
+    requirement: Shift queue items summarize provider state without exposing raw provider payloads.
+    evidence: Queue item summary
+  - id: safe-next-action-required
+    decision: block
+    requirement: Every visible queue item must include a safe next action for the assigned team.
+    evidence: Safe next action
+  - id: owner-and-support-required
+    decision: block
+    requirement: Owner and support group must be known before a queue item can leave triage.
+    evidence: Owner assignment
+  - id: handover-evidence-required
+    decision: block
+    requirement: Queue items that cross shifts must keep handover notes and evidence references.
+    evidence: Handover notes

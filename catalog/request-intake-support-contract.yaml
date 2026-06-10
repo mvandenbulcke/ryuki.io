@@ -1,0 +1,105 @@
+# Request intake support seed data only. Do not add raw request payloads, raw draft payloads, raw duplicate rows, raw provider payloads, raw logs, raw rows, recipient data, credentials, tenant IDs, object IDs, private network values, live endpoints, or URLs.
+version: 1
+status: draft
+source: static-seed
+intakeSupportMode: static-intake-support
+templateCatalogReadOnly: true
+duplicateDetectionDryRunOnly: true
+draftStateReadOnly: true
+liveSubmissionAllowed: false
+draftPersistenceAllowed: false
+duplicateQueryAllowed: false
+workflowMutationAllowed: false
+approvalMutationAllowed: false
+providerCallsAllowed: false
+rawRequestPayloadsAllowed: false
+rawDraftPayloadsAllowed: false
+rawDuplicateRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawLogContentAllowed: false
+rawRowsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+supportSurfaces:
+  - request-templates
+  - duplicate-detection
+  - saved-draft-states
+  - intake-precheck
+  - evidence-summary
+templateTypes:
+  - offering-template
+  - site-default-template
+  - role-default-template
+  - maintenance-template
+  - retirement-template
+duplicateSignals:
+  - same-offering-scope
+  - same-target-resource
+  - same-site-environment-owner
+  - overlapping-maintenance-window
+  - active-request-open
+  - recent-build-or-retirement
+draftStates:
+  - not-started
+  - in-progress
+  - stale
+  - blocked
+  - ready-for-validation
+  - expired
+requiredGuards:
+  - template-source-reviewed
+  - duplicate-signals-reviewed
+  - draft-state-read-only
+  - request-submission-blocked
+  - draft-persistence-blocked
+  - raw-payloads-blocked
+  - recipient-data-blocked
+  - evidence-redacted
+blockedReasons:
+  - live-submission-disabled
+  - draft-persistence-disabled
+  - duplicate-query-disabled
+  - workflow-mutation-disabled
+  - approval-mutation-disabled
+  - provider-calls-disabled
+  - raw-request-payloads-disabled
+  - raw-draft-payloads-disabled
+  - raw-duplicate-rows-disabled
+  - raw-provider-payloads-disabled
+  - raw-log-content-disabled
+  - raw-rows-disabled
+  - raw-recipient-data-disabled
+  - credential-values-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - private-network-values-disabled
+  - template-source-missing
+  - duplicate-signal-missing
+  - draft-state-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Template catalog review
+  - Duplicate signal review
+  - Draft state summary
+  - Intake precheck summary
+  - Evidence references
+rules:
+  - id: template-catalog-read-only
+    decision: block
+    requirement: Request intake support exposes template metadata only and must not create, update, or persist request drafts.
+    evidence: Template catalog review
+  - id: duplicate-detection-dry-run-only
+    decision: block
+    requirement: Duplicate detection remains a static signal contract and must not query live request stores, provider systems, or raw request payloads.
+    evidence: Duplicate signal review
+  - id: submission-and-approval-mutation-disabled
+    decision: block
+    requirement: Intake support cannot submit requests, mutate workflows, mutate approvals, or start live execution.
+    evidence: Intake precheck summary
+  - id: raw-intake-data-not-exposed
+    decision: block
+    requirement: Request intake support evidence must use safe summaries only and must not expose raw request payloads, raw draft payloads, raw duplicate rows, raw provider payloads, raw logs, raw rows, recipient data, credential values, tenant identifiers, object identifiers, private network values, live endpoints, or URLs.
+    evidence: Evidence references

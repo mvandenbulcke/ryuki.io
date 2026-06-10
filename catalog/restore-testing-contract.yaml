@@ -1,0 +1,84 @@
+# Restore testing seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw restore logs, raw rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+testMode: schedule-and-evidence
+dryRunRequired: true
+providerCallsEnabled: false
+liveRestoreAllowed: false
+testExecutionAllowed: false
+rawRestoreLogsAllowed: false
+supportedWorkflows:
+  - restore-test-schedule
+  - restore-point-validation
+  - verification-plan-review
+  - critical-app-cadence
+  - evidence-pack-review
+requiredInputs:
+  - application
+  - criticality
+  - backupPolicy
+  - restoreType
+  - restorePointSelection
+  - verificationPlan
+  - owner
+  - supportGroup
+  - testWindow
+  - evidenceManifest
+requiredGuards:
+  - restore-point-known
+  - target-isolation-reviewed
+  - verification-plan-ready
+  - owner-approval-assigned
+  - backup-operator-approval-assigned
+  - schedule-window-known
+  - evidence-redacted
+planSections:
+  - testScope
+  - restorePointSummary
+  - isolationPlan
+  - verificationPlan
+  - scheduleCadence
+  - evidencePack
+  - approvalRoute
+  - handoverNotes
+blockedReasons:
+  - provider-calls-disabled
+  - live-restore-disabled
+  - test-execution-disabled
+  - restore-point-unknown
+  - target-isolation-not-reviewed
+  - verification-plan-missing
+  - schedule-window-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Restore test scope
+  - Restore point summary
+  - Isolation plan
+  - Verification plan
+  - Schedule cadence
+  - Approval decisions
+  - Evidence pack
+  - Evidence references
+rules:
+  - id: no-live-restore-test-execution
+    decision: block
+    requirement: Restore testing produces schedule, verification, and evidence plans only, never executing restores.
+    evidence: Restore test scope
+  - id: restore-point-required
+    decision: block
+    requirement: Restore test plans require a known restore point selection.
+    evidence: Restore point summary
+  - id: isolation-and-verification-required
+    decision: block
+    requirement: Target isolation and verification plans must be ready before approval.
+    evidence: Verification plan
+  - id: cadence-required-for-critical-apps
+    decision: block
+    requirement: Critical applications require an explicit restore-test cadence.
+    evidence: Schedule cadence
+  - id: evidence-pack-required
+    decision: block
+    requirement: Restore testing must produce a redacted evidence pack before completion.
+    evidence: Evidence pack

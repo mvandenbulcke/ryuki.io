@@ -1,0 +1,113 @@
+# Adapter readiness matrix seed data only. Do not add endpoint names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw provider payloads, raw health checks, or secret paths.
+version: 1
+status: draft
+source: static-seed
+matrixMode: static-readiness
+providerCallsEnabled: false
+externalAccessBlocked: true
+liveProviderValidationAllowed: false
+credentialValuesAllowed: false
+rawProviderPayloadsAllowed: false
+supportedAdapters:
+  - vmware
+  - hyperv
+  - proxmox
+  - veeam-br
+  - veeam-one
+  - zabbix
+  - servicenow-file-exchange
+readinessStates:
+  - ready
+  - degraded
+  - stale
+  - blocked
+  - unknown
+readinessDimensions:
+  - secretReference
+  - endpointReachability
+  - apiVersionCompatibility
+  - permissionScope
+  - dryRunCapability
+  - staleDataMarker
+  - ownerSupport
+  - evidenceReadiness
+safeCapabilities:
+  - readiness
+  - read-only
+  - dry-run
+  - stale-data-marker
+  - evidence-reference
+requiredInputs:
+  - adapterDomain
+  - site
+  - scope
+  - secretReferenceState
+  - apiVersionState
+  - permissionScopeState
+  - reachabilityState
+  - dryRunCapabilityState
+  - staleDataMarker
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - secret-reference-known
+  - endpoint-not-raw
+  - api-version-reviewed
+  - permissions-reviewed
+  - stale-data-marked
+  - owner-known
+  - support-group-known
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - adapterScope
+  - authReadiness
+  - compatibilityReadiness
+  - permissionReadiness
+  - reachabilityReadiness
+  - staleDataReview
+  - safeCapabilities
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-provider-validation-disabled
+  - secret-reference-missing
+  - endpoint-unconfigured
+  - api-version-unknown
+  - permission-scope-unknown
+  - stale-data-unmarked
+  - owner-unknown
+  - support-group-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Readiness summary
+  - Adapter scope
+  - Secret reference state
+  - API version review
+  - Permission scope review
+  - Reachability state
+  - Stale-data marker
+  - Safe capabilities
+  - Evidence references
+rules:
+  - id: no-live-provider-readiness-checks
+    decision: block
+    requirement: Adapter readiness matrix uses static, mock, or manual evidence only and never calls provider endpoints.
+    evidence: Readiness summary
+  - id: secret-reference-only
+    decision: block
+    requirement: Readiness may record secret-reference state only, never secret values or secret paths.
+    evidence: Secret reference state
+  - id: compatibility-and-permissions-required
+    decision: block
+    requirement: API version compatibility and permission scope must be reviewed before readiness can unblock dry-run workflows.
+    evidence: API version review
+  - id: stale-readiness-marked
+    decision: block
+    requirement: Stale or unknown readiness must be marked and routed to review before workflow preflight trusts it.
+    evidence: Stale-data marker
+  - id: raw-provider-data-not-exposed
+    decision: block
+    requirement: Operators receive readiness summaries only, not raw provider payloads, raw health checks, endpoint names, or private network details.
+    evidence: Readiness summary

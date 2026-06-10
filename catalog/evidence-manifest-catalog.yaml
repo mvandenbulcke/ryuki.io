@@ -1,0 +1,113 @@
+# Evidence manifest seed data only. Do not add evidence payloads, logs, credentials, tokens, tenant IDs, object IDs, private IPs, or provider payloads.
+version: 1
+status: draft
+manifestPurpose: Redacted evidence pack index and export metadata for audit, CAB, incident review, handover, and CMDB file exchange.
+redactionStates:
+  - pending
+  - redacted
+  - blocked
+exportReadiness:
+  - draft
+  - redaction-pending
+  - ready-for-audit
+  - ready-for-cab
+  - ready-for-incident-review
+  - ready-for-handover
+  - blocked
+requiredManifestFields:
+  - evidenceId
+  - evidenceType
+  - requestReference
+  - operationReference
+  - exporter
+  - createdAt
+  - redactionState
+  - exportReadiness
+  - recordTypes
+  - evidenceReferences
+  - retentionClass
+recordTypes:
+  - Request payload summary
+  - Validation result
+  - Failed rules
+  - Remediation hints
+  - Provider-safe plan
+  - Plan summary
+  - Policy decision record
+  - Approval decisions
+  - Delegated authority
+  - Emergency flag
+  - Lock record
+  - Redacted execution log
+  - Child operation results
+  - Before/after inventory
+  - Before/after monitoring state
+  - Policy assignments
+  - Evidence references
+  - Final evidence references
+  - File hash
+  - Header mapping
+  - Accepted row count
+  - Accepted/rejected rows
+  - Rejected rows
+  - Import user
+  - Export package
+  - Reviewer approval
+  - CMDB export package
+  - CMDB closure export
+  - CMDB relationship closure export
+  - Relationship review
+  - Data retention decision
+  - Backup retention proof
+  - Dependency review
+  - Quarantine plan
+  - Retirement plan
+  - Restore plan summary
+  - Verification result
+  - Wave plan summary
+  - Risk notes
+  - Handover notes
+  - Compliance state
+  - Onboarding plan summary
+  - Zabbix reference
+  - Runbook plan summary
+  - Monitoring disablement proof
+  - Alert references
+  - Health snapshot
+  - Stale-data markers
+  - Dependency status
+  - Dashboard timestamp
+requiredRedactionChecks:
+  - no-secret-pattern-scan
+  - provider-summary-only
+  - stack-trace-suppression
+  - identifier-redaction
+  - private-network-redaction
+  - log-line-filtering
+  - export-readiness-gate
+safeExportTargets:
+  - audit-review
+  - cab-review
+  - incident-review
+  - handover
+  - cmdb-file-exchange
+prohibitedContent:
+  - credential values
+  - bearer material
+  - private key material
+  - generated certificates
+  - Vault initialization material
+  - raw provider payloads
+  - unfiltered logs
+  - stack traces
+  - tenant identifiers
+  - object identifiers
+  - private network addresses
+  - raw recipient data
+retentionClasses:
+  - operational-review
+  - audit-retained
+  - cab-retained
+  - incident-retained
+  - handover-retained
+  - cmdb-exchange-retained

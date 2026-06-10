@@ -1,0 +1,3 @@
+# local-auth contract — static stub for COVERAGE_TSV registration
+slice: local-auth
+status: active

@@ -1,0 +1,164 @@
+# vCenter object placement seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, MoRefs, UUIDs, endpoint names, private IPs, raw VMware, Hyper-V, or Proxmox inventory rows, datastore paths, serials, asset tags, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+placementMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+livePlacementAllowed: false
+rawInventoryRowsAllowed: false
+objectIdentifiersAllowed: false
+hypervisorParity:
+  - id: vmware-vcenter-object-placement
+    platform: vmware
+    workflow: vcenter-object-placement
+    dimensionEquivalents:
+      - folder
+      - cluster
+      - resource-pool
+      - datastore
+      - storage-policy
+      - network
+      - tag-policy
+      - site
+      - environment
+    placementMode: dry-run-plan
+    dryRunRequired: true
+    providerCallsEnabled: false
+    livePlacementAllowed: false
+    rawInventoryRowsAllowed: false
+    objectIdentifiersAllowed: false
+    evidence: Placement summary
+  - id: hyper-v-object-placement
+    platform: hyper-v
+    workflow: hyper-v-object-placement
+    dimensionEquivalents:
+      - folder
+      - cluster
+      - resource-pool
+      - storage-policy
+      - network
+      - tag-policy
+      - site
+      - environment
+    placementMode: dry-run-plan
+    dryRunRequired: true
+    providerCallsEnabled: false
+    livePlacementAllowed: false
+    rawInventoryRowsAllowed: false
+    objectIdentifiersAllowed: false
+    evidence: Placement summary
+  - id: proxmox-object-placement
+    platform: proxmox
+    workflow: proxmox-object-placement
+    dimensionEquivalents:
+      - folder
+      - cluster
+      - resource-pool
+      - datastore
+      - network
+      - tag-policy
+      - site
+      - environment
+    placementMode: dry-run-plan
+    dryRunRequired: true
+    providerCallsEnabled: false
+    livePlacementAllowed: false
+    rawInventoryRowsAllowed: false
+    objectIdentifiersAllowed: false
+    evidence: Placement summary
+supportedWorkflows:
+  - request-preflight
+  - windows-server-deployment
+  - linux-server-deployment
+  - vm-day2-change
+  - application-environment-deployment
+  - placement-exception-review
+placementDimensions:
+  - folder
+  - cluster
+  - resource-pool
+  - datastore
+  - storage-policy
+  - network
+  - tag-policy
+  - site
+  - environment
+requiredInputs:
+  - placementScope
+  - workloadProfile
+  - site
+  - environment
+  - criticality
+  - owner
+  - capacityDecision
+  - networkProfile
+  - storageProfile
+  - tagPolicy
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - environment-known
+  - folder-policy-known
+  - cluster-capacity-admitted
+  - resource-pool-policy-known
+  - datastore-policy-known
+  - storage-policy-known
+  - network-profile-known
+  - tag-policy-known
+  - dry-run-plan-produced
+  - evidence-redacted
+planSections:
+  - placementSummary
+  - folderPlan
+  - clusterResourcePoolPlan
+  - datastoreStoragePolicyPlan
+  - networkPlan
+  - tagPolicyPlan
+  - policyExceptions
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-placement-disabled
+  - raw-inventory-rows-disabled
+  - object-identifiers-disabled
+  - site-unknown
+  - environment-unknown
+  - folder-policy-missing
+  - cluster-capacity-missing
+  - resource-pool-policy-missing
+  - datastore-policy-missing
+  - storage-policy-missing
+  - network-profile-missing
+  - tag-policy-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Placement summary
+  - Folder plan
+  - Cluster and resource pool plan
+  - Datastore and storage policy plan
+  - Network plan
+  - Tag policy plan
+  - Policy exception decision
+  - Evidence references
+rules:
+  - id: no-live-vcenter-placement
+    decision: block
+    requirement: Object placement standards produce dry-run decisions only and never move, create, tag, migrate, or reconfigure VMware, Hyper-V, or Proxmox placement state.
+    evidence: Placement summary
+  - id: capacity-admission-required
+    decision: block
+    requirement: Cluster capacity admission must be accepted before a placement plan can become approvable.
+    evidence: Cluster and resource pool plan
+  - id: network-storage-policy-required
+    decision: block
+    requirement: Network, datastore, and storage policy profiles must be known before placement can be planned.
+    evidence: Datastore and storage policy plan
+  - id: tag-policy-required
+    decision: block
+    requirement: Site, environment, owner, criticality, backup, monitoring, and CMDB tag policy decisions must be present in the dry-run plan.
+    evidence: Tag policy plan
+  - id: raw-inventory-not-exposed
+    decision: block
+    requirement: Placement evidence must use safe summaries only and must not expose raw VMware, Hyper-V, or Proxmox inventory rows, object identifiers, endpoint names, hostnames, datastore paths, or provider payloads.
+    evidence: Evidence references

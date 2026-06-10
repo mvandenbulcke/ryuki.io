@@ -1,0 +1,117 @@
+# vSAN and ESXi lifecycle seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, MoRefs, UUIDs, endpoint names, private IPs, raw VMware, Hyper-V, or Proxmox inventory rows, datastore paths, serials, asset tags, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+lifecycleMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveLifecycleAllowed: false
+rawInventoryRowsAllowed: false
+hostIdentifiersAllowed: false
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+platformLifecycleParity:
+  - vmware-vsan-esxi-lifecycle-safe-summary
+  - hyper-v-cluster-host-lifecycle-safe-summary
+  - proxmox-cluster-node-lifecycle-safe-summary
+supportedWorkflows:
+  - vsan-cluster-lifecycle
+  - esxi-patch-lifecycle
+  - firmware-baseline-review
+  - hardware-readiness-review
+  - maintenance-mode-plan
+  - lifecycle-exception-review
+lifecycleDomains:
+  - vsan-health
+  - esxi-version
+  - firmware-baseline
+  - driver-compatibility
+  - hardware-hcl
+  - cluster-maintenance
+  - network-readiness
+  - storage-policy
+requiredInputs:
+  - clusterScope
+  - site
+  - hypervisorPlatform
+  - platformProfile
+  - targetBaseline
+  - maintenanceWindow
+  - capacityDecision
+  - hardwareReadiness
+  - networkReadiness
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - cluster-scope-known
+  - site-known
+  - platform-profile-known
+  - target-baseline-known
+  - hardware-readiness-reviewed
+  - network-readiness-reviewed
+  - capacity-admission-ready
+  - maintenance-window-approved
+  - rollback-plan-ready
+  - dry-run-plan-produced
+  - evidence-redacted
+planSections:
+  - lifecycleSummary
+  - currentBaseline
+  - targetBaseline
+  - hardwareFirmwareReview
+  - networkStorageReadiness
+  - maintenanceModePlan
+  - capacityAndFailureDomainImpact
+  - rollbackPlan
+  - policyExceptions
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-lifecycle-disabled
+  - unsupported-hypervisor
+  - raw-inventory-rows-disabled
+  - host-identifiers-disabled
+  - cluster-scope-missing
+  - site-unknown
+  - platform-profile-missing
+  - target-baseline-missing
+  - hardware-readiness-missing
+  - network-readiness-missing
+  - capacity-admission-missing
+  - maintenance-window-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Lifecycle summary
+  - Current baseline summary
+  - Target baseline summary
+  - Hardware and firmware review
+  - Network and storage readiness
+  - Maintenance mode plan
+  - Capacity and failure-domain impact
+  - Rollback plan
+  - Policy exception decision
+  - Evidence references
+rules:
+  - id: no-live-vsan-esxi-lifecycle
+    decision: block
+    requirement: vSAN, ESXi, Hyper-V host, and Proxmox node lifecycle contracts produce dry-run plans only and never patch, remediate, enter maintenance mode, evacuate data, or reconfigure clusters.
+    evidence: Lifecycle summary
+  - id: hardware-readiness-required
+    decision: block
+    requirement: Hardware model, firmware baseline, driver compatibility, and support state must be reviewed before a lifecycle plan can become approvable.
+    evidence: Hardware and firmware review
+  - id: network-storage-readiness-required
+    decision: block
+    requirement: Network, storage policy, vSAN health, and failure-domain readiness must be reviewed before maintenance sequencing is planned.
+    evidence: Network and storage readiness
+  - id: maintenance-rollback-required
+    decision: block
+    requirement: Maintenance window, sequencing, capacity impact, and rollback plan must be present before lifecycle approval.
+    evidence: Rollback plan
+  - id: raw-host-inventory-not-exposed
+    decision: block
+    requirement: Lifecycle evidence must use safe summaries only and must not expose raw host inventory rows, object identifiers, endpoint names, hostnames, datastore paths, serials, or provider payloads.
+    evidence: Evidence references

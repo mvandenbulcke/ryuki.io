@@ -1,0 +1,111 @@
+# Cost capacity analytics seed data only. Do not add billing account IDs, subscription IDs, resource IDs, tenant IDs, object IDs, hostnames, repository names, usernames, credentials, tokens, raw cost rows, raw inventory rows, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+analyticsMode: forecast-only
+dryRunRequired: true
+providerCallsEnabled: false
+liveRemediationAllowed: false
+billingExportIngestionAllowed: false
+rawCostRowsAllowed: false
+rawInventoryRowsAllowed: false
+resourceIdentifiersAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+rawProviderPayloadsAllowed: false
+platformScope:
+  - vmware
+  - hyperv
+  - proxmox
+analyticsDomains:
+  - compute-capacity
+  - storage-capacity
+  - backup-capacity
+  - growth-trend
+  - cost-trend
+  - efficiency-opportunity
+  - forecast-risk
+analyticsSignals:
+  - capacity-pressure
+  - storage-growth-risk
+  - backup-growth-risk
+  - cost-anomaly
+  - underutilization-signal
+  - stale-usage-data
+  - forecast-window-missing
+requiredInputs:
+  - analyticsScope
+  - site
+  - serviceDomain
+  - capacitySummary
+  - costBand
+  - growthTrend
+  - forecastWindow
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - analytics-scope-summarized
+  - aggregate-usage-known
+  - cost-band-known
+  - growth-trend-known
+  - forecast-window-set
+  - owner-known
+  - remediation-plan-ready
+  - evidence-redacted
+planSections:
+  - analyticsSummary
+  - capacityForecast
+  - storageForecast
+  - backupForecast
+  - costTrend
+  - efficiencyOpportunities
+  - remediationOptions
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - billing-export-ingestion-disabled
+  - raw-cost-rows-disabled
+  - raw-inventory-rows-disabled
+  - resource-identifiers-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - raw-provider-payloads-disabled
+  - analytics-scope-missing
+  - aggregate-usage-missing
+  - cost-band-missing
+  - growth-trend-unknown
+  - forecast-window-missing
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Cost capacity summary
+  - Capacity forecast
+  - Storage forecast
+  - Backup forecast
+  - Cost trend
+  - Efficiency opportunities
+  - Remediation options
+  - Evidence references
+rules:
+  - id: no-live-cost-capacity-remediation
+    decision: block
+    requirement: Cost and capacity analytics reports forecast state only and never changes resources, budgets, repositories, clusters, tickets, or provider state.
+    evidence: Cost capacity summary
+  - id: aggregate-summaries-required
+    decision: block
+    requirement: Aggregate usage summaries and cost bands are required before analytics can be accepted.
+    evidence: Capacity forecast
+  - id: forecast-window-required
+    decision: block
+    requirement: Capacity and cost decisions require a declared forecast window.
+    evidence: Cost capacity summary
+  - id: remediation-options-review-only
+    decision: block
+    requirement: Efficiency and remediation options are review-only until a separate approved live workflow exists.
+    evidence: Remediation options
+  - id: raw-cost-inventory-data-not-exposed
+    decision: block
+    requirement: Cost capacity evidence must use safe summaries only and must not expose raw cost rows, raw inventory rows, resource IDs, billing account IDs, subscription IDs, tenant IDs, object IDs, or provider payloads.
+    evidence: Evidence references

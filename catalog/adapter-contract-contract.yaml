@@ -1,0 +1,7 @@
+# Adapter contract dry-run seed data only. Do not add credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+mode: dry-run-contract
+providerCallsEnabled: false
+dryRunOnly: true

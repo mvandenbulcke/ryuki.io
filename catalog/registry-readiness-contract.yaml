@@ -1,0 +1,133 @@
+# Registry readiness seed data only. Do not add registry URLs, project names, repository names, image tags, image digests, robot account names, robot secrets, user names, group names, OIDC identifiers, LDAP identifiers, CVE rows, webhook URLs, replication endpoints, tenant IDs, object IDs, private IPs, credentials, tokens, raw registry payloads, raw scanner payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+registryProvider: Harbor
+providerCallsEnabled: false
+harborApiCallsAllowed: false
+registryPushAllowed: false
+registryPullAllowed: false
+projectMutationAllowed: false
+robotAccountMutationAllowed: false
+retentionPolicyMutationAllowed: false
+immutabilityRuleMutationAllowed: false
+scannerMutationAllowed: false
+replicationMutationAllowed: false
+webhookMutationAllowed: false
+credentialValuesAllowed: false
+robotSecretValuesAllowed: false
+registryUrlsAllowed: false
+imageDigestsAllowed: false
+rawRegistryPayloadsAllowed: false
+rawScannerPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+registryIdentifiersAllowed: false
+readinessSurfaces:
+  - harbor-system-readiness
+  - project-topology-readiness
+  - rbac-readiness
+  - robot-account-readiness
+  - retention-policy-readiness
+  - vulnerability-scanning-readiness
+  - tag-immutability-readiness
+  - quota-readiness
+  - audit-log-readiness
+  - replication-webhook-readiness
+  - evidence-redaction-readiness
+requiredInputs:
+  - registryUseCaseSummary
+  - projectTopologySummary
+  - rbacModelSummary
+  - robotAccountScopeSummary
+  - retentionPolicySummary
+  - immutabilityRuleSummary
+  - scannerProfile
+  - quotaSummary
+  - auditLogSummary
+  - replicationWebhookSummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - harbor-provider-reviewed
+  - project-creation-reviewed
+  - project-rbac-reviewed
+  - robot-account-scope-reviewed
+  - retention-policy-reviewed
+  - vulnerability-scanner-reviewed
+  - immutability-rule-reviewed
+  - quota-reviewed
+  - audit-log-reviewed
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - systemSecurityPosture
+  - projectTopology
+  - rbacAndRobotScope
+  - retentionAndQuotaReadiness
+  - immutabilityReadiness
+  - scannerReadiness
+  - replicationWebhookReadiness
+  - auditMonitoringReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - harbor-api-calls-disabled
+  - registry-push-disabled
+  - registry-pull-disabled
+  - project-mutation-disabled
+  - robot-account-mutation-disabled
+  - retention-policy-mutation-disabled
+  - immutability-rule-mutation-disabled
+  - scanner-mutation-disabled
+  - replication-mutation-disabled
+  - webhook-mutation-disabled
+  - credential-values-disabled
+  - robot-secret-values-disabled
+  - registry-urls-disabled
+  - image-digests-disabled
+  - raw-registry-payloads-disabled
+  - raw-scanner-payloads-disabled
+  - raw-provider-payloads-disabled
+  - registry-identifiers-disabled
+  - provider-review-missing
+  - project-rbac-missing
+  - robot-scope-missing
+  - retention-policy-missing
+  - scanner-review-missing
+  - immutability-review-missing
+  - quota-review-missing
+  - audit-log-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Registry readiness summary
+  - System security review
+  - Project topology review
+  - RBAC and robot scope review
+  - Retention policy review
+  - Immutability rule review
+  - Scanner readiness review
+  - Quota review
+  - Audit log review
+  - Evidence references
+rules:
+  - id: no-live-registry-actions
+    decision: block
+    requirement: Registry readiness reports static readiness only and never calls Harbor APIs, pushes images, pulls images, mutates projects, changes robot accounts, changes retention policies, changes immutability rules, changes scanners, changes replication, changes webhooks, or changes provider state.
+    evidence: Registry readiness summary
+  - id: project-rbac-and-robot-scope-required
+    decision: block
+    requirement: Harbor project topology, project creation restriction, project RBAC, robot account scope, and quota posture must be reviewed before registry readiness can be accepted.
+    evidence: RBAC and robot scope review
+  - id: retention-scanning-immutability-required
+    decision: block
+    requirement: Tag retention, vulnerability scanning, vulnerability allowlist posture, tag immutability, and audit logging must be reviewed before platform images can depend on the registry.
+    evidence: Scanner readiness review
+  - id: replication-webhook-readiness-required
+    decision: block
+    requirement: Replication, webhook, proxy cache, and monitoring posture must be summarized before future registry automation can be accepted.
+    evidence: Audit log review
+  - id: raw-registry-data-not-exposed
+    decision: block
+    requirement: Registry readiness evidence must use safe summaries only and must not expose registry URLs, project names, repository names, image tags, image digests, robot account names, robot secrets, user names, group names, OIDC identifiers, LDAP identifiers, CVE rows, webhook URLs, replication endpoints, tenant IDs, object IDs, private IPs, credentials, tokens, raw registry payloads, raw scanner payloads, or provider payloads.
+    evidence: Evidence references

@@ -1,0 +1,141 @@
+# Approval decision readiness seed data only. Do not add approver records, recipient data, credentials, tokens, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, live endpoints, raw approval payloads, raw request payloads, raw logs, raw rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+approvalReadinessMode: static-approval-decision-readiness
+identityProvider: Microsoft Entra ID
+configuredForProduction: false
+decisionQueueReadOnly: true
+routeCatalogReadOnly: true
+evidenceRequired: true
+localMockAuthAllowed: true
+providerCallsAllowed: false
+liveAuthenticationAllowed: false
+graphCallsAllowed: false
+entraGroupLookupAllowed: false
+serviceNowApprovalMutationAllowed: false
+approvalExecutionAllowed: false
+approvalQueueMutationAllowed: false
+approvalDecisionMutationAllowed: false
+notificationDispatchAllowed: false
+workflowMutationAllowed: false
+rawApproverDataAllowed: false
+rawApprovalPayloadsAllowed: false
+rawRequestPayloadsAllowed: false
+rawRecipientDataAllowed: false
+rawProviderPayloadsAllowed: false
+rawLogContentAllowed: false
+rawRowsAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+serviceNowIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+approvalRoutes:
+  - p0-live-execution-default
+  - p0-cmdb-file-exchange
+  - p0-platform-admin-readiness
+  - p1-retirement-governance
+decisionStates:
+  - not-required
+  - pending-approval
+  - approved
+  - rejected
+  - delegated
+  - emergency-approved
+  - expired
+  - blocked
+decisionTypes:
+  - technical-approval
+  - business-approval
+  - risk-acceptance
+  - emergency-approval
+  - cmdb-review
+  - audit-review
+routeStages:
+  - route-selected
+  - preflight-reviewed
+  - technical-review
+  - business-review
+  - risk-review
+  - emergency-review
+  - final-approval
+  - evidence-ready
+approvalScopes:
+  - request
+  - workflow
+  - change
+  - cmdb-file-exchange
+  - platform-admin
+  - retirement
+escalationStates:
+  - none
+  - needs-delegation
+  - needs-final-approval
+  - expired
+  - blocked
+requiredGuards:
+  - approval-route-known
+  - request-scope-summarized
+  - decision-state-known
+  - datacenter-final-approval
+  - delegated-authority-reviewed
+  - emergency-flag-reviewed
+  - separation-of-duties-reviewed
+  - evidence-redacted
+blockedReasons:
+  - provider-calls-disabled
+  - live-authentication-disabled
+  - graph-calls-disabled
+  - entra-group-lookup-disabled
+  - servicenow-approval-mutation-disabled
+  - approval-execution-disabled
+  - approval-queue-mutation-disabled
+  - approval-decision-mutation-disabled
+  - notification-dispatch-disabled
+  - workflow-mutation-disabled
+  - raw-approver-data-disabled
+  - raw-approval-payloads-disabled
+  - raw-request-payloads-disabled
+  - raw-recipient-data-disabled
+  - raw-provider-payloads-disabled
+  - raw-log-content-disabled
+  - raw-rows-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - principal-identifiers-disabled
+  - group-identifiers-disabled
+  - servicenow-identifiers-disabled
+  - private-network-values-disabled
+  - credential-values-disabled
+  - token-values-disabled
+  - approval-route-missing
+  - decision-state-missing
+  - approval-evidence-missing
+requiredEvidence:
+  - Approval route summary
+  - Decision state summary
+  - Delegated authority review
+  - Emergency flag review
+  - Separation of duties review
+  - Approval evidence references
+rules:
+  - id: approval-route-readiness-required
+    decision: block
+    requirement: Approval decisions require route, scope, decision state, delegated authority posture, emergency posture, and evidence references before workflow approval can be represented.
+    evidence: Approval route summary
+  - id: datacenter-final-approval-required
+    decision: block
+    requirement: Live execution readiness requires Datacenter final approval unless a future delegated approval model is explicitly configured outside this static contract.
+    evidence: Decision state summary
+  - id: no-live-approval-execution
+    decision: block
+    requirement: Approval readiness is read-only and never executes approvals, mutates queues, dispatches notifications, calls identity providers, calls ServiceNow, or changes workflow state.
+    evidence: Approval evidence references
+  - id: raw-approval-data-not-exposed
+    decision: block
+    requirement: Approval readiness evidence must use safe summaries only and must not expose approver records, raw approval payloads, raw request payloads, raw recipient data, raw provider payloads, raw logs, raw rows, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, private network values, credentials, or tokens.
+    evidence: Approval evidence references

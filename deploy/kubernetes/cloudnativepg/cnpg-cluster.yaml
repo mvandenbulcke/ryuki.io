@@ -1,0 +1,78 @@
+# Static CloudNativePG Cluster skeleton — no live deployment.
+# This manifest defines the minimum viable contract for the HA PostgreSQL
+# control-plane database. Credentials live in Vault and are injected at
+# deploy-time by the Vault Secrets Operator. Do not add passwords,
+# connection strings, or credential material here.
+#
+# Prerequisites:
+#   - CloudNativePG operator installed in the cluster
+#   - Vault Secrets Operator configured for secret synchronization
+#   - vSphere CSI driver providing the storage class
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ryuki-platform-db
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+spec:
+  # Three-instance HA topology per build sheet decision
+  instances: 3
+
+  # Anti-affinity keeps pods on separate nodes
+  affinity:
+    podAntiAffinityType: required
+
+  # Placeholder database name — real name resolved at deploy-time
+  bootstrap:
+    initdb:
+      database: ryuki_platform
+      owner: ryuki_platform
+      secret:
+        name: ryuki-platform-db-superuser
+
+  # vSphere CSI-backed persistent storage
+  storage:
+    size: 10Gi
+    storageClass: vsphere-csi
+
+  # Separate WAL volume on fast storage
+  walStorage:
+    size: 5Gi
+    storageClass: vsphere-csi
+
+  # External secret reference for Vault-managed credentials
+  managed:
+    roles:
+      - name: ryuki-platform-app
+        ensure: managed
+        passwordSecret:
+          name: ryuki-platform-db-app-user
+
+  # Maintenance and upgrade posture — placeholder, reviewed per plan
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  # Backup configuration — placeholder, real Barman object store resolved at deploy-time
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://placeholder-bucket/
+      endpointURL: https://placeholder-s3-endpoint.invalid
+      s3Credentials:
+        accessKeyIdSecret:
+          name: ryuki-platform-db-backup-s3
+          key: access_key_id
+        secretAccessKeySecret:
+          name: ryuki-platform-db-backup-s3
+          key: secret_access_key
+
+  # Monitoring integration — placeholder
+  monitoring:
+    enablePodMonitor: true
+
+  # Postgres configuration — minimum safe defaults
+  postgresql:
+    parameters:
+      shared_buffers: 256MB
+      max_connections: 200

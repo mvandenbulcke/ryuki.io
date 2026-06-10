@@ -1,0 +1,251 @@
+# Cluster capacity admission seed data only. Do not add cluster names, datastore names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw capacity rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+admissionMode: dry-run-admission
+dryRunRequired: true
+providerCallsEnabled: false
+liveProviderValidationAllowed: false
+livePlacementAllowed: false
+rawCapacityRowsAllowed: false
+rawProviderPayloadsAllowed: false
+hypervisorWorkflowParity:
+  - id: vmware
+    label: VMware
+    workflowEquivalent: vmware-cluster-capacity-admission
+    admissionMode: dry-run-admission
+    dryRunRequired: true
+    providerCallsEnabled: false
+    liveProviderValidationAllowed: false
+    livePlacementAllowed: false
+    rawCapacityRowsAllowed: false
+    rawProviderPayloadsAllowed: false
+    supportedWorkflows:
+      - windows-server-deployment
+      - linux-server-deployment
+      - vm-day2-change
+      - cluster-placement-review
+      - capacity-exception-review
+    capacitySignals:
+      - cpu-headroom
+      - memory-headroom
+      - datastore-headroom
+      - vsan-headroom
+      - ha-failover-headroom
+      - drs-balance
+      - reservation-impact
+      - stale-capacity-data
+    requiredGuards:
+      - cluster-summary-known
+      - compute-headroom-reviewed
+      - datastore-headroom-reviewed
+      - vsan-headroom-reviewed
+      - ha-failover-reviewed
+      - drs-balance-reviewed
+      - reservation-impact-reviewed
+      - growth-window-set
+      - owner-known
+      - evidence-redacted
+    requiredEvidence:
+      - Capacity admission summary
+      - Cluster scope summary
+      - Compute headroom
+      - Storage headroom
+      - HA and DRS risk
+      - Reservation impact
+      - Placement decision
+      - Exceptions and remediation
+      - Evidence references
+  - id: hyper-v
+    label: Hyper-V
+    workflowEquivalent: hyper-v-cluster-capacity-admission
+    admissionMode: dry-run-admission
+    dryRunRequired: true
+    providerCallsEnabled: false
+    liveProviderValidationAllowed: false
+    livePlacementAllowed: false
+    rawCapacityRowsAllowed: false
+    rawProviderPayloadsAllowed: false
+    supportedWorkflows:
+      - windows-server-deployment
+      - linux-server-deployment
+      - vm-day2-change
+      - cluster-placement-review
+      - capacity-exception-review
+    capacitySignals:
+      - cpu-headroom
+      - memory-headroom
+      - datastore-headroom
+      - vsan-headroom
+      - ha-failover-headroom
+      - drs-balance
+      - reservation-impact
+      - stale-capacity-data
+    requiredGuards:
+      - cluster-summary-known
+      - compute-headroom-reviewed
+      - datastore-headroom-reviewed
+      - vsan-headroom-reviewed
+      - ha-failover-reviewed
+      - drs-balance-reviewed
+      - reservation-impact-reviewed
+      - growth-window-set
+      - owner-known
+      - evidence-redacted
+    requiredEvidence:
+      - Capacity admission summary
+      - Cluster scope summary
+      - Compute headroom
+      - Storage headroom
+      - HA and DRS risk
+      - Reservation impact
+      - Placement decision
+      - Exceptions and remediation
+      - Evidence references
+  - id: proxmox
+    label: Proxmox
+    workflowEquivalent: proxmox-cluster-capacity-admission
+    admissionMode: dry-run-admission
+    dryRunRequired: true
+    providerCallsEnabled: false
+    liveProviderValidationAllowed: false
+    livePlacementAllowed: false
+    rawCapacityRowsAllowed: false
+    rawProviderPayloadsAllowed: false
+    supportedWorkflows:
+      - windows-server-deployment
+      - linux-server-deployment
+      - vm-day2-change
+      - cluster-placement-review
+      - capacity-exception-review
+    capacitySignals:
+      - cpu-headroom
+      - memory-headroom
+      - datastore-headroom
+      - vsan-headroom
+      - ha-failover-headroom
+      - drs-balance
+      - reservation-impact
+      - stale-capacity-data
+    requiredGuards:
+      - cluster-summary-known
+      - compute-headroom-reviewed
+      - datastore-headroom-reviewed
+      - vsan-headroom-reviewed
+      - ha-failover-reviewed
+      - drs-balance-reviewed
+      - reservation-impact-reviewed
+      - growth-window-set
+      - owner-known
+      - evidence-redacted
+    requiredEvidence:
+      - Capacity admission summary
+      - Cluster scope summary
+      - Compute headroom
+      - Storage headroom
+      - HA and DRS risk
+      - Reservation impact
+      - Placement decision
+      - Exceptions and remediation
+      - Evidence references
+supportedWorkflows:
+  - windows-server-deployment
+  - linux-server-deployment
+  - vm-day2-change
+  - cluster-placement-review
+  - capacity-exception-review
+admissionDecisions:
+  - admit
+  - review
+  - block
+  - defer
+capacitySignals:
+  - cpu-headroom
+  - memory-headroom
+  - datastore-headroom
+  - vsan-headroom
+  - ha-failover-headroom
+  - drs-balance
+  - reservation-impact
+  - stale-capacity-data
+requiredInputs:
+  - site
+  - clusterScope
+  - workloadProfile
+  - vmSizing
+  - storagePolicy
+  - availabilityTier
+  - reservationIntent
+  - growthWindow
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - cluster-summary-known
+  - compute-headroom-reviewed
+  - datastore-headroom-reviewed
+  - vsan-headroom-reviewed
+  - ha-failover-reviewed
+  - drs-balance-reviewed
+  - reservation-impact-reviewed
+  - growth-window-set
+  - owner-known
+  - evidence-redacted
+planSections:
+  - admissionSummary
+  - clusterScope
+  - computeHeadroom
+  - storageHeadroom
+  - haDrsRisk
+  - reservationImpact
+  - placementDecision
+  - exceptionsAndRemediation
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-provider-validation-disabled
+  - live-placement-disabled
+  - cluster-summary-missing
+  - compute-headroom-unknown
+  - storage-headroom-unknown
+  - ha-failover-headroom-insufficient
+  - drs-balance-unknown
+  - reservation-impact-unknown
+  - stale-capacity-data
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Capacity admission summary
+  - Cluster scope summary
+  - Compute headroom
+  - Storage headroom
+  - HA and DRS risk
+  - Reservation impact
+  - Placement decision
+  - Exceptions and remediation
+  - Evidence references
+rules:
+  - id: no-live-vcenter-capacity-checks
+    decision: block
+    requirement: Cluster capacity admission uses static, mock, or manually imported summaries only and never calls VMware, Hyper-V, or Proxmox APIs.
+    evidence: Capacity admission summary
+  - id: dry-run-capacity-before-approval
+    decision: block
+    requirement: Build and day-2 workflows require dry-run capacity admission before approval can proceed.
+    evidence: Placement decision
+  - id: ha-drs-headroom-required
+    decision: block
+    requirement: HA failover headroom and DRS balance must be reviewed before admitting workload placement.
+    evidence: HA and DRS risk
+  - id: storage-headroom-required
+    decision: block
+    requirement: Datastore and vSAN headroom must be reviewed before admitting workload placement.
+    evidence: Storage headroom
+  - id: stale-capacity-blocks-admission
+    decision: block
+    requirement: Stale or unknown capacity evidence blocks admission until refreshed or reviewed.
+    evidence: Capacity admission summary
+  - id: raw-capacity-data-not-exposed
+    decision: block
+    requirement: Operators receive aggregate capacity summaries only, not raw VMware, Hyper-V, or Proxmox capacity rows, cluster names, datastore names, or provider payloads.
+    evidence: Capacity admission summary

@@ -1,0 +1,74 @@
+# Worker capability seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+routingMode: metadata-only
+providerCallsEnabled: false
+liveDispatchAllowed: false
+secretValuesAllowed: false
+capabilityTypes:
+  - generic-worker
+  - windows-gmsa
+  - powercli
+  - linux-ansible
+  - protected-network
+routingDimensions:
+  - workflowType
+  - osFamily
+  - site
+  - networkZone
+  - providerDomain
+  - riskLevel
+  - approvalState
+requiredInputs:
+  - workflowType
+  - requestedCapability
+  - site
+  - environment
+  - networkZone
+  - riskLevel
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - worker-registered
+  - capability-tag-known
+  - identity-reference-ready
+  - network-zone-approved
+  - approval-route-assigned
+  - dry-run-ready
+  - evidence-redacted
+blockedReasons:
+  - worker-unknown
+  - capability-missing
+  - identity-reference-missing
+  - protected-network-unapproved
+  - route-ambiguous
+  - approval-missing
+  - worker-health-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Routing request summary
+  - Capability match
+  - Worker readiness
+  - Identity reference decision
+  - Network zone decision
+  - Approval route
+  - Dry-run readiness
+  - Evidence references
+rules:
+  - id: no-live-worker-dispatch
+    decision: block
+    requirement: Worker capability routing returns metadata decisions only and never dispatches live jobs.
+    evidence: Routing request summary
+  - id: secret-values-not-allowed
+    decision: block
+    requirement: Worker identity state must use secret references only and never expose credential values.
+    evidence: Identity reference decision
+  - id: protected-network-approval-required
+    decision: block
+    requirement: Protected network routes require explicit approval and network-zone decision evidence.
+    evidence: Network zone decision
+  - id: ambiguous-route-blocks-dispatch
+    decision: block
+    requirement: Ambiguous or missing capability matches block dispatch until reviewed.
+    evidence: Capability match

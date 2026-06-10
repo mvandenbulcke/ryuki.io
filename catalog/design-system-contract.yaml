@@ -1,0 +1,118 @@
+# Design system seed data only. Do not add external font URLs, logo asset URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw UI diagnostic rows, stack traces, recipient addresses, or implementation internals.
+version: 1
+status: draft
+source: static-seed
+designMode: static-design-system
+lightModeRequired: true
+darkModeRequired: true
+accessibilityReviewRequired: true
+evidenceSafetyRequired: true
+liveThemeMutationAllowed: false
+externalFontFetchAllowed: false
+unsafeErrorDetailAllowed: false
+rawUiDiagnosticRowsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+accessTokenValuesAllowed: false
+rawRecipientDataAllowed: false
+brandTokens:
+  - configurable-branding
+designSurfaces:
+  - light-theme
+  - dark-theme
+  - accessibility-notes
+  - branding-configuration
+  - neutral-surfaces
+  - status-badges
+  - dense-tables
+  - request-forms
+  - error-evidence-presentation
+statusFamilies:
+  - lifecycle
+  - risk
+  - health
+  - evidence
+  - protection
+  - monitoring
+requiredInputs:
+  - themeSummary
+  - accessibilitySummary
+  - brandingSummary
+  - surfaceSummary
+  - statusBadgeSummary
+  - tableGuidanceSummary
+  - formGuidanceSummary
+  - errorEvidenceSummary
+  - evidenceManifest
+requiredGuards:
+  - light-theme-reviewed
+  - dark-theme-reviewed
+  - contrast-reviewed
+  - focus-treatment-reviewed
+  - non-color-status-reviewed
+  - branding-reviewed
+  - table-density-reviewed
+  - form-safety-reviewed
+  - evidence-presentation-reviewed
+planSections:
+  - themeUsage
+  - accessibilityNotes
+  - brandingConfiguration
+  - uiSurfaces
+  - statusBadges
+  - tables
+  - forms
+  - errorEvidencePresentation
+blockedReasons:
+  - live-theme-mutation-disabled
+  - external-font-fetch-disabled
+  - unsafe-error-detail-disabled
+  - raw-ui-diagnostic-rows-disabled
+  - raw-evidence-payloads-disabled
+  - raw-provider-payloads-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - access-token-values-disabled
+  - raw-recipient-data-disabled
+  - light-theme-review-missing
+  - dark-theme-review-missing
+  - contrast-review-missing
+  - focus-treatment-review-missing
+  - non-color-status-review-missing
+  - branding-review-missing
+  - table-density-review-missing
+  - form-safety-review-missing
+  - evidence-presentation-review-missing
+requiredEvidence:
+  - Light theme review
+  - Dark theme review
+  - Accessibility review
+  - Branding configuration review
+  - UI surface review
+  - Status badge review
+  - Table guidance review
+  - Form guidance review
+  - Error and evidence presentation review
+rules:
+  - id: branding-admin-configurable
+    decision: block
+    requirement: Branding is admin-configurable through the admin portal. Accent color and logo are set by the administrator. Neutral operational defaults are shown until configured. No specific brand colors or logo assets are committed to the repository.
+    evidence: Branding configuration review
+  - id: light-dark-theme-required
+    decision: block
+    requirement: Light and dark mode must be reviewed for text, badges, focus states, table surfaces, empty states, and error and evidence states before UI readiness is accepted.
+    evidence: Dark theme review
+  - id: accessibility-status-required
+    decision: block
+    requirement: Status presentation must use text and visible focus treatment, not color alone, and must make stale, degraded, blocked, failed, and emergency states explicit.
+    evidence: Accessibility review
+  - id: evidence-error-safety-required
+    decision: block
+    requirement: UI error and evidence presentation must show safe summaries and redaction state instead of raw implementation or provider detail.
+    evidence: Error and evidence presentation review
+  - id: raw-design-data-not-exposed
+    decision: block
+    requirement: Design system evidence must use safe summaries only and must not expose external font URLs, logo asset URLs, tenant IDs, object IDs, private IPs, credential values, secret values, access tokens, raw provider payloads, raw evidence payloads, raw UI diagnostic rows, stack traces, recipient addresses, or implementation internals.
+    evidence: Error and evidence presentation review

@@ -1,0 +1,113 @@
+# AD computer lifecycle seed data only. Do not add computer names, hostnames, FQDNs, sAMAccountNames, distinguished names, canonical names, domain names, OU distinguished names, service principal names, object GUIDs, object SIDs, security identifiers, principal IDs, user names, group names, tenant IDs, object IDs, live endpoints, private IPs, credentials, tokens, raw computer data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+lifecycleMode: review-only
+dryRunRequired: true
+providerCallsEnabled: false
+workerExecutionAllowed: false
+liveDirectoryChangesAllowed: false
+computerPrestageAllowed: false
+computerMoveAllowed: false
+computerDisableAllowed: false
+computerDeleteAllowed: false
+computerRecoverAllowed: false
+rawComputerDataAllowed: false
+principalIdentifiersAllowed: false
+distinguishedNamesAllowed: false
+domainIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+securityIdentifiersAllowed: false
+hostIdentifiersAllowed: false
+rawProviderPayloadsAllowed: false
+lifecycleActions:
+  - computer-prestage-review
+  - computer-move-review
+  - computer-disable-review
+  - computer-delete-review
+  - computer-recover-review
+  - computer-reconcile-review
+reviewSignals:
+  - ou-policy-match
+  - lifecycle-state-match
+  - cmdb-state-match
+  - approval-state
+  - rollback-window-ready
+  - stale-object-risk
+  - evidence-redaction
+requiredInputs:
+  - lifecycleAction
+  - requestContext
+  - targetComputerSummary
+  - ouPolicySummary
+  - lifecycleState
+  - cmdbState
+  - owner
+  - supportGroup
+  - approvalRoute
+  - rollbackPlan
+  - evidenceManifest
+requiredGuards:
+  - request-context-known
+  - target-scope-summarized
+  - ou-policy-reviewed
+  - lifecycle-action-supported
+  - cmdb-state-reviewed
+  - approval-route-assigned
+  - rollback-plan-ready
+  - evidence-redacted
+planSections:
+  - lifecycleSummary
+  - targetScope
+  - ouPolicyReview
+  - cmdbReconciliation
+  - approvalRoute
+  - rollbackPlan
+  - recoveryReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - worker-execution-disabled
+  - live-directory-change-disabled
+  - computer-prestage-disabled
+  - computer-move-disabled
+  - computer-disable-disabled
+  - computer-delete-disabled
+  - computer-recover-disabled
+  - raw-computer-data-disabled
+  - principal-identifiers-disabled
+  - distinguished-names-disabled
+  - domain-identifiers-disabled
+  - object-identifiers-disabled
+  - security-identifiers-disabled
+  - computer-identifiers-disabled
+  - raw-provider-payloads-disabled
+  - approval-missing
+  - rollback-plan-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Lifecycle review summary
+  - Target scope summary
+  - OU policy review
+  - CMDB reconciliation summary
+  - Approval route
+  - Rollback plan
+  - Recovery readiness
+  - Evidence references
+rules:
+  - id: no-live-ad-computer-changes
+    decision: block
+    requirement: AD computer lifecycle records review plans only and never prestages, moves, disables, deletes, recovers, reconciles, or mutates directory computer objects.
+    evidence: Lifecycle review summary
+  - id: ou-policy-review-required
+    decision: block
+    requirement: OU policy, lifecycle state, CMDB state, owner, and support group must be reviewed before any lifecycle decision can be accepted.
+    evidence: OU policy review
+  - id: approval-and-rollback-required
+    decision: block
+    requirement: Approval route, rollback plan, and recovery readiness must be present before future directory execution can be considered.
+    evidence: Rollback plan
+  - id: raw-ad-computer-data-not-exposed
+    decision: block
+    requirement: AD computer lifecycle evidence must use safe summaries only and must not expose computer names, hostnames, FQDNs, sAMAccountNames, distinguished names, canonical names, domain names, OU distinguished names, service principal names, object GUIDs, object SIDs, security identifiers, principal IDs, user names, group names, tenant IDs, object IDs, private IPs, credentials, secret values, access tokens, raw computer data, or provider payloads.
+    evidence: Evidence references

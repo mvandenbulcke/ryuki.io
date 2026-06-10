@@ -1,0 +1,94 @@
+# Synthetic health check seed data only. Do not add URLs, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw probe output, raw alert payloads, certificate serials, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+checkMode: dry-run-definition
+dryRunRequired: true
+providerCallsEnabled: false
+liveChecksAllowed: false
+externalProbesAllowed: false
+zabbixMutationAllowed: false
+rawProbeOutputAllowed: false
+supportedWorkflows:
+  - web-endpoint-check
+  - api-check
+  - dns-resolution-check
+  - certificate-expiry-check
+  - load-balancer-check
+  - iis-service-check
+  - evidence-pack-review
+checkSignals:
+  - endpoint-unreachable
+  - api-error
+  - dns-resolution-risk
+  - certificate-expiry-risk
+  - load-balancer-risk
+  - iis-service-risk
+  - stale-check-definition
+requiredInputs:
+  - serviceName
+  - application
+  - site
+  - environment
+  - checkType
+  - targetSummary
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - check-target-reviewed
+  - check-type-supported
+  - owner-known
+  - maintenance-window-known
+  - synthetic-definition-dry-run
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - checkSummary
+  - targetScope
+  - syntheticDefinition
+  - expectedResult
+  - alertImpact
+  - maintenanceImpact
+  - approvalRoute
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-checks-disabled
+  - external-probes-disabled
+  - zabbix-mutation-disabled
+  - target-scope-unknown
+  - unsupported-check-type
+  - owner-unknown
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Synthetic check summary
+  - Target scope summary
+  - Synthetic definition draft
+  - Expected result
+  - Alert impact
+  - Maintenance impact
+  - Approval route
+  - Evidence references
+rules:
+  - id: no-live-synthetic-probes
+    decision: block
+    requirement: Synthetic health checks produce definition drafts only, never running live probes or calling external endpoints.
+    evidence: Synthetic definition draft
+  - id: no-zabbix-mutation
+    decision: block
+    requirement: Synthetic definitions do not create, update, or delete Zabbix checks until live integration gates exist.
+    evidence: Synthetic definition draft
+  - id: target-scope-required
+    decision: block
+    requirement: Target scope must be reviewed and aggregate-safe before a synthetic check can be drafted.
+    evidence: Target scope summary
+  - id: maintenance-impact-required
+    decision: block
+    requirement: Maintenance-window and alert-impact behavior must be reviewed before check definitions are approved.
+    evidence: Maintenance impact
+  - id: raw-probe-output-not-exposed
+    decision: block
+    requirement: Operators receive synthetic check summaries only, not raw probe output, alert payloads, certificate serials, or provider output.
+    evidence: Synthetic check summary

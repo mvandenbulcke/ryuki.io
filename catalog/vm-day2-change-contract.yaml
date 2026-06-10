@@ -1,0 +1,308 @@
+# VM day-2 change seed data only. Do not add VM names, hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw inventory rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+changeMode: dry-run-plan
+dryRunRequired: true
+providerCallsEnabled: false
+liveChangeAllowed: false
+supportedActions:
+  - resize-cpu
+  - resize-memory
+  - add-disk
+  - extend-disk
+  - add-nic
+  - remove-nic
+  - move-network
+  - migrate-storage
+  - migrate-host
+  - update-tags
+  - plan-cross-hypervisor-migration
+requiredInputs:
+  - platformCiKey
+  - changeType
+  - targetScope
+  - site
+  - environment
+  - owner
+  - capacityNeed
+  - maintenanceWindow
+  - rollbackPlan
+  - migrationDirection
+  - migrationMethod
+  - downtimeClass
+  - sourceBackupVerification
+  - sourceQuarantineWindow
+  - targetGuestTooling
+  - cutoverValidationPlan
+  - evidenceManifest
+requiredGuards:
+  - request-preflight-ready
+  - capacity-admission-ready
+  - cmdb-ci-known
+  - backup-state-known
+  - monitoring-impact-reviewed
+  - approval-route-assigned
+  - lock-scope-defined
+  - rollback-plan-ready
+  - cold-offline-default
+  - source-backup-verified
+  - source-quarantine-planned
+  - downtime-window-approved
+  - target-guest-tooling-planned
+  - cutover-validation-ready
+  - evidence-redacted
+planSections:
+  - changeSummary
+  - currentState
+  - desiredState
+  - capacityImpact
+  - networkImpact
+  - backupMonitoringImpact
+  - cmdbUpdatePlan
+  - lockPlan
+  - rollbackNotes
+  - verificationPlan
+  - migrationMethodMatrix
+  - downtimePlan
+  - sourceQuarantine
+  - targetGuestTooling
+  - cutoverValidation
+blockedReasons:
+  - provider-calls-disabled
+  - live-change-disabled
+  - stale-inventory
+  - capacity-not-approved
+  - cmdb-context-ambiguous
+  - backup-state-unknown
+  - monitoring-impact-unknown
+  - maintenance-window-missing
+  - lock-scope-missing
+  - rollback-plan-missing
+  - migration-method-unknown
+  - downtime-class-missing
+  - source-backup-unverified
+  - source-quarantine-missing
+  - target-guest-tooling-missing
+  - cutover-validation-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request payload summary
+  - VM change dry-run plan
+  - Capacity impact
+  - Network impact
+  - Backup and monitoring impact
+  - CMDB update plan
+  - Approval decisions
+  - Lock record
+  - Verification plan
+  - Migration method matrix
+  - Downtime class
+  - Source backup verification
+  - Source quarantine plan
+  - Target guest tooling plan
+  - Cutover validation plan
+  - Evidence references
+migrationEquivalenceMatrix:
+  - direction: vmware-to-hyperv
+    sourcePlatform: VMware
+    targetPlatform: Hyper-V
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+  - direction: hyperv-to-vmware
+    sourcePlatform: Hyper-V
+    targetPlatform: VMware
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+  - direction: vmware-to-proxmox
+    sourcePlatform: VMware
+    targetPlatform: Proxmox
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+  - direction: hyperv-to-proxmox
+    sourcePlatform: Hyper-V
+    targetPlatform: Proxmox
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+  - direction: proxmox-to-vmware
+    sourcePlatform: Proxmox
+    targetPlatform: VMware
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+  - direction: proxmox-to-hyperv
+    sourcePlatform: Proxmox
+    targetPlatform: Hyper-V
+    coverage: static-equivalence-plan
+    executionPosture: blocked-live-execution
+    methodClass: cold-offline-v2v
+    downtimeClass: planned-outage
+    rollbackModel: source-quarantine-reverse-plan
+    toolingPosture: tool-selected-at-execution-readiness
+    sourceSafetyPosture: backup-verified-source-quarantined
+    targetGuestTooling: target-native-guest-tools-after-validation
+    providerMutationAllowed: false
+    liveExecutionAllowed: false
+    requiredSafetyRules:
+      - static-equivalence-only
+      - provider-mutation-blocked
+      - live-execution-blocked
+      - cold-offline-default
+      - source-compatibility-reviewed
+      - target-capacity-admission-ready
+      - network-equivalence-reviewed
+      - storage-format-mapping-reviewed
+      - backup-monitoring-rebind-plan
+      - downtime-window-approved
+      - source-backup-verified
+      - source-quarantine-planned
+      - target-guest-tooling-planned
+      - cutover-validation-plan
+      - rollback-or-reverse-plan
+      - evidence-redacted
+rules:
+  - id: no-live-vm-change
+    decision: block
+    requirement: VM day-2 changes and migration equivalence plans produce dry-run plans only and never call VMware, Hyper-V, Proxmox, or worker execution.
+    evidence: VM change dry-run plan
+  - id: capacity-admission-required
+    decision: block
+    requirement: CPU, memory, disk, storage, and host movement plans require capacity admission before approval.
+    evidence: Capacity impact
+  - id: network-impact-reviewed
+    decision: block
+    requirement: NIC and network movement plans require network impact review before approval.
+    evidence: Network impact
+  - id: backup-monitoring-impact-required
+    decision: block
+    requirement: Backup and monitoring impact must be known before approval.
+    evidence: Backup and monitoring impact
+  - id: lock-and-rollback-required
+    decision: block
+    requirement: Lock scope, rollback plan, and verification plan are required before future execution can be considered.
+    evidence: Lock record

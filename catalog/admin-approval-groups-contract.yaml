@@ -1,0 +1,195 @@
+version: 1
+status: draft
+source: static-seed
+approvalGroupsMode: static-admin-approval-groups
+groupMappingReadOnly: true
+datacenterFallbackRequired: true
+delegationReviewRequired: true
+separationOfDutiesReviewRequired: true
+liveIdentityLookupAllowed: false
+graphCallsAllowed: false
+roleAssignmentMutationAllowed: false
+groupMembershipMutationAllowed: false
+approvalMutationAllowed: false
+policyMutationAllowed: false
+workflowMutationAllowed: false
+providerCallsAllowed: false
+notificationDispatchAllowed: false
+rawUserDataAllowed: false
+rawGroupDataAllowed: false
+rawMembershipRowsAllowed: false
+rawApprovalPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+groupIdentifiersAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+privateNetworkValuesAllowed: false
+groupScopes:
+  - datacenter-final-approval
+  - technical-approval
+  - business-approval
+  - risk-approval
+  - emergency-approval
+  - audit-review
+  - service-specific-delegation
+groupStates:
+  - not-created
+  - planned
+  - pending-review
+  - approved
+  - delegated
+  - expired
+  - blocked
+mappingDimensions:
+  - role
+  - site
+  - service
+  - workflow
+  - criticality
+  - emergency
+  - separation-of-duties
+approvalGroupProposals:
+  - role: datacenter-final-approver
+    groupRef: placeholder-group-ref-datacenter-final-approver
+    appRole: DatacenterApprover
+    approvalBoundary: datacenter-final-live-execution-approval
+  - role: vmware-operators
+    groupRef: placeholder-group-ref-vmware-operators
+    appRole: VMwareOperator
+    approvalBoundary: vmware-live-execution-operator-review
+  - role: hyper-v-operators
+    groupRef: placeholder-group-ref-hyper-v-operators
+    appRole: HyperVOperator
+    approvalBoundary: hyper-v-live-execution-operator-review
+  - role: proxmox-operators
+    groupRef: placeholder-group-ref-proxmox-operators
+    appRole: ProxmoxOperator
+    approvalBoundary: proxmox-live-execution-operator-review
+  - role: backup-operators
+    groupRef: placeholder-group-ref-backup-operators
+    appRole: BackupOperator
+    approvalBoundary: backup-live-execution-operator-review
+  - role: monitoring-operators
+    groupRef: placeholder-group-ref-monitoring-operators
+    appRole: MonitoringOperator
+    approvalBoundary: monitoring-live-execution-operator-review
+  - role: cmdb-import-export-reviewers
+    groupRef: placeholder-group-ref-cmdb-import-export-reviewers
+    appRole: ServiceDesk
+    approvalBoundary: cmdb-import-export-live-execution-review
+  - role: security-auditors
+    groupRef: placeholder-group-ref-security-auditors
+    appRole: Auditor
+    approvalBoundary: security-audit-live-execution-review
+  - role: break-glass-approvers
+    groupRef: placeholder-group-ref-break-glass-approvers
+    appRole: BreakGlassAdmin
+    approvalBoundary: break-glass-live-execution-approval
+  - role: service-desk-triage
+    groupRef: placeholder-group-ref-service-desk-triage
+    appRole: ServiceDesk
+    approvalBoundary: service-desk-live-execution-triage
+delegationBoundaries:
+  - boundary: vmware-live-execution
+    operatorGroupRef: placeholder-group-ref-vmware-operators
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: hyper-v-live-execution
+    operatorGroupRef: placeholder-group-ref-hyper-v-operators
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: proxmox-live-execution
+    operatorGroupRef: placeholder-group-ref-proxmox-operators
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: backup-live-execution
+    operatorGroupRef: placeholder-group-ref-backup-operators
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: monitoring-live-execution
+    operatorGroupRef: placeholder-group-ref-monitoring-operators
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: cmdb-import-export-live-execution
+    operatorGroupRef: placeholder-group-ref-cmdb-import-export-reviewers
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: break-glass-live-execution
+    operatorGroupRef: placeholder-group-ref-break-glass-approvers
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+  - boundary: service-desk-live-execution-triage
+    operatorGroupRef: placeholder-group-ref-service-desk-triage
+    finalApproverGroupRef: placeholder-group-ref-datacenter-final-approver
+    reviewerGroupRef: placeholder-group-ref-security-auditors
+    fallback: datacenter-final-approval
+requiredGuards:
+  - default-datacenter-approver-reviewed
+  - group-purpose-reviewed
+  - delegation-boundary-reviewed
+  - separation-of-duties-reviewed
+  - break-glass-reviewed
+  - expiry-review-set
+  - evidence-redacted
+  - live-identity-lookup-blocked
+blockedReasons:
+  - approval-groups-live-identity-lookup-disabled
+  - approval-groups-graph-calls-disabled
+  - approval-groups-role-assignment-disabled
+  - approval-groups-group-membership-mutation-disabled
+  - approval-groups-approval-mutation-disabled
+  - approval-groups-policy-mutation-disabled
+  - approval-groups-workflow-mutation-disabled
+  - approval-groups-provider-calls-disabled
+  - approval-groups-notification-dispatch-disabled
+  - approval-groups-raw-user-data-disabled
+  - approval-groups-raw-group-data-disabled
+  - approval-groups-raw-membership-rows-disabled
+  - approval-groups-raw-approval-payloads-disabled
+  - approval-groups-raw-provider-payloads-disabled
+  - approval-groups-raw-recipient-data-disabled
+  - approval-groups-tenant-identifiers-disabled
+  - approval-groups-object-identifiers-disabled
+  - approval-groups-principal-identifiers-disabled
+  - approval-groups-group-identifiers-disabled
+  - approval-groups-credential-values-disabled
+  - approval-groups-token-values-disabled
+  - approval-groups-private-network-values-disabled
+  - group-scope-missing
+  - delegation-boundary-missing
+  - separation-of-duties-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Approval group mapping summary
+  - Datacenter fallback summary
+  - Delegation boundary summary
+  - Separation of duties summary
+  - Evidence references
+rules:
+  - id: approval-groups-read-only
+    decision: block
+    requirement: Admin approval group mappings are static summaries and must not look up live identity groups, mutate membership, assign roles, or execute approvals.
+    evidence: Approval group mapping summary
+  - id: datacenter-fallback-required
+    decision: block
+    requirement: Datacenter final approval remains the default live-execution authority until delegated service-specific approval groups are formally reviewed.
+    evidence: Datacenter fallback summary
+  - id: delegation-boundary-required
+    decision: block
+    requirement: Approval group delegation requires group purpose, role, site, service, workflow, criticality, emergency scope, expiry, and separation-of-duties review.
+    evidence: Delegation boundary summary
+  - id: raw-approval-group-data-not-exposed
+    decision: block
+    requirement: Approval group evidence must not expose raw user data, raw group data, raw membership rows, raw approval payloads, raw provider payloads, raw recipient data, tenant identifiers, object identifiers, principal identifiers, group identifiers, credential values, token values, private network values, live endpoints, or URLs.
+    evidence: Evidence references

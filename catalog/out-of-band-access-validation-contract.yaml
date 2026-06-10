@@ -1,0 +1,107 @@
+# Out-of-band access validation seed data only. Do not add endpoint names, hostnames, usernames, account names, access group identifiers, credentials, tokens, tenant IDs, object IDs, UUIDs, private IPs, raw inventory rows, serial numbers, asset tags, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+validationMode: review-only
+providerCallsEnabled: false
+liveAccessChecksAllowed: false
+liveCertificateChecksAllowed: false
+rawInventoryRowsAllowed: false
+endpointIdentifiersAllowed: false
+serialNumbersAllowed: false
+accountIdentifiersAllowed: false
+supportedConsoleTypes:
+  - hpe-ilo
+  - dell-idrac
+  - lenovo-xcc
+supportedWorkflows:
+  - oob-access-readiness
+  - hardware-console-review
+  - oob-certificate-review
+  - role-assignment-review
+  - break-glass-readiness-review
+  - incident-readiness-review
+readinessDomains:
+  - console-access
+  - certificate-readiness
+  - role-readiness
+  - break-glass-readiness
+  - network-reachability
+  - hardware-cmdb
+  - evidence-readiness
+requiredInputs:
+  - site
+  - hardwareProfile
+  - platformRole
+  - owner
+  - supportGroup
+  - accessProfile
+  - certificateProfile
+  - breakGlassProfile
+  - cmdbContext
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - hardware-profile-known
+  - support-owner-known
+  - access-profile-reviewed
+  - certificate-profile-reviewed
+  - role-model-reviewed
+  - break-glass-procedure-reviewed
+  - incident-runbook-linked
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - accessProfileReview
+  - certificateReadiness
+  - roleModelReview
+  - breakGlassReadiness
+  - incidentReadiness
+  - exceptionDecision
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-access-checks-disabled
+  - live-certificate-checks-disabled
+  - raw-inventory-rows-disabled
+  - endpoint-identifiers-disabled
+  - serial-numbers-disabled
+  - account-identifiers-disabled
+  - site-unknown
+  - hardware-profile-unknown
+  - access-profile-missing
+  - certificate-profile-missing
+  - role-model-missing
+  - break-glass-profile-missing
+  - incident-runbook-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - OOB readiness summary
+  - Access profile review
+  - Certificate readiness review
+  - Role model review
+  - Break-glass readiness review
+  - Incident readiness review
+  - Exception decision
+  - Evidence references
+rules:
+  - id: no-live-oob-access-checks
+    decision: block
+    requirement: Out-of-band access validation reports review state only and never logs in to consoles, tests credentials, changes roles, or calls hardware controllers.
+    evidence: OOB readiness summary
+  - id: certificate-readiness-required
+    decision: block
+    requirement: Certificate profile and renewal readiness must be reviewed before incident readiness can be accepted.
+    evidence: Certificate readiness review
+  - id: role-model-review-required
+    decision: block
+    requirement: Role assignment intent and access profile must be reviewed without exposing account names or group identifiers.
+    evidence: Role model review
+  - id: break-glass-readiness-required
+    decision: block
+    requirement: Break-glass procedure, ownership, and incident runbook linkage must be reviewed before readiness is accepted.
+    evidence: Break-glass readiness review
+  - id: raw-oob-inventory-not-exposed
+    decision: block
+    requirement: OOB readiness evidence must use safe summaries only and must not expose endpoint names, hostnames, private IPs, serials, asset tags, account names, access group identifiers, raw inventory rows, or provider payloads.
+    evidence: Evidence references

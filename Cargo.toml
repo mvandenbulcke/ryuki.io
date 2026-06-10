@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "sources/ryuki-core",
+    "sources/ryuki-api",
+    "sources/ryuki-engine",
+    "portal/portal-ui",
+    "scripts/validator-rs",
+]
+
+[package]
+name = "ryuki-integration-tests"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+autolib = false
+
+[[test]]
+name = "integration_test"
+path = "tests/integration_test.rs"
+
+[[test]]
+name = "workspace_integration_test"
+path = "tests/workspace_integration_test.rs"
+
+[[test]]
+name = "compose_integration_test"
+path = "tests/compose_integration_test.rs"
+
+[[test]]
+name = "kubernetes_integration_test"
+path = "tests/kubernetes_integration_test.rs"
+
+[[test]]
+name = "ci_integration_test"
+path = "tests/ci_integration_test.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+ryuki-core = { workspace = true }
+ryuki-engine = { workspace = true }
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+ryuki-core = { path = "sources/ryuki-core" }
+ryuki-engine = { path = "sources/ryuki-engine" }
+
+[profile.wasm-release]
+codegen-units = 1
+inherits = "release"
+lto = true
+opt-level = "z"

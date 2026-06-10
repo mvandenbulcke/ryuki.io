@@ -1,0 +1,106 @@
+# Reboot orchestration seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw rows, logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+orchestrationMode: dry-run-queue
+dryRunRequired: true
+providerCallsEnabled: false
+liveExecutionAllowed: false
+liveRebootAllowed: false
+supportedTargets:
+  - windows-server
+  - linux-server
+  - application-tier
+  - dependency-group
+  - patch-wave
+queueStates:
+  - planned
+  - waiting-approval
+  - waiting-window
+  - ready-for-dispatch
+  - blocked
+  - handed-over
+  - plan-complete
+sequencingRules:
+  - dependency-order
+  - site-window
+  - criticality-tier
+  - application-tier
+  - rollback-window
+  - handover-required
+requiredInputs:
+  - patchCycle
+  - rebootScope
+  - maintenanceWindow
+  - dependencyOrder
+  - backupState
+  - monitoringMaintenance
+  - owner
+  - supportGroup
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - patch-policy-imported
+  - dependency-order-known
+  - maintenance-window-approved
+  - blackout-window-clear
+  - backup-state-known
+  - monitoring-maintenance-ready
+  - approval-route-assigned
+  - lock-scope-defined
+  - evidence-redacted
+planSections:
+  - scopeSummary
+  - dependencyOrder
+  - maintenanceWindow
+  - rebootBatches
+  - backupReadiness
+  - monitoringSuppression
+  - lockPlan
+  - rollbackNotes
+  - handoverNotes
+blockedReasons:
+  - provider-calls-disabled
+  - live-reboot-disabled
+  - stale-inventory
+  - missing-maintenance-window
+  - dependency-order-unknown
+  - backup-state-unknown
+  - monitoring-maintenance-missing
+  - blackout-window-conflict
+  - approval-missing
+  - lock-scope-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Request payload summary
+  - Validation result
+  - Dependency order
+  - Reboot queue summary
+  - Maintenance window
+  - Backup state
+  - Monitoring maintenance plan
+  - Approval decisions
+  - Lock record
+  - Handover notes
+  - Evidence references
+rules:
+  - id: no-live-reboot-execution
+    decision: block
+    requirement: Reboot orchestration builds provider-safe queues only and never executes operating system or provider reboot actions.
+    evidence: Reboot queue summary
+  - id: dependency-order-required
+    decision: block
+    requirement: Dependency order must be known before any reboot batch can become ready for dispatch.
+    evidence: Dependency order
+  - id: maintenance-window-required
+    decision: block
+    requirement: Every reboot batch must have an approved maintenance window outside blackout periods.
+    evidence: Maintenance window
+  - id: backup-monitoring-readiness-required
+    decision: block
+    requirement: Backup state and monitoring maintenance readiness must be known before approval.
+    evidence: Backup state
+  - id: handover-required-for-blocked-batch
+    decision: block
+    requirement: Blocked or deferred reboot batches must have owner, support group, and handover notes.
+    evidence: Handover notes

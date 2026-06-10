@@ -1,0 +1,146 @@
+# Azure landing-zone validation seed data only. Do not add tenant IDs, subscription IDs, object IDs, principal IDs, resource IDs, management group IDs, policy assignment IDs, role assignment IDs, private IPs, address CIDRs, raw ALZ sources, Terraform state, Terraform plans, credentials, tokens, or Azure payloads.
+version: 1
+status: draft
+source: static-seed
+validationMode: static-validation
+dryRunRequired: true
+providerCallsEnabled: false
+terraformExecutionAllowed: false
+terraformPlanAgainstTenantAllowed: false
+terraformApplyAllowed: false
+azureResourceChangesAllowed: false
+managementGroupChangesAllowed: false
+subscriptionChangesAllowed: false
+policyAssignmentChangesAllowed: false
+roleAssignmentChangesAllowed: false
+networkChangesAllowed: false
+vmDeploymentAllowed: false
+cmdbChangesAllowed: false
+serviceNowChangesAllowed: false
+rawAlzSourcesAllowed: false
+rawTerraformStateAllowed: false
+rawTerraformPlanAllowed: false
+rawAzurePayloadsAllowed: false
+tenantIdentifiersAllowed: false
+subscriptionIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+principalIdentifiersAllowed: false
+resourceIdentifiersAllowed: false
+privateIpValuesAllowed: false
+credentialValuesAllowed: false
+validationSurfaces:
+  - source-inventory-review
+  - management-group-taxonomy-review
+  - subscription-readiness-review
+  - policy-baseline-review
+  - naming-tagging-review
+  - connectivity-guardrail-review
+  - identity-guardrail-review
+  - security-guardrail-review
+  - azure-vm-readiness-review
+  - cmdb-servicenow-file-exchange-review
+requiredInputs:
+  - businessPurpose
+  - workloadProfile
+  - landingZoneScopeSummary
+  - managementGroupSummary
+  - subscriptionSummary
+  - policyBaselineSummary
+  - namingTaggingSummary
+  - connectivitySummary
+  - identitySummary
+  - securitySummary
+  - vmSizingSummary
+  - backupMonitoringSummary
+  - cmdbContext
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - source-inventory-acknowledged
+  - safe-facts-extraction-required
+  - raw-alz-sources-blocked
+  - tenant-identifiers-blocked
+  - subscription-identifiers-blocked
+  - policy-baseline-reviewed
+  - naming-tagging-reviewed
+  - connectivity-reviewed
+  - identity-reviewed
+  - security-reviewed
+  - azure-vm-readiness-reviewed
+  - approval-route-assigned
+  - evidence-redacted
+planSections:
+  - validationSummary
+  - sourceInventoryReview
+  - landingZoneScope
+  - policyBaselineReview
+  - namingTaggingReview
+  - connectivityReview
+  - identityReview
+  - securityReview
+  - azureVmReadiness
+  - cmdbPublicationPlan
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - terraform-execution-disabled
+  - terraform-plan-against-tenant-disabled
+  - terraform-apply-disabled
+  - azure-resource-change-disabled
+  - management-group-change-disabled
+  - subscription-change-disabled
+  - policy-assignment-change-disabled
+  - role-assignment-change-disabled
+  - network-change-disabled
+  - vm-deployment-disabled
+  - cmdb-change-disabled
+  - servicenow-change-disabled
+  - raw-alz-sources-disabled
+  - raw-terraform-state-disabled
+  - raw-terraform-plan-disabled
+  - raw-azure-payloads-disabled
+  - tenant-identifiers-disabled
+  - subscription-identifiers-disabled
+  - object-identifiers-disabled
+  - principal-identifiers-disabled
+  - resource-identifiers-disabled
+  - private-ip-values-disabled
+  - credential-values-disabled
+  - safe-facts-review-missing
+  - policy-baseline-missing
+  - naming-tagging-missing
+  - connectivity-review-missing
+  - identity-review-missing
+  - security-review-missing
+  - vm-readiness-missing
+  - approval-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Azure validation summary
+  - ALZ source inventory
+  - Safe facts review
+  - Policy baseline review
+  - Naming and tagging review
+  - Connectivity guardrail review
+  - Identity guardrail review
+  - Security guardrail review
+  - Azure VM readiness
+  - CMDB publication plan
+  - Evidence references
+rules:
+  - id: no-live-azure-or-terraform-execution
+    decision: block
+    requirement: Azure landing-zone validation produces static validation only and never runs Terraform, calls Azure Resource Manager, creates Azure VMs, changes management groups, subscriptions, policies, roles, network, CMDB, ServiceNow, workers, or provider state.
+    evidence: Azure validation summary
+  - id: safe-facts-before-use
+    decision: block
+    requirement: Raw ALZ sources remain inventory-only until safe-facts extraction and no-secret review are complete.
+    evidence: ALZ source inventory
+  - id: landing-zone-readiness-required
+    decision: block
+    requirement: Policy baseline, naming, tagging, connectivity, identity, security, Azure VM readiness, CMDB context, and approval route must be reviewed before validation can be accepted.
+    evidence: Safe facts review
+  - id: raw-azure-data-not-exposed
+    decision: block
+    requirement: Azure landing-zone validation evidence must use safe summaries only and must not expose tenant IDs, subscription IDs, object IDs, principal IDs, resource IDs, management group IDs, policy assignment IDs, role assignment IDs, private IPs, address CIDRs, raw ALZ sources, Terraform state, Terraform plans, credentials, secret values, access tokens, or Azure payloads.
+    evidence: Evidence references

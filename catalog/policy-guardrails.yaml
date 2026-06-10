@@ -1,0 +1,319 @@
+# Policy guardrail seed data only. Do not add secrets, tenant IDs, object IDs, live endpoints, private IPs, or provider payloads.
+version: 1
+status: draft
+policyFamilies:
+  - naming
+  - tagging
+  - ownership
+  - sitePlacement
+  - backup
+  - monitoring
+  - cmdb
+  - patching
+  - approvals
+  - evidence
+  - dryRun
+  - capacity
+futureWorkflowIds:
+  - application-environment-deployment
+  - sql-server-deployment
+  - datacenter-readiness
+  - vm-day-2-change
+  - backup-and-dr-assignment
+  - monitoring-coverage-gap-report
+  - reboot-orchestration
+  - os-baseline-compliance
+  - approved-software-deployment
+rules:
+  - id: p0-preflight-required-fields
+    family: ownership
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - application-environment-deployment
+      - sql-server-deployment
+    requiredInputs:
+      - owner
+      - site
+      - environment
+      - criticality
+    decision: block
+    failureMessage: Request is missing owner, site, environment, or criticality.
+    remediation: Add the missing ownership and service context before validation.
+    evidence:
+      - Validation result
+      - Failed rules
+      - Remediation hints
+  - id: p0-site-ou-catalog-match
+    family: sitePlacement
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - vm-day-2-change
+      - cmdb-import
+    requiredInputs:
+      - site
+      - country
+      - ouPlacement
+    decision: block
+    failureMessage: Site, country, or OU placement does not match the approved site catalog.
+    remediation: Select a known site code and use the catalog OU placement pattern for that country and site.
+    evidence:
+      - Validation result
+      - Failed rules
+      - Site catalog reference
+  - id: p0-prod-critical-backup-policy
+    family: backup
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - application-environment-deployment
+      - sql-server-deployment
+    requiredInputs:
+      - environment
+      - criticality
+      - backupPolicy
+      - retentionNeed
+    decision: block
+    failureMessage: Production or critical workloads require an assigned backup policy.
+    remediation: Choose a backup policy, retention need, and any required DR or replica intent before approval.
+    evidence:
+      - Validation result
+      - Policy assignments
+      - Veeam reference
+  - id: p0-monitoring-profile-required
+    family: monitoring
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - zabbix-onboarding
+      - monitoring-coverage-gap-report
+    requiredInputs:
+      - monitoringProfile
+      - alertGroup
+      - maintenanceWindow
+    decision: block
+    failureMessage: Monitoring profile, alert group, or maintenance window is missing.
+    remediation: Select the Zabbix onboarding profile and alert routing context before approval.
+    evidence:
+      - Validation result
+      - Onboarding plan summary
+      - Zabbix reference
+  - id: p0-cmdb-context-required
+    family: cmdb
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - cmdb-update-export
+      - vm-decommission-quarantine
+    requiredInputs:
+      - cmdbContext
+      - application
+      - supportGroup
+      - ciClass
+    decision: review
+    failureMessage: CMDB context is incomplete or ambiguous.
+    remediation: Provide CI identity, application, owner, support group, and relationship context or route for CMDB review.
+    evidence:
+      - Validation result
+      - Accepted/rejected rows
+      - CMDB export package
+  - id: p0-dry-run-before-approval
+    family: dryRun
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - patch-wave-planning
+      - controlled-restore-request
+      - zabbix-onboarding
+      - cmdb-import
+      - cmdb-update-export
+      - operator-runbook-launch
+      - vm-decommission-quarantine
+      - application-environment-retirement
+    requiredInputs:
+      - dryRunPlan
+      - riskNotes
+      - rollbackNotes
+    decision: block
+    failureMessage: Approval cannot proceed without a provider-safe dry-run plan.
+    remediation: Generate and attach the dry-run plan, affected resources, risk notes, and rollback notes.
+    evidence:
+      - Provider-safe plan
+      - Plan summary
+      - Risk notes
+  - id: p0-redacted-evidence-state
+    family: evidence
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - controlled-restore-request
+      - operator-runbook-launch
+      - application-environment-retirement
+    requiredInputs:
+      - evidenceManifest
+      - redactionState
+      - evidenceReferences
+    decision: block
+    failureMessage: Evidence manifest is missing or not marked redacted.
+    remediation: Create an evidence manifest with redacted summaries, safe references, and no provider-sensitive payloads.
+    evidence:
+      - Evidence references
+      - Redacted execution log
+      - Evidence manifest
+  - id: p0-capacity-admission-check
+    family: capacity
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - application-environment-deployment
+      - sql-server-deployment
+      - datacenter-readiness
+    requiredInputs:
+      - capacityScope
+      - vmSizing
+      - site
+      - environment
+    decision: block
+    failureMessage: Capacity admission has not confirmed safe placement.
+    remediation: Validate site, cluster, datastore, and availability headroom before approval.
+    evidence:
+      - Validation result
+      - Provider-safe plan
+      - Capacity check summary
+  - id: p1-naming-standard-review
+    family: naming
+    priority: P1
+    appliesTo:
+      - windows-server-deployment
+      - linux-server-deployment
+      - application-environment-deployment
+      - sql-server-deployment
+    requiredInputs:
+      - requestedName
+      - site
+      - environment
+      - serverRole
+    decision: review
+    failureMessage: Naming inputs are present but exact naming standard is not confirmed.
+    remediation: Route to platform review until the formal naming pattern is approved.
+    evidence:
+      - Validation result
+      - Policy decision record
+  - id: p1-tagging-standard-review
+    family: tagging
+    priority: P1
+    appliesTo:
+      - windows-server-deployment
+      - linux-server-deployment
+      - vm-day-2-change
+      - backup-and-dr-assignment
+    requiredInputs:
+      - owner
+      - site
+      - environment
+      - criticality
+      - backupPolicy
+      - monitoringProfile
+    decision: review
+    failureMessage: Required tag inputs are present but final tag taxonomy is not confirmed.
+    remediation: Route to platform review until the formal tag taxonomy is approved.
+    evidence:
+      - Validation result
+      - Policy assignments
+  - id: p1-patch-context-required
+    family: patching
+    priority: P1
+    appliesTo:
+      - patch-wave-planning
+      - reboot-orchestration
+      - os-baseline-compliance
+      - approved-software-deployment
+    requiredInputs:
+      - patchGroup
+      - maintenanceWindow
+      - rebootPolicy
+      - blackoutDates
+    decision: warn
+    failureMessage: Patch context is incomplete and may delay maintenance planning.
+    remediation: Import or provide patch policy and maintenance-window data before scheduling.
+    evidence:
+      - Validation result
+      - Wave plan summary
+      - Compliance state
+  - id: p0-approval-authority-required
+    family: approvals
+    priority: P0
+    appliesTo:
+      - request-preflight
+      - windows-server-deployment
+      - linux-server-deployment
+      - controlled-restore-request
+      - operator-runbook-launch
+      - vm-decommission-quarantine
+      - application-environment-retirement
+    requiredInputs:
+      - approvalRoute
+      - datacenterApproval
+      - businessApproval
+    decision: block
+    failureMessage: Required approval route is missing.
+    remediation: Route live execution to Datacenter Approver and required business or service approvers.
+    evidence:
+      - Approval decisions
+      - Delegated authority
+      - Emergency flag
+siteBindings:
+  ALBI:
+    policyFamilies: &defaultSiteFamilies
+      - naming
+      - tagging
+      - ownership
+      - sitePlacement
+      - backup
+      - monitoring
+      - cmdb
+      - patching
+      - approvals
+      - evidence
+      - dryRun
+      - capacity
+  AOST:
+    policyFamilies: *defaultSiteFamilies
+  BUR1:
+    policyFamilies: *defaultSiteFamilies
+  CCSS:
+    policyFamilies: *defaultSiteFamilies
+  LOVE:
+    policyFamilies: *defaultSiteFamilies
+  MACL:
+    policyFamilies: *defaultSiteFamilies
+  PITE:
+    policyFamilies: *defaultSiteFamilies
+  RMA1:
+    policyFamilies: *defaultSiteFamilies
+  SSYM:
+    policyFamilies: *defaultSiteFamilies
+  TOR1:
+    policyFamilies: *defaultSiteFamilies
+  TRUJ:
+    policyFamilies: *defaultSiteFamilies
+  VILL:
+    policyFamilies: *defaultSiteFamilies
+  WIJH:
+    policyFamilies: *defaultSiteFamilies

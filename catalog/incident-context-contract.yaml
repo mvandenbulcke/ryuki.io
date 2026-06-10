@@ -1,0 +1,80 @@
+# Incident context seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, raw logs, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+panelMode: aggregate-safe
+providerCallsEnabled: false
+liveExecutionAllowed: false
+rawProviderPayloadsAllowed: false
+contextDomains:
+  - ci
+  - application
+  - vm
+  - change
+  - backup
+  - monitoring
+  - cmdb
+  - evidence
+panelSections:
+  - incidentSummary
+  - serviceContext
+  - assetContext
+  - changeContext
+  - backupContext
+  - monitoringContext
+  - cmdbContext
+  - evidenceContext
+  - safeNextActions
+requiredInputs:
+  - incidentContext
+  - ciIdentity
+  - application
+  - owner
+  - supportGroup
+  - site
+  - environment
+  - evidenceManifest
+requiredGuards:
+  - incident-linked
+  - ci-identity-known
+  - owner-known
+  - support-group-known
+  - stale-data-marked
+  - evidence-redacted
+  - safe-next-action-set
+blockedReasons:
+  - incident-missing
+  - ci-identity-unknown
+  - owner-unknown
+  - support-group-unknown
+  - stale-data-unmarked
+  - raw-provider-payload
+  - evidence-not-redacted
+  - missing-safe-next-action
+requiredEvidence:
+  - Incident summary
+  - CI identity summary
+  - Owner and support group
+  - Change context
+  - Backup state
+  - Monitoring state
+  - CMDB relationship summary
+  - Safe next actions
+  - Evidence references
+rules:
+  - id: no-live-context-lookup
+    decision: block
+    requirement: Incident context panel uses existing platform state only and never performs live provider lookup.
+    evidence: Incident summary
+  - id: no-raw-provider-payloads
+    decision: block
+    requirement: Panel output must summarize context without raw provider payloads, logs, credentials, or identifiers.
+    evidence: CI identity summary
+  - id: stale-data-must-be-marked
+    decision: block
+    requirement: Stale or cached context must be marked before operators use it for incident decisions.
+    evidence: Monitoring state
+  - id: safe-next-action-required
+    decision: block
+    requirement: Incident context must include safe next actions for the assigned owner or support group.
+    evidence: Safe next actions

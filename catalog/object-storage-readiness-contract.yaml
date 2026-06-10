@@ -1,0 +1,127 @@
+# Object storage readiness seed data only. Do not add storage account names, container names, blob names, URLs, endpoints, subscription IDs, resource group names, tenant IDs, object IDs, private IPs, access keys, shared keys, SAS tokens, connection strings, raw blob payloads, raw storage payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+storageProvider: Azure Blob Storage
+providerCallsEnabled: false
+azureApiCallsAllowed: false
+storageAccountMutationAllowed: false
+containerMutationAllowed: false
+blobReadWriteAllowed: false
+lifecyclePolicyMutationAllowed: false
+immutabilityPolicyMutationAllowed: false
+publicNetworkAccessAllowed: false
+sharedKeyUsageAllowed: false
+sasTokenValuesAllowed: false
+credentialValuesAllowed: false
+connectionStringsAllowed: false
+rawBlobPayloadsAllowed: false
+rawStoragePayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+storageIdentifiersAllowed: false
+readinessSurfaces:
+  - azure-blob-account-readiness
+  - container-topology-readiness
+  - evidence-pack-retention-readiness
+  - export-retention-readiness
+  - cloudnativepg-backup-target-readiness
+  - immutability-versioning-readiness
+  - lifecycle-management-readiness
+  - private-network-readiness
+  - vault-secret-reference-readiness
+  - monitoring-diagnostic-readiness
+  - evidence-redaction-readiness
+requiredInputs:
+  - storageUseCaseSummary
+  - containerRoleSummary
+  - retentionPolicySummary
+  - immutabilityPolicySummary
+  - lifecyclePolicySummary
+  - privateEndpointSummary
+  - vaultReferenceSummary
+  - monitoringProfile
+  - backupTargetSummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - azure-blob-provider-reviewed
+  - container-purpose-reviewed
+  - retention-policy-reviewed
+  - immutability-versioning-reviewed
+  - lifecycle-management-reviewed
+  - private-endpoint-reviewed
+  - shared-key-disabled-reviewed
+  - vault-reference-reviewed
+  - diagnostic-logging-reviewed
+  - evidence-redacted
+planSections:
+  - readinessSummary
+  - accountSecurityPosture
+  - containerRolePlan
+  - retentionAndLifecycleReadiness
+  - immutabilityReadiness
+  - privateNetworkReadiness
+  - secretReferenceReadiness
+  - backupTargetReadiness
+  - monitoringReadiness
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - azure-api-calls-disabled
+  - storage-account-mutation-disabled
+  - container-mutation-disabled
+  - blob-read-write-disabled
+  - lifecycle-policy-mutation-disabled
+  - immutability-policy-mutation-disabled
+  - public-network-access-disabled
+  - shared-key-usage-disabled
+  - sas-token-values-disabled
+  - credential-values-disabled
+  - connection-strings-disabled
+  - raw-blob-payloads-disabled
+  - raw-storage-payloads-disabled
+  - raw-provider-payloads-disabled
+  - storage-identifiers-disabled
+  - provider-review-missing
+  - container-role-missing
+  - retention-policy-missing
+  - immutability-review-missing
+  - lifecycle-review-missing
+  - private-network-review-missing
+  - vault-reference-missing
+  - diagnostics-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Object storage readiness summary
+  - Account security review
+  - Container role review
+  - Retention policy review
+  - Immutability and versioning review
+  - Lifecycle management review
+  - Private network review
+  - Secret reference review
+  - Backup target review
+  - Monitoring diagnostics review
+  - Evidence references
+rules:
+  - id: no-live-object-storage-actions
+    decision: block
+    requirement: Object storage readiness reports static readiness only and never calls Azure APIs, mutates storage accounts, mutates containers, reads or writes blobs, changes lifecycle policies, changes immutability policies, or changes provider state.
+    evidence: Object storage readiness summary
+  - id: container-retention-purpose-required
+    decision: block
+    requirement: Evidence, export, audit artifact, and CloudNativePG backup use cases must have container purpose, retention, lifecycle, and backup target readiness reviewed before acceptance.
+    evidence: Retention policy review
+  - id: security-and-network-boundary-required
+    decision: block
+    requirement: Public network access, shared key usage, managed identity posture, private endpoint posture, and Vault secret references must be reviewed before object storage readiness can be accepted.
+    evidence: Account security review
+  - id: immutability-lifecycle-required
+    decision: block
+    requirement: Versioning, immutability, protected append posture, lifecycle management, and monitoring diagnostics must be reviewed before retained evidence or backups can depend on object storage.
+    evidence: Immutability and versioning review
+  - id: raw-object-storage-data-not-exposed
+    decision: block
+    requirement: Object storage readiness evidence must use safe summaries only and must not expose storage account names, container names, blob names, URLs, endpoints, subscription IDs, resource group names, tenant IDs, object IDs, private IPs, access keys, shared keys, SAS tokens, connection strings, raw blob payloads, raw storage payloads, or provider payloads.
+    evidence: Evidence references

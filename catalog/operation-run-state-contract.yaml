@@ -1,0 +1,129 @@
+version: 1
+status: draft
+source: static-seed
+operationRunStateMode: static-operation-run-state
+operationStateReadOnly: true
+childOperationStateReadOnly: true
+lockStateReadOnly: true
+retryStateReadOnly: true
+redactedLogSummaryOnly: true
+liveExecutionAllowed: false
+workerDispatchAllowed: false
+providerCallsAllowed: false
+operationMutationAllowed: false
+childOperationMutationAllowed: false
+lockMutationAllowed: false
+retryMutationAllowed: false
+workflowMutationAllowed: false
+rawOperationRowsAllowed: false
+rawChildOperationRowsAllowed: false
+rawExecutionLogsAllowed: false
+rawLockRowsAllowed: false
+rawRetryRowsAllowed: false
+rawProviderPayloadsAllowed: false
+rawRecipientDataAllowed: false
+credentialValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+serialNumbersAllowed: false
+operationStates:
+  - queued
+  - blocked
+  - planning
+  - approval-wait
+  - locked
+  - executing
+  - verifying
+  - succeeded
+  - failed
+  - cancelled
+  - degraded
+childOperationStates:
+  - pending
+  - blocked
+  - ready
+  - running
+  - retry-wait
+  - succeeded
+  - failed
+  - skipped
+lockStates:
+  - not-required
+  - pending
+  - active
+  - conflict
+  - expired
+  - released
+retryStates:
+  - not-retryable
+  - retry-pending
+  - backoff-wait
+  - retry-exhausted
+  - manual-review
+logStates:
+  - not-started
+  - redacted-summary-ready
+  - redaction-pending
+  - blocked
+requiredGuards:
+  - operation-scope-known
+  - child-operations-summarized
+  - lock-scope-reviewed
+  - retry-policy-reviewed
+  - redacted-log-summary-ready
+  - evidence-redacted
+  - live-execution-blocked
+blockedReasons:
+  - run-state-live-execution-disabled
+  - run-state-worker-dispatch-disabled
+  - run-state-provider-calls-disabled
+  - run-state-operation-mutation-disabled
+  - run-state-child-operation-mutation-disabled
+  - run-state-lock-mutation-disabled
+  - run-state-retry-mutation-disabled
+  - run-state-workflow-mutation-disabled
+  - run-state-raw-operation-rows-disabled
+  - run-state-raw-child-operation-rows-disabled
+  - run-state-raw-execution-logs-disabled
+  - run-state-raw-lock-rows-disabled
+  - run-state-raw-retry-rows-disabled
+  - run-state-raw-provider-payloads-disabled
+  - run-state-raw-recipient-data-disabled
+  - run-state-credential-values-disabled
+  - run-state-token-values-disabled
+  - run-state-tenant-identifiers-disabled
+  - run-state-object-identifiers-disabled
+  - run-state-private-network-values-disabled
+  - run-state-serials-disabled
+  - operation-scope-missing
+  - child-operation-state-unknown
+  - lock-conflict
+  - retry-policy-missing
+  - redacted-log-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Operation run summary
+  - Child operation summary
+  - Lock state summary
+  - Retry state summary
+  - Redacted log summary
+  - Evidence references
+rules:
+  - id: operation-run-state-read-only
+    decision: block
+    requirement: Operation run state summaries are read-only and must not execute, retry, cancel, close, or mutate operation runs.
+    evidence: Operation run summary
+  - id: child-lock-retry-state-read-only
+    decision: block
+    requirement: Child operation, lock, and retry state summaries are read-only and must not dispatch workers, acquire locks, release locks, or update retry state.
+    evidence: Lock state summary
+  - id: redacted-log-summary-required
+    decision: block
+    requirement: Run-state evidence must use redacted log summaries only and must not expose raw execution logs or provider payloads.
+    evidence: Redacted log summary
+  - id: raw-operation-run-data-not-exposed
+    decision: block
+    requirement: Operation run-state evidence must not expose raw operation rows, child operation rows, lock rows, retry rows, recipient data, credential values, token values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.
+    evidence: Evidence references

@@ -1,0 +1,185 @@
+# Kubernetes runtime readiness seed data only. Do not add kubeconfigs, cluster identifiers, context identifiers, namespace identifiers, ingress identifiers, TLS material identifiers, workload identity identifiers, identity material, pod identifiers, image pull material, registry material, tenant identifiers, object identifiers, private network details, sensitive auth material, raw Kubernetes payloads, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+readinessMode: static-readiness
+runtimeProvider: Kubernetes
+deploymentTarget: portable-base-manifests
+providerCallsEnabled: false
+kubectlApplyAllowed: false
+helmInstallAllowed: false
+helmUpgradeAllowed: false
+kustomizeBuildAllowed: false
+clusterMutationAllowed: false
+namespaceMutationAllowed: false
+deploymentMutationAllowed: false
+serviceMutationAllowed: false
+ingressMutationAllowed: false
+networkPolicyMutationAllowed: false
+serviceAccountMutationAllowed: false
+sensitiveResourceMutationAllowed: false
+imagePullAllowed: false
+registryAccessAllowed: false
+rawKubernetesPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+kubeconfigValuesAllowed: false
+clusterIdentifiersAllowed: false
+sensitiveValuesAllowed: false
+readinessSurfaces:
+  - namespace-readiness
+  - deployment-readiness
+  - service-readiness
+  - ingress-readiness
+  - ingress-front-tier-readiness
+  - network-policy-readiness
+  - serviceaccount-readiness
+  - image-reference-readiness
+  - runtime-reference-readiness
+  - runtime-security-readiness
+  - observability-readiness
+  - evidence-redaction-readiness
+ingressFrontTierProfiles:
+  - haproxy-vip-front-tier
+  - nginx-ingress-controller
+  - same-origin-api-route
+ingressRoutePostures:
+  - placeholder-dns-only
+  - tls-posture-reviewed
+  - health-check-summary-required
+  - failover-owner-reviewed
+  - approval-route-reviewed
+requiredInputs:
+  - runtimeScopeSummary
+  - namespaceSummary
+  - componentTopologySummary
+  - serviceRoutingSummary
+  - frontTierSummary
+  - controllerClassSummary
+  - ingressRouteSummary
+  - sameOriginRouteSummary
+  - certificatePostureSummary
+  - healthCheckPostureSummary
+  - failoverOwnershipSummary
+  - networkPolicySummary
+  - serviceAccountSummary
+  - imageReferenceSummary
+  - runtimeReferenceSummary
+  - runtimeSecuritySummary
+  - observabilitySummary
+  - approvalRoute
+  - evidenceManifest
+requiredGuards:
+  - namespace-reviewed
+  - deployment-topology-reviewed
+  - service-routing-reviewed
+  - front-tier-reviewed
+  - controller-class-reviewed
+  - ingress-routing-reviewed
+  - same-origin-route-reviewed
+  - certificate-posture-reviewed
+  - health-check-reviewed
+  - failover-owner-reviewed
+  - default-deny-reviewed
+  - egress-allowlist-reviewed
+  - service-account-reviewed
+  - image-reference-reviewed
+  - runtime-reference-reviewed
+  - runtime-security-reviewed
+  - observability-reviewed
+  - evidence-redacted
+planSections:
+  - runtimeSummary
+  - namespaceReview
+  - componentTopology
+  - serviceRouting
+  - ingressFrontTier
+  - ingressRouting
+  - sameOriginRouting
+  - healthCheckFailover
+  - networkPolicyReview
+  - serviceAccountReview
+  - imageReferenceReview
+  - runtimeReferenceReview
+  - runtimeSecurityReview
+  - observabilityReview
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - kubectl-apply-disabled
+  - helm-install-disabled
+  - helm-upgrade-disabled
+  - kustomize-build-disabled
+  - cluster-mutation-disabled
+  - namespace-mutation-disabled
+  - deployment-mutation-disabled
+  - service-mutation-disabled
+  - ingress-mutation-disabled
+  - network-policy-mutation-disabled
+  - service-account-mutation-disabled
+  - sensitive-resource-mutation-disabled
+  - image-pull-disabled
+  - registry-access-disabled
+  - raw-kubernetes-payloads-disabled
+  - raw-provider-payloads-disabled
+  - kubeconfig-values-disabled
+  - cluster-identifiers-disabled
+  - sensitive-values-disabled
+  - namespace-review-missing
+  - deployment-topology-missing
+  - service-routing-missing
+  - front-tier-review-missing
+  - controller-class-review-missing
+  - ingress-routing-missing
+  - same-origin-route-missing
+  - certificate-posture-missing
+  - health-check-posture-missing
+  - failover-owner-missing
+  - default-deny-missing
+  - egress-allowlist-missing
+  - service-account-review-missing
+  - image-reference-review-missing
+  - runtime-reference-review-missing
+  - runtime-security-missing
+  - observability-missing
+  - evidence-not-redacted
+requiredEvidence:
+  - Kubernetes runtime readiness summary
+  - Namespace review
+  - Deployment topology review
+  - Service routing review
+  - Ingress front tier review
+  - Ingress routing review
+  - Same-origin route review
+  - Health check and failover review
+  - Network policy review
+  - Service account review
+  - Image reference review
+  - Runtime reference review
+  - Runtime security review
+  - Observability review
+  - Evidence references
+rules:
+  - id: no-live-kubernetes-runtime-actions
+    decision: block
+    requirement: Kubernetes runtime readiness reports static readiness only and never calls providers, applies manifests, installs or upgrades Helm releases, builds overlays, mutates namespaces, mutates workloads, mutates Services, mutates Ingress, mutates NetworkPolicies, mutates ServiceAccounts, creates sensitive resources, pulls images, accesses registries, or changes provider state.
+    evidence: Kubernetes runtime readiness summary
+  - id: namespace-and-workload-topology-required
+    decision: block
+    requirement: Namespace scope, component topology, Deployment selector posture, Service selector posture, placeholder image posture, and workload exposure boundaries must be reviewed before runtime readiness can be accepted.
+    evidence: Deployment topology review
+  - id: ingress-and-network-policy-required
+    decision: block
+    requirement: Same-origin Ingress routing, TLS placeholder posture, default deny posture, explicit ingress allowances, explicit egress allowances, and DNS allowance must be reviewed before runtime readiness can be accepted.
+    evidence: Network policy review
+  - id: haproxy-nginx-ingress-model-required
+    decision: block
+    requirement: HAProxy VIP front tier posture, NGINX ingress controller class, same-origin API route, certificate posture, health checks, failover ownership, approval route, and redacted evidence must be reviewed as safe summaries before ingress readiness can pass.
+    evidence: Ingress front tier review
+  - id: identity-image-runtime-reference-required
+    decision: block
+    requirement: ServiceAccount posture, identity automount posture, image reference posture, registry access boundary, and external runtime reference posture must be reviewed before workloads can depend on the runtime skeleton.
+    evidence: Service account review
+  - id: raw-kubernetes-data-not-exposed
+    decision: block
+    requirement: Kubernetes runtime readiness evidence must use safe summaries only and must not expose kubeconfigs, cluster identifiers, context identifiers, namespace identifiers, ingress identifiers, TLS material identifiers, workload identity identifiers, identity material, pod identifiers, image pull material, registry material, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw Kubernetes payloads, or provider-returned content.
+    evidence: Evidence references

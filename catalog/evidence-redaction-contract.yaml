@@ -1,0 +1,125 @@
+# Evidence redaction contract seed data only. Do not add evidence payloads, logs, credentials, tokens, tenant IDs, object IDs, private IPs, recipient data, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+redactionMode: static-evidence-redaction
+manifestCatalog: evidence-manifest-catalog
+redactionRequired: true
+exportGateRequired: true
+providerCallsAllowed: false
+liveEvidenceMutationAllowed: false
+evidencePayloadsAllowed: false
+rawRequestPayloadsAllowed: false
+rawProviderPayloadsAllowed: false
+rawEvidencePayloadsAllowed: false
+rawLogContentAllowed: false
+unfilteredLogsAllowed: false
+stackTracesAllowed: false
+exportWithoutRedactionAllowed: false
+credentialValuesAllowed: false
+secretValuesAllowed: false
+tokenValuesAllowed: false
+tenantIdentifiersAllowed: false
+objectIdentifiersAllowed: false
+privateNetworkValuesAllowed: false
+rawRecipientDataAllowed: false
+redactionStates:
+  - pending
+  - redacted
+  - blocked
+exportReadiness:
+  - draft
+  - redaction-pending
+  - ready-for-audit
+  - ready-for-cab
+  - ready-for-incident-review
+  - ready-for-handover
+  - blocked
+requiredManifestFields:
+  - evidenceId
+  - evidenceType
+  - requestReference
+  - operationReference
+  - exporter
+  - createdAt
+  - redactionState
+  - exportReadiness
+  - recordTypes
+  - evidenceReferences
+  - retentionClass
+requiredRedactionChecks:
+  - no-secret-pattern-scan
+  - provider-summary-only
+  - stack-trace-suppression
+  - identifier-redaction
+  - private-network-redaction
+  - log-line-filtering
+  - export-readiness-gate
+safeExportTargets:
+  - audit-review
+  - cab-review
+  - incident-review
+  - handover
+  - cmdb-file-exchange
+prohibitedContent:
+  - credential values
+  - bearer material
+  - private key material
+  - generated certificates
+  - Vault initialization material
+  - raw provider payloads
+  - unfiltered logs
+  - stack traces
+  - tenant identifiers
+  - object identifiers
+  - private network addresses
+  - raw recipient data
+retentionClasses:
+  - operational-review
+  - audit-retained
+  - cab-retained
+  - incident-retained
+  - handover-retained
+  - cmdb-exchange-retained
+requiredEvidence:
+  - Evidence manifest summary
+  - Redaction check summary
+  - Export readiness decision
+  - Prohibited content review
+  - Retention class decision
+  - Evidence references
+blockedReasons:
+  - provider-calls-disabled
+  - live-evidence-mutation-disabled
+  - evidence-payloads-disabled
+  - raw-request-payloads-disabled
+  - raw-provider-payloads-disabled
+  - raw-evidence-payloads-disabled
+  - raw-log-content-disabled
+  - unfiltered-logs-disabled
+  - stack-traces-disabled
+  - export-without-redaction-disabled
+  - credential-values-disabled
+  - secret-values-disabled
+  - token-values-disabled
+  - tenant-identifiers-disabled
+  - object-identifiers-disabled
+  - private-network-values-disabled
+  - raw-recipient-data-disabled
+  - manifest-fields-missing
+  - redaction-check-missing
+  - export-readiness-missing
+  - retention-class-missing
+rules:
+  - id: redaction-before-export-required
+    decision: block
+    requirement: Evidence export requires redacted state, export readiness, prohibited content review, and evidence references before any audit, CAB, incident, handover, or CMDB file package can be accepted.
+    evidence: Export readiness decision
+  - id: raw-evidence-data-not-exposed
+    decision: block
+    requirement: Evidence records must use safe summaries only and must not expose raw request payloads, raw provider payloads, raw evidence payloads, raw log content, unfiltered logs, stack traces, credentials, secrets, tokens, tenant IDs, object IDs, private network values, or raw recipient data.
+    evidence: Prohibited content review
+  - id: manifest-catalog-alignment-required
+    decision: block
+    requirement: Redaction states, export readiness states, manifest fields, redaction checks, safe export targets, and retention classes must align with the evidence manifest catalog.
+    evidence: Evidence manifest summary

@@ -1,0 +1,126 @@
+# Customization spec governance seed data only. Do not add raw XML, encrypted XML values, OU paths, domain credentials, usernames, passwords, tokens, tenant IDs, object IDs, live endpoints, private IPs, hostnames, raw provider payloads, or screenshots.
+version: 1
+status: draft
+source: static-seed
+governanceMode: safe-facts-only
+siteCatalogRequired: true
+providerCallsEnabled: false
+liveProviderValidationAllowed: false
+rawXmlAllowed: false
+encryptedXmlAllowed: false
+credentialMaterialAllowed: false
+freeFormOuAllowed: false
+rawProviderPayloadsAllowed: false
+liveGuestCustomizationAllowed: false
+supportedHypervisors:
+  - VMware
+  - Hyper-V
+  - Proxmox
+guestCustomizationParity:
+  - vmware-vcenter-customization-spec-safe-facts
+  - hyper-v-answer-file-safe-facts
+  - proxmox-cloud-init-safe-facts
+supportedWorkflows:
+  - request-preflight
+  - windows-server-deployment
+  - ou-placement-review
+  - customization-spec-drift-review
+  - site-catalog-review
+safeFactFields:
+  - customizationSpecReference
+  - countryCode
+  - siteCode
+  - domainReference
+  - ouPatternReference
+  - timezoneCode
+  - dhcpNetworkBehavior
+  - organizationLabel
+  - windowsBehavior
+driftSignals:
+  - missing-expected-spec
+  - unknown-spec
+  - country-site-mismatch
+  - ou-pattern-mismatch
+  - domain-mismatch
+  - timezone-mismatch
+  - network-behavior-mismatch
+  - windows-behavior-mismatch
+  - stale-spec-inventory
+requiredInputs:
+  - site
+  - country
+  - hypervisorPlatform
+  - customizationSpecReference
+  - domainReference
+  - ouPatternReference
+  - timezoneCode
+  - dhcpNetworkBehavior
+  - organizationLabel
+  - windowsBehavior
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - site-known
+  - safe-facts-from-catalog
+  - ou-pattern-derived
+  - free-form-ou-blocked
+  - encrypted-xml-excluded
+  - drift-check-reviewed
+  - stale-data-marked
+  - owner-known
+  - evidence-redacted
+planSections:
+  - safeFactSummary
+  - siteMapping
+  - ouPlacementDecision
+  - timezoneAndNetworkBehavior
+  - windowsBehaviorReview
+  - driftReview
+  - blockedFindings
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-provider-validation-disabled
+  - live-guest-customization-disabled
+  - unsupported-hypervisor
+  - raw-xml-blocked
+  - encrypted-xml-blocked
+  - credential-material-blocked
+  - site-unknown
+  - spec-reference-unknown
+  - ou-pattern-mismatch
+  - stale-spec-inventory
+  - owner-unknown
+  - evidence-not-redacted
+requiredEvidence:
+  - Safe customization fact summary
+  - Site catalog version
+  - Site mapping decision
+  - OU placement decision
+  - Timezone and DHCP behavior
+  - Windows behavior review
+  - Drift review
+  - Blocked findings
+  - Evidence references
+rules:
+  - id: no-live-customization-spec-provider-calls
+    decision: block
+    requirement: Customization spec governance uses static, mock, or manually reviewed safe facts only and never calls VMware, Hyper-V, Proxmox, or guest customization execution.
+    evidence: Safe customization fact summary
+  - id: raw-xml-never-accepted
+    decision: block
+    requirement: Raw XML, encrypted XML values, credential material, screenshots, and provider payloads must never be committed or exposed.
+    evidence: Blocked findings
+  - id: safe-catalog-facts-required
+    decision: block
+    requirement: Site, country, timezone, DHCP behavior, organization, and Windows behavior must come from approved safe catalog facts.
+    evidence: Site catalog version
+  - id: free-form-ou-blocked
+    decision: block
+    requirement: Normal requests must derive OU placement from catalog facts instead of accepting free-form OU paths.
+    evidence: OU placement decision
+  - id: stale-spec-review-required
+    decision: block
+    requirement: Stale or unknown customization spec evidence must be routed to review before build preflight trusts it.
+    evidence: Drift review

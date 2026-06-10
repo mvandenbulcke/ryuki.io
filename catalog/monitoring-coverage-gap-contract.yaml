@@ -1,0 +1,126 @@
+# Monitoring coverage gap seed data only. Do not add hostnames, usernames, credentials, tokens, tenant IDs, object IDs, live endpoints, private IPs, Zabbix host IDs, host group IDs, template IDs, proxy IDs, maintenance IDs, action IDs, event IDs, raw host rows, raw alert payloads, raw problem rows, or provider payloads.
+version: 1
+status: draft
+source: static-seed
+reportMode: aggregate-gap-report
+providerCallsEnabled: false
+liveRemediationAllowed: false
+zabbixMutationAllowed: false
+liveTaskCreationAllowed: false
+rawHostRowsAllowed: false
+rawAlertPayloadsAllowed: false
+rawProblemRowsAllowed: false
+rawProviderPayloadsAllowed: false
+templateBaseline:
+  defaultPosture: default-built-in-templates
+  exceptionProfiles:
+    - lenovo-xcc-snmp
+  exceptionEvidence: Lenovo XCC SNMP
+supportedScopes:
+  - host
+  - application
+  - site
+  - environment
+  - monitoring-profile
+  - support-group
+gapSignals:
+  - missing-zabbix-host
+  - missing-host-group
+  - missing-template
+  - missing-proxy-or-server
+  - missing-maintenance-window
+  - missing-owner
+  - missing-support-group
+  - alert-routing-gap
+  - stale-monitoring-inventory
+requiredInputs:
+  - assetScope
+  - site
+  - environment
+  - monitoringProfile
+  - hostGroupProfile
+  - templateProfile
+  - proxyOrServerProfile
+  - maintenanceWindow
+  - owner
+  - supportGroup
+  - evidenceManifest
+requiredGuards:
+  - inventory-coverage-current
+  - monitoring-profile-known
+  - host-summary-known
+  - host-group-known
+  - template-known
+  - proxy-or-server-known
+  - maintenance-window-known
+  - owner-known
+  - support-group-known
+  - alert-routing-reviewed
+  - stale-data-marked
+  - evidence-redacted
+planSections:
+  - coverageSummary
+  - hostOnboardingState
+  - hostGroupTemplateReview
+  - proxyOrServerReview
+  - maintenanceWindowReview
+  - alertRoutingReview
+  - ownerRouting
+  - remediationDraft
+  - evidenceReferences
+blockedReasons:
+  - provider-calls-disabled
+  - live-remediation-disabled
+  - zabbix-mutation-disabled
+  - live-task-creation-disabled
+  - raw-host-rows-disabled
+  - raw-alert-payloads-disabled
+  - raw-problem-rows-disabled
+  - raw-provider-payloads-disabled
+  - asset-scope-unknown
+  - monitoring-profile-missing
+  - host-summary-unknown
+  - host-group-missing
+  - template-missing
+  - proxy-or-server-unknown
+  - maintenance-window-missing
+  - alert-routing-unknown
+  - owner-unknown
+  - support-group-unknown
+  - stale-monitoring-inventory
+  - evidence-not-redacted
+requiredEvidence:
+  - Monitoring coverage summary
+  - Host onboarding state
+  - Host group and template review
+  - Proxy or server review
+  - Maintenance window review
+  - Alert routing review
+  - Owner routing
+  - Remediation draft
+  - Evidence references
+rules:
+  - id: no-live-zabbix-coverage-remediation
+    decision: block
+    requirement: Monitoring coverage gap reporting must not create hosts, update groups, link templates, assign proxies, change maintenance windows, or mutate Zabbix provider state.
+    evidence: Remediation draft
+  - id: aggregate-coverage-report-only
+    decision: block
+    requirement: Operators receive aggregate coverage summaries only, never raw host rows, alert payloads, problem rows, object IDs, or provider payloads.
+    evidence: Monitoring coverage summary
+  - id: host-group-template-required
+    decision: block
+    requirement: Host group and template coverage must be known before monitoring coverage status can be trusted.
+    evidence: Host group and template review
+  - id: proxy-maintenance-required
+    decision: block
+    requirement: Proxy or server assignment and maintenance window coverage must be reviewed before a gap can be closed.
+    evidence: Proxy or server review
+  - id: alert-routing-reviewed
+    decision: block
+    requirement: Alert routing must be reviewed before monitoring coverage is considered complete.
+    evidence: Alert routing review
+  - id: stale-monitoring-inventory-blocks
+    decision: block
+    requirement: Stale monitoring inventory blocks coverage decisions until refreshed or routed to review.
+    evidence: Monitoring coverage summary

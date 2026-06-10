@@ -1,0 +1,262 @@
+#![recursion_limit = "512"]
+
+mod boundary;
+mod config;
+mod config_store;
+mod contracts;
+pub mod database;
+
+use axum::body::Body;
+use axum::http::{HeaderMap, Request as HttpRequest, StatusCode};
+use axum::middleware;
+use axum::response::Response;
+use axum::{extract::Query, routing::get, Json, Router};
+use std::collections::HashMap;
+use tower_http::cors::{Any, CorsLayer};
+
+use ryuki_core::types::{ApiError, ValidationResult};
+
+/// ProblemDetails error type alias: HTTP status code + structured ApiError JSON body.
+type ProblemDetails = (StatusCode, Json<ApiError>);
+
+fn problem_details(
+    status: StatusCode,
+    error: impl Into<String>,
+    message: impl Into<String>,
+    detail: Option<impl Into<String>>,
+) -> ProblemDetails {
+    let api_error = match detail {
+        Some(d) => ApiError::with_detail(error, message, d),
+        None => ApiError::new(error, message),
+    };
+    (status, Json(api_error))
+}
+
+/// Safe auth log metadata: presence + mode only, never raw header values.
+#[derive(Debug, PartialEq)]
+struct AuthLogFields {
+    auth_header_present: bool,
+    provider_mode: &'static str,
+}
+
+/// Resolves auth log metadata from an optional Authorization header value.
+/// Never exposes raw header content.
+fn resolve_auth_metadata(header: Option<&str>) -> AuthLogFields {
+    AuthLogFields {
+        auth_header_present: header.is_some(),
+        provider_mode: "static-dry-run",
+    }
+}
+
+async fn auth_middleware(
+    headers: HeaderMap,
+    mut request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
+    let log = resolve_auth_metadata(auth_header);
+    tracing::info!(
+        auth_header_present = log.auth_header_present,
+        provider_mode = log.provider_mode,
+        "auth middleware"
+    );
+    let session = if let Some(header_value) = auth_header {
+        ryuki_engine::auth::validate_token(header_value)
+    } else {
+        ryuki_engine::auth::AuthSession::static_dry_run()
+    };
+
+    request.extensions_mut().insert(session);
+    next.run(request).await
+}
+
+#[tokio::main]
+async fn main() {
+    let app_config = config::load();
+    config_store::init_with_config("platform-config.json", &app_config);
+
+    tracing_subscriber::fmt::init();
+
+    database::try_connect_with_url(&app_config.database_url).await;
+    database::migrate_if_connected().await;
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/api/validation/run", get(validation_run))
+        .merge(contracts::routes())
+        .merge(boundary::routes())
+        .layer(middleware::from_fn(auth_middleware))
+        .layer(cors);
+
+    let listener = tokio::net::TcpListener::bind(&app_config.api_bind_addr)
+        .await
+        .unwrap();
+    tracing::info!("ryuki-api listening on {}", app_config.api_bind_addr);
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn health(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    if params.get("simulate") == Some(&"error".to_string()) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HEALTH_CHECK_FAILED",
+            "Platform health check failed",
+            Some("Simulated error for testing ProblemDetails contract"),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({"status": "healthy", "source": "simulated"}),
+    ))
+}
+
+async fn ready(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    if params.get("simulate") == Some(&"error".to_string()) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "READINESS_CHECK_FAILED",
+            "Platform readiness check failed",
+            Some("Simulated error for testing ProblemDetails contract"),
+        ));
+    }
+    Ok(Json(
+        serde_json::json!({"status": "ready", "source": "simulated"}),
+    ))
+}
+
+async fn validation_run(
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<ValidationResult>, ProblemDetails> {
+    let slice = params.get("slice").cloned().unwrap_or_default();
+    if slice.is_empty() {
+        return Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "Slice name required for validation",
+            Some("Provide a 'slice' query parameter to run validation"),
+        ));
+    }
+    Ok(Json(ValidationResult {
+        errors: vec![],
+        warnings: vec!["static dry-run: no live validation performed".into()],
+    }))
+}
+
+async fn metrics() -> Response {
+    let body = ryuki_engine::health_monitor::metrics_text();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_auth_log_metadata_header_present() {
+        let fields = resolve_auth_metadata(Some("Bearer secret-token-123"));
+        assert!(fields.auth_header_present);
+        assert_eq!(fields.provider_mode, "static-dry-run");
+    }
+
+    #[test]
+    fn test_auth_log_metadata_header_absent() {
+        let fields = resolve_auth_metadata(None);
+        assert!(!fields.auth_header_present);
+        assert_eq!(fields.provider_mode, "static-dry-run");
+    }
+
+    #[test]
+    fn test_auth_log_metadata_with_invalid_utf8_header() {
+        // invalid header fallback: still present but unusable bytes
+        let fields = resolve_auth_metadata(Some("invalid"));
+        assert!(fields.auth_header_present);
+    }
+
+    #[test]
+    fn test_problem_details_without_detail() {
+        let (status, Json(body)) = problem_details(
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_FAILED",
+            "Slice name required",
+            None::<&str>,
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "VALIDATION_FAILED");
+        assert_eq!(body.message, "Slice name required");
+        assert_eq!(body.detail, None);
+    }
+
+    #[test]
+    fn test_problem_details_with_detail() {
+        let (status, Json(body)) = problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "HEALTH_CHECK_FAILED",
+            "Platform health check failed",
+            Some("Simulated error"),
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "HEALTH_CHECK_FAILED");
+        assert_eq!(body.message, "Platform health check failed");
+        assert_eq!(body.detail, Some("Simulated error".into()));
+    }
+
+    #[test]
+    fn test_problem_details_serializes_as_json() {
+        let (_, Json(body)) = problem_details(
+            StatusCode::NOT_FOUND,
+            "RESOURCE_NOT_FOUND",
+            "The requested resource was not found",
+            None::<&str>,
+        );
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("RESOURCE_NOT_FOUND"));
+        assert!(json.contains("The requested resource was not found"));
+        assert!(!json.contains("detail"));
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    #[tokio::test]
+    async fn test_migrations_run_against_pg18() {
+        if std::env::var("DATABASE_URL").is_err() {
+            eprintln!("SKIP: DATABASE_URL not set");
+            return;
+        }
+        let url = std::env::var("DATABASE_URL").unwrap();
+        crate::database::try_connect_with_url(&url).await;
+        let db = crate::database::get_db().expect("database should be available");
+        crate::database::run_migrations(db).await;
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM platform_config")
+            .fetch_one(db)
+            .await
+            .expect("platform_config table should exist");
+        assert_eq!(count.0, 9, "expected 9 platform_config rows");
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")
+                .fetch_all(db)
+                .await
+                .expect("should query tables");
+        let names: Vec<&str> = tables.iter().map(|t| t.0.as_str()).collect();
+        assert!(names.contains(&"platform_config"));
+        assert!(names.contains(&"requests"));
+        assert!(names.contains(&"sessions"));
+    }
+}
