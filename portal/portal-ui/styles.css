@@ -20,8 +20,50 @@
   --focus: #2563eb;
 }
 
+[data-theme="dark"] {
+  --accent: #7eb8f0;
+  --accent-text: #a0d0ff;
+  --accent-secondary: #f0a030;
+  --bg: #11141a;
+  --surface: #181c23;
+  --surface-2: #222834;
+  --text: #f3f5f8;
+  --muted: #aab2c0;
+  --line: #303746;
+  --good: #68d391;
+  --good-bg: #143222;
+  --warn: #f6c453;
+  --warn-bg: #3a2d10;
+  --bad: #ff8f82;
+  --bad-bg: #3b1715;
+  --stale: #c2cad7;
+  --stale-bg: #2a3140;
+  --focus: #8ab4ff;
+}
+
+[data-theme="light"] {
+  --accent: #4a90d9;
+  --accent-text: #3a7bc8;
+  --accent-secondary: #f0a030;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --text: #16181d;
+  --muted: #5e6572;
+  --line: #d8dde6;
+  --good: #0f7b48;
+  --good-bg: #e4f6ed;
+  --warn: #8a5a00;
+  --warn-bg: #fff0bd;
+  --bad: #b42318;
+  --bad-bg: #fee4df;
+  --stale: #596579;
+  --stale-bg: #e7ebf1;
+  --focus: #2563eb;
+}
+
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
     --accent: #7eb8f0;
     --accent-text: #a0d0ff;
     --accent-secondary: #f0a030;
@@ -125,7 +167,21 @@ input:focus-visible {
   font: inherit;
 }
 
-.scope,
+.scope {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  align-items: center;
+}
+
+.session-info {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .freshness {
   display: flex;
   flex-wrap: wrap;
@@ -153,6 +209,26 @@ input:focus-visible {
 .pill.role {
   border-color: color-mix(in srgb, var(--accent) 42%, var(--line));
   color: var(--accent-text);
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .nav {
@@ -982,4 +1058,134 @@ th {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+/* Login page */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  padding: 20px;
+}
+
+.login-card {
+  max-width: 420px;
+  width: 100%;
+  padding: 36px 32px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  display: grid;
+  gap: 24px;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+}
+
+.login-brand .brand-mark {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  font-size: 18px;
+}
+
+.login-loader {
+  text-align: center;
+  padding: 20px;
+  color: var(--muted);
+}
+
+.login-loader p {
+  margin: 0;
+}
+
+.login-actions {
+  display: grid;
+  gap: 14px;
+}
+
+.login-description {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.login-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 20px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #ffffff;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.login-button:hover {
+  opacity: 0.92;
+}
+
+.login-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.login-status {
+  text-align: center;
+  padding: 10px;
+  color: var(--muted);
+}
+
+.login-status p {
+  margin: 0;
+}
+
+.login-error {
+  padding: 14px;
+  background: var(--bad-bg);
+  border: 1px solid var(--bad);
+  border-radius: 8px;
+  color: var(--bad);
+  display: grid;
+  gap: 6px;
+}
+
+.login-error .eyebrow {
+  color: var(--bad);
+}
+
+.login-warning {
+  display: grid;
+  gap: 10px;
+  text-align: center;
+  padding: 20px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  color: var(--warn);
+}
+
+.login-warning .eyebrow {
+  color: var(--warn);
+}
+
+.login-link {
+  display: inline-block;
+  color: var(--accent-text);
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.login-link:hover {
+  opacity: 0.8;
 }

@@ -2210,6 +2210,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
