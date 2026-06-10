@@ -385,7 +385,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   <div class="header-inner">
     <a href="/" class="logo">ryuki<span>.io</span></a>
     <div class="header-right">
-      <a href="https://github.com/anomalyco/ryuki" class="header-link docs-link" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="header-link docs-link" target="_blank" rel="noopener">GitHub</a>
       <a href="/docs/" class="header-link docs-link">Docs</a>
       <button class="theme-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
         <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
@@ -401,10 +401,10 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 <section class="hero">
   <div class="container">
     <h1><span>Ryuki</span></h1>
-    <p class="tagline">System engineer platform engineering portal for multi&dash;site datacenter infrastructure management. Governed, auditable workflows across VMware, Hyper-V, Proxmox, Windows, Linux, SQL Server, and network fabric.</p>
+    <p class="tagline">System engineer platform engineering portal for multi&mdash;site datacenter infrastructure management. Governed, auditable workflows across VMware, Hyper-V, Proxmox, Windows, Linux, SQL Server, and network fabric.</p>
     <div class="hero-links">
       <a href="/docs/" class="btn btn-primary">Get Started</a>
-      <a href="https://github.com/anomalyco/ryuki" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
     </div>
   </div>
 </section>
@@ -422,7 +422,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         </div>
         <h3>VM Lifecycle</h3>
-        <p>Provision, resize, migrate, and retire VMs across VMware, Hyper&dash;V, and Proxmox. Capacity governance and placement policies per cluster.</p>
+        <p>Provision, resize, migrate, and retire VMs across VMware, Hyper&mdash;V, and Proxmox. Capacity governance and placement policies per cluster.</p>
         <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span></div>
       </div>
 
@@ -579,7 +579,7 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all</code></pre
     <p>Start taming your infrastructure today.</p>
     <div class="btn-group">
       <a href="/docs/" class="btn btn-primary">Read the Docs</a>
-      <a href="https://github.com/anomalyco/ryuki" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
 </section>
@@ -597,6 +597,7 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all</code></pre
 (function(){
   const STORAGE_KEY = 'ryuki-theme'
   const ATTR = 'data-theme'
+  const MODE_ATTR = 'data-theme-mode'
   const html = document.documentElement
   const btn = document.getElementById('theme-toggle')
 
@@ -608,13 +609,13 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all</code></pre
   function apply(theme){html.setAttribute(ATTR, theme)}
 
   const stored = localStorage.getItem(STORAGE_KEY) || 'system'
+  html.setAttribute(MODE_ATTR, stored)
   apply(resolveTheme(stored))
-  html.setAttribute(ATTR, stored)
 
   function cycle(){
-    const current = html.getAttribute(ATTR)
+    const current = html.getAttribute(MODE_ATTR)
     const next = current === 'light' ? 'dark' : current === 'dark' ? 'system' : 'light'
-    html.setAttribute(ATTR, next)
+    html.setAttribute(MODE_ATTR, next)
     localStorage.setItem(STORAGE_KEY, next)
     apply(resolveTheme(next))
   }

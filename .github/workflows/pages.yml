@@ -17,5 +17,5 @@ jobs:
       - uses: actions/configure-pages@v4
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: '.'
+          path: 'index.html'
       - uses: actions/deploy-pages@v4
