@@ -3588,9 +3588,21 @@ async fn backup_restore_validate(Json(body): Json<RestorePlanRequest>) -> ApiRes
 }
 
 async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiResult {
-    let restore: ryuki_engine::models::RestoreRequest =
-        serde_json::from_value(json!({"id": body.restore_id, "source_ci_key": "ci-001", "restore_type": "full-vm", "restore_point": "2026-06-10T02:00:00Z", "target_site": "LOVE", "target_environment": "production", "verification_plan": "", "retention_need": "", "owner": "backup-team", "status": "Planned", "dry_run_plan": null, "created_at": "", "metadata": {}}))
-            .map_err(|e| status_400(&e.to_string()))?;
+    let restore = ryuki_engine::models::RestoreRequest {
+        id: body.restore_id,
+        source_ci_key: "ci-001".to_string(),
+        restore_type: ryuki_engine::models::RestoreType::FullVm,
+        restore_point: "2026-06-10T02:00:00Z".to_string(),
+        target_site: "LOVE".to_string(),
+        target_environment: "production".to_string(),
+        verification_plan: String::new(),
+        retention_need: String::new(),
+        owner: "backup-team".to_string(),
+        status: ryuki_engine::models::RestoreStatus::Planned,
+        dry_run_plan: None,
+        created_at: String::new(),
+        metadata: std::collections::HashMap::new(),
+    };
     let approver = body.approver.as_deref().unwrap_or("Backup Operator");
     match backup_engine::approve_restore(&restore, approver) {
         Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
@@ -3599,9 +3611,21 @@ async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiRe
 }
 
 async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiResult {
-    let restore: ryuki_engine::models::RestoreRequest =
-        serde_json::from_value(json!({"id": body.restore_id, "source_ci_key": "ci-001", "restore_type": "full-vm", "restore_point": "2026-06-10T02:00:00Z", "target_site": "LOVE", "target_environment": "production", "verification_plan": "", "retention_need": "", "owner": "backup-team", "status": "Approved", "dry_run_plan": null, "created_at": "", "metadata": {}}))
-            .map_err(|e| status_400(&e.to_string()))?;
+    let restore = ryuki_engine::models::RestoreRequest {
+        id: body.restore_id,
+        source_ci_key: "ci-001".to_string(),
+        restore_type: ryuki_engine::models::RestoreType::FullVm,
+        restore_point: "2026-06-10T02:00:00Z".to_string(),
+        target_site: "LOVE".to_string(),
+        target_environment: "production".to_string(),
+        verification_plan: String::new(),
+        retention_need: String::new(),
+        owner: "backup-team".to_string(),
+        status: ryuki_engine::models::RestoreStatus::Approved,
+        dry_run_plan: None,
+        created_at: String::new(),
+        metadata: std::collections::HashMap::new(),
+    };
     match backup_engine::execute_restore(&restore) {
         Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
         Err(e) => Err(status_400(&e)),
