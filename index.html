@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="system">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Ryuki — System engineer platform engineering portal for multi-site datacenter infrastructure management.">
+<title>Ryuki — Infrastructure Platform Portal</title>
+<style>
+/* ── Reset ──────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{min-height:100vh;line-height:1.6;-webkit-font-smoothing:antialiased}
+img,svg{display:block;max-width:100%}
+pre,code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+
+/* ── Theme: CSS Custom Properties ──────────────────────── */
+:root{
+  --font:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans",sans-serif;
+  --radius:6px;
+  --transition:200ms ease;
+}
+
+/* light (default) */
+:root, [data-theme="light"] {
+  --bg:            #ffffff;
+  --bg-secondary:  #f7f8fa;
+  --bg-tertiary:   #eef0f4;
+  --text:          #1a1d23;
+  --text-secondary:#5a6070;
+  --text-muted:    #8b909f;
+  --border:        #dde0e6;
+  --accent:        #4A90D9;
+  --accent-hover:  #3a7bc8;
+  --accent-bg:     #e8f2fc;
+  --code-bg:       #f0f2f5;
+  --code-text:     #2c3e50;
+  --card-bg:       #ffffff;
+  --card-border:   #e2e5eb;
+  --card-shadow:   0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
+  --header-bg:     rgba(255,255,255,.85);
+  --hero-gradient: linear-gradient(135deg, #f0f4fb 0%, #e2ebf5 50%, #f7f8fa 100%);
+  --feature-icon-bg:#e8f2fc;
+  --tag-bg:        #eef2f9;
+  --tag-text:      #3a5a8c;
+  --section-alt:   #f7f8fa;
+}
+
+/* dark */
+[data-theme="dark"] {
+  --bg:            #101216;
+  --bg-secondary:  #181a1f;
+  --bg-tertiary:   #22252c;
+  --text:          #e4e6ed;
+  --text-secondary:#9ca0ad;
+  --text-muted:    #6b7080;
+  --border:        #2a2d35;
+  --accent:        #4A90D9;
+  --accent-hover:  #5ca0e9;
+  --accent-bg:     #1a2740;
+  --code-bg:       #1e2129;
+  --code-text:     #d4d8e0;
+  --card-bg:       #181a1f;
+  --card-border:   #2a2d35;
+  --card-shadow:   0 1px 3px rgba(0,0,0,.3), 0 1px 2px rgba(0,0,0,.2);
+  --header-bg:     rgba(16,18,22,.9);
+  --hero-gradient: linear-gradient(135deg, #13151a 0%, #1a1e28 50%, #101216 100%);
+  --feature-icon-bg:#1a2740;
+  --tag-bg:        #1e2540;
+  --tag-text:      #8aacd4;
+  --section-alt:   #14161a;
+}
+
+/* ── Base ───────────────────────────────────────────────── */
+body{
+  font-family:var(--font);
+  background:var(--bg);
+  color:var(--text);
+  transition:background var(--transition), color var(--transition);
+}
+
+/* ── Header ─────────────────────────────────────────────── */
+.site-header{
+  position:sticky;
+  top:0;
+  z-index:100;
+  background:var(--header-bg);
+  -webkit-backdrop-filter:blur(12px);
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--border);
+  transition:background var(--transition), border-color var(--transition);
+}
+.header-inner{
+  max-width:1200px;
+  margin:0 auto;
+  padding:0 1.5rem;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  height:56px;
+}
+.logo{
+  font-size:1.25rem;
+  font-weight:700;
+  color:var(--text);
+  text-decoration:none;
+  letter-spacing:-.02em;
+}
+.logo span{color:var(--accent)}
+
+.header-right{
+  display:flex;
+  align-items:center;
+  gap:.75rem;
+}
+.header-link{
+  color:var(--text-secondary);
+  text-decoration:none;
+  font-size:.875rem;
+  font-weight:500;
+  padding:.25rem .5rem;
+  border-radius:var(--radius);
+  transition:color var(--transition);
+}
+.header-link:hover{color:var(--accent)}
+
+/* theme toggle button */
+.theme-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:36px;
+  height:36px;
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  background:var(--bg-secondary);
+  color:var(--text-secondary);
+  cursor:pointer;
+  padding:0;
+  transition:background var(--transition), border-color var(--transition), color var(--transition);
+}
+.theme-btn:hover{color:var(--accent);border-color:var(--accent)}
+.theme-btn svg{width:18px;height:18px}
+.theme-btn .icon-sun{display:none}
+.theme-btn .icon-moon{display:block}
+[data-theme="dark"] .theme-btn .icon-sun{display:block}
+[data-theme="dark"] .theme-btn .icon-moon{display:none}
+
+/* ── Layout ──────────────────────────────────────────────── */
+.container{max-width:1200px;margin:0 auto;padding:0 1.5rem}
+section{padding:5rem 0}
+section.alt{background:var(--section-alt);transition:background var(--transition)}
+
+/* ── Hero ───────────────────────────────────────────────── */
+.hero{
+  background:var(--hero-gradient);
+  padding:7rem 0 5rem;
+  text-align:center;
+  transition:background var(--transition);
+}
+.hero h1{
+  font-size:clamp(2.5rem,6vw,4rem);
+  font-weight:800;
+  letter-spacing:-.03em;
+  line-height:1.1;
+  margin-bottom:1rem;
+}
+.hero h1 span{color:var(--accent)}
+.hero .tagline{
+  font-size:1.2rem;
+  color:var(--text-secondary);
+  max-width:640px;
+  margin:0 auto 2rem;
+  line-height:1.6;
+}
+.hero .hero-links{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}
+.btn{
+  display:inline-flex;
+  align-items:center;
+  gap:.5rem;
+  padding:.6rem 1.4rem;
+  border-radius:var(--radius);
+  font-size:.875rem;
+  font-weight:600;
+  text-decoration:none;
+  transition:all var(--transition);
+  white-space:nowrap;
+}
+.btn-primary{
+  background:var(--accent);
+  color:#fff;
+  border:1px solid var(--accent);
+}
+.btn-primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn-secondary{
+  background:var(--bg);
+  color:var(--text);
+  border:1px solid var(--border);
+}
+.btn-secondary:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ── Section Headings ────────────────────────────────────── */
+.section-label{
+  font-size:.75rem;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:var(--accent);
+  margin-bottom:.5rem;
+}
+.section-title{
+  font-size:clamp(1.5rem,3vw,2rem);
+  font-weight:700;
+  letter-spacing:-.02em;
+  margin-bottom:1rem;
+}
+.section-subtitle{
+  font-size:1rem;
+  color:var(--text-secondary);
+  max-width:640px;
+}
+
+/* ── Features Grid ───────────────────────────────────────── */
+.features-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(300px,1fr));
+  gap:1.25rem;
+  margin-top:2.5rem;
+}
+.feature-card{
+  background:var(--card-bg);
+  border:1px solid var(--card-border);
+  border-radius:var(--radius);
+  padding:1.5rem;
+  box-shadow:var(--card-shadow);
+  transition:background var(--transition), border-color var(--transition), box-shadow var(--transition);
+}
+.feature-card:hover{border-color:var(--accent);box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.feature-icon{
+  width:40px;
+  height:40px;
+  border-radius:var(--radius);
+  background:var(--feature-icon-bg);
+  color:var(--accent);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  margin-bottom:1rem;
+  font-size:1.2rem;
+  transition:background var(--transition);
+}
+.feature-card h3{
+  font-size:1rem;
+  font-weight:600;
+  margin-bottom:.4rem;
+}
+.feature-card p{
+  font-size:.875rem;
+  color:var(--text-secondary);
+  line-height:1.5;
+}
+.feature-tags{
+  display:flex;
+  flex-wrap:wrap;
+  gap:.35rem;
+  margin-top:.75rem;
+}
+.tag{
+  font-size:.7rem;
+  font-weight:600;
+  padding:.15rem .5rem;
+  border-radius:100px;
+  background:var(--tag-bg);
+  color:var(--tag-text);
+  transition:background var(--transition), color var(--transition);
+}
+
+/* ── Architecture Table ──────────────────────────────────── */
+.arch-table{
+  width:100%;
+  border-collapse:collapse;
+  margin-top:2.5rem;
+  font-size:.875rem;
+}
+.arch-table th,.arch-table td{
+  padding:.75rem 1rem;
+  text-align:left;
+  border-bottom:1px solid var(--border);
+}
+.arch-table th{
+  font-size:.7rem;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--text-muted);
+}
+.arch-table td{color:var(--text-secondary)}
+.arch-table td:first-child{font-weight:600;color:var(--accent);white-space:nowrap}
+.arch-table tr:last-child td{border-bottom:none}
+.arch-table tbody tr{transition:background var(--transition)}
+.arch-table tbody tr:hover{background:var(--bg-tertiary)}
+.arch-wrap{
+  background:var(--card-bg);
+  border:1px solid var(--card-border);
+  border-radius:var(--radius);
+  overflow:hidden;
+  box-shadow:var(--card-shadow);
+  transition:background var(--transition), border-color var(--transition);
+}
+
+/* ── Quick Start ────────────────────────────────────────── */
+.code-block{
+  background:var(--code-bg);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  margin-top:2rem;
+  overflow:hidden;
+  transition:background var(--transition), border-color var(--transition);
+}
+.code-block-header{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:.6rem 1rem;
+  border-bottom:1px solid var(--border);
+  font-size:.75rem;
+  font-weight:600;
+  color:var(--text-muted);
+  transition:border-color var(--transition);
+}
+.code-block pre{
+  padding:1.25rem 1rem;
+  overflow-x:auto;
+  font-size:.8125rem;
+  line-height:1.65;
+  color:var(--code-text);
+  background:transparent;
+  transition:color var(--transition);
+}
+.code-block code{background:none;padding:0}
+
+/* ── CTA ────────────────────────────────────────────────── */
+.cta{text-align:center;padding:5rem 0}
+.cta .section-title{margin-bottom:.5rem}
+.cta p{color:var(--text-secondary);margin-bottom:2rem}
+.cta .btn-group{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}
+
+/* ── Footer ──────────────────────────────────────────────── */
+.site-footer{
+  border-top:1px solid var(--border);
+  padding:2rem 0;
+  font-size:.8125rem;
+  color:var(--text-muted);
+  transition:border-color var(--transition);
+}
+.footer-inner{
+  max-width:1200px;
+  margin:0 auto;
+  padding:0 1.5rem;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:.5rem;
+}
+
+/* ── Responsive ──────────────────────────────────────────── */
+@media(max-width:768px){
+  .hero{padding:5rem 0 3rem}
+  section{padding:3rem 0}
+  .features-grid{grid-template-columns:1fr}
+  .arch-table{font-size:.8125rem}
+  .arch-table th,.arch-table td{padding:.5rem .75rem}
+  .header-link.docs-link{display:none}
+}
+@media(max-width:480px){
+  .hero h1{font-size:2rem}
+  .hero .tagline{font-size:1rem}
+  .arch-table td:first-child{white-space:normal}
+}
+</style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="logo">ryuki<span>.io</span></a>
+    <div class="header-right">
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="header-link docs-link" target="_blank" rel="noopener">GitHub</a>
+      <a href="/docs/" class="header-link docs-link">Docs</a>
+      <button class="theme-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+        <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <h1><span>Ryuki</span></h1>
+    <p class="tagline">System engineer platform engineering portal for multi&mdash;site datacenter infrastructure management. Governed, auditable workflows across VMware, Hyper-V, Proxmox, Windows, Linux, SQL Server, and network fabric.</p>
+    <div class="hero-links">
+      <a href="/docs/" class="btn btn-primary">Get Started</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <div class="section-label">Features</div>
+    <h2 class="section-title">Platform Capabilities</h2>
+    <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure.</p>
+    <div class="features-grid">
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <h3>VM Lifecycle</h3>
+        <p>Provision, resize, migrate, and retire VMs across VMware, Hyper&mdash;V, and Proxmox. Capacity governance and placement policies per cluster.</p>
+        <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </div>
+        <h3>Monitoring &amp; Alerting</h3>
+        <p>Zabbix host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts.</p>
+        <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">SNMP</span><span class="tag">Drift</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </div>
+        <h3>Backup &amp; Recovery</h3>
+        <p>Veeam Backup &amp; Replication coverage tracking, restore testing, DR orchestration, and repository health across sites.</p>
+        <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">DR</span><span class="tag">SQL</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
+        </div>
+        <h3>CMDB &amp; Inventory</h3>
+        <p>ServiceNow CMDB integration with Excel import/export, CI reconciliation, relationship graph visualization, and reconciliation engine.</p>
+        <div class="feature-tags"><span class="tag">ServiceNow</span><span class="tag">Excel</span><span class="tag">Graph</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        </div>
+        <h3>OS Patching &amp; Compliance</h3>
+        <p>Windows and Linux deployment, scheduled patching with approval gates, and OS baseline compliance reporting across the fleet.</p>
+        <div class="feature-tags"><span class="tag">Windows</span><span class="tag">Linux</span><span class="tag">SQL Server</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        </div>
+        <h3>Image Factory</h3>
+        <p>Monthly golden image build pipeline: template construction, automated testing, promotion through environments, and publishing to target platforms.</p>
+        <div class="feature-tags"><span class="tag">Packer</span><span class="tag">Windows</span><span class="tag">Linux</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </div>
+        <h3>Evidence &amp; Audit</h3>
+        <p>Redacted evidence packs per work item, approval chain lineage, shift handover reports, and audit-ready export without exposing credentials.</p>
+        <div class="feature-tags"><span class="tag">Audit</span><span class="tag">Compliance</span><span class="tag">RBAC</span></div>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon">
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        </div>
+        <h3>Datacenter Fabric</h3>
+        <p>Hardware lifecycle management, firmware baselines, switchport/VLAN readiness checks, and physical asset tracking across sites.</p>
+        <div class="feature-tags"><span class="tag">Network</span><span class="tag">Firmware</span><span class="tag">Lifecycle</span></div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture" class="alt">
+  <div class="container">
+    <div class="section-label">Architecture</div>
+    <h2 class="section-title">Stack &amp; Components</h2>
+    <p class="section-subtitle">Full-stack Rust control plane with SSR portal, secrets management, and static validation engine.</p>
+    <div class="arch-wrap">
+    <table class="arch-table">
+      <thead>
+        <tr><th>Component</th><th>Stack</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>ryuki-portal-ui</td>
+          <td>Rust / Leptos / Axum</td>
+          <td>Full-stack SSR portal with Sigma design system. Same-origin browser isolation &mdash; never calls provider APIs directly.</td>
+        </tr>
+        <tr>
+          <td>ryuki-api</td>
+          <td>Rust / Axum / sqlx</td>
+          <td>Control plane API with Entra ID SSO, role-based access, and governed request lifecycle.</td>
+        </tr>
+        <tr>
+          <td>ryuki-engine</td>
+          <td>Rust</td>
+          <td>Domain models, evidence generation, health probes, and provider adapters.</td>
+        </tr>
+        <tr>
+          <td>ryuki-core</td>
+          <td>Rust</td>
+          <td>Shared types, utilities, secret scanning, and cross-cutting configuration.</td>
+        </tr>
+        <tr>
+          <td>ryuki-validator</td>
+          <td>Rust</td>
+          <td>98-slice static validation engine for pre-commit and CI guardrails.</td>
+        </tr>
+        <tr>
+          <td>PostgreSQL</td>
+          <td>CloudNativePG / Docker</td>
+          <td>Control plane database with schema migrations via <code>sqlx</code>.</td>
+        </tr>
+        <tr>
+          <td>Vault</td>
+          <td>HashiCorp Vault</td>
+          <td>Secrets management &mdash; provider credentials never committed or logged.</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</section>
+
+<!-- Quick Start -->
+<section id="quickstart">
+  <div class="container">
+    <div class="section-label">Quick Start</div>
+    <h2 class="section-title">Get Running in Minutes</h2>
+    <p class="section-subtitle">Start PostgreSQL, configure the environment, build, and validate.</p>
+    <div class="code-block">
+      <div class="code-block-header"><span>Shell</span></div>
+      <pre><code># Start PostgreSQL via Docker Compose
+docker compose -f deploy/compose/compose.yaml up -d platform-db
+
+# Copy and configure environment
+cp .env.example .env
+
+# Build the full workspace
+cargo build --workspace
+
+# Run the test suite
+cargo test --workspace
+
+# Execute all validators
+cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta">
+  <div class="container">
+    <h2 class="section-title">Ready to Ship?</h2>
+    <p>Start taming your infrastructure today.</p>
+    <div class="btn-group">
+      <a href="/docs/" class="btn btn-primary">Read the Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <span>&copy; 2026 Ryuki</span>
+    <span>MIT License</span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  const STORAGE_KEY = 'ryuki-theme'
+  const ATTR = 'data-theme'
+  const MODE_ATTR = 'data-theme-mode'
+  const html = document.documentElement
+  const btn = document.getElementById('theme-toggle')
+
+  function getPrefers(){return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'}
+  function resolveTheme(stored){
+    if(stored === 'system' || !stored){return getPrefers()}
+    return stored
+  }
+  function apply(theme){html.setAttribute(ATTR, theme)}
+
+  const stored = localStorage.getItem(STORAGE_KEY) || 'system'
+  html.setAttribute(MODE_ATTR, stored)
+  apply(resolveTheme(stored))
+
+  function cycle(){
+    const current = html.getAttribute(MODE_ATTR)
+    const next = current === 'light' ? 'dark' : current === 'dark' ? 'system' : 'light'
+    html.setAttribute(MODE_ATTR, next)
+    localStorage.setItem(STORAGE_KEY, next)
+    apply(resolveTheme(next))
+  }
+
+  btn.addEventListener('click', cycle)
+
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(){
+    const s = localStorage.getItem(STORAGE_KEY) || 'system'
+    if(s === 'system') apply(getPrefers())
+  })
+})()
+</script>
+
+</body>
+</html>

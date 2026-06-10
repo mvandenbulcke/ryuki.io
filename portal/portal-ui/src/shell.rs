@@ -39,6 +39,83 @@ pub fn Shell() -> impl IntoView {
     let user_name = auth_session.display_name.clone();
     let user_roles = auth_session.roles.join(", ");
 
+    let (theme_icon, set_theme_icon) = signal(String::from("\u{263C}\u{FE0F}"));
+
+    #[cfg(not(feature = "hydrate"))]
+    let _ = &set_theme_icon;
+
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        if let Some(window) = web_sys::window() {
+            let doc = window.document().unwrap();
+            let html = doc.document_element().unwrap();
+            let explicit = html.get_attribute("data-theme");
+            let is_dark = match explicit.as_deref() {
+                Some("dark") => true,
+                Some("light") => false,
+                _ => window
+                    .match_media("(prefers-color-scheme: dark)")
+                    .ok()
+                    .flatten()
+                    .map(|m| m.matches())
+                    .unwrap_or(false),
+            };
+            set_theme_icon.set(if is_dark {
+                "\u{2600}\u{FE0F}".to_string()
+            } else {
+                "\u{1F319}".to_string()
+            });
+        }
+    });
+
+    let on_theme_click = {
+        move |_| {
+            #[cfg(feature = "hydrate")]
+            {
+                let Some(window) = web_sys::window() else {
+                    return;
+                };
+                let doc = window.document().unwrap();
+                let html = doc.document_element().unwrap();
+                let storage = window.local_storage().unwrap().unwrap();
+
+                let current = html.get_attribute("data-theme");
+                match current.as_deref() {
+                    None | Some("") => {
+                        let _ = html.set_attribute("data-theme", "dark");
+                        let _ = storage.set_item("ryuki-theme", "dark");
+                    }
+                    Some("dark") => {
+                        let _ = html.set_attribute("data-theme", "light");
+                        let _ = storage.set_item("ryuki-theme", "light");
+                    }
+                    Some("light") => {
+                        let _ = html.remove_attribute("data-theme");
+                        let _ = storage.remove_item("ryuki-theme");
+                    }
+                    _ => {}
+                }
+
+                let explicit = html.get_attribute("data-theme");
+                let is_dark = match explicit.as_deref() {
+                    Some("dark") => true,
+                    Some("light") => false,
+                    _ => window
+                        .match_media("(prefers-color-scheme: dark)")
+                        .ok()
+                        .flatten()
+                        .map(|m| m.matches())
+                        .unwrap_or(false),
+                };
+                set_theme_icon.set(if is_dark {
+                    "\u{2600}\u{FE0F}".to_string()
+                } else {
+                    "\u{1F319}".to_string()
+                });
+            }
+        }
+    };
+
     view! {
         <div class="shell">
             <header class="topbar" aria-label="Product shell">
@@ -58,14 +135,23 @@ pub fn Shell() -> impl IntoView {
                         disabled=true
                     />
                 </form>
-                <div class="scope" aria-label="Current scope">
-                    <span class="pill">{site_scope_label.clone()}</span>
-                    <span class="pill">{environment_scope_label.clone()}</span>
-                    <span class="pill role">{role_scope_label.clone()}</span>
-                </div>
-                <div class="session-info" aria-label="Session info">
-                    <span class="pill user">{user_name}</span>
-                    <span class="table-note">"Roles: " {user_roles}</span>
+                <div class="toolbar">
+                    <div class="scope" aria-label="Current scope">
+                        <span class="pill">{site_scope_label.clone()}</span>
+                        <span class="pill">{environment_scope_label.clone()}</span>
+                        <span class="pill role">{role_scope_label.clone()}</span>
+                    </div>
+                    <div class="session-info" aria-label="Session info">
+                        <span class="pill user">{user_name}</span>
+                        <span class="table-note">"Roles: " {user_roles}</span>
+                    </div>
+                    <button
+                        class="theme-toggle"
+                        aria-label="Toggle theme"
+                        on:click=on_theme_click
+                    >
+                        {move || theme_icon.get()}
+                    </button>
                 </div>
             </header>
 

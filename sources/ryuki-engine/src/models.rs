@@ -69,6 +69,9 @@ pub enum RequestType {
     ApplicationEnvironmentRetirement,
     VmDecommissionQuarantine,
     RequestPreflight,
+    VmDay2Change,
+    SnapshotGovernance,
+    BackupCoverageReport,
 }
 
 impl std::fmt::Display for RequestType {
@@ -87,6 +90,9 @@ impl std::fmt::Display for RequestType {
             }
             RequestType::VmDecommissionQuarantine => write!(f, "vm-decommission-quarantine"),
             RequestType::RequestPreflight => write!(f, "request-preflight"),
+            RequestType::VmDay2Change => write!(f, "vm-day2-change"),
+            RequestType::SnapshotGovernance => write!(f, "snapshot-governance"),
+            RequestType::BackupCoverageReport => write!(f, "backup-coverage-report"),
         }
     }
 }
@@ -438,6 +444,405 @@ impl std::fmt::Display for PolicyDecision {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2ChangeRequest {
+    pub id: String,
+    pub target_ci_key: String,
+    pub change_type: VmChangeType,
+    pub target_value: u32,
+    pub site: String,
+    pub environment: String,
+    pub owner: String,
+    pub maintenance_window: String,
+    pub status: VmChangeStatus,
+    pub plan: Option<VmDay2Plan>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VmChangeType {
+    ResizeCpu,
+    ResizeMemory,
+    AddDisk,
+    ExtendDisk,
+    MigrateHost,
+    MigrateStorage,
+}
+
+impl std::fmt::Display for VmChangeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmChangeType::ResizeCpu => write!(f, "resize-cpu"),
+            VmChangeType::ResizeMemory => write!(f, "resize-memory"),
+            VmChangeType::AddDisk => write!(f, "add-disk"),
+            VmChangeType::ExtendDisk => write!(f, "extend-disk"),
+            VmChangeType::MigrateHost => write!(f, "migrate-host"),
+            VmChangeType::MigrateStorage => write!(f, "migrate-storage"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VmChangeStatus {
+    Draft,
+    Validated,
+    Planned,
+    Approved,
+    Locked,
+    Executed,
+    Verified,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDay2Plan {
+    pub current_state: VmCurrentState,
+    pub desired_state: VmDesiredState,
+    pub capacity_impact: String,
+    pub backup_impact: String,
+    pub monitoring_impact: String,
+    pub rollback_notes: String,
+    pub verification_plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmCurrentState {
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+    pub host: String,
+    pub datastore: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VmDesiredState {
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRecord {
+    pub id: String,
+    pub platform_ci_key: String,
+    pub snapshot_purpose: String,
+    pub requested_expiry: String,
+    pub owner: String,
+    pub support_group: String,
+    pub change_context: String,
+    pub status: SnapshotStatus,
+    pub policy_decision: Option<String>,
+    pub backup_impact: Option<String>,
+    pub remediation_plan: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SnapshotStatus {
+    Draft,
+    ReviewRequested,
+    ExpiryApproved,
+    StaleFlagged,
+    RemediationPlanned,
+    Expired,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BackupCoverageReport {
+    pub id: String,
+    pub site_scope: Vec<String>,
+    pub environment_scope: Vec<String>,
+    pub generation_time: String,
+    pub total_assets: u32,
+    pub covered_assets: u32,
+    pub missing_backup: u32,
+    pub missing_dr_replica: u32,
+    pub stale_policy: u32,
+    pub critical_gaps: Vec<String>,
+    pub coverage_percentage: f64,
+    pub status: CoverageReportStatus,
+    pub recommendations: Vec<String>,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CoverageReportStatus {
+    Generated,
+    Reviewing,
+    ActionRequired,
+    Accepted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RestoreRequest {
+    pub id: String,
+    pub source_ci_key: String,
+    pub restore_type: RestoreType,
+    pub restore_point: String,
+    pub target_site: String,
+    pub target_environment: String,
+    pub verification_plan: String,
+    pub retention_need: String,
+    pub owner: String,
+    pub status: RestoreStatus,
+    pub dry_run_plan: Option<String>,
+    pub created_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestoreType {
+    FullVm,
+    FileLevel,
+    ApplicationItem,
+    InstantVmRecovery,
+}
+
+impl std::fmt::Display for RestoreType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreType::FullVm => write!(f, "full-vm"),
+            RestoreType::FileLevel => write!(f, "file-level"),
+            RestoreType::ApplicationItem => write!(f, "application-item"),
+            RestoreType::InstantVmRecovery => write!(f, "instant-vm-recovery"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestoreStatus {
+    Draft,
+    Validated,
+    Planned,
+    Approved,
+    Locked,
+    Executed,
+    Verified,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecommissionRequest {
+    pub id: String,
+    pub server_name: String,
+    pub site: String,
+    pub os_family: String,
+    pub server_type: ServerType,
+    pub reason: String,
+    pub final_backup_required: bool,
+    pub quarantine_days: u32,
+    pub status: DecommissionStatus,
+    pub dependencies_identified: Vec<String>,
+    pub backup_confirmed: bool,
+    pub approvals_collected: Vec<String>,
+    pub quarantine_until: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ServerType {
+    VM,
+    Physical,
+}
+
+impl std::fmt::Display for ServerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerType::VM => write!(f, "VM"),
+            ServerType::Physical => write!(f, "Physical"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DecommissionStatus {
+    Draft,
+    Planned,
+    Validated,
+    Approved,
+    Quarantined,
+    Executed,
+    Verified,
+    Completed,
+    RolledBack,
+    Failed,
+}
+
+impl std::fmt::Display for DecommissionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecommissionStatus::Draft => write!(f, "draft"),
+            DecommissionStatus::Planned => write!(f, "planned"),
+            DecommissionStatus::Validated => write!(f, "validated"),
+            DecommissionStatus::Approved => write!(f, "approved"),
+            DecommissionStatus::Quarantined => write!(f, "quarantined"),
+            DecommissionStatus::Executed => write!(f, "executed"),
+            DecommissionStatus::Verified => write!(f, "verified"),
+            DecommissionStatus::Completed => write!(f, "completed"),
+            DecommissionStatus::RolledBack => write!(f, "rolled-back"),
+            DecommissionStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuarantineEntry {
+    pub server_name: String,
+    pub site: String,
+    pub quarantine_until: String,
+    pub remaining_days: u32,
+    pub decommission_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxDeploymentRequest {
+    pub id: String,
+    pub distro: LinuxDistro,
+    pub version: String,
+    pub site: String,
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+    pub hostname: String,
+    pub network: String,
+    pub hardening_profile: HardeningProfile,
+    pub status: LinuxDeploymentStatus,
+    pub plan: Option<LinuxDeploymentPlan>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxDistro {
+    Sles,
+    Rhel,
+    Rocky,
+    Alma,
+    Ubuntu,
+    Debian,
+}
+
+impl std::fmt::Display for LinuxDistro {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinuxDistro::Sles => write!(f, "sles"),
+            LinuxDistro::Rhel => write!(f, "rhel"),
+            LinuxDistro::Rocky => write!(f, "rocky"),
+            LinuxDistro::Alma => write!(f, "alma"),
+            LinuxDistro::Ubuntu => write!(f, "ubuntu"),
+            LinuxDistro::Debian => write!(f, "debian"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LinuxDeploymentStatus {
+    Draft,
+    Validated,
+    Planned,
+    Approved,
+    Locked,
+    Executed,
+    Verified,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HardeningProfile {
+    CisLevel1,
+    CisLevel2,
+    Stig,
+    Custom,
+}
+
+impl std::fmt::Display for HardeningProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HardeningProfile::CisLevel1 => write!(f, "cis-level-1"),
+            HardeningProfile::CisLevel2 => write!(f, "cis-level-2"),
+            HardeningProfile::Stig => write!(f, "stig"),
+            HardeningProfile::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxDeploymentPlan {
+    pub placement: LinuxPlacement,
+    pub storage: LinuxStoragePlan,
+    pub network: LinuxNetworkPlan,
+    pub cloud_init: String,
+    pub distro_baseline: String,
+    pub join_domain: String,
+    pub hardening_plan: String,
+    pub backup_policy: String,
+    pub monitoring_profile: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxPlacement {
+    pub hypervisor: String,
+    pub cluster: String,
+    pub host: String,
+    pub datastore: String,
+    pub resource_pool: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxStoragePlan {
+    pub disk_gb: u32,
+    pub datastore: String,
+    pub thin_provisioned: bool,
+    pub disk_controller: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxNetworkPlan {
+    pub network_label: String,
+    pub adapter_type: String,
+    pub dhcp: bool,
+    pub dns_servers: Vec<String>,
+    pub gateway: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxDistroInfo {
+    pub distro: LinuxDistro,
+    pub display_name: String,
+    pub package_manager: String,
+    pub default_network: String,
+    pub firewall: String,
+    pub min_version: String,
+    pub max_version: String,
+    pub supported_versions: Vec<String>,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinuxDeploymentVerification {
+    pub id: String,
+    pub deployment_id: String,
+    pub hostname_ok: bool,
+    pub agent_running: bool,
+    pub monitoring_onboarded: bool,
+    pub backup_assigned: bool,
+    pub domain_joined: bool,
+    pub hardening_applied: bool,
+    pub evidence: Vec<EvidenceItem>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +940,46 @@ mod tests {
         assert_eq!(ReadinessState::Configured.to_string(), "configured");
         assert_eq!(ReadinessState::Blocked.to_string(), "blocked");
         assert_eq!(ReadinessState::Stale.to_string(), "stale");
+    }
+
+    #[test]
+    fn test_linux_distro_display() {
+        assert_eq!(LinuxDistro::Sles.to_string(), "sles");
+        assert_eq!(LinuxDistro::Ubuntu.to_string(), "ubuntu");
+        assert_eq!(LinuxDistro::Debian.to_string(), "debian");
+        assert_eq!(LinuxDistro::Rhel.to_string(), "rhel");
+    }
+
+    #[test]
+    fn test_hardening_profile_display() {
+        assert_eq!(HardeningProfile::CisLevel1.to_string(), "cis-level-1");
+        assert_eq!(HardeningProfile::Stig.to_string(), "stig");
+        assert_eq!(HardeningProfile::Custom.to_string(), "custom");
+    }
+
+    #[test]
+    fn test_linux_placement_defaults() {
+        let placement = LinuxPlacement {
+            hypervisor: "VMware".into(),
+            cluster: "cluster-a".into(),
+            host: "esx-01".into(),
+            datastore: "ds-01".into(),
+            resource_pool: "pool-production".into(),
+        };
+        assert_eq!(placement.hypervisor, "VMware");
+        assert_eq!(placement.cluster, "cluster-a");
+    }
+
+    #[test]
+    fn test_linux_network_plan_dhcp() {
+        let net = LinuxNetworkPlan {
+            network_label: "VLAN100".into(),
+            adapter_type: "VMXNET3".into(),
+            dhcp: true,
+            dns_servers: vec![],
+            gateway: "auto".into(),
+        };
+        assert!(net.dhcp);
+        assert!(net.dns_servers.is_empty());
     }
 }

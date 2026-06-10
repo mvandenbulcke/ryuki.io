@@ -18,12 +18,14 @@ serde_json = { workspace = true }
 ryuki-core = { path = "../../sources/ryuki-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"], optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "Element", "Storage", "MediaQueryList"], optional = true }
 
 [features]
 default = []
 hydrate = [
     "dep:console_error_panic_hook",
     "dep:wasm-bindgen",
+    "dep:web-sys",
     "leptos/hydrate",
 ]
 ssr = [

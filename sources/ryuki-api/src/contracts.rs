@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query},
     http::StatusCode,
+    routing::delete,
     routing::put,
     routing::{get, post},
     Json, Router,
@@ -14,6 +15,13 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::database::get_db;
+use ryuki_engine::alert_routing_engine;
+use ryuki_engine::backup_engine;
+use ryuki_engine::linux_deployment;
+use ryuki_engine::patch_engine;
+use ryuki_engine::server_decommission;
+use ryuki_engine::snapshot_engine;
+use ryuki_engine::vm_operations;
 
 pub fn routes() -> Router {
     Router::new()
@@ -375,6 +383,18 @@ pub fn routes() -> Router {
             "/api/patching/maintenance-calendar-contract",
             get(patching_maintenance_calendar),
         )
+        // ─── Patch wave orchestration ───
+        .route("/api/maintain/patch/plan", post(patch_plan))
+        .route("/api/maintain/patch/validate", post(patch_validate))
+        .route("/api/maintain/patch/approve", post(patch_approve))
+        .route("/api/maintain/patch/execute", post(patch_execute))
+        .route("/api/maintain/patch/verify", post(patch_verify))
+        .route("/api/maintain/patch/compliance", get(patch_compliance))
+        .route(
+            "/api/maintain/patch/pending-reboots",
+            get(patch_pending_reboots),
+        )
+        .route("/api/maintain/patch-contract", get(patch_contract))
         .route(
             "/api/protect/controlled-restore-contract",
             get(protect_controlled_restore),
@@ -500,6 +520,115 @@ pub fn routes() -> Router {
             "/api/platform/health/adapters",
             get(platform_health_adapters),
         )
+        .route(
+            "/api/monitoring/alert-routing-contract",
+            get(monitoring_alert_routing_contract),
+        )
+        .route("/api/monitoring/alert-routes", post(alert_routes_create))
+        .route("/api/monitoring/alert-routes", get(alert_routes_list))
+        .route("/api/monitoring/alert-routes/{id}", get(alert_routes_get))
+        .route(
+            "/api/monitoring/alert-routes/{id}",
+            put(alert_routes_update),
+        )
+        .route(
+            "/api/monitoring/alert-routes/{id}",
+            delete(alert_routes_delete),
+        )
+        .route("/api/monitoring/alerts/resolve", post(alert_resolve))
+        .route("/api/monitoring/alerts/unrouted", get(alert_unrouted))
+        // ─── VM Day-2 Operations ───
+        .route("/api/vm/day2/plan", post(vm_day2_plan))
+        .route("/api/vm/day2/validate", post(vm_day2_validate))
+        .route("/api/vm/day2/execute", post(vm_day2_execute))
+        .route("/api/vm/day2/verify", post(vm_day2_verify))
+        .route("/api/vm/day2-change-contract", get(vm_day2_change_contract))
+        // ─── Snapshot Governance ───
+        .route("/api/protect/snapshot/plan", post(snapshot_plan))
+        .route("/api/protect/snapshot/validate", post(snapshot_validate))
+        .route("/api/protect/snapshot/review", post(snapshot_review))
+        .route(
+            "/api/protect/snapshot/flag-stale",
+            post(snapshot_flag_stale),
+        )
+        .route("/api/protect/snapshot/remediate", post(snapshot_remediate))
+        .route(
+            "/api/protect/snapshot-governance-contract",
+            get(snapshot_governance_contract),
+        )
+        // ─── Backup Coverage & Restore ───
+        .route(
+            "/api/protect/backup/coverage-report",
+            post(backup_coverage_report),
+        )
+        .route(
+            "/api/protect/backup/restore-plan",
+            post(backup_restore_plan),
+        )
+        .route(
+            "/api/protect/backup/restore-validate",
+            post(backup_restore_validate),
+        )
+        .route(
+            "/api/protect/backup/restore-approve",
+            post(backup_restore_approve),
+        )
+        .route(
+            "/api/protect/backup/restore-execute",
+            post(backup_restore_execute),
+        )
+        .route(
+            "/api/protect/backup-coverage-contract",
+            get(backup_coverage_contract),
+        )
+        // ─── Linux Deployment ───
+        .route("/api/build/linux/plan", post(linux_deploy_plan))
+        .route("/api/build/linux/validate", post(linux_deploy_validate))
+        .route("/api/build/linux/execute", post(linux_deploy_execute))
+        .route("/api/build/linux/verify", post(linux_deploy_verify))
+        .route(
+            "/api/build/linux/supported-distros",
+            get(linux_supported_distros),
+        )
+        .route(
+            "/api/build/linux-deploy-contract",
+            get(linux_deploy_contract),
+        )
+        // ─── Server Decommission ───
+        .route("/api/retire/decommission/plan", post(decommission_plan))
+        .route(
+            "/api/retire/decommission/validate",
+            post(decommission_validate),
+        )
+        .route(
+            "/api/retire/decommission/approve/{id}",
+            post(decommission_approve),
+        )
+        .route(
+            "/api/retire/decommission/quarantine/{id}",
+            post(decommission_quarantine),
+        )
+        .route(
+            "/api/retire/decommission/execute/{id}",
+            post(decommission_execute),
+        )
+        .route(
+            "/api/retire/decommission/verify/{id}",
+            post(decommission_verify),
+        )
+        .route(
+            "/api/retire/decommission/rollback/{id}",
+            post(decommission_rollback),
+        )
+        .route(
+            "/api/retire/decommission/quarantine",
+            get(decommission_quarantine_inventory),
+        )
+        .route("/api/retire/decommission/{id}", get(decommission_get))
+        .route(
+            "/api/retire/decommission-contract",
+            get(decommission_contract),
+        )
 }
 
 // ─── Shared data ───
@@ -520,6 +649,218 @@ pub struct PreflightQuery {
     pub evidence_manifest: Option<String>,
     #[serde(rename = "secretReferenceState")]
     pub secret_reference_state: Option<String>,
+}
+
+// ─── VM Day-2 request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct VmDay2PlanRequest {
+    #[serde(rename = "targetCiKey")]
+    target_ci_key: String,
+    #[serde(rename = "changeType")]
+    change_type: String,
+    #[serde(rename = "targetValue")]
+    target_value: u32,
+    site: String,
+    environment: String,
+    owner: String,
+    #[serde(rename = "maintenanceWindow")]
+    maintenance_window: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct VmDay2ActionRequest {
+    #[serde(rename = "changeId")]
+    change_id: String,
+}
+
+// ─── Snapshot request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SnapshotPlanRequest {
+    #[serde(rename = "platformCiKey")]
+    platform_ci_key: String,
+    #[serde(rename = "snapshotPurpose")]
+    snapshot_purpose: String,
+    #[serde(rename = "requestedExpiry")]
+    requested_expiry: String,
+    owner: String,
+    #[serde(rename = "supportGroup")]
+    support_group: String,
+    #[serde(rename = "changeContext")]
+    change_context: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SnapshotActionRequest {
+    #[serde(rename = "snapshotId")]
+    snapshot_id: String,
+}
+
+// ─── Backup request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CoverageReportRequest {
+    #[serde(rename = "siteScope")]
+    site_scope: Vec<String>,
+    #[serde(rename = "environmentScope")]
+    environment_scope: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RestorePlanRequest {
+    #[serde(rename = "sourceCiKey")]
+    source_ci_key: String,
+    #[serde(rename = "restoreType")]
+    restore_type: String,
+    #[serde(rename = "restorePoint")]
+    restore_point: String,
+    #[serde(rename = "targetSite")]
+    target_site: String,
+    #[serde(rename = "targetEnvironment")]
+    target_environment: String,
+    owner: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RestoreActionRequest {
+    #[serde(rename = "restoreId")]
+    restore_id: String,
+    approver: Option<String>,
+}
+
+// ─── Linux deployment request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LinuxDeployPlanRequest {
+    distro: String,
+    version: String,
+    site: String,
+    cpu: u32,
+    #[serde(rename = "memoryGb")]
+    memory_gb: u32,
+    #[serde(rename = "diskGb")]
+    disk_gb: u32,
+    hostname: String,
+    network: String,
+    #[serde(rename = "hardeningProfile")]
+    hardening_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LinuxDeployValidateRequest {
+    distro: String,
+    version: String,
+    site: String,
+    cpu: u32,
+    #[serde(rename = "memoryGb")]
+    memory_gb: u32,
+    #[serde(rename = "diskGb")]
+    disk_gb: u32,
+    hostname: String,
+    network: String,
+    #[serde(rename = "hardeningProfile")]
+    hardening_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LinuxDeployExecuteRequest {
+    distro: String,
+    version: String,
+    site: String,
+    cpu: u32,
+    #[serde(rename = "memoryGb")]
+    memory_gb: u32,
+    #[serde(rename = "diskGb")]
+    disk_gb: u32,
+    hostname: String,
+    network: String,
+    #[serde(rename = "hardeningProfile")]
+    hardening_profile: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LinuxDeployVerifyRequest {
+    distro: String,
+    version: String,
+    site: String,
+    cpu: u32,
+    #[serde(rename = "memoryGb")]
+    memory_gb: u32,
+    #[serde(rename = "diskGb")]
+    disk_gb: u32,
+    hostname: String,
+    network: String,
+    #[serde(rename = "hardeningProfile")]
+    hardening_profile: String,
+}
+
+// ─── Alert routing request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AlertRouteCreateRequest {
+    #[serde(rename = "triggerName")]
+    trigger_name: String,
+    severity: String,
+    #[serde(rename = "hostGroup")]
+    host_group: String,
+    #[serde(rename = "supportGroup")]
+    support_group: String,
+    priority: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AlertRouteUpdateRequest {
+    #[serde(rename = "triggerName")]
+    trigger_name: Option<String>,
+    severity: Option<String>,
+    #[serde(rename = "hostGroup")]
+    host_group: Option<String>,
+    #[serde(rename = "supportGroup")]
+    support_group: Option<String>,
+    priority: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AlertResolveRequest {
+    #[serde(rename = "triggerName")]
+    trigger_name: String,
+    severity: String,
+    #[serde(rename = "hostGroup")]
+    host_group: String,
+}
+
+// ─── Patch wave request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct PatchPlanRequest {
+    site: String,
+    #[serde(rename = "osFamily")]
+    os_family: String,
+    criticality: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct PatchActionRequest {
+    #[serde(rename = "waveId")]
+    wave_id: String,
 }
 
 // ─── Request lifecycle types ───
@@ -2350,6 +2691,75 @@ async fn patching_maintenance_calendar() -> Json<Value> {
     )
 }
 
+// ─── Patch wave orchestration handlers ───
+
+async fn patch_plan(Json(body): Json<PatchPlanRequest>) -> ApiResult {
+    match patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality) {
+        Ok(wave) => Ok(Json(serde_json::to_value(wave).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
+    match patch_engine::validate_patch_wave(&body.wave_id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_approve(Json(body): Json<PatchActionRequest>) -> ApiResult {
+    match patch_engine::approve_patch_wave(&body.wave_id) {
+        Ok(wave) => Ok(Json(serde_json::to_value(wave).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_execute(Json(body): Json<PatchActionRequest>) -> ApiResult {
+    match patch_engine::execute_patch_wave(&body.wave_id) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_verify(Json(body): Json<PatchActionRequest>) -> ApiResult {
+    match patch_engine::verify_patch_wave(&body.wave_id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_compliance() -> ApiResult {
+    match patch_engine::get_patch_compliance() {
+        Ok(compliance) => Ok(Json(compliance)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_pending_reboots() -> ApiResult {
+    match patch_engine::get_pending_reboots() {
+        Ok(reboots) => Ok(Json(reboots)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn patch_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "patchMode": "dry-run-orchestration",
+        "dryRunRequired": true,
+        "liveExecutionAllowed": false,
+        "supportedWorkflows": ["patch-plan","patch-validate","patch-approve","patch-execute","patch-verify","patch-compliance","pending-reboots"],
+        "waveDimensions": ["site","osFamily","criticality","maintenanceWindow","rebootPolicy","dependencyGroup","backupState"],
+        "validOsFamilies": ["windows","linux"],
+        "validSites": ["LOVE","BUR1","CCSS","TOR1","TRUJ","VILL","ALBI","AOST","MACL","SSYM","WIJH","RMA1","PITE"],
+        "requiredInputs": ["site","osFamily","criticality"],
+        "requiredGuards": ["patch-policy-imported","inventory-coverage-current","backup-state-known","maintenance-window-known","approval-route-assigned","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-execution-disabled","unknown-site","invalid-os-family","backup-state-unknown","maintenance-window-missing","approval-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Patch wave plan summary","Validation result","Approval decisions","Redacted execution evidence","Post-patch compliance report","Evidence references"]
+    }))
+}
+
 async fn protect_controlled_restore() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"restoreTypes":["file","vm","application","sql"],"requiredGuards":["restore-point-known","target-isolation-reviewed","owner-approval-assigned","backup-operator-approval-assigned","verification-plan-ready","evidence-redacted"],"planSections":["restoreScope","restorePointSummary","targetSelection","isolationPlan","verificationPlan","riskNotes","rollbackNotes"],"blockedReasons":["provider-calls-disabled","restore-point-unknown","target-selection-missing","target-isolation-not-reviewed","approval-missing","verification-plan-missing","evidence-not-redacted"]}),
@@ -2782,6 +3192,10 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthExtractor {
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
+fn status_400(msg: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": msg})))
+}
+
 fn status_404(id: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -3179,6 +3593,747 @@ async fn requests_verify(Path(request_id): Path<String>) -> ApiResult {
         }
         None => Err(status_404(&request_id)),
     }
+}
+
+// ─── VM Day-2 Operations handlers ───
+
+async fn vm_day2_plan(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
+    let change_type = match body.change_type.as_str() {
+        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
+        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
+        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
+        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
+        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
+        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
+        _ => return Err(status_400("Invalid change type")),
+    };
+    match vm_operations::plan_vm_day2_change(
+        &body.target_ci_key,
+        change_type,
+        body.target_value,
+        &body.site,
+        &body.environment,
+        &body.owner,
+        &body.maintenance_window,
+    ) {
+        Ok(change) => Ok(Json(serde_json::to_value(change).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn vm_day2_validate(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
+    let change_type = match body.change_type.as_str() {
+        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
+        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
+        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
+        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
+        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
+        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
+        _ => return Err(status_400("Invalid change type")),
+    };
+    let change = vm_operations::plan_vm_day2_change(
+        &body.target_ci_key,
+        change_type,
+        body.target_value,
+        &body.site,
+        &body.environment,
+        &body.owner,
+        &body.maintenance_window,
+    )
+    .map_err(|e| status_400(&e))?;
+    match vm_operations::validate_vm_day2_change(&change) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn vm_day2_execute(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
+    let change_type = match body.change_type.as_str() {
+        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
+        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
+        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
+        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
+        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
+        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
+        _ => return Err(status_400("Invalid change type")),
+    };
+    let change = vm_operations::plan_vm_day2_change(
+        &body.target_ci_key,
+        change_type,
+        body.target_value,
+        &body.site,
+        &body.environment,
+        &body.owner,
+        &body.maintenance_window,
+    )
+    .map_err(|e| status_400(&e))?;
+    match vm_operations::execute_vm_day2_change(&change) {
+        Ok(executed) => Ok(Json(serde_json::to_value(executed).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn vm_day2_verify(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
+    let change_type = match body.change_type.as_str() {
+        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
+        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
+        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
+        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
+        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
+        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
+        _ => return Err(status_400("Invalid change type")),
+    };
+    let change = vm_operations::plan_vm_day2_change(
+        &body.target_ci_key,
+        change_type,
+        body.target_value,
+        &body.site,
+        &body.environment,
+        &body.owner,
+        &body.maintenance_window,
+    )
+    .map_err(|e| status_400(&e))?;
+    match vm_operations::verify_vm_day2_change(&change) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn vm_day2_change_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "changeMode": "dry-run-plan",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveChangeAllowed": false,
+        "supportedActions": ["resize-cpu","resize-memory","add-disk","extend-disk","migrate-host","migrate-storage"],
+        "requiredInputs": ["targetCiKey","changeType","targetValue","site","environment","owner","maintenanceWindow"],
+        "requiredGuards": ["request-preflight-ready","capacity-admission-ready","cmdb-ci-known","backup-state-known","monitoring-impact-reviewed","approval-route-assigned","lock-scope-defined","rollback-plan-ready","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-change-disabled","stale-inventory","capacity-not-approved","cmdb-context-ambiguous","backup-state-unknown","maintenance-window-missing"],
+        "requiredEvidence": ["VM change dry-run plan","Capacity impact","Backup and monitoring impact","Verification plan","Evidence references"]
+    }))
+}
+
+// ─── Snapshot Governance handlers ───
+
+async fn snapshot_plan(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+    match snapshot_engine::plan_snapshot(
+        &body.platform_ci_key,
+        &body.snapshot_purpose,
+        &body.requested_expiry,
+        &body.owner,
+        &body.support_group,
+        &body.change_context,
+    ) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn snapshot_validate(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+    let record = snapshot_engine::plan_snapshot(
+        &body.platform_ci_key,
+        &body.snapshot_purpose,
+        &body.requested_expiry,
+        &body.owner,
+        &body.support_group,
+        &body.change_context,
+    )
+    .map_err(|e| status_400(&e))?;
+    match snapshot_engine::validate_snapshot(&record) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn snapshot_review(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+    let record = snapshot_engine::plan_snapshot(
+        &body.platform_ci_key,
+        &body.snapshot_purpose,
+        &body.requested_expiry,
+        &body.owner,
+        &body.support_group,
+        &body.change_context,
+    )
+    .map_err(|e| status_400(&e))?;
+    match snapshot_engine::review_snapshot_policy(&record) {
+        Ok(reviewed) => Ok(Json(serde_json::to_value(reviewed).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn snapshot_flag_stale(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+    let record = snapshot_engine::plan_snapshot(
+        &body.platform_ci_key,
+        &body.snapshot_purpose,
+        "2020-01-01T00:00:00Z",
+        &body.owner,
+        &body.support_group,
+        &body.change_context,
+    )
+    .map_err(|e| status_400(&e))?;
+    match snapshot_engine::flag_stale_snapshots(&[record]) {
+        Ok(flagged) => Ok(Json(serde_json::to_value(flagged).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn snapshot_remediate(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+    let mut record = snapshot_engine::plan_snapshot(
+        &body.platform_ci_key,
+        &body.snapshot_purpose,
+        "2020-01-01T00:00:00Z",
+        &body.owner,
+        &body.support_group,
+        &body.change_context,
+    )
+    .map_err(|e| status_400(&e))?;
+    record.status = ryuki_engine::models::SnapshotStatus::StaleFlagged;
+    match snapshot_engine::plan_snapshot_remediation(&record) {
+        Ok(remediated) => Ok(Json(serde_json::to_value(remediated).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn snapshot_governance_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "governanceMode": "dry-run-review",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveSnapshotAllowed": false,
+        "liveDeletionAllowed": false,
+        "supportedWorkflows": ["planned-snapshot-exception","snapshot-expiry-review","stale-snapshot-remediation","owner-attestation","backup-conflict-review"],
+        "requiredInputs": ["platformCiKey","snapshotPurpose","requestedExpiry","owner","supportGroup","changeContext","backupState","maintenanceWindow","evidenceManifest"],
+        "requiredGuards": ["cmdb-ci-known","owner-known","backup-state-known","expiry-policy-known","approval-route-assigned","lock-scope-defined","rollback-notes-ready","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-snapshot-disabled","live-deletion-disabled","stale-inventory","missing-owner","missing-expiry","backup-conflict-unknown"],
+        "requiredEvidence": ["Snapshot summary","Policy decision","Expiry review","Backup impact","Remediation dry-run plan","Approval decisions","Lock record","Handover notes","Evidence references"]
+    }))
+}
+
+// ─── Backup Coverage & Restore handlers ───
+
+async fn backup_coverage_report(Json(body): Json<CoverageReportRequest>) -> ApiResult {
+    match backup_engine::generate_backup_coverage_report(&body.site_scope, &body.environment_scope)
+    {
+        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn backup_restore_plan(Json(body): Json<RestorePlanRequest>) -> ApiResult {
+    let restore_type = match body.restore_type.as_str() {
+        "full-vm" => ryuki_engine::models::RestoreType::FullVm,
+        "file-level" => ryuki_engine::models::RestoreType::FileLevel,
+        "application-item" => ryuki_engine::models::RestoreType::ApplicationItem,
+        "instant-vm-recovery" => ryuki_engine::models::RestoreType::InstantVmRecovery,
+        _ => return Err(status_400("Invalid restore type")),
+    };
+    match backup_engine::plan_restore(
+        &body.source_ci_key,
+        restore_type,
+        &body.restore_point,
+        &body.target_site,
+        &body.target_environment,
+        &body.owner,
+    ) {
+        Ok(restore) => Ok(Json(serde_json::to_value(restore).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn backup_restore_validate(Json(body): Json<RestorePlanRequest>) -> ApiResult {
+    let restore_type = match body.restore_type.as_str() {
+        "full-vm" => ryuki_engine::models::RestoreType::FullVm,
+        "file-level" => ryuki_engine::models::RestoreType::FileLevel,
+        "application-item" => ryuki_engine::models::RestoreType::ApplicationItem,
+        "instant-vm-recovery" => ryuki_engine::models::RestoreType::InstantVmRecovery,
+        _ => return Err(status_400("Invalid restore type")),
+    };
+    let restore = backup_engine::plan_restore(
+        &body.source_ci_key,
+        restore_type,
+        &body.restore_point,
+        &body.target_site,
+        &body.target_environment,
+        &body.owner,
+    )
+    .map_err(|e| status_400(&e))?;
+    match backup_engine::validate_restore_request(&restore) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+    let restore = ryuki_engine::models::RestoreRequest {
+        id: body.restore_id,
+        source_ci_key: "ci-001".to_string(),
+        restore_type: ryuki_engine::models::RestoreType::FullVm,
+        restore_point: "2026-06-10T02:00:00Z".to_string(),
+        target_site: "LOVE".to_string(),
+        target_environment: "production".to_string(),
+        verification_plan: String::new(),
+        retention_need: String::new(),
+        owner: "backup-team".to_string(),
+        status: ryuki_engine::models::RestoreStatus::Planned,
+        dry_run_plan: None,
+        created_at: String::new(),
+        metadata: std::collections::HashMap::new(),
+    };
+    let approver = body.approver.as_deref().unwrap_or("Backup Operator");
+    match backup_engine::approve_restore(&restore, approver) {
+        Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+    let restore = ryuki_engine::models::RestoreRequest {
+        id: body.restore_id,
+        source_ci_key: "ci-001".to_string(),
+        restore_type: ryuki_engine::models::RestoreType::FullVm,
+        restore_point: "2026-06-10T02:00:00Z".to_string(),
+        target_site: "LOVE".to_string(),
+        target_environment: "production".to_string(),
+        verification_plan: String::new(),
+        retention_need: String::new(),
+        owner: "backup-team".to_string(),
+        status: ryuki_engine::models::RestoreStatus::Approved,
+        dry_run_plan: None,
+        created_at: String::new(),
+        metadata: std::collections::HashMap::new(),
+    };
+    match backup_engine::execute_restore(&restore) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn backup_coverage_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "coverageMode": "dry-run-report",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveBackupQueryAllowed": false,
+        "supportedWorkflows": ["backup-coverage-report","restore-plan","restore-validation","restore-approval","restore-execution"],
+        "requiredInputs": ["siteScope","environmentScope","sourceCiKey","restoreType","restorePoint","targetSite","targetEnvironment","owner"],
+        "requiredGuards": ["backup-state-known","restore-point-verified","target-capacity-reviewed","network-isolation-reviewed","approval-route-assigned","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-backup-query-disabled","backup-state-unknown","restore-point-not-verified","target-capacity-not-reviewed"],
+        "requiredEvidence": ["Coverage report summary","Restore dry-run plan","Backup integrity check","Restore execution log","Post-restore verification","Evidence references"]
+    }))
+}
+
+// ─── Server Decommission request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DecommissionPlanRequest {
+    #[serde(rename = "serverName")]
+    server_name: String,
+    site: String,
+    #[serde(rename = "osFamily")]
+    os_family: String,
+    #[serde(rename = "serverType")]
+    server_type: String,
+    reason: String,
+    #[serde(rename = "finalBackupRequired")]
+    final_backup_required: bool,
+    #[serde(rename = "quarantineDays")]
+    quarantine_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DecommissionApproveRequest {
+    approver: String,
+}
+
+// ─── Server Decommission store (in-memory) ───
+
+static DECOMMISSION_STORE: OnceLock<Mutex<Vec<ryuki_engine::models::DecommissionRequest>>> =
+    OnceLock::new();
+
+fn decommission_store() -> &'static Mutex<Vec<ryuki_engine::models::DecommissionRequest>> {
+    DECOMMISSION_STORE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// ─── Server Decommission handlers ───
+
+async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
+    let server_type = match body.server_type.as_str() {
+        "VM" => ryuki_engine::models::ServerType::VM,
+        "Physical" => ryuki_engine::models::ServerType::Physical,
+        _ => return Err(status_400("Invalid server type. Use VM or Physical.")),
+    };
+    match server_decommission::plan_decommission(
+        &body.server_name,
+        &body.site,
+        &body.os_family,
+        server_type,
+        &body.reason,
+        body.final_backup_required,
+        body.quarantine_days,
+    ) {
+        Ok(req) => {
+            let json = serde_json::to_value(&req).unwrap();
+            let mut store = decommission_store().lock().await;
+            store.push(req);
+            Ok(Json(json))
+        }
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_validate(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
+    let server_type = match body.server_type.as_str() {
+        "VM" => ryuki_engine::models::ServerType::VM,
+        "Physical" => ryuki_engine::models::ServerType::Physical,
+        _ => return Err(status_400("Invalid server type")),
+    };
+    let req = server_decommission::plan_decommission(
+        &body.server_name,
+        &body.site,
+        &body.os_family,
+        server_type,
+        &body.reason,
+        body.final_backup_required,
+        body.quarantine_days,
+    )
+    .map_err(|e| status_400(&e))?;
+    match server_decommission::validate_decommission(&req) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_approve(
+    Path(id): Path<String>,
+    Json(body): Json<DecommissionApproveRequest>,
+) -> ApiResult {
+    let mut store = decommission_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    let mut req = store[idx].clone();
+    req.approvals_collected.push(body.approver);
+    req.status = ryuki_engine::models::DecommissionStatus::Approved;
+    req.updated_at = chrono::Utc::now().to_rfc3339();
+    store[idx] = req.clone();
+    Ok(Json(serde_json::to_value(req).unwrap()))
+}
+
+async fn decommission_quarantine(Path(id): Path<String>) -> ApiResult {
+    let mut store = decommission_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    match server_decommission::quarantine_server(&store[idx]) {
+        Ok(quarantined) => {
+            store[idx] = quarantined.clone();
+            Ok(Json(serde_json::to_value(quarantined).unwrap()))
+        }
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_execute(Path(id): Path<String>) -> ApiResult {
+    let mut store = decommission_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    match server_decommission::execute_decommission(&store[idx]) {
+        Ok(executed) => {
+            store[idx] = executed.clone();
+            Ok(Json(serde_json::to_value(executed).unwrap()))
+        }
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_verify(Path(id): Path<String>) -> ApiResult {
+    let store = decommission_store().lock().await;
+    let req = store
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    match server_decommission::verify_decommission(req) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_rollback(Path(id): Path<String>) -> ApiResult {
+    let mut store = decommission_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    match server_decommission::rollback_decommission(&store[idx]) {
+        Ok(rolled_back) => {
+            store[idx] = rolled_back.clone();
+            Ok(Json(serde_json::to_value(rolled_back).unwrap()))
+        }
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn decommission_quarantine_inventory() -> ApiResult {
+    let store = decommission_store().lock().await;
+    let requests: Vec<_> = store.clone();
+    let inventory = server_decommission::get_quarantine_inventory(&requests);
+    Ok(Json(serde_json::to_value(inventory).unwrap()))
+}
+
+async fn decommission_get(Path(id): Path<String>) -> ApiResult {
+    let store = decommission_store().lock().await;
+    let req = store
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| status_400("Decommission request not found"))?;
+    Ok(Json(serde_json::to_value(req).unwrap()))
+}
+
+async fn decommission_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "decommissionMode": "dry-run-quarantine",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveDecommissionAllowed": false,
+        "liveDeletionAllowed": false,
+        "supportedActions": ["plan","validate","approve","quarantine","execute","verify","rollback"],
+        "requiredInputs": ["serverName","site","osFamily","serverType","reason","finalBackupRequired","quarantineDays"],
+        "workflowStages": ["draft","planned","validated","approved","quarantined","executed","verified","completed","rolledBack","failed"],
+        "dependencyCategories": ["backup-retention","dns-records","monitoring","cmdb","network-firewall","certificates","scheduled-tasks","service-accounts","group-policy","file-shares"],
+        "requiredGuards": ["dependencies-identified","backup-confirmed","approvals-collected","quarantine-period-set","monitoring-removed","dns-removed","cmdb-removed","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-decommission-disabled","live-deletion-disabled","dependencies-not-identified","backup-not-confirmed","approvals-missing","quarantine-expired"],
+        "requiredEvidence": ["Decommission plan summary","Dependency review","Backup retention proof","Approval decisions","Quarantine plan","Redacted execution log","Monitoring disablement proof","CMDB closure export","Final evidence references"]
+    }))
+}
+
+// ─── Linux Deployment handlers ───
+
+fn parse_linux_distro(d: &str) -> ryuki_engine::models::LinuxDistro {
+    match d {
+        "sles" => ryuki_engine::models::LinuxDistro::Sles,
+        "rhel" => ryuki_engine::models::LinuxDistro::Rhel,
+        "rocky" => ryuki_engine::models::LinuxDistro::Rocky,
+        "alma" => ryuki_engine::models::LinuxDistro::Alma,
+        "ubuntu" => ryuki_engine::models::LinuxDistro::Ubuntu,
+        "debian" => ryuki_engine::models::LinuxDistro::Debian,
+        _ => ryuki_engine::models::LinuxDistro::Ubuntu,
+    }
+}
+
+fn parse_hardening_profile(p: &str) -> ryuki_engine::models::HardeningProfile {
+    match p {
+        "cis-level-1" => ryuki_engine::models::HardeningProfile::CisLevel1,
+        "cis-level-2" => ryuki_engine::models::HardeningProfile::CisLevel2,
+        "stig" => ryuki_engine::models::HardeningProfile::Stig,
+        "custom" => ryuki_engine::models::HardeningProfile::Custom,
+        _ => ryuki_engine::models::HardeningProfile::CisLevel1,
+    }
+}
+
+async fn linux_deploy_plan(Json(body): Json<LinuxDeployPlanRequest>) -> ApiResult {
+    let distro = parse_linux_distro(&body.distro);
+    let hardening = parse_hardening_profile(&body.hardening_profile);
+    match linux_deployment::plan_linux_deployment(
+        distro,
+        &body.version,
+        &body.site,
+        body.cpu,
+        body.memory_gb,
+        body.disk_gb,
+        &body.hostname,
+        &body.network,
+        hardening,
+    ) {
+        Ok(req) => Ok(Json(serde_json::to_value(req).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn linux_deploy_validate(Json(body): Json<LinuxDeployValidateRequest>) -> ApiResult {
+    let distro = parse_linux_distro(&body.distro);
+    let hardening = parse_hardening_profile(&body.hardening_profile);
+    let req = linux_deployment::plan_linux_deployment(
+        distro,
+        &body.version,
+        &body.site,
+        body.cpu,
+        body.memory_gb,
+        body.disk_gb,
+        &body.hostname,
+        &body.network,
+        hardening,
+    )
+    .map_err(|e| status_400(&e))?;
+    match linux_deployment::validate_linux_deployment(&req) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn linux_deploy_execute(Json(body): Json<LinuxDeployExecuteRequest>) -> ApiResult {
+    let distro = parse_linux_distro(&body.distro);
+    let hardening = parse_hardening_profile(&body.hardening_profile);
+    let req = linux_deployment::plan_linux_deployment(
+        distro,
+        &body.version,
+        &body.site,
+        body.cpu,
+        body.memory_gb,
+        body.disk_gb,
+        &body.hostname,
+        &body.network,
+        hardening,
+    )
+    .map_err(|e| status_400(&e))?;
+    match linux_deployment::execute_linux_deployment(&req) {
+        Ok(executed) => Ok(Json(serde_json::to_value(executed).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn linux_deploy_verify(Json(body): Json<LinuxDeployVerifyRequest>) -> ApiResult {
+    let distro = parse_linux_distro(&body.distro);
+    let hardening = parse_hardening_profile(&body.hardening_profile);
+    let mut req = linux_deployment::plan_linux_deployment(
+        distro,
+        &body.version,
+        &body.site,
+        body.cpu,
+        body.memory_gb,
+        body.disk_gb,
+        &body.hostname,
+        &body.network,
+        hardening,
+    )
+    .map_err(|e| status_400(&e))?;
+    req.status = ryuki_engine::models::LinuxDeploymentStatus::Executed;
+    match linux_deployment::verify_linux_deployment(&req) {
+        Ok(verification) => Ok(Json(serde_json::to_value(verification).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn linux_supported_distros() -> Json<Value> {
+    let catalog = linux_deployment::supported_distro_catalog();
+    Json(serde_json::to_value(catalog).unwrap())
+}
+
+async fn linux_deploy_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "deployMode": "dry-run-deployment",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveDeploymentAllowed": false,
+        "liveHypervisorCallsAllowed": false,
+        "supportedDistros": ["sles","rhel","rocky","alma","ubuntu","debian"],
+        "supportedHardeningProfiles": ["cis-level-1","cis-level-2","stig","custom"],
+        "requiredInputs": ["distro","version","site","cpu","memoryGb","diskGb","hostname","network","hardeningProfile"],
+        "requiredGuards": ["site-known","distro-version-supported","capacity-admission-ready","network-profile-known","hostname-valid","hardening-profile-known","approval-route-assigned","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-deployment-disabled","live-hypervisor-calls-disabled","site-unknown","distro-version-not-supported","capacity-not-approved","network-profile-missing","hostname-invalid","hardening-profile-unknown","raw-hypervisor-payloads-disabled","credential-values-disabled","object-identifiers-disabled","private-network-values-disabled","evidence-not-redacted"],
+        "requiredEvidence": ["Linux deployment plan","Placement decision","Cloud-init configuration","Validation result","Execution evidence","Post-deploy verification","Evidence references"]
+    }))
+}
+
+// ─── Alert routing handlers ───
+
+async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiResult {
+    match alert_routing_engine::build_alert_route(
+        &body.trigger_name,
+        &body.severity,
+        &body.host_group,
+        &body.support_group,
+        &body.priority,
+    ) {
+        Ok(route) => Ok(Json(serde_json::to_value(route).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn alert_routes_list() -> Json<Value> {
+    let routes = alert_routing_engine::list_routes();
+    Json(serde_json::to_value(routes).unwrap())
+}
+
+async fn alert_routes_get(Path(id): Path<String>) -> ApiResult {
+    match alert_routing_engine::get_route(&id) {
+        Some(route) => Ok(Json(serde_json::to_value(route).unwrap())),
+        None => Err(status_404(&id)),
+    }
+}
+
+async fn alert_routes_update(
+    Path(id): Path<String>,
+    Json(body): Json<AlertRouteUpdateRequest>,
+) -> ApiResult {
+    match alert_routing_engine::update_route(
+        &id,
+        body.trigger_name.as_deref(),
+        body.severity.as_deref(),
+        body.host_group.as_deref(),
+        body.support_group.as_deref(),
+        body.priority.as_deref(),
+        body.enabled,
+    ) {
+        Ok(route) => Ok(Json(serde_json::to_value(route).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn alert_routes_delete(Path(id): Path<String>) -> ApiResult {
+    match alert_routing_engine::delete_route(&id) {
+        Ok(()) => Ok(Json(serde_json::json!({"deleted": true, "id": id}))),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn alert_resolve(Json(body): Json<AlertResolveRequest>) -> ApiResult {
+    match alert_routing_engine::resolve_alert_route(
+        &body.trigger_name,
+        &body.severity,
+        &body.host_group,
+    ) {
+        Ok(decision) => Ok(Json(serde_json::to_value(decision).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn alert_unrouted() -> Json<Value> {
+    let unrouted = alert_routing_engine::get_unrouted_alerts();
+    Json(serde_json::to_value(unrouted).unwrap())
+}
+
+async fn monitoring_alert_routing_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveRoutingAllowed": false,
+        "dryRunRequired": true,
+        "supportedWorkflows": ["alert-routing-create","alert-routing-list","alert-routing-update","alert-routing-delete","alert-resolve"],
+        "routeDimensions": ["triggerName","severity","hostGroup","supportGroup","priority"],
+        "validSeverities": ["info","warning","average","high","disaster"],
+        "validPriorities": ["P1","P2","P3","P4"],
+        "requiredInputs": ["triggerName","severity","hostGroup","supportGroup","priority"],
+        "requiredGuards": ["trigger-name-known","severity-valid","host-group-known","support-group-known","priority-valid","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-routing-disabled","unknown-trigger","invalid-severity","unknown-host-group","unknown-support-group","invalid-priority","evidence-not-redacted"],
+        "requiredEvidence": ["Alert route summary","Validation result","Route decision","Coverage gap report","Evidence references"],
+        "rules": [
+            {"id":"no-live-alert-action","decision":"block","requirement":"Alert routing returns dry-run route decisions only and never changes Zabbix or ServiceNow actions.","evidence":"Alert route summary"},
+            {"id":"support-group-required","decision":"block","requirement":"Every alert route requires a known support group before routing can proceed.","evidence":"Validation result"},
+            {"id":"severity-must-be-valid","decision":"block","requirement":"Alert severity must be one of: info, warning, average, high, disaster.","evidence":"Validation result"},
+            {"id":"raw-data-not-exposed","decision":"block","requirement":"Alert routing evidence must use safe summaries only and must not expose raw Zabbix or ServiceNow payloads.","evidence":"Evidence references"}
+        ]
+    }))
 }
 
 #[cfg(test)]
