@@ -7,7 +7,7 @@ mod contracts;
 pub mod database;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequest, StatusCode};
 use axum::middleware;
 use axum::response::Response;
 use axum::{extract::Query, routing::get, Extension, Json, Router};
@@ -76,11 +76,28 @@ fn auth_session_for_request(auth_mode: AuthMode, auth_header: Option<&str>) -> A
     }
 }
 
+fn is_unsafe_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+fn is_auth_exempt_path(path: &str) -> bool {
+    matches!(path, "/api/auth/login" | "/api/auth/logout")
+}
+
+fn auth_session_allows_unsafe_method(session: &AuthSession) -> bool {
+    session.token_valid || session.provider_mode == "static-dry-run"
+}
+
 async fn auth_middleware(
     headers: HeaderMap,
     mut request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
@@ -90,6 +107,24 @@ async fn auth_middleware(
         "auth middleware"
     );
     let session = auth_session_for_request(auth_mode, auth_header);
+
+    if is_unsafe_method(&method)
+        && !is_auth_exempt_path(&path)
+        && !auth_session_allows_unsafe_method(&session)
+    {
+        let body = serde_json::to_string(&ApiError::new(
+            "AUTH_REQUIRED",
+            "Verified authentication is required for this operation",
+        ))
+        .unwrap_or_else(|_| {
+            r#"{"error":"AUTH_REQUIRED","message":"Verified authentication is required for this operation"}"#.into()
+        });
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+    }
 
     request.extensions_mut().insert(session);
     next.run(request).await
@@ -867,6 +902,34 @@ mod tests {
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
+    }
+
+    #[test]
+    fn test_unsafe_method_detection() {
+        assert!(is_unsafe_method(&Method::POST));
+        assert!(is_unsafe_method(&Method::PUT));
+        assert!(is_unsafe_method(&Method::PATCH));
+        assert!(is_unsafe_method(&Method::DELETE));
+        assert!(!is_unsafe_method(&Method::GET));
+    }
+
+    #[test]
+    fn test_auth_exempt_paths_are_limited_to_auth_flow() {
+        assert!(is_auth_exempt_path("/api/auth/login"));
+        assert!(is_auth_exempt_path("/api/auth/logout"));
+        assert!(!is_auth_exempt_path("/api/requests"));
+    }
+
+    #[test]
+    fn test_unsafe_method_auth_requires_static_or_verified_session() {
+        let static_session = AuthSession::static_dry_run();
+        let unverified = AuthSession::unverified_entra();
+        let mut verified = AuthSession::unverified_entra();
+        verified.token_valid = true;
+
+        assert!(auth_session_allows_unsafe_method(&static_session));
+        assert!(auth_session_allows_unsafe_method(&verified));
+        assert!(!auth_session_allows_unsafe_method(&unverified));
     }
 
     #[test]
