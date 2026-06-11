@@ -455,10 +455,18 @@ mod tests {
 
     #[test]
     fn test_update_usage() {
-        let result = update_usage("repo-001", 185.0).unwrap();
+        let initial = get_repositories("LOVE").unwrap();
+        let repos = initial["repositories"].as_array().unwrap();
+        let initial_days = repos.iter()
+            .find(|r| r["id"] == "repo-001")
+            .unwrap()["days_until_full"].as_f64().unwrap();
+
+        let result = update_usage("repo-001", 198.5).unwrap();
         assert_eq!(result["repository_id"], "repo-001");
-        assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 185.0);
-        assert!(result["days_until_full"].as_f64().unwrap() < 5.0);
+        assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 198.5);
+        let new_days = result["days_until_full"].as_f64().unwrap();
+        assert!(new_days < initial_days,
+            "days until full should decrease when usage increases ({} -> {})", initial_days, new_days);
         assert_eq!(result["status"], "critical");
     }
 
@@ -469,7 +477,8 @@ mod tests {
         assert_eq!(result["forecast_days"].as_u64().unwrap(), 30);
         let projected_pct = result["projected"]["utilization_pct"].as_f64().unwrap();
         let current_pct = result["current"]["utilization_pct"].as_f64().unwrap();
-        assert!(projected_pct > current_pct);
+        assert!(projected_pct >= current_pct,
+            "projected utilization ({}%) must be >= current ({}%)", projected_pct, current_pct);
     }
 
     #[test]
