@@ -16,11 +16,12 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::Instrument;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -110,6 +111,15 @@ struct RequestId(String);
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
+static DRAINING: AtomicBool = AtomicBool::new(false);
+
+fn set_draining() {
+    DRAINING.store(true, Ordering::Release);
+}
+
+fn is_draining() -> bool {
+    DRAINING.load(Ordering::Acquire)
+}
 
 async fn request_counter_middleware(
     request: HttpRequest<Body>,
@@ -134,10 +144,26 @@ fn duration_tracker() -> &'static DurationTracker {
 
 async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -> Response {
     let start = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
+
     let response = next.run(request).await;
     let duration_us = start.elapsed().as_micros() as u64;
+    let status = response.status();
 
-    tracing::info!(duration_us, "request completed");
+    tracing::info!(
+        method = %method,
+        path = %path,
+        status = status.as_u16(),
+        duration_us,
+        request_id = %request_id,
+        "access"
+    );
 
     let tracker = duration_tracker();
     let mut durations = tracker.durations.lock().unwrap();
@@ -197,6 +223,7 @@ async fn security_headers_middleware(
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
+    let csp = &crate::config_store::get_app_config().security.content_security_policy;
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -210,6 +237,10 @@ async fn security_headers_middleware(
     headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_str(csp).unwrap_or(HeaderValue::from_static("default-src 'self'")),
     );
     response
 }
@@ -242,6 +273,7 @@ async fn shutdown_signal(timeout_secs: u64) {
     }
 
     tracing::info!(timeout_secs, "draining in-flight requests");
+    set_draining();
     tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
 }
 
@@ -290,6 +322,8 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let body_limit = app_config.server.max_body_size_bytes;
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -308,6 +342,7 @@ async fn main() {
             async move { rate_limit_middleware(limiter, req, next).await }
         }))
         .layer(middleware::from_fn(auth_middleware))
+        .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(middleware::from_fn(timing_middleware));
@@ -388,6 +423,16 @@ async fn ready(
             Some("Simulated error for testing ProblemDetails contract"),
         ));
     }
+
+    if is_draining() {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DRAINING",
+            "Server is draining and not accepting traffic",
+            Some("Shutdown in progress"),
+        ));
+    }
+
     let db_connected = crate::database::get_db().is_some();
     let status = if db_connected { "ready" } else { "degraded" };
     tracing::info!(status, db_connected, "readiness check result");

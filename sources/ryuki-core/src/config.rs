@@ -173,6 +173,8 @@ pub struct ServerConfig {
     pub shutdown_timeout_secs: u64,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size_bytes: usize,
 }
 
 fn default_bind_address() -> String {
@@ -187,12 +189,35 @@ fn default_request_timeout() -> u64 {
     30
 }
 
+fn default_max_body_size() -> usize {
+    10 * 1024 * 1024
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_address: default_bind_address(),
             shutdown_timeout_secs: default_shutdown_timeout(),
             request_timeout_secs: default_request_timeout(),
+            max_body_size_bytes: default_max_body_size(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SecurityConfig {
+    #[serde(default = "default_csp_directive")]
+    pub content_security_policy: String,
+}
+
+fn default_csp_directive() -> String {
+    "default-src 'self'".to_string()
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            content_security_policy: default_csp_directive(),
         }
     }
 }
@@ -284,6 +309,8 @@ pub struct RyukiConfig {
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
     pub logging: LogConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 fn default_database_url() -> String {
@@ -321,6 +348,7 @@ impl Default for RyukiConfig {
             cors: CorsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             logging: LogConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
