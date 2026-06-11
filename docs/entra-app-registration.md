@@ -119,8 +119,8 @@ Define these roles in the app registration manifest (Entra admin center → App 
 1. Roles are defined once in the app registration manifest (above).
 2. Users and/or groups are assigned roles in the **Enterprise application** blade (not the app registration).
 3. When a user authenticates, the access token issued by Entra ID includes a `roles` claim containing the assigned role values (e.g., `["PlatformAdmin", "Auditor"]`).
-4. The platform's `get_roles_from_token()` function extracts the `roles` array from the token body.
-5. `check_permission()` maps role names to permissions for authorization decisions.
+4. Verified Entra role values are mapped to platform permissions.
+5. `check_permission()` maps verified role names to permissions for authorization decisions.
 
 ## Environment Configuration
 

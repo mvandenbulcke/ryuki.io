@@ -156,7 +156,8 @@ pub fn get_rbac_roles() -> Vec<RbacRole> {
     ]
 }
 
-pub fn get_roles_from_token(token: &str) -> Vec<String> {
+#[cfg(test)]
+fn get_untrusted_roles_from_token(token: &str) -> Vec<String> {
     if token.is_empty() {
         return vec![];
     }
@@ -180,6 +181,7 @@ pub fn get_roles_from_token(token: &str) -> Vec<String> {
     vec![]
 }
 
+#[cfg(test)]
 fn base64_decode_url_safe(input: &str) -> String {
     let mut s = input.to_string();
     s = s.replace('-', "+").replace('_', "/");
@@ -188,6 +190,7 @@ fn base64_decode_url_safe(input: &str) -> String {
     String::from_utf8(base64_decode_internal(&s).unwrap_or_default()).unwrap_or_default()
 }
 
+#[cfg(test)]
 fn base64_decode_internal(input: &str) -> Option<Vec<u8>> {
     let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::new();
@@ -329,26 +332,26 @@ mod tests {
     }
 
     #[test]
-    fn test_get_roles_from_token_empty_or_junk() {
-        assert!(get_roles_from_token("").is_empty());
-        assert!(get_roles_from_token("garbage").is_empty());
+    fn test_get_untrusted_roles_from_token_empty_or_junk() {
+        assert!(get_untrusted_roles_from_token("").is_empty());
+        assert!(get_untrusted_roles_from_token("garbage").is_empty());
     }
 
     #[test]
-    fn test_get_roles_from_token_extracts_roles_claim() {
+    fn test_get_untrusted_roles_from_token_extracts_roles_claim() {
         let header = base64_url_encode(r#"{"alg":"RS256"}"#);
         let payload = base64_url_encode(r#"{"roles":["PlatformAdmin","Auditor"]}"#);
         let token = format!("{}.{}", header, payload);
-        let roles = get_roles_from_token(&token);
+        let roles = get_untrusted_roles_from_token(&token);
         assert_eq!(roles, vec!["PlatformAdmin", "Auditor"]);
     }
 
     #[test]
-    fn test_get_roles_from_token_no_roles_claim() {
+    fn test_get_untrusted_roles_from_token_no_roles_claim() {
         let header = base64_url_encode(r#"{"alg":"RS256"}"#);
         let payload = base64_url_encode(r#"{"sub":"user123"}"#);
         let token = format!("{}.{}", header, payload);
-        assert!(get_roles_from_token(&token).is_empty());
+        assert!(get_untrusted_roles_from_token(&token).is_empty());
     }
 
     #[test]
