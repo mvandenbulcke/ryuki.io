@@ -29,3 +29,4 @@ pgdata/
 
 # Tooling artifacts
 .graphify_python
+.atl/
