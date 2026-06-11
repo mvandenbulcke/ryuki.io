@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use ryuki_core::types::{ApiError, ValidationResult};
@@ -173,12 +175,22 @@ async fn main() {
     let app_config = config::load_config();
     config_store::init_with_config("platform-config.json", &app_config);
 
+    let level_filter = match app_config.logging.level {
+        ryuki_core::config::LogLevel::Trace => LevelFilter::TRACE,
+        ryuki_core::config::LogLevel::Debug => LevelFilter::DEBUG,
+        ryuki_core::config::LogLevel::Info => LevelFilter::INFO,
+        ryuki_core::config::LogLevel::Warn => LevelFilter::WARN,
+        ryuki_core::config::LogLevel::Error => LevelFilter::ERROR,
+    };
+    let env_filter =
+        EnvFilter::builder().with_default_directive(level_filter.into()).from_env_lossy();
+
     match app_config.logging.format {
         ryuki_core::config::LogFormat::Json => {
-            tracing_subscriber::fmt().json().init();
+            tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
         }
         ryuki_core::config::LogFormat::Text => {
-            tracing_subscriber::fmt::init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
 
