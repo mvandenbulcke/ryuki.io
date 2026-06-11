@@ -7,12 +7,18 @@ mod contracts;
 pub mod database;
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request as HttpRequest, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, StatusCode};
 use axum::middleware;
 use axum::response::Response;
 use axum::{extract::Query, routing::get, Json, Router};
+use governor::clock::DefaultClock;
+use governor::state::keyed::DefaultKeyedStateStore;
+use governor::{Quota, RateLimiter};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
 
 use ryuki_core::types::{ApiError, ValidationResult};
 
@@ -70,21 +76,124 @@ async fn auth_middleware(
     next.run(request).await
 }
 
+async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware::Next) -> Response {
+    let request_id = Uuid::new_v4().to_string();
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
+
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("unknown")),
+    );
+    response
+}
+
+#[derive(Debug, Clone)]
+struct RequestId(String);
+
+type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
+
+async fn rate_limit_middleware(
+    limiter: Option<SharedRateLimiter>,
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    if let Some(ref limiter) = limiter {
+        let client_key = request
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .split(',')
+            .next()
+            .unwrap_or("unknown")
+            .trim()
+            .to_string();
+
+        if limiter.check_key(&client_key).is_err() {
+            tracing::warn!(client = %client_key, "rate limit exceeded");
+            let api_error = ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests");
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&api_error).unwrap()))
+                .unwrap();
+        }
+    }
+
+    next.run(request).await
+}
+
+fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<SharedRateLimiter> {
+    if !config.enabled {
+        return None;
+    }
+    let quota = Quota::per_second(
+        NonZeroU32::new(config.requests_per_second as u32).unwrap_or(NonZeroU32::MIN),
+    )
+    .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::MIN));
+    Some(Arc::new(RateLimiter::keyed(quota)))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT, shutting down gracefully");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, shutting down gracefully");
+        },
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+}
+
 #[tokio::main]
 async fn main() {
-    let app_config = config::load();
+    let app_config = config::load_config();
     config_store::init_with_config("platform-config.json", &app_config);
 
-    tracing_subscriber::fmt::init();
+    match app_config.logging.format {
+        ryuki_core::config::LogFormat::Json => {
+            tracing_subscriber::fmt().json().init();
+        }
+        ryuki_core::config::LogFormat::Text => {
+            tracing_subscriber::fmt::init();
+        }
+    }
 
     database::try_connect_with_url(&app_config.database_url).await;
     database::migrate_if_connected().await;
 
+    let rate_limiter = create_rate_limiter(&app_config.rate_limit);
+
+    let cors_origins: Vec<_> = app_config
+        .cors
+        .allowed_origins
+        .iter()
+        .map(|o| o.parse().unwrap())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::AllowOrigin::list([
-            "http://localhost:3000".parse().unwrap(),
-            "http://127.0.0.1:3000".parse().unwrap(),
-        ]))
+        .allow_origin(tower_http::cors::AllowOrigin::list(cors_origins))
         .allow_methods(Any)
         .allow_headers(Any);
 
@@ -95,14 +204,22 @@ async fn main() {
         .route("/api/validation/run", get(validation_run))
         .merge(contracts::routes())
         .merge(boundary::routes())
+        .layer(middleware::from_fn(request_id_middleware))
+        .layer(middleware::from_fn(move |req, next| {
+            let limiter = rate_limiter.clone();
+            async move { rate_limit_middleware(limiter, req, next).await }
+        }))
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(&app_config.api_bind_addr)
+    let listener = tokio::net::TcpListener::bind(&app_config.server.bind_address)
         .await
         .unwrap();
-    tracing::info!("ryuki-api listening on {}", app_config.api_bind_addr);
-    axum::serve(listener, app).await.unwrap();
+    tracing::info!("ryuki-api listening on {}", app_config.server.bind_address);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 
 async fn health(

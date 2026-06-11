@@ -1,10 +1,11 @@
+use ryuki_core::config::RyukiConfig;
 use ryuki_core::types::PlatformConfig;
 use std::path::Path;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 static STORE: OnceLock<Mutex<ConfigStore>> = OnceLock::new();
-static APP_CONFIG: OnceLock<crate::config::AppConfig> = OnceLock::new();
+static APP_CONFIG: OnceLock<RyukiConfig> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct ConfigStore {
@@ -25,7 +26,7 @@ impl ConfigStore {
             config.entra_tenant_id = app_cfg.entra_tenant_id.clone();
             config.entra_client_id = app_cfg.entra_client_id.clone();
             config.entra_authority = app_cfg.entra_authority.clone();
-            config.auth_mode = app_cfg.auth_mode.clone();
+            config.auth_mode = app_cfg.auth_mode.as_str().to_string();
             config.platform_name = app_cfg.platform_name.clone();
             config.platform_url = app_cfg.platform_url.clone();
         }
@@ -60,7 +61,7 @@ impl ConfigStore {
     }
 }
 
-pub fn init_with_config(path: &str, app_cfg: &crate::config::AppConfig) {
+pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
     let _ = APP_CONFIG.set(app_cfg.clone());
     let store = ConfigStore::new(path);
     STORE
@@ -68,7 +69,7 @@ pub fn init_with_config(path: &str, app_cfg: &crate::config::AppConfig) {
         .expect("config store already initialized");
 }
 
-pub fn get_app_config() -> &'static crate::config::AppConfig {
+pub fn get_app_config() -> &'static RyukiConfig {
     APP_CONFIG.get().expect("app config not initialized")
 }
 

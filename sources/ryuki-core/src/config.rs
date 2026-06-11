@@ -1,12 +1,13 @@
 use figment::{
-    providers::{Env, Format, Json, Toml},
     Figment,
+    providers::{Env, Format, Json, Toml},
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthMode {
+    #[default]
     MockDryRun,
     StaticDryRun,
     EntraId,
@@ -14,7 +15,7 @@ pub enum AuthMode {
 }
 
 impl AuthMode {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "mock-dry-run" => Some(Self::MockDryRun),
             "static-dry-run" => Some(Self::StaticDryRun),
@@ -34,21 +35,16 @@ impl AuthMode {
     }
 }
 
-impl Default for AuthMode {
-    fn default() -> Self {
-        Self::MockDryRun
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DatabaseProvider {
+    #[default]
     CloudNativePg,
     PostgresLocal,
 }
 
 impl DatabaseProvider {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "cloudnativepg" => Some(Self::CloudNativePg),
             "postgres-local" => Some(Self::PostgresLocal),
@@ -57,21 +53,16 @@ impl DatabaseProvider {
     }
 }
 
-impl Default for DatabaseProvider {
-    fn default() -> Self {
-        Self::CloudNativePg
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SecretProvider {
+    #[default]
     HashicorpVault,
     None,
 }
 
 impl SecretProvider {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "hashicorp-vault" => Some(Self::HashicorpVault),
             "none" => Some(Self::None),
@@ -80,22 +71,17 @@ impl SecretProvider {
     }
 }
 
-impl Default for SecretProvider {
-    fn default() -> Self {
-        Self::HashicorpVault
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum KubernetesRuntime {
+    #[default]
     VsphereVks,
     DockerCompose,
     None,
 }
 
 impl KubernetesRuntime {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "vsphere-vks" => Some(Self::VsphereVks),
             "docker-compose" => Some(Self::DockerCompose),
@@ -105,21 +91,16 @@ impl KubernetesRuntime {
     }
 }
 
-impl Default for KubernetesRuntime {
-    fn default() -> Self {
-        Self::VsphereVks
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum MonitoringProvider {
+    #[default]
     Zabbix,
     None,
 }
 
 impl MonitoringProvider {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "zabbix" => Some(Self::Zabbix),
             "none" => Some(Self::None),
@@ -128,21 +109,16 @@ impl MonitoringProvider {
     }
 }
 
-impl Default for MonitoringProvider {
-    fn default() -> Self {
-        Self::Zabbix
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackupProvider {
+    #[default]
     Veeam,
     None,
 }
 
 impl BackupProvider {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "veeam" => Some(Self::Veeam),
             "none" => Some(Self::None),
@@ -151,39 +127,23 @@ impl BackupProvider {
     }
 }
 
-impl Default for BackupProvider {
-    fn default() -> Self {
-        Self::Veeam
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
 }
 
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
+    #[default]
     Text,
     Json,
-}
-
-impl Default for LogFormat {
-    fn default() -> Self {
-        Self::Text
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -363,14 +323,24 @@ impl Default for RyukiConfig {
     }
 }
 
+fn merge_file(figment: Figment, path: &str) -> Figment {
+    if path.ends_with(".toml") {
+        figment.merge(Toml::file(path))
+    } else {
+        figment.merge(Json::file(path))
+    }
+}
+
 impl RyukiConfig {
     /// Load config from multiple sources with priority:
     /// 1. Environment variables (highest priority)
     /// 2. Config file (ryuki.toml, ryuki.json, platform-config.json)
     /// 3. Default values (lowest priority)
+    #[allow(clippy::result_large_err)]
     pub fn load() -> Result<Self, figment::Error> {
-        let mut figment = Figment::new()
-            .merge(figment::providers::Serialized::defaults(RyukiConfig::default()));
+        let mut figment = Figment::new().merge(figment::providers::Serialized::defaults(
+            RyukiConfig::default(),
+        ));
 
         for path in &["ryuki.toml", "ryuki.json", "platform-config.json"] {
             if std::path::Path::new(path).exists() {
@@ -378,9 +348,7 @@ impl RyukiConfig {
             }
         }
 
-        figment
-            .merge(Env::prefixed("RYUKI_").split("__"))
-            .extract()
+        figment.merge(Env::prefixed("RYUKI_").split("__")).extract()
     }
 
     pub fn validate(&self) -> Vec<String> {
@@ -411,31 +379,20 @@ impl RyukiConfig {
     }
 }
 
-fn merge_file(figment: Figment, path: &str) -> Figment {
-    if path.ends_with(".toml") {
-        figment.merge(Toml::file(path))
-    } else {
-        figment.merge(Json::file(path))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_auth_mode_from_str() {
+    fn test_auth_mode_parse() {
+        assert_eq!(AuthMode::parse("mock-dry-run"), Some(AuthMode::MockDryRun));
         assert_eq!(
-            AuthMode::from_str("mock-dry-run"),
-            Some(AuthMode::MockDryRun)
-        );
-        assert_eq!(
-            AuthMode::from_str("static-dry-run"),
+            AuthMode::parse("static-dry-run"),
             Some(AuthMode::StaticDryRun)
         );
-        assert_eq!(AuthMode::from_str("entra-id"), Some(AuthMode::EntraId));
-        assert_eq!(AuthMode::from_str("local"), Some(AuthMode::Local));
-        assert_eq!(AuthMode::from_str("invalid"), None);
+        assert_eq!(AuthMode::parse("entra-id"), Some(AuthMode::EntraId));
+        assert_eq!(AuthMode::parse("local"), Some(AuthMode::Local));
+        assert_eq!(AuthMode::parse("invalid"), None);
     }
 
     #[test]
@@ -508,7 +465,10 @@ mod tests {
     fn test_cors_config_default_origins() {
         let cors = CorsConfig::default();
         assert_eq!(cors.allowed_origins.len(), 2);
-        assert!(cors.allowed_origins.contains(&"http://localhost:3000".to_string()));
+        assert!(
+            cors.allowed_origins
+                .contains(&"http://localhost:3000".to_string())
+        );
     }
 
     #[test]

@@ -47,6 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 figment = { version = "0.10", features = ["env", "json", "toml"] }
+governor = { version = "0.7", default-features = false, features = ["std", "clock"] }
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 
