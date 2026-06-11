@@ -102,6 +102,20 @@ pub struct PlatformConfig {
     pub backup_provider: String,
     #[serde(default = "default_hypervisor_provider")]
     pub hypervisor_provider: String,
+    #[serde(default = "default_storage_provider")]
+    pub storage_provider: String,
+    #[serde(default = "default_dns_provider")]
+    pub dns_provider: String,
+    #[serde(default = "default_ipam_provider")]
+    pub ipam_provider: String,
+    #[serde(default = "default_load_balancer_provider")]
+    pub load_balancer_provider: String,
+    #[serde(default = "default_firewall_provider")]
+    pub firewall_provider: String,
+    #[serde(default = "default_build_provider")]
+    pub build_provider: String,
+    #[serde(default = "default_network_provider")]
+    pub network_provider: String,
 }
 
 fn default_entra_authority() -> String {
@@ -144,6 +158,34 @@ fn default_hypervisor_provider() -> String {
     "vmware".to_string()
 }
 
+fn default_storage_provider() -> String {
+    "none".to_string()
+}
+
+fn default_dns_provider() -> String {
+    "none".to_string()
+}
+
+fn default_ipam_provider() -> String {
+    "none".to_string()
+}
+
+fn default_load_balancer_provider() -> String {
+    "none".to_string()
+}
+
+fn default_firewall_provider() -> String {
+    "none".to_string()
+}
+
+fn default_build_provider() -> String {
+    "none".to_string()
+}
+
+fn default_network_provider() -> String {
+    "none".to_string()
+}
+
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
@@ -159,6 +201,13 @@ impl Default for PlatformConfig {
             monitoring_provider: default_monitoring_provider(),
             backup_provider: default_backup_provider(),
             hypervisor_provider: default_hypervisor_provider(),
+            storage_provider: default_storage_provider(),
+            dns_provider: default_dns_provider(),
+            ipam_provider: default_ipam_provider(),
+            load_balancer_provider: default_load_balancer_provider(),
+            firewall_provider: default_firewall_provider(),
+            build_provider: default_build_provider(),
+            network_provider: default_network_provider(),
         }
     }
 }
@@ -264,6 +313,69 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         errors.push(format!(
             "invalid hypervisor_provider '{}': must be one of {:?}",
             config.hypervisor_provider, valid_hypervisor_providers
+        ));
+    }
+
+    let valid_storage_providers = [
+        "netapp",
+        "pure-storage",
+        "dell-powerstore",
+        "hpe-alletra",
+        "azure-blob",
+        "none",
+    ];
+    if !valid_storage_providers.contains(&config.storage_provider.as_str()) {
+        errors.push(format!(
+            "invalid storage_provider '{}'",
+            config.storage_provider
+        ));
+    }
+
+    let valid_dns_providers = ["infoblox", "bluecat", "windows-dns", "route53", "none"];
+    if !valid_dns_providers.contains(&config.dns_provider.as_str()) {
+        errors.push(format!("invalid dns_provider '{}'", config.dns_provider));
+    }
+
+    let valid_ipam_providers = ["infoblox", "phpipam", "netbox", "none"];
+    if !valid_ipam_providers.contains(&config.ipam_provider.as_str()) {
+        errors.push(format!("invalid ipam_provider '{}'", config.ipam_provider));
+    }
+
+    let valid_lb_providers = ["f5-bigip", "citrix-adc", "haproxy", "nginx", "none"];
+    if !valid_lb_providers.contains(&config.load_balancer_provider.as_str()) {
+        errors.push(format!(
+            "invalid load_balancer_provider '{}'",
+            config.load_balancer_provider
+        ));
+    }
+
+    let valid_fw_providers = ["palo-alto", "checkpoint", "fortinet", "cisco-asa", "none"];
+    if !valid_fw_providers.contains(&config.firewall_provider.as_str()) {
+        errors.push(format!(
+            "invalid firewall_provider '{}'",
+            config.firewall_provider
+        ));
+    }
+
+    let valid_build_providers = [
+        "jenkins",
+        "github-actions",
+        "azure-devops",
+        "argocd",
+        "none",
+    ];
+    if !valid_build_providers.contains(&config.build_provider.as_str()) {
+        errors.push(format!(
+            "invalid build_provider '{}'",
+            config.build_provider
+        ));
+    }
+
+    let valid_network_providers = ["cisco-aci", "vmware-nsx", "evpn", "none"];
+    if !valid_network_providers.contains(&config.network_provider.as_str()) {
+        errors.push(format!(
+            "invalid network_provider '{}'",
+            config.network_provider
         ));
     }
 

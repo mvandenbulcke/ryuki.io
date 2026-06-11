@@ -211,6 +211,172 @@ impl BackupProvider {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageProvider {
+    #[default]
+    None,
+    NetApp,
+    PureStorage,
+    DellPowerStore,
+    HpeAlletra,
+    AzureBlob,
+}
+
+impl StorageProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "netapp" => Some(Self::NetApp),
+            "pure-storage" => Some(Self::PureStorage),
+            "dell-powerstore" => Some(Self::DellPowerStore),
+            "hpe-alletra" => Some(Self::HpeAlletra),
+            "azure-blob" => Some(Self::AzureBlob),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnsProvider {
+    #[default]
+    None,
+    Infoblox,
+    BlueCat,
+    WindowsDns,
+    Route53,
+}
+
+impl DnsProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "infoblox" => Some(Self::Infoblox),
+            "bluecat" => Some(Self::BlueCat),
+            "windows-dns" => Some(Self::WindowsDns),
+            "route53" => Some(Self::Route53),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum IpamProvider {
+    #[default]
+    None,
+    Infoblox,
+    PhpIpam,
+    NetBox,
+}
+
+impl IpamProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "infoblox" => Some(Self::Infoblox),
+            "phpipam" => Some(Self::PhpIpam),
+            "netbox" => Some(Self::NetBox),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoadBalancerProvider {
+    #[default]
+    None,
+    F5BigIp,
+    CitrixAdc,
+    HAProxy,
+    Nginx,
+}
+
+impl LoadBalancerProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f5-bigip" => Some(Self::F5BigIp),
+            "citrix-adc" => Some(Self::CitrixAdc),
+            "haproxy" => Some(Self::HAProxy),
+            "nginx" => Some(Self::Nginx),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallProvider {
+    #[default]
+    None,
+    PaloAlto,
+    CheckPoint,
+    Fortinet,
+    CiscoAsa,
+}
+
+impl FirewallProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "palo-alto" => Some(Self::PaloAlto),
+            "checkpoint" => Some(Self::CheckPoint),
+            "fortinet" => Some(Self::Fortinet),
+            "cisco-asa" => Some(Self::CiscoAsa),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuildProvider {
+    #[default]
+    None,
+    Jenkins,
+    GitHubActions,
+    AzureDevOps,
+    ArgoCD,
+}
+
+impl BuildProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "jenkins" => Some(Self::Jenkins),
+            "github-actions" => Some(Self::GitHubActions),
+            "azure-devops" => Some(Self::AzureDevOps),
+            "argocd" => Some(Self::ArgoCD),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkProvider {
+    #[default]
+    None,
+    CiscoAci,
+    VmwareNsx,
+    Evpn,
+}
+
+impl NetworkProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "cisco-aci" => Some(Self::CiscoAci),
+            "vmware-nsx" => Some(Self::VmwareNsx),
+            "evpn" => Some(Self::Evpn),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Trace,
@@ -387,6 +553,50 @@ impl Default for CorsConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SmtpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_smtp_host")]
+    pub host: String,
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default = "default_smtp_from")]
+    pub from_address: String,
+    #[serde(default)]
+    pub use_tls: bool,
+}
+
+fn default_smtp_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_from() -> String {
+    "ryuki@localhost".to_string()
+}
+
+impl Default for SmtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_smtp_host(),
+            port: default_smtp_port(),
+            username: String::new(),
+            password: String::new(),
+            from_address: default_smtp_from(),
+            use_tls: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
@@ -449,6 +659,20 @@ pub struct RyukiConfig {
     #[serde(default)]
     pub backup_provider: BackupProvider,
     #[serde(default)]
+    pub storage_provider: StorageProvider,
+    #[serde(default)]
+    pub dns_provider: DnsProvider,
+    #[serde(default)]
+    pub ipam_provider: IpamProvider,
+    #[serde(default)]
+    pub load_balancer_provider: LoadBalancerProvider,
+    #[serde(default)]
+    pub firewall_provider: FirewallProvider,
+    #[serde(default)]
+    pub build_provider: BuildProvider,
+    #[serde(default)]
+    pub network_provider: NetworkProvider,
+    #[serde(default)]
     pub cors: CorsConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -456,6 +680,8 @@ pub struct RyukiConfig {
     pub logging: LogConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub smtp: SmtpConfig,
 }
 
 fn default_database_url() -> String {
@@ -491,10 +717,18 @@ impl Default for RyukiConfig {
             hypervisor_provider: HypervisorProvider::default(),
             monitoring_provider: MonitoringProvider::default(),
             backup_provider: BackupProvider::default(),
+            storage_provider: StorageProvider::default(),
+            dns_provider: DnsProvider::default(),
+            ipam_provider: IpamProvider::default(),
+            load_balancer_provider: LoadBalancerProvider::default(),
+            firewall_provider: FirewallProvider::default(),
+            build_provider: BuildProvider::default(),
+            network_provider: NetworkProvider::default(),
             cors: CorsConfig::default(),
             rate_limit: RateLimitConfig::default(),
             logging: LogConfig::default(),
             security: SecurityConfig::default(),
+            smtp: SmtpConfig::default(),
         }
     }
 }
