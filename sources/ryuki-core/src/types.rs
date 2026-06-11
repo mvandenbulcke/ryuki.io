@@ -92,6 +92,14 @@ pub struct PlatformConfig {
     pub platform_name: String,
     #[serde(default = "default_platform_url")]
     pub platform_url: String,
+    #[serde(default = "default_secret_provider")]
+    pub secret_provider: String,
+    #[serde(default = "default_kubernetes_runtime")]
+    pub kubernetes_runtime: String,
+    #[serde(default = "default_monitoring_provider")]
+    pub monitoring_provider: String,
+    #[serde(default = "default_backup_provider")]
+    pub backup_provider: String,
 }
 
 fn default_entra_authority() -> String {
@@ -114,6 +122,22 @@ fn default_platform_url() -> String {
     "http://localhost:18080".to_string()
 }
 
+fn default_secret_provider() -> String {
+    "hashicorp-vault".to_string()
+}
+
+fn default_kubernetes_runtime() -> String {
+    "vsphere-vks".to_string()
+}
+
+fn default_monitoring_provider() -> String {
+    "zabbix".to_string()
+}
+
+fn default_backup_provider() -> String {
+    "veeam".to_string()
+}
+
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
@@ -124,8 +148,68 @@ impl Default for PlatformConfig {
             database_provider: default_database_provider(),
             platform_name: default_platform_name(),
             platform_url: default_platform_url(),
+            secret_provider: default_secret_provider(),
+            kubernetes_runtime: default_kubernetes_runtime(),
+            monitoring_provider: default_monitoring_provider(),
+            backup_provider: default_backup_provider(),
         }
     }
+}
+
+/// Validates a PlatformConfig for correctness.
+/// Returns a list of validation errors (empty = valid).
+pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    let valid_auth_modes = ["mock-dry-run", "static-dry-run", "entra-id", "local"];
+    if !valid_auth_modes.contains(&config.auth_mode.as_str()) {
+        errors.push(format!(
+            "invalid auth_mode '{}': must be one of {:?}",
+            config.auth_mode, valid_auth_modes
+        ));
+    }
+
+    let valid_db_providers = ["cloudnativepg", "postgres-local"];
+    if !valid_db_providers.contains(&config.database_provider.as_str()) {
+        errors.push(format!(
+            "invalid database_provider '{}': must be one of {:?}",
+            config.database_provider, valid_db_providers
+        ));
+    }
+
+    let valid_secret_providers = ["hashicorp-vault", "none"];
+    if !valid_secret_providers.contains(&config.secret_provider.as_str()) {
+        errors.push(format!(
+            "invalid secret_provider '{}': must be one of {:?}",
+            config.secret_provider, valid_secret_providers
+        ));
+    }
+
+    let valid_k8s_runtimes = ["vsphere-vks", "docker-compose", "none"];
+    if !valid_k8s_runtimes.contains(&config.kubernetes_runtime.as_str()) {
+        errors.push(format!(
+            "invalid kubernetes_runtime '{}': must be one of {:?}",
+            config.kubernetes_runtime, valid_k8s_runtimes
+        ));
+    }
+
+    let valid_mon_providers = ["zabbix", "none"];
+    if !valid_mon_providers.contains(&config.monitoring_provider.as_str()) {
+        errors.push(format!(
+            "invalid monitoring_provider '{}': must be one of {:?}",
+            config.monitoring_provider, valid_mon_providers
+        ));
+    }
+
+    let valid_backup_providers = ["veeam", "none"];
+    if !valid_backup_providers.contains(&config.backup_provider.as_str()) {
+        errors.push(format!(
+            "invalid backup_provider '{}': must be one of {:?}",
+            config.backup_provider, valid_backup_providers
+        ));
+    }
+
+    errors
 }
 
 #[cfg(test)]
