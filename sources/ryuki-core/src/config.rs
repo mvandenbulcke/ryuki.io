@@ -1087,10 +1087,7 @@ impl RyukiConfig {
         } else if !self.database_url.starts_with("postgres://")
             && !self.database_url.starts_with("postgresql://")
         {
-            errors.push(format!(
-                "database_url '{}' must start with postgres:// or postgresql://",
-                self.database_url
-            ));
+            errors.push("database_url must start with postgres:// or postgresql://".into());
         }
 
         if self.server.bind_address.is_empty() {
@@ -1170,6 +1167,12 @@ impl RyukiConfig {
                 "rate_limit.requests_per_second must be less than or equal to {}",
                 u32::MAX
             ));
+        }
+
+        if self.rate_limit.enabled && self.rate_limit.burst_size == 0 {
+            errors.push(
+                "rate_limit.burst_size must be greater than 0 when rate_limit is enabled".into(),
+            );
         }
 
         if self.rate_limit.enabled {
@@ -1386,6 +1389,16 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_database_url_does_not_echo_value() {
+        let mut config = RyukiConfig::default();
+        config.database_url = "mysql://user:pass@db.internal/ryuki".into();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("database_url")));
+        assert!(!errors.iter().any(|e| e.contains("user:pass")));
+        assert!(!errors.iter().any(|e| e.contains("db.internal")));
+    }
+
+    #[test]
     fn test_validate_ryuki_config_empty_database() {
         let mut config = RyukiConfig::default();
         config.database_url = String::new();
@@ -1573,6 +1586,15 @@ mod tests {
         assert!(errors.iter().any(|e| {
             e.contains("rate_limit.path_overrides.health.burst_size must be greater than 0")
         }));
+    }
+
+    #[test]
+    fn test_validate_rate_limit_burst_size_zero() {
+        let mut config = RyukiConfig::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.burst_size = 0;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("rate_limit.burst_size")));
     }
 
     #[test]

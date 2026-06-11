@@ -16,7 +16,7 @@ cd ryuki-platform
 cp .env.example .env
 ```
 
-Edit `.env` — set `DATABASE_URL` to match your local PostgreSQL.
+Edit `.env` — set `RYUKI_DATABASE_URL` to match your local PostgreSQL.
 
 ### 2. Start the database
 
@@ -57,8 +57,8 @@ Default is **mock-dry-run** — no real Entra ID, all operations are simulated.
 To enable live Entra ID authentication:
 
 1. Register an Entra ID application (see `docs/configuration.md`)
-2. Set `AUTH_MODE=entra-id-live` in `.env`
-3. Set `ENTRA_TENANT_ID` and `ENTRA_CLIENT_ID`
+2. Set `RYUKI_AUTH_MODE=entra-id` in `.env`
+3. Set `RYUKI_ENTRA_TENANT_ID` and `RYUKI_ENTRA_CLIENT_ID`
 4. Restart the API
 
 ## Project Structure

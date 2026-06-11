@@ -53,7 +53,7 @@
 ## Key Decisions
 
 - **Same-origin**: Portal and API served from the same origin. CORS allows the Portal origin only.
-- **Dry-run default**: All provider operations default to mock/dry-run unless `AUTH_MODE` is set to `entra-id-live`.
+- **Dry-run default**: All provider operations default to mock/dry-run unless `RYUKI_AUTH_MODE` is set to `entra-id`.
 - **Vault secrets**: Platform secrets (DB credentials, provider tokens) stored in HashiCorp Vault, never in environment or config files.
 - **Entra app roles**: RBAC via Entra ID app roles with `roles` claim in the access token. No group-name-to-role mapping.
 

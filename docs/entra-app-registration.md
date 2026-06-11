@@ -127,10 +127,10 @@ Define these roles in the app registration manifest (Entra admin center → App 
 Only the Entra tenant and client IDs are needed:
 
 ```env
-ENTRA_TENANT_ID=<your-tenant-id>
-ENTRA_CLIENT_ID=<your-app-client-id>
-ENTRA_AUTHORITY=https://login.microsoftonline.com
-AUTH_MODE=entra-id-live
+RYUKI_ENTRA_TENANT_ID=<your-tenant-id>
+RYUKI_ENTRA_CLIENT_ID=<your-app-client-id>
+RYUKI_ENTRA_AUTHORITY=https://login.microsoftonline.com
+RYUKI_AUTH_MODE=entra-id
 ```
 
 ## Important Security Notes
