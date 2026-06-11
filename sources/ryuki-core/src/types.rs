@@ -52,6 +52,7 @@ pub enum ExecutionMode {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(default)]
 pub struct BoundaryStatus {
     pub http_request_allowed: bool,
     pub provider_calls_allowed: bool,

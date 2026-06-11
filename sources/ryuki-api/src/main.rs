@@ -425,6 +425,12 @@ async fn main() {
         .allow_headers(Any)
         .max_age(Duration::from_secs(app_config.cors.max_age_secs));
 
+    let compression = CompressionLayer::new().quality(
+        tower_http::compression::CompressionLevel::Precise(
+            app_config.server.compression_quality as i32,
+        ),
+    );
+
     let body_limit = app_config.server.max_body_size_bytes;
     let timeout_secs = app_config.server.request_timeout_secs;
 
@@ -471,7 +477,7 @@ async fn main() {
         ))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(cors)
-        .layer(CompressionLayer::new())
+        .layer(compression)
         .layer(middleware::from_fn(cache_control_middleware))
         .layer(middleware::from_fn(timing_middleware));
 

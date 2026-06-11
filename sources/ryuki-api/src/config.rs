@@ -58,6 +58,7 @@ pub fn get_platform_status() -> serde_json::Value {
             "pool_idle_timeout_secs": config.server.pool_idle_timeout_secs,
             "pool_acquire_timeout_secs": config.server.pool_acquire_timeout_secs,
             "pool_max_lifetime_secs": config.server.pool_max_lifetime_secs,
+            "compression_quality": config.server.compression_quality,
             "tls_enabled": config.server.tls_cert_path.is_some(),
         },
         "rate_limit": {
@@ -77,6 +78,13 @@ pub fn get_platform_status() -> serde_json::Value {
             "csp": config.security.content_security_policy,
             "hsts_enabled": config.security.hsts_enabled,
             "hsts_max_age_secs": config.security.hsts_max_age_secs,
+        },
+        "smtp": {
+            "enabled": config.smtp.enabled,
+            "host": config.smtp.host,
+            "port": config.smtp.port,
+            "from_address": config.smtp.from_address,
+            "use_tls": config.smtp.use_tls,
         },
         "validation_errors": validation_errors,
     })

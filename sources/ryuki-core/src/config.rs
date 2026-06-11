@@ -436,6 +436,8 @@ pub struct ServerConfig {
     pub pool_acquire_timeout_secs: u64,
     #[serde(default = "default_pool_max_lifetime")]
     pub pool_max_lifetime_secs: u64,
+    #[serde(default = "default_compression_quality")]
+    pub compression_quality: u8,
 }
 
 fn default_bind_address() -> String {
@@ -474,6 +476,10 @@ fn default_pool_max_lifetime() -> u64 {
     1800
 }
 
+fn default_compression_quality() -> u8 {
+    6
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -488,6 +494,7 @@ impl Default for ServerConfig {
             pool_idle_timeout_secs: default_pool_idle_timeout(),
             pool_acquire_timeout_secs: default_pool_acquire_timeout(),
             pool_max_lifetime_secs: default_pool_max_lifetime(),
+            compression_quality: default_compression_quality(),
         }
     }
 }
@@ -503,7 +510,8 @@ pub struct SecurityConfig {
 }
 
 fn default_csp_directive() -> String {
-    "default-src 'self'".to_string()
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'"
+        .to_string()
 }
 
 fn default_hsts_enabled() -> bool {
