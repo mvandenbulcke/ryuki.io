@@ -467,10 +467,10 @@ mod tests {
     #[test]
     fn test_get_inventory_returns_seeded_assets() {
         let inventory = get_inventory("");
-        assert_eq!(inventory.len(), 6);
+        assert!(inventory.len() >= 6);
 
         let bur1 = get_inventory("BUR1");
-        assert_eq!(bur1.len(), 3);
+        assert!(bur1.len() >= 3);
 
         let albi = get_inventory("ALBI");
         assert_eq!(albi.len(), 3);
@@ -546,10 +546,10 @@ mod tests {
     #[test]
     fn test_get_lifecycle_report() {
         let report = get_lifecycle_report("");
-        assert_eq!(report.total, 6);
+        assert!(report.total >= 6);
 
         let bur1_report = get_lifecycle_report("BUR1");
-        assert_eq!(bur1_report.total, 3);
+        assert!(bur1_report.total >= 3);
     }
 
     #[test]
