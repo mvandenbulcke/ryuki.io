@@ -387,11 +387,13 @@ pub fn approve_deployment(request_id: &str, approver: &str) -> Result<Deployment
 }
 
 pub fn execute_deployment(request_id: &str) -> Result<Vec<EvidenceItem>, String> {
-    let store = deployment_store().lock().unwrap();
-    let record = store
+    let mut store = deployment_store().lock().unwrap();
+    let idx = store
         .iter()
-        .find(|d| d.id == request_id)
+        .position(|d| d.id == request_id)
         .ok_or_else(|| format!("Deployment not found: {}", request_id))?;
+
+    let record = &store[idx];
 
     if record.status != DeploymentStatus::Approved {
         return Err(format!(
@@ -438,15 +440,33 @@ pub fn execute_deployment(request_id: &str) -> Result<Vec<EvidenceItem>, String>
         evidence_type: EvidenceType::Summary,
     });
 
+    let mut executed = record.clone();
+    executed.status = DeploymentStatus::Executed;
+    executed.executed_at = Some(chrono::Utc::now().to_rfc3339());
+    executed.evidence = evidence.clone();
+    store[idx] = executed;
+
     Ok(evidence)
 }
 
 pub fn verify_deployment(request_id: &str) -> Result<ValidationResult, String> {
-    let store = deployment_store().lock().unwrap();
-    let record = store
+    let mut store = deployment_store().lock().unwrap();
+    let idx = store
         .iter()
-        .find(|d| d.id == request_id)
+        .position(|d| d.id == request_id)
         .ok_or_else(|| format!("Deployment not found: {}", request_id))?;
+
+    let record = &store[idx];
+
+    if !matches!(
+        record.status,
+        DeploymentStatus::Executed | DeploymentStatus::Verified | DeploymentStatus::Completed
+    ) {
+        return Err(format!(
+            "Cannot verify deployment in status {:?}. Must be Executed first.",
+            record.status
+        ));
+    }
 
     let mut warnings: Vec<String> = Vec::new();
 
@@ -460,13 +480,22 @@ pub fn verify_deployment(request_id: &str) -> Result<ValidationResult, String> {
     ));
     warnings.push("DRY-RUN: Configuration drift check passed (simulated)".into());
 
-    Ok(ValidationResult {
+    let result = ValidationResult {
         passed: true,
         errors: vec![],
         warnings,
         failed_rules: vec![],
         remediation: vec![],
-    })
+    };
+
+    if record.status == DeploymentStatus::Executed {
+        let mut verified = record.clone();
+        verified.status = DeploymentStatus::Verified;
+        verified.verified_at = Some(chrono::Utc::now().to_rfc3339());
+        store[idx] = verified;
+    }
+
+    Ok(result)
 }
 
 pub fn get_deployment_history(server_name: &str) -> Vec<DeploymentRecord> {
@@ -689,6 +718,12 @@ mod tests {
                 .iter()
                 .any(|e| e.key == "post-install-health-check")
         );
+
+        let history = get_deployment_history(&request.server_name);
+        let executed = history.iter().find(|d| d.id == approved.id).unwrap();
+        assert_eq!(executed.status, DeploymentStatus::Executed);
+        assert!(executed.executed_at.is_some());
+        assert_eq!(executed.evidence, evidence);
     }
 
     #[test]
@@ -710,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_deployment() {
+    fn test_verify_deployment_requires_execution() {
         let request = DeploymentRequest {
             server_name: "w-nlams-srv-03".into(),
             package_id: "pkg-qualys-agent".into(),
@@ -719,9 +754,29 @@ mod tests {
             requester: "compliance-team".into(),
         };
         let planned = plan_deployment(&request).unwrap();
-        let result = verify_deployment(&planned.id).unwrap();
+        assert!(verify_deployment(&planned.id).is_err());
+    }
+
+    #[test]
+    fn test_verify_deployment_after_execute() {
+        let request = DeploymentRequest {
+            server_name: "w-nlams-srv-04".into(),
+            package_id: "pkg-qualys-agent".into(),
+            target_version: "5.2.0".into(),
+            scheduled_time: "2026-06-19T23:00:00Z".into(),
+            requester: "compliance-team".into(),
+        };
+        let planned = plan_deployment(&request).unwrap();
+        let approved = approve_deployment(&planned.id, "admin").unwrap();
+        execute_deployment(&approved.id).unwrap();
+        let result = verify_deployment(&approved.id).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());
+
+        let history = get_deployment_history(&request.server_name);
+        let verified = history.iter().find(|d| d.id == approved.id).unwrap();
+        assert_eq!(verified.status, DeploymentStatus::Verified);
+        assert!(verified.verified_at.is_some());
     }
 
     #[test]

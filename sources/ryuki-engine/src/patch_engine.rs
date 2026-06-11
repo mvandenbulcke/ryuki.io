@@ -394,11 +394,13 @@ pub fn approve_patch_wave(wave_id: &str) -> Result<PatchWave, String> {
 }
 
 pub fn execute_patch_wave(wave_id: &str) -> Result<Vec<EvidenceItem>, String> {
-    let store = patch_wave_store().lock().unwrap();
-    let wave = store
+    let mut store = patch_wave_store().lock().unwrap();
+    let idx = store
         .iter()
-        .find(|w| w.id == wave_id)
+        .position(|w| w.id == wave_id)
         .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
+
+    let wave = &store[idx];
 
     if wave.status != PatchWaveStatus::Approved {
         return Err(format!(
@@ -462,6 +464,24 @@ pub fn execute_patch_wave(wave_id: &str) -> Result<Vec<EvidenceItem>, String> {
         evidence_type: EvidenceType::Summary,
     });
 
+    let mut completed = wave.clone();
+    completed.status = PatchWaveStatus::Completed;
+    completed
+        .metadata
+        .insert("executed_at".into(), chrono::Utc::now().to_rfc3339());
+    completed.metadata.insert(
+        "execution_evidence_count".into(),
+        evidence.len().to_string(),
+    );
+    completed.metadata.insert(
+        "execution_summary".into(),
+        format!(
+            "DRY-RUN: Patch wave completed for {} servers (simulated, no provider calls)",
+            completed.servers.len()
+        ),
+    );
+    store[idx] = completed;
+
     Ok(evidence)
 }
 
@@ -471,6 +491,13 @@ pub fn verify_patch_wave(wave_id: &str) -> Result<ValidationResult, String> {
         .iter()
         .find(|w| w.id == wave_id)
         .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
+
+    if wave.status != PatchWaveStatus::Completed {
+        return Err(format!(
+            "Cannot verify patch wave in status {:?}. Must be Completed first.",
+            wave.status
+        ));
+    }
 
     let mut warnings: Vec<String> = Vec::new();
 
@@ -779,6 +806,17 @@ mod tests {
         assert!(evidence.iter().any(|e| e.key == "pre-patch-backup-check"));
         assert!(evidence.iter().any(|e| e.key == "post-patch-reboot"));
         assert!(evidence.iter().any(|e| e.key == "post-patch-health-check"));
+
+        let stored = get_patch_waves()
+            .into_iter()
+            .find(|w| w.id == approved.id)
+            .unwrap();
+        assert_eq!(stored.status, PatchWaveStatus::Completed);
+        assert_eq!(
+            stored.metadata.get("execution_evidence_count").unwrap(),
+            &evidence.len().to_string()
+        );
+        assert!(stored.metadata.contains_key("executed_at"));
     }
 
     #[test]
@@ -793,8 +831,16 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_patch_wave() {
+    fn test_verify_patch_wave_requires_execution() {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
+        assert!(verify_patch_wave(&wave.id).is_err());
+    }
+
+    #[test]
+    fn test_verify_patch_wave_after_execute() {
+        let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
+        let approved = approve_patch_wave(&wave.id).unwrap();
+        execute_patch_wave(&approved.id).unwrap();
         let result = verify_patch_wave(&wave.id).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());

@@ -227,6 +227,16 @@ pub fn execute_decommission(request: &DecommissionRequest) -> Result<Decommissio
 }
 
 pub fn verify_decommission(request: &DecommissionRequest) -> Result<Vec<EvidenceItem>, String> {
+    if !matches!(
+        request.status,
+        DecommissionStatus::Executed | DecommissionStatus::Verified | DecommissionStatus::Completed
+    ) {
+        return Err(format!(
+            "Cannot verify decommission in status {:?}. Must be Executed first.",
+            request.status
+        ));
+    }
+
     let mut evidence: Vec<EvidenceItem> = Vec::new();
 
     evidence.push(EvidenceItem {
@@ -524,9 +534,17 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_decommission() {
+    fn test_verify_decommission_requires_execution() {
         let req = make_test_request();
-        let evidence = verify_decommission(&req).unwrap();
+        assert!(verify_decommission(&req).is_err());
+    }
+
+    #[test]
+    fn test_verify_decommission_after_execute() {
+        let mut req = make_test_request();
+        req.status = DecommissionStatus::Quarantined;
+        let executed = execute_decommission(&req).unwrap();
+        let evidence = verify_decommission(&executed).unwrap();
         assert_eq!(evidence.len(), 5);
         assert!(evidence.iter().any(|e| e.key == "decommission-dns-cleanup"));
         assert!(
