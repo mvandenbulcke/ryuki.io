@@ -29,6 +29,7 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use crate::database::MigrationStatus;
 use ryuki_core::config::AuthMode;
 use ryuki_core::types::{ApiError, ValidationResult};
 use ryuki_engine::auth::AuthSession;
@@ -180,6 +181,15 @@ struct RequestId(String);
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DRAINING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessStatus {
+    Ready,
+    DatabaseUnavailable,
+    MigrationsNotApplied,
+    MigrationsFailed,
+    DatabaseUnusable,
+}
 
 /// Per-endpoint request counts keyed by "METHOD /path".
 /// Uses std::sync::Mutex with HashMap — acceptable for dev/light production.
@@ -711,27 +721,85 @@ async fn ready(
         ));
     }
 
-    let db_connected = crate::database::get_db().is_some();
-    let result = readiness_response(db_connected);
+    let readiness_status = readiness_check().await;
+    let result = readiness_response(readiness_status);
     let status = if result.is_ok() { "ready" } else { "not_ready" };
-    tracing::info!(status, db_connected, "readiness check result");
+    tracing::info!(status, ?readiness_status, "readiness check result");
     result
 }
 
-fn readiness_response(db_connected: bool) -> Result<Json<serde_json::Value>, ProblemDetails> {
-    if !db_connected {
-        return Err(problem_details(
+async fn readiness_check() -> ReadinessStatus {
+    let Some(pool) = crate::database::get_db() else {
+        return ReadinessStatus::DatabaseUnavailable;
+    };
+
+    let status = readiness_status_for_pool_state(true, crate::database::migration_status());
+    if status != ReadinessStatus::Ready {
+        return status;
+    }
+
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(1) => ReadinessStatus::Ready,
+        Ok(_) => ReadinessStatus::DatabaseUnusable,
+        Err(e) => {
+            tracing::warn!(error = %e, "database readiness probe failed");
+            ReadinessStatus::DatabaseUnusable
+        }
+    }
+}
+
+fn readiness_status_for_pool_state(
+    pool_present: bool,
+    migration_status: MigrationStatus,
+) -> ReadinessStatus {
+    if !pool_present {
+        return ReadinessStatus::DatabaseUnavailable;
+    }
+
+    match migration_status {
+        MigrationStatus::Applied => ReadinessStatus::Ready,
+        MigrationStatus::NotApplied => ReadinessStatus::MigrationsNotApplied,
+        MigrationStatus::Failed => ReadinessStatus::MigrationsFailed,
+    }
+}
+
+fn readiness_response(status: ReadinessStatus) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    match status {
+        ReadinessStatus::Ready => Ok(Json(serde_json::json!({
+            "status": "ready",
+            "database": {
+                "connected": true,
+                "migrations": "applied",
+            },
+        }))),
+        ReadinessStatus::DatabaseUnavailable => Err(problem_details(
             StatusCode::SERVICE_UNAVAILABLE,
             "DATABASE_UNAVAILABLE",
             "Database is unavailable",
             Some("Readiness requires an active database connection"),
-        ));
+        )),
+        ReadinessStatus::MigrationsNotApplied => Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DATABASE_MIGRATIONS_NOT_APPLIED",
+            "Database migrations are not applied",
+            Some("Readiness requires completed database migrations"),
+        )),
+        ReadinessStatus::MigrationsFailed => Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DATABASE_MIGRATIONS_FAILED",
+            "Database migrations failed",
+            Some("Readiness requires successful database migrations"),
+        )),
+        ReadinessStatus::DatabaseUnusable => Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DATABASE_UNUSABLE",
+            "Database is unusable",
+            Some("Database readiness probe failed"),
+        )),
     }
-
-    Ok(Json(serde_json::json!({
-        "status": "ready",
-        "database": { "connected": true },
-    })))
 }
 
 async fn validation_run(
@@ -1013,18 +1081,87 @@ mod tests {
 
     #[test]
     fn test_readiness_response_with_db_is_ready() {
-        let Json(body) = readiness_response(true).expect("ready response should succeed");
+        let Json(body) =
+            readiness_response(ReadinessStatus::Ready).expect("ready response should succeed");
         assert_eq!(body["status"], "ready");
         assert_eq!(body["database"]["connected"], true);
+        assert_eq!(body["database"]["migrations"], "applied");
     }
 
     #[test]
     fn test_readiness_response_without_db_is_service_unavailable() {
-        let Err((status, Json(body))) = readiness_response(false) else {
+        let Err((status, Json(body))) = readiness_response(ReadinessStatus::DatabaseUnavailable)
+        else {
             panic!("readiness should fail when database is unavailable");
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.error, "DATABASE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn test_readiness_response_for_migrations_not_applied_is_safe_503() {
+        let Err((status, Json(body))) = readiness_response(ReadinessStatus::MigrationsNotApplied)
+        else {
+            panic!("readiness should fail when migrations are not applied");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "DATABASE_MIGRATIONS_NOT_APPLIED");
+        assert_eq!(body.message, "Database migrations are not applied");
+        assert_eq!(
+            body.detail,
+            Some("Readiness requires completed database migrations".into())
+        );
+    }
+
+    #[test]
+    fn test_readiness_response_for_failed_migrations_is_safe_503() {
+        let Err((status, Json(body))) = readiness_response(ReadinessStatus::MigrationsFailed)
+        else {
+            panic!("readiness should fail when migrations failed");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "DATABASE_MIGRATIONS_FAILED");
+        assert_eq!(body.message, "Database migrations failed");
+        assert_eq!(
+            body.detail,
+            Some("Readiness requires successful database migrations".into())
+        );
+    }
+
+    #[test]
+    fn test_readiness_response_for_unusable_database_is_safe_503() {
+        let Err((status, Json(body))) = readiness_response(ReadinessStatus::DatabaseUnusable)
+        else {
+            panic!("readiness should fail when database probe fails");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "DATABASE_UNUSABLE");
+        assert_eq!(body.message, "Database is unusable");
+        assert_eq!(body.detail, Some("Database readiness probe failed".into()));
+    }
+
+    #[test]
+    fn test_readiness_status_requires_pool_before_migrations() {
+        assert_eq!(
+            readiness_status_for_pool_state(false, MigrationStatus::Applied),
+            ReadinessStatus::DatabaseUnavailable
+        );
+    }
+
+    #[test]
+    fn test_readiness_status_requires_applied_migrations() {
+        assert_eq!(
+            readiness_status_for_pool_state(true, MigrationStatus::NotApplied),
+            ReadinessStatus::MigrationsNotApplied
+        );
+        assert_eq!(
+            readiness_status_for_pool_state(true, MigrationStatus::Failed),
+            ReadinessStatus::MigrationsFailed
+        );
+        assert_eq!(
+            readiness_status_for_pool_state(true, MigrationStatus::Applied),
+            ReadinessStatus::Ready
+        );
     }
 
     #[test]
