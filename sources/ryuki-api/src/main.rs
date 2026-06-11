@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use std::time::Instant;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
@@ -502,6 +503,9 @@ async fn main() {
         .merge(contracts::routes())
         .merge(boundary::routes())
         .fallback(not_found)
+        .layer(ConcurrencyLimitLayer::new(
+            app_config.server.max_concurrent_connections,
+        ))
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(request_counter_middleware))
         .layer(middleware::from_fn(request_id_middleware))
