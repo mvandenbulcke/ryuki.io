@@ -373,4 +373,99 @@ mod tests {
         assert_eq!(vr2.errors, vr.errors);
         assert_eq!(vr2.warnings, vr.warnings);
     }
+
+    #[test]
+    fn validate_platform_config_all_valid() {
+        let config = PlatformConfig::default();
+        let errors = validate_platform_config(&config);
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_auth_mode() {
+        let mut config = PlatformConfig::default();
+        config.auth_mode = "ldap".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("auth_mode")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_database_provider() {
+        let mut config = PlatformConfig::default();
+        config.database_provider = "mysql".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("database_provider")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_secret_provider() {
+        let mut config = PlatformConfig::default();
+        config.secret_provider = "aws-secrets-manager".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("secret_provider")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_kubernetes_runtime() {
+        let mut config = PlatformConfig::default();
+        config.kubernetes_runtime = "aks".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("kubernetes_runtime")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_monitoring_provider() {
+        let mut config = PlatformConfig::default();
+        config.monitoring_provider = "datadog".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("monitoring_provider")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_backup_provider() {
+        let mut config = PlatformConfig::default();
+        config.backup_provider = "commvault".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("backup_provider")));
+    }
+
+    #[test]
+    fn validate_platform_config_mock_dry_run_auth_valid() {
+        let mut config = PlatformConfig::default();
+        config.auth_mode = "mock-dry-run".into();
+        let errors = validate_platform_config(&config);
+        assert!(errors.is_empty(), "mock-dry-run should be valid, got: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_platform_config_entra_id_auth_valid() {
+        let mut config = PlatformConfig::default();
+        config.auth_mode = "entra-id".into();
+        let errors = validate_platform_config(&config);
+        assert!(errors.is_empty(), "entra-id should be valid, got: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_platform_config_provider_none_valid() {
+        let mut config = PlatformConfig::default();
+        config.secret_provider = "none".into();
+        let errors = validate_platform_config(&config);
+        assert!(errors.is_empty(), "none should be valid for secret_provider, got: {:?}", errors);
+    }
+
+    #[test]
+    fn platform_config_default_has_all_provider_fields() {
+        let config = PlatformConfig::default();
+        assert_eq!(config.database_provider, "cloudnativepg");
+        assert_eq!(config.secret_provider, "hashicorp-vault");
+        assert_eq!(config.kubernetes_runtime, "vsphere-vks");
+        assert_eq!(config.monitoring_provider, "zabbix");
+        assert_eq!(config.backup_provider, "veeam");
+    }
 }
