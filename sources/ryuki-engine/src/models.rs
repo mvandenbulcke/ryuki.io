@@ -166,6 +166,9 @@ pub enum HypervisorType {
     VMware,
     HyperV,
     Proxmox,
+    NutanixAhv,
+    Xen,
+    Kvm,
 }
 
 impl std::fmt::Display for HypervisorType {
@@ -174,6 +177,9 @@ impl std::fmt::Display for HypervisorType {
             HypervisorType::VMware => write!(f, "vmware"),
             HypervisorType::HyperV => write!(f, "hyperv"),
             HypervisorType::Proxmox => write!(f, "proxmox"),
+            HypervisorType::NutanixAhv => write!(f, "nutanix-ahv"),
+            HypervisorType::Xen => write!(f, "xen"),
+            HypervisorType::Kvm => write!(f, "kvm"),
         }
     }
 }
@@ -351,8 +357,15 @@ pub enum AdapterType {
     VMware,
     HyperV,
     Proxmox,
+    NutanixAhv,
+    Xen,
+    Kvm,
     Veeam,
     VeeamOne,
+    Commvault,
+    Rubrik,
+    Cohesity,
+    NetBackup,
     Zabbix,
     ServiceNow,
 }
@@ -363,8 +376,15 @@ impl std::fmt::Display for AdapterType {
             AdapterType::VMware => write!(f, "vmware"),
             AdapterType::HyperV => write!(f, "hyperv"),
             AdapterType::Proxmox => write!(f, "proxmox"),
+            AdapterType::NutanixAhv => write!(f, "nutanix-ahv"),
+            AdapterType::Xen => write!(f, "xen"),
+            AdapterType::Kvm => write!(f, "kvm"),
             AdapterType::Veeam => write!(f, "veeam"),
             AdapterType::VeeamOne => write!(f, "veeam-one"),
+            AdapterType::Commvault => write!(f, "commvault"),
+            AdapterType::Rubrik => write!(f, "rubrik"),
+            AdapterType::Cohesity => write!(f, "cohesity"),
+            AdapterType::NetBackup => write!(f, "netbackup"),
             AdapterType::Zabbix => write!(f, "zabbix"),
             AdapterType::ServiceNow => write!(f, "servicenow"),
         }

@@ -301,9 +301,16 @@ mod tests {
             "vmware",
             "hyperv",
             "proxmox",
+            "nutanix",
+            "xen",
+            "kvm",
             "veeam",
             "zabbix",
             "servicenow",
+            "commvault",
+            "rubrik",
+            "cohesity",
+            "netbackup",
         ];
         for adapter in &adapters {
             let check = check_adapter_health(adapter);

@@ -37,6 +37,7 @@ pub fn get_platform_status() -> serde_json::Value {
         "providers": {
             "secret": format!("{:?}", config.secret_provider),
             "kubernetes": format!("{:?}", config.kubernetes_runtime),
+            "hypervisor": format!("{:?}", config.hypervisor_provider),
             "monitoring": format!("{:?}", config.monitoring_provider),
             "backup": format!("{:?}", config.backup_provider),
         },

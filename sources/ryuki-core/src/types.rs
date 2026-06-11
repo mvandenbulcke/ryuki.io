@@ -100,6 +100,8 @@ pub struct PlatformConfig {
     pub monitoring_provider: String,
     #[serde(default = "default_backup_provider")]
     pub backup_provider: String,
+    #[serde(default = "default_hypervisor_provider")]
+    pub hypervisor_provider: String,
 }
 
 fn default_entra_authority() -> String {
@@ -138,6 +140,10 @@ fn default_backup_provider() -> String {
     "veeam".to_string()
 }
 
+fn default_hypervisor_provider() -> String {
+    "vmware".to_string()
+}
+
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
@@ -152,6 +158,7 @@ impl Default for PlatformConfig {
             kubernetes_runtime: default_kubernetes_runtime(),
             monitoring_provider: default_monitoring_provider(),
             backup_provider: default_backup_provider(),
+            hypervisor_provider: default_hypervisor_provider(),
         }
     }
 }
@@ -201,11 +208,34 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         ));
     }
 
-    let valid_backup_providers = ["veeam", "none"];
+    let valid_backup_providers = [
+        "veeam",
+        "commvault",
+        "rubrik",
+        "cohesity",
+        "netbackup",
+        "none",
+    ];
     if !valid_backup_providers.contains(&config.backup_provider.as_str()) {
         errors.push(format!(
             "invalid backup_provider '{}': must be one of {:?}",
             config.backup_provider, valid_backup_providers
+        ));
+    }
+
+    let valid_hypervisor_providers = [
+        "vmware",
+        "hyperv",
+        "proxmox",
+        "nutanix-ahv",
+        "xen",
+        "kvm",
+        "none",
+    ];
+    if !valid_hypervisor_providers.contains(&config.hypervisor_provider.as_str()) {
+        errors.push(format!(
+            "invalid hypervisor_provider '{}': must be one of {:?}",
+            config.hypervisor_provider, valid_hypervisor_providers
         ));
     }
 
@@ -429,10 +459,19 @@ mod tests {
     #[test]
     fn validate_platform_config_invalid_backup_provider() {
         let mut config = PlatformConfig::default();
-        config.backup_provider = "commvault".into();
+        config.backup_provider = "acronis".into();
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("backup_provider")));
+    }
+
+    #[test]
+    fn validate_platform_config_invalid_hypervisor_provider() {
+        let mut config = PlatformConfig::default();
+        config.hypervisor_provider = "virtualbox".into();
+        let errors = validate_platform_config(&config);
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("hypervisor_provider")));
     }
 
     #[test]
@@ -479,5 +518,6 @@ mod tests {
         assert_eq!(config.kubernetes_runtime, "vsphere-vks");
         assert_eq!(config.monitoring_provider, "zabbix");
         assert_eq!(config.backup_provider, "veeam");
+        assert_eq!(config.hypervisor_provider, "vmware");
     }
 }

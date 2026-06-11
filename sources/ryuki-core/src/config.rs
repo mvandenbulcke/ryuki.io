@@ -95,6 +95,46 @@ impl KubernetesRuntime {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
+pub enum HypervisorProvider {
+    #[default]
+    Vmware,
+    HyperV,
+    Proxmox,
+    NutanixAhv,
+    Xen,
+    Kvm,
+    None,
+}
+
+impl HypervisorProvider {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "vmware" => Some(Self::Vmware),
+            "hyperv" => Some(Self::HyperV),
+            "proxmox" => Some(Self::Proxmox),
+            "nutanix-ahv" => Some(Self::NutanixAhv),
+            "xen" => Some(Self::Xen),
+            "kvm" => Some(Self::Kvm),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vmware => "vmware",
+            Self::HyperV => "hyperv",
+            Self::Proxmox => "proxmox",
+            Self::NutanixAhv => "nutanix-ahv",
+            Self::Xen => "xen",
+            Self::Kvm => "kvm",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum MonitoringProvider {
     #[default]
     Zabbix,
@@ -116,6 +156,10 @@ impl MonitoringProvider {
 pub enum BackupProvider {
     #[default]
     Veeam,
+    Commvault,
+    Rubrik,
+    Cohesity,
+    NetBackup,
     None,
 }
 
@@ -123,6 +167,10 @@ impl BackupProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "veeam" => Some(Self::Veeam),
+            "commvault" => Some(Self::Commvault),
+            "rubrik" => Some(Self::Rubrik),
+            "cohesity" => Some(Self::Cohesity),
+            "netbackup" => Some(Self::NetBackup),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -334,6 +382,8 @@ pub struct RyukiConfig {
     #[serde(default)]
     pub kubernetes_runtime: KubernetesRuntime,
     #[serde(default)]
+    pub hypervisor_provider: HypervisorProvider,
+    #[serde(default)]
     pub monitoring_provider: MonitoringProvider,
     #[serde(default)]
     pub backup_provider: BackupProvider,
@@ -377,6 +427,7 @@ impl Default for RyukiConfig {
             database_provider: DatabaseProvider::default(),
             secret_provider: SecretProvider::default(),
             kubernetes_runtime: KubernetesRuntime::default(),
+            hypervisor_provider: HypervisorProvider::default(),
             monitoring_provider: MonitoringProvider::default(),
             backup_provider: BackupProvider::default(),
             cors: CorsConfig::default(),
@@ -513,6 +564,7 @@ mod tests {
         assert_eq!(config.database_provider, DatabaseProvider::CloudNativePg);
         assert_eq!(config.secret_provider, SecretProvider::HashicorpVault);
         assert_eq!(config.kubernetes_runtime, KubernetesRuntime::VsphereVks);
+        assert_eq!(config.hypervisor_provider, HypervisorProvider::Vmware);
         assert_eq!(config.monitoring_provider, MonitoringProvider::Zabbix);
         assert_eq!(config.backup_provider, BackupProvider::Veeam);
         assert_eq!(config.logging.level, LogLevel::Info);

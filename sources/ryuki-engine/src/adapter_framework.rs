@@ -238,6 +238,228 @@ impl ProviderAdapter for ProxmoxAdapter {
     }
 }
 
+pub struct NutanixAdapter {
+    pub config: AdapterConfig,
+}
+
+impl NutanixAdapter {
+    pub fn static_dry_run() -> Self {
+        NutanixAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::NutanixAhv,
+                name: "Nutanix AHV SIMULATED".into(),
+                endpoint: "https://nutanix-prism.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "6.8 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for NutanixAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![
+            InventoryItem {
+                id: "nutanix-mock-001".into(),
+                name: "nutanix-cluster-mock".into(),
+                item_type: InventoryType::Cluster,
+                owner: "nutanix-team".into(),
+                site: "GBLON".into(),
+                environment: "production".into(),
+                criticality: "critical".into(),
+                last_synced: now.clone(),
+                source: "nutanix".into(),
+                stale: false,
+                metadata: HashMap::from([("simulated".into(), "true".into())]),
+            },
+            InventoryItem {
+                id: "nutanix-mock-002".into(),
+                name: "nutanix-vm-mock".into(),
+                item_type: InventoryType::Server,
+                owner: "test-team".into(),
+                site: "GBLON".into(),
+                environment: "production".into(),
+                criticality: "high".into(),
+                last_synced: now,
+                source: "nutanix".into(),
+                stale: false,
+                metadata: HashMap::from([("simulated".into(), "true".into())]),
+            },
+        ])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Nutanix AHV", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct XenAdapter {
+    pub config: AdapterConfig,
+}
+
+impl XenAdapter {
+    pub fn static_dry_run() -> Self {
+        XenAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Xen,
+                name: "Xen/XCP-ng SIMULATED".into(),
+                endpoint: "https://xen-pool.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "8.2 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for XenAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "xen-mock-001".into(),
+            name: "xen-host-mock".into(),
+            item_type: InventoryType::HypervisorHost,
+            owner: "xen-team".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            criticality: "high".into(),
+            last_synced: now.clone(),
+            source: "xen".into(),
+            stale: false,
+            metadata: HashMap::from([("simulated".into(), "true".into())]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Xen/XCP-ng", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct KvmAdapter {
+    pub config: AdapterConfig,
+}
+
+impl KvmAdapter {
+    pub fn static_dry_run() -> Self {
+        KvmAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Kvm,
+                name: "KVM/libvirt SIMULATED".into(),
+                endpoint: "qemu:///system (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "libvirt 10.0 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for KvmAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "kvm-mock-001".into(),
+            name: "kvm-host-mock".into(),
+            item_type: InventoryType::HypervisorHost,
+            owner: "kvm-team".into(),
+            site: "FRPAR".into(),
+            environment: "production".into(),
+            criticality: "high".into(),
+            last_synced: now.clone(),
+            source: "kvm".into(),
+            stale: false,
+            metadata: HashMap::from([("simulated".into(), "true".into())]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("KVM/libvirt", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub struct VeeamAdapter {
     pub config: AdapterConfig,
 }
@@ -303,6 +525,294 @@ impl ProviderAdapter for VeeamAdapter {
         _params: &HashMap<String, String>,
     ) -> Result<String, String> {
         Ok(sanitized_dry_run_result("Veeam", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct CommvaultAdapter {
+    pub config: AdapterConfig,
+}
+
+impl CommvaultAdapter {
+    pub fn static_dry_run() -> Self {
+        CommvaultAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Commvault,
+                name: "Commvault SIMULATED".into(),
+                endpoint: "https://commvault.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "11.32 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for CommvaultAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "commvault-mock-001".into(),
+            name: "commvault-repo-mock".into(),
+            item_type: InventoryType::BackupRepository,
+            owner: "backup-team".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "commvault".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("capacity_tb".into(), "80".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Commvault", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct RubrikAdapter {
+    pub config: AdapterConfig,
+}
+
+impl RubrikAdapter {
+    pub fn static_dry_run() -> Self {
+        RubrikAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Rubrik,
+                name: "Rubrik SIMULATED".into(),
+                endpoint: "https://rubrik.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "9.0 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for RubrikAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "rubrik-mock-001".into(),
+            name: "rubrik-cluster-mock".into(),
+            item_type: InventoryType::BackupRepository,
+            owner: "backup-team".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "rubrik".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("sla_domain".into(), "gold".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Rubrik", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct CohesityAdapter {
+    pub config: AdapterConfig,
+}
+
+impl CohesityAdapter {
+    pub fn static_dry_run() -> Self {
+        CohesityAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Cohesity,
+                name: "Cohesity SIMULATED".into(),
+                endpoint: "https://cohesity.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "7.0 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for CohesityAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "cohesity-mock-001".into(),
+            name: "cohesity-cluster-mock".into(),
+            item_type: InventoryType::BackupRepository,
+            owner: "backup-team".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "cohesity".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("protection_policy".into(), "platinum".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Cohesity", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct NetBackupAdapter {
+    pub config: AdapterConfig,
+}
+
+impl NetBackupAdapter {
+    pub fn static_dry_run() -> Self {
+        NetBackupAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::NetBackup,
+                name: "Veritas NetBackup SIMULATED".into(),
+                endpoint: "https://netbackup.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "10.4 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for NetBackupAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "netbackup-mock-001".into(),
+            name: "netbackup-master-mock".into(),
+            item_type: InventoryType::BackupRepository,
+            owner: "backup-team".into(),
+            site: "FRPAR".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "netbackup".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("storage_unit".into(), "tape-stu-01".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Veritas NetBackup", operation))
     }
 
     fn disconnect(&self) -> Result<(), String> {
@@ -555,12 +1065,81 @@ mod tests {
     }
 
     #[test]
+    fn test_nutanix_adapter_all_dry_run() {
+        let adapter = NutanixAdapter::static_dry_run();
+        assert!(adapter.connect().is_ok());
+        assert_eq!(adapter.health_check().unwrap(), AdapterStatus::Connected);
+        let items = adapter.sync_inventory().unwrap();
+        assert!(!items.is_empty());
+        let result = adapter.execute("test-op", &HashMap::new()).unwrap();
+        assert!(result.contains("DRY-RUN"));
+        assert!(adapter.disconnect().is_ok());
+    }
+
+    #[test]
+    fn test_xen_adapter_returns_mock_data() {
+        let adapter = XenAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, InventoryType::HypervisorHost);
+    }
+
+    #[test]
+    fn test_kvm_adapter_returns_mock_data() {
+        let adapter = KvmAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item_type, InventoryType::HypervisorHost);
+    }
+
+    #[test]
+    fn test_commvault_adapter_capacity_mock() {
+        let adapter = CommvaultAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert!(items[0].metadata.contains_key("capacity_tb"));
+    }
+
+    #[test]
+    fn test_rubrik_adapter_sla_field() {
+        let adapter = RubrikAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert_eq!(items[0].metadata.get("sla_domain").unwrap(), "gold");
+    }
+
+    #[test]
+    fn test_cohesity_adapter_policy_field() {
+        let adapter = CohesityAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert_eq!(
+            items[0].metadata.get("protection_policy").unwrap(),
+            "platinum"
+        );
+    }
+
+    #[test]
+    fn test_netbackup_adapter_storage_unit_field() {
+        let adapter = NetBackupAdapter::static_dry_run();
+        let items = adapter.sync_inventory().unwrap();
+        assert_eq!(
+            items[0].metadata.get("storage_unit").unwrap(),
+            "tape-stu-01"
+        );
+    }
+
+    #[test]
     fn test_all_adapter_configs_are_safe() {
         let adapters: Vec<Box<dyn ProviderAdapter>> = vec![
             Box::new(VMwareAdapter::static_dry_run()),
             Box::new(HyperVAdapter::static_dry_run()),
             Box::new(ProxmoxAdapter::static_dry_run()),
+            Box::new(NutanixAdapter::static_dry_run()),
+            Box::new(XenAdapter::static_dry_run()),
+            Box::new(KvmAdapter::static_dry_run()),
             Box::new(VeeamAdapter::static_dry_run()),
+            Box::new(CommvaultAdapter::static_dry_run()),
+            Box::new(RubrikAdapter::static_dry_run()),
+            Box::new(CohesityAdapter::static_dry_run()),
+            Box::new(NetBackupAdapter::static_dry_run()),
             Box::new(ZabbixAdapter::static_dry_run()),
             Box::new(ServiceNowAdapter::static_dry_run()),
         ];
@@ -581,14 +1160,28 @@ mod tests {
         let vmware = VMwareAdapter::static_dry_run();
         let hyperv = HyperVAdapter::static_dry_run();
         let proxmox = ProxmoxAdapter::static_dry_run();
+        let nutanix = NutanixAdapter::static_dry_run();
+        let xen = XenAdapter::static_dry_run();
+        let kvm = KvmAdapter::static_dry_run();
         let veeam = VeeamAdapter::static_dry_run();
+        let commvault = CommvaultAdapter::static_dry_run();
+        let rubrik = RubrikAdapter::static_dry_run();
+        let cohesity = CohesityAdapter::static_dry_run();
+        let netbackup = NetBackupAdapter::static_dry_run();
         let zabbix = ZabbixAdapter::static_dry_run();
         let servicenow = ServiceNowAdapter::static_dry_run();
 
         assert_eq!(vmware.config.readiness, ReadinessState::Configured);
         assert_eq!(hyperv.config.readiness, ReadinessState::Configured);
         assert_eq!(proxmox.config.readiness, ReadinessState::Configured);
+        assert_eq!(nutanix.config.readiness, ReadinessState::Configured);
+        assert_eq!(xen.config.readiness, ReadinessState::Configured);
+        assert_eq!(kvm.config.readiness, ReadinessState::Configured);
         assert_eq!(veeam.config.readiness, ReadinessState::Configured);
+        assert_eq!(commvault.config.readiness, ReadinessState::Configured);
+        assert_eq!(rubrik.config.readiness, ReadinessState::Configured);
+        assert_eq!(cohesity.config.readiness, ReadinessState::Configured);
+        assert_eq!(netbackup.config.readiness, ReadinessState::Configured);
         assert_eq!(zabbix.config.readiness, ReadinessState::Configured);
         assert_eq!(servicenow.config.readiness, ReadinessState::Configured);
     }
@@ -616,7 +1209,14 @@ mod tests {
             Box::new(VMwareAdapter::static_dry_run()),
             Box::new(HyperVAdapter::static_dry_run()),
             Box::new(ProxmoxAdapter::static_dry_run()),
+            Box::new(NutanixAdapter::static_dry_run()),
+            Box::new(XenAdapter::static_dry_run()),
+            Box::new(KvmAdapter::static_dry_run()),
             Box::new(VeeamAdapter::static_dry_run()),
+            Box::new(CommvaultAdapter::static_dry_run()),
+            Box::new(RubrikAdapter::static_dry_run()),
+            Box::new(CohesityAdapter::static_dry_run()),
+            Box::new(NetBackupAdapter::static_dry_run()),
             Box::new(ZabbixAdapter::static_dry_run()),
             Box::new(ServiceNowAdapter::static_dry_run()),
         ];

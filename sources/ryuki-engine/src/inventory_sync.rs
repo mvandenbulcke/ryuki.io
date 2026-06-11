@@ -9,8 +9,15 @@ pub fn sync_inventory_sources() -> Result<Vec<InventoryItem>, String> {
         "vmware",
         "hyperv",
         "proxmox",
+        "nutanix",
+        "xen",
+        "kvm",
         "veeam",
         "zabbix",
+        "commvault",
+        "rubrik",
+        "cohesity",
+        "netbackup",
         "cmdb-export",
     ];
     let now = Utc::now().to_rfc3339();
@@ -118,6 +125,111 @@ fn mock_inventory_for_source(source: &str, now: &str) -> Vec<InventoryItem> {
                 source: "zabbix".into(),
                 stale: false,
                 metadata: HashMap::from([("version".into(), "7.4".into())]),
+            });
+        }
+        "nutanix" => {
+            items.push(InventoryItem {
+                id: "inv-nutanix-001".to_string(),
+                name: "nutanix-cluster-defra-01".into(),
+                item_type: InventoryType::HypervisorHost,
+                owner: "nutanix-team".into(),
+                site: "DEFRA".into(),
+                environment: "production".into(),
+                criticality: "critical".into(),
+                last_synced: now.to_string(),
+                source: "nutanix".into(),
+                stale: false,
+                metadata: HashMap::from([("ahv_version".into(), "6.5".into())]),
+            });
+        }
+        "xen" => {
+            items.push(InventoryItem {
+                id: "inv-xen-001".to_string(),
+                name: "xen-host-nlams-01".into(),
+                item_type: InventoryType::HypervisorHost,
+                owner: "xen-team".into(),
+                site: "NLAMS".into(),
+                environment: "production".into(),
+                criticality: "high".into(),
+                last_synced: now.to_string(),
+                source: "xen".into(),
+                stale: false,
+                metadata: HashMap::new(),
+            });
+        }
+        "kvm" => {
+            items.push(InventoryItem {
+                id: "inv-kvm-001".to_string(),
+                name: "kvm-host-frpar-01".into(),
+                item_type: InventoryType::HypervisorHost,
+                owner: "kvm-team".into(),
+                site: "FRPAR".into(),
+                environment: "production".into(),
+                criticality: "high".into(),
+                last_synced: now.to_string(),
+                source: "kvm".into(),
+                stale: false,
+                metadata: HashMap::from([("libvirt_version".into(), "10.0".into())]),
+            });
+        }
+        "commvault" => {
+            items.push(InventoryItem {
+                id: "inv-commvault-001".to_string(),
+                name: "commvault-commcell-gblon".into(),
+                item_type: InventoryType::BackupRepository,
+                owner: "backup-team".into(),
+                site: "GBLON".into(),
+                environment: "production".into(),
+                criticality: "critical".into(),
+                last_synced: now.to_string(),
+                source: "commvault".into(),
+                stale: false,
+                metadata: HashMap::from([("capacity_tb".into(), "120".into())]),
+            });
+        }
+        "rubrik" => {
+            items.push(InventoryItem {
+                id: "inv-rubrik-001".to_string(),
+                name: "rubrik-cluster-defra-01".into(),
+                item_type: InventoryType::BackupRepository,
+                owner: "backup-team".into(),
+                site: "DEFRA".into(),
+                environment: "production".into(),
+                criticality: "critical".into(),
+                last_synced: now.to_string(),
+                source: "rubrik".into(),
+                stale: false,
+                metadata: HashMap::from([("capacity_tb".into(), "200".into())]),
+            });
+        }
+        "cohesity" => {
+            items.push(InventoryItem {
+                id: "inv-cohesity-001".to_string(),
+                name: "cohesity-cluster-nlams-01".into(),
+                item_type: InventoryType::BackupRepository,
+                owner: "backup-team".into(),
+                site: "NLAMS".into(),
+                environment: "production".into(),
+                criticality: "critical".into(),
+                last_synced: now.to_string(),
+                source: "cohesity".into(),
+                stale: false,
+                metadata: HashMap::from([("capacity_tb".into(), "80".into())]),
+            });
+        }
+        "netbackup" => {
+            items.push(InventoryItem {
+                id: "inv-netbackup-001".to_string(),
+                name: "netbackup-master-frpar-01".into(),
+                item_type: InventoryType::BackupRepository,
+                owner: "backup-team".into(),
+                site: "FRPAR".into(),
+                environment: "production".into(),
+                criticality: "high".into(),
+                last_synced: now.to_string(),
+                source: "netbackup".into(),
+                stale: false,
+                metadata: HashMap::from([("capacity_tb".into(), "150".into())]),
             });
         }
         "cmdb-export" => {

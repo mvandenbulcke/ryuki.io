@@ -443,6 +443,34 @@ pub fn routes() -> Router {
             get(integrations_servicenow_readiness),
         )
         .route(
+            "/api/integrations/nutanix/readiness",
+            get(integrations_nutanix_readiness),
+        )
+        .route(
+            "/api/integrations/xen/readiness",
+            get(integrations_xen_readiness),
+        )
+        .route(
+            "/api/integrations/kvm/readiness",
+            get(integrations_kvm_readiness),
+        )
+        .route(
+            "/api/integrations/commvault/readiness",
+            get(integrations_commvault_readiness),
+        )
+        .route(
+            "/api/integrations/rubrik/readiness",
+            get(integrations_rubrik_readiness),
+        )
+        .route(
+            "/api/integrations/cohesity/readiness",
+            get(integrations_cohesity_readiness),
+        )
+        .route(
+            "/api/integrations/netbackup/readiness",
+            get(integrations_netbackup_readiness),
+        )
+        .route(
             "/api/integrations/servicenow/cmdb-file-contract",
             get(integrations_servicenow_cmdb_file),
         )
@@ -2408,8 +2436,15 @@ fn components() -> Value {
         "platform-worker",
         "inventory-sync",
         "vmware-adapter",
+        "nutanix-ahv-adapter",
+        "xen-adapter",
+        "kvm-adapter",
         "veeam-br-adapter",
         "veeam-one-adapter",
+        "commvault-adapter",
+        "rubrik-adapter",
+        "cohesity-adapter",
+        "netbackup-adapter",
         "zabbix-adapter",
         "servicenow-adapter",
         "image-factory-controller",
@@ -2955,7 +2990,7 @@ async fn requests_preflight() -> Json<Value> {
         "objectIdentifiersAllowed": false,
         "principalIdentifiersAllowed": false,
         "privateNetworkValuesAllowed": false,
-        "hypervisorScope": ["vmware","hyperv","proxmox"],
+        "hypervisorScope": ["vmware","hyperv","proxmox","nutanix-ahv","xen","kvm"],
         "preflightSurfaces": ["input-completeness","catalog-policy-readiness","site-context-readiness","dependency-readiness","approval-route-readiness","dry-run-plan-readiness","evidence-redaction-readiness"],
         "validationStages": ["site","owner","capacity","network","backup","monitoring","cmdb","approval","dry-run","evidence"],
         "requiredInputs": ["requestedOffering","owner","site","environment","criticality","dryRunPlan","approvalRoute","evidenceManifest","secretReferenceState"],
@@ -3464,6 +3499,9 @@ async fn catalog_access_control() -> Json<Value> {
             {"id":"vmware-operator","title":"VMware Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["vmware","placement","lifecycle"]},
             {"id":"hyper-v-operator","title":"Hyper-V Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["hyper-v","placement","lifecycle"]},
             {"id":"proxmox-operator","title":"Proxmox Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["proxmox","placement","lifecycle"]},
+            {"id":"nutanix-operator","title":"Nutanix AHV Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["nutanix-ahv","placement","lifecycle"]},
+            {"id":"xen-operator","title":"Xen Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["xen","placement","lifecycle"]},
+            {"id":"kvm-operator","title":"KVM Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["kvm","placement","lifecycle"]},
             {"id":"wintel-linux-operator","title":"Wintel/Linux Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["windows","linux","patching","baseline"]},
             {"id":"backup-operator","title":"Backup Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["backup","restore","dr"]},
             {"id":"monitoring-operator","title":"Monitoring Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["monitoring","alert-routing","maintenance-window"]},
@@ -4003,7 +4041,14 @@ async fn integrations_readiness() -> Json<Value> {
             {"id":"vmware","component":"vmware-adapter","apiGroup":"/api/integrations/vmware","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"hyperv","component":"hyperv-adapter","apiGroup":"/api/integrations/hyperv","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"proxmox","component":"proxmox-adapter","apiGroup":"/api/integrations/proxmox","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"nutanix","component":"nutanix-ahv-adapter","apiGroup":"/api/integrations/nutanix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"xen","component":"xen-adapter","apiGroup":"/api/integrations/xen","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"kvm","component":"kvm-adapter","apiGroup":"/api/integrations/kvm","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"veeam","component":"veeam-br-adapter","apiGroup":"/api/integrations/veeam","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"commvault","component":"commvault-adapter","apiGroup":"/api/integrations/commvault","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"rubrik","component":"rubrik-adapter","apiGroup":"/api/integrations/rubrik","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"cohesity","component":"cohesity-adapter","apiGroup":"/api/integrations/cohesity","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"netbackup","component":"netbackup-adapter","apiGroup":"/api/integrations/netbackup","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
         ]
@@ -4015,7 +4060,14 @@ fn adapter_json(id: &str) -> Value {
         {"id":"vmware","component":"vmware-adapter","apiGroup":"/api/integrations/vmware","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"hyperv","component":"hyperv-adapter","apiGroup":"/api/integrations/hyperv","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"proxmox","component":"proxmox-adapter","apiGroup":"/api/integrations/proxmox","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"nutanix","component":"nutanix-ahv-adapter","apiGroup":"/api/integrations/nutanix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"xen","component":"xen-adapter","apiGroup":"/api/integrations/xen","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"kvm","component":"kvm-adapter","apiGroup":"/api/integrations/kvm","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"veeam","component":"veeam-br-adapter","apiGroup":"/api/integrations/veeam","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"commvault","component":"commvault-adapter","apiGroup":"/api/integrations/commvault","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"rubrik","component":"rubrik-adapter","apiGroup":"/api/integrations/rubrik","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"cohesity","component":"cohesity-adapter","apiGroup":"/api/integrations/cohesity","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"netbackup","component":"netbackup-adapter","apiGroup":"/api/integrations/netbackup","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
     ]);
@@ -4054,10 +4106,94 @@ async fn integrations_servicenow_readiness() -> Json<Value> {
     Json(adapter_json("servicenow"))
 }
 
+async fn integrations_nutanix_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "nutanix",
+        "adapter": "nutanix-ahv",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["inventory", "health", "provisioning", "lifecycle", "templates"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_xen_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "xen",
+        "adapter": "xen",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["inventory", "health", "provisioning", "lifecycle", "templates"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_kvm_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "kvm",
+        "adapter": "kvm",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["inventory", "health", "provisioning", "lifecycle", "templates"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_commvault_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "commvault",
+        "adapter": "commvault",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["backup", "restore", "policy", "reporting", "retention"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_rubrik_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "rubrik",
+        "adapter": "rubrik",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["backup", "restore", "policy", "reporting", "retention"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_cohesity_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "cohesity",
+        "adapter": "cohesity",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["backup", "restore", "policy", "reporting", "retention"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
+async fn integrations_netbackup_readiness() -> Json<Value> {
+    Json(json!({
+        "provider": "netbackup",
+        "adapter": "netbackup",
+        "status": "available",
+        "mode": "static-dry-run",
+        "capabilities": ["backup", "restore", "policy", "reporting", "retention"],
+        "last_checked": chrono::Utc::now().to_rfc3339(),
+        "source": "static-seed"
+    }))
+}
+
 async fn integrations_adapter_matrix() -> Json<Value> {
     Json(json!({
         "source": "static-seed", "providerCallsEnabled": false,
-        "adapters": ["vmware","hyperv","proxmox","veeam-br","veeam-one","zabbix","servicenow-file-exchange"],
+        "adapters": ["vmware","hyperv","proxmox","nutanix","xen","kvm","veeam-br","veeam-one","commvault","rubrik","cohesity","netbackup","zabbix","servicenow-file-exchange"],
         "states": ["ready","degraded","stale","blocked","unknown"],
         "dimensions": ["secretReference","endpointReachability","apiVersionCompatibility","permissionScope","dryRunCapability","staleDataMarker","ownerSupport","evidenceReadiness"],
         "guards": ["secret-reference-known","endpoint-not-raw","api-version-reviewed","permissions-reviewed","stale-data-marked","owner-known","support-group-known","evidence-redacted"],
@@ -4070,7 +4206,7 @@ async fn integrations_adapter_matrix() -> Json<Value> {
 async fn integrations_adapter_contract_test() -> Json<Value> {
     Json(json!({
         "source": "static-seed", "providerCallsEnabled": false,
-        "targets": ["vmware-readiness","hyperv-readiness","proxmox-readiness","veeam-readiness","zabbix-readiness","servicenow-file-exchange","adapter-readiness-matrix","dry-run-plan"],
+        "targets": ["vmware-readiness","hyperv-readiness","proxmox-readiness","nutanix-readiness","xen-readiness","kvm-readiness","veeam-readiness","commvault-readiness","rubrik-readiness","cohesity-readiness","netbackup-readiness","zabbix-readiness","servicenow-file-exchange","adapter-readiness-matrix","dry-run-plan"],
         "testTypes": ["readiness-contract","dry-run-contract","blocked-default","secret-reference-contract","stale-data-marker","redaction-contract","evidence-contract"],
         "fixtureTypes": ["static-json-fixture","static-yaml-fixture","mock-provider-result","negative-case-fixture","redacted-evidence-fixture"],
         "requiredGuards": ["fixture-set-redacted","provider-calls-blocked","credential-values-absent","network-egress-blocked","expected-state-declared","blocked-reasons-declared","stale-data-marked","evidence-redacted"],
@@ -4106,13 +4242,13 @@ async fn integrations_servicenow_future_api() -> Json<Value> {
 
 async fn inventory_coverage() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"domains":["vmware","hyperv","proxmox","veeam","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"freshnessStates":["current","stale","unknown","blocked"],"gapTypes":["backup-coverage-gap","monitoring-coverage-gap","cmdb-drift","stale-data","ownership-gap","policy-gap"],"driftSignals":["identity-mismatch","owner-mismatch","backup-policy-mismatch","monitoring-profile-mismatch","site-placement-mismatch"],"evidence":["Inventory snapshot","Coverage gap list","Stale-data markers","CMDB reconciliation summary","Evidence references"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"domains":["vmware","hyperv","proxmox","nutanix-ahv","xen","kvm","veeam","commvault","rubrik","cohesity","netbackup","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"freshnessStates":["current","stale","unknown","blocked"],"gapTypes":["backup-coverage-gap","monitoring-coverage-gap","cmdb-drift","stale-data","ownership-gap","policy-gap"],"driftSignals":["identity-mismatch","owner-mismatch","backup-policy-mismatch","monitoring-profile-mismatch","site-placement-mismatch"],"evidence":["Inventory snapshot","Coverage gap list","Stale-data markers","CMDB reconciliation summary","Evidence references"]}),
     )
 }
 
 async fn inventory_coverage_local() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","coverage":"local-static-seed","domains":["vmware","hyperv","proxmox","veeam","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"providerCallsEnabled":false}),
+        json!({"source":"static-seed","coverage":"local-static-seed","domains":["vmware","hyperv","proxmox","nutanix-ahv","xen","kvm","veeam","commvault","rubrik","cohesity","netbackup","zabbix","servicenow-cmdb","site-catalog","policy-catalog"],"providerCallsEnabled":false}),
     )
 }
 
@@ -4143,25 +4279,25 @@ async fn software_approved_deployment() -> Json<Value> {
 
 async fn workflows_server_lifecycle() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"workflows":["windows-server-deployment","linux-server-deployment"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"supportedLinuxDistributions":["sles","rhel","rocky-linux","alma-linux","ubuntu","debian"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","hypervisorPlatform","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"requiredGuards":["request-preflight-ready","capacity-admission-ready","inventory-coverage-current","approval-route-assigned","evidence-redacted","secret-reference-configured"],"planSections":["placementPlan","osCustomizationPlan","backupPlan","monitoringPlan","cmdbUpdatePlan","riskNotes","rollbackNotes"],"blockedReasons":["missing-required-input","stale-inventory","capacity-not-approved","backup-policy-missing","monitoring-profile-missing","cmdb-context-ambiguous","unsupported-hypervisor","live-hypervisor-execution-disabled","live-execution-disabled"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"workflows":["windows-server-deployment","linux-server-deployment"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"supportedLinuxDistributions":["sles","rhel","rocky-linux","alma-linux","ubuntu","debian"],"requiredInputs":["businessPurpose","requester","owner","site","environment","criticality","hypervisorPlatform","imageVersion","vmSizing","network","backupPolicy","monitoringProfile","cmdbContext"],"requiredGuards":["request-preflight-ready","capacity-admission-ready","inventory-coverage-current","approval-route-assigned","evidence-redacted","secret-reference-configured"],"planSections":["placementPlan","osCustomizationPlan","backupPlan","monitoringPlan","cmdbUpdatePlan","riskNotes","rollbackNotes"],"blockedReasons":["missing-required-input","stale-inventory","capacity-not-approved","backup-policy-missing","monitoring-profile-missing","cmdb-context-ambiguous","unsupported-hypervisor","live-hypervisor-execution-disabled","live-execution-disabled"]}),
     )
 }
 
 async fn workflows_app_env_deployment() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["tier-topology-plan","vm-placement-plan","dns-ipam-plan","certificate-plan","firewall-rule-plan","monitoring-plan","backup-plan","cmdb-relationship-plan","handover-plan"],"tiers":["front-tier","mid-tier","back-tier","data-tier","shared-service-tier"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","tier-topology-reviewed","placement-plan-reviewed","dns-ipam-plan-reviewed","certificate-plan-reviewed","network-flow-reviewed","monitoring-plan-reviewed","backup-plan-reviewed","cmdb-relationship-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["environmentSummary","tierTopology","placementPlan","dnsIpamPlan","certificatePlan","networkFlowPlan","monitoringPlan","backupPlan","cmdbRelationshipPlan","rollbackPlan","handoverPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-dns-ipam-change-disabled","live-certificate-change-disabled","live-firewall-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","raw-network-data-disabled","raw-dns-records-disabled","raw-certificate-data-disabled","raw-firewall-rules-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","app-env-host-identifiers-disabled","fqdn-values-disabled","ip-address-values-disabled","credential-values-disabled","raw-recipient-data-disabled","tier-topology-missing","dns-ipam-plan-missing","certificate-plan-missing","firewall-plan-missing","monitoring-plan-missing","backup-plan-missing","cmdb-relationship-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["tier-topology-plan","vm-placement-plan","dns-ipam-plan","certificate-plan","firewall-rule-plan","monitoring-plan","backup-plan","cmdb-relationship-plan","handover-plan"],"tiers":["front-tier","mid-tier","back-tier","data-tier","shared-service-tier"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"requiredGuards":["request-preflight-ready","tier-topology-reviewed","placement-plan-reviewed","dns-ipam-plan-reviewed","certificate-plan-reviewed","network-flow-reviewed","monitoring-plan-reviewed","backup-plan-reviewed","cmdb-relationship-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["environmentSummary","tierTopology","placementPlan","dnsIpamPlan","certificatePlan","networkFlowPlan","monitoringPlan","backupPlan","cmdbRelationshipPlan","rollbackPlan","handoverPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-dns-ipam-change-disabled","live-certificate-change-disabled","live-firewall-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","raw-network-data-disabled","raw-dns-records-disabled","raw-certificate-data-disabled","raw-firewall-rules-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","app-env-host-identifiers-disabled","fqdn-values-disabled","ip-address-values-disabled","credential-values-disabled","raw-recipient-data-disabled","tier-topology-missing","dns-ipam-plan-missing","certificate-plan-missing","firewall-plan-missing","monitoring-plan-missing","backup-plan-missing","cmdb-relationship-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
     )
 }
 
 async fn workflows_app_env_retirement() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"phases":["intake-review","relationship-review","dependency-freeze-plan","data-retention-plan","backup-retention-plan","access-closure-plan","monitoring-disable-plan","cmdb-retirement-plan","rollback-window-review","final-closure-hold"],"domains":["application-environment","dependency-graph","data-retention","backup-retention","access-closure","monitoring-state","cmdb-relationship","owner-approval","rollback-window","evidence-readiness"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","relationship-graph-reviewed","dependency-impact-reviewed","data-retention-reviewed","backup-retention-reviewed","access-closure-reviewed","monitoring-disable-reviewed","cmdb-retirement-reviewed","rollback-window-reviewed","final-closure-blocked","approval-route-assigned","evidence-redacted"],"planSections":["retirementSummary","relationshipReview","dependencyImpact","dataRetentionPlan","backupRetentionPlan","accessClosurePlan","monitoringDisablePlan","cmdbRetirementPlan","rollbackWindow","finalClosureHold","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-retirement-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","live-access-change-disabled","live-data-deletion-disabled","raw-dependency-rows-disabled","raw-relationship-rows-disabled","raw-inventory-rows-disabled","raw-backup-rows-disabled","raw-monitoring-rows-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","application-identifiers-disabled","environment-identifiers-disabled","app-env-host-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","credential-values-disabled","raw-recipient-data-disabled","dependency-review-missing","data-retention-missing","backup-retention-missing","access-closure-review-missing","monitoring-disable-review-missing","cmdb-retirement-review-missing","rollback-window-missing","final-closure-blocked","approval-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"phases":["intake-review","relationship-review","dependency-freeze-plan","data-retention-plan","backup-retention-plan","access-closure-plan","monitoring-disable-plan","cmdb-retirement-plan","rollback-window-review","final-closure-hold"],"domains":["application-environment","dependency-graph","data-retention","backup-retention","access-closure","monitoring-state","cmdb-relationship","owner-approval","rollback-window","evidence-readiness"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"requiredGuards":["request-preflight-ready","relationship-graph-reviewed","dependency-impact-reviewed","data-retention-reviewed","backup-retention-reviewed","access-closure-reviewed","monitoring-disable-reviewed","cmdb-retirement-reviewed","rollback-window-reviewed","final-closure-blocked","approval-route-assigned","evidence-redacted"],"planSections":["retirementSummary","relationshipReview","dependencyImpact","dataRetentionPlan","backupRetentionPlan","accessClosurePlan","monitoringDisablePlan","cmdbRetirementPlan","rollbackWindow","finalClosureHold","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-retirement-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-monitoring-change-disabled","live-backup-change-disabled","live-cmdb-change-disabled","live-access-change-disabled","live-data-deletion-disabled","raw-dependency-rows-disabled","raw-relationship-rows-disabled","raw-inventory-rows-disabled","raw-backup-rows-disabled","raw-monitoring-rows-disabled","raw-cmdb-rows-disabled","raw-provider-payloads-disabled","application-identifiers-disabled","environment-identifiers-disabled","app-env-host-identifiers-disabled","object-identifiers-disabled","private-network-values-disabled","credential-values-disabled","raw-recipient-data-disabled","dependency-review-missing","data-retention-missing","backup-retention-missing","access-closure-review-missing","monitoring-disable-review-missing","cmdb-retirement-review-missing","rollback-window-missing","final-closure-blocked","approval-missing","evidence-not-redacted"]}),
     )
 }
 
 async fn workflows_sql_server() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["standalone-instance-plan","failover-cluster-plan","availability-group-plan","disk-layout-plan","runtime-identity-plan","spn-policy-review","backup-policy-plan","monitoring-plan","cmdb-publication-plan"],"topologies":["standalone","failover-cluster","availability-group"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"requiredGuards":["request-preflight-ready","topology-reviewed","capacity-admission-ready","disk-layout-reviewed","runtime-identity-reviewed","spn-policy-reviewed","backup-plan-reviewed","monitoring-plan-reviewed","cmdb-publication-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["deploymentSummary","topologyReview","placementPlan","diskLayoutPlan","runtimeIdentityPlan","spnPolicyReview","backupPlan","monitoringPlan","cmdbPublicationPlan","rollbackPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-sql-change-disabled","live-directory-change-disabled","live-dns-change-disabled","live-backup-change-disabled","live-monitoring-change-disabled","live-cmdb-change-disabled","availability-group-change-disabled","sql-runtime-identity-change-disabled","spn-change-disabled","database-creation-disabled","sql-agent-job-change-disabled","raw-sql-instance-data-disabled","raw-database-data-disabled","raw-path-data-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","sql-host-identifiers-disabled","sql-listener-identifiers-disabled","credential-values-disabled","port-values-disabled","topology-missing","disk-layout-missing","runtime-identity-missing","spn-policy-missing","backup-plan-missing","monitoring-plan-missing","cmdb-context-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"deploymentPlans":["standalone-instance-plan","failover-cluster-plan","availability-group-plan","disk-layout-plan","runtime-identity-plan","spn-policy-review","backup-policy-plan","monitoring-plan","cmdb-publication-plan"],"topologies":["standalone","failover-cluster","availability-group"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"requiredGuards":["request-preflight-ready","topology-reviewed","capacity-admission-ready","disk-layout-reviewed","runtime-identity-reviewed","spn-policy-reviewed","backup-plan-reviewed","monitoring-plan-reviewed","cmdb-publication-reviewed","approval-route-assigned","rollback-plan-ready","evidence-redacted"],"planSections":["deploymentSummary","topologyReview","placementPlan","diskLayoutPlan","runtimeIdentityPlan","spnPolicyReview","backupPlan","monitoringPlan","cmdbPublicationPlan","rollbackPlan","evidenceReferences"],"blockedReasons":["provider-calls-disabled","worker-execution-disabled","live-deployment-disabled","live-vmware-change-disabled","live-hyperv-change-disabled","live-proxmox-change-disabled","live-sql-change-disabled","live-directory-change-disabled","live-dns-change-disabled","live-backup-change-disabled","live-monitoring-change-disabled","live-cmdb-change-disabled","availability-group-change-disabled","sql-runtime-identity-change-disabled","spn-change-disabled","database-creation-disabled","sql-agent-job-change-disabled","raw-sql-instance-data-disabled","raw-database-data-disabled","raw-path-data-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","sql-host-identifiers-disabled","sql-listener-identifiers-disabled","credential-values-disabled","port-values-disabled","topology-missing","disk-layout-missing","runtime-identity-missing","spn-policy-missing","backup-plan-missing","monitoring-plan-missing","cmdb-context-missing","approval-missing","rollback-plan-missing","evidence-not-redacted"]}),
     )
 }
 
@@ -4243,19 +4379,19 @@ async fn integrations_vmware_cluster_capacity() -> Json<Value> {
 
 async fn integrations_vmware_customization_spec() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["request-preflight","windows-server-deployment","ou-placement-review","customization-spec-drift-review","site-catalog-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"guestCustomizationParity":["vmware-vcenter-customization-spec-safe-facts","hyper-v-answer-file-safe-facts","proxmox-cloud-init-safe-facts"],"safeFacts":["customizationSpecReference","countryCode","siteCode","domainReference","ouPatternReference","timezoneCode","dhcpNetworkBehavior","organizationLabel","windowsBehavior"],"driftSignals":["missing-expected-spec","unknown-spec","country-site-mismatch","ou-pattern-mismatch","domain-mismatch","timezone-mismatch","network-behavior-mismatch","windows-behavior-mismatch","stale-spec-inventory"],"requiredGuards":["site-known","safe-facts-from-catalog","ou-pattern-derived","free-form-ou-blocked","encrypted-xml-excluded","drift-check-reviewed","stale-data-marked","owner-known","evidence-redacted"],"planSections":["safeFactSummary","siteMapping","ouPlacementDecision","timezoneAndNetworkBehavior","windowsBehaviorReview","driftReview","blockedFindings","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-provider-validation-disabled","live-guest-customization-disabled","unsupported-hypervisor","raw-xml-blocked","encrypted-xml-blocked","credential-material-blocked","site-unknown","spec-reference-unknown","ou-pattern-mismatch","stale-spec-inventory","owner-unknown","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["request-preflight","windows-server-deployment","ou-placement-review","customization-spec-drift-review","site-catalog-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"guestCustomizationParity":["vmware-vcenter-customization-spec-safe-facts","hyper-v-answer-file-safe-facts","proxmox-cloud-init-safe-facts","nutanix-ahv-cloud-init-safe-facts","xen-cloud-init-safe-facts","kvm-cloud-init-safe-facts"],"safeFacts":["customizationSpecReference","countryCode","siteCode","domainReference","ouPatternReference","timezoneCode","dhcpNetworkBehavior","organizationLabel","windowsBehavior"],"driftSignals":["missing-expected-spec","unknown-spec","country-site-mismatch","ou-pattern-mismatch","domain-mismatch","timezone-mismatch","network-behavior-mismatch","windows-behavior-mismatch","stale-spec-inventory"],"requiredGuards":["site-known","safe-facts-from-catalog","ou-pattern-derived","free-form-ou-blocked","encrypted-xml-excluded","drift-check-reviewed","stale-data-marked","owner-known","evidence-redacted"],"planSections":["safeFactSummary","siteMapping","ouPlacementDecision","timezoneAndNetworkBehavior","windowsBehaviorReview","driftReview","blockedFindings","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-provider-validation-disabled","live-guest-customization-disabled","unsupported-hypervisor","raw-xml-blocked","encrypted-xml-blocked","credential-material-blocked","site-unknown","spec-reference-unknown","ou-pattern-mismatch","stale-spec-inventory","owner-unknown","evidence-not-redacted"]}),
     )
 }
 
 async fn integrations_vmware_object_placement() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"livePlacementEnabled":false,"vcenterDimensions":["folder","cluster","resource-pool","datastore","storage-policy","network","tag-policy","site","environment"],"hyperVDimensions":["folder","cluster","resource-pool","storage-policy","network","tag-policy","site","environment"],"proxmoxDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"requiredGuards":["site-known","environment-known","folder-policy-known","cluster-capacity-admitted","resource-pool-policy-known","datastore-policy-known","storage-policy-known","network-profile-known","tag-policy-known","dry-run-plan-produced","evidence-redacted"],"planSections":["placementSummary","folderPlan","clusterResourcePoolPlan","datastoreStoragePolicyPlan","networkPlan","tagPolicyPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-placement-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","site-unknown","environment-unknown","folder-policy-missing","cluster-capacity-missing","resource-pool-policy-missing","datastore-policy-missing","storage-policy-missing","network-profile-missing","tag-policy-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"livePlacementEnabled":false,"vcenterDimensions":["folder","cluster","resource-pool","datastore","storage-policy","network","tag-policy","site","environment"],"hyperVDimensions":["folder","cluster","resource-pool","storage-policy","network","tag-policy","site","environment"],"proxmoxDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"nutanixAhvDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"xenDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"kvmDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"requiredGuards":["site-known","environment-known","folder-policy-known","cluster-capacity-admitted","resource-pool-policy-known","datastore-policy-known","storage-policy-known","network-profile-known","tag-policy-known","dry-run-plan-produced","evidence-redacted"],"planSections":["placementSummary","folderPlan","clusterResourcePoolPlan","datastoreStoragePolicyPlan","networkPlan","tagPolicyPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-placement-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","site-unknown","environment-unknown","folder-policy-missing","cluster-capacity-missing","resource-pool-policy-missing","datastore-policy-missing","storage-policy-missing","network-profile-missing","tag-policy-missing","evidence-not-redacted"]}),
     )
 }
 
 async fn integrations_vmware_vsan_esxi() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["vsan-cluster-lifecycle","esxi-patch-lifecycle","firmware-baseline-review","hardware-readiness-review","maintenance-mode-plan","lifecycle-exception-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox"],"platformLifecycleParity":["vmware-vsan-esxi-lifecycle-safe-summary","hyper-v-cluster-host-lifecycle-safe-summary","proxmox-cluster-node-lifecycle-safe-summary"],"domains":["vsan-health","esxi-version","firmware-baseline","driver-compatibility","hardware-hcl","cluster-maintenance","network-readiness","storage-policy"],"requiredGuards":["cluster-scope-known","site-known","platform-profile-known","target-baseline-known","hardware-readiness-reviewed","network-readiness-reviewed","capacity-admission-ready","maintenance-window-approved","rollback-plan-ready","dry-run-plan-produced","evidence-redacted"],"planSections":["lifecycleSummary","currentBaseline","targetBaseline","hardwareFirmwareReview","networkStorageReadiness","maintenanceModePlan","capacityAndFailureDomainImpact","rollbackPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-lifecycle-disabled","unsupported-hypervisor","raw-inventory-rows-disabled","host-identifiers-disabled","cluster-scope-missing","site-unknown","platform-profile-missing","target-baseline-missing","hardware-readiness-missing","network-readiness-missing","capacity-admission-missing","maintenance-window-missing","rollback-plan-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["vsan-cluster-lifecycle","esxi-patch-lifecycle","firmware-baseline-review","hardware-readiness-review","maintenance-mode-plan","lifecycle-exception-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"platformLifecycleParity":["vmware-vsan-esxi-lifecycle-safe-summary","hyper-v-cluster-host-lifecycle-safe-summary","proxmox-cluster-node-lifecycle-safe-summary","nutanix-ahv-cluster-lifecycle-safe-summary","xen-cluster-host-lifecycle-safe-summary","kvm-cluster-host-lifecycle-safe-summary"],"domains":["vsan-health","esxi-version","firmware-baseline","driver-compatibility","hardware-hcl","cluster-maintenance","network-readiness","storage-policy"],"requiredGuards":["cluster-scope-known","site-known","platform-profile-known","target-baseline-known","hardware-readiness-reviewed","network-readiness-reviewed","capacity-admission-ready","maintenance-window-approved","rollback-plan-ready","dry-run-plan-produced","evidence-redacted"],"planSections":["lifecycleSummary","currentBaseline","targetBaseline","hardwareFirmwareReview","networkStorageReadiness","maintenanceModePlan","capacityAndFailureDomainImpact","rollbackPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-lifecycle-disabled","unsupported-hypervisor","raw-inventory-rows-disabled","host-identifiers-disabled","cluster-scope-missing","site-unknown","platform-profile-missing","target-baseline-missing","hardware-readiness-missing","network-readiness-missing","capacity-admission-missing","maintenance-window-missing","rollback-plan-missing","evidence-not-redacted"]}),
     )
 }
 
@@ -5858,7 +5994,7 @@ async fn admin_delegation_boundary() -> Json<Value> {
 
 async fn auth_local_roles() -> Json<Value> {
     Json(
-        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","actions":["request","approve","execute","admin","audit"],"roles":[{"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]},{"id":"datacenter-approver","title":"Datacenter Approver","visibility":"site-scope","canRequest":true,"canApprove":true,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["datacenter","capacity","live-execution-final"]},{"id":"vmware-operator","title":"VMware Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["vmware","placement","lifecycle"]},{"id":"hyper-v-operator","title":"Hyper-V Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["hyper-v","placement","lifecycle"]},{"id":"proxmox-operator","title":"Proxmox Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["proxmox","placement","lifecycle"]},{"id":"wintel-linux-operator","title":"Wintel/Linux Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["windows","linux","patching","baseline"]},{"id":"backup-operator","title":"Backup Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["backup","restore","dr"]},{"id":"monitoring-operator","title":"Monitoring Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["monitoring","alert-routing","maintenance-window"]},{"id":"service-desk","title":"Service Desk","visibility":"ticket-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["approved-runbook","incident-context","handover"]},{"id":"auditor","title":"Auditor","visibility":"audit-scope","canRequest":false,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["evidence-review","export-review","compliance"]},{"id":"requester","title":"Requester","visibility":"own-requests","canRequest":true,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":false,"executionDomains":["request-intake","evidence-view"]}]}),
+        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","actions":["request","approve","execute","admin","audit"],"roles":[{"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]},{"id":"datacenter-approver","title":"Datacenter Approver","visibility":"site-scope","canRequest":true,"canApprove":true,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["datacenter","capacity","live-execution-final"]},{"id":"vmware-operator","title":"VMware Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["vmware","placement","lifecycle"]},{"id":"hyper-v-operator","title":"Hyper-V Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["hyper-v","placement","lifecycle"]},{"id":"proxmox-operator","title":"Proxmox Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["proxmox","placement","lifecycle"]},{"id":"nutanix-operator","title":"Nutanix AHV Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["nutanix-ahv","placement","lifecycle"]},{"id":"xen-operator","title":"Xen Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["xen","placement","lifecycle"]},{"id":"kvm-operator","title":"KVM Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":false,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["kvm","placement","lifecycle"]},{"id":"wintel-linux-operator","title":"Wintel/Linux Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["windows","linux","patching","baseline"]},{"id":"backup-operator","title":"Backup Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["backup","restore","dr"]},{"id":"monitoring-operator","title":"Monitoring Operator","visibility":"assigned-site-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["monitoring","alert-routing","maintenance-window"]},{"id":"service-desk","title":"Service Desk","visibility":"ticket-scope","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":false,"canAudit":false,"executionDomains":["approved-runbook","incident-context","handover"]},{"id":"auditor","title":"Auditor","visibility":"audit-scope","canRequest":false,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":true,"executionDomains":["evidence-review","export-review","compliance"]},{"id":"requester","title":"Requester","visibility":"own-requests","canRequest":true,"canApprove":false,"canExecute":false,"canAdmin":false,"canAudit":false,"executionDomains":["request-intake","evidence-view"]}]}),
     )
 }
 
@@ -5971,7 +6107,7 @@ async fn auth_logout(
 
 async fn analytics_cost_capacity() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"platformScope":["vmware","hyperv","proxmox"],"domains":["compute-capacity","storage-capacity","backup-capacity","growth-trend","cost-trend","efficiency-opportunity","forecast-risk"],"signals":["capacity-pressure","storage-growth-risk","backup-growth-risk","cost-anomaly","underutilization-signal","stale-usage-data","forecast-window-missing"],"requiredGuards":["analytics-scope-summarized","aggregate-usage-known","cost-band-known","growth-trend-known","forecast-window-set","owner-known","remediation-plan-ready","evidence-redacted"],"planSections":["analyticsSummary","capacityForecast","storageForecast","backupForecast","costTrend","efficiencyOpportunities","remediationOptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","billing-export-ingestion-disabled","raw-cost-rows-disabled","raw-inventory-rows-disabled","resource-identifiers-disabled","tenant-identifiers-disabled","object-identifiers-disabled","raw-provider-payloads-disabled","analytics-scope-missing","aggregate-usage-missing","cost-band-missing","growth-trend-unknown","forecast-window-missing","owner-unknown","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"platformScope":["vmware","hyperv","proxmox","nutanix-ahv","xen","kvm"],"domains":["compute-capacity","storage-capacity","backup-capacity","growth-trend","cost-trend","efficiency-opportunity","forecast-risk"],"signals":["capacity-pressure","storage-growth-risk","backup-growth-risk","cost-anomaly","underutilization-signal","stale-usage-data","forecast-window-missing"],"requiredGuards":["analytics-scope-summarized","aggregate-usage-known","cost-band-known","growth-trend-known","forecast-window-set","owner-known","remediation-plan-ready","evidence-redacted"],"planSections":["analyticsSummary","capacityForecast","storageForecast","backupForecast","costTrend","efficiencyOpportunities","remediationOptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","billing-export-ingestion-disabled","raw-cost-rows-disabled","raw-inventory-rows-disabled","resource-identifiers-disabled","tenant-identifiers-disabled","object-identifiers-disabled","raw-provider-payloads-disabled","analytics-scope-missing","aggregate-usage-missing","cost-band-missing","growth-trend-unknown","forecast-window-missing","owner-unknown","evidence-not-redacted"]}),
     )
 }
 
@@ -6290,7 +6426,14 @@ async fn platform_health_adapters() -> Json<Value> {
         "vmware",
         "hyperv",
         "proxmox",
+        "nutanix",
+        "xen",
+        "kvm",
         "veeam",
+        "commvault",
+        "rubrik",
+        "cohesity",
+        "netbackup",
         "zabbix",
         "servicenow",
     ];
