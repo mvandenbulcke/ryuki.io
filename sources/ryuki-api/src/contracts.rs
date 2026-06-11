@@ -1825,6 +1825,56 @@ struct OobFailingQuery {
     site: Option<String>,
 }
 
+// ─── Hardware lifecycle request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareInventoryQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareFirmwareGapsQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareSupportRiskQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareRefreshPlanQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareLifecycleReportQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareAddRequest {
+    vendor: String,
+    model: String,
+    site: String,
+    cluster: String,
+    serial: String,
+    #[serde(rename = "warrantyExpiry")]
+    warranty_expiry: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct HardwareUpdateFirmwareRequest {
+    version: String,
+}
+
 // ─── Request lifecycle types ───
 
 #[derive(Debug, Deserialize)]
@@ -7811,6 +7861,172 @@ async fn repo_capacity_recommendations(
     repository_capacity::get_recommendations(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+// ─── Hardware lifecycle handlers ───
+
+async fn hardware_inventory(
+    Query(query): Query<HardwareInventoryQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let inventory = hardware_lifecycle::get_inventory(site);
+    Json(serde_json::to_value(inventory).unwrap())
+}
+
+async fn hardware_warranty_expiring() -> Json<Value> {
+    let expiring = hardware_lifecycle::get_warranty_expiring();
+    Json(serde_json::to_value(expiring).unwrap())
+}
+
+async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
+    match hardware_lifecycle::check_firmware_compliance(&id) {
+        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn hardware_firmware_gaps(
+    Query(query): Query<HardwareFirmwareGapsQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let gaps = hardware_lifecycle::get_firmware_gaps(site);
+    Json(serde_json::to_value(gaps).unwrap())
+}
+
+async fn hardware_support_risk(
+    Query(query): Query<HardwareSupportRiskQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let risk = hardware_lifecycle::get_support_risk(site);
+    Json(serde_json::to_value(risk).unwrap())
+}
+
+async fn hardware_refresh_plan(
+    Query(query): Query<HardwareRefreshPlanQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let plan = hardware_lifecycle::get_refresh_plan(site);
+    Json(serde_json::to_value(plan).unwrap())
+}
+
+async fn hardware_lifecycle_report(
+    Query(query): Query<HardwareLifecycleReportQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let report = hardware_lifecycle::get_lifecycle_report(site);
+    Json(serde_json::to_value(report).unwrap())
+}
+
+async fn hardware_add(Json(body): Json<HardwareAddRequest>) -> ApiResult {
+    match hardware_lifecycle::add_asset(
+        &body.vendor,
+        &body.model,
+        &body.site,
+        &body.cluster,
+        &body.serial,
+        &body.warranty_expiry,
+    ) {
+        Ok(asset) => Ok(Json(serde_json::to_value(asset).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn hardware_update_firmware(
+    Path(id): Path<String>,
+    Json(body): Json<HardwareUpdateFirmwareRequest>,
+) -> ApiResult {
+    match hardware_lifecycle::update_firmware(&id, &body.version) {
+        Ok(asset) => Ok(Json(serde_json::to_value(asset).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn hardware_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "lifecycleMode": "metadata-only",
+        "providerCallsEnabled": false,
+        "liveExecutionAllowed": false,
+        "serialNumbersAllowed": false,
+        "supportedWorkflows": [
+            "hardware-inventory",
+            "warranty-expiry-check",
+            "firmware-compliance-check",
+            "firmware-gap-analysis",
+            "support-risk-assessment",
+            "refresh-planning",
+            "lifecycle-reporting"
+        ],
+        "validVendors": ["HPE", "Lenovo"],
+        "validModels": ["DL360 Gen10", "DL380 Gen10", "DL380 Gen9", "SR635"],
+        "lifecycleStates": ["Production", "Extended", "Retiring", "Retired"],
+        "supportStatuses": ["Supported", "Expiring", "Expired"],
+        "requiredInputs": [
+            "vendor",
+            "model",
+            "serialNumber",
+            "site",
+            "cluster",
+            "warrantyExpiry",
+            "firmwareBaseline",
+            "firmwareInstalled"
+        ],
+        "requiredGuards": [
+            "vendor-known",
+            "model-known",
+            "site-known",
+            "support-status-known",
+            "firmware-baseline-known",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-execution-disabled",
+            "serial-numbers-disabled",
+            "vendor-unknown",
+            "model-unknown",
+            "site-unknown",
+            "support-status-unknown",
+            "firmware-baseline-unknown",
+            "evidence-not-redacted"
+        ],
+        "requiredEvidence": [
+            "Hardware inventory summary",
+            "Warranty expiry report",
+            "Firmware compliance check",
+            "Firmware gap analysis",
+            "Support risk assessment",
+            "Refresh plan",
+            "Lifecycle report",
+            "Evidence references"
+        ],
+        "rules": [
+            {
+                "id": "no-live-hardware-mutation",
+                "decision": "block",
+                "requirement": "Hardware lifecycle returns dry-run decisions only and never calls vendor APIs, mutates firmware, or executes hardware changes.",
+                "evidence": "Hardware inventory summary"
+            },
+            {
+                "id": "no-serial-or-asset-identifiers",
+                "decision": "block",
+                "requirement": "Committed hardware lifecycle metadata must not contain serial numbers, asset tags, or device identifiers.",
+                "evidence": "Hardware inventory summary"
+            },
+            {
+                "id": "support-and-firmware-required",
+                "decision": "block",
+                "requirement": "Support status and firmware baseline must be known before operational changes can be considered.",
+                "evidence": "Firmware compliance check"
+            },
+            {
+                "id": "refresh-risk-review-required",
+                "decision": "block",
+                "requirement": "Hardware with support or capacity risk needs refresh plan review before continued operation.",
+                "evidence": "Refresh plan"
+            }
+        ]
+    }))
 }
 
 #[cfg(test)]
