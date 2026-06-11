@@ -97,10 +97,14 @@ fn deployment_store() -> &'static Mutex<DeploymentStore> {
 }
 
 fn seed_data() -> DeploymentStore {
+    let sites = crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()]);
+    let s0 = sites.first().map(|s| s.as_str()).unwrap_or("DEFRA");
+    let s1 = sites.get(1).map(|s| s.as_str()).unwrap_or("GBLON");
+
     vec![
         SQLDeployment {
             id: "sql-001".into(),
-            instance_name: "LOVE-SQL-PROD-01".into(),
+            instance_name: format!("{}-SQL-PROD-01", s0),
             sql_version: SQLVersion::Sql2022,
             edition: SQLEdition::Enterprise,
             cpu: 8,
@@ -109,14 +113,14 @@ fn seed_data() -> DeploymentStore {
             log_disk_gb: 200,
             tempdb_disk_gb: 100,
             collation: "Latin1_General_CI_AS".into(),
-            service_account: "svc-sql-love-prod@ryuki.local".into(),
-            site: "LOVE".into(),
+            service_account: format!("svc-sql-{}-prod@ryuki.local", s0.to_lowercase()),
+            site: s0.into(),
             cluster_mode: ClusterMode::AG,
             status: DeploymentStatus::Draft,
         },
         SQLDeployment {
             id: "sql-002".into(),
-            instance_name: "BUR1-SQL-PROD-01".into(),
+            instance_name: format!("{}-SQL-PROD-01", s1),
             sql_version: SQLVersion::Sql2019,
             edition: SQLEdition::Standard,
             cpu: 4,
@@ -125,8 +129,8 @@ fn seed_data() -> DeploymentStore {
             log_disk_gb: 100,
             tempdb_disk_gb: 50,
             collation: "SQL_Latin1_General_CP1_CI_AS".into(),
-            service_account: "svc-sql-bur1-prod@ryuki.local".into(),
-            site: "BUR1".into(),
+            service_account: format!("svc-sql-{}-prod@ryuki.local", s1.to_lowercase()),
+            site: s1.into(),
             cluster_mode: ClusterMode::Standalone,
             status: DeploymentStatus::Draft,
         },
@@ -773,21 +777,26 @@ mod tests {
             >= 5);
     }
 
+    fn active_sites() -> Vec<String> {
+        crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()])
+    }
+
     #[test]
     fn test_get_inventory_all() {
         let result = get_inventory("").unwrap();
         assert!(result["deployment_count"].as_u64().unwrap() >= 2);
         let deployments = result["deployments"].as_array().unwrap();
-        assert!(deployments.iter().any(|d| d["site"] == "LOVE"));
-        assert!(deployments.iter().any(|d| d["site"] == "BUR1"));
+        let sites = active_sites();
+        assert!(deployments.iter().any(|d| d["site"] == sites[0]));
     }
 
     #[test]
     fn test_get_inventory_by_site() {
-        let result = get_inventory("LOVE").unwrap();
+        let site = active_sites()[0].clone();
+        let result = get_inventory(&site).unwrap();
         let deployments = result["deployments"].as_array().unwrap();
         for d in deployments {
-            assert_eq!(d["site"], "LOVE");
+            assert_eq!(d["site"], site);
         }
     }
 

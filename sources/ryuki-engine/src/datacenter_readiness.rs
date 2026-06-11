@@ -71,53 +71,58 @@ fn readiness_store() -> &'static Mutex<ReadinessStore> {
 }
 
 fn seed_data() -> ReadinessStore {
+    let sites = crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()]);
+    let s0 = sites.first().map(|s| s.as_str()).unwrap_or("DEFRA");
+    let s1 = sites.get(1).map(|s| s.as_str()).unwrap_or("GBLON");
+    let s2 = sites.get(2).map(|s| s.as_str()).unwrap_or("FRPAR");
+
     vec![
         SiteReadiness {
-            site: "LOVE".into(),
+            site: s0.into(),
             checks: vec![
                 ReadinessCheck {
-                    id: "dc-check-love-power".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-power", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::Power,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T10:00:00Z".into(),
                     details: "PDU A+B redundant, UPS load 62% with 28 min runtime".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-love-cooling".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-cooling", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::Cooling,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T10:00:00Z".into(),
                     details: "CRAC units nominal, return air 22 C, supply 16 C".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-love-rack".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-rack", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::RackSpace,
                     status: CheckStatus::Warning,
                     last_checked: "2026-06-11T10:00:00Z".into(),
                     details: "12 rack units free across 3 racks (limited headroom)".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-love-switchport".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-switchport", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::Switchport,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T10:00:00Z".into(),
                     details: "18 switchports available across prod/dmz/mgmt VLANs".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-love-firmware".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-firmware", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::Firmware,
                     status: CheckStatus::Warning,
                     last_checked: "2026-06-11T10:00:00Z".into(),
                     details: "2 PDUs on firmware v2.8 (current v3.1), SFP modules current".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-love-capacity".into(),
-                    site: "LOVE".into(),
+                    id: format!("dc-check-{}-capacity", s0.to_lowercase()),
+                    site: s0.into(),
                     check_type: CheckType::Capacity,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T10:00:00Z".into(),
@@ -126,51 +131,51 @@ fn seed_data() -> ReadinessStore {
             ],
         },
         SiteReadiness {
-            site: "BUR1".into(),
+            site: s1.into(),
             checks: vec![
                 ReadinessCheck {
-                    id: "dc-check-bur1-power".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-power", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::Power,
                     status: CheckStatus::Failed,
                     last_checked: "2026-06-11T09:30:00Z".into(),
                     details: "UPS-B in bypass mode, PDU-3 overload alarm at 91%".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-bur1-cooling".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-cooling", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::Cooling,
                     status: CheckStatus::Warning,
                     last_checked: "2026-06-11T09:30:00Z".into(),
                     details: "CRAC-2 compressor cycling, return air 26 C (threshold 24 C)".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-bur1-rack".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-rack", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::RackSpace,
                     status: CheckStatus::Failed,
                     last_checked: "2026-06-11T09:30:00Z".into(),
                     details: "Zero rack units free, 2 racks over-populated (48U in 42U)".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-bur1-switchport".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-switchport", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::Switchport,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T09:30:00Z".into(),
                     details: "22 switchports available, fabric links healthy".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-bur1-firmware".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-firmware", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::Firmware,
                     status: CheckStatus::Failed,
                     last_checked: "2026-06-11T09:30:00Z".into(),
                     details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-bur1-capacity".into(),
-                    site: "BUR1".into(),
+                    id: format!("dc-check-{}-capacity", s1.to_lowercase()),
+                    site: s1.into(),
                     check_type: CheckType::Capacity,
                     status: CheckStatus::Warning,
                     last_checked: "2026-06-11T09:30:00Z".into(),
@@ -179,51 +184,51 @@ fn seed_data() -> ReadinessStore {
             ],
         },
         SiteReadiness {
-            site: "CCSS".into(),
+            site: s2.into(),
             checks: vec![
                 ReadinessCheck {
-                    id: "dc-check-ccss-power".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-power", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::Power,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T08:00:00Z".into(),
                     details: "PDU A+B nominal, UPS load 45%, generator tested 2026-06-09".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-ccss-cooling".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-cooling", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::Cooling,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T08:00:00Z".into(),
                     details: "All CRAC units healthy, supply temp 15 C per ASHRAE A1".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-ccss-rack".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-rack", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::RackSpace,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T08:00:00Z".into(),
                     details: "42 rack units free across 7 empty racks (new buildout)".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-ccss-switchport".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-switchport", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::Switchport,
                     status: CheckStatus::NotChecked,
                     last_checked: "2026-06-11T08:00:00Z".into(),
                     details: "Switch fabric not yet provisioned, awaiting L2 install".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-ccss-firmware".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-firmware", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::Firmware,
                     status: CheckStatus::NotChecked,
                     last_checked: "2026-06-11T08:00:00Z".into(),
                     details: "Hardware not yet racked, firmware baseline pending".into(),
                 },
                 ReadinessCheck {
-                    id: "dc-check-ccss-capacity".into(),
-                    site: "CCSS".into(),
+                    id: format!("dc-check-{}-capacity", s2.to_lowercase()),
+                    site: s2.into(),
                     check_type: CheckType::Capacity,
                     status: CheckStatus::Passed,
                     last_checked: "2026-06-11T08:00:00Z".into(),
@@ -508,18 +513,28 @@ pub fn get_sites() -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    fn sites() -> Vec<String> {
+        crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()])
+    }
+
+    fn s0() -> String { sites()[0].clone() }
+    fn s1() -> String { sites()[1].clone() }
+    fn s2() -> String { sites()[2].clone() }
+
     #[test]
-    fn test_check_power_love() {
-        let result = check_power("LOVE").unwrap();
+    fn test_check_power_healthy_site() {
+        let site = s0();
+        let result = check_power(&site).unwrap();
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], site);
         assert_eq!(result["status"], "passed");
         assert!(result["details"].as_str().unwrap().contains("PDU"));
     }
 
     #[test]
-    fn test_check_power_bur1_failed() {
-        let result = check_power("BUR1").unwrap();
+    fn test_check_power_failing_site() {
+        let site = s1();
+        let result = check_power(&site).unwrap();
         assert_eq!(result["status"], "failed");
         assert!(result["details"].as_str().unwrap().contains("UPS-B"));
     }
@@ -530,16 +545,18 @@ mod tests {
     }
 
     #[test]
-    fn test_run_full_readiness_love() {
-        let result = run_full_readiness("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+    fn test_run_full_readiness_first_site() {
+        let site = s0();
+        let result = run_full_readiness(&site).unwrap();
+        assert_eq!(result["site"], site);
         assert_eq!(result["checks_run"], 6);
         assert!(!result["results"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn test_get_readiness_score_love_good() {
-        let result = get_readiness_score("LOVE").unwrap();
+    fn test_get_readiness_score_healthy_site() {
+        let site = s0();
+        let result = get_readiness_score(&site).unwrap();
         let score = result["readiness_score_pct"].as_u64().unwrap();
         assert!(score > 50);
         assert!(score <= 100);
@@ -547,16 +564,18 @@ mod tests {
     }
 
     #[test]
-    fn test_get_readiness_score_bur1_poor() {
-        let result = get_readiness_score("BUR1").unwrap();
+    fn test_get_readiness_score_failing_site() {
+        let site = s1();
+        let result = get_readiness_score(&site).unwrap();
         let score = result["readiness_score_pct"].as_u64().unwrap();
         assert!(score < 60);
     }
 
     #[test]
-    fn test_get_site_report_love() {
-        let result = get_site_report("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+    fn test_get_site_report_first_site() {
+        let site = s0();
+        let result = get_site_report(&site).unwrap();
+        assert_eq!(result["site"], site);
         assert!(!result["overall_status"].as_str().unwrap().is_empty());
         assert_eq!(result["checks"].as_array().unwrap().len(), 6);
     }
@@ -569,22 +588,24 @@ mod tests {
     }
 
     #[test]
-    fn test_get_sites_returns_three() {
+    fn test_get_sites_returns_configured_count() {
         let result = get_sites().unwrap();
-        let sites = result["sites"].as_array().unwrap();
-        assert_eq!(sites.len(), 3);
+        let site_list = result["sites"].as_array().unwrap();
+        assert_eq!(site_list.len(), 3);
     }
 
     #[test]
-    fn test_check_switchports_ccss_not_checked() {
-        let result = check_switchports("CCSS").unwrap();
+    fn test_check_switchports_greenfield_not_checked() {
+        let site = s2();
+        let result = check_switchports(&site).unwrap();
         assert_eq!(result["status"], "not-checked");
         assert!(result["details"].as_str().unwrap().contains("not yet provisioned"));
     }
 
     #[test]
-    fn test_readiness_score_ccss_greenfield() {
-        let result = get_readiness_score("CCSS").unwrap();
+    fn test_readiness_score_greenfield_low() {
+        let site = s2();
+        let result = get_readiness_score(&site).unwrap();
         let score = result["readiness_score_pct"].as_u64().unwrap();
         assert!(score < 100);
         assert_eq!(result["not_checked"], 2);
