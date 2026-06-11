@@ -176,14 +176,14 @@ TEMPLATE = """<!doctype html>
 :root,[data-theme="light"]{{
   --bg:#ffffff;--bg-secondary:#f6f8fb;--text:#14181f;--text-secondary:#525a6b;
   --border:#e2e6ee;--border-strong:#cdd4e0;
-  --accent:#8B0000;--accent-bg:#fdeeee;
+  --accent:#8B0000;--accent-bg:#fdeeee;--logo-red:#8B0000;--logo-gold:#d4a017;
   --code-bg:#0f1420;--code-text:#d6deeb;--inline-code:#f3eaea;
   --header-bg:rgba(255,255,255,.86);
 }}
 [data-theme="dark"]{{
   --bg:#0b0d12;--bg-secondary:#11141b;--text:#e7eaf1;--text-secondary:#9aa2b2;
   --border:#222734;--border-strong:#313848;
-  --accent:#e25d5d;--accent-bg:#3a1313;
+  --accent:#e25d5d;--accent-bg:#3a1313;--logo-red:#c0392b;--logo-gold:#FFD700;
   --code-bg:#0d1119;--code-text:#d6deeb;--inline-code:#1c1517;
   --header-bg:rgba(11,13,18,.86);
 }}
@@ -196,7 +196,7 @@ body{{font-family:var(--font);background:var(--bg);color:var(--text);
   display:flex;align-items:center;justify-content:space-between;gap:1rem}}
 .brand{{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:1.08rem;
   letter-spacing:-.02em;color:var(--text);text-decoration:none}}
-.brand img{{width:25px;height:25px}}
+.brand .mark{{width:25px;height:25px}}
 .brand .io{{color:var(--accent)}}
 .header-nav{{display:flex;align-items:center;gap:.9rem;font-size:.85rem}}
 .header-nav a{{color:var(--text-secondary);text-decoration:none;font-weight:500}}
@@ -250,7 +250,14 @@ td code{{white-space:nowrap}}
 <body>
 <header class="site-header">
   <div class="header-inner">
-    <a href="/" class="brand"><img src="/assets/logo.svg" alt="Ryuki logo"><span>ryuki<span class="io">.io</span></span></a>
+    <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
+  <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
+  <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z" fill="var(--logo-red)"/>
+  <circle cx="48.4" cy="13.2" r="1.6" fill="var(--logo-gold)"/>
+  <circle cx="32" cy="35" r="5.8" fill="var(--logo-gold)"/>
+</svg><span>ryuki<span class="io">.io</span></span></a>
     <nav class="header-nav">
       <a href="/documentation.html">Docs</a>
       <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
