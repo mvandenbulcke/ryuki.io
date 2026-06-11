@@ -6340,6 +6340,10 @@ async fn admin_platform_settings() -> Json<Value> {
                 "entra_authority" => config.entra_authority = value.clone(),
                 "auth_mode" => config.auth_mode = value.clone(),
                 "database_provider" => config.database_provider = value.clone(),
+                "secret_provider" => config.secret_provider = value.clone(),
+                "kubernetes_runtime" => config.kubernetes_runtime = value.clone(),
+                "monitoring_provider" => config.monitoring_provider = value.clone(),
+                "backup_provider" => config.backup_provider = value.clone(),
                 "platform_name" => config.platform_name = value.clone(),
                 "platform_url" => config.platform_url = value.clone(),
                 _ => {}
@@ -6351,7 +6355,21 @@ async fn admin_platform_settings() -> Json<Value> {
     Json(serde_json::to_value(config).unwrap_or_default())
 }
 
-async fn admin_platform_settings_update(Json(body): Json<PlatformConfig>) -> Json<Value> {
+async fn admin_platform_settings_update(
+    Json(body): Json<PlatformConfig>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let validation_errors = ryuki_core::types::validate_platform_config(&body);
+    if !validation_errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::with_detail(
+                "CONFIG_VALIDATION_FAILED",
+                "Platform configuration validation failed",
+                validation_errors.join("; "),
+            )),
+        ));
+    }
+
     if let Some(pool) = get_db() {
         let entries = [
             ("entra_tenant_id", &body.entra_tenant_id),
@@ -6359,6 +6377,10 @@ async fn admin_platform_settings_update(Json(body): Json<PlatformConfig>) -> Jso
             ("entra_authority", &body.entra_authority),
             ("auth_mode", &body.auth_mode),
             ("database_provider", &body.database_provider),
+            ("secret_provider", &body.secret_provider),
+            ("kubernetes_runtime", &body.kubernetes_runtime),
+            ("monitoring_provider", &body.monitoring_provider),
+            ("backup_provider", &body.backup_provider),
             ("platform_name", &body.platform_name),
             ("platform_url", &body.platform_url),
         ];
@@ -6379,7 +6401,7 @@ async fn admin_platform_settings_update(Json(body): Json<PlatformConfig>) -> Jso
     } else {
         crate::config_store::load_config().await
     };
-    Json(serde_json::to_value(config).unwrap_or_default())
+    Ok(Json(serde_json::to_value(config).unwrap_or_default()))
 }
 
 async fn admin_platform_settings_reset() -> Json<Value> {
@@ -6391,6 +6413,10 @@ async fn admin_platform_settings_reset() -> Json<Value> {
             ("entra_authority", &defaults.entra_authority),
             ("auth_mode", &defaults.auth_mode),
             ("database_provider", &defaults.database_provider),
+            ("secret_provider", &defaults.secret_provider),
+            ("kubernetes_runtime", &defaults.kubernetes_runtime),
+            ("monitoring_provider", &defaults.monitoring_provider),
+            ("backup_provider", &defaults.backup_provider),
             ("platform_name", &defaults.platform_name),
             ("platform_url", &defaults.platform_url),
         ];
