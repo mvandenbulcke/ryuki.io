@@ -26,6 +26,7 @@ use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
+use ryuki_engine::datacenter_readiness;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
 use ryuki_engine::image_factory;
@@ -1262,6 +1263,43 @@ pub fn routes() -> Router {
         .route(
             "/api/maintain/calendar-contract",
             get(maintenance_calendar_contract),
+        )
+        // ─── Datacenter Readiness ───
+        .route(
+            "/api/datacenter/readiness-score-contract",
+            get(datacenter_readiness_score_endpoint),
+        )
+        .route(
+            "/api/datacenter/site-report-contract",
+            get(datacenter_site_report_endpoint),
+        )
+        .route(
+            "/api/datacenter/failing-checks-contract",
+            get(datacenter_failing_checks_endpoint),
+        )
+        .route(
+            "/api/datacenter/check-power-contract",
+            get(datacenter_check_power_endpoint),
+        )
+        .route(
+            "/api/datacenter/check-cooling-contract",
+            get(datacenter_check_cooling_endpoint),
+        )
+        .route(
+            "/api/datacenter/check-rack-space-contract",
+            get(datacenter_check_rack_space_endpoint),
+        )
+        .route(
+            "/api/datacenter/check-switchports-contract",
+            get(datacenter_check_switchports_endpoint),
+        )
+        .route(
+            "/api/datacenter/full-readiness-contract",
+            get(datacenter_full_readiness_endpoint),
+        )
+        .route(
+            "/api/datacenter/sites-contract",
+            get(datacenter_sites_endpoint),
         )
         // ─── Network Port & VLAN Readiness ───
         .route(
@@ -8435,6 +8473,84 @@ async fn image_factory_contract() -> Json<Value> {
                 "evidence": "Golden image build log"
             }
         ]
+    }))
+}
+
+// ─── Datacenter Readiness request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DatacenterSiteQuery {
+    site: String,
+}
+
+// ─── Datacenter Readiness handlers ───
+
+async fn datacenter_readiness_score_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::get_readiness_score(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_site_report_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::get_site_report(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_failing_checks_endpoint() -> Json<Value> {
+    Json(datacenter_readiness::get_failing_checks().unwrap_or_else(|e| {
+        json!({"source": "dry-run", "error": e, "failing_count": 0, "failing_checks": []})
+    }))
+}
+
+async fn datacenter_check_power_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::check_power(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_check_cooling_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::check_cooling(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_check_rack_space_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::check_rack_space(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_check_switchports_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::check_switchports(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_full_readiness_endpoint(
+    Query(params): Query<DatacenterSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    datacenter_readiness::run_full_readiness(&params.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn datacenter_sites_endpoint() -> Json<Value> {
+    Json(datacenter_readiness::get_sites().unwrap_or_else(|e| {
+        json!({"source": "dry-run", "error": e, "sites": []})
     }))
 }
 
