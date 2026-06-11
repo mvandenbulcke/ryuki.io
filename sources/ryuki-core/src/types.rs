@@ -281,12 +281,46 @@ impl Default for PlatformConfig {
 pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
+    if config.platform_name.trim().is_empty() {
+        errors.push("platform_name is required".into());
+    }
+
+    if config.platform_url.trim().is_empty() {
+        errors.push("platform_url is required".into());
+    } else if !config.platform_url.starts_with("http://")
+        && !config.platform_url.starts_with("https://")
+    {
+        errors.push(format!(
+            "platform_url '{}' must start with http:// or https://",
+            config.platform_url
+        ));
+    }
+
+    if !config.entra_authority.trim().is_empty()
+        && !config.entra_authority.starts_with("http://")
+        && !config.entra_authority.starts_with("https://")
+    {
+        errors.push(format!(
+            "entra_authority '{}' must start with http:// or https://",
+            config.entra_authority
+        ));
+    }
+
     let valid_auth_modes = ["mock-dry-run", "static-dry-run", "entra-id", "local"];
     if !valid_auth_modes.contains(&config.auth_mode.as_str()) {
         errors.push(format!(
             "invalid auth_mode '{}': must be one of {:?}",
             config.auth_mode, valid_auth_modes
         ));
+    }
+
+    if config.auth_mode == "entra-id" {
+        if config.entra_tenant_id.trim().is_empty() {
+            errors.push("entra_tenant_id is required when auth_mode is entra-id".into());
+        }
+        if config.entra_client_id.trim().is_empty() {
+            errors.push("entra_client_id is required when auth_mode is entra-id".into());
+        }
     }
 
     let valid_db_providers = [
@@ -442,6 +476,50 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
             "invalid network_provider '{}'",
             config.network_provider
         ));
+    }
+
+    if config.retention_daily_backups == 0 {
+        errors.push("retention_daily_backups must be greater than 0".into());
+    }
+    if config.retention_weekly_backups == 0 {
+        errors.push("retention_weekly_backups must be greater than 0".into());
+    }
+    if config.retention_monthly_backups == 0 {
+        errors.push("retention_monthly_backups must be greater than 0".into());
+    }
+    if config.retention_yearly_backups == 0 {
+        errors.push("retention_yearly_backups must be greater than 0".into());
+    }
+
+    let valid_days = [
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+    ];
+    if !config.maintenance_window_day.trim().is_empty()
+        && !valid_days.contains(&config.maintenance_window_day.as_str())
+    {
+        errors.push(format!(
+            "maintenance_window_day must be one of: {:?}",
+            valid_days
+        ));
+    }
+
+    if config.maintenance_window_start_hour >= 24 {
+        errors.push("maintenance_window_start_hour must be 0-23".into());
+    }
+    if config.maintenance_window_duration_hours == 0 {
+        errors.push("maintenance_window_duration_hours must be greater than 0".into());
+    }
+    if config.keep_alive_timeout_secs == 0 {
+        errors.push("keep_alive_timeout_secs must be greater than 0".into());
+    }
+    if config.max_concurrent_connections == 0 {
+        errors.push("max_concurrent_connections must be greater than 0".into());
     }
 
     errors
@@ -695,6 +773,8 @@ mod tests {
     fn validate_platform_config_entra_id_auth_valid() {
         let mut config = PlatformConfig::default();
         config.auth_mode = "entra-id".into();
+        config.entra_tenant_id = "tenant-id".into();
+        config.entra_client_id = "client-id".into();
         let errors = validate_platform_config(&config);
         assert!(
             errors.is_empty(),
@@ -712,6 +792,111 @@ mod tests {
             errors.is_empty(),
             "none should be valid for secret_provider, got: {:?}",
             errors
+        );
+    }
+
+    #[test]
+    fn validate_platform_config_rejects_blank_identity_fields() {
+        let mut config = PlatformConfig::default();
+        config.platform_name = "   ".into();
+        config.platform_url = "   ".into();
+        config.auth_mode = "entra-id".into();
+        config.entra_tenant_id = "   ".into();
+        config.entra_client_id = "".into();
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.iter().any(|e| e.contains("platform_name")));
+        assert!(errors.iter().any(|e| e.contains("platform_url")));
+        assert!(errors.iter().any(|e| e.contains("entra_tenant_id")));
+        assert!(errors.iter().any(|e| e.contains("entra_client_id")));
+    }
+
+    #[test]
+    fn validate_platform_config_rejects_invalid_urls() {
+        let mut config = PlatformConfig::default();
+        config.platform_url = "ftp://ryuki.local".into();
+        config.entra_authority = "login.microsoftonline.com".into();
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.iter().any(|e| e.contains("platform_url")));
+        assert!(errors.iter().any(|e| e.contains("entra_authority")));
+    }
+
+    #[test]
+    fn validate_platform_config_allows_empty_entra_authority() {
+        let mut config = PlatformConfig::default();
+        config.entra_authority = "".into();
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+    }
+
+    #[test]
+    fn validate_platform_config_rejects_zero_retention_values() {
+        let mut config = PlatformConfig::default();
+        config.retention_daily_backups = 0;
+        config.retention_weekly_backups = 0;
+        config.retention_monthly_backups = 0;
+        config.retention_yearly_backups = 0;
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.iter().any(|e| e.contains("retention_daily_backups")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("retention_weekly_backups"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("retention_monthly_backups"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("retention_yearly_backups"))
+        );
+    }
+
+    #[test]
+    fn validate_platform_config_rejects_invalid_maintenance_values() {
+        let mut config = PlatformConfig::default();
+        config.maintenance_window_day = "funday".into();
+        config.maintenance_window_start_hour = 24;
+        config.maintenance_window_duration_hours = 0;
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.iter().any(|e| e.contains("maintenance_window_day")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("maintenance_window_start_hour"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("maintenance_window_duration_hours"))
+        );
+    }
+
+    #[test]
+    fn validate_platform_config_rejects_zero_server_limits() {
+        let mut config = PlatformConfig::default();
+        config.keep_alive_timeout_secs = 0;
+        config.max_concurrent_connections = 0;
+
+        let errors = validate_platform_config(&config);
+
+        assert!(errors.iter().any(|e| e.contains("keep_alive_timeout_secs")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("max_concurrent_connections"))
         );
     }
 
