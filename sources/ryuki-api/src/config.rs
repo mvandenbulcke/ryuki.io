@@ -21,18 +21,41 @@ pub fn load_config() -> RyukiConfig {
 }
 
 pub fn get_platform_status() -> serde_json::Value {
-    let config = load_config();
+    let config = crate::config_store::get_app_config();
     let validation_errors = config.validate();
     serde_json::json!({
         "platform_name": config.platform_name,
+        "platform_url": config.platform_url,
         "auth_mode": config.auth_mode.as_str(),
-        "database_provider": format!("{:?}", config.database_provider),
-        "secret_provider": format!("{:?}", config.secret_provider),
-        "kubernetes_runtime": format!("{:?}", config.kubernetes_runtime),
-        "monitoring_provider": format!("{:?}", config.monitoring_provider),
-        "backup_provider": format!("{:?}", config.backup_provider),
-        "logging_level": format!("{:?}", config.logging.level),
-        "rate_limit_enabled": config.rate_limit.enabled,
+        "entra_authority": config.entra_authority,
+        "entra_configured": !config.entra_tenant_id.is_empty(),
+        "database": {
+            "url": "[redacted]",
+            "provider": format!("{:?}", config.database_provider),
+            "connected": crate::database::get_db().is_some(),
+        },
+        "providers": {
+            "secret": format!("{:?}", config.secret_provider),
+            "kubernetes": format!("{:?}", config.kubernetes_runtime),
+            "monitoring": format!("{:?}", config.monitoring_provider),
+            "backup": format!("{:?}", config.backup_provider),
+        },
+        "server": {
+            "bind_address": config.server.bind_address,
+            "shutdown_timeout_secs": config.server.shutdown_timeout_secs,
+        },
+        "rate_limit": {
+            "enabled": config.rate_limit.enabled,
+            "requests_per_second": config.rate_limit.requests_per_second,
+            "burst_size": config.rate_limit.burst_size,
+        },
+        "cors": {
+            "allowed_origins": config.cors.allowed_origins,
+        },
+        "logging": {
+            "level": format!("{:?}", config.logging.level),
+            "format": format!("{:?}", config.logging.format),
+        },
         "validation_errors": validation_errors,
     })
 }

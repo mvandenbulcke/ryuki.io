@@ -202,6 +202,7 @@ async fn main() {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/api/validation/run", get(validation_run))
+        .route("/api/platform/status", get(platform_status))
         .merge(contracts::routes())
         .merge(boundary::routes())
         .layer(middleware::from_fn(request_id_middleware))
@@ -279,6 +280,10 @@ async fn metrics() -> Response {
         .header("content-type", "text/plain; version=0.0.4")
         .body(Body::from(body))
         .unwrap()
+}
+
+async fn platform_status() -> Json<serde_json::Value> {
+    Json(crate::config::get_platform_status())
 }
 
 #[cfg(test)]
