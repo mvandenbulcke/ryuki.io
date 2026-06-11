@@ -193,7 +193,7 @@ fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<S
     Some(Arc::new(RateLimiter::keyed(quota)))
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(timeout_secs: u64) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -220,7 +220,8 @@ async fn shutdown_signal() {
         },
     }
 
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    tracing::info!(timeout_secs, "draining in-flight requests");
+    tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
 }
 
 #[tokio::main]
@@ -293,7 +294,7 @@ async fn main() {
         .unwrap();
     tracing::info!("ryuki-api listening on {}", app_config.server.bind_address);
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(app_config.server.shutdown_timeout_secs))
         .await
         .unwrap();
 }
