@@ -60,6 +60,7 @@ use ryuki_engine::degradation_mode;
 use ryuki_engine::emergency_change;
 use ryuki_engine::evidence_pipeline;
 use ryuki_engine::servicenow_api;
+use ryuki_engine::site_registry;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -975,6 +976,13 @@ pub fn routes() -> Router {
             "/api/admin/approval-groups-contract",
             get(admin_approval_groups),
         )
+        // ─── Site Registry (UN/LOCODE) ───
+        .route("/api/admin/sites", get(site_registry_list))
+        .route("/api/admin/sites/{unlocode}", get(site_registry_get))
+        .route("/api/admin/sites/{unlocode}/activate", post(site_registry_activate))
+        .route("/api/admin/sites/{unlocode}/deactivate", post(site_registry_deactivate))
+        .route("/api/admin/sites/search", get(site_registry_search))
+        .route("/api/admin/site-registry-contract", get(site_registry_contract))
         .route(
             "/api/admin/delegation-boundary-contract",
             get(admin_delegation_boundary),
@@ -8711,6 +8719,71 @@ async fn platform_health_metrics_text() -> axum::response::Response {
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(axum::body::Body::from(health_monitor::metrics_text()))
         .unwrap()
+}
+
+// ─── Site Registry (UN/LOCODE) handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SiteSearchQuery {
+    q: String,
+}
+
+async fn site_registry_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::list_sites(false)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn site_registry_get(
+    Path(unlocode): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::get_site(&unlocode)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn site_registry_activate(
+    Path(unlocode): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::activate_site(&unlocode)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn site_registry_deactivate(
+    Path(unlocode): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::deactivate_site(&unlocode)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn site_registry_search(
+    Query(params): Query<SiteSearchQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::search_sites(&params.q)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn site_registry_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "description": "UN/LOCODE-based site registry. Sites are identified by 5-character UN/LOCODE codes (e.g. DEFRA for Frankfurt, GBLON for London). Activate sites to make them available for engine operations.",
+        "referenceData": "UN/LOCODE — United Nations Code for Trade and Transport Locations",
+        "endpoints": [
+            {"method":"GET","path":"/api/admin/sites","description":"List all reference sites with active status"},
+            {"method":"GET","path":"/api/admin/sites/{unlocode}","description":"Get single site details"},
+            {"method":"POST","path":"/api/admin/sites/{unlocode}/activate","description":"Activate a site for use"},
+            {"method":"POST","path":"/api/admin/sites/{unlocode}/deactivate","description":"Deactivate a site"},
+            {"method":"GET","path":"/api/admin/sites/search?q={query}","description":"Search by unlocode, city name, country, or country code"}
+        ],
+        "activeSites": ["DEBER","DEFRA","FRPAR","GBLON","NLAMS"],
+        "supportedCountries": ["DE","FR","GB","NL","ES","IT","CH","AT","BE","SE","DK","IE"]
+    }))
 }
 
 // ─── Runbook Execution handlers ───

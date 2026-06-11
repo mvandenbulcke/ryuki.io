@@ -39,6 +39,7 @@ pub mod request_lifecycle;
 pub mod runbook_execution;
 pub mod server_decommission;
 pub mod servicenow_api;
+pub mod site_registry;
 pub mod shift_queue;
 pub mod snapshot_engine;
 pub mod software_deployment;
