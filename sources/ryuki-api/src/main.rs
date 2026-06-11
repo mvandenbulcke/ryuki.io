@@ -285,6 +285,11 @@ fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<S
         NonZeroU32::new(config.requests_per_second as u32).unwrap_or(NonZeroU32::MIN),
     )
     .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::MIN));
+    // TODO: path_overrides are config-only for now. The governor library's KeyedRateLimiter uses a
+    // single global quota for all keys. Per-path quotas require multiple RateLimiter instances —
+    // one per overridden path group plus one default. Expose overrides via platform_status so
+    // operators can see them, but actual enforcement uses the single default quota until
+    // multi-limiter support is added.
     Some(Arc::new(RateLimiter::keyed(quota)))
 }
 

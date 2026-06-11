@@ -117,6 +117,24 @@ pub struct PlatformConfig {
     pub build_provider: String,
     #[serde(default = "default_network_provider")]
     pub network_provider: String,
+    #[serde(default = "default_retention_daily_val")]
+    pub retention_daily_backups: u32,
+    #[serde(default = "default_retention_weekly_val")]
+    pub retention_weekly_backups: u32,
+    #[serde(default = "default_retention_monthly_val")]
+    pub retention_monthly_backups: u32,
+    #[serde(default = "default_retention_yearly_val")]
+    pub retention_yearly_backups: u32,
+    #[serde(default = "default_mw_day")]
+    pub maintenance_window_day: String,
+    #[serde(default = "default_mw_start")]
+    pub maintenance_window_start_hour: u8,
+    #[serde(default = "default_mw_duration")]
+    pub maintenance_window_duration_hours: u8,
+    #[serde(default = "default_keep_alive_timeout")]
+    pub keep_alive_timeout_secs: u64,
+    #[serde(default = "default_max_connections")]
+    pub max_concurrent_connections: u64,
 }
 
 fn default_entra_authority() -> String {
@@ -187,6 +205,42 @@ fn default_network_provider() -> String {
     "none".to_string()
 }
 
+fn default_retention_daily_val() -> u32 {
+    30
+}
+
+fn default_retention_weekly_val() -> u32 {
+    12
+}
+
+fn default_retention_monthly_val() -> u32 {
+    12
+}
+
+fn default_retention_yearly_val() -> u32 {
+    7
+}
+
+fn default_mw_day() -> String {
+    "sunday".to_string()
+}
+
+fn default_mw_start() -> u8 {
+    2
+}
+
+fn default_mw_duration() -> u8 {
+    4
+}
+
+fn default_keep_alive_timeout() -> u64 {
+    75
+}
+
+fn default_max_connections() -> u64 {
+    512
+}
+
 impl Default for PlatformConfig {
     fn default() -> Self {
         Self {
@@ -209,6 +263,15 @@ impl Default for PlatformConfig {
             firewall_provider: default_firewall_provider(),
             build_provider: default_build_provider(),
             network_provider: default_network_provider(),
+            retention_daily_backups: default_retention_daily_val(),
+            retention_weekly_backups: default_retention_weekly_val(),
+            retention_monthly_backups: default_retention_monthly_val(),
+            retention_yearly_backups: default_retention_yearly_val(),
+            maintenance_window_day: default_mw_day(),
+            maintenance_window_start_hour: default_mw_start(),
+            maintenance_window_duration_hours: default_mw_duration(),
+            keep_alive_timeout_secs: default_keep_alive_timeout(),
+            max_concurrent_connections: default_max_connections(),
         }
     }
 }

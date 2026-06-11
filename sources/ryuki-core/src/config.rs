@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use figment::{
     Figment,
     providers::{Env, Format, Json, Toml},
@@ -565,6 +567,10 @@ pub struct ServerConfig {
     pub pool_max_lifetime_secs: u64,
     #[serde(default = "default_compression_quality")]
     pub compression_quality: u8,
+    #[serde(default = "default_keep_alive_timeout")]
+    pub keep_alive_timeout_secs: u64,
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_concurrent_connections: usize,
 }
 
 fn default_bind_address() -> String {
@@ -607,6 +613,14 @@ fn default_compression_quality() -> u8 {
     6
 }
 
+fn default_keep_alive_timeout() -> u64 {
+    75
+}
+
+fn default_max_concurrent_connections() -> usize {
+    512
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -622,6 +636,8 @@ impl Default for ServerConfig {
             pool_acquire_timeout_secs: default_pool_acquire_timeout(),
             pool_max_lifetime_secs: default_pool_max_lifetime(),
             compression_quality: default_compression_quality(),
+            keep_alive_timeout_secs: default_keep_alive_timeout(),
+            max_concurrent_connections: default_max_concurrent_connections(),
         }
     }
 }
@@ -732,6 +748,27 @@ impl Default for SmtpConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LogConfigExtended {
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default = "default_log_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_log_retention_days() -> u32 {
+    30
+}
+
+impl Default for LogConfigExtended {
+    fn default() -> Self {
+        Self {
+            file_path: None,
+            retention_days: default_log_retention_days(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SessionConfig {
     #[serde(default = "default_session_cookie_max_age")]
     pub cookie_max_age_secs: u64,
@@ -767,10 +804,93 @@ impl Default for SessionConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetentionConfig {
+    #[serde(default = "default_retention_daily")]
+    pub daily_backups: u32,
+    #[serde(default = "default_retention_weekly")]
+    pub weekly_backups: u32,
+    #[serde(default = "default_retention_monthly")]
+    pub monthly_backups: u32,
+    #[serde(default = "default_retention_yearly")]
+    pub yearly_backups: u32,
+}
+
+fn default_retention_daily() -> u32 {
+    30
+}
+
+fn default_retention_weekly() -> u32 {
+    12
+}
+
+fn default_retention_monthly() -> u32 {
+    12
+}
+
+fn default_retention_yearly() -> u32 {
+    7
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            daily_backups: default_retention_daily(),
+            weekly_backups: default_retention_weekly(),
+            monthly_backups: default_retention_monthly(),
+            yearly_backups: default_retention_yearly(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MaintenanceWindowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_window_day")]
+    pub day_of_week: String,
+    #[serde(default = "default_window_start")]
+    pub start_hour_utc: u8,
+    #[serde(default = "default_window_duration")]
+    pub duration_hours: u8,
+}
+
+fn default_window_day() -> String {
+    "sunday".to_string()
+}
+
+fn default_window_start() -> u8 {
+    2
+}
+
+fn default_window_duration() -> u8 {
+    4
+}
+
+impl Default for MaintenanceWindowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day_of_week: default_window_day(),
+            start_hour_utc: default_window_start(),
+            duration_hours: default_window_duration(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
     #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u64,
+    #[serde(default = "default_burst_size")]
+    pub burst_size: u32,
+    #[serde(default)]
+    pub path_overrides: HashMap<String, RateLimitPathOverride>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RateLimitPathOverride {
     pub requests_per_second: u64,
     #[serde(default = "default_burst_size")]
     pub burst_size: u32,
@@ -794,6 +914,7 @@ impl Default for RateLimitConfig {
             enabled: default_rate_limit_enabled(),
             requests_per_second: default_requests_per_second(),
             burst_size: default_burst_size(),
+            path_overrides: HashMap::new(),
         }
     }
 }
@@ -853,7 +974,13 @@ pub struct RyukiConfig {
     #[serde(default)]
     pub smtp: SmtpConfig,
     #[serde(default)]
+    pub log_extended: LogConfigExtended,
+    #[serde(default)]
     pub session: SessionConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
+    pub maintenance_window: MaintenanceWindowConfig,
 }
 
 fn default_database_url() -> String {
@@ -901,7 +1028,10 @@ impl Default for RyukiConfig {
             logging: LogConfig::default(),
             security: SecurityConfig::default(),
             smtp: SmtpConfig::default(),
+            log_extended: LogConfigExtended::default(),
             session: SessionConfig::default(),
+            retention: RetentionConfig::default(),
+            maintenance_window: MaintenanceWindowConfig::default(),
         }
     }
 }
@@ -974,6 +1104,20 @@ impl RyukiConfig {
             );
         }
 
+        if self.server.keep_alive_timeout_secs == 0 {
+            errors.push("server.keep_alive_timeout_secs must be greater than 0".into());
+        }
+
+        if self.server.max_concurrent_connections == 0 {
+            errors.push("server.max_concurrent_connections must be greater than 0".into());
+        }
+
+        if self.log_extended.file_path.is_some() && self.log_extended.retention_days == 0 {
+            errors.push(
+                "log_extended.retention_days must be greater than 0 when file_path is set".into(),
+            );
+        }
+
         if self.server.pool_idle_timeout_secs == 0 {
             errors.push("server.pool_idle_timeout_secs must be greater than 0".into());
         }
@@ -1004,6 +1148,16 @@ impl RyukiConfig {
                 "rate_limit.requests_per_second must be greater than 0 when rate_limit is enabled"
                     .into(),
             );
+        }
+
+        if self.rate_limit.enabled {
+            for (path, override_cfg) in &self.rate_limit.path_overrides {
+                if override_cfg.requests_per_second == 0 {
+                    errors.push(format!(
+                        "rate_limit.path_overrides.{path}.requests_per_second is 0 — override will deny all requests for this group"
+                    ));
+                }
+            }
         }
 
         if self.platform_name.is_empty() {
@@ -1093,6 +1247,45 @@ impl RyukiConfig {
         }
         if self.session.cookie_max_age_secs == 0 {
             errors.push("session.cookie_max_age_secs must be greater than 0".into());
+        }
+
+        if self.retention.daily_backups == 0 {
+            errors.push("retention.daily_backups must be greater than 0".into());
+        }
+        if self.retention.weekly_backups == 0 {
+            errors.push("retention.weekly_backups must be greater than 0".into());
+        }
+        if self.retention.monthly_backups == 0 {
+            errors.push("retention.monthly_backups must be greater than 0".into());
+        }
+        if self.retention.yearly_backups == 0 {
+            errors.push("retention.yearly_backups must be greater than 0".into());
+        }
+
+        if self.maintenance_window.enabled {
+            if self.maintenance_window.duration_hours == 0 {
+                errors.push(
+                    "maintenance_window.duration_hours must be greater than 0 when enabled".into(),
+                );
+            }
+            if self.maintenance_window.start_hour_utc >= 24 {
+                errors.push("maintenance_window.start_hour_utc must be 0-23".into());
+            }
+            let valid_days = [
+                "sunday",
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday",
+                "saturday",
+            ];
+            if !valid_days.contains(&self.maintenance_window.day_of_week.as_str()) {
+                errors.push(format!(
+                    "maintenance_window.day_of_week must be one of: {:?}",
+                    valid_days
+                ));
+            }
         }
 
         errors

@@ -59,12 +59,20 @@ pub fn get_platform_status() -> serde_json::Value {
             "pool_acquire_timeout_secs": config.server.pool_acquire_timeout_secs,
             "pool_max_lifetime_secs": config.server.pool_max_lifetime_secs,
             "compression_quality": config.server.compression_quality,
+            "keep_alive_timeout_secs": config.server.keep_alive_timeout_secs,
+            "max_concurrent_connections": config.server.max_concurrent_connections,
             "tls_enabled": config.server.tls_cert_path.is_some(),
         },
         "rate_limit": {
             "enabled": config.rate_limit.enabled,
             "requests_per_second": config.rate_limit.requests_per_second,
             "burst_size": config.rate_limit.burst_size,
+            "path_overrides": config.rate_limit.path_overrides.iter().map(|(path, ov)| {
+                (path.clone(), serde_json::json!({
+                    "requests_per_second": ov.requests_per_second,
+                    "burst_size": ov.burst_size,
+                }))
+            }).collect::<serde_json::Map<String, serde_json::Value>>(),
         },
         "cors": {
             "allowed_origins": config.cors.allowed_origins,
@@ -86,11 +94,27 @@ pub fn get_platform_status() -> serde_json::Value {
             "from_address": config.smtp.from_address,
             "use_tls": config.smtp.use_tls,
         },
+        "log_extended": {
+            "file_path": config.log_extended.file_path,
+            "retention_days": config.log_extended.retention_days,
+        },
         "session": {
             "cookie_max_age_secs": config.session.cookie_max_age_secs,
             "cookie_secure": config.session.cookie_secure,
             "cookie_http_only": config.session.cookie_http_only,
             "cookie_same_site": config.session.cookie_same_site,
+        },
+        "retention": {
+            "daily_backups": config.retention.daily_backups,
+            "weekly_backups": config.retention.weekly_backups,
+            "monthly_backups": config.retention.monthly_backups,
+            "yearly_backups": config.retention.yearly_backups,
+        },
+        "maintenance_window": {
+            "enabled": config.maintenance_window.enabled,
+            "day_of_week": config.maintenance_window.day_of_week,
+            "start_hour_utc": config.maintenance_window.start_hour_utc,
+            "duration_hours": config.maintenance_window.duration_hours,
         },
         "validation_errors": validation_errors,
     })
