@@ -639,12 +639,25 @@ async fn ready(
     }
 
     let db_connected = crate::database::get_db().is_some();
-    let status = if db_connected { "ready" } else { "degraded" };
+    let result = readiness_response(db_connected);
+    let status = if result.is_ok() { "ready" } else { "not_ready" };
     tracing::info!(status, db_connected, "readiness check result");
+    result
+}
+
+fn readiness_response(db_connected: bool) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    if !db_connected {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DATABASE_UNAVAILABLE",
+            "Database is unavailable",
+            Some("Readiness requires an active database connection"),
+        ));
+    }
 
     Ok(Json(serde_json::json!({
-        "status": status,
-        "database": { "connected": db_connected },
+        "status": "ready",
+        "database": { "connected": true },
     })))
 }
 
@@ -855,6 +868,22 @@ mod tests {
         assert!(health_limiter.check_key(&health_key).is_ok());
         assert!(health_limiter.check_key(&health_key).is_ok());
         assert!(health_limiter.check_key(&health_key).is_err());
+    }
+
+    #[test]
+    fn test_readiness_response_with_db_is_ready() {
+        let Json(body) = readiness_response(true).expect("ready response should succeed");
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["database"]["connected"], true);
+    }
+
+    #[test]
+    fn test_readiness_response_without_db_is_service_unavailable() {
+        let Err((status, Json(body))) = readiness_response(false) else {
+            panic!("readiness should fail when database is unavailable");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "DATABASE_UNAVAILABLE");
     }
 
     #[test]
