@@ -1,0 +1,729 @@
+use chrono::{Days, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::{Mutex, OnceLock};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrPlanStatus {
+    Draft,
+    Approved,
+    Active,
+    Expired,
+}
+
+impl std::fmt::Display for DrPlanStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DrPlanStatus::Draft => write!(f, "Draft"),
+            DrPlanStatus::Approved => write!(f, "Approved"),
+            DrPlanStatus::Active => write!(f, "Active"),
+            DrPlanStatus::Expired => write!(f, "Expired"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrTestResult {
+    Passed,
+    Failed,
+    Partial,
+}
+
+impl std::fmt::Display for DrTestResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DrTestResult::Passed => write!(f, "Passed"),
+            DrTestResult::Failed => write!(f, "Failed"),
+            DrTestResult::Partial => write!(f, "Partial"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DrScenarioType {
+    FullFailover,
+    PartialFailover,
+    Tabletop,
+    CommunicationOnly,
+}
+
+impl std::fmt::Display for DrScenarioType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DrScenarioType::FullFailover => write!(f, "FullFailover"),
+            DrScenarioType::PartialFailover => write!(f, "PartialFailover"),
+            DrScenarioType::Tabletop => write!(f, "Tabletop"),
+            DrScenarioType::CommunicationOnly => write!(f, "CommunicationOnly"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrPlan {
+    pub id: String,
+    pub name: String,
+    pub site: String,
+    pub target_site: String,
+    pub systems: Vec<String>,
+    pub rpo_minutes: u32,
+    pub rto_minutes: u32,
+    pub last_tested: Option<String>,
+    pub next_test_due: String,
+    pub status: DrPlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrTestRun {
+    pub id: String,
+    pub plan_id: String,
+    pub site: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub result: DrTestResult,
+    pub systems_tested: Vec<String>,
+    pub systems_failed: Vec<String>,
+    pub tester: String,
+    pub evidence_pack_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrScenario {
+    pub id: String,
+    pub name: String,
+    pub scenario_type: DrScenarioType,
+    pub site: String,
+    pub target_site: String,
+    pub systems: Vec<String>,
+}
+
+type DrStore = (Vec<DrPlan>, Vec<DrTestRun>, Vec<DrScenario>);
+
+static DR_STORE: OnceLock<Mutex<DrStore>> = OnceLock::new();
+
+fn dr_store() -> &'static Mutex<DrStore> {
+    DR_STORE.get_or_init(|| Mutex::new(seed_data()))
+}
+
+fn now_iso() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn parse_iso_time(time: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(time)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_scenario_type(scenario_type: &str) -> Result<DrScenarioType, String> {
+    match scenario_type {
+        "FullFailover" | "full-failover" => Ok(DrScenarioType::FullFailover),
+        "PartialFailover" | "partial-failover" => Ok(DrScenarioType::PartialFailover),
+        "Tabletop" | "tabletop" => Ok(DrScenarioType::Tabletop),
+        "CommunicationOnly" | "communication-only" => Ok(DrScenarioType::CommunicationOnly),
+        other => Err(format!(
+            "Invalid scenario_type: {}. Must be FullFailover, PartialFailover, Tabletop, or CommunicationOnly",
+            other
+        )),
+    }
+}
+
+fn parse_test_result(result: &str) -> Result<DrTestResult, String> {
+    match result {
+        "Passed" | "passed" => Ok(DrTestResult::Passed),
+        "Failed" | "failed" => Ok(DrTestResult::Failed),
+        "Partial" | "partial" => Ok(DrTestResult::Partial),
+        other => Err(format!(
+            "Invalid result: {}. Must be Passed, Failed, or Partial",
+            other
+        )),
+    }
+}
+
+fn seed_data() -> DrStore {
+    let now = Utc::now();
+    let plans = vec![
+        DrPlan {
+            id: "drp-defra-001".into(),
+            name: "DEFRA production full-site failover".into(),
+            site: "DEFRA".into(),
+            target_site: "GBLON".into(),
+            systems: vec!["defra-app-01".into(), "defra-db-01".into()],
+            rpo_minutes: 15,
+            rto_minutes: 120,
+            last_tested: Some((now - chrono::Duration::days(40)).to_rfc3339()),
+            next_test_due: (now - chrono::Duration::days(10)).to_rfc3339(),
+            status: DrPlanStatus::Active,
+        },
+        DrPlan {
+            id: "drp-gblon-001".into(),
+            name: "GBLON storage partial failover".into(),
+            site: "GBLON".into(),
+            target_site: "FRPAR".into(),
+            systems: vec!["gblon-vsan-01".into(), "gblon-vsan-02".into()],
+            rpo_minutes: 30,
+            rto_minutes: 180,
+            last_tested: Some((now - chrono::Duration::days(12)).to_rfc3339()),
+            next_test_due: (now + Days::new(18)).to_rfc3339(),
+            status: DrPlanStatus::Approved,
+        },
+        DrPlan {
+            id: "drp-frpar-001".into(),
+            name: "FRPAR communications tabletop".into(),
+            site: "FRPAR".into(),
+            target_site: "DEFRA".into(),
+            systems: vec!["frpar-core-01".into(), "frpar-fw-01".into()],
+            rpo_minutes: 60,
+            rto_minutes: 240,
+            last_tested: None,
+            next_test_due: (now - chrono::Duration::days(2)).to_rfc3339(),
+            status: DrPlanStatus::Draft,
+        },
+    ];
+
+    let test_runs = vec![
+        DrTestRun {
+            id: "drt-defra-001".into(),
+            plan_id: "drp-defra-001".into(),
+            site: "DEFRA".into(),
+            started_at: (now - chrono::Duration::days(40) - chrono::Duration::hours(3))
+                .to_rfc3339(),
+            completed_at: Some(
+                (now - chrono::Duration::days(40) - chrono::Duration::hours(1)).to_rfc3339(),
+            ),
+            result: DrTestResult::Passed,
+            systems_tested: vec!["defra-app-01".into(), "defra-db-01".into()],
+            systems_failed: vec![],
+            tester: "dr.coordinator".into(),
+            evidence_pack_id: "evp-dr-defra-001".into(),
+        },
+        DrTestRun {
+            id: "drt-defra-002".into(),
+            plan_id: "drp-defra-001".into(),
+            site: "DEFRA".into(),
+            started_at: (now - chrono::Duration::days(95) - chrono::Duration::hours(4))
+                .to_rfc3339(),
+            completed_at: Some(
+                (now - chrono::Duration::days(95) - chrono::Duration::hours(2)).to_rfc3339(),
+            ),
+            result: DrTestResult::Partial,
+            systems_tested: vec!["defra-app-01".into(), "defra-db-01".into()],
+            systems_failed: vec!["defra-db-01".into()],
+            tester: "platform.ops".into(),
+            evidence_pack_id: "evp-dr-defra-002".into(),
+        },
+        DrTestRun {
+            id: "drt-gblon-001".into(),
+            plan_id: "drp-gblon-001".into(),
+            site: "GBLON".into(),
+            started_at: (now - chrono::Duration::days(12) - chrono::Duration::hours(2))
+                .to_rfc3339(),
+            completed_at: Some(
+                (now - chrono::Duration::days(12) - chrono::Duration::hours(1)).to_rfc3339(),
+            ),
+            result: DrTestResult::Passed,
+            systems_tested: vec!["gblon-vsan-01".into(), "gblon-vsan-02".into()],
+            systems_failed: vec![],
+            tester: "storage.ops".into(),
+            evidence_pack_id: "evp-dr-gblon-001".into(),
+        },
+        DrTestRun {
+            id: "drt-frpar-001".into(),
+            plan_id: "drp-frpar-001".into(),
+            site: "FRPAR".into(),
+            started_at: (now - chrono::Duration::days(180) - chrono::Duration::hours(2))
+                .to_rfc3339(),
+            completed_at: Some(
+                (now - chrono::Duration::days(180) - chrono::Duration::hours(1)).to_rfc3339(),
+            ),
+            result: DrTestResult::Failed,
+            systems_tested: vec!["frpar-core-01".into(), "frpar-fw-01".into()],
+            systems_failed: vec!["frpar-fw-01".into()],
+            tester: "network.ops".into(),
+            evidence_pack_id: "evp-dr-frpar-001".into(),
+        },
+    ];
+
+    let scenarios = vec![
+        DrScenario {
+            id: "drs-defra-full".into(),
+            name: "DEFRA full production failover".into(),
+            scenario_type: DrScenarioType::FullFailover,
+            site: "DEFRA".into(),
+            target_site: "GBLON".into(),
+            systems: vec!["defra-app-01".into(), "defra-db-01".into()],
+        },
+        DrScenario {
+            id: "drs-gblon-partial".into(),
+            name: "GBLON storage pool partial failover".into(),
+            scenario_type: DrScenarioType::PartialFailover,
+            site: "GBLON".into(),
+            target_site: "FRPAR".into(),
+            systems: vec!["gblon-vsan-01".into()],
+        },
+        DrScenario {
+            id: "drs-frpar-tabletop".into(),
+            name: "FRPAR network recovery tabletop".into(),
+            scenario_type: DrScenarioType::Tabletop,
+            site: "FRPAR".into(),
+            target_site: "DEFRA".into(),
+            systems: vec!["frpar-core-01".into(), "frpar-fw-01".into()],
+        },
+        DrScenario {
+            id: "drs-defra-comms".into(),
+            name: "DEFRA crisis communications only".into(),
+            scenario_type: DrScenarioType::CommunicationOnly,
+            site: "DEFRA".into(),
+            target_site: "GBLON".into(),
+            systems: vec!["defra-app-01".into()],
+        },
+    ];
+
+    (plans, test_runs, scenarios)
+}
+
+pub fn list_plans(site: &str) -> Result<Value, String> {
+    let store = dr_store().lock().unwrap();
+    let plans: Vec<DrPlan> = if site.is_empty() {
+        store.0.clone()
+    } else {
+        store.0.iter().filter(|p| p.site == site).cloned().collect()
+    };
+
+    Ok(json!({
+        "source": "dry-run",
+        "site": site,
+        "count": plans.len(),
+        "plans": plans,
+        "dry_run": true
+    }))
+}
+
+pub fn get_plan(id: &str) -> Result<Value, String> {
+    let store = dr_store().lock().unwrap();
+    let plan = store
+        .0
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| format!("DR plan '{}' not found", id))?;
+
+    Ok(json!({
+        "source": "dry-run",
+        "plan": plan,
+        "rpo_minutes": plan.rpo_minutes,
+        "rto_minutes": plan.rto_minutes,
+        "dry_run": true
+    }))
+}
+
+pub fn create_plan(
+    name: &str,
+    site: &str,
+    target_site: &str,
+    systems: Vec<String>,
+    rpo: u32,
+    rto: u32,
+) -> Result<Value, String> {
+    if name.trim().is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if site.trim().is_empty() {
+        return Err("site cannot be empty".into());
+    }
+    if target_site.trim().is_empty() {
+        return Err("target_site cannot be empty".into());
+    }
+    if systems.is_empty() {
+        return Err("systems cannot be empty".into());
+    }
+    if rpo == 0 || rto == 0 {
+        return Err("rpo and rto must be greater than zero".into());
+    }
+
+    let id = format!(
+        "drp-{}-{}",
+        site.to_lowercase(),
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    );
+
+    let plan = DrPlan {
+        id: id.clone(),
+        name: name.to_string(),
+        site: site.to_string(),
+        target_site: target_site.to_string(),
+        systems,
+        rpo_minutes: rpo,
+        rto_minutes: rto,
+        last_tested: None,
+        next_test_due: (Utc::now() + Days::new(90)).to_rfc3339(),
+        status: DrPlanStatus::Draft,
+    };
+
+    dr_store().lock().unwrap().0.push(plan.clone());
+
+    Ok(json!({
+        "source": "dry-run",
+        "plan_id": id,
+        "plan": plan,
+        "dry_run": true
+    }))
+}
+
+pub fn start_test(plan_id: &str, scenario_type: &str, tester: &str) -> Result<Value, String> {
+    let scenario = parse_scenario_type(scenario_type)?;
+    if tester.trim().is_empty() {
+        return Err("tester cannot be empty".into());
+    }
+
+    let mut store = dr_store().lock().unwrap();
+    let plan = store
+        .0
+        .iter()
+        .find(|p| p.id == plan_id)
+        .cloned()
+        .ok_or_else(|| format!("DR plan '{}' not found", plan_id))?;
+
+    let id = format!(
+        "drt-{}-{}",
+        plan.site.to_lowercase(),
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    );
+    let evidence_pack_id = format!("evp-{}", id);
+
+    let test_run = DrTestRun {
+        id: id.clone(),
+        plan_id: plan_id.to_string(),
+        site: plan.site,
+        started_at: now_iso(),
+        completed_at: None,
+        result: DrTestResult::Partial,
+        systems_tested: plan.systems,
+        systems_failed: vec![],
+        tester: tester.to_string(),
+        evidence_pack_id: evidence_pack_id.clone(),
+    };
+
+    store.1.push(test_run.clone());
+
+    Ok(json!({
+        "source": "dry-run",
+        "test_id": id,
+        "plan_id": plan_id,
+        "scenario_type": scenario,
+        "test_run": test_run,
+        "evidence_pack_id": evidence_pack_id,
+        "dry_run": true
+    }))
+}
+
+pub fn complete_test(
+    test_id: &str,
+    result: &str,
+    systems_failed: Vec<String>,
+) -> Result<Value, String> {
+    let result = parse_test_result(result)?;
+    let completed_at = now_iso();
+    let mut store = dr_store().lock().unwrap();
+    let run = store
+        .1
+        .iter_mut()
+        .find(|r| r.id == test_id)
+        .ok_or_else(|| format!("DR test '{}' not found", test_id))?;
+
+    run.completed_at = Some(completed_at.clone());
+    run.result = result;
+    run.systems_failed = systems_failed;
+    let completed_run = run.clone();
+
+    if let Some(plan) = store.0.iter_mut().find(|p| p.id == completed_run.plan_id) {
+        plan.last_tested = Some(completed_at);
+        plan.next_test_due = (Utc::now() + Days::new(90)).to_rfc3339();
+    }
+
+    Ok(json!({
+        "source": "dry-run",
+        "test_id": test_id,
+        "test_run": completed_run,
+        "dry_run": true
+    }))
+}
+
+pub fn get_test_results(plan_id: &str) -> Result<Value, String> {
+    let store = dr_store().lock().unwrap();
+    if !store.0.iter().any(|p| p.id == plan_id) {
+        return Err(format!("DR plan '{}' not found", plan_id));
+    }
+
+    let results: Vec<DrTestRun> = store
+        .1
+        .iter()
+        .filter(|r| r.plan_id == plan_id)
+        .cloned()
+        .collect();
+
+    Ok(json!({
+        "source": "dry-run",
+        "plan_id": plan_id,
+        "count": results.len(),
+        "test_results": results,
+        "dry_run": true
+    }))
+}
+
+pub fn list_due_tests() -> Result<Value, String> {
+    let now = Utc::now();
+    let store = dr_store().lock().unwrap();
+    let due: Vec<DrPlan> = store
+        .0
+        .iter()
+        .filter(|p| parse_iso_time(&p.next_test_due).is_some_and(|due| due <= now))
+        .cloned()
+        .collect();
+
+    Ok(json!({
+        "source": "dry-run",
+        "count": due.len(),
+        "due_tests": due,
+        "dry_run": true
+    }))
+}
+
+pub fn get_dr_readiness(site: &str) -> Result<Value, String> {
+    if site.trim().is_empty() {
+        return Err("site cannot be empty".into());
+    }
+
+    let now = Utc::now();
+    let store = dr_store().lock().unwrap();
+    let plans: Vec<&DrPlan> = store.0.iter().filter(|p| p.site == site).collect();
+    if plans.is_empty() {
+        return Err(format!("Site '{}' has no DR plans", site));
+    }
+
+    let overdue = plans
+        .iter()
+        .filter(|p| parse_iso_time(&p.next_test_due).is_some_and(|due| due <= now))
+        .count();
+    let last_tested = plans
+        .iter()
+        .filter_map(|p| p.last_tested.as_deref())
+        .filter_map(parse_iso_time)
+        .max()
+        .map(|dt| dt.to_rfc3339());
+    let completed_runs: Vec<&DrTestRun> = store
+        .1
+        .iter()
+        .filter(|r| r.site == site && r.completed_at.is_some())
+        .collect();
+    let passed = completed_runs
+        .iter()
+        .filter(|r| r.result == DrTestResult::Passed)
+        .count();
+    let pass_rate_pct = if completed_runs.is_empty() {
+        0
+    } else {
+        ((passed as f64 / completed_runs.len() as f64) * 100.0).round() as u32
+    };
+
+    Ok(json!({
+        "source": "dry-run",
+        "site": site,
+        "plans_count": plans.len(),
+        "last_tested": last_tested,
+        "overdue": overdue,
+        "pass_rate_pct": pass_rate_pct,
+        "dry_run": true
+    }))
+}
+
+pub fn list_scenarios(site: &str) -> Result<Value, String> {
+    let store = dr_store().lock().unwrap();
+    let scenarios: Vec<DrScenario> = if site.is_empty() {
+        store.2.clone()
+    } else {
+        store.2.iter().filter(|s| s.site == site).cloned().collect()
+    };
+
+    Ok(json!({
+        "source": "dry-run",
+        "site": site,
+        "count": scenarios.len(),
+        "scenarios": scenarios,
+        "dry_run": true
+    }))
+}
+
+pub fn update_rpo_rto(plan_id: &str, rpo: u32, rto: u32) -> Result<Value, String> {
+    if rpo == 0 || rto == 0 {
+        return Err("rpo and rto must be greater than zero".into());
+    }
+
+    let mut store = dr_store().lock().unwrap();
+    let plan = store
+        .0
+        .iter_mut()
+        .find(|p| p.id == plan_id)
+        .ok_or_else(|| format!("DR plan '{}' not found", plan_id))?;
+
+    plan.rpo_minutes = rpo;
+    plan.rto_minutes = rto;
+
+    Ok(json!({
+        "source": "dry-run",
+        "plan_id": plan_id,
+        "rpo_minutes": plan.rpo_minutes,
+        "rto_minutes": plan.rto_minutes,
+        "plan": plan.clone(),
+        "dry_run": true
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_and_list_plans() {
+        let site = "NLAMS";
+        let created = create_plan(
+            "NLAMS application DR",
+            site,
+            "DEFRA",
+            vec!["nlams-app-01".into(), "nlams-db-01".into()],
+            20,
+            90,
+        )
+        .unwrap();
+
+        assert!(
+            created["plan_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("drp-nlams-")
+        );
+        let listed = list_plans(site).unwrap();
+        assert!(
+            listed["plans"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| { p["id"] == created["plan_id"] && p["site"] == site })
+        );
+    }
+
+    #[test]
+    fn test_start_and_complete_test_passed() {
+        let plan = create_plan(
+            "DEBER pass test DR",
+            "DEBER",
+            "GBLON",
+            vec!["deber-app-01".into()],
+            15,
+            60,
+        )
+        .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let started = start_test(plan_id, "Tabletop", "qa.operator").unwrap();
+        let test_id = started["test_id"].as_str().unwrap();
+
+        let completed = complete_test(test_id, "Passed", vec![]).unwrap();
+        assert_eq!(completed["test_run"]["result"], "passed");
+        assert!(completed["test_run"]["completed_at"].is_string());
+    }
+
+    #[test]
+    fn test_start_and_complete_test_failed() {
+        let plan = create_plan(
+            "DEHAM failed test DR",
+            "DEHAM",
+            "FRPAR",
+            vec!["deham-app-01".into(), "deham-db-01".into()],
+            30,
+            120,
+        )
+        .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap();
+        let started = start_test(plan_id, "FullFailover", "qa.operator").unwrap();
+        let test_id = started["test_id"].as_str().unwrap();
+
+        let completed = complete_test(test_id, "Failed", vec!["deham-db-01".into()]).unwrap();
+        assert_eq!(completed["test_run"]["result"], "failed");
+        assert_eq!(
+            completed["test_run"]["systems_failed"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_list_due_tests() {
+        let due = list_due_tests().unwrap();
+        assert!(due["count"].as_u64().unwrap() >= 1);
+        assert!(
+            due["due_tests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == "drp-defra-001")
+        );
+    }
+
+    #[test]
+    fn test_dr_readiness_report() {
+        let report = get_dr_readiness("DEFRA").unwrap();
+        assert_eq!(report["site"], "DEFRA");
+        assert!(report["plans_count"].as_u64().unwrap() >= 1);
+        assert!(report["pass_rate_pct"].as_u64().unwrap() <= 100);
+    }
+
+    #[test]
+    fn test_update_rpo_rto() {
+        let plan = create_plan(
+            "NOOSL objective update DR",
+            "NOOSL",
+            "DEFRA",
+            vec!["noosl-app-01".into()],
+            45,
+            180,
+        )
+        .unwrap();
+        let plan_id = plan["plan_id"].as_str().unwrap();
+
+        let updated = update_rpo_rto(plan_id, 10, 45).unwrap();
+        assert_eq!(updated["rpo_minutes"], 10);
+        assert_eq!(updated["rto_minutes"], 45);
+    }
+
+    #[test]
+    fn test_test_not_found_error() {
+        let result = complete_test("drt-nonexistent", "Passed", vec![]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_get_test_results() {
+        let results = get_test_results("drp-defra-001").unwrap();
+        assert_eq!(results["plan_id"], "drp-defra-001");
+        assert!(results["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_list_scenarios() {
+        let scenarios = list_scenarios("DEFRA").unwrap();
+        assert!(scenarios["count"].as_u64().unwrap() >= 1);
+    }
+}

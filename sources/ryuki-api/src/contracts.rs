@@ -26,13 +26,18 @@ use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_engine;
 use ryuki_engine::cmdb_impact;
+use ryuki_engine::compliance_reporting;
+use ryuki_engine::container_namespace;
 use ryuki_engine::cost_capacity;
+use ryuki_engine::dns_ipam;
 use ryuki_engine::datacenter_readiness;
 use ryuki_engine::degradation_mode;
+use ryuki_engine::dr_testing;
 use ryuki_engine::emergency_change;
 use ryuki_engine::evidence_pipeline;
 use ryuki_engine::file_share_ntfs;
 use ryuki_engine::firmware_lifecycle;
+use ryuki_engine::firewall_rules;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
 use ryuki_engine::health_monitor;
@@ -42,6 +47,7 @@ use ryuki_engine::incident_context;
 use ryuki_engine::inventory_sync;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
+use ryuki_engine::load_balancer;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
@@ -52,6 +58,7 @@ use ryuki_engine::outage_comms;
 use ryuki_engine::patch_engine;
 use ryuki_engine::repository_capacity;
 use ryuki_engine::runbook_execution;
+use ryuki_engine::secrets_rotation;
 use ryuki_engine::server_decommission;
 use ryuki_engine::servicenow_api;
 use ryuki_engine::shift_queue;
@@ -59,6 +66,7 @@ use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::software_deployment;
 use ryuki_engine::sql_deployment;
+use ryuki_engine::storage_provisioning;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::zabbix_drift;
@@ -306,6 +314,19 @@ pub fn routes() -> Router {
             post(shares_revoke),
         )
         .route("/api/identity/shares-contract", get(shares_contract))
+        // ─── Compliance Reporting Engine ───
+        .route("/api/audit/compliance/frameworks", get(compliance_frameworks))
+        .route("/api/audit/compliance/frameworks/{id}", get(compliance_framework_get))
+        .route("/api/audit/compliance/controls", get(compliance_controls_list))
+        .route("/api/audit/compliance/controls/{id}", get(compliance_control_get))
+        .route("/api/audit/compliance/controls/{id}/assess", post(compliance_control_assess))
+        .route("/api/audit/compliance/reports/generate", post(compliance_report_generate))
+        .route("/api/audit/compliance/reports/{id}", get(compliance_report_get))
+        .route("/api/audit/compliance/findings", get(compliance_findings_list))
+        .route("/api/audit/compliance/findings/{id}/resolve", post(compliance_finding_resolve))
+        .route("/api/audit/compliance/findings/{id}/waive", post(compliance_finding_waive))
+        .route("/api/audit/compliance/summary", get(compliance_summary))
+        .route("/api/audit/compliance-contract", get(compliance_contract))
         // ─── Evidence Pipeline Engine ───
         .route("/api/evidence/collect", post(evidence_collect))
         .route("/api/evidence/redact", post(evidence_redact))
@@ -767,6 +788,18 @@ pub fn routes() -> Router {
             "/api/protect/repository-capacity/recommendations/{id}",
             get(repo_capacity_recommendations),
         )
+        // ─── Secrets Rotation Engine ───
+        .route("/api/protect/secrets", get(secrets_list))
+        .route("/api/protect/secrets", post(secrets_register))
+        .route("/api/protect/secrets/{id}", get(secrets_get))
+        .route("/api/protect/secrets/{id}/rotate", post(secrets_rotate))
+        .route("/api/protect/secrets/{id}/history", get(secrets_rotation_history))
+        .route("/api/protect/secrets/due", get(secrets_due_rotations))
+        .route("/api/protect/secrets/expiring", get(secrets_expiring))
+        .route("/api/protect/secrets/rotate-all", post(secrets_rotate_all))
+        .route("/api/protect/secrets/summary", get(secrets_rotation_summary))
+        .route("/api/protect/secrets/fail", post(secrets_rotation_fail))
+        .route("/api/protect/secrets-contract", get(secrets_contract))
         .route(
             "/api/protect/immutability-air-gap-compliance-contract",
             get(protect_immutability_air_gap),
@@ -1151,6 +1184,18 @@ pub fn routes() -> Router {
         .route("/api/vm/day2/execute", post(vm_day2_execute))
         .route("/api/vm/day2/verify", post(vm_day2_verify))
         .route("/api/vm/day2-change-contract", get(vm_day2_change_contract))
+        // ─── DR Testing Engine ───
+        .route("/api/protect/dr/plans", get(dr_plans_list))
+        .route("/api/protect/dr/plans", post(dr_plan_create))
+        .route("/api/protect/dr/plans/{id}", get(dr_plan_get))
+        .route("/api/protect/dr/plans/{id}/rpo-rto", post(dr_plan_update_rpo_rto))
+        .route("/api/protect/dr/tests/start", post(dr_test_start))
+        .route("/api/protect/dr/tests/complete", post(dr_test_complete))
+        .route("/api/protect/dr/tests/results/{id}", get(dr_test_results))
+        .route("/api/protect/dr/due-tests", get(dr_tests_due))
+        .route("/api/protect/dr/readiness", get(dr_readiness))
+        .route("/api/protect/dr/scenarios", get(dr_scenarios))
+        .route("/api/protect/dr-contract", get(dr_contract))
         // ─── Snapshot Governance ───
         .route("/api/protect/snapshot/plan", post(snapshot_plan))
         .route("/api/protect/snapshot/validate", post(snapshot_validate))
@@ -1189,6 +1234,18 @@ pub fn routes() -> Router {
             "/api/protect/backup-coverage-contract",
             get(backup_coverage_contract),
         )
+        // ─── K8s Container Namespace Engine ───
+        .route("/api/build/k8s/namespaces", get(k8s_namespaces_list))
+        .route("/api/build/k8s/namespaces", post(k8s_namespace_provision))
+        .route("/api/build/k8s/namespaces/{id}", get(k8s_namespace_get))
+        .route("/api/build/k8s/namespaces/{id}/quota", post(k8s_namespace_update_quota))
+        .route("/api/build/k8s/namespaces/{id}/suspend", post(k8s_namespace_suspend))
+        .route("/api/build/k8s/namespaces/{id}/resume", post(k8s_namespace_resume))
+        .route("/api/build/k8s/namespaces/{id}/terminate", post(k8s_namespace_terminate))
+        .route("/api/build/k8s/utilization", get(k8s_cluster_utilization))
+        .route("/api/build/k8s/validate-name", post(k8s_validate_name))
+        .route("/api/build/k8s/summary", get(k8s_summary))
+        .route("/api/build/k8s-contract", get(k8s_contract))
         // ─── Linux Deployment ───
         .route("/api/build/linux/plan", post(linux_deploy_plan))
         .route("/api/build/linux/validate", post(linux_deploy_validate))
@@ -1331,6 +1388,42 @@ pub fn routes() -> Router {
             "/api/datacenter/sites-contract",
             get(datacenter_sites_endpoint),
         )
+        // ─── DNS & IPAM Engine ───
+        .route("/api/network/dns/records", get(dns_records_list))
+        .route("/api/network/dns/records", post(dns_record_create))
+        .route("/api/network/dns/records/{id}", get(dns_record_get))
+        .route("/api/network/dns/records/{id}", delete(dns_record_delete))
+        .route("/api/network/ipam/subnets", get(ipam_subnets_list))
+        .route("/api/network/ipam/subnets/{id}", get(ipam_subnet_get))
+        .route("/api/network/ipam/reserve", post(ipam_reserve_ip))
+        .route("/api/network/ipam/release/{id}", post(ipam_release_ip))
+        .route("/api/network/ipam/summary", get(ipam_summary))
+        .route("/api/network/ipam/availability/{id}", get(ipam_check_availability))
+        .route("/api/network/dns-ipam-contract", get(dns_ipam_contract))
+        // ─── Firewall Rules Engine ───
+        .route("/api/network/firewall/rules", get(firewall_rules_list))
+        .route("/api/network/firewall/rules", post(firewall_rule_create))
+        .route("/api/network/firewall/rules/{id}", get(firewall_rule_get))
+        .route("/api/network/firewall/rules/{id}", delete(firewall_rule_delete))
+        .route("/api/network/firewall/rules/{id}/update", post(firewall_rule_update))
+        .route("/api/network/firewall/validate", post(firewall_rule_validate))
+        .route("/api/network/firewall/rule-sets", post(firewall_rule_set_create))
+        .route("/api/network/firewall/rule-sets/{id}/apply", post(firewall_rule_set_apply))
+        .route("/api/network/firewall/rule-sets/{id}/revoke", post(firewall_rule_set_revoke))
+        .route("/api/network/firewall/conflicts", get(firewall_conflicts))
+        .route("/api/network/firewall-contract", get(firewall_contract))
+        // ─── Load Balancer Engine ───
+        .route("/api/network/loadbalancer/vs", get(lb_vs_list))
+        .route("/api/network/loadbalancer/vs", post(lb_provision))
+        .route("/api/network/loadbalancer/vs/{id}", get(lb_vs_get))
+        .route("/api/network/loadbalancer/vs/{id}/member", post(lb_pool_member_add))
+        .route("/api/network/loadbalancer/vs/{id}/member/{hostname}", delete(lb_pool_member_remove))
+        .route("/api/network/loadbalancer/vs/{id}/drain", post(lb_vs_drain))
+        .route("/api/network/loadbalancer/vs/{id}/disable", post(lb_vs_disable))
+        .route("/api/network/loadbalancer/vs/{id}/enable", post(lb_vs_enable))
+        .route("/api/network/loadbalancer/status", get(lb_status))
+        .route("/api/network/loadbalancer/validate-vip", post(lb_validate_vip))
+        .route("/api/network/loadbalancer-contract", get(lb_contract))
         // ─── Network Port & VLAN Readiness ───
         .route(
             "/api/datacenter/network/readiness",
@@ -1380,7 +1473,20 @@ pub fn routes() -> Router {
             post(oob_validate_site),
         )
         .route("/api/datacenter/oob-contract", get(oob_contract))
-        // ─── Hardware Lifecycle ───
+        // ─── Storage Provisioning Engine ───
+        .route("/api/datacenter/storage/volumes", get(storage_volumes_list))
+        .route("/api/datacenter/storage/volumes", post(storage_volume_provision))
+        .route("/api/datacenter/storage/volumes/{id}", get(storage_volume_get))
+        .route("/api/datacenter/storage/volumes/{id}/extend", post(storage_volume_extend))
+        .route("/api/datacenter/storage/volumes/{id}/map", post(storage_volume_map))
+        .route("/api/datacenter/storage/volumes/{id}/unmap", post(storage_volume_unmap))
+        .route("/api/datacenter/storage/volumes/{id}/retire", post(storage_volume_retire))
+        .route("/api/datacenter/storage/arrays", get(storage_arrays_list))
+        .route("/api/datacenter/storage/arrays/{id}", get(storage_array_get))
+        .route("/api/datacenter/storage/check-capacity", post(storage_check_capacity))
+        .route("/api/datacenter/storage/report", get(storage_report))
+        .route("/api/datacenter/storage-contract", get(storage_contract))
+         // ─── Hardware Lifecycle ───
         .route(
             "/api/datacenter/hardware/inventory",
             get(hardware_inventory),
@@ -8029,7 +8135,7 @@ async fn servicenow_contract() -> Json<Value> {
     Json(servicenow_api::get_snow_contract())
 }
 
-// ─── Repository Capacity Forecasting ───
+        // ─── Repository Capacity Forecasting ───
 
 #[derive(Deserialize)]
 struct RepoCapacitySiteQuery {
@@ -9311,6 +9417,335 @@ async fn access_review_contract() -> Json<Value> {
         ]
     }))
 }
+
+// ─── DNS & IPAM handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DnsListQuery { site: Option<String>, #[serde(rename = "recordType")] record_type: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DnsCreateRequest { name: String, #[serde(rename = "recordType")] record_type: String, value: String, zone: String, ttl: u32, site: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct IpamReserveRequest { #[serde(rename = "subnetId")] subnet_id: String, hostname: String, purpose: String, #[serde(rename = "reservedBy")] reserved_by: String, #[serde(rename = "ttlDays")] ttl_days: u64 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct IpamAvailabilityQuery { count: Option<u32> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct IpamSiteQuery { site: Option<String> }
+
+async fn dns_records_list(Query(q): Query<DnsListQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::list_dns_records(q.site.as_deref().unwrap_or(""), q.record_type.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dns_record_create(Json(b): Json<DnsCreateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::create_dns_record(&b.name, &b.record_type, &b.value, &b.zone, b.ttl, &b.site).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::get_dns_record(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dns_record_delete(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::delete_dns_record(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn ipam_subnets_list(Query(q): Query<IpamSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::list_subnets(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::get_subnet(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn ipam_reserve_ip(Json(b): Json<IpamReserveRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::reserve_ip(&b.subnet_id, &b.hostname, &b.purpose, &b.reserved_by, b.ttl_days).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn ipam_release_ip(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::release_ip(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn ipam_summary(Query(q): Query<IpamSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::get_ipam_summary(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn ipam_check_availability(Path(id): Path<String>, Query(q): Query<IpamAvailabilityQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dns_ipam::check_ip_availability(&id, q.count.unwrap_or(1)).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dns_ipam_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/network/dns/records"},{"method":"POST","path":"/api/network/dns/records"},{"method":"GET","path":"/api/network/dns/records/{id}"},{"method":"DELETE","path":"/api/network/dns/records/{id}"},{"method":"GET","path":"/api/network/ipam/subnets"},{"method":"GET","path":"/api/network/ipam/subnets/{id}"},{"method":"POST","path":"/api/network/ipam/reserve"},{"method":"POST","path":"/api/network/ipam/release/{id}"},{"method":"GET","path":"/api/network/ipam/summary"},{"method":"GET","path":"/api/network/ipam/availability/{id}"}]})) }
+
+// ─── Firewall Rules handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwListQuery { site: Option<String>, direction: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwCreateRequest { name: String, #[serde(rename = "sourceIp")] source_ip: String, #[serde(rename = "destIp")] dest_ip: String, protocol: String, action: String, direction: String, site: String, description: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwUpdateRequest { action: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwValidateRequest { name: String, #[serde(rename = "sourceIp")] source_ip: String, #[serde(rename = "destIp")] dest_ip: String, protocol: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwRuleSetCreateRequest { name: String, #[serde(rename = "ruleIds")] rule_ids: Vec<String>, site: String, target: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct FwConflictsQuery { site: Option<String> }
+
+async fn firewall_rules_list(Query(q): Query<FwListQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::list_rules(q.site.as_deref().unwrap_or(""), q.direction.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn firewall_rule_create(Json(b): Json<FwCreateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::create_rule(&b.name, &b.source_ip, &b.dest_ip, &b.protocol, &b.action, &b.direction, &b.site, &b.description).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn firewall_rule_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::get_rule(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn firewall_rule_delete(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::delete_rule(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn firewall_rule_update(Path(id): Path<String>, Json(b): Json<FwUpdateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::update_rule(&id, &b.action).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn firewall_rule_validate(Json(b): Json<FwValidateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::validate_rule(&b.name, &b.source_ip, &b.dest_ip, &b.protocol).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn firewall_rule_set_create(Json(b): Json<FwRuleSetCreateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::create_rule_set(&b.name, b.rule_ids, &b.site, &b.target).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn firewall_rule_set_apply(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::apply_rule_set(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn firewall_rule_set_revoke(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::revoke_rule_set(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn firewall_conflicts(Query(q): Query<FwConflictsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firewall_rules::get_conflicts(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn firewall_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/network/firewall/rules"},{"method":"POST","path":"/api/network/firewall/rules"},{"method":"GET","path":"/api/network/firewall/rules/{id}"},{"method":"DELETE","path":"/api/network/firewall/rules/{id}"},{"method":"POST","path":"/api/network/firewall/rules/{id}/update"},{"method":"POST","path":"/api/network/firewall/validate"},{"method":"POST","path":"/api/network/firewall/rule-sets"},{"method":"POST","path":"/api/network/firewall/rule-sets/{id}/apply"},{"method":"POST","path":"/api/network/firewall/rule-sets/{id}/revoke"},{"method":"GET","path":"/api/network/firewall/conflicts"}]})) }
+
+// ─── Storage Provisioning handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct StorageSiteQuery { site: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct StorageProvisionRequest { name: String, #[serde(rename = "sizeGb")] size_gb: u64, #[serde(rename = "volumeType")] volume_type: String, #[serde(rename = "arrayId")] array_id: String, site: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct StorageExtendRequest { #[serde(rename = "additionalGb")] additional_gb: u64 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct StorageMapRequest { hostname: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct StorageCapacityRequest { #[serde(rename = "arrayId")] array_id: String, #[serde(rename = "requestedGb")] requested_gb: u64 }
+
+async fn storage_volumes_list(Query(q): Query<StorageSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::list_volumes(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn storage_volume_provision(Json(b): Json<StorageProvisionRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::provision_volume(&b.name, b.size_gb, &b.volume_type, &b.array_id, &b.site).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn storage_volume_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::get_volume(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_volume_extend(Path(id): Path<String>, Json(b): Json<StorageExtendRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::extend_volume(&id, b.additional_gb).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_volume_map(Path(id): Path<String>, Json(b): Json<StorageMapRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::map_volume(&id, &b.hostname).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_volume_unmap(Path(id): Path<String>, Json(b): Json<StorageMapRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::unmap_volume(&id, &b.hostname).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_volume_retire(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::retire_volume(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_arrays_list(Query(q): Query<StorageSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::list_arrays(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn storage_array_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::get_array(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_check_capacity(Json(b): Json<StorageCapacityRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::check_capacity(&b.array_id, b.requested_gb).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn storage_report(Query(q): Query<StorageSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    storage_provisioning::get_storage_report(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn storage_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/datacenter/storage/volumes"},{"method":"POST","path":"/api/datacenter/storage/volumes"},{"method":"GET","path":"/api/datacenter/storage/volumes/{id}"},{"method":"POST","path":"/api/datacenter/storage/volumes/{id}/extend"},{"method":"POST","path":"/api/datacenter/storage/volumes/{id}/map"},{"method":"POST","path":"/api/datacenter/storage/volumes/{id}/unmap"},{"method":"POST","path":"/api/datacenter/storage/volumes/{id}/retire"},{"method":"GET","path":"/api/datacenter/storage/arrays"},{"method":"GET","path":"/api/datacenter/storage/arrays/{id}"},{"method":"POST","path":"/api/datacenter/storage/check-capacity"},{"method":"GET","path":"/api/datacenter/storage/report"}]})) }
+
+// ─── K8s Container Namespace handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct K8sSiteQuery { site: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct K8sProvisionRequest { name: String, cluster: String, site: String, cpu: u32, memory: u32, storage: u32, environment: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct K8sQuotaRequest { cpu: u32, memory: u32, storage: u32 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct K8sValidateRequest { name: String, cluster: String }
+
+async fn k8s_namespaces_list(Query(q): Query<K8sSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::list_namespaces(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_provision(Json(b): Json<K8sProvisionRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::provision_namespace(&b.name, &b.cluster, &b.site, b.cpu, b.memory, b.storage, &b.environment).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::get_namespace(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_update_quota(Path(id): Path<String>, Json(b): Json<K8sQuotaRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::update_quota(&id, b.cpu, b.memory, b.storage).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_suspend(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::suspend_namespace(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_resume(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::resume_namespace(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn k8s_namespace_terminate(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::terminate_namespace(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn k8s_cluster_utilization(Query(q): Query<K8sSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::get_cluster_utilization(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn k8s_validate_name(Json(b): Json<K8sValidateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::validate_namespace_name(&b.name, &b.cluster).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn k8s_summary(Query(q): Query<K8sSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    container_namespace::get_k8s_summary(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn k8s_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/build/k8s/namespaces"},{"method":"POST","path":"/api/build/k8s/namespaces"},{"method":"GET","path":"/api/build/k8s/namespaces/{id}"},{"method":"POST","path":"/api/build/k8s/namespaces/{id}/quota"},{"method":"POST","path":"/api/build/k8s/namespaces/{id}/suspend"},{"method":"POST","path":"/api/build/k8s/namespaces/{id}/resume"},{"method":"POST","path":"/api/build/k8s/namespaces/{id}/terminate"},{"method":"GET","path":"/api/build/k8s/utilization"},{"method":"POST","path":"/api/build/k8s/validate-name"},{"method":"GET","path":"/api/build/k8s/summary"}]})) }
+
+// ─── DR Testing handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DrSiteQuery { site: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DrPlanCreateRequest { name: String, site: String, #[serde(rename = "targetSite")] target_site: String, systems: Vec<String>, rpo: u32, rto: u32 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DrRpoRtoRequest { rpo: u32, rto: u32 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DrTestStartRequest { #[serde(rename = "planId")] plan_id: String, #[serde(rename = "scenarioType")] scenario_type: String, tester: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct DrTestCompleteRequest { #[serde(rename = "testId")] test_id: String, result: String, #[serde(rename = "systemsFailed")] systems_failed: Vec<String> }
+
+async fn dr_plans_list(Query(q): Query<DrSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::list_plans(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dr_plan_create(Json(b): Json<DrPlanCreateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::create_plan(&b.name, &b.site, &b.target_site, b.systems, b.rpo, b.rto).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dr_plan_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::get_plan(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dr_plan_update_rpo_rto(Path(id): Path<String>, Json(b): Json<DrRpoRtoRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::update_rpo_rto(&id, b.rpo, b.rto).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dr_test_start(Json(b): Json<DrTestStartRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::start_test(&b.plan_id, &b.scenario_type, &b.tester).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dr_test_complete(Json(b): Json<DrTestCompleteRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::complete_test(&b.test_id, &b.result, b.systems_failed).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dr_test_results(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::get_test_results(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn dr_tests_due() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::list_due_tests().map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+async fn dr_readiness(Query(q): Query<DrSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::get_dr_readiness(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dr_scenarios(Query(q): Query<DrSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    dr_testing::list_scenarios(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn dr_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/dr/plans"},{"method":"POST","path":"/api/protect/dr/plans"},{"method":"GET","path":"/api/protect/dr/plans/{id}"},{"method":"POST","path":"/api/protect/dr/plans/{id}/rpo-rto"},{"method":"POST","path":"/api/protect/dr/tests/start"},{"method":"POST","path":"/api/protect/dr/tests/complete"},{"method":"GET","path":"/api/protect/dr/tests/results/{id}"},{"method":"GET","path":"/api/protect/dr/due-tests"},{"method":"GET","path":"/api/protect/dr/readiness"},{"method":"GET","path":"/api/protect/dr/scenarios"}]})) }
+
+// ─── Compliance Reporting handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceControlsQuery { #[serde(rename = "frameworkId")] framework_id: Option<String>, site: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceAssessRequest { status: String, #[serde(rename = "assessedBy")] assessed_by: String, #[serde(rename = "evidenceRef")] evidence_ref: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceReportGenerateRequest { #[serde(rename = "frameworkId")] framework_id: String, site: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceFindingsQuery { site: Option<String>, severity: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceResolveRequest { resolution: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceWaiveRequest { reason: String, #[serde(rename = "approvedBy")] approved_by: String, expiry: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct ComplianceSiteQuery { site: Option<String> }
+
+async fn compliance_frameworks() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::list_frameworks().map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+async fn compliance_framework_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::get_framework(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_controls_list(Query(q): Query<ComplianceControlsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::list_controls(q.framework_id.as_deref().unwrap_or(""), q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn compliance_control_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::get_control(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_control_assess(Path(id): Path<String>, Json(b): Json<ComplianceAssessRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::assess_control(&id, &b.status, &b.assessed_by, &b.evidence_ref).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_report_generate(Json(b): Json<ComplianceReportGenerateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::generate_report(&b.framework_id, &b.site).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn compliance_report_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::get_report(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_findings_list(Query(q): Query<ComplianceFindingsQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::list_findings(q.site.as_deref().unwrap_or(""), q.severity.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn compliance_finding_resolve(Path(id): Path<String>, Json(b): Json<ComplianceResolveRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::resolve_finding(&id, &b.resolution).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_finding_waive(Path(id): Path<String>, Json(b): Json<ComplianceWaiveRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::create_waiver(&id, &b.reason, &b.approved_by, &b.expiry).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn compliance_summary(Query(q): Query<ComplianceSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    compliance_reporting::get_compliance_summary(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn compliance_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/audit/compliance/frameworks"},{"method":"GET","path":"/api/audit/compliance/frameworks/{id}"},{"method":"GET","path":"/api/audit/compliance/controls"},{"method":"GET","path":"/api/audit/compliance/controls/{id}"},{"method":"POST","path":"/api/audit/compliance/controls/{id}/assess"},{"method":"POST","path":"/api/audit/compliance/reports/generate"},{"method":"GET","path":"/api/audit/compliance/reports/{id}"},{"method":"GET","path":"/api/audit/compliance/findings"},{"method":"POST","path":"/api/audit/compliance/findings/{id}/resolve"},{"method":"POST","path":"/api/audit/compliance/findings/{id}/waive"},{"method":"GET","path":"/api/audit/compliance/summary"}]})) }
+
+// ─── Secrets Rotation handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsListQuery { site: Option<String>, #[serde(rename = "secretType")] secret_type: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsRegisterRequest { name: String, #[serde(rename = "secretType")] secret_type: String, #[serde(rename = "vaultPath")] vault_path: String, #[serde(rename = "intervalDays")] interval_days: u64, owner: String, site: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsRotateRequest { #[serde(rename = "rotatedBy")] rotated_by: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsExpiringQuery { days: Option<u64> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsFailRequest { #[serde(rename = "rotationId")] rotation_id: String, error: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct SecretsSiteQuery { site: Option<String> }
+
+async fn secrets_list(Query(q): Query<SecretsListQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::list_secrets(q.site.as_deref().unwrap_or(""), q.secret_type.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn secrets_register(Json(b): Json<SecretsRegisterRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::register_secret(&b.name, &b.secret_type, &b.vault_path, b.interval_days, &b.owner, &b.site).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::get_secret(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn secrets_rotate(Path(id): Path<String>, Json(b): Json<SecretsRotateRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::rotate_secret(&id, &b.rotated_by).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn secrets_rotation_history(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::get_rotation_history(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::list_due_rotations().map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+async fn secrets_expiring(Query(q): Query<SecretsExpiringQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::list_expiring(q.days.unwrap_or(30)).map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+async fn secrets_rotate_all(Query(q): Query<SecretsSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::force_rotate_all(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn secrets_rotation_summary(Query(q): Query<SecretsSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::get_rotation_summary(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn secrets_rotation_fail(Json(b): Json<SecretsFailRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    secrets_rotation::mark_rotation_failed(&b.rotation_id, &b.error).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn secrets_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/secrets"},{"method":"POST","path":"/api/protect/secrets"},{"method":"GET","path":"/api/protect/secrets/{id}"},{"method":"POST","path":"/api/protect/secrets/{id}/rotate"},{"method":"GET","path":"/api/protect/secrets/{id}/history"},{"method":"GET","path":"/api/protect/secrets/due"},{"method":"GET","path":"/api/protect/secrets/expiring"},{"method":"POST","path":"/api/protect/secrets/rotate-all"},{"method":"GET","path":"/api/protect/secrets/summary"},{"method":"POST","path":"/api/protect/secrets/fail"}]})) }
+
+// ─── Load Balancer handlers ───
+
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct LbSiteQuery { site: Option<String> }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct LbProvisionRequest { name: String, vip: String, port: u16, protocol: String, site: String, members: Vec<String>, algorithm: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct LbMemberRequest { hostname: String, ip: String, port: u16 }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct LbMemberRemoveRequest { hostname: String }
+#[derive(Debug, Deserialize)] #[allow(dead_code)] struct LbValidateVipRequest { vip: String, site: String }
+
+async fn lb_vs_list(Query(q): Query<LbSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::list_virtual_servers(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn lb_provision(Json(b): Json<LbProvisionRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::provision_lb(&b.name, &b.vip, b.port, &b.protocol, &b.site, b.members, &b.algorithm).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn lb_vs_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::get_virtual_server(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_pool_member_add(Path(id): Path<String>, Json(b): Json<LbMemberRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::add_pool_member(&id, &b.hostname, &b.ip, b.port).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_pool_member_remove(Path((id, _hostname)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::remove_pool_member(&id, &_hostname).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_vs_drain(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::drain_virtual_server(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_vs_disable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::disable_virtual_server(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_vs_enable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::enable_virtual_server(&id).map(Json).map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+async fn lb_status(Query(q): Query<LbSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::get_lb_status(q.site.as_deref().unwrap_or("")).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn lb_validate_vip(Json(b): Json<LbValidateVipRequest>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    load_balancer::validate_vip(&b.vip, &b.site).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+async fn lb_contract() -> Json<Value> { Json(json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/network/loadbalancer/vs"},{"method":"POST","path":"/api/network/loadbalancer/vs"},{"method":"GET","path":"/api/network/loadbalancer/vs/{id}"},{"method":"POST","path":"/api/network/loadbalancer/vs/{id}/member"},{"method":"DELETE","path":"/api/network/loadbalancer/vs/{id}/member/{hostname}"},{"method":"POST","path":"/api/network/loadbalancer/vs/{id}/drain"},{"method":"POST","path":"/api/network/loadbalancer/vs/{id}/disable"},{"method":"POST","path":"/api/network/loadbalancer/vs/{id}/enable"},{"method":"GET","path":"/api/network/loadbalancer/status"},{"method":"POST","path":"/api/network/loadbalancer/validate-vip"}]})) }
 
 // ─── Datacenter Readiness request types ───
 
