@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request as HttpRequest, StatusCode};
 use axum::middleware;
 use axum::response::Response;
-use axum::{extract::Query, routing::get, Json, Router};
+use axum::{extract::Query, routing::get, Extension, Json, Router};
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
@@ -93,7 +93,6 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct RequestId(String);
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
@@ -311,8 +310,12 @@ async fn metrics() -> Response {
         .unwrap()
 }
 
-async fn platform_status() -> Json<serde_json::Value> {
-    Json(crate::config::get_platform_status())
+async fn platform_status(Extension(request_id): Extension<RequestId>) -> Json<serde_json::Value> {
+    let mut status = crate::config::get_platform_status();
+    if let serde_json::Value::Object(ref mut map) = status {
+        map.insert("request_id".into(), serde_json::Value::String(request_id.0));
+    }
+    Json(status)
 }
 
 #[cfg(test)]
