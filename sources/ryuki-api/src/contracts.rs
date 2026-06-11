@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::database::get_db;
 use ryuki_engine::ad_computer_lifecycle;
+use ryuki_engine::aiops;
 use ryuki_engine::alert_routing_engine;
 use ryuki_engine::file_share_ntfs;
 use ryuki_engine::app_environment;
@@ -28,16 +29,19 @@ use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
+use ryuki_engine::noise_remediation;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::patch_engine;
 use ryuki_engine::server_decommission;
 use ryuki_engine::shift_queue;
 use ryuki_engine::snapshot_engine;
+use ryuki_engine::software_deployment;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::degradation_mode;
+use ryuki_engine::servicenow_api;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -506,6 +510,40 @@ pub fn routes() -> Router {
             get(patch_pending_reboots),
         )
         .route("/api/maintain/patch-contract", get(patch_contract))
+        // ─── Software deployment ───
+        .route(
+            "/api/maintain/software/packages",
+            get(software_packages_list),
+        )
+        .route(
+            "/api/maintain/software/validate",
+            post(software_validate),
+        )
+        .route("/api/maintain/software/plan", post(software_plan))
+        .route(
+            "/api/maintain/software/approve/{id}",
+            post(software_approve),
+        )
+        .route(
+            "/api/maintain/software/execute/{id}",
+            post(software_execute),
+        )
+        .route(
+            "/api/maintain/software/verify/{id}",
+            post(software_verify),
+        )
+        .route(
+            "/api/maintain/software/history/{server}",
+            get(software_history),
+        )
+        .route(
+            "/api/maintain/software/compliance",
+            get(software_compliance),
+        )
+        .route(
+            "/api/maintain/software-contract",
+            get(software_contract),
+        )
         // ─── OS baseline compliance ───
         .route(
             "/api/maintain/baseline/check/{server}",
@@ -686,6 +724,48 @@ pub fn routes() -> Router {
             get(cmdb_impact_downstream),
         )
         .route("/api/cmdb/impact-contract", get(cmdb_impact_contract))
+        // ─── ServiceNow API Integration ───
+        .route(
+            "/api/cmdb/servicenow/incident",
+            post(servicenow_incident),
+        )
+        .route(
+            "/api/cmdb/servicenow/change",
+            post(servicenow_change),
+        )
+        .route(
+            "/api/cmdb/servicenow/request",
+            post(servicenow_request),
+        )
+        .route(
+            "/api/cmdb/servicenow/validate/{id}",
+            post(servicenow_validate),
+        )
+        .route(
+            "/api/cmdb/servicenow/approve/{id}",
+            post(servicenow_approve),
+        )
+        .route(
+            "/api/cmdb/servicenow/submit/{id}",
+            post(servicenow_submit),
+        )
+        .route(
+            "/api/cmdb/servicenow/status/{id}",
+            get(servicenow_status),
+        )
+        .route("/api/cmdb/servicenow/pending", get(servicenow_pending))
+        .route(
+            "/api/cmdb/servicenow/cancel/{id}",
+            post(servicenow_cancel),
+        )
+        .route(
+            "/api/cmdb/servicenow/history/{ci}",
+            get(servicenow_history),
+        )
+        .route(
+            "/api/cmdb/servicenow-contract",
+            get(servicenow_contract),
+        )
         .route(
             "/api/admin/worker-capability-contract",
             get(admin_worker_capability),
@@ -743,6 +823,42 @@ pub fn routes() -> Router {
         )
         .route("/api/analytics/trend", get(analytics_trend))
         .route("/api/analytics/contract", get(analytics_contract))
+        .route(
+            "/api/analytics/aiops/generate",
+            post(aiops_generate),
+        )
+        .route(
+            "/api/analytics/aiops/review/{id}",
+            post(aiops_review),
+        )
+        .route(
+            "/api/analytics/aiops/accept/{id}",
+            post(aiops_accept),
+        )
+        .route(
+            "/api/analytics/aiops/reject/{id}",
+            post(aiops_reject),
+        )
+        .route(
+            "/api/analytics/aiops/implement/{id}",
+            post(aiops_implement),
+        )
+        .route(
+            "/api/analytics/aiops/type",
+            get(aiops_type),
+        )
+        .route(
+            "/api/analytics/aiops/savings",
+            get(aiops_savings),
+        )
+        .route(
+            "/api/analytics/aiops/stats",
+            get(aiops_stats),
+        )
+        .route(
+            "/api/analytics/aiops-contract",
+            get(aiops_contract),
+        )
         .route("/api/platform/health", get(platform_health))
         .route(
             "/api/platform/health/components",
@@ -790,6 +906,33 @@ pub fn routes() -> Router {
         .route(
             "/api/monitoring/zabbix-drift-contract",
             get(zabbix_drift_contract),
+        )
+        // ─── Noise Remediation ───
+        .route(
+            "/api/monitoring/noise/detect",
+            post(noise_detect),
+        )
+        .route(
+            "/api/monitoring/noise/flapping",
+            post(noise_flapping_detect),
+        )
+        .route(
+            "/api/monitoring/noise/suggest/{id}",
+            post(noise_suggest),
+        )
+        .route(
+            "/api/monitoring/noise/suppress/{id}",
+            post(noise_suppress),
+        )
+        .route(
+            "/api/monitoring/noise/resolve/{id}",
+            post(noise_resolve),
+        )
+        .route("/api/monitoring/noise/report", get(noise_report))
+        .route("/api/monitoring/noise/suppressed", get(noise_suppressed_list))
+        .route(
+            "/api/monitoring/noise-contract",
+            get(noise_contract),
         )
         // ─── Certificate Lifecycle ───
         .route(
@@ -1471,6 +1614,33 @@ struct ZabbixDriftSiteRequest {
 #[allow(dead_code)]
 struct ZabbixDriftQuery {
     site: Option<String>,
+}
+
+// ─── Noise remediation request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NoiseSiteRequest {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NoiseSiteQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NoiseSuppressRequest {
+    duration_minutes: u32,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NoiseResolveRequest {
+    resolution: String,
 }
 
 // ─── Network readiness request types ───
@@ -3892,6 +4062,83 @@ async fn patch_contract() -> Json<Value> {
     }))
 }
 
+// ─── Software deployment handlers ───
+
+#[derive(Debug, Deserialize)]
+struct SoftwarePackagesQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SoftwareActionRequest {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    approver: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SoftwareComplianceQuery {
+    site: String,
+}
+
+async fn software_packages_list(Query(query): Query<SoftwarePackagesQuery>) -> ApiResult {
+    let site = query.site.as_deref();
+    let packages = software_deployment::get_approved_packages(site);
+    Ok(Json(serde_json::to_value(packages).unwrap()))
+}
+
+async fn software_validate(Json(body): Json<software_deployment::DeploymentRequest>) -> ApiResult {
+    match software_deployment::validate_deployment(&body) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>) -> ApiResult {
+    match software_deployment::plan_deployment(&body) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_approve(Path(id): Path<String>, Json(body): Json<SoftwareActionRequest>) -> ApiResult {
+    let approver = body.approver.unwrap_or_else(|| "admin".into());
+    match software_deployment::approve_deployment(&id, &approver) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_execute(Path(id): Path<String>) -> ApiResult {
+    match software_deployment::execute_deployment(&id) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_verify(Path(id): Path<String>) -> ApiResult {
+    match software_deployment::verify_deployment(&id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_history(Path(server): Path<String>) -> ApiResult {
+    let history = software_deployment::get_deployment_history(&server);
+    Ok(Json(serde_json::to_value(history).unwrap()))
+}
+
+async fn software_compliance(Query(query): Query<SoftwareComplianceQuery>) -> ApiResult {
+    match software_deployment::get_package_compliance(&query.site) {
+        Ok(compliance) => Ok(Json(compliance)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn software_contract() -> Json<Value> {
+    Json(software_deployment::get_software_contract())
+}
+
 // ─── OS baseline compliance handlers ───
 
 #[derive(Debug, Deserialize)]
@@ -4301,6 +4548,76 @@ async fn zabbix_drift_contract() -> Json<Value> {
             "POST /api/monitoring/zabbix/drift/verify/{drift_id}": "Verify remediation was applied successfully"
         }
     }))
+}
+
+// ─── Noise remediation handlers ───
+
+async fn noise_detect(
+    Json(body): Json<NoiseSiteRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match noise_remediation::detect_noise(&body.site) {
+        Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_flapping_detect(
+    Json(body): Json<NoiseSiteRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match noise_remediation::detect_flapping(&body.site) {
+        Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_suggest(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match noise_remediation::suggest_remediation(&id) {
+        Ok(suggestions) => Ok(Json(suggestions)),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_suppress(
+    Path(id): Path<String>,
+    Json(body): Json<NoiseSuppressRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match noise_remediation::suppress_trigger(&id, body.duration_minutes, &body.reason) {
+        Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_resolve(
+    Path(id): Path<String>,
+    Json(body): Json<NoiseResolveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match noise_remediation::resolve_noise(&id, &body.resolution) {
+        Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_report(
+    Query(q): Query<NoiseSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = q.site.unwrap_or_else(|| "LOVE".to_string());
+    match noise_remediation::get_noise_report(&site) {
+        Ok(report) => Ok(Json(report)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn noise_suppressed_list() -> Json<Value> {
+    match noise_remediation::get_suppressed_triggers() {
+        Ok(triggers) => Json(serde_json::to_value(triggers).unwrap_or_default()),
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+async fn noise_contract() -> Json<Value> {
+    Json(noise_remediation::get_noise_contract())
 }
 
 async fn observe_synthetic_health_check_contract() -> Json<Value> {
@@ -4851,6 +5168,152 @@ async fn analytics_contract() -> Json<Value> {
             "raw-cost-rows-disabled",
             "resource-identifiers-disabled",
             "tenant-identifiers-disabled"
+        ]
+    }))
+}
+
+// ─── AIOps Suggestion Engine handlers ───
+
+#[derive(Deserialize)]
+struct AiopsSiteQuery {
+    site: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AiopsTypeQuery {
+    #[serde(rename = "type")]
+    suggestion_type: String,
+}
+
+#[derive(Deserialize)]
+struct AiopsReviewRequest {
+    reviewer: String,
+}
+
+#[derive(Deserialize)]
+struct AiopsRejectRequest {
+    reason: String,
+}
+
+async fn aiops_generate(
+    Query(params): Query<AiopsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    aiops::generate_suggestions(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn aiops_review(
+    Path(id): Path<String>,
+    Json(body): Json<AiopsReviewRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    aiops::review_suggestion(&id, &body.reviewer)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn aiops_accept(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    aiops::accept_suggestion(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn aiops_reject(
+    Path(id): Path<String>,
+    Json(body): Json<AiopsRejectRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    aiops::reject_suggestion(&id, &body.reason)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn aiops_implement(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    aiops::implement_suggestion(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn aiops_type(
+    Query(params): Query<AiopsTypeQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    aiops::get_suggestions_by_type(&params.suggestion_type)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn aiops_savings(
+    Query(params): Query<AiopsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    aiops::get_savings_summary(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn aiops_stats(
+    Query(params): Query<AiopsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    aiops::get_suggestion_stats(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn aiops_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveCorrelationAllowed": false,
+        "liveRemediationAllowed": false,
+        "automationDispatchAllowed": false,
+        "rawOperationRowsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "suggestionTypes": [
+            "right-sizing",
+            "migration",
+            "consolidation",
+            "risk-reduction",
+            "cost-optimization",
+            "performance-improvement"
+        ],
+        "suggestionStatuses": [
+            "new",
+            "reviewed",
+            "accepted",
+            "rejected",
+            "implemented"
+        ],
+        "endpoints": {
+            "generate": "POST /api/analytics/aiops/generate?site=",
+            "review": "POST /api/analytics/aiops/review/{id}",
+            "accept": "POST /api/analytics/aiops/accept/{id}",
+            "reject": "POST /api/analytics/aiops/reject/{id}",
+            "implement": "POST /api/analytics/aiops/implement/{id}",
+            "by_type": "GET /api/analytics/aiops/type?type=",
+            "savings": "GET /api/analytics/aiops/savings?site=",
+            "stats": "GET /api/analytics/aiops/stats?site=",
+            "contract": "GET /api/analytics/aiops-contract"
+        },
+        "sites": ["LOVE", "BUR1"],
+        "requiredGuards": [
+            "suggestion-static-analysis-only",
+            "no-live-provider-calls",
+            "reviewer-required-for-acceptance",
+            "confidence-score-explicit",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-correlation-disabled",
+            "live-remediation-disabled",
+            "automation-dispatch-disabled",
+            "raw-operation-rows-disabled",
+            "raw-provider-payloads-disabled"
         ]
     }))
 }
@@ -6712,6 +7175,136 @@ async fn oob_contract() -> Json<Value> {
             "GET /api/datacenter/oob-contract": "OOB access validation contract"
         }
     }))
+}
+
+// ─── ServiceNow API request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ServicenowIncidentRequest {
+    #[serde(rename = "ciName")]
+    ci_name: String,
+    description: String,
+    urgency: String,
+    #[serde(rename = "assignmentGroup")]
+    assignment_group: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ServicenowChangeRequest {
+    #[serde(rename = "ciName")]
+    ci_name: String,
+    #[serde(rename = "changeType")]
+    change_type: String,
+    description: String,
+    #[serde(rename = "plannedStart")]
+    planned_start: String,
+    #[serde(rename = "plannedEnd")]
+    planned_end: String,
+    risk: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ServicenowRequestRequest {
+    #[serde(rename = "ciName")]
+    ci_name: String,
+    #[serde(rename = "requestType")]
+    request_type: String,
+    description: String,
+}
+
+// ─── ServiceNow API handlers ───
+
+async fn servicenow_incident(
+    Json(body): Json<ServicenowIncidentRequest>,
+) -> ApiResult {
+    match servicenow_api::prepare_incident(
+        &body.ci_name,
+        &body.description,
+        &body.urgency,
+        &body.assignment_group,
+    ) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_change(
+    Json(body): Json<ServicenowChangeRequest>,
+) -> ApiResult {
+    match servicenow_api::prepare_change(
+        &body.ci_name,
+        &body.change_type,
+        &body.description,
+        &body.planned_start,
+        &body.planned_end,
+        &body.risk,
+    ) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_request(
+    Json(body): Json<ServicenowRequestRequest>,
+) -> ApiResult {
+    match servicenow_api::prepare_request(
+        &body.ci_name,
+        &body.request_type,
+        &body.description,
+    ) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_validate(Path(id): Path<String>) -> ApiResult {
+    match servicenow_api::validate_request(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_approve(Path(id): Path<String>) -> ApiResult {
+    match servicenow_api::approve_request(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_submit(Path(id): Path<String>) -> ApiResult {
+    match servicenow_api::queue_for_submission(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_status(Path(id): Path<String>) -> ApiResult {
+    match servicenow_api::get_submission_status(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn servicenow_pending() -> Json<Value> {
+    Json(servicenow_api::get_pending_submissions())
+}
+
+async fn servicenow_cancel(Path(id): Path<String>) -> ApiResult {
+    match servicenow_api::cancel_request(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn servicenow_history(Path(ci): Path<String>) -> Json<Value> {
+    Json(servicenow_api::get_submission_history(&ci))
+}
+
+async fn servicenow_contract() -> Json<Value> {
+    Json(servicenow_api::get_snow_contract())
 }
 
 #[cfg(test)]
