@@ -81,7 +81,7 @@ fn seed_checks() -> Vec<HealthCheck> {
             expected_status: 200,
             expected_body_contains: Some("Ryuki Infrastructure Platform".into()),
             interval_seconds: 60,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             enabled: true,
         },
         HealthCheck {
@@ -92,7 +92,7 @@ fn seed_checks() -> Vec<HealthCheck> {
             expected_status: 200,
             expected_body_contains: None,
             interval_seconds: 30,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             enabled: true,
         },
         HealthCheck {
@@ -103,7 +103,7 @@ fn seed_checks() -> Vec<HealthCheck> {
             expected_status: 0,
             expected_body_contains: None,
             interval_seconds: 120,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             enabled: true,
         },
         HealthCheck {
@@ -114,7 +114,7 @@ fn seed_checks() -> Vec<HealthCheck> {
             expected_status: 0,
             expected_body_contains: None,
             interval_seconds: 30,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             enabled: true,
         },
         HealthCheck {
@@ -125,7 +125,7 @@ fn seed_checks() -> Vec<HealthCheck> {
             expected_status: 0,
             expected_body_contains: None,
             interval_seconds: 3600,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             enabled: true,
         },
     ]
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn test_run_all_checks_for_site() {
-        let results = run_all_checks("LOVE");
+        let results = run_all_checks("DEFRA");
         assert!(!results.is_empty());
         for result in &results {
             assert!(result.message.contains("DRY-RUN"));
@@ -386,9 +386,9 @@ mod tests {
 
     #[test]
     fn test_get_dashboard_returns_summary() {
-        run_all_checks("LOVE");
-        let dashboard = get_dashboard("LOVE");
-        assert_eq!(dashboard.site, "LOVE");
+        run_all_checks("DEFRA");
+        let dashboard = get_dashboard("DEFRA");
+        assert_eq!(dashboard.site, "DEFRA");
         assert!(dashboard.total_checks > 0);
         assert!(dashboard.passing + dashboard.failing <= dashboard.total_checks);
     }
@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_get_outage_report_no_runs() {
-        let outages = get_outage_report("LOVE");
+        let outages = get_outage_report("DEFRA");
         // With no results or fresh results, nothing should be in outage
         assert!(outages.is_empty());
     }

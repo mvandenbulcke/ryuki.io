@@ -41,15 +41,15 @@ fn seed_gmsa_accounts() -> Vec<GMSAAccount> {
     vec![
         GMSAAccount {
             id: Uuid::new_v4().to_string(),
-            name: "svc-webappool-bur1".into(),
-            sam_account_name: "svc-webappool-bur1$".into(),
-            dns_host_name: "svc-webappool-bur1.corp.local".into(),
+            name: "svc-webappool-gblon".into(),
+            sam_account_name: "svc-webappool-gblon$".into(),
+            dns_host_name: "svc-webappool-gblon.corp.local".into(),
             service_principal_names: vec![
                 "HTTP/webapp01.corp.local".into(),
                 "HTTP/webapp02.corp.local".into(),
             ],
             authorized_hosts: vec!["webapp01.corp.local".into(), "webapp02.corp.local".into()],
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             status: GMSAStatus::Active,
             managed_password_interval_days: 30,
             created_at: now.to_rfc3339(),
@@ -57,12 +57,12 @@ fn seed_gmsa_accounts() -> Vec<GMSAAccount> {
         },
         GMSAAccount {
             id: Uuid::new_v4().to_string(),
-            name: "svc-sqlagent-love".into(),
-            sam_account_name: "svc-sqlagent-love$".into(),
-            dns_host_name: "svc-sqlagent-love.corp.local".into(),
+            name: "svc-sqlagent-defra".into(),
+            sam_account_name: "svc-sqlagent-defra$".into(),
+            dns_host_name: "svc-sqlagent-defra.corp.local".into(),
             service_principal_names: vec!["MSSQLSvc/sql01.corp.local:1433".into()],
             authorized_hosts: vec!["sql01.corp.local".into()],
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             status: GMSAStatus::Expiring,
             managed_password_interval_days: 60,
             created_at: (now - chrono::Duration::days(180)).to_rfc3339(),
@@ -70,12 +70,12 @@ fn seed_gmsa_accounts() -> Vec<GMSAAccount> {
         },
         GMSAAccount {
             id: Uuid::new_v4().to_string(),
-            name: "svc-iisworker-albi".into(),
-            sam_account_name: "svc-iisworker-albi$".into(),
-            dns_host_name: "svc-iisworker-albi.corp.local".into(),
-            service_principal_names: vec!["HTTP/iis-albi.corp.local".into()],
-            authorized_hosts: vec!["iis-albi.corp.local".into()],
-            site: "ALBI".into(),
+            name: "svc-iisworker-frpar".into(),
+            sam_account_name: "svc-iisworker-frpar$".into(),
+            dns_host_name: "svc-iisworker-frpar.corp.local".into(),
+            service_principal_names: vec!["HTTP/iis-frpar.corp.local".into()],
+            authorized_hosts: vec!["iis-frpar.corp.local".into()],
+            site: "FRPAR".into(),
             status: GMSAStatus::Expired,
             managed_password_interval_days: 30,
             created_at: (now - chrono::Duration::days(400)).to_rfc3339(),
@@ -144,13 +144,13 @@ pub fn validate_gmsa(name: &str) -> Result<crate::models::ValidationResult, Stri
     if !name.starts_with("svc-") {
         errors.push("gMSA name must start with 'svc-'".into());
         failed_rules.push("gmsa-naming-convention".into());
-        remediation.push("Rename the gMSA to start with 'svc-' (e.g. svc-webappool-bur1)".into());
+        remediation.push("Rename the gMSA to start with 'svc-' (e.g. svc-webappool-gblon)".into());
     }
 
     let parts: Vec<&str> = name.split('-').collect();
     if parts.len() < 2 {
         errors.push(
-            "gMSA name must have at least service and site parts (e.g. svc-webappool-bur1)".into(),
+            "gMSA name must have at least service and site parts (e.g. svc-webappool-gblon)".into(),
         );
         failed_rules.push("gmsa-name-structure".into());
         remediation.push("Use format svc-PURPOSE-SITE".into());
@@ -331,18 +331,18 @@ mod tests {
     #[test]
     fn test_create_gmsa_succeeds() {
         let account = create_gmsa(
-            "svc-testapp-bur1",
+            "svc-testapp-gblon",
             vec!["test01.corp.local".into()],
             vec!["HTTP/test01.corp.local".into()],
-            "BUR1",
+            "GBLON",
         );
         assert!(account.is_ok());
         let record = account.unwrap();
-        assert_eq!(record.name, "svc-testapp-bur1");
-        assert_eq!(record.sam_account_name, "svc-testapp-bur1$");
-        assert_eq!(record.dns_host_name, "svc-testapp-bur1.corp.local");
+        assert_eq!(record.name, "svc-testapp-gblon");
+        assert_eq!(record.sam_account_name, "svc-testapp-gblon$");
+        assert_eq!(record.dns_host_name, "svc-testapp-gblon.corp.local");
         assert_eq!(record.status, GMSAStatus::Active);
-        assert_eq!(record.site, "BUR1");
+        assert_eq!(record.site, "GBLON");
         assert_eq!(record.authorized_hosts.len(), 1);
     }
 
@@ -352,7 +352,7 @@ mod tests {
             "bad-name",
             vec!["host.corp.local".into()],
             vec!["HTTP/host.corp.local".into()],
-            "BUR1",
+            "GBLON",
         );
         assert!(result.is_err());
     }
@@ -360,30 +360,30 @@ mod tests {
     #[test]
     fn test_create_gmsa_empty_hosts() {
         let result = create_gmsa(
-            "svc-testapp-bur1",
+            "svc-testapp-gblon",
             vec![],
             vec!["HTTP/host.corp.local".into()],
-            "BUR1",
+            "GBLON",
         );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_gmsa_valid() {
-        let result = validate_gmsa("svc-webappool-bur1").unwrap();
+        let result = validate_gmsa("svc-webappool-gblon").unwrap();
         assert!(result.passed);
     }
 
     #[test]
     fn test_validate_gmsa_invalid_prefix() {
-        let result = validate_gmsa("bad-webappool-bur1").unwrap();
+        let result = validate_gmsa("bad-webappool-gblon").unwrap();
         assert!(!result.passed);
         assert!(result.errors.iter().any(|e| e.contains("svc-")));
     }
 
     #[test]
     fn test_assign_to_host_succeeds() {
-        let result = assign_to_host("svc-webappool-bur1", "new-host.corp.local");
+        let result = assign_to_host("svc-webappool-gblon", "new-host.corp.local");
         assert!(result.is_ok());
         let account = result.unwrap();
         assert!(
@@ -396,23 +396,23 @@ mod tests {
     #[test]
     fn test_assign_to_host_revoked_fails() {
         let mut store = GMSA_STORE.lock().unwrap();
-        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-bur1") {
+        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-gblon") {
             account.status = GMSAStatus::Revoked;
         }
         drop(store);
 
-        let result = assign_to_host("svc-webappool-bur1", "new-host.corp.local");
+        let result = assign_to_host("svc-webappool-gblon", "new-host.corp.local");
         assert!(result.is_err());
 
         let mut store = GMSA_STORE.lock().unwrap();
-        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-bur1") {
+        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-gblon") {
             account.status = GMSAStatus::Active;
         }
     }
 
     #[test]
     fn test_remove_from_host_succeeds() {
-        let result = remove_from_host("svc-webappool-bur1", "webapp01.corp.local");
+        let result = remove_from_host("svc-webappool-gblon", "webapp01.corp.local");
         assert!(result.is_ok());
         let account = result.unwrap();
         assert!(
@@ -421,12 +421,12 @@ mod tests {
                 .contains(&"webapp01.corp.local".to_string())
         );
 
-        let _ = assign_to_host("svc-webappool-bur1", "webapp01.corp.local");
+        let _ = assign_to_host("svc-webappool-gblon", "webapp01.corp.local");
     }
 
     #[test]
     fn test_rotate_password_succeeds() {
-        let result = rotate_password("svc-webappool-bur1");
+        let result = rotate_password("svc-webappool-gblon");
         assert!(result.is_ok());
         let account = result.unwrap();
         assert_eq!(account.status, GMSAStatus::Active);
@@ -434,13 +434,13 @@ mod tests {
 
     #[test]
     fn test_test_retrieval_succeeds() {
-        let result = test_retrieval("svc-webappool-bur1", "webapp01.corp.local");
+        let result = test_retrieval("svc-webappool-gblon", "webapp01.corp.local");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_test_retrieval_unauthorized_host() {
-        let result = test_retrieval("svc-webappool-bur1", "evil-host.corp.local");
+        let result = test_retrieval("svc-webappool-gblon", "evil-host.corp.local");
         assert!(result.is_err());
     }
 
@@ -449,20 +449,20 @@ mod tests {
         let inventory = get_gmsa_inventory("");
         assert!(inventory.len() >= 3);
         let names: Vec<&str> = inventory.iter().map(|a| a.name.as_str()).collect();
-        assert!(names.contains(&"svc-webappool-bur1"));
-        assert!(names.contains(&"svc-sqlagent-love"));
-        assert!(names.contains(&"svc-iisworker-albi"));
+        assert!(names.contains(&"svc-webappool-gblon"));
+        assert!(names.contains(&"svc-sqlagent-defra"));
+        assert!(names.contains(&"svc-iisworker-frpar"));
     }
 
     #[test]
     fn test_get_gmsa_inventory_by_site() {
-        let bur1 = get_gmsa_inventory("BUR1");
-        assert!(!bur1.is_empty());
-        assert!(bur1.iter().all(|a| a.site == "BUR1"));
+        let gblon = get_gmsa_inventory("GBLON");
+        assert!(!gblon.is_empty());
+        assert!(gblon.iter().all(|a| a.site == "GBLON"));
 
-        let love = get_gmsa_inventory("LOVE");
-        assert!(!love.is_empty());
-        assert!(love.iter().all(|a| a.site == "LOVE"));
+        let defra = get_gmsa_inventory("DEFRA");
+        assert!(!defra.is_empty());
+        assert!(defra.iter().all(|a| a.site == "DEFRA"));
     }
 
     #[test]
@@ -481,9 +481,9 @@ mod tests {
 
     #[test]
     fn test_get_gmsa_found() {
-        let found = get_gmsa("svc-webappool-bur1");
+        let found = get_gmsa("svc-webappool-gblon");
         assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "svc-webappool-bur1");
+        assert_eq!(found.unwrap().name, "svc-webappool-gblon");
     }
 
     #[test]

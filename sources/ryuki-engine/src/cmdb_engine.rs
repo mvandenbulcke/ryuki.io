@@ -20,9 +20,9 @@ fn mock_excel_import() -> Result<Vec<CmdbRecord>, String> {
     let records = vec![
         CmdbRecord {
             ci_id: "ci-001".into(),
-            ci_name: "srv-love-web01.corp.local".into(),
+            ci_name: "srv-defra-web01.corp.local".into(),
             ci_type: "Windows Server".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             environment: "production".into(),
             owner: "app-team-web".into(),
             support_group: "Wintel-Operations".into(),
@@ -42,9 +42,9 @@ fn mock_excel_import() -> Result<Vec<CmdbRecord>, String> {
         },
         CmdbRecord {
             ci_id: "ci-002".into(),
-            ci_name: "srv-bur1-db01.corp.local".into(),
+            ci_name: "srv-gblon-db01.corp.local".into(),
             ci_type: "Database Server".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             environment: "production".into(),
             owner: "db-team".into(),
             support_group: "DBA-Operations".into(),
@@ -65,9 +65,9 @@ fn mock_excel_import() -> Result<Vec<CmdbRecord>, String> {
         },
         CmdbRecord {
             ci_id: "ci-003".into(),
-            ci_name: "srv-albi-app01.corp.local".into(),
+            ci_name: "srv-frpar-app01.corp.local".into(),
             ci_type: "Application Server".into(),
-            site: "ALBI".into(),
+            site: "FRPAR".into(),
             environment: "production".into(),
             owner: "".into(),
             support_group: "".into(),
@@ -89,9 +89,9 @@ fn mock_servicenow_import() -> Result<Vec<CmdbRecord>, String> {
     let records = vec![
         CmdbRecord {
             ci_id: "sn-ci-001".into(),
-            ci_name: "srv-tor1-mon01.corp.local".into(),
+            ci_name: "srv-nlams-mon01.corp.local".into(),
             ci_type: "Monitoring Server".into(),
-            site: "TOR1".into(),
+            site: "NLAMS".into(),
             environment: "production".into(),
             owner: "monitoring-team".into(),
             support_group: "Monitoring-Operations".into(),
@@ -107,9 +107,9 @@ fn mock_servicenow_import() -> Result<Vec<CmdbRecord>, String> {
         },
         CmdbRecord {
             ci_id: "sn-ci-002".into(),
-            ci_name: "srv-wijh-fs01.corp.local".into(),
+            ci_name: "srv-gblon-fs01.corp.local".into(),
             ci_type: "File Server".into(),
-            site: "WIJH".into(),
+            site: "GBLON".into(),
             environment: "production".into(),
             owner: "fs-team".into(),
             support_group: "Storage-Operations".into(),
@@ -233,7 +233,7 @@ mod tests {
     fn test_import_cmdb_records_servicenow_source() {
         let records = import_cmdb_records("servicenow-export").unwrap();
         assert_eq!(records.len(), 2);
-        assert!(records.iter().any(|r| r.ci_name.contains("tor1-mon01")));
+        assert!(records.iter().any(|r| r.ci_name.contains("nlams-mon01")));
     }
 
     #[test]
@@ -251,10 +251,10 @@ mod tests {
         let platform = vec![
             InventoryItem {
                 id: "inv-001".into(),
-                name: "srv-love-web01.corp.local".into(),
+                name: "srv-defra-web01.corp.local".into(),
                 item_type: InventoryType::Server,
                 owner: "team".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 environment: "production".into(),
                 criticality: "high".into(),
                 last_synced: "2026-01-01T00:00:00Z".into(),
@@ -267,7 +267,7 @@ mod tests {
                 name: "srv-platform-only.corp.local".into(),
                 item_type: InventoryType::Server,
                 owner: "team".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 environment: "production".into(),
                 criticality: "high".into(),
                 last_synced: "2026-01-01T00:00:00Z".into(),
@@ -306,7 +306,7 @@ mod tests {
         let cmdb = import_cmdb_records("servicenow-export").unwrap();
         let exported = export_cmdb(&cmdb, "json").unwrap();
         assert!(exported.contains("sn-ci-001"));
-        assert!(exported.contains("srv-tor1-mon01"));
+        assert!(exported.contains("srv-nlams-mon01"));
     }
 
     #[test]
@@ -333,10 +333,10 @@ mod tests {
     fn test_reconcile_cmdb_exact_match() {
         let platform = vec![InventoryItem {
             id: "inv-001".into(),
-            name: "srv-love-web01.corp.local".into(),
+            name: "srv-defra-web01.corp.local".into(),
             item_type: InventoryType::Server,
             owner: "team".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             environment: "production".into(),
             criticality: "high".into(),
             last_synced: "2026-01-01T00:00:00Z".into(),
@@ -346,9 +346,9 @@ mod tests {
         }];
         let cmdb = vec![CmdbRecord {
             ci_id: "ci-001".into(),
-            ci_name: "srv-love-web01.corp.local".into(),
+            ci_name: "srv-defra-web01.corp.local".into(),
             ci_type: "Windows Server".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             environment: "production".into(),
             owner: "team".into(),
             support_group: "wintel".into(),

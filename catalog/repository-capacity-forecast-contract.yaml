@@ -82,7 +82,7 @@ rules:
     evidence: Retention risk
   - id: hub-spoke-impact-required
     decision: block
-    requirement: ESBUR1/BUR1 hub-spoke capacity impact must be visible for shared target planning.
+    requirement: GBLON hub-spoke capacity impact must be visible for shared target planning.
     evidence: Hub-spoke capacity impact
   - id: raw-repository-rows-not-exposed
     decision: block

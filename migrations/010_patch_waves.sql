@@ -17,15 +17,15 @@ CREATE TABLE patch_wave_servers (
 );
 
 INSERT INTO patch_waves (id, site, os_family, status) VALUES
-    ('a0000000-0000-0000-0000-000000000001', 'LOVE', 'windows', 'draft'),
-    ('a0000000-0000-0000-0000-000000000002', 'BUR1', 'linux', 'validated'),
-    ('a0000000-0000-0000-0000-000000000003', 'CCSS', 'windows', 'approved');
+    ('a0000000-0000-0000-0000-000000000001', 'DEFRA', 'windows', 'draft'),
+    ('a0000000-0000-0000-0000-000000000002', 'GBLON', 'linux', 'validated'),
+    ('a0000000-0000-0000-0000-000000000003', 'FRPAR', 'windows', 'approved');
 
 INSERT INTO patch_wave_servers (wave_id, server_name, patch_status, reboot_required) VALUES
-    ('a0000000-0000-0000-0000-000000000001', 'w-love-srv-01', 'pending', false),
-    ('a0000000-0000-0000-0000-000000000001', 'w-love-srv-02', 'pending', false),
-    ('a0000000-0000-0000-0000-000000000001', 'w-love-srv-03', 'pending', true),
-    ('a0000000-0000-0000-0000-000000000002', 'l-bur1-srv-01', 'patched', true),
-    ('a0000000-0000-0000-0000-000000000002', 'l-bur1-srv-02', 'pending', false),
-    ('a0000000-0000-0000-0000-000000000003', 'w-ccss-srv-01', 'patched', false),
-    ('a0000000-0000-0000-0000-000000000003', 'w-ccss-srv-02', 'patched', true);
+    ('a0000000-0000-0000-0000-000000000001', 'w-defra-srv-01', 'pending', false),
+    ('a0000000-0000-0000-0000-000000000001', 'w-defra-srv-02', 'pending', false),
+    ('a0000000-0000-0000-0000-000000000001', 'w-defra-srv-03', 'pending', true),
+    ('a0000000-0000-0000-0000-000000000002', 'l-gblon-srv-01', 'patched', true),
+    ('a0000000-0000-0000-0000-000000000002', 'l-gblon-srv-02', 'pending', false),
+    ('a0000000-0000-0000-0000-000000000003', 'w-frpar-srv-01', 'patched', false),
+    ('a0000000-0000-0000-0000-000000000003', 'w-frpar-srv-02', 'patched', true);

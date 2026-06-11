@@ -67,39 +67,39 @@ fn now_iso() -> String {
 fn seed_data() -> IncidentContextStore {
     vec![
         IncidentContext {
-            incident_id: "inc-love-001".into(),
-            title: "LOVE database latency spike".into(),
+            incident_id: "inc-defra-001".into(),
+            title: "DEFRA database latency spike".into(),
             severity: "sev2".into(),
             affected_ci: vec![AffectedCI {
-                ci_name: "love-db-cluster".into(),
+                ci_name: "defra-db-cluster".into(),
                 ci_type: "database".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 status: "degraded".into(),
             }],
-            upstream_deps: mock_upstream_deps("LOVE"),
-            downstream_deps: mock_downstream_deps("LOVE"),
-            recent_changes: mock_recent_changes("LOVE"),
-            on_call: mock_on_call("LOVE"),
-            related_tickets: vec!["INC-LOVE-7421".into(), "CHG-LOVE-219".into()],
+            upstream_deps: mock_upstream_deps("DEFRA"),
+            downstream_deps: mock_downstream_deps("DEFRA"),
+            recent_changes: mock_recent_changes("DEFRA"),
+            on_call: mock_on_call("DEFRA"),
+            related_tickets: vec!["INC-DEFRA-7421".into(), "CHG-DEFRA-219".into()],
             assembled_at: "2026-06-11T10:00:00Z".into(),
             status: "active".into(),
             resolution: None,
         },
         IncidentContext {
-            incident_id: "inc-bur1-001".into(),
-            title: "BUR1 storage fabric errors".into(),
+            incident_id: "inc-gblon-001".into(),
+            title: "GBLON storage fabric errors".into(),
             severity: "sev1".into(),
             affected_ci: vec![AffectedCI {
-                ci_name: "bur1-vsan-cluster".into(),
+                ci_name: "gblon-vsan-cluster".into(),
                 ci_type: "storage".into(),
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 status: "critical".into(),
             }],
-            upstream_deps: mock_upstream_deps("BUR1"),
-            downstream_deps: mock_downstream_deps("BUR1"),
-            recent_changes: mock_recent_changes("BUR1"),
-            on_call: mock_on_call("BUR1"),
-            related_tickets: vec!["INC-BUR1-8844".into(), "CHG-BUR1-118".into()],
+            upstream_deps: mock_upstream_deps("GBLON"),
+            downstream_deps: mock_downstream_deps("GBLON"),
+            recent_changes: mock_recent_changes("GBLON"),
+            on_call: mock_on_call("GBLON"),
+            related_tickets: vec!["INC-GBLON-8844".into(), "CHG-GBLON-118".into()],
             assembled_at: "2026-06-11T09:30:00Z".into(),
             status: "active".into(),
             resolution: None,
@@ -158,16 +158,16 @@ fn mock_recent_changes(site: &str) -> Vec<RecentChange> {
 
 fn mock_on_call(site: &str) -> OnCallInfo {
     match site.to_uppercase().as_str() {
-        "BUR1" => OnCallInfo {
+        "GBLON" => OnCallInfo {
             primary: "casey.storage".into(),
             secondary: "riley.datacenter".into(),
-            escalation: "bur1-incident-commander".into(),
+            escalation: "gblon-incident-commander".into(),
             group: "storage-operations".into(),
         },
         _ => OnCallInfo {
             primary: "morgan.platform".into(),
             secondary: "jamie.sre".into(),
-            escalation: "love-incident-commander".into(),
+            escalation: "defra-incident-commander".into(),
             group: "platform-operations".into(),
         },
     }
@@ -426,15 +426,15 @@ mod tests {
     #[test]
     fn test_assemble_context_creates_incident_with_deps_and_changes() {
         let result = assemble_context(
-            "LOVE app latency",
+            "DEFRA app latency",
             "sev2",
-            vec!["love-app-servers".into()],
-            "LOVE",
+            vec!["defra-app-servers".into()],
+            "DEFRA",
         )
         .unwrap();
 
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["context"]["title"], "LOVE app latency");
+        assert_eq!(result["context"]["title"], "DEFRA app latency");
         assert!(
             !result["context"]["upstream_deps"]
                 .as_array()
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_get_context_returns_full_assembled_data() {
-        let incident_id = new_test_incident("LOVE");
+        let incident_id = new_test_incident("DEFRA");
         let result = get_context(&incident_id).unwrap();
 
         assert_eq!(result["source"], "dry-run");
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_get_affected_services_returns_ci_list_with_deps() {
-        let incident_id = new_test_incident("BUR1");
+        let incident_id = new_test_incident("GBLON");
         let result = get_affected_services(&incident_id).unwrap();
 
         assert_eq!(result["source"], "dry-run");
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_resolve_incident_marks_resolved() {
-        let incident_id = new_test_incident("LOVE");
+        let incident_id = new_test_incident("DEFRA");
         let result =
             resolve_incident(&incident_id, "service restored after mock rollback").unwrap();
 
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_escalate_updates_on_call_info() {
-        let incident_id = new_test_incident("BUR1");
+        let incident_id = new_test_incident("GBLON");
         let result = escalate(&incident_id, "customer impact exceeded threshold").unwrap();
 
         assert!(
@@ -505,8 +505,8 @@ mod tests {
 
     #[test]
     fn test_list_active_incidents_filters_resolved() {
-        let active_id = new_test_incident("LOVE");
-        let resolved_id = new_test_incident("BUR1");
+        let active_id = new_test_incident("DEFRA");
+        let resolved_id = new_test_incident("GBLON");
         resolve_incident(&resolved_id, "mock validation complete").unwrap();
 
         let result = list_active_incidents().unwrap();

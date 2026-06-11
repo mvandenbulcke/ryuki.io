@@ -16,7 +16,7 @@ fn ryuki_engine_request_lifecycle_dry_run() {
         ryuki_engine::models::RequestType::ServerDeployment,
         "test-requester",
         "test-owner",
-        "LOVE",
+        "DEFRA",
         "production",
         "high",
     );
@@ -38,7 +38,7 @@ fn ryuki_engine_evidence_pipeline() {
         ryuki_engine::models::RequestType::ServerDeployment,
         "test-requester",
         "test-owner",
-        "LOVE",
+        "DEFRA",
         "production",
         "high",
     )

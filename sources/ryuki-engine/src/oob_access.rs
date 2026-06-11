@@ -14,11 +14,11 @@ fn seed_data() -> OobStore {
     let now = chrono::Utc::now();
     vec![
         OOBEndpoint {
-            id: "oob-love-001".into(),
+            id: "oob-defra-001".into(),
             endpoint_type: "iLO".into(),
-            hostname: "ilove01.corp.local".into(),
+            hostname: "idefra01.corp.local".into(),
             ip_address: "10.1.100.11".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             firmware_version: "2.78".into(),
             certificate_valid: true,
             cert_expiry: (now + chrono::Duration::days(180)).to_rfc3339(),
@@ -27,11 +27,11 @@ fn seed_data() -> OobStore {
             default_credentials_changed: true,
         },
         OOBEndpoint {
-            id: "oob-love-002".into(),
+            id: "oob-defra-002".into(),
             endpoint_type: "iDRAC".into(),
             hostname: "idrac02.corp.local".into(),
             ip_address: "10.1.100.12".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             firmware_version: "6.10.30.00".into(),
             certificate_valid: false,
             cert_expiry: (now - chrono::Duration::days(15)).to_rfc3339(),
@@ -40,11 +40,11 @@ fn seed_data() -> OobStore {
             default_credentials_changed: false,
         },
         OOBEndpoint {
-            id: "oob-love-003".into(),
+            id: "oob-defra-003".into(),
             endpoint_type: "IPMI".into(),
             hostname: "ipmi03.corp.local".into(),
             ip_address: "10.1.100.13".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             firmware_version: "1.94".into(),
             certificate_valid: true,
             cert_expiry: (now + chrono::Duration::days(20)).to_rfc3339(),
@@ -53,11 +53,11 @@ fn seed_data() -> OobStore {
             default_credentials_changed: true,
         },
         OOBEndpoint {
-            id: "oob-bur1-001".into(),
+            id: "oob-gblon-001".into(),
             endpoint_type: "iLO".into(),
             hostname: "ilocur101.corp.local".into(),
             ip_address: "10.2.100.11".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             firmware_version: "2.80".into(),
             certificate_valid: true,
             cert_expiry: (now + chrono::Duration::days(365)).to_rfc3339(),
@@ -66,11 +66,11 @@ fn seed_data() -> OobStore {
             default_credentials_changed: true,
         },
         OOBEndpoint {
-            id: "oob-bur1-002".into(),
+            id: "oob-gblon-002".into(),
             endpoint_type: "XCC".into(),
-            hostname: "xccbur102.corp.local".into(),
+            hostname: "xccgblon02.corp.local".into(),
             ip_address: "10.2.100.12".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             firmware_version: "4.20".into(),
             certificate_valid: true,
             cert_expiry: (now + chrono::Duration::days(10)).to_rfc3339(),
@@ -79,11 +79,11 @@ fn seed_data() -> OobStore {
             default_credentials_changed: false,
         },
         OOBEndpoint {
-            id: "oob-bur1-003".into(),
+            id: "oob-gblon-003".into(),
             endpoint_type: "iDRAC".into(),
-            hostname: "idracbur103.corp.local".into(),
+            hostname: "idracgblon03.corp.local".into(),
             ip_address: "10.2.100.13".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             firmware_version: "6.00.00.00".into(),
             certificate_valid: false,
             cert_expiry: (now - chrono::Duration::days(45)).to_rfc3339(),
@@ -374,22 +374,22 @@ mod tests {
 
     #[test]
     fn test_get_inventory_by_site() {
-        let result = get_inventory("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_inventory("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["total"], 3);
     }
 
     #[test]
-    fn test_get_inventory_bur1() {
-        let result = get_inventory("BUR1").unwrap();
+    fn test_get_inventory_gblon() {
+        let result = get_inventory("GBLON").unwrap();
         assert_eq!(result["total"], 3);
     }
 
     #[test]
     fn test_test_endpoint_success() {
-        let result = test_endpoint("oob-love-001").unwrap();
+        let result = test_endpoint("oob-defra-001").unwrap();
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["endpoint_id"], "oob-love-001");
+        assert_eq!(result["endpoint_id"], "oob-defra-001");
         assert_eq!(result["reachable"], true);
         assert!(result["dry_run"].as_bool().unwrap());
     }
@@ -401,27 +401,27 @@ mod tests {
 
     #[test]
     fn test_validate_certificate_valid() {
-        let result = validate_certificate("oob-love-001").unwrap();
+        let result = validate_certificate("oob-defra-001").unwrap();
         assert_eq!(result["certificate_valid"], true);
         assert!(result["days_remaining"].as_i64().unwrap() > 0);
     }
 
     #[test]
     fn test_validate_certificate_expired() {
-        let result = validate_certificate("oob-love-002").unwrap();
+        let result = validate_certificate("oob-defra-002").unwrap();
         assert_eq!(result["certificate_valid"], false);
     }
 
     #[test]
     fn test_check_default_credentials_compliant() {
-        let result = check_default_credentials("oob-love-001").unwrap();
+        let result = check_default_credentials("oob-defra-001").unwrap();
         assert_eq!(result["default_credentials_changed"], true);
         assert_eq!(result["status"], "compliant");
     }
 
     #[test]
     fn test_check_default_credentials_non_compliant() {
-        let result = check_default_credentials("oob-love-002").unwrap();
+        let result = check_default_credentials("oob-defra-002").unwrap();
         assert_eq!(result["default_credentials_changed"], false);
         assert_eq!(result["status"], "non_compliant");
     }
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_get_failing_by_site() {
-        let result = get_failing("LOVE").unwrap();
+        let result = get_failing("DEFRA").unwrap();
         let count = result["failing_count"].as_u64().unwrap();
         assert!(count > 0);
     }
@@ -461,10 +461,10 @@ mod tests {
     }
 
     #[test]
-    fn test_run_site_validation_love() {
-        let result = run_site_validation("LOVE").unwrap();
+    fn test_run_site_validation_defra() {
+        let result = run_site_validation("DEFRA").unwrap();
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["total_endpoints"], 3);
         assert!(result["reachable"].as_u64().unwrap() > 0);
         assert!(result["dry_run"].as_bool().unwrap());
@@ -478,12 +478,12 @@ mod tests {
     #[test]
     fn test_get_failing_for_site_no_failures() {
         let mut store = oob_store().lock().unwrap();
-        for ep in store.iter_mut().filter(|e| e.site == "BUR1") {
+        for ep in store.iter_mut().filter(|e| e.site == "GBLON") {
             ep.reachable = true;
         }
         drop(store);
 
-        let result = get_failing("BUR1").unwrap();
+        let result = get_failing("GBLON").unwrap();
         assert_eq!(result["failing_count"], 0);
     }
 }

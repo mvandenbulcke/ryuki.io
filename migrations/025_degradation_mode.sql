@@ -21,23 +21,23 @@ CREATE INDEX idx_component_status_site ON component_status(site);
 CREATE INDEX idx_component_status_adapter ON component_status(adapter_name);
 
 INSERT INTO site_status (site, state, api_status, db_status, degradation_reason) VALUES
-    ('LOVE', 'healthy', 'up', 'up', NULL),
-    ('BUR1', 'degraded', 'degraded', 'up', 'Hyper-V and Veeam adapters reporting degraded connectivity'),
-    ('TOR1', 'unreachable', 'down', 'down', 'Site TOR1 network unreachable, all components down');
+    ('DEFRA', 'healthy', 'up', 'up', NULL),
+    ('GBLON', 'degraded', 'degraded', 'up', 'Hyper-V and Veeam adapters reporting degraded connectivity'),
+    ('NLAMS', 'unreachable', 'down', 'down', 'Site NLAMS network unreachable, all components down');
 
 INSERT INTO component_status (site, adapter_name, status) VALUES
-    ('LOVE', 'vmware', 'up'),
-    ('LOVE', 'hyperv', 'up'),
-    ('LOVE', 'proxmox', 'up'),
-    ('LOVE', 'veeam', 'up'),
-    ('LOVE', 'zabbix', 'up'),
-    ('BUR1', 'vmware', 'up'),
-    ('BUR1', 'hyperv', 'degraded'),
-    ('BUR1', 'proxmox', 'up'),
-    ('BUR1', 'veeam', 'degraded'),
-    ('BUR1', 'zabbix', 'up'),
-    ('TOR1', 'vmware', 'down'),
-    ('TOR1', 'hyperv', 'down'),
-    ('TOR1', 'proxmox', 'down'),
-    ('TOR1', 'veeam', 'down'),
-    ('TOR1', 'zabbix', 'down');
+    ('DEFRA', 'vmware', 'up'),
+    ('DEFRA', 'hyperv', 'up'),
+    ('DEFRA', 'proxmox', 'up'),
+    ('DEFRA', 'veeam', 'up'),
+    ('DEFRA', 'zabbix', 'up'),
+    ('GBLON', 'vmware', 'up'),
+    ('GBLON', 'hyperv', 'degraded'),
+    ('GBLON', 'proxmox', 'up'),
+    ('GBLON', 'veeam', 'degraded'),
+    ('GBLON', 'zabbix', 'up'),
+    ('NLAMS', 'vmware', 'down'),
+    ('NLAMS', 'hyperv', 'down'),
+    ('NLAMS', 'proxmox', 'down'),
+    ('NLAMS', 'veeam', 'down'),
+    ('NLAMS', 'zabbix', 'down');

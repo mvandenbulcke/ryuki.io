@@ -138,8 +138,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::HPE,
             model: "DL360 Gen10".into(),
             serial_number: "HPE-DL360-001".into(),
-            site: "BUR1".into(),
-            cluster: "bur1-prod-cluster-a".into(),
+            site: "GBLON".into(),
+            cluster: "gblon-prod-cluster-a".into(),
             warranty_expiry: (now + chrono::Duration::days(45)).to_rfc3339(),
             firmware_baseline: "2.94".into(),
             firmware_installed: "2.92".into(),
@@ -152,8 +152,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::HPE,
             model: "DL380 Gen10".into(),
             serial_number: "HPE-DL380-001".into(),
-            site: "BUR1".into(),
-            cluster: "bur1-prod-cluster-a".into(),
+            site: "GBLON".into(),
+            cluster: "gblon-prod-cluster-a".into(),
             warranty_expiry: (now + chrono::Duration::days(730)).to_rfc3339(),
             firmware_baseline: "2.94".into(),
             firmware_installed: "2.94".into(),
@@ -166,8 +166,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::Lenovo,
             model: "SR635".into(),
             serial_number: "LNV-SR635-001".into(),
-            site: "BUR1".into(),
-            cluster: "bur1-storage-cluster-b".into(),
+            site: "GBLON".into(),
+            cluster: "gblon-storage-cluster-b".into(),
             warranty_expiry: (now - chrono::Duration::days(120)).to_rfc3339(),
             firmware_baseline: "3.20".into(),
             firmware_installed: "3.10".into(),
@@ -180,8 +180,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::HPE,
             model: "DL360 Gen10".into(),
             serial_number: "HPE-DL360-002".into(),
-            site: "ALBI".into(),
-            cluster: "albi-prod-cluster-a".into(),
+            site: "FRPAR".into(),
+            cluster: "frpar-prod-cluster-a".into(),
             warranty_expiry: (now + chrono::Duration::days(60)).to_rfc3339(),
             firmware_baseline: "2.94".into(),
             firmware_installed: "2.94".into(),
@@ -194,8 +194,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::Lenovo,
             model: "SR635".into(),
             serial_number: "LNV-SR635-002".into(),
-            site: "ALBI".into(),
-            cluster: "albi-storage-cluster-b".into(),
+            site: "FRPAR".into(),
+            cluster: "frpar-storage-cluster-b".into(),
             warranty_expiry: (now + chrono::Duration::days(1095)).to_rfc3339(),
             firmware_baseline: "3.20".into(),
             firmware_installed: "3.20".into(),
@@ -208,8 +208,8 @@ fn seed_assets() -> Vec<HardwareAsset> {
             vendor: Vendor::HPE,
             model: "DL380 Gen9".into(),
             serial_number: "HPE-DL380-002".into(),
-            site: "ALBI".into(),
-            cluster: "albi-test-cluster-c".into(),
+            site: "FRPAR".into(),
+            cluster: "frpar-test-cluster-c".into(),
             warranty_expiry: (now - chrono::Duration::days(500)).to_rfc3339(),
             firmware_baseline: "2.94".into(),
             firmware_installed: "2.80".into(),
@@ -469,11 +469,11 @@ mod tests {
         let inventory = get_inventory("");
         assert!(inventory.len() >= 6);
 
-        let bur1 = get_inventory("BUR1");
-        assert!(bur1.len() >= 3);
+        let gblon = get_inventory("GBLON");
+        assert!(gblon.len() >= 3);
 
-        let albi = get_inventory("ALBI");
-        assert_eq!(albi.len(), 3);
+        let frpar = get_inventory("FRPAR");
+        assert_eq!(frpar.len(), 3);
     }
 
     #[test]
@@ -548,8 +548,8 @@ mod tests {
         let report = get_lifecycle_report("");
         assert!(report.total >= 6);
 
-        let bur1_report = get_lifecycle_report("BUR1");
-        assert!(bur1_report.total >= 3);
+        let gblon_report = get_lifecycle_report("GBLON");
+        assert!(gblon_report.total >= 3);
     }
 
     #[test]
@@ -557,15 +557,15 @@ mod tests {
         let asset = add_asset(
             "HPE",
             "DL360 Gen11",
-            "BUR1",
-            "bur1-new-cluster",
+            "GBLON",
+            "gblon-new-cluster",
             "HPE-DL360-003",
             "2028-01-01T00:00:00Z",
         )
         .unwrap();
         assert_eq!(asset.vendor, Vendor::HPE);
         assert_eq!(asset.model, "DL360 Gen11");
-        assert_eq!(asset.site, "BUR1");
+        assert_eq!(asset.site, "GBLON");
         assert_eq!(asset.serial_number, "HPE-DL360-003");
 
         let inventory = get_inventory("");
@@ -577,7 +577,7 @@ mod tests {
         let result = add_asset(
             "Dell",
             "PowerEdge",
-            "BUR1",
+            "GBLON",
             "cluster",
             "DELL-001",
             "2028-01-01T00:00:00Z",
@@ -643,9 +643,9 @@ mod tests {
 
     #[test]
     fn test_firmware_gaps_by_site() {
-        let bur1_gaps = get_firmware_gaps("BUR1");
-        let albi_gaps = get_firmware_gaps("ALBI");
-        assert!(!bur1_gaps.is_empty() || !albi_gaps.is_empty());
+        let gblon_gaps = get_firmware_gaps("GBLON");
+        let frpar_gaps = get_firmware_gaps("FRPAR");
+        assert!(!gblon_gaps.is_empty() || !frpar_gaps.is_empty());
     }
 
     #[test]

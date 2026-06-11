@@ -1225,8 +1225,8 @@ pub struct DatacenterSitesCatalog {
 
 pub fn datacenter_readiness_score_fallback(site: &str) -> DatacenterReadinessScore {
     match site {
-        "LOVE" => DatacenterReadinessScore {
-            site: "LOVE".into(),
+        "DEFRA" => DatacenterReadinessScore {
+            site: "DEFRA".into(),
             readiness_score_pct: 83,
             total_checks: 6,
             passed: 4,
@@ -1234,8 +1234,8 @@ pub fn datacenter_readiness_score_fallback(site: &str) -> DatacenterReadinessSco
             warnings: 2,
             not_checked: 0,
         },
-        "BUR1" => DatacenterReadinessScore {
-            site: "BUR1".into(),
+        "GBLON" => DatacenterReadinessScore {
+            site: "GBLON".into(),
             readiness_score_pct: 25,
             total_checks: 6,
             passed: 1,
@@ -1257,7 +1257,7 @@ pub fn datacenter_readiness_score_fallback(site: &str) -> DatacenterReadinessSco
 
 pub fn datacenter_site_report_fallback(site: &str) -> DatacenterSiteReport {
     let check_type_details: Vec<(&str, &str, &str, &str)> = match site {
-        "LOVE" => vec![
+        "DEFRA" => vec![
             ("power", "passed", "PDU A+B redundant, UPS load 62% with 28 min runtime", "2026-06-11T10:00:00Z"),
             ("cooling", "passed", "CRAC units nominal, return air 22 C, supply 16 C", "2026-06-11T10:00:00Z"),
             ("rack-space", "warning", "12 rack units free across 3 racks (limited headroom)", "2026-06-11T10:00:00Z"),
@@ -1265,7 +1265,7 @@ pub fn datacenter_site_report_fallback(site: &str) -> DatacenterSiteReport {
             ("firmware", "warning", "2 PDUs on firmware v2.8 (current v3.1), SFP modules current", "2026-06-11T10:00:00Z"),
             ("capacity", "passed", "Compute 78% allocated, storage 64%, network fabric 42%", "2026-06-11T10:00:00Z"),
         ],
-        "BUR1" => vec![
+        "GBLON" => vec![
             ("power", "failed", "UPS-B in bypass mode, PDU-3 overload alarm at 91%", "2026-06-11T09:30:00Z"),
             ("cooling", "warning", "CRAC-2 compressor cycling, return air 26 C (threshold 24 C)", "2026-06-11T09:30:00Z"),
             ("rack-space", "failed", "Zero rack units free, 2 racks over-populated (48U in 42U)", "2026-06-11T09:30:00Z"),
@@ -1319,19 +1319,19 @@ pub fn datacenter_failing_checks_fallback() -> DatacenterFailingChecksSummary {
         failing_count: 3,
         failing_checks: vec![
             DatacenterFailingCheck {
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 check_type: "power".into(),
                 details: "UPS-B in bypass mode, PDU-3 overload alarm at 91%".into(),
                 last_checked: "2026-06-11T09:30:00Z".into(),
             },
             DatacenterFailingCheck {
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 check_type: "rack-space".into(),
                 details: "Zero rack units free, 2 racks over-populated (48U in 42U)".into(),
                 last_checked: "2026-06-11T09:30:00Z".into(),
             },
             DatacenterFailingCheck {
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 check_type: "firmware".into(),
                 details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs"
                     .into(),
@@ -1343,29 +1343,29 @@ pub fn datacenter_failing_checks_fallback() -> DatacenterFailingChecksSummary {
 
 pub fn datacenter_single_check_fallback(site: &str, check_type: &str) -> DatacenterSingleCheck {
     match (site, check_type) {
-        ("LOVE", "power") => DatacenterSingleCheck {
-            site: "LOVE".into(),
+        ("DEFRA", "power") => DatacenterSingleCheck {
+            site: "DEFRA".into(),
             check_type: "power".into(),
             status: "passed".into(),
             details: "PDU A+B redundant, UPS load 62% with 28 min runtime".into(),
             last_checked: "2026-06-11T10:00:00Z".into(),
         },
-        ("LOVE", "cooling") => DatacenterSingleCheck {
-            site: "LOVE".into(),
+        ("DEFRA", "cooling") => DatacenterSingleCheck {
+            site: "DEFRA".into(),
             check_type: "cooling".into(),
             status: "passed".into(),
             details: "CRAC units nominal, return air 22 C, supply 16 C".into(),
             last_checked: "2026-06-11T10:00:00Z".into(),
         },
-        ("LOVE", "rack-space") => DatacenterSingleCheck {
-            site: "LOVE".into(),
+        ("DEFRA", "rack-space") => DatacenterSingleCheck {
+            site: "DEFRA".into(),
             check_type: "rack-space".into(),
             status: "warning".into(),
             details: "12 rack units free across 3 racks (limited headroom)".into(),
             last_checked: "2026-06-11T10:00:00Z".into(),
         },
-        ("BUR1", "power") => DatacenterSingleCheck {
-            site: "BUR1".into(),
+        ("GBLON", "power") => DatacenterSingleCheck {
+            site: "GBLON".into(),
             check_type: "power".into(),
             status: "failed".into(),
             details: "UPS-B in bypass mode, PDU-3 overload alarm at 91%".into(),
@@ -1394,21 +1394,21 @@ pub fn datacenter_sites_catalog_fallback() -> DatacenterSitesCatalog {
     DatacenterSitesCatalog {
         sites: vec![
             DatacenterSiteSummary {
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 total_checks: 6,
                 passed: 4,
                 failed: 0,
                 not_checked: 0,
             },
             DatacenterSiteSummary {
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 total_checks: 6,
                 passed: 1,
                 failed: 3,
                 not_checked: 0,
             },
             DatacenterSiteSummary {
-                site: "CCSS".into(),
+                site: "FRPAR".into(),
                 total_checks: 6,
                 passed: 4,
                 failed: 0,

@@ -81,7 +81,7 @@ fn seed_data() -> FirmwareStore {
     (
         vec![
             FirmwareRecord {
-                id: "fw-love-srv-001".into(),
+                id: "fw-defra-srv-001".into(),
                 device_type: DeviceType::Server,
                 vendor: "HPE".into(),
                 model: "DL360 Gen10".into(),
@@ -89,11 +89,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "2.90".into(),
                 latest_version: "2.96".into(),
                 eol_date: "2028-12-31".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 compliance_status: ComplianceStatus::Compliant,
             },
             FirmwareRecord {
-                id: "fw-love-sw-001".into(),
+                id: "fw-defra-sw-001".into(),
                 device_type: DeviceType::Switch,
                 vendor: "Cisco".into(),
                 model: "Nexus 93180YC-FX".into(),
@@ -101,11 +101,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "10.2.5".into(),
                 latest_version: "10.4.3".into(),
                 eol_date: "2027-09-30".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 compliance_status: ComplianceStatus::NonCompliant,
             },
             FirmwareRecord {
-                id: "fw-love-pdu-001".into(),
+                id: "fw-defra-pdu-001".into(),
                 device_type: DeviceType::PDU,
                 vendor: "APC".into(),
                 model: "AP8941".into(),
@@ -113,11 +113,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "6.8.0".into(),
                 latest_version: "7.1.2".into(),
                 eol_date: "2029-03-31".into(),
-                site: "LOVE".into(),
+                site: "DEFRA".into(),
                 compliance_status: ComplianceStatus::Compliant,
             },
             FirmwareRecord {
-                id: "fw-bur1-srv-001".into(),
+                id: "fw-gblon-srv-001".into(),
                 device_type: DeviceType::Server,
                 vendor: "Lenovo".into(),
                 model: "SR635".into(),
@@ -125,11 +125,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "3.20".into(),
                 latest_version: "3.24".into(),
                 eol_date: "2028-06-30".into(),
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 compliance_status: ComplianceStatus::NonCompliant,
             },
             FirmwareRecord {
-                id: "fw-bur1-sw-001".into(),
+                id: "fw-gblon-sw-001".into(),
                 device_type: DeviceType::Switch,
                 vendor: "Arista".into(),
                 model: "7050SX3".into(),
@@ -137,11 +137,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "4.29.1".into(),
                 latest_version: "4.31.2".into(),
                 eol_date: "2025-09-30".into(),
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 compliance_status: ComplianceStatus::EOL,
             },
             FirmwareRecord {
-                id: "fw-bur1-crac-001".into(),
+                id: "fw-gblon-crac-001".into(),
                 device_type: DeviceType::CRAC,
                 vendor: "Vertiv".into(),
                 model: "Liebert iCOM".into(),
@@ -149,11 +149,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "8.0".into(),
                 latest_version: "8.4".into(),
                 eol_date: "2027-12-31".into(),
-                site: "BUR1".into(),
+                site: "GBLON".into(),
                 compliance_status: ComplianceStatus::Exception,
             },
             FirmwareRecord {
-                id: "fw-madr-fw-001".into(),
+                id: "fw-deber-fw-001".into(),
                 device_type: DeviceType::Firewall,
                 vendor: "Palo Alto".into(),
                 model: "PA-3220".into(),
@@ -161,11 +161,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "10.2.8".into(),
                 latest_version: "11.1.4".into(),
                 eol_date: "2026-12-31".into(),
-                site: "MADR".into(),
+                site: "DEBER".into(),
                 compliance_status: ComplianceStatus::NonCompliant,
             },
             FirmwareRecord {
-                id: "fw-madr-srv-001".into(),
+                id: "fw-deber-srv-001".into(),
                 device_type: DeviceType::Server,
                 vendor: "Dell".into(),
                 model: "PowerEdge R750".into(),
@@ -173,11 +173,11 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "6.8".into(),
                 latest_version: "7.1".into(),
                 eol_date: "2030-01-31".into(),
-                site: "MADR".into(),
+                site: "DEBER".into(),
                 compliance_status: ComplianceStatus::Compliant,
             },
             FirmwareRecord {
-                id: "fw-madr-pdu-001".into(),
+                id: "fw-deber-pdu-001".into(),
                 device_type: DeviceType::PDU,
                 vendor: "Eaton".into(),
                 model: "ePDU G3".into(),
@@ -185,13 +185,13 @@ fn seed_data() -> FirmwareStore {
                 minimum_version: "2.8.0".into(),
                 latest_version: "3.0.1".into(),
                 eol_date: "2024-12-31".into(),
-                site: "MADR".into(),
+                site: "DEBER".into(),
                 compliance_status: ComplianceStatus::EOL,
             },
         ],
         vec![FirmwareException {
-            id: "fwex-bur1-crac-001".into(),
-            device_id: "fw-bur1-crac-001".into(),
+            id: "fwex-gblon-crac-001".into(),
+            device_id: "fw-gblon-crac-001".into(),
             reason: "Awaiting maintenance window for CRAC controller upgrade".into(),
             approved_by: "facilities.lead".into(),
             expiry_date: (Utc::now() + Duration::days(21)).date_naive().to_string(),
@@ -527,11 +527,11 @@ mod tests {
 
     #[test]
     fn test_list_devices_filters_by_site() {
-        let result = list_devices("LOVE").unwrap();
+        let result = list_devices("DEFRA").unwrap();
         let devices = result["devices"].as_array().unwrap();
 
         assert!(!devices.is_empty());
-        assert!(devices.iter().all(|device| device["site"] == "LOVE"));
+        assert!(devices.iter().all(|device| device["site"] == "DEFRA"));
     }
 
     #[test]
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn test_request_and_list_exceptions() {
         let request = request_exception(
-            "fw-love-sw-001",
+            "fw-defra-sw-001",
             "Vendor image pending staged validation",
             "netops.lead",
             14,
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn test_revoke_exception_restores_noncompliant_status() {
         let request = request_exception(
-            "fw-bur1-srv-001",
+            "fw-gblon-srv-001",
             "Rollback validation required",
             "platform.owner",
             7,
@@ -591,7 +591,7 @@ mod tests {
         let exception_id = request["exception"]["id"].as_str().unwrap();
 
         revoke_exception(exception_id).unwrap();
-        let device = get_device("fw-bur1-srv-001").unwrap();
+        let device = get_device("fw-gblon-srv-001").unwrap();
 
         assert_eq!(device["device"]["compliance_status"], "NonCompliant");
     }

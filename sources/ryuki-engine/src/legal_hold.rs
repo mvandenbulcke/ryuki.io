@@ -71,17 +71,14 @@ pub struct ComplianceResult {
     pub message: String,
 }
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 fn seed_holds() -> Vec<LegalHold> {
     let now = chrono::Utc::now();
     vec![
         LegalHold {
             id: "lh-00000000-0000-0000-0000-000000000001".into(),
-            server_or_app_name: "srv-love-finance.ryuki.local".into(),
+            server_or_app_name: "srv-defra-finance.ryuki.local".into(),
             hold_type: HoldType::Litigation,
             reason: "DRY-RUN: Regulatory investigation Q2-2026 — financial audit trail preservation required".into(),
             initiated_by: "compliance-team".into(),
@@ -89,11 +86,11 @@ fn seed_holds() -> Vec<LegalHold> {
             expiry_date: (now + chrono::Duration::days(135)).to_rfc3339(),
             status: HoldStatus::Active,
             affected_backups: vec![
-                "backup-srv-love-finance-20260601".into(),
-                "backup-srv-love-finance-20260515".into(),
-                "backup-srv-love-finance-20260501".into(),
+                "backup-srv-defra-finance-20260601".into(),
+                "backup-srv-defra-finance-20260515".into(),
+                "backup-srv-defra-finance-20260501".into(),
             ],
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             released_by: None,
             released_date: None,
             audit_trail: vec![
@@ -107,7 +104,7 @@ fn seed_holds() -> Vec<LegalHold> {
         },
         LegalHold {
             id: "lh-00000000-0000-0000-0000-000000000002".into(),
-            server_or_app_name: "srv-bur1-erp.ryuki.local".into(),
+            server_or_app_name: "srv-gblon-erp.ryuki.local".into(),
             hold_type: HoldType::Compliance,
             reason: "DRY-RUN: SOX compliance extended retention — 7-year archive mandate".into(),
             initiated_by: "audit-team".into(),
@@ -115,12 +112,12 @@ fn seed_holds() -> Vec<LegalHold> {
             expiry_date: (now + chrono::Duration::days(2190)).to_rfc3339(),
             status: HoldStatus::Active,
             affected_backups: vec![
-                "backup-srv-bur1-erp-20260301".into(),
-                "backup-srv-bur1-erp-20251201".into(),
-                "backup-srv-bur1-erp-20250901".into(),
-                "backup-srv-bur1-erp-20250601".into(),
+                "backup-srv-gblon-erp-20260301".into(),
+                "backup-srv-gblon-erp-20251201".into(),
+                "backup-srv-gblon-erp-20250901".into(),
+                "backup-srv-gblon-erp-20250601".into(),
             ],
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             released_by: None,
             released_date: None,
             audit_trail: vec![
@@ -134,7 +131,7 @@ fn seed_holds() -> Vec<LegalHold> {
         },
         LegalHold {
             id: "lh-00000000-0000-0000-0000-000000000003".into(),
-            server_or_app_name: "srv-ccss-hr.ryuki.local".into(),
+            server_or_app_name: "srv-frpar-hr.ryuki.local".into(),
             hold_type: HoldType::Investigation,
             reason: "DRY-RUN: HR data integrity investigation — access logs and backup retention".into(),
             initiated_by: "security-team".into(),
@@ -142,10 +139,10 @@ fn seed_holds() -> Vec<LegalHold> {
             expiry_date: (now + chrono::Duration::days(15)).to_rfc3339(),
             status: HoldStatus::Active,
             affected_backups: vec![
-                "backup-srv-ccss-hr-20260605".into(),
-                "backup-srv-ccss-hr-20260525".into(),
+                "backup-srv-frpar-hr-20260605".into(),
+                "backup-srv-frpar-hr-20260525".into(),
             ],
-            site: "CCSS".into(),
+            site: "FRPAR".into(),
             released_by: None,
             released_date: None,
             audit_trail: vec![
@@ -440,7 +437,7 @@ mod tests {
             HoldType::Litigation,
             "Test hold for validation",
             "test-user",
-            "LOVE",
+            "DEFRA",
         )
         .expect("place_hold should succeed");
         assert!(result.id.starts_with("lh-"));
@@ -453,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_place_hold_empty_target_fails() {
-        let result = place_hold("", HoldType::Compliance, "reason", "user", "LOVE");
+        let result = place_hold("", HoldType::Compliance, "reason", "user", "DEFRA");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("target"));
     }
@@ -478,7 +475,7 @@ mod tests {
             HoldType::Investigation,
             "Validation test",
             "test-user",
-            "BUR1",
+            "GBLON",
         )
         .unwrap();
         let result = validate_hold(&hold.id).expect("validate should succeed");
@@ -501,7 +498,7 @@ mod tests {
             HoldType::Retention,
             "Extend test",
             "test-user",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         let new_expiry = "2028-12-31T23:59:59Z";
@@ -527,7 +524,7 @@ mod tests {
             HoldType::Litigation,
             "Release test",
             "test-user",
-            "BUR1",
+            "GBLON",
         )
         .unwrap();
         let released = release_hold(&hold.id, "compliance-officer").expect("release should succeed");
@@ -547,7 +544,7 @@ mod tests {
             HoldType::Investigation,
             "Already released test",
             "test-user",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         release_hold(&hold.id, "user").unwrap();
@@ -558,9 +555,9 @@ mod tests {
 
     #[test]
     fn test_get_active_holds_filters_by_site() {
-        let holds = get_active_holds("LOVE");
+        let holds = get_active_holds("DEFRA");
         assert!(!holds.is_empty());
-        assert!(holds.iter().all(|h| h.site == "LOVE"));
+        assert!(holds.iter().all(|h| h.site == "DEFRA"));
         assert!(holds.iter().all(|h| h.status == HoldStatus::Active));
     }
 
@@ -575,10 +572,10 @@ mod tests {
     fn test_get_expiring_holds_finds_near_expiry() {
         let expiring = get_expiring_holds();
         // At least the seed hold lh-...003 with 15 days to expiry should be found
-        let ccss_hold = expiring
+        let frpar_hold = expiring
             .iter()
-            .find(|h| h.site == "CCSS");
-        assert!(ccss_hold.is_some(), "Expected CCSS investigation hold to be expiring within 30 days");
+            .find(|h| h.site == "FRPAR");
+        assert!(frpar_hold.is_some(), "Expected FRPAR investigation hold to be expiring within 30 days");
     }
 
     #[test]
@@ -588,7 +585,7 @@ mod tests {
             HoldType::Compliance,
             "Evidence test",
             "test-user",
-            "TOR1",
+            "NLAMS",
         )
         .unwrap();
         let evidence = get_hold_evidence(&hold.id).expect("evidence should be found");
@@ -598,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_check_compliance_server_under_hold() {
-        let result = check_compliance("srv-love-finance")
+        let result = check_compliance("srv-defra-finance")
             .expect("compliance check should succeed");
         assert!(result.under_hold);
         assert!(!result.active_holds.is_empty());

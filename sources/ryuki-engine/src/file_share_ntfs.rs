@@ -87,7 +87,7 @@ fn seed_shares() -> Vec<FileShare> {
             id: Uuid::new_v4().to_string(),
             unc_path: "\\\\fs01\\Finance".into(),
             server_name: "fs01.corp.local".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             size_gb: 512.0,
             owner: "alice.williams".into(),
             last_recertification: (now - chrono::Duration::days(200)).to_rfc3339(),
@@ -98,7 +98,7 @@ fn seed_shares() -> Vec<FileShare> {
             id: Uuid::new_v4().to_string(),
             unc_path: "\\\\fs02\\Engineering".into(),
             server_name: "fs02.corp.local".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             size_gb: 1024.0,
             owner: "bob.johnson".into(),
             last_recertification: long_past.to_rfc3339(),
@@ -109,7 +109,7 @@ fn seed_shares() -> Vec<FileShare> {
             id: Uuid::new_v4().to_string(),
             unc_path: "\\\\fs03\\HR".into(),
             server_name: "fs03.corp.local".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             size_gb: 256.0,
             owner: "carol.smith".into(),
             last_recertification: (now - chrono::Duration::days(400)).to_rfc3339(),
@@ -351,9 +351,9 @@ mod tests {
 
     #[test]
     fn test_get_shares_filters_by_site() {
-        let shares = get_shares("LOVE");
+        let shares = get_shares("DEFRA");
         assert_eq!(shares.len(), 2);
-        assert!(shares.iter().all(|s| s.site == "LOVE"));
+        assert!(shares.iter().all(|s| s.site == "DEFRA"));
     }
 
     #[test]
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn test_detect_open_access_finds_everyone_fullcontrol() {
         let all = get_shares("");
-        let eng = all.iter().find(|s| s.site == "BUR1").unwrap();
+        let eng = all.iter().find(|s| s.site == "GBLON").unwrap();
         let open = detect_open_access(&eng.id);
         assert!(!open.is_empty());
         assert_eq!(open[0].ad_group, "Domain Users");
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn test_get_permission_report_risk_critical() {
         let all = get_shares("");
-        let eng = all.iter().find(|s| s.site == "BUR1").unwrap();
+        let eng = all.iter().find(|s| s.site == "GBLON").unwrap();
         let report = get_permission_report(&eng.id);
         assert!(report.is_ok());
         let r = report.unwrap();
@@ -419,10 +419,10 @@ mod tests {
     #[test]
     fn test_revoke_permission_removes_entry() {
         let all = get_shares("");
-        let love = all.iter().find(|s| s.unc_path.contains("Finance")).unwrap();
-        let result = revoke_permission(&love.id, "Everyone");
+        let defra = all.iter().find(|s| s.unc_path.contains("Finance")).unwrap();
+        let result = revoke_permission(&defra.id, "Everyone");
         assert!(result.is_ok());
-        let detail = get_share_detail(&love.id).unwrap();
+        let detail = get_share_detail(&defra.id).unwrap();
         let everyone_left = detail
             .permissions
             .iter()

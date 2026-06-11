@@ -48,7 +48,7 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
             NoisyTrigger {
                 id: "noise-001".into(),
                 trigger_name: "High CPU utilization".into(),
-                host: "srv-love-app01.corp.local".into(),
+                host: "srv-defra-app01.corp.local".into(),
                 severity: "warning".into(),
                 event_count_last_24h: 47,
                 avg_interval_minutes: 30.6,
@@ -64,12 +64,12 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
             NoisyTrigger {
                 id: "noise-002".into(),
                 trigger_name: "ICMP ping loss".into(),
-                host: "srv-bur1-net01.corp.local".into(),
+                host: "srv-gblon-net01.corp.local".into(),
                 severity: "disaster".into(),
                 event_count_last_24h: 183,
                 avg_interval_minutes: 7.8,
                 flapping: true,
-                suggested_action: "Correlate with known network maintenance window BUR1-SW-UPGRADE".into(),
+                suggested_action: "Correlate with known network maintenance window GBLON-SW-UPGRADE".into(),
                 status: NoiseStatus::Active,
                 suppress_until: None,
                 suppress_reason: None,
@@ -80,7 +80,7 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
             NoisyTrigger {
                 id: "noise-003".into(),
                 trigger_name: "Disk space low".into(),
-                host: "srv-tor1-fs01.corp.local".into(),
+                host: "srv-nlams-fs01.corp.local".into(),
                 severity: "average".into(),
                 event_count_last_24h: 12,
                 avg_interval_minutes: 120.0,
@@ -96,7 +96,7 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
             NoisyTrigger {
                 id: "noise-004".into(),
                 trigger_name: "Service port flapping".into(),
-                host: "srv-ccss-web01.corp.local".into(),
+                host: "srv-frpar-web01.corp.local".into(),
                 severity: "high".into(),
                 event_count_last_24h: 89,
                 avg_interval_minutes: 4.2,
@@ -112,7 +112,7 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
             NoisyTrigger {
                 id: "noise-005".into(),
                 trigger_name: "SSL certificate expiry warning".into(),
-                host: "srv-love-lb01.corp.local".into(),
+                host: "srv-defra-lb01.corp.local".into(),
                 severity: "warning".into(),
                 event_count_last_24h: 1,
                 avg_interval_minutes: 1440.0,
@@ -129,10 +129,7 @@ fn noise_store() -> &'static Mutex<Vec<NoisyTrigger>> {
     })
 }
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 fn site_from_host(host: &str) -> &str {
     for site in VALID_SITES {
@@ -140,7 +137,7 @@ fn site_from_host(host: &str) -> &str {
             return site;
         }
     }
-    "LOVE"
+    "DEFRA"
 }
 
 pub fn detect_noise(site: &str) -> Result<Vec<NoisyTrigger>, String> {
@@ -316,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_detect_noise_returns_noisy_triggers() {
-        let results = detect_noise("LOVE").unwrap();
+        let results = detect_noise("DEFRA").unwrap();
         assert!(!results.is_empty());
         assert!(results.iter().all(|t| t.event_count_last_24h > 10));
     }
@@ -328,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_detect_flapping_returns_flapping_triggers() {
-        let results = detect_flapping("BUR1").unwrap();
+        let results = detect_flapping("GBLON").unwrap();
         assert!(!results.is_empty());
         assert!(results.iter().all(|t| t.flapping));
     }
@@ -378,8 +375,8 @@ mod tests {
 
     #[test]
     fn test_get_noise_report_for_site() {
-        let report = get_noise_report("LOVE").unwrap();
-        assert_eq!(report["site"], "LOVE");
+        let report = get_noise_report("DEFRA").unwrap();
+        assert_eq!(report["site"], "DEFRA");
         assert!(report["total_triggers"].as_u64().unwrap() >= 1);
         assert!(report["dry_run"].as_bool().unwrap());
     }

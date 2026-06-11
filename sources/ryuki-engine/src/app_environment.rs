@@ -3,10 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const VALID_TIERS: &[TierType] = &[TierType::Front, TierType::Mid, TierType::Back];
 
@@ -523,8 +520,8 @@ pub fn retire_environment(env: &AppEnvironment) -> Result<AppEnvironment, String
 }
 
 pub fn seed_examples() -> Vec<AppEnvironment> {
-    let example1 = plan_environment("payment-service", EnvironmentType::Prod, "LOVE").unwrap();
-    let example2 = plan_environment("inventory-api", EnvironmentType::Staging, "BUR1").unwrap();
+    let example1 = plan_environment("payment-service", EnvironmentType::Prod, "DEFRA").unwrap();
+    let example2 = plan_environment("inventory-api", EnvironmentType::Staging, "GBLON").unwrap();
 
     let mut all = Vec::new();
     all.extend(example1);
@@ -538,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_plan_environment_creates_three_tiers() {
-        let tiers = plan_environment("myapp", EnvironmentType::Prod, "LOVE").unwrap();
+        let tiers = plan_environment("myapp", EnvironmentType::Prod, "DEFRA").unwrap();
         assert_eq!(tiers.len(), 3);
 
         let tier_names: Vec<String> = tiers.iter().map(|t| t.tier.to_string()).collect();
@@ -549,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_plan_environment_all_tiers_have_ids() {
-        let tiers = plan_environment("myapp", EnvironmentType::Dev, "BUR1").unwrap();
+        let tiers = plan_environment("myapp", EnvironmentType::Dev, "GBLON").unwrap();
         for tier in &tiers {
             assert!(tier.id.starts_with("aenv-"));
             assert!(!tier.id.is_empty());
@@ -558,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_plan_environment_tier_specs_are_set() {
-        let tiers = plan_environment("myapp", EnvironmentType::Staging, "TOR1").unwrap();
+        let tiers = plan_environment("myapp", EnvironmentType::Staging, "NLAMS").unwrap();
         let front = tiers.iter().find(|t| t.tier == TierType::Front).unwrap();
         let mid = tiers.iter().find(|t| t.tier == TierType::Mid).unwrap();
         let back = tiers.iter().find(|t| t.tier == TierType::Back).unwrap();
@@ -581,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_plan_environment_empty_app_name_fails() {
-        let result = plan_environment("", EnvironmentType::Prod, "LOVE");
+        let result = plan_environment("", EnvironmentType::Prod, "DEFRA");
         assert!(result.is_err());
     }
 
@@ -593,14 +590,14 @@ mod tests {
 
     #[test]
     fn test_validate_environment_passes() {
-        let tiers = plan_environment("myapp", EnvironmentType::Prod, "LOVE").unwrap();
+        let tiers = plan_environment("myapp", EnvironmentType::Prod, "DEFRA").unwrap();
         let result = validate_environment(&tiers[0]).unwrap();
         assert!(result.passed);
     }
 
     #[test]
     fn test_validate_environment_detects_bad_site() {
-        let mut env = plan_environment("myapp", EnvironmentType::Prod, "LOVE")
+        let mut env = plan_environment("myapp", EnvironmentType::Prod, "DEFRA")
             .unwrap()
             .into_iter()
             .next()
@@ -613,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_validate_environment_detects_missing_app_name() {
-        let mut env = plan_environment("myapp", EnvironmentType::Dev, "BUR1")
+        let mut env = plan_environment("myapp", EnvironmentType::Dev, "GBLON")
             .unwrap()
             .into_iter()
             .next()
@@ -626,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_approve_environment() {
-        let env = plan_environment("myapp", EnvironmentType::Prod, "LOVE")
+        let env = plan_environment("myapp", EnvironmentType::Prod, "DEFRA")
             .unwrap()
             .into_iter()
             .next()
@@ -638,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_approve_environment_wrong_status_fails() {
-        let mut env = plan_environment("myapp", EnvironmentType::Test, "BUR1")
+        let mut env = plan_environment("myapp", EnvironmentType::Test, "GBLON")
             .unwrap()
             .into_iter()
             .next()
@@ -650,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_deploy_environment() {
-        let mut env = plan_environment("myapp", EnvironmentType::Staging, "TOR1")
+        let mut env = plan_environment("myapp", EnvironmentType::Staging, "NLAMS")
             .unwrap()
             .into_iter()
             .next()
@@ -663,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_deploy_environment_not_approved_fails() {
-        let env = plan_environment("myapp", EnvironmentType::Prod, "LOVE")
+        let env = plan_environment("myapp", EnvironmentType::Prod, "DEFRA")
             .unwrap()
             .into_iter()
             .next()
@@ -674,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_verify_environment() {
-        let mut env = plan_environment("myapp", EnvironmentType::Dev, "BUR1")
+        let mut env = plan_environment("myapp", EnvironmentType::Dev, "GBLON")
             .unwrap()
             .into_iter()
             .next()
@@ -704,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_verify_environment_not_deployed_fails() {
-        let env = plan_environment("myapp", EnvironmentType::Dev, "LOVE")
+        let env = plan_environment("myapp", EnvironmentType::Dev, "DEFRA")
             .unwrap()
             .into_iter()
             .next()
@@ -715,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_retire_environment() {
-        let mut env = plan_environment("myapp", EnvironmentType::Staging, "BUR1")
+        let mut env = plan_environment("myapp", EnvironmentType::Staging, "GBLON")
             .unwrap()
             .into_iter()
             .next()
@@ -728,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_retire_environment_already_retired_fails() {
-        let mut env = plan_environment("myapp", EnvironmentType::Prod, "LOVE")
+        let mut env = plan_environment("myapp", EnvironmentType::Prod, "DEFRA")
             .unwrap()
             .into_iter()
             .next()
@@ -743,8 +740,8 @@ mod tests {
         let examples = seed_examples();
         assert_eq!(examples.len(), 6);
         let sites: Vec<&str> = examples.iter().map(|e| e.site.as_str()).collect();
-        assert!(sites.contains(&"LOVE"));
-        assert!(sites.contains(&"BUR1"));
+        assert!(sites.contains(&"DEFRA"));
+        assert!(sites.contains(&"GBLON"));
     }
 
     #[test]
@@ -780,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_plan_environment_has_plans_for_all_tiers() {
-        let tiers = plan_environment("myapp", EnvironmentType::Prod, "LOVE").unwrap();
+        let tiers = plan_environment("myapp", EnvironmentType::Prod, "DEFRA").unwrap();
         for tier in &tiers {
             assert!(!tier.networking_plan.is_empty());
             assert!(!tier.dns_plan.is_empty());
@@ -793,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_validate_environment_generates_warnings_for_large_specs() {
-        let mut env = plan_environment("bigapp", EnvironmentType::Prod, "LOVE")
+        let mut env = plan_environment("bigapp", EnvironmentType::Prod, "DEFRA")
             .unwrap()
             .into_iter()
             .find(|t| t.tier == TierType::Front)

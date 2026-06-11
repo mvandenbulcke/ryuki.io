@@ -26,9 +26,9 @@ CREATE INDEX idx_file_shares_status ON file_shares(status);
 CREATE INDEX idx_ntfs_permissions_share ON ntfs_permissions(file_share_id);
 
 INSERT INTO file_shares (unc_path, server_name, site, size_gb, owner, last_recertification, recertification_due, status) VALUES
-    ('\\fs01\Finance', 'fs01.corp.local', 'LOVE', 512.0, 'alice.williams', NOW() - INTERVAL '200 days', NOW() + INTERVAL '180 days', 'Compliant'),
-    ('\\fs02\Engineering', 'fs02.corp.local', 'BUR1', 1024.0, 'bob.johnson', NOW() - INTERVAL '400 days', NOW() - INTERVAL '30 days', 'Overdue'),
-    ('\\fs03\HR', 'fs03.corp.local', 'LOVE', 256.0, 'carol.smith', NOW() - INTERVAL '400 days', NOW() - INTERVAL '5 days', 'NeedsRecertification');
+    ('\\fs01\Finance', 'fs01.corp.local', 'DEFRA', 512.0, 'alice.williams', NOW() - INTERVAL '200 days', NOW() + INTERVAL '180 days', 'Compliant'),
+    ('\\fs02\Engineering', 'fs02.corp.local', 'GBLON', 1024.0, 'bob.johnson', NOW() - INTERVAL '400 days', NOW() - INTERVAL '30 days', 'Overdue'),
+    ('\\fs03\HR', 'fs03.corp.local', 'DEFRA', 256.0, 'carol.smith', NOW() - INTERVAL '400 days', NOW() - INTERVAL '5 days', 'NeedsRecertification');
 
 INSERT INTO ntfs_permissions (file_share_id, folder_path, permission_type, ad_group, principal, inherited, last_reviewed)
 SELECT id, '\Finance\Reports', 'Modify', 'GG-Finance-RW', 'GG-Finance-RW@corp.local', false, NOW()

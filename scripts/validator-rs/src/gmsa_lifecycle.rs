@@ -318,7 +318,7 @@ const SAFE_PROGRAM_TEXT_SEGMENTS: &[&str] = &[
     "Before/after monitoring state",
     "CORP.local",
     "OU=Servers,OU=<SITE>,OU=<COUNTRY>,DC=corp,DC=local",
-    "ESBUR1/BUR1 hub-spoke capacity impact must be visible for shared target planning.",
+    "GBLON hub-spoke capacity impact must be visible for shared target planning.",
     "Kubernetes auth, workload secret delivery, injector boundary, service account posture, and secret-reference behavior must be reviewed before workloads can depend on Vault.",
     "Kubernetes runtime readiness evidence must use safe summaries only and must not expose kubeconfigs, cluster identifiers, context identifiers, namespace identifiers, ingress identifiers, TLS material identifiers, workload identity identifiers, identity material, pod identifiers, image pull material, registry material, organization-scope identifiers, provider-side identifiers, private network details, sensitive auth material, raw Kubernetes payloads, or provider-returned content.",
     "Vault deployment readiness evidence must use safe summaries only and must not expose Vault URLs, namespaces, mount paths, secret paths, policy names, role names, service account token data, TLS material, root tokens, recovery keys, unseal keys, audit log lines, storage class names, tenant IDs, object IDs, private IPs, credentials, tokens, raw Vault payloads, raw Kubernetes payloads, or provider payloads.",

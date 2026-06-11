@@ -114,135 +114,135 @@ fn seed_reviews() -> Vec<AccessReview> {
     let now = Utc::now();
     vec![
         AccessReview {
-            id: "ar-love-ad-001".into(),
+            id: "ar-defra-ad-001".into(),
             review_type: ReviewType::ADGroup,
-            target_name: "LOVE-Infra-Admins".into(),
-            owner: "love.platform.owner".into(),
+            target_name: "DEFRA-Infra-Admins".into(),
+            owner: "defra.platform.owner".into(),
             last_reviewed: (now - Duration::days(120)).to_rfc3339(),
             next_review_due: (now - Duration::days(30)).to_rfc3339(),
             status: ReviewStatus::Pending,
             reviewer: None,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             access_details: vec![
                 "Privileged AD group".into(),
                 "Domain admin delegation".into(),
             ],
         },
         AccessReview {
-            id: "ar-love-svc-001".into(),
+            id: "ar-defra-svc-001".into(),
             review_type: ReviewType::ServiceAccount,
-            target_name: "svc-love-backup".into(),
+            target_name: "svc-defra-backup".into(),
             owner: "backup.platform.owner".into(),
             last_reviewed: (now - Duration::days(88)).to_rfc3339(),
             next_review_due: (now + Duration::days(2)).to_rfc3339(),
             status: ReviewStatus::InProgress,
             reviewer: Some("alice.reviewer".into()),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             access_details: vec![
                 "Backup API token".into(),
                 "Vault policy: backup-read".into(),
             ],
         },
         AccessReview {
-            id: "ar-love-share-001".into(),
+            id: "ar-defra-share-001".into(),
             review_type: ReviewType::SharePermission,
-            target_name: "\\\\love-fs-01\\engineering".into(),
+            target_name: "\\\\defra-fs-01\\engineering".into(),
             owner: "engineering.owner".into(),
             last_reviewed: (now - Duration::days(10)).to_rfc3339(),
             next_review_due: (now + Duration::days(80)).to_rfc3339(),
             status: ReviewStatus::Approved,
             reviewer: Some("carla.reviewer".into()),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             access_details: vec![
                 "Read/write share permission".into(),
                 "NTFS modify for engineers".into(),
             ],
         },
         AccessReview {
-            id: "ar-bur1-admin-001".into(),
+            id: "ar-gblon-admin-001".into(),
             review_type: ReviewType::LocalAdmin,
-            target_name: "bur1-hv-01 local Administrators".into(),
-            owner: "bur1.compute.owner".into(),
+            target_name: "gblon-hv-01 local Administrators".into(),
+            owner: "gblon.compute.owner".into(),
             last_reviewed: (now - Duration::days(180)).to_rfc3339(),
             next_review_due: (now - Duration::days(90)).to_rfc3339(),
             status: ReviewStatus::Pending,
             reviewer: None,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             access_details: vec![
                 "Local admin group".into(),
                 "Break-glass workstation access".into(),
             ],
         },
         AccessReview {
-            id: "ar-bur1-sudo-001".into(),
+            id: "ar-gblon-sudo-001".into(),
             review_type: ReviewType::Sudo,
-            target_name: "bur1-linux-sre sudoers".into(),
+            target_name: "gblon-linux-sre sudoers".into(),
             owner: "linux.platform.owner".into(),
             last_reviewed: (now - Duration::days(70)).to_rfc3339(),
             next_review_due: (now + Duration::days(20)).to_rfc3339(),
             status: ReviewStatus::Pending,
             reviewer: None,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             access_details: vec![
                 "NOPASSWD deploy commands".into(),
                 "Journal read access".into(),
             ],
         },
         AccessReview {
-            id: "ar-bur1-svc-001".into(),
+            id: "ar-gblon-svc-001".into(),
             review_type: ReviewType::ServiceAccount,
-            target_name: "svc-bur1-monitoring".into(),
+            target_name: "svc-gblon-monitoring".into(),
             owner: "observability.owner".into(),
             last_reviewed: (now - Duration::days(30)).to_rfc3339(),
             next_review_due: (now + Duration::days(60)).to_rfc3339(),
             status: ReviewStatus::Exempted,
             reviewer: Some("security.exception".into()),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             access_details: vec![
                 "Monitoring read-only credential".into(),
                 "Temporary exemption until agent migration".into(),
             ],
         },
         AccessReview {
-            id: "ar-madr-ad-001".into(),
+            id: "ar-deber-ad-001".into(),
             review_type: ReviewType::ADGroup,
-            target_name: "MADR-Storage-Operators".into(),
-            owner: "madr.storage.owner".into(),
+            target_name: "DEBER-Storage-Operators".into(),
+            owner: "deber.storage.owner".into(),
             last_reviewed: (now - Duration::days(95)).to_rfc3339(),
             next_review_due: (now - Duration::days(5)).to_rfc3339(),
             status: ReviewStatus::InProgress,
             reviewer: Some("diego.reviewer".into()),
-            site: "MADR".into(),
+            site: "DEBER".into(),
             access_details: vec![
                 "Storage console operator".into(),
                 "Array snapshot rights".into(),
             ],
         },
         AccessReview {
-            id: "ar-madr-sudo-001".into(),
+            id: "ar-deber-sudo-001".into(),
             review_type: ReviewType::Sudo,
-            target_name: "madr-db sudoers".into(),
+            target_name: "deber-db sudoers".into(),
             owner: "database.platform.owner".into(),
             last_reviewed: (now - Duration::days(20)).to_rfc3339(),
             next_review_due: (now + Duration::days(40)).to_rfc3339(),
             status: ReviewStatus::Approved,
             reviewer: Some("db.security".into()),
-            site: "MADR".into(),
+            site: "DEBER".into(),
             access_details: vec![
                 "PostgreSQL service restart".into(),
                 "Log collection commands".into(),
             ],
         },
         AccessReview {
-            id: "ar-madr-share-001".into(),
+            id: "ar-deber-share-001".into(),
             review_type: ReviewType::SharePermission,
-            target_name: "\\\\madr-fs-02\\finance".into(),
+            target_name: "\\\\deber-fs-02\\finance".into(),
             owner: "finance.owner".into(),
             last_reviewed: (now - Duration::days(140)).to_rfc3339(),
             next_review_due: (now - Duration::days(50)).to_rfc3339(),
             status: ReviewStatus::Revoked,
             reviewer: Some("finance.security".into()),
-            site: "MADR".into(),
+            site: "DEBER".into(),
             access_details: vec![
                 "Legacy contractor group removed".into(),
                 "Access revoked in dry-run evidence".into(),
@@ -620,8 +620,8 @@ mod tests {
         assert_eq!(result["source"], "dry-run");
         assert!(result["reviews"].as_array().unwrap().len() >= 9);
 
-        let love = list_reviews("LOVE", "").unwrap();
-        assert!(love["reviews"].as_array().unwrap().len() >= 3);
+        let defra = list_reviews("DEFRA", "").unwrap();
+        assert!(defra["reviews"].as_array().unwrap().len() >= 3);
     }
 
     #[test]
@@ -631,13 +631,13 @@ mod tests {
         assert!(
             reviews
                 .iter()
-                .any(|review| review["id"] == "ar-love-ad-001")
+                .any(|review| review["id"] == "ar-defra-ad-001")
         );
     }
 
     #[test]
     fn test_start_review_sets_in_progress() {
-        let result = start_review("ar-bur1-sudo-001", "test.reviewer").unwrap();
+        let result = start_review("ar-gblon-sudo-001", "test.reviewer").unwrap();
         assert_eq!(result["review"]["status"], "InProgress");
         assert_eq!(result["review"]["reviewer"], "test.reviewer");
     }
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn test_approve_review_sets_approved() {
         let result =
-            approve_review("ar-love-svc-001", "test.approver", "Access still required").unwrap();
+            approve_review("ar-defra-svc-001", "test.approver", "Access still required").unwrap();
         assert_eq!(result["review"]["status"], "Approved");
         assert_eq!(result["review"]["reviewer"], "test.approver");
     }
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn test_revoke_review_sets_revoked() {
         let result = revoke_review(
-            "ar-bur1-admin-001",
+            "ar-gblon-admin-001",
             "test.reviewer",
             "Access no longer needed",
         )

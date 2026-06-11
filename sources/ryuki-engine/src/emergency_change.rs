@@ -17,20 +17,20 @@ fn seed_data() -> EmergencyStore {
     let now = Utc::now();
     vec![
         EmergencyChange {
-            id: "emg-love-001".into(),
+            id: "emg-defra-001".into(),
             change_description: "Urgent firewall rule change for DB replication recovery".into(),
-            affected_systems: vec!["love-db-cluster".into(), "love-fw-edge".into()],
+            affected_systems: vec!["defra-db-cluster".into(), "defra-fw-edge".into()],
             initiated_by: "alice.operator".into(),
             reason_override: "Incident INC-2025-0042 — replication lag exceeds SLA".into(),
             approved_by: Some("EMERGENCY — auto-approved per break-glass policy".into()),
             executed_at: Some((now - chrono::Duration::hours(3)).to_rfc3339()),
             status: EmergencyChangeStatus::Verified,
             audit_evidence: vec![
-                "FW rule diff applied to love-fw-edge-01".into(),
+                "FW rule diff applied to defra-fw-edge-01".into(),
                 "DB replication caught up within 12min of change".into(),
                 "Post-change verification: all replicas in sync".into(),
             ],
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             created_at: (now - chrono::Duration::hours(4)).to_rfc3339(),
             updated_at: (now - chrono::Duration::hours(2)).to_rfc3339(),
             post_review_notes: Some(
@@ -38,37 +38,37 @@ fn seed_data() -> EmergencyStore {
             ),
         },
         EmergencyChange {
-            id: "emg-bur1-001".into(),
+            id: "emg-gblon-001".into(),
             change_description: "Emergency storage capacity expansion — datastore at 97%"
                 .into(),
-            affected_systems: vec!["bur1-vsan-cluster".into(), "bur1-datastore-prod".into()],
+            affected_systems: vec!["gblon-vsan-cluster".into(), "gblon-datastore-prod".into()],
             initiated_by: "bob.engineer".into(),
-            reason_override: "Capacity alert BUR1-DS-PROD-001 — risk of VM outage".into(),
+            reason_override: "Capacity alert GBLON-DS-PROD-001 — risk of VM outage".into(),
             approved_by: Some("EMERGENCY — auto-approved per break-glass policy".into()),
             executed_at: Some((now - chrono::Duration::hours(1)).to_rfc3339()),
             status: EmergencyChangeStatus::Executed,
             audit_evidence: vec![
-                "Added 2TB to bur1-datastore-prod".into(),
+                "Added 2TB to gblon-datastore-prod".into(),
                 "No VM disruption observed".into(),
                 "Post-expand usage: 72%".into(),
             ],
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             created_at: (now - chrono::Duration::hours(2)).to_rfc3339(),
             updated_at: (now - chrono::Duration::hours(1)).to_rfc3339(),
             post_review_notes: None,
         },
         EmergencyChange {
-            id: "emg-love-002".into(),
-            change_description: "Emergency certificate renewal — wildcard expired on love-lb-01"
+            id: "emg-defra-002".into(),
+            change_description: "Emergency certificate renewal — wildcard expired on defra-lb-01"
                 .into(),
-            affected_systems: vec!["love-lb-01".into(), "love-ingress".into()],
+            affected_systems: vec!["defra-lb-01".into(), "defra-ingress".into()],
             initiated_by: "carol.security".into(),
             reason_override: "TLS cert expiry causing user-facing errors on portal".into(),
             approved_by: Some("EMERGENCY — auto-approved per break-glass policy".into()),
             executed_at: None,
             status: EmergencyChangeStatus::Approved,
             audit_evidence: vec![],
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             created_at: (now - chrono::Duration::minutes(30)).to_rfc3339(),
             updated_at: (now - chrono::Duration::minutes(15)).to_rfc3339(),
             post_review_notes: None,
@@ -415,12 +415,12 @@ mod tests {
             vec!["dns-primary".into()],
             "test.user",
             "Outage mitigation",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         assert_eq!(result["source"], "dry-run");
         assert_eq!(result["status"], "Initiated");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["change_id"].as_str().unwrap().starts_with("emg-"));
     }
 
@@ -437,7 +437,7 @@ mod tests {
             vec!["system-a".into()],
             "alice",
             "outage",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         let id = init["change_id"].as_str().unwrap();
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_cannot_approve_non_initiated() {
-        let emg = "emg-love-001";
+        let emg = "emg-defra-001";
         let result = auto_approve(emg);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Cannot approve"));
@@ -465,7 +465,7 @@ mod tests {
             vec!["host-a".into()],
             "bob",
             "zero-day",
-            "BUR1",
+            "GBLON",
         )
         .unwrap();
         let id = init["change_id"].as_str().unwrap();
@@ -489,7 +489,7 @@ mod tests {
             vec!["h".into()],
             "c",
             "r",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         let id = init["change_id"].as_str().unwrap();
@@ -504,7 +504,7 @@ mod tests {
             vec!["h".into()],
             "d",
             "r",
-            "LOVE",
+            "DEFRA",
         )
         .unwrap();
         let id = init["change_id"].as_str().unwrap();
@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn test_get_emergency_history_by_site() {
-        let result = get_emergency_history("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_emergency_history("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["count"].as_u64().unwrap() > 0);
     }
 
@@ -554,8 +554,8 @@ mod tests {
 
     #[test]
     fn test_get_emergency_stats_by_site() {
-        let result = get_emergency_stats("BUR1").unwrap();
-        assert_eq!(result["site"], "BUR1");
+        let result = get_emergency_stats("GBLON").unwrap();
+        assert_eq!(result["site"], "GBLON");
         assert!(result["total"].as_u64().unwrap() >= 1);
     }
 }

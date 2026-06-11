@@ -3,10 +3,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 const VALID_ENVIRONMENTS: &[&str] = &["development", "test", "acceptance", "production"];
 const BLOCKED_STATUSES: &[RequestStatus] = &[RequestStatus::Failed, RequestStatus::Completed];
 
@@ -514,7 +511,7 @@ mod tests {
             RequestType::ServerDeployment,
             "alice",
             "bob",
-            "LOVE",
+            "DEFRA",
             "production",
             "critical",
         )

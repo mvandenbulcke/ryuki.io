@@ -22,9 +22,9 @@ CREATE TABLE firmware_history (
 );
 
 INSERT INTO hardware_assets (vendor, model, serial_number, site, cluster, warranty_expiry, firmware_baseline, firmware_installed, support_status, lifecycle_status) VALUES
-    ('HPE', 'DL360 Gen10', 'HPE-DL360-001', 'BUR1', 'bur1-prod-cluster-a', NOW() + INTERVAL '45 days', '2.94', '2.92', 'Expiring', 'Production'),
-    ('HPE', 'DL380 Gen10', 'HPE-DL380-001', 'BUR1', 'bur1-prod-cluster-a', NOW() + INTERVAL '730 days', '2.94', '2.94', 'Supported', 'Production'),
-    ('Lenovo', 'SR635', 'LNV-SR635-001', 'BUR1', 'bur1-storage-cluster-b', NOW() - INTERVAL '120 days', '3.20', '3.10', 'Expired', 'Extended'),
-    ('HPE', 'DL360 Gen10', 'HPE-DL360-002', 'ALBI', 'albi-prod-cluster-a', NOW() + INTERVAL '60 days', '2.94', '2.94', 'Expiring', 'Production'),
-    ('Lenovo', 'SR635', 'LNV-SR635-002', 'ALBI', 'albi-storage-cluster-b', NOW() + INTERVAL '1095 days', '3.20', '3.20', 'Supported', 'Production'),
-    ('HPE', 'DL380 Gen9', 'HPE-DL380-002', 'ALBI', 'albi-test-cluster-c', NOW() - INTERVAL '500 days', '2.94', '2.80', 'Expired', 'Retiring');
+    ('HPE', 'DL360 Gen10', 'HPE-DL360-001', 'GBLON', 'gblon-prod-cluster-a', NOW() + INTERVAL '45 days', '2.94', '2.92', 'Expiring', 'Production'),
+    ('HPE', 'DL380 Gen10', 'HPE-DL380-001', 'GBLON', 'gblon-prod-cluster-a', NOW() + INTERVAL '730 days', '2.94', '2.94', 'Supported', 'Production'),
+    ('Lenovo', 'SR635', 'LNV-SR635-001', 'GBLON', 'gblon-storage-cluster-b', NOW() - INTERVAL '120 days', '3.20', '3.10', 'Expired', 'Extended'),
+    ('HPE', 'DL360 Gen10', 'HPE-DL360-002', 'FRPAR', 'frpar-prod-cluster-a', NOW() + INTERVAL '60 days', '2.94', '2.94', 'Expiring', 'Production'),
+    ('Lenovo', 'SR635', 'LNV-SR635-002', 'FRPAR', 'frpar-storage-cluster-b', NOW() + INTERVAL '1095 days', '3.20', '3.20', 'Supported', 'Production'),
+    ('HPE', 'DL380 Gen9', 'HPE-DL380-002', 'FRPAR', 'frpar-test-cluster-c', NOW() - INTERVAL '500 days', '2.94', '2.80', 'Expired', 'Retiring');

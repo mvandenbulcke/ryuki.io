@@ -33,10 +33,10 @@ CREATE INDEX idx_capacity_history_snapshot ON capacity_history(repository_id, sn
 
 INSERT INTO backup_repositories (id, name, repository_type, site, total_capacity_tb, used_capacity_tb, growth_rate_gb_per_day, days_until_full, last_forecast, status)
 VALUES
-    ('e0000380-3800-3800-3800-000000000001', 'love-storeonce-01', 'store-once', 'LOVE', 200.00, 178.00, 3.50, 6.3, '2026-06-11 08:00:00+00', 'critical'),
-    ('e0000380-3800-3800-3800-000000000002', 'love-datadomain-01', 'data-domain', 'LOVE', 150.00, 120.00, 2.10, 14.3, '2026-06-11 08:00:00+00', 'warning'),
-    ('e0000380-3800-3800-3800-000000000003', 'bur1-storeonce-01', 'store-once', 'BUR1', 250.00, 190.00, 1.80, 33.3, '2026-06-11 08:00:00+00', 'healthy'),
-    ('e0000380-3800-3800-3800-000000000004', 'bur1-hardened-01', 'hardened-linux', 'BUR1', 500.00, 120.00, 4.20, 90.5, '2026-06-11 08:00:00+00', 'healthy');
+    ('e0000380-3800-3800-3800-000000000001', 'defra-storeonce-01', 'store-once', 'DEFRA', 200.00, 178.00, 3.50, 6.3, '2026-06-11 08:00:00+00', 'critical'),
+    ('e0000380-3800-3800-3800-000000000002', 'defra-datadomain-01', 'data-domain', 'DEFRA', 150.00, 120.00, 2.10, 14.3, '2026-06-11 08:00:00+00', 'warning'),
+    ('e0000380-3800-3800-3800-000000000003', 'gblon-storeonce-01', 'store-once', 'GBLON', 250.00, 190.00, 1.80, 33.3, '2026-06-11 08:00:00+00', 'healthy'),
+    ('e0000380-3800-3800-3800-000000000004', 'gblon-hardened-01', 'hardened-linux', 'GBLON', 500.00, 120.00, 4.20, 90.5, '2026-06-11 08:00:00+00', 'healthy');
 
 INSERT INTO capacity_history (id, repository_id, used_capacity_tb, utilization_pct, days_until_full, status, snapshot_at)
 VALUES

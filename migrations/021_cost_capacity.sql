@@ -45,25 +45,25 @@ CREATE INDEX idx_vm_utilization_idle ON vm_utilization(site) WHERE idle = true;
 CREATE INDEX idx_vm_utilization_oversized ON vm_utilization(site) WHERE oversized = true;
 
 INSERT INTO site_capacity (id, site, total_cpu_cores, used_cpu_cores, total_memory_gb, used_memory_gb, total_storage_gb, used_storage_gb, vm_count, cpu_utilization_pct, memory_utilization_pct, monthly_cost, forecast_cpu_6m_pct, forecast_memory_6m_pct, forecast_storage_6m_pct) VALUES
-    ('c0000300-3000-3000-3000-000000000001', 'LOVE', 56, 24, 228, 100, 1640, 1640, 10, 51.5, 48.6, 3245.00, 62.3, 57.6, 62.4),
-    ('c0000300-3000-3000-3000-000000000002', 'BUR1', 62, 24, 248, 107, 1860, 1860, 8, 42.8, 40.5, 2980.00, 54.6, 49.5, 55.1);
+    ('c0000300-3000-3000-3000-000000000001', 'DEFRA', 56, 24, 228, 100, 1640, 1640, 10, 51.5, 48.6, 3245.00, 62.3, 57.6, 62.4),
+    ('c0000300-3000-3000-3000-000000000002', 'GBLON', 62, 24, 248, 107, 1860, 1860, 8, 42.8, 40.5, 2980.00, 54.6, 49.5, 55.1);
 
 INSERT INTO vm_utilization (id, vm_name, site, cluster_name, cpu_cores, memory_gb, storage_gb, cpu_usage_pct, memory_usage_pct, monthly_cost, idle, oversized, orphaned_disk_gb) VALUES
-    ('d0000300-3000-3000-3000-000000000001', 'love-srv-01', 'LOVE', 'love-general-cluster', 8, 32, 200, 72.5, 65.0, 291.40, false, false, 0),
-    ('d0000300-3000-3000-3000-000000000002', 'love-srv-02', 'LOVE', 'love-general-cluster', 4, 16, 100, 18.2, 22.1, 153.20, false, false, 0),
-    ('d0000300-3000-3000-3000-000000000003', 'love-srv-03', 'LOVE', 'love-general-cluster', 16, 64, 500, 85.3, 78.0, 524.80, false, false, 0),
-    ('d0000300-3000-3000-3000-000000000004', 'love-db-01', 'LOVE', 'love-db-cluster', 12, 48, 400, 91.2, 88.5, 429.60, false, false, 0),
-    ('d0000300-3000-3000-3000-000000000005', 'love-web-01', 'LOVE', 'love-web-cluster', 2, 8, 80, 12.0, 35.0, 117.00, false, true, 0),
-    ('d0000300-3000-3000-3000-000000000006', 'love-web-02', 'LOVE', 'love-web-cluster', 2, 8, 80, 14.0, 31.0, 117.00, false, true, 0),
-    ('d0000300-3000-3000-3000-000000000007', 'love-dev-01', 'LOVE', 'love-general-cluster', 4, 16, 100, 2.1, 5.3, 153.20, true, false, 0),
-    ('d0000300-3000-3000-3000-000000000008', 'love-dev-02', 'LOVE', 'love-general-cluster', 4, 16, 120, 3.5, 6.2, 154.80, true, false, 50),
-    ('d0000300-3000-3000-3000-000000000009', 'love-legacy-01', 'LOVE', 'love-general-cluster', 2, 4, 60, 95.0, 92.0, 88.60, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000a', 'love-dc-01', 'LOVE', 'love-general-cluster', 4, 16, 100, 45.0, 48.0, 153.20, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000b', 'bur1-srv-01', 'BUR1', 'bur1-general-cluster', 8, 32, 200, 68.0, 60.0, 291.40, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000c', 'bur1-srv-02', 'BUR1', 'bur1-general-cluster', 4, 16, 100, 22.0, 28.0, 153.20, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000d', 'bur1-srv-03', 'BUR1', 'bur1-general-cluster', 16, 64, 500, 80.0, 75.0, 524.80, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000e', 'bur1-db-01', 'BUR1', 'bur1-db-cluster', 12, 48, 400, 88.0, 82.0, 429.60, false, false, 0),
-    ('d0000300-3000-3000-3000-00000000000f', 'bur1-dr-01', 'BUR1', 'bur1-dr-cluster', 8, 32, 300, 3.0, 4.5, 299.40, true, false, 0),
-    ('d0000300-3000-3000-3000-000000000010', 'bur1-web-01', 'BUR1', 'bur1-web-cluster', 2, 8, 60, 18.0, 42.0, 115.40, false, true, 0),
-    ('d0000300-3000-3000-3000-000000000011', 'bur1-qa-01', 'BUR1', 'bur1-general-cluster', 4, 16, 100, 4.0, 7.0, 153.20, true, false, 0),
-    ('d0000300-3000-3000-3000-000000000012', 'bur1-qa-02', 'BUR1', 'bur1-general-cluster', 8, 32, 200, 5.0, 8.5, 299.40, true, true, 100);
+    ('d0000300-3000-3000-3000-000000000001', 'defra-srv-01', 'DEFRA', 'defra-general-cluster', 8, 32, 200, 72.5, 65.0, 291.40, false, false, 0),
+    ('d0000300-3000-3000-3000-000000000002', 'defra-srv-02', 'DEFRA', 'defra-general-cluster', 4, 16, 100, 18.2, 22.1, 153.20, false, false, 0),
+    ('d0000300-3000-3000-3000-000000000003', 'defra-srv-03', 'DEFRA', 'defra-general-cluster', 16, 64, 500, 85.3, 78.0, 524.80, false, false, 0),
+    ('d0000300-3000-3000-3000-000000000004', 'defra-db-01', 'DEFRA', 'defra-db-cluster', 12, 48, 400, 91.2, 88.5, 429.60, false, false, 0),
+    ('d0000300-3000-3000-3000-000000000005', 'defra-web-01', 'DEFRA', 'defra-web-cluster', 2, 8, 80, 12.0, 35.0, 117.00, false, true, 0),
+    ('d0000300-3000-3000-3000-000000000006', 'defra-web-02', 'DEFRA', 'defra-web-cluster', 2, 8, 80, 14.0, 31.0, 117.00, false, true, 0),
+    ('d0000300-3000-3000-3000-000000000007', 'defra-dev-01', 'DEFRA', 'defra-general-cluster', 4, 16, 100, 2.1, 5.3, 153.20, true, false, 0),
+    ('d0000300-3000-3000-3000-000000000008', 'defra-dev-02', 'DEFRA', 'defra-general-cluster', 4, 16, 120, 3.5, 6.2, 154.80, true, false, 50),
+    ('d0000300-3000-3000-3000-000000000009', 'defra-legacy-01', 'DEFRA', 'defra-general-cluster', 2, 4, 60, 95.0, 92.0, 88.60, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000a', 'defra-dc-01', 'DEFRA', 'defra-general-cluster', 4, 16, 100, 45.0, 48.0, 153.20, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000b', 'gblon-srv-01', 'GBLON', 'gblon-general-cluster', 8, 32, 200, 68.0, 60.0, 291.40, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000c', 'gblon-srv-02', 'GBLON', 'gblon-general-cluster', 4, 16, 100, 22.0, 28.0, 153.20, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000d', 'gblon-srv-03', 'GBLON', 'gblon-general-cluster', 16, 64, 500, 80.0, 75.0, 524.80, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000e', 'gblon-db-01', 'GBLON', 'gblon-db-cluster', 12, 48, 400, 88.0, 82.0, 429.60, false, false, 0),
+    ('d0000300-3000-3000-3000-00000000000f', 'gblon-dr-01', 'GBLON', 'gblon-dr-cluster', 8, 32, 300, 3.0, 4.5, 299.40, true, false, 0),
+    ('d0000300-3000-3000-3000-000000000010', 'gblon-web-01', 'GBLON', 'gblon-web-cluster', 2, 8, 60, 18.0, 42.0, 115.40, false, true, 0),
+    ('d0000300-3000-3000-3000-000000000011', 'gblon-qa-01', 'GBLON', 'gblon-general-cluster', 4, 16, 100, 4.0, 7.0, 153.20, true, false, 0),
+    ('d0000300-3000-3000-3000-000000000012', 'gblon-qa-02', 'GBLON', 'gblon-general-cluster', 8, 32, 200, 5.0, 8.5, 299.40, true, true, 100);

@@ -38,50 +38,50 @@ fn seed_data() -> ImageStore {
     vec![
         GoldenImage {
             id: "img-001".into(),
-            image_name: "win-svr-2022-love-v1".into(),
+            image_name: "win-svr-2022-defra-v1".into(),
             os_family: "Windows".into(),
             os_version: "2022".into(),
             distro: "Windows Server 2022 Datacenter".into(),
             build_date: "2026-05-01T06:00:00Z".into(),
             status: BuildStatus::Promoted,
             supersedes_image_id: None,
-            site_scope: "LOVE".into(),
+            site_scope: "DEFRA".into(),
             build_log: "Build completed: 2026-05-01T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.".into(),
         },
         GoldenImage {
             id: "img-002".into(),
-            image_name: "ubuntu-2404-love-v1".into(),
+            image_name: "ubuntu-2404-defra-v1".into(),
             os_family: "Linux".into(),
             os_version: "24.04".into(),
             distro: "Ubuntu 24.04 LTS".into(),
             build_date: "2026-05-02T06:00:00Z".into(),
             status: BuildStatus::Promoted,
             supersedes_image_id: None,
-            site_scope: "LOVE".into(),
+            site_scope: "DEFRA".into(),
             build_log: "Build completed: 2026-05-02T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.".into(),
         },
         GoldenImage {
             id: "img-003".into(),
-            image_name: "win-svr-2025-bur1-v0".into(),
+            image_name: "win-svr-2025-gblon-v0".into(),
             os_family: "Windows".into(),
             os_version: "2025".into(),
             distro: "Windows Server 2025 Datacenter".into(),
             build_date: "2026-06-10T08:00:00Z".into(),
             status: BuildStatus::Building,
             supersedes_image_id: None,
-            site_scope: "BUR1".into(),
+            site_scope: "GBLON".into(),
             build_log: "Build started: 2026-06-10T08:00:00Z. Status: OS installation completed, agent installation in progress.".into(),
         },
         GoldenImage {
             id: "img-004".into(),
-            image_name: "win-svr-2019-love-v0".into(),
+            image_name: "win-svr-2019-defra-v0".into(),
             os_family: "Windows".into(),
             os_version: "2019".into(),
             distro: "Windows Server 2019 Datacenter".into(),
             build_date: "2026-04-01T06:00:00Z".into(),
             status: BuildStatus::Superseded,
             supersedes_image_id: None,
-            site_scope: "LOVE".into(),
+            site_scope: "DEFRA".into(),
             build_log: "Superseded by img-001 (Windows Server 2022) on 2026-05-01. No further builds scheduled.".into(),
         },
     ]
@@ -364,16 +364,16 @@ mod tests {
 
     #[test]
     fn test_initiate_build() {
-        let result = initiate_build("rhel-9-test", "Linux", "RHEL 9", "9.3", "LOVE").unwrap();
+        let result = initiate_build("rhel-9-test", "Linux", "RHEL 9", "9.3", "DEFRA").unwrap();
         assert_eq!(result["source"], "dry-run");
         assert_eq!(result["image"]["os_family"], "Linux");
         assert_eq!(result["image"]["status"], "building");
-        assert_eq!(result["image"]["site_scope"], "LOVE");
+        assert_eq!(result["image"]["site_scope"], "DEFRA");
     }
 
     #[test]
     fn test_run_tests() {
-        let build = initiate_build("test-img", "Linux", "Ubuntu", "24.04", "LOVE").unwrap();
+        let build = initiate_build("test-img", "Linux", "Ubuntu", "24.04", "DEFRA").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         let result = run_tests(image_id).unwrap();
         assert_eq!(result["source"], "dry-run");
@@ -382,34 +382,34 @@ mod tests {
 
     #[test]
     fn test_promote_image() {
-        let build = initiate_build("test-promote", "Windows", "WinSvr2025", "2025", "BUR1").unwrap();
+        let build = initiate_build("test-promote", "Windows", "WinSvr2025", "2025", "GBLON").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         run_tests(image_id).unwrap();
         let result = promote_image(image_id).unwrap();
         assert_eq!(result["source"], "dry-run");
         assert_eq!(result["image"]["status"], "promoted");
 
-        // Verify the previously promoted win-svr-2022-love-v1 is NOT superseded (different site/os)
-        let love_active = get_active_images("LOVE").unwrap();
-        let win_images = love_active["active_by_os"]["Windows"].as_array().unwrap();
+        // Verify the previously promoted win-svr-2022-defra-v1 is NOT superseded (different site/os)
+        let defra_active = get_active_images("DEFRA").unwrap();
+        let win_images = defra_active["active_by_os"]["Windows"].as_array().unwrap();
         assert!(win_images.iter().any(|i| i["id"] == "img-001"));
     }
 
     #[test]
     fn test_promote_supersedes_previous() {
-        // img-002 is Ubuntu promoted at LOVE. Build a new Ubuntu, test, and promote it.
-        let build = initiate_build("ubuntu-2404-v2", "Linux", "Ubuntu 24.04", "24.04", "LOVE").unwrap();
+        // img-002 is Ubuntu promoted at DEFRA. Build a new Ubuntu, test, and promote it.
+        let build = initiate_build("ubuntu-2404-v2", "Linux", "Ubuntu 24.04", "24.04", "DEFRA").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         run_tests(image_id).unwrap();
         let result = promote_image(image_id).unwrap();
         let superseded = result["superseded"].as_array().unwrap();
-        assert!(!superseded.is_empty(), "should supersede the existing Ubuntu image at LOVE");
+        assert!(!superseded.is_empty(), "should supersede the existing Ubuntu image at DEFRA");
         assert!(superseded.iter().any(|s| s.as_str() == Some("img-002")));
     }
 
     #[test]
     fn test_reject_image() {
-        let build = initiate_build("test-reject", "Linux", "Ubuntu", "24.04", "LOVE").unwrap();
+        let build = initiate_build("test-reject", "Linux", "Ubuntu", "24.04", "DEFRA").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         let result = reject_image(image_id, "Security scan failed: CVE-2026-1234").unwrap();
         assert_eq!(result["source"], "dry-run");
@@ -419,8 +419,8 @@ mod tests {
 
     #[test]
     fn test_get_active_images() {
-        let result = get_active_images("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_active_images("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["active_count"].as_u64().unwrap() >= 1);
         let win_images = result["active_by_os"]["Windows"].as_array().unwrap();
         assert!(win_images.iter().any(|i| i["id"] == "img-001"));
@@ -428,8 +428,8 @@ mod tests {
 
     #[test]
     fn test_get_build_history() {
-        let result = get_build_history("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_build_history("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["build_count"].as_u64().unwrap() >= 2);
     }
 
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_schedule_monthly_build() {
-        let result = schedule_monthly_build("BUR1", "Linux", "Ubuntu 24.04").unwrap();
+        let result = schedule_monthly_build("GBLON", "Linux", "Ubuntu 24.04").unwrap();
         assert_eq!(result["source"], "dry-run");
         assert_eq!(result["scheduled"], true);
         assert_eq!(result["cadence"], "monthly");

@@ -17,19 +17,11 @@ const REQUIRED_NETWORK: &str = "DHCP";
 const REQUIRED_ORGANIZATION: &str = "Ryuki EU";
 const REQUIRED_WINDOWS_BEHAVIOR: &[&str] = &["Sysprep", "VM-name generator", "Change SID"];
 const REQUIRED_SITE_FACTS: &[(&str, &str, &str, i64)] = &[
-    ("belove-windows-customization", "BE", "LOVE", 105),
-    ("esbur1-windows-customization", "ES", "BUR1", 105),
-    ("esccss-windows-customization", "ES", "CCSS", 105),
-    ("estor1-windows-customization", "ES", "TOR1", 105),
-    ("estruj-windows-customization", "ES", "TRUJ", 105),
-    ("esvill-windows-customization", "ES", "VILL", 105),
-    ("fralbi-windows-customization", "FR", "ALBI", 105),
-    ("fraost-windows-customization", "FR", "AOST", 105),
-    ("frmacl-windows-customization", "FR", "MACL", 105),
-    ("frssym-windows-customization", "FR", "SSYM", 105),
-    ("nlwijh-windows-customization", "NL", "WIJH", 105),
-    ("ptrma1-windows-customization", "PT", "RMA1", 85),
-    ("ropite-windows-customization", "RO", "PITE", 130),
+    ("deber-windows-customization", "DE", "DEBER", 105),
+    ("defra-windows-customization", "DE", "DEFRA", 105),
+    ("frpar-windows-customization", "FR", "FRPAR", 105),
+    ("gblon-windows-customization", "GB", "GBLON", 85),
+    ("nlams-windows-customization", "NL", "NLAMS", 105),
 ];
 const REQUIRED_DISABLED_FIELDS: &[&str] = &[
     "providerCallsAllowed",
@@ -2014,9 +2006,9 @@ mod tests {
     #[test]
     fn site_fact_unknown_sensitive_field_is_reported() {
         let block = r#"
-            spec = "belove-windows-customization",
-            country = "BE",
-            site = "LOVE",
+            spec = "defra-windows-customization",
+            country = "DE",
+            site = "DEFRA",
             timezoneCode = 105,
             encryptedXml = "safe-summary",
         "#;
@@ -2024,7 +2016,7 @@ mod tests {
         for field in endpoint_assignment_fields(block) {
             if !SITE_FACT_FIELDS.contains(&field.as_str()) {
                 errors.push(format!(
-                    "belove-windows-customization has unexpected site fact field {field}"
+                    "defra-windows-customization has unexpected site fact field {field}"
                 ));
             }
         }

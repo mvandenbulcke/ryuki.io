@@ -17,7 +17,7 @@ CREATE INDEX idx_immutability_status ON immutability_checks(status);
 CREATE INDEX idx_immutability_repository_type ON immutability_checks(repository_type);
 
 INSERT INTO immutability_checks (id, repository_name, repository_type, site, immutability_enabled, retention_lock_set, min_retention_days, last_verified, status) VALUES
-    ('imm-00000000-0000-0000-0000-000000000001', 'repo-love-storeonce-01', 'StoreOnce', 'LOVE', true, true, 90, NOW() - INTERVAL '2 days', 'Compliant'),
-    ('imm-00000000-0000-0000-0000-000000000002', 'repo-bur1-hlr-01', 'HardenedLinux', 'BUR1', true, false, 30, NOW() - INTERVAL '7 days', 'AtRisk'),
-    ('imm-00000000-0000-0000-0000-000000000003', 'repo-ccss-objstore-01', 'ObjectStorage', 'CCSS', false, false, 0, NOW() - INTERVAL '14 days', 'NonCompliant'),
-    ('imm-00000000-0000-0000-0000-000000000004', 'repo-tor1-storeonce-02', 'StoreOnce', 'TOR1', true, true, 60, NOW() - INTERVAL '1 day', 'Compliant');
+    ('imm-00000000-0000-0000-0000-000000000001', 'repo-defra-storeonce-01', 'StoreOnce', 'DEFRA', true, true, 90, NOW() - INTERVAL '2 days', 'Compliant'),
+    ('imm-00000000-0000-0000-0000-000000000002', 'repo-gblon-hlr-01', 'HardenedLinux', 'GBLON', true, false, 30, NOW() - INTERVAL '7 days', 'AtRisk'),
+    ('imm-00000000-0000-0000-0000-000000000003', 'repo-frpar-objstore-01', 'ObjectStorage', 'FRPAR', false, false, 0, NOW() - INTERVAL '14 days', 'NonCompliant'),
+    ('imm-00000000-0000-0000-0000-000000000004', 'repo-nlams-storeonce-02', 'StoreOnce', 'NLAMS', true, true, 60, NOW() - INTERVAL '1 day', 'Compliant');

@@ -2,10 +2,7 @@ use crate::models::*;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn generate_backup_coverage_report(
     site_scope: &[String],
@@ -234,7 +231,7 @@ mod tests {
     use super::*;
 
     fn make_site_scope() -> Vec<String> {
-        vec!["LOVE".into(), "BUR1".into()]
+        vec!["DEFRA".into(), "GBLON".into()]
     }
 
     #[test]
@@ -264,7 +261,7 @@ mod tests {
             "ci-srv-001",
             RestoreType::FullVm,
             "2026-06-10T02:00:00Z",
-            "BUR1",
+            "GBLON",
             "production",
             "backup-team",
         )
@@ -277,7 +274,7 @@ mod tests {
     #[test]
     fn test_plan_restore_empty_ci_key_fails() {
         assert!(
-            plan_restore("", RestoreType::FullVm, "rp", "LOVE", "production", "owner").is_err()
+            plan_restore("", RestoreType::FullVm, "rp", "DEFRA", "production", "owner").is_err()
         );
     }
 
@@ -302,7 +299,7 @@ mod tests {
             "ci-srv-001",
             RestoreType::ApplicationItem,
             "2026-06-10T02:00:00Z",
-            "LOVE",
+            "DEFRA",
             "production",
             "backup-team",
         )
@@ -317,7 +314,7 @@ mod tests {
             "ci-srv-001",
             RestoreType::InstantVmRecovery,
             "2026-06-10T02:00:00Z",
-            "LOVE",
+            "DEFRA",
             "production",
             "backup-team",
         )
@@ -336,7 +333,7 @@ mod tests {
             "ci-srv-001",
             RestoreType::FullVm,
             "2026-06-10T02:00:00Z",
-            "LOVE",
+            "DEFRA",
             "production",
             "backup-team",
         )
@@ -353,7 +350,7 @@ mod tests {
             "ci-srv-001",
             RestoreType::FullVm,
             "2026-06-10T02:00:00Z",
-            "LOVE",
+            "DEFRA",
             "production",
             "backup-team",
         )

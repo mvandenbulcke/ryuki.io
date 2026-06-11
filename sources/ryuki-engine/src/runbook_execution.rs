@@ -76,26 +76,26 @@ fn now_iso() -> String {
 fn seed_data() -> ExecutionStore {
     vec![
         RunbookExecution {
-            id: "rbx-love-001".into(),
+            id: "rbx-defra-001".into(),
             runbook_id: "patch-windows-server".into(),
             status: ExecutionStatus::Draft,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             started_by: "alice.engineer".into(),
             steps_results: vec![pending_step(1), pending_step(2), pending_step(3)],
         },
         RunbookExecution {
-            id: "rbx-bur1-001".into(),
+            id: "rbx-gblon-001".into(),
             runbook_id: "restart-service".into(),
             status: ExecutionStatus::Approved,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             started_by: "bob.engineer".into(),
             steps_results: vec![pending_step(1), pending_step(2), pending_step(3)],
         },
         RunbookExecution {
-            id: "rbx-madr-001".into(),
+            id: "rbx-deber-001".into(),
             runbook_id: "certificate-renewal".into(),
             status: ExecutionStatus::Completed,
-            site: "MADR".into(),
+            site: "DEBER".into(),
             started_by: "carla.engineer".into(),
             steps_results: vec![completed_step(1), completed_step(2), completed_step(3)],
         },
@@ -272,7 +272,7 @@ fn runbook_catalog() -> Vec<Runbook> {
 }
 
 fn valid_site(site: &str) -> bool {
-    matches!(site, "LOVE" | "BUR1" | "MADR")
+    matches!(site, "DEFRA" | "GBLON" | "DEBER")
 }
 
 fn find_runbook(runbook_id: &str) -> Option<Runbook> {
@@ -308,7 +308,7 @@ pub fn list_runbooks() -> Result<Value, String> {
 pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<Value, String> {
     if !valid_site(site) {
         return Err(format!(
-            "Unsupported site '{}'. Must be LOVE, BUR1, or MADR",
+            "Unsupported site '{}'. Must be DEFRA, GBLON, or DEBER",
             site
         ));
     }
@@ -508,16 +508,16 @@ mod tests {
 
     #[test]
     fn test_start_runbook_creates_execution_in_draft_status() {
-        let result = start_runbook("restart-service", "LOVE", "test.engineer").unwrap();
+        let result = start_runbook("restart-service", "DEFRA", "test.engineer").unwrap();
 
         assert_eq!(result["execution"]["runbook_id"], "restart-service");
-        assert_eq!(result["execution"]["site"], "LOVE");
+        assert_eq!(result["execution"]["site"], "DEFRA");
         assert_eq!(result["execution"]["status"], "draft");
     }
 
     #[test]
     fn test_approve_and_complete_flow() {
-        let result = start_runbook("dns-record-update", "BUR1", "test.engineer").unwrap();
+        let result = start_runbook("dns-record-update", "GBLON", "test.engineer").unwrap();
         let id = result["execution"]["id"].as_str().unwrap();
 
         let approved = approve_execution(id, "change.manager").unwrap();
@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_execute_step_updates_result() {
-        let result = start_runbook("certificate-renewal", "MADR", "test.engineer").unwrap();
+        let result = start_runbook("certificate-renewal", "DEBER", "test.engineer").unwrap();
         let id = result["execution"]["id"].as_str().unwrap();
 
         let executed = execute_step(id, 1).unwrap();
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_fail_execution_records_reason() {
-        let result = start_runbook("firewall-rule-change", "LOVE", "test.engineer").unwrap();
+        let result = start_runbook("firewall-rule-change", "DEFRA", "test.engineer").unwrap();
         let id = result["execution"]["id"].as_str().unwrap();
 
         let failed = fail_execution(id, "Policy simulation detected unintended exposure").unwrap();
@@ -563,12 +563,12 @@ mod tests {
 
     #[test]
     fn test_list_executions_filters_by_site() {
-        let _ = start_runbook("restart-service", "MADR", "test.engineer").unwrap();
+        let _ = start_runbook("restart-service", "DEBER", "test.engineer").unwrap();
 
-        let result = list_executions(Some("MADR")).unwrap();
+        let result = list_executions(Some("DEBER")).unwrap();
         let executions = result["executions"].as_array().unwrap();
 
         assert!(!executions.is_empty());
-        assert!(executions.iter().all(|e| e["site"] == "MADR"));
+        assert!(executions.iter().all(|e| e["site"] == "DEBER"));
     }
 }

@@ -3,10 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const VALID_OU_PREFIXES: &[&str] = &[
     "OU=Servers",
@@ -71,7 +68,7 @@ fn validate_naming_convention(name: &str) -> Result<(), String> {
     let parts: Vec<&str> = name.split('-').collect();
     if parts.len() != 3 {
         return Err(format!(
-            "Invalid computer name '{}': must match pattern SITE-ROLE-NN (e.g. LOVE-SRV-01)",
+            "Invalid computer name '{}': must match pattern SITE-ROLE-NN (e.g. DEFRA-SRV-01)",
             name
         ));
     }
@@ -159,7 +156,7 @@ pub fn validate_computer(name: &str) -> Result<ValidationResult, String> {
         errors.push(e.clone());
         failed_rules.push("p0-computer-naming-convention".into());
         remediation
-            .push("Rename the computer to match SITE-ROLE-NN format (e.g. LOVE-SRV-01)".into());
+            .push("Rename the computer to match SITE-ROLE-NN format (e.g. DEFRA-SRV-01)".into());
     }
 
     let parts: Vec<&str> = name.split('-').collect();
@@ -415,9 +412,9 @@ pub fn seed_examples() -> Vec<ADComputer> {
     vec![
         ADComputer {
             id: computer_id(),
-            name: "LOVE-SRV-01".to_string(),
-            site: "LOVE".to_string(),
-            ou_path: "OU=Servers,OU=LOVE,DC=corp,DC=local".to_string(),
+            name: "DEFRA-SRV-01".to_string(),
+            site: "DEFRA".to_string(),
+            ou_path: "OU=Servers,OU=DEFRA,DC=corp,DC=local".to_string(),
             status: ComputerStatus::Active,
             last_logon: now.clone(),
             os: "Windows Server 2022".to_string(),
@@ -426,8 +423,8 @@ pub fn seed_examples() -> Vec<ADComputer> {
         },
         ADComputer {
             id: computer_id(),
-            name: "LOVE-DC-01".to_string(),
-            site: "LOVE".to_string(),
+            name: "DEFRA-DC-01".to_string(),
+            site: "DEFRA".to_string(),
             ou_path: "OU=Domain Controllers,DC=corp,DC=local".to_string(),
             status: ComputerStatus::Active,
             last_logon: now.clone(),
@@ -437,9 +434,9 @@ pub fn seed_examples() -> Vec<ADComputer> {
         },
         ADComputer {
             id: computer_id(),
-            name: "BUR1-SRV-01".to_string(),
-            site: "BUR1".to_string(),
-            ou_path: "OU=Servers,OU=BUR1,DC=corp,DC=local".to_string(),
+            name: "GBLON-SRV-01".to_string(),
+            site: "GBLON".to_string(),
+            ou_path: "OU=Servers,OU=GBLON,DC=corp,DC=local".to_string(),
             status: ComputerStatus::Active,
             last_logon: now.clone(),
             os: "Windows Server 2019".to_string(),
@@ -448,9 +445,9 @@ pub fn seed_examples() -> Vec<ADComputer> {
         },
         ADComputer {
             id: computer_id(),
-            name: "BUR1-SRV-02".to_string(),
-            site: "BUR1".to_string(),
-            ou_path: "OU=Servers,OU=BUR1,DC=corp,DC=local".to_string(),
+            name: "GBLON-SRV-02".to_string(),
+            site: "GBLON".to_string(),
+            ou_path: "OU=Servers,OU=GBLON,DC=corp,DC=local".to_string(),
             status: ComputerStatus::Disabled,
             last_logon: (chrono::Utc::now() - chrono::Duration::days(150)).to_rfc3339(),
             os: "Windows Server 2016".to_string(),
@@ -465,9 +462,9 @@ pub fn seed_examples() -> Vec<ADComputer> {
         },
         ADComputer {
             id: computer_id(),
-            name: "TOR1-TEST-01".to_string(),
-            site: "TOR1".to_string(),
-            ou_path: "OU=Testing,OU=TOR1,DC=corp,DC=local".to_string(),
+            name: "NLAMS-TEST-01".to_string(),
+            site: "NLAMS".to_string(),
+            ou_path: "OU=Testing,OU=NLAMS,DC=corp,DC=local".to_string(),
             status: ComputerStatus::Quarantined,
             last_logon: (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
             os: "Windows Server 2022".to_string(),
@@ -489,12 +486,12 @@ mod tests {
 
     #[test]
     fn test_validate_naming_convention_valid() {
-        assert!(validate_naming_convention("LOVE-SRV-01").is_ok());
-        assert!(validate_naming_convention("BUR1-DC-02").is_ok());
-        assert!(validate_naming_convention("TOR1-WS-100").is_ok());
-        assert!(validate_naming_convention("ALBI-MGMT-01").is_ok());
-        assert!(validate_naming_convention("RMA1-TEST-42").is_ok());
-        assert!(validate_naming_convention("PITE-DEV-9999").is_ok());
+        assert!(validate_naming_convention("DEFRA-SRV-01").is_ok());
+        assert!(validate_naming_convention("GBLON-DC-02").is_ok());
+        assert!(validate_naming_convention("NLAMS-WS-100").is_ok());
+        assert!(validate_naming_convention("FRPAR-MGMT-01").is_ok());
+        assert!(validate_naming_convention("FRPAR-TEST-42").is_ok());
+        assert!(validate_naming_convention("NLAMS-DEV-9999").is_ok());
     }
 
     #[test]
@@ -505,47 +502,47 @@ mod tests {
 
     #[test]
     fn test_validate_naming_convention_invalid_role() {
-        assert!(validate_naming_convention("LOVE-APP-01").is_err());
-        assert!(validate_naming_convention("LOVE-DB-01").is_err());
+        assert!(validate_naming_convention("DEFRA-APP-01").is_err());
+        assert!(validate_naming_convention("DEFRA-DB-01").is_err());
     }
 
     #[test]
     fn test_validate_naming_convention_invalid_number() {
-        assert!(validate_naming_convention("LOVE-SRV-1").is_err());
-        assert!(validate_naming_convention("LOVE-SRV-ABCD").is_err());
+        assert!(validate_naming_convention("DEFRA-SRV-1").is_err());
+        assert!(validate_naming_convention("DEFRA-SRV-ABCD").is_err());
     }
 
     #[test]
     fn test_prestage_computer_success() {
         let computer =
-            prestage_computer("LOVE-SRV-01", "LOVE", "OU=Servers,DC=corp,DC=local").unwrap();
-        assert_eq!(computer.name, "LOVE-SRV-01");
-        assert_eq!(computer.site, "LOVE");
+            prestage_computer("DEFRA-SRV-01", "DEFRA", "OU=Servers,DC=corp,DC=local").unwrap();
+        assert_eq!(computer.name, "DEFRA-SRV-01");
+        assert_eq!(computer.site, "DEFRA");
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("prestaged"));
     }
 
     #[test]
     fn test_prestage_computer_invalid_site() {
-        let result = prestage_computer("LOVE-SRV-01", "INVALID", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer("DEFRA-SRV-01", "INVALID", "OU=Servers,DC=corp,DC=local");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_prestage_computer_invalid_name() {
-        let result = prestage_computer("BAD-SRV-01", "LOVE", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer("BAD-SRV-01", "DEFRA", "OU=Servers,DC=corp,DC=local");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validate_computer_valid() {
-        let result = validate_computer("LOVE-SRV-01").unwrap();
+        let result = validate_computer("DEFRA-SRV-01").unwrap();
         assert!(result.passed);
     }
 
     #[test]
     fn test_validate_computer_invalid() {
-        let result = validate_computer("LOVE-APP-01").unwrap();
+        let result = validate_computer("DEFRA-APP-01").unwrap();
         assert!(!result.passed);
         assert!(result.errors.iter().any(|e| e.contains("role code")));
     }
@@ -558,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_move_computer_success() {
-        let computer = move_computer("LOVE-SRV-01", "OU=DMZ,DC=corp,DC=local").unwrap();
+        let computer = move_computer("DEFRA-SRV-01", "OU=DMZ,DC=corp,DC=local").unwrap();
         assert_eq!(computer.ou_path, "OU=DMZ,DC=corp,DC=local");
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("moved"));
@@ -566,13 +563,13 @@ mod tests {
 
     #[test]
     fn test_move_computer_invalid_target_ou() {
-        let result = move_computer("LOVE-SRV-01", "OU=Invalid,DC=corp,DC=local");
+        let result = move_computer("DEFRA-SRV-01", "OU=Invalid,DC=corp,DC=local");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_disable_computer_success() {
-        let computer = disable_computer("LOVE-SRV-01", "Scheduled maintenance").unwrap();
+        let computer = disable_computer("DEFRA-SRV-01", "Scheduled maintenance").unwrap();
         assert_eq!(computer.status, ComputerStatus::Disabled);
         assert!(computer.metadata.contains_key("disabled"));
         assert!(
@@ -586,31 +583,31 @@ mod tests {
 
     #[test]
     fn test_disable_computer_empty_reason() {
-        let result = disable_computer("LOVE-SRV-01", "");
+        let result = disable_computer("DEFRA-SRV-01", "");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_enable_computer_success() {
-        let computer = enable_computer("LOVE-SRV-01").unwrap();
+        let computer = enable_computer("DEFRA-SRV-01").unwrap();
         assert_eq!(computer.status, ComputerStatus::Active);
         assert!(computer.metadata.contains_key("enabled"));
     }
 
     #[test]
     fn test_delete_computer_success() {
-        let result = delete_computer("LOVE-SRV-01");
+        let result = delete_computer("DEFRA-SRV-01");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_reconcile_computers_success() {
-        let result = reconcile_computers("LOVE").unwrap();
-        assert_eq!(result.site, "LOVE");
+        let result = reconcile_computers("DEFRA").unwrap();
+        assert_eq!(result.site, "DEFRA");
         assert_eq!(result.total_ad_objects, 3);
         assert_eq!(result.total_cmdb_objects, 2);
         assert_eq!(result.missing_from_cmdb.len(), 1);
-        assert!(result.missing_from_cmdb.contains(&"LOVE-WS-01".to_string()));
+        assert!(result.missing_from_cmdb.contains(&"DEFRA-WS-01".to_string()));
         assert!(result.dry_run);
     }
 
@@ -622,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_get_orphaned_success() {
-        let orphaned = get_orphaned("BUR1").unwrap();
+        let orphaned = get_orphaned("GBLON").unwrap();
         assert!(!orphaned.is_empty());
         for computer in &orphaned {
             assert!(computer.metadata.contains_key("orphaned"));
@@ -640,11 +637,11 @@ mod tests {
         let examples = seed_examples();
         assert_eq!(examples.len(), 5);
         let names: Vec<&str> = examples.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"LOVE-SRV-01"));
-        assert!(names.contains(&"LOVE-DC-01"));
-        assert!(names.contains(&"BUR1-SRV-01"));
-        assert!(names.contains(&"BUR1-SRV-02"));
-        assert!(names.contains(&"TOR1-TEST-01"));
+        assert!(names.contains(&"DEFRA-SRV-01"));
+        assert!(names.contains(&"DEFRA-DC-01"));
+        assert!(names.contains(&"GBLON-SRV-01"));
+        assert!(names.contains(&"GBLON-SRV-02"));
+        assert!(names.contains(&"NLAMS-TEST-01"));
     }
 
     #[test]
@@ -657,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_prestage_empty_name() {
-        let result = prestage_computer("", "LOVE", "OU=Servers,DC=corp,DC=local");
+        let result = prestage_computer("", "DEFRA", "OU=Servers,DC=corp,DC=local");
         assert!(result.is_err());
     }
 

@@ -231,7 +231,7 @@ mod tests {
             RequestType::ServerDeployment,
             "alice",
             "bob",
-            "LOVE",
+            "DEFRA",
             "production",
             "critical",
         )

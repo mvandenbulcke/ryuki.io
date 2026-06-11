@@ -43,9 +43,9 @@ fn seed_data() -> RepoStore {
     vec![
         Repository {
             id: "repo-001".into(),
-            name: "love-storeonce-01".into(),
+            name: "defra-storeonce-01".into(),
             repository_type: RepositoryType::StoreOnce,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             total_capacity_tb: 200.0,
             used_capacity_tb: 198.74,
             growth_rate_gb_per_day: 200.0,
@@ -53,9 +53,9 @@ fn seed_data() -> RepoStore {
         },
         Repository {
             id: "repo-002".into(),
-            name: "love-datadomain-01".into(),
+            name: "defra-datadomain-01".into(),
             repository_type: RepositoryType::DataDomain,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             total_capacity_tb: 150.0,
             used_capacity_tb: 147.0,
             growth_rate_gb_per_day: 210.0,
@@ -63,9 +63,9 @@ fn seed_data() -> RepoStore {
         },
         Repository {
             id: "repo-003".into(),
-            name: "bur1-storeonce-01".into(),
+            name: "gblon-storeonce-01".into(),
             repository_type: RepositoryType::StoreOnce,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             total_capacity_tb: 250.0,
             used_capacity_tb: 230.0,
             growth_rate_gb_per_day: 600.0,
@@ -73,9 +73,9 @@ fn seed_data() -> RepoStore {
         },
         Repository {
             id: "repo-004".into(),
-            name: "bur1-hardened-01".into(),
+            name: "gblon-hardened-01".into(),
             repository_type: RepositoryType::HardenedLinux,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             total_capacity_tb: 500.0,
             used_capacity_tb: 120.0,
             growth_rate_gb_per_day: 4200.0,
@@ -409,18 +409,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_repositories_love() {
-        let result = get_repositories("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+    fn test_get_repositories_defra() {
+        let result = get_repositories("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["repository_count"].as_u64().unwrap(), 2);
         let repos = result["repositories"].as_array().unwrap();
         assert_eq!(repos.len(), 2);
     }
 
     #[test]
-    fn test_get_repositories_bur1() {
-        let result = get_repositories("BUR1").unwrap();
-        assert_eq!(result["site"], "BUR1");
+    fn test_get_repositories_gblon() {
+        let result = get_repositories("GBLON").unwrap();
+        assert_eq!(result["site"], "GBLON");
         assert_eq!(result["repository_count"].as_u64().unwrap(), 2);
     }
 
@@ -465,10 +465,10 @@ mod tests {
 
     #[test]
     fn test_get_capacity_report() {
-        let result = get_capacity_report("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_capacity_report("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["total_capacity_tb"].as_f64().unwrap() > 0.0);
-        // LOVE has 2 repos: one Critical (6.3 days), one Warning (14.3 days)
+        // DEFRA has 2 repos: one Critical (6.3 days), one Warning (14.3 days)
         assert_eq!(result["critical_count"].as_u64().unwrap(), 1);
         assert_eq!(result["warning_count"].as_u64().unwrap(), 1);
     }
@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_forecast_capacity_bur1() {
+    fn test_forecast_capacity_gblon() {
         let result = forecast_capacity("repo-003", 90).unwrap();
         assert_eq!(result["forecast_days"].as_u64().unwrap(), 90);
         assert!(result["projected"]["utilization_pct"].as_f64().unwrap() > 0.0);

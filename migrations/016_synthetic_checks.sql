@@ -22,8 +22,8 @@ CREATE TABLE check_results (
 );
 
 INSERT INTO health_checks (name, check_type, endpoint, expected_status, expected_body_contains, interval_seconds, site, enabled) VALUES
-    ('portal-web-endpoint', 'http', 'portal.ryuki.io', 200, 'Ryuki Infrastructure Platform', 60, 'LOVE', true),
-    ('api-health-endpoint', 'http', 'api.ryuki.io', 200, NULL, 30, 'LOVE', true),
-    ('payment-dns-resolution', 'dns', 'payment-service.ryuki.io', 0, NULL, 120, 'LOVE', true),
-    ('db-tcp-connectivity', 'tcp', 'db.ryuki.io:5432', 0, NULL, 30, 'BUR1', true),
-    ('api-cert-expiry', 'certificate', 'api.ryuki.io:443', 0, NULL, 3600, 'BUR1', true);
+    ('portal-web-endpoint', 'http', 'portal.ryuki.io', 200, 'Ryuki Infrastructure Platform', 60, 'DEFRA', true),
+    ('api-health-endpoint', 'http', 'api.ryuki.io', 200, NULL, 30, 'DEFRA', true),
+    ('payment-dns-resolution', 'dns', 'payment-service.ryuki.io', 0, NULL, 120, 'DEFRA', true),
+    ('db-tcp-connectivity', 'tcp', 'db.ryuki.io:5432', 0, NULL, 30, 'GBLON', true),
+    ('api-cert-expiry', 'certificate', 'api.ryuki.io:443', 0, NULL, 3600, 'GBLON', true);

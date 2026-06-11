@@ -2,10 +2,7 @@ use crate::models::*;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn supported_distro_catalog() -> Vec<LinuxDistroInfo> {
     vec![
@@ -573,7 +570,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Ubuntu,
             "22.04 LTS",
-            "LOVE",
+            "DEFRA",
             4,
             16,
             100,
@@ -596,7 +593,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Sles,
             "15.5",
-            "BUR1",
+            "GBLON",
             8,
             32,
             200,
@@ -618,7 +615,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Debian,
             "12 (bookworm)",
-            "TOR1",
+            "NLAMS",
             2,
             8,
             50,
@@ -631,7 +628,7 @@ mod tests {
         assert!(plan.distro_baseline.contains("Debian"));
         assert!(plan.distro_baseline.contains("nftables"));
         assert!(plan.cloud_init.contains("apt"));
-        assert_eq!(req.site, "TOR1");
+        assert_eq!(req.site, "NLAMS");
     }
 
     #[test]
@@ -640,7 +637,7 @@ mod tests {
             plan_linux_deployment(
                 LinuxDistro::Ubuntu,
                 "22.04 LTS",
-                "LOVE",
+                "DEFRA",
                 4,
                 16,
                 100,
@@ -676,7 +673,7 @@ mod tests {
             plan_linux_deployment(
                 LinuxDistro::Rhel,
                 "9.4",
-                "LOVE",
+                "DEFRA",
                 0,
                 16,
                 100,
@@ -694,7 +691,7 @@ mod tests {
             plan_linux_deployment(
                 LinuxDistro::Ubuntu,
                 "99.99 LTS",
-                "LOVE",
+                "DEFRA",
                 4,
                 16,
                 100,
@@ -711,7 +708,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Rocky,
             "9.4",
-            "LOVE",
+            "DEFRA",
             4,
             16,
             100,
@@ -729,7 +726,7 @@ mod tests {
         let mut req = plan_linux_deployment(
             LinuxDistro::Alma,
             "9.4",
-            "LOVE",
+            "DEFRA",
             4,
             16,
             100,
@@ -749,7 +746,7 @@ mod tests {
         let mut req = plan_linux_deployment(
             LinuxDistro::Ubuntu,
             "24.04 LTS",
-            "BUR1",
+            "GBLON",
             2,
             8,
             50,
@@ -769,7 +766,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Ubuntu,
             "22.04 LTS",
-            "LOVE",
+            "DEFRA",
             4,
             16,
             100,
@@ -789,7 +786,7 @@ mod tests {
         let mut req = plan_linux_deployment(
             LinuxDistro::Debian,
             "12 (bookworm)",
-            "TOR1",
+            "NLAMS",
             2,
             8,
             50,
@@ -826,7 +823,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Ubuntu,
             "22.04 LTS",
-            "LOVE",
+            "DEFRA",
             4,
             16,
             100,
@@ -878,7 +875,7 @@ mod tests {
         let req = plan_linux_deployment(
             LinuxDistro::Rhel,
             "9.5",
-            "LOVE",
+            "DEFRA",
             256,
             8192,
             10000,

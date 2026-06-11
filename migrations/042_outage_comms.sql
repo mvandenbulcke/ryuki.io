@@ -32,14 +32,14 @@ CREATE INDEX idx_outage_notice_systems_notice ON outage_notice_systems(notice_id
 
 INSERT INTO outage_notices (id, site, start_time, end_time, impact_level, message_template, status, sent_at, acknowledged_by, created_at, updated_at)
 VALUES
-    ('e0000420-4200-4200-4200-000000000001', 'LOVE', NOW() + INTERVAL '2 days', NOW() + INTERVAL '2 days 4 hours', 'High', 'Scheduled database maintenance on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Draft', NULL, NULL, NOW() - INTERVAL '12 hours', NOW() - INTERVAL '12 hours'),
-    ('e0000420-4200-4200-4200-000000000002', 'BUR1', NOW() - INTERVAL '6 hours', NOW() - INTERVAL '1 hour', 'Critical', 'Emergency storage expansion on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Sent', NOW() - INTERVAL '5 hours 30 minutes', 'bob.engineer', NOW() - INTERVAL '7 hours', NOW() - INTERVAL '5 hours'),
-    ('e0000420-4200-4200-4200-000000000003', 'CCSS', NOW() + INTERVAL '5 days', NOW() + INTERVAL '5 days 3 hours', 'Med', 'Network firmware upgrade on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Draft', NULL, NULL, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour');
+    ('e0000420-4200-4200-4200-000000000001', 'DEFRA', NOW() + INTERVAL '2 days', NOW() + INTERVAL '2 days 4 hours', 'High', 'Scheduled database maintenance on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Draft', NULL, NULL, NOW() - INTERVAL '12 hours', NOW() - INTERVAL '12 hours'),
+    ('e0000420-4200-4200-4200-000000000002', 'GBLON', NOW() - INTERVAL '6 hours', NOW() - INTERVAL '1 hour', 'Critical', 'Emergency storage expansion on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Sent', NOW() - INTERVAL '5 hours 30 minutes', 'bob.engineer', NOW() - INTERVAL '7 hours', NOW() - INTERVAL '5 hours'),
+    ('e0000420-4200-4200-4200-000000000003', 'FRPAR', NOW() + INTERVAL '5 days', NOW() + INTERVAL '5 days 3 hours', 'Med', 'Network firmware upgrade on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.', 'Draft', NULL, NULL, NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour');
 
 INSERT INTO outage_notice_systems (notice_id, system_name) VALUES
-    ('e0000420-4200-4200-4200-000000000001', 'love-db-cluster'),
-    ('e0000420-4200-4200-4200-000000000001', 'love-app-servers'),
-    ('e0000420-4200-4200-4200-000000000002', 'bur1-vsan-cluster'),
-    ('e0000420-4200-4200-4200-000000000002', 'bur1-esx-hosts'),
-    ('e0000420-4200-4200-4200-000000000003', 'ccss-core-switch'),
-    ('e0000420-4200-4200-4200-000000000003', 'ccss-edge-firewall');
+    ('e0000420-4200-4200-4200-000000000001', 'defra-db-cluster'),
+    ('e0000420-4200-4200-4200-000000000001', 'defra-app-servers'),
+    ('e0000420-4200-4200-4200-000000000002', 'gblon-vsan-cluster'),
+    ('e0000420-4200-4200-4200-000000000002', 'gblon-esx-hosts'),
+    ('e0000420-4200-4200-4200-000000000003', 'frpar-core-switch'),
+    ('e0000420-4200-4200-4200-000000000003', 'frpar-edge-firewall');

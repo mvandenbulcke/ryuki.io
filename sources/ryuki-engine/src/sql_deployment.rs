@@ -341,7 +341,7 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
         if cpu < 4 {
             warnings.push("FCI deployments benefit from at least 4 CPU cores".into());
         }
-        warnings.push("FCI requires shared storage (SAN/FC) and Windows Server Failover Clustering pre-configured".into());
+        warnings.push("FCI requires shared storage (SAN/FC) and Windows Server Faidefrar Clustering pre-configured".into());
         remediation.push("Verify WSFC cluster exists and shared storage is available before deployment".into());
     }
 
@@ -352,7 +352,7 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
         if cpu < 4 {
             warnings.push("AG deployments benefit from at least 4 CPU cores per node".into());
         }
-        warnings.push("AG requires Windows Server Failover Clustering and at least 2 nodes".into());
+        warnings.push("AG requires Windows Server Faidefrar Clustering and at least 2 nodes".into());
         remediation.push("Ensure 2+ nodes, WSFC, and AG listener DNS record are pre-provisioned".into());
     }
 
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn test_plan_deployment_basic() {
         let result = plan_deployment(json!({
-            "instance_name": "LOVE-SQL-TEST-01",
+            "instance_name": "DEFRA-SQL-TEST-01",
             "sql_version": "2022",
             "edition": "Standard",
             "cpu": 4,
@@ -644,13 +644,13 @@ mod tests {
             "tempdb_disk_gb": 50,
             "collation": "Latin1_General_CI_AS",
             "service_account": "svc-sql-test@ryuki.local",
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "Standalone"
         }))
         .unwrap();
 
-        assert_eq!(result["instance_name"], "LOVE-SQL-TEST-01");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["instance_name"], "DEFRA-SQL-TEST-01");
+        assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["status"], "planned");
         assert!(result["deployment_id"].as_str().unwrap().starts_with("sql-"));
         assert!(result["disk_layout"]["data"]["size_gb"].as_u64().unwrap() == 200);
@@ -669,12 +669,12 @@ mod tests {
     #[test]
     fn test_validate_deployment_all_passing() {
         let result = validate_deployment(json!({
-            "instance_name": "LOVE-SQL-01",
+            "instance_name": "DEFRA-SQL-01",
             "sql_version": "2022",
             "edition": "Enterprise",
             "cpu": 8,
             "memory_gb": 64,
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "AG",
             "service_account": "svc-sql@ryuki.local"
         }))
@@ -710,7 +710,7 @@ mod tests {
             "edition": "Standard",
             "cpu": 4,
             "memory_gb": 16,
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "Standalone",
             "service_account": "svc@ryuki.local"
         }))
@@ -729,7 +729,7 @@ mod tests {
     #[test]
     fn test_install_configure_verify_backup_monitoring_flow() {
         plan_deployment(json!({
-            "instance_name": "BUR1-SQL-DEV-01",
+            "instance_name": "GBLON-SQL-DEV-01",
             "sql_version": "2022",
             "edition": "Developer",
             "cpu": 2,
@@ -739,7 +739,7 @@ mod tests {
             "tempdb_disk_gb": 30,
             "collation": "SQL_Latin1_General_CP1_CI_AS",
             "service_account": "svc-dev@ryuki.local",
-            "site": "BUR1",
+            "site": "GBLON",
             "cluster_mode": "Standalone"
         }))
         .unwrap();
@@ -747,7 +747,7 @@ mod tests {
         let store = deployment_store().lock().unwrap();
         let deployment_id = store
             .iter()
-            .find(|d| d.instance_name == "BUR1-SQL-DEV-01")
+            .find(|d| d.instance_name == "GBLON-SQL-DEV-01")
             .map(|d| d.id.clone())
             .unwrap();
         drop(store);
@@ -823,7 +823,7 @@ mod tests {
             "edition": "Developer",
             "cpu": 4,
             "memory_gb": 16,
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "Standalone",
             "service_account": "svc@ryuki.local"
         }))
@@ -847,7 +847,7 @@ mod tests {
             "edition": "Enterprise",
             "cpu": 8,
             "memory_gb": 64,
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "FCI",
             "service_account": "svc@ryuki.local"
         }))
@@ -871,7 +871,7 @@ mod tests {
             "edition": "Enterprise",
             "cpu": 4,
             "memory_gb": 16,
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "Standalone",
             "service_account": "svc@ryuki.local"
         }))
@@ -900,7 +900,7 @@ mod tests {
             "tempdb_disk_gb": 30,
             "collation": "Latin1_General_CI_AS",
             "service_account": "svc@ryuki.local",
-            "site": "LOVE",
+            "site": "DEFRA",
             "cluster_mode": "Standalone"
         }));
         assert!(result.is_err());

@@ -56,7 +56,7 @@ fn seed_certificates() -> Vec<CertificateRecord> {
             valid_to: (now + chrono::Duration::days(60)).to_rfc3339(),
             service_type: "IIS".into(),
             hostname: "web01.corp.local".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             status: CertificateStatus::Expiring,
             created_at: now.to_rfc3339(),
         },
@@ -68,7 +68,7 @@ fn seed_certificates() -> Vec<CertificateRecord> {
             valid_to: (now + chrono::Duration::days(185)).to_rfc3339(),
             service_type: "VMware".into(),
             hostname: "vcenter.corp.local".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             status: CertificateStatus::Active,
             created_at: now.to_rfc3339(),
         },
@@ -80,7 +80,7 @@ fn seed_certificates() -> Vec<CertificateRecord> {
             valid_to: (now - chrono::Duration::days(30)).to_rfc3339(),
             service_type: "ESXi".into(),
             hostname: "esxi01.corp.local".into(),
-            site: "ALBI".into(),
+            site: "FRPAR".into(),
             status: CertificateStatus::Expired,
             created_at: now.to_rfc3339(),
         },
@@ -235,7 +235,7 @@ mod tests {
             subject: "CN=test.local".into(),
             service_type: "IIS".into(),
             hostname: "web02.corp.local".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             validity_days: 365,
         }
     }
@@ -275,7 +275,7 @@ mod tests {
         let record = result.unwrap();
         assert_eq!(record.common_name, "test.local");
         assert_eq!(record.status, CertificateStatus::Active);
-        assert_eq!(record.site, "BUR1");
+        assert_eq!(record.site, "GBLON");
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_check_expiry_finds_expiring() {
-        let results = check_expiry("BUR1", 90);
+        let results = check_expiry("GBLON", 90);
         assert!(!results.is_empty());
         let expiring: Vec<&CertificateRecord> = results
             .iter()

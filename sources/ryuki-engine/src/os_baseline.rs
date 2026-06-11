@@ -3,10 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BaselineCheck {
@@ -116,11 +113,11 @@ fn ensure_seeded() {
     let _ = RESULT_STORE.get_or_init(|| {
         let mut results = Vec::new();
         let servers = [
-            ("srv-love-dc01", "LOVE"),
-            ("srv-love-web01", "LOVE"),
-            ("srv-bur1-db01", "BUR1"),
-            ("srv-ccss-app01", "CCSS"),
-            ("srv-tor1-fs01", "TOR1"),
+            ("srv-defra-dc01", "DEFRA"),
+            ("srv-defra-web01", "DEFRA"),
+            ("srv-gblon-db01", "GBLON"),
+            ("srv-frpar-app01", "FRPAR"),
+            ("srv-nlams-fs01", "NLAMS"),
         ];
         let checks = CHECK_STORE.get().unwrap().lock().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -165,10 +162,11 @@ fn result_store() -> &'static Mutex<Vec<BaselineResult>> {
 
 fn server_site(server_name: &str) -> &str {
     match server_name {
-        n if n.contains("love") => "LOVE",
-        n if n.contains("bur1") => "BUR1",
-        n if n.contains("ccss") => "CCSS",
-        n if n.contains("tor1") => "TOR1",
+        n if n.contains("defra") => "DEFRA",
+        n if n.contains("gblon") => "GBLON",
+        n if n.contains("frpar") => "FRPAR",
+        n if n.contains("nlams") => "NLAMS",
+        n if n.contains("deber") => "DEBER",
         _ => "UNKNOWN",
     }
 }
@@ -360,15 +358,15 @@ mod tests {
 
     #[test]
     fn test_check_server_compliance_returns_results() {
-        let results = check_server_compliance("srv-love-dc01");
+        let results = check_server_compliance("srv-defra-dc01");
         assert_eq!(results.len(), 4);
         assert!(results.iter().all(|r| r.compliant));
     }
 
     #[test]
     fn test_check_site_compliance_valid_site() {
-        let summary = check_site_compliance("LOVE").unwrap();
-        assert_eq!(summary.site, "LOVE");
+        let summary = check_site_compliance("DEFRA").unwrap();
+        assert_eq!(summary.site, "DEFRA");
         assert_eq!(summary.total_servers, 2);
         assert_eq!(summary.total_checks, 8);
         assert!(summary.compliance_percentage > 0.0);
@@ -381,17 +379,17 @@ mod tests {
 
     #[test]
     fn test_get_noncompliant_returns_failures() {
-        let noncompliant = get_noncompliant("BUR1").unwrap();
+        let noncompliant = get_noncompliant("GBLON").unwrap();
         let db_server = noncompliant
             .iter()
-            .find(|s| s.server_name == "srv-bur1-db01");
+            .find(|s| s.server_name == "srv-gblon-db01");
         assert!(db_server.is_some());
         assert!(db_server.unwrap().total_failures > 0);
     }
 
     #[test]
     fn test_get_compliance_trend() {
-        let trend = get_compliance_trend("LOVE").unwrap();
+        let trend = get_compliance_trend("DEFRA").unwrap();
         assert_eq!(trend.len(), 6);
         assert!(trend.last().unwrap().compliance_percentage > 80.0);
     }
@@ -407,12 +405,12 @@ mod tests {
 
     #[test]
     fn test_remediate_finding() {
-        let result = remediate_finding("srv-ccss-app01", "bc-001").unwrap();
+        let result = remediate_finding("srv-frpar-app01", "bc-001").unwrap();
         assert_eq!(result["remediated"], true);
         assert_eq!(result["check_id"], "bc-001");
         assert_eq!(result["dry_run"], true);
 
-        let updated = check_server_compliance("srv-ccss-app01");
+        let updated = check_server_compliance("srv-frpar-app01");
         let fixed = updated.iter().find(|r| r.check_id == "bc-001").unwrap();
         assert!(fixed.compliant);
     }
@@ -424,19 +422,19 @@ mod tests {
 
     #[test]
     fn test_get_noncompliant_empty_for_compliant_site() {
-        let noncompliant = get_noncompliant("LOVE").unwrap();
+        let noncompliant = get_noncompliant("DEFRA").unwrap();
         let dc_server = noncompliant
             .iter()
-            .find(|s| s.server_name == "srv-love-dc01");
+            .find(|s| s.server_name == "srv-defra-dc01");
         assert!(dc_server.is_none());
     }
 
     #[test]
     fn test_server_site_mapping() {
-        assert_eq!(server_site("srv-love-dc01"), "LOVE");
-        assert_eq!(server_site("srv-bur1-db01"), "BUR1");
-        assert_eq!(server_site("srv-ccss-app01"), "CCSS");
-        assert_eq!(server_site("srv-tor1-fs01"), "TOR1");
+        assert_eq!(server_site("srv-defra-dc01"), "DEFRA");
+        assert_eq!(server_site("srv-gblon-db01"), "GBLON");
+        assert_eq!(server_site("srv-frpar-app01"), "FRPAR");
+        assert_eq!(server_site("srv-nlams-fs01"), "NLAMS");
         assert_eq!(server_site("unknown-server"), "UNKNOWN");
     }
 }

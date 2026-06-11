@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum LogSourceType {
@@ -144,63 +141,63 @@ pub fn seed_hosts() -> Vec<LogSource> {
     vec![
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000001".into(),
-            hostname: "srv-love-01.ryuki.local".into(),
+            hostname: "srv-defra-01.ryuki.local".into(),
             source_type: LogSourceType::WindowsEventLog,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             status: ForwardingStatus::Active,
             log_volume_per_day_mb: 450,
             retention_days: 90,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000002".into(),
-            hostname: "srv-love-02.ryuki.local".into(),
+            hostname: "srv-defra-02.ryuki.local".into(),
             source_type: LogSourceType::Syslog,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             status: ForwardingStatus::Active,
             log_volume_per_day_mb: 120,
             retention_days: 90,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000003".into(),
-            hostname: "srv-bur1-01.ryuki.local".into(),
+            hostname: "srv-gblon-01.ryuki.local".into(),
             source_type: LogSourceType::WindowsEventLog,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             status: ForwardingStatus::Configured,
             log_volume_per_day_mb: 380,
             retention_days: 60,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000004".into(),
-            hostname: "srv-ccss-web.ryuki.local".into(),
+            hostname: "srv-frpar-web.ryuki.local".into(),
             source_type: LogSourceType::IIS,
-            site: "CCSS".into(),
+            site: "FRPAR".into(),
             status: ForwardingStatus::Failed,
             log_volume_per_day_mb: 2100,
             retention_days: 30,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000005".into(),
-            hostname: "srv-tor1-lnx.ryuki.local".into(),
+            hostname: "srv-nlams-lnx.ryuki.local".into(),
             source_type: LogSourceType::Auditd,
-            site: "TOR1".into(),
+            site: "NLAMS".into(),
             status: ForwardingStatus::NotConfigured,
             log_volume_per_day_mb: 85,
             retention_days: 90,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000006".into(),
-            hostname: "srv-love-web.ryuki.local".into(),
+            hostname: "srv-defra-web.ryuki.local".into(),
             source_type: LogSourceType::IIS,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             status: ForwardingStatus::Active,
             log_volume_per_day_mb: 3200,
             retention_days: 90,
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000007".into(),
-            hostname: "srv-bur1-lnx.ryuki.local".into(),
+            hostname: "srv-gblon-lnx.ryuki.local".into(),
             source_type: LogSourceType::Syslog,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             status: ForwardingStatus::Active,
             log_volume_per_day_mb: 90,
             retention_days: 90,
@@ -578,26 +575,26 @@ mod tests {
         let result = onboard_host(
             "srv-new.ryuki.local",
             &[LogSourceType::WindowsEventLog, LogSourceType::Syslog],
-            "LOVE",
+            "DEFRA",
         )
         .expect("onboard should succeed");
         assert!(result.success);
         assert_eq!(result.hostname, "srv-new.ryuki.local");
-        assert_eq!(result.site, "LOVE");
+        assert_eq!(result.site, "DEFRA");
         assert_eq!(result.configured_sources.len(), 2);
         assert!(result.message.contains("DRY-RUN"));
     }
 
     #[test]
     fn test_onboard_host_empty_hostname() {
-        let result = onboard_host("", &[LogSourceType::WindowsEventLog], "LOVE");
+        let result = onboard_host("", &[LogSourceType::WindowsEventLog], "DEFRA");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("hostname"));
     }
 
     #[test]
     fn test_onboard_host_empty_sources() {
-        let result = onboard_host("srv-test.ryuki.local", &[], "LOVE");
+        let result = onboard_host("srv-test.ryuki.local", &[], "DEFRA");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("source_types"));
     }
@@ -615,10 +612,10 @@ mod tests {
 
     #[test]
     fn test_validate_config_known_host() {
-        let result = validate_config("srv-love-01.ryuki.local")
+        let result = validate_config("srv-defra-01.ryuki.local")
             .expect("validate should succeed for known host");
         assert!(result.valid);
-        assert_eq!(result.hostname, "srv-love-01.ryuki.local");
+        assert_eq!(result.hostname, "srv-defra-01.ryuki.local");
         assert!(!result.configured_sources.is_empty());
     }
 
@@ -632,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_verify_forwarding_active_host() {
-        let result = verify_forwarding("srv-love-01.ryuki.local")
+        let result = verify_forwarding("srv-defra-01.ryuki.local")
             .expect("verify should succeed");
         assert!(result.verified);
         assert!(result.siem_received);
@@ -649,8 +646,8 @@ mod tests {
 
     #[test]
     fn test_get_coverage_report_valid_site() {
-        let result = get_coverage_report("LOVE").expect("coverage report should succeed");
-        assert_eq!(result.site, "LOVE");
+        let result = get_coverage_report("DEFRA").expect("coverage report should succeed");
+        assert_eq!(result.site, "DEFRA");
         assert!(result.total_hosts > 0);
     }
 
@@ -662,28 +659,28 @@ mod tests {
 
     #[test]
     fn test_get_gap_report() {
-        let result = get_gap_report("CCSS").expect("gap report should succeed");
-        assert_eq!(result.site, "CCSS");
+        let result = get_gap_report("FRPAR").expect("gap report should succeed");
+        assert_eq!(result.site, "FRPAR");
         assert!(!result.required_sources.is_empty());
     }
 
     #[test]
     fn test_get_volume_report() {
-        let result = get_volume_report("LOVE").expect("volume report should succeed");
-        assert_eq!(result.site, "LOVE");
+        let result = get_volume_report("DEFRA").expect("volume report should succeed");
+        assert_eq!(result.site, "DEFRA");
         assert!(result.total_volume_mb_per_day > 0);
         assert!(!result.top_talkers.is_empty());
     }
 
     #[test]
     fn test_get_retention_status() {
-        let result = get_retention_status("BUR1").expect("retention status should succeed");
-        assert_eq!(result.site, "BUR1");
+        let result = get_retention_status("GBLON").expect("retention status should succeed");
+        assert_eq!(result.site, "GBLON");
     }
 
     #[test]
     fn test_disable_forwarding_known_host() {
-        let result = disable_forwarding("srv-love-01.ryuki.local")
+        let result = disable_forwarding("srv-defra-01.ryuki.local")
             .expect("disable should succeed");
         assert!(result.success);
         assert!(result.message.contains("DRY-RUN"));
@@ -740,13 +737,13 @@ mod tests {
         let result = OnboardingResult {
             success: true,
             hostname: "srv-test.ryuki.local".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             configured_sources: vec![LogSourceType::WindowsEventLog],
             message: "DRY-RUN: done".into(),
         };
         let json = serde_json::to_string(&result).expect("serialization should work");
         assert!(json.contains("srv-test.ryuki.local"));
-        assert!(json.contains("LOVE"));
+        assert!(json.contains("DEFRA"));
         let deserialized: OnboardingResult =
             serde_json::from_str(&json).expect("deserialization should work");
         assert!(deserialized.success);

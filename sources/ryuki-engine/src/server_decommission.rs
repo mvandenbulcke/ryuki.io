@@ -2,10 +2,7 @@ use crate::models::*;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 const DEPENDENCY_CATEGORIES: &[&str] = &[
     "backup-retention",
@@ -364,7 +361,7 @@ mod tests {
     fn make_test_request() -> DecommissionRequest {
         plan_decommission(
             "srv-app-01",
-            "LOVE",
+            "DEFRA",
             "Windows",
             ServerType::VM,
             "End of lifecycle — application retired",
@@ -388,7 +385,7 @@ mod tests {
     #[test]
     fn test_plan_decommission_empty_server_name_fails() {
         assert!(
-            plan_decommission("", "LOVE", "Windows", ServerType::VM, "reason", true, 30,).is_err()
+            plan_decommission("", "DEFRA", "Windows", ServerType::VM, "reason", true, 30,).is_err()
         );
     }
 
@@ -413,7 +410,7 @@ mod tests {
         assert!(
             plan_decommission(
                 "srv-01",
-                "LOVE",
+                "DEFRA",
                 "Windows",
                 ServerType::VM,
                 "reason",
@@ -428,7 +425,7 @@ mod tests {
     fn test_plan_physical_server() {
         let req = plan_decommission(
             "srv-phys-01",
-            "BUR1",
+            "GBLON",
             "Linux",
             ServerType::Physical,
             "Hardware refresh",

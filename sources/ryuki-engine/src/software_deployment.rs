@@ -3,10 +3,7 @@ use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 static PACKAGE_STORE: OnceLock<Mutex<Vec<ApprovedPackage>>> = OnceLock::new();
 static DEPLOYMENT_STORE: OnceLock<Mutex<Vec<DeploymentRecord>>> = OnceLock::new();
@@ -147,7 +144,7 @@ fn seed_packages() -> Vec<ApprovedPackage> {
             package_type: PackageType::Msi,
             approved_by: "backup-team".into(),
             approved_date: "2026-04-10".into(),
-            site_scope: SiteScope::Specific(vec!["LOVE".into(), "BUR1".into(), "TOR1".into()]),
+            site_scope: SiteScope::Specific(vec!["DEFRA".into(), "GBLON".into(), "NLAMS".into()]),
         },
         ApprovedPackage {
             id: "pkg-qualys-agent".into(),
@@ -176,7 +173,7 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
     vec![
         DeploymentRecord {
             id: "dep-001".into(),
-            server_name: "w-love-srv-01".into(),
+            server_name: "w-defra-srv-01".into(),
             package_id: "pkg-zabbix-agent".into(),
             package_name: "Zabbix Agent 7.0".into(),
             target_version: "7.0.4".into(),
@@ -191,7 +188,7 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
         },
         DeploymentRecord {
             id: "dep-002".into(),
-            server_name: "l-bur1-srv-03".into(),
+            server_name: "l-gblon-srv-03".into(),
             package_id: "pkg-crowdstrike-sensor".into(),
             package_name: "CrowdStrike Falcon Sensor".into(),
             target_version: "7.11.0".into(),
@@ -206,7 +203,7 @@ fn seed_deployments() -> Vec<DeploymentRecord> {
         },
         DeploymentRecord {
             id: "dep-003".into(),
-            server_name: "w-tor1-srv-02".into(),
+            server_name: "w-nlams-srv-02".into(),
             package_id: "pkg-qualys-agent".into(),
             package_name: "Qualys Cloud Agent".into(),
             target_version: "5.2.0".into(),
@@ -537,7 +534,7 @@ pub fn get_software_contract() -> Value {
         "liveExecutionAllowed": false,
         "supportedWorkflows": ["get-packages", "validate", "plan", "approve", "execute", "verify", "history", "compliance"],
         "validPackageTypes": ["msi", "exe", "apt", "rpm", "script"],
-        "validSites": ["LOVE","BUR1","CCSS","TOR1","TRUJ","VILL","ALBI","AOST","MACL","SSYM","WIJH","RMA1","PITE"],
+        "validSites": ["DEFRA","GBLON","FRPAR","NLAMS","DEBER","DEFRA","FRPAR","GBLON","NLAMS","DEBER","GBLON","FRPAR","NLAMS"],
         "requiredInputs": ["serverName", "packageId", "targetVersion", "requester"],
         "requiredGuards": ["package-approved", "server-online", "no-conflicting-deployments", "approval-route-assigned", "evidence-redacted"],
         "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "package-not-approved", "server-offline", "conflicting-deployment", "approval-missing", "evidence-not-redacted"],
@@ -557,16 +554,16 @@ mod tests {
 
     #[test]
     fn test_get_approved_packages_by_site() {
-        let love_packages = get_approved_packages(Some("LOVE"));
-        assert!(love_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
-        assert!(love_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
-        assert!(love_packages.iter().any(|p| p.id == "pkg-qualys-agent"));
-        assert!(love_packages.iter().any(|p| p.id == "pkg-crowdstrike-sensor"));
-        assert!(love_packages.iter().any(|p| p.id == "pkg-ms-teams"));
+        let defra_packages = get_approved_packages(Some("DEFRA"));
+        assert!(defra_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
+        assert!(defra_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
+        assert!(defra_packages.iter().any(|p| p.id == "pkg-qualys-agent"));
+        assert!(defra_packages.iter().any(|p| p.id == "pkg-crowdstrike-sensor"));
+        assert!(defra_packages.iter().any(|p| p.id == "pkg-ms-teams"));
 
-        let macl_packages = get_approved_packages(Some("MACL"));
-        assert!(macl_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
-        assert!(!macl_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
+        let nlams_packages = get_approved_packages(Some("NLAMS"));
+        assert!(nlams_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
+        assert!(!nlams_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
     }
 
     #[test]
@@ -586,7 +583,7 @@ mod tests {
     #[test]
     fn test_validate_deployment_unknown_package() {
         let request = DeploymentRequest {
-            server_name: "w-love-srv-01".into(),
+            server_name: "w-defra-srv-01".into(),
             package_id: "pkg-unknown".into(),
             target_version: "1.0".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -600,7 +597,7 @@ mod tests {
     #[test]
     fn test_validate_deployment_valid() {
         let request = DeploymentRequest {
-            server_name: "w-love-srv-01".into(),
+            server_name: "w-defra-srv-01".into(),
             package_id: "pkg-zabbix-agent".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -613,7 +610,7 @@ mod tests {
     #[test]
     fn test_plan_deployment_creates_record() {
         let request = DeploymentRequest {
-            server_name: "w-love-srv-02".into(),
+            server_name: "w-defra-srv-02".into(),
             package_id: "pkg-zabbix-agent".into(),
             target_version: "7.0.4".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -630,7 +627,7 @@ mod tests {
     #[test]
     fn test_plan_deployment_unknown_package_fails() {
         let request = DeploymentRequest {
-            server_name: "w-love-srv-02".into(),
+            server_name: "w-defra-srv-02".into(),
             package_id: "pkg-unknown".into(),
             target_version: "1.0".into(),
             scheduled_time: "2026-06-15T22:00:00Z".into(),
@@ -642,7 +639,7 @@ mod tests {
     #[test]
     fn test_approve_deployment() {
         let request = DeploymentRequest {
-            server_name: "w-love-srv-03".into(),
+            server_name: "w-defra-srv-03".into(),
             package_id: "pkg-qualys-agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-16T22:00:00Z".into(),
@@ -662,7 +659,7 @@ mod tests {
     #[test]
     fn test_execute_deployment() {
         let request = DeploymentRequest {
-            server_name: "w-bur1-srv-01".into(),
+            server_name: "w-gblon-srv-01".into(),
             package_id: "pkg-crowdstrike-sensor".into(),
             target_version: "7.11.0".into(),
             scheduled_time: "2026-06-18T23:00:00Z".into(),
@@ -679,7 +676,7 @@ mod tests {
     #[test]
     fn test_execute_deployment_not_approved_fails() {
         let request = DeploymentRequest {
-            server_name: "w-bur1-srv-02".into(),
+            server_name: "w-gblon-srv-02".into(),
             package_id: "pkg-ms-teams".into(),
             target_version: "24091.214.2846.4154".into(),
             scheduled_time: "2026-06-17T22:00:00Z".into(),
@@ -697,7 +694,7 @@ mod tests {
     #[test]
     fn test_verify_deployment() {
         let request = DeploymentRequest {
-            server_name: "w-tor1-srv-03".into(),
+            server_name: "w-nlams-srv-03".into(),
             package_id: "pkg-qualys-agent".into(),
             target_version: "5.2.0".into(),
             scheduled_time: "2026-06-19T22:00:00Z".into(),
@@ -716,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_get_deployment_history() {
-        let history = get_deployment_history("w-love-srv-01");
+        let history = get_deployment_history("w-defra-srv-01");
         assert!(!history.is_empty());
         assert!(history.iter().any(|d| d.id == "dep-001"));
     }
@@ -729,10 +726,10 @@ mod tests {
 
     #[test]
     fn test_get_package_compliance() {
-        let compliance = get_package_compliance("LOVE").unwrap();
+        let compliance = get_package_compliance("DEFRA").unwrap();
         assert_eq!(compliance["source"], "dry-run");
         assert_eq!(compliance["dry_run"], true);
-        assert_eq!(compliance["site"], "LOVE");
+        assert_eq!(compliance["site"], "DEFRA");
         assert!(compliance["packages"].as_array().unwrap().len() >= 4);
     }
 

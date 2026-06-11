@@ -100,9 +100,9 @@ fn seed_data() -> NoticeStore {
     let now = Utc::now();
     vec![
         OutageNotice {
-            id: "oc-love-001".into(),
-            site: "LOVE".into(),
-            affected_systems: vec!["love-db-cluster".into(), "love-app-servers".into()],
+            id: "oc-defra-001".into(),
+            site: "DEFRA".into(),
+            affected_systems: vec!["defra-db-cluster".into(), "defra-app-servers".into()],
             start_time: (now + Days::new(2)).to_rfc3339(),
             end_time: (now + Days::new(2) + chrono::Duration::hours(4)).to_rfc3339(),
             impact_level: ImpactLevel::High,
@@ -118,9 +118,9 @@ fn seed_data() -> NoticeStore {
             ],
         },
         OutageNotice {
-            id: "oc-bur1-001".into(),
-            site: "BUR1".into(),
-            affected_systems: vec!["bur1-vsan-cluster".into(), "bur1-esx-hosts".into()],
+            id: "oc-gblon-001".into(),
+            site: "GBLON".into(),
+            affected_systems: vec!["gblon-vsan-cluster".into(), "gblon-esx-hosts".into()],
             start_time: (now - chrono::Duration::hours(6)).to_rfc3339(),
             end_time: (now - chrono::Duration::hours(1)).to_rfc3339(),
             impact_level: ImpactLevel::Critical,
@@ -136,9 +136,9 @@ fn seed_data() -> NoticeStore {
             ],
         },
         OutageNotice {
-            id: "oc-ccss-001".into(),
-            site: "CCSS".into(),
-            affected_systems: vec!["ccss-core-switch".into(), "ccss-edge-firewall".into()],
+            id: "oc-frpar-001".into(),
+            site: "FRPAR".into(),
+            affected_systems: vec!["frpar-core-switch".into(), "frpar-edge-firewall".into()],
             start_time: (now + Days::new(5)).to_rfc3339(),
             end_time: (now + Days::new(5) + chrono::Duration::hours(3)).to_rfc3339(),
             impact_level: ImpactLevel::Med,
@@ -521,16 +521,16 @@ mod tests {
     #[test]
     fn test_create_notice_succeeds() {
         let notice = create_notice(
-            "LOVE",
-            vec!["love-app-01".into()],
+            "DEFRA",
+            vec!["defra-app-01".into()],
             "2026-07-01T10:00:00Z",
             "2026-07-01T14:00:00Z",
             "High",
         )
         .unwrap();
 
-        assert!(notice.id.starts_with("oc-love-"));
-        assert_eq!(notice.site, "LOVE");
+        assert!(notice.id.starts_with("oc-defra-"));
+        assert_eq!(notice.site, "DEFRA");
         assert_eq!(notice.impact_level, ImpactLevel::High);
         assert_eq!(notice.status, NoticeStatus::Draft);
         assert_eq!(notice.affected_systems.len(), 1);
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn test_create_notice_invalid_impact() {
         let result = create_notice(
-            "LOVE",
+            "DEFRA",
             vec!["srv".into()],
             "2026-07-01T10:00:00Z",
             "2026-07-01T14:00:00Z",
@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn test_create_notice_invalid_time_range() {
         let result = create_notice(
-            "LOVE",
+            "DEFRA",
             vec!["srv".into()],
             "2026-07-01T14:00:00Z",
             "2026-07-01T10:00:00Z",
@@ -574,12 +574,12 @@ mod tests {
 
     #[test]
     fn test_preview_notice_renders_template() {
-        let preview = preview_notice("oc-love-001").unwrap();
-        assert_eq!(preview["notice_id"], "oc-love-001");
+        let preview = preview_notice("oc-defra-001").unwrap();
+        assert_eq!(preview["notice_id"], "oc-defra-001");
         assert_eq!(preview["status"], "draft");
         let rendered = preview["rendered_message"].as_str().unwrap();
-        assert!(rendered.contains("LOVE"));
-        assert!(rendered.contains("love-db-cluster"));
+        assert!(rendered.contains("DEFRA"));
+        assert!(rendered.contains("defra-db-cluster"));
         assert!(!rendered.contains("{{site}}"));
     }
 
@@ -591,8 +591,8 @@ mod tests {
     #[test]
     fn test_send_notice() {
         let notice = create_notice(
-            "BUR1",
-            vec!["bur1-app-01".into()],
+            "GBLON",
+            vec!["gblon-app-01".into()],
             "2026-08-01T10:00:00Z",
             "2026-08-01T14:00:00Z",
             "Med",
@@ -606,14 +606,14 @@ mod tests {
 
     #[test]
     fn test_send_notice_already_sent() {
-        assert!(send_notice("oc-bur1-001").is_err());
+        assert!(send_notice("oc-gblon-001").is_err());
     }
 
     #[test]
     fn test_acknowledge_notice() {
         let notice = create_notice(
-            "ALBI",
-            vec!["albi-srv-01".into()],
+            "FRPAR",
+            vec!["frpar-srv-01".into()],
             "2026-08-02T10:00:00Z",
             "2026-08-02T12:00:00Z",
             "Low",
@@ -632,14 +632,14 @@ mod tests {
 
     #[test]
     fn test_acknowledge_notice_not_sent() {
-        assert!(acknowledge_notice("oc-love-001", "user").is_err());
+        assert!(acknowledge_notice("oc-defra-001", "user").is_err());
     }
 
     #[test]
     fn test_complete_notice() {
         let notice = create_notice(
-            "TOR1",
-            vec!["tor1-srv-01".into()],
+            "NLAMS",
+            vec!["nlams-srv-01".into()],
             "2026-08-03T08:00:00Z",
             "2026-08-03T10:00:00Z",
             "High",
@@ -657,14 +657,14 @@ mod tests {
 
     #[test]
     fn test_complete_notice_not_sent() {
-        assert!(complete_notice("oc-ccss-001").is_err());
+        assert!(complete_notice("oc-frpar-001").is_err());
     }
 
     #[test]
     fn test_cancel_notice() {
         let notice = create_notice(
-            "VILL",
-            vec!["vill-srv-01".into()],
+            "DEFRA",
+            vec!["defra-srv-01".into()],
             "2026-08-04T10:00:00Z",
             "2026-08-04T12:00:00Z",
             "Med",
@@ -678,8 +678,8 @@ mod tests {
     #[test]
     fn test_cancel_notice_already_completed() {
         let notice = create_notice(
-            "AOST",
-            vec!["aost-srv-01".into()],
+            "GBLON",
+            vec!["gblon-srv-01".into()],
             "2026-07-01T10:00:00Z",
             "2026-07-01T14:00:00Z",
             "Low",
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn test_get_active_notices() {
-        let active = get_active_notices("LOVE");
+        let active = get_active_notices("DEFRA");
         assert!(!active.is_empty());
         for notice in &active {
             assert!(notice.status != NoticeStatus::Completed);
@@ -705,8 +705,8 @@ mod tests {
     #[test]
     fn test_get_notice_history() {
         let notice = create_notice(
-            "TRUJ",
-            vec!["truj-srv-01".into()],
+            "DEBER",
+            vec!["deber-srv-01".into()],
             "2026-06-10T08:00:00Z",
             "2026-06-10T10:00:00Z",
             "Low",
@@ -716,15 +716,15 @@ mod tests {
         let _ack = acknowledge_notice(&notice.id, "user").unwrap();
         let _completed = complete_notice(&notice.id).unwrap();
 
-        let history = get_notice_history("TRUJ");
+        let history = get_notice_history("DEBER");
         assert!(!history.is_empty());
         assert!(history.iter().any(|n| n.id == notice.id));
     }
 
     #[test]
     fn test_get_upcoming() {
-        let upcoming = get_upcoming("LOVE");
-        assert!(!upcoming.is_empty(), "oc-love-001 is 2 days in the future");
+        let upcoming = get_upcoming("DEFRA");
+        assert!(!upcoming.is_empty(), "oc-defra-001 is 2 days in the future");
         for notice in &upcoming {
             assert!(notice.status != NoticeStatus::Cancelled);
             assert!(notice.status != NoticeStatus::Completed);
@@ -736,18 +736,18 @@ mod tests {
         let all = get_all_notices("");
         assert!(all.len() >= 3);
 
-        let love = get_all_notices("LOVE");
-        assert!(!love.is_empty());
-        for n in &love {
-            assert_eq!(n.site, "LOVE");
+        let defra = get_all_notices("DEFRA");
+        assert!(!defra.is_empty());
+        for n in &defra {
+            assert_eq!(n.site, "DEFRA");
         }
     }
 
     #[test]
     fn test_get_notice() {
-        let notice = get_notice("oc-love-001").unwrap();
-        assert_eq!(notice.id, "oc-love-001");
-        assert_eq!(notice.site, "LOVE");
+        let notice = get_notice("oc-defra-001").unwrap();
+        assert_eq!(notice.id, "oc-defra-001");
+        assert_eq!(notice.site, "DEFRA");
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn test_create_notice_empty_systems() {
         let result = create_notice(
-            "LOVE",
+            "DEFRA",
             vec![],
             "2026-07-01T10:00:00Z",
             "2026-07-01T14:00:00Z",
@@ -816,15 +816,15 @@ mod tests {
 
     #[test]
     fn test_get_notice_history_empty_for_new_site() {
-        let history = get_notice_history("MACL");
+        let history = get_notice_history("NLAMS");
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_get_active_notices_empty_for_completed_site() {
         let notice = create_notice(
-            "SSYM",
-            vec!["ssym-srv-01".into()],
+            "DEBER",
+            vec!["deber-srv-01".into()],
             "2026-06-09T08:00:00Z",
             "2026-06-09T10:00:00Z",
             "Low",
@@ -834,7 +834,7 @@ mod tests {
         let _ack = acknowledge_notice(&notice.id, "user").unwrap();
         let _completed = complete_notice(&notice.id).unwrap();
 
-        let active = get_active_notices("SSYM");
+        let active = get_active_notices("DEBER");
         assert!(active.is_empty());
     }
 }

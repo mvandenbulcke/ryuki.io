@@ -855,13 +855,13 @@ mod tests {
             RequestType::ServerDeployment,
             "alice".into(),
             "bob".into(),
-            "LOVE".into(),
+            "DEFRA".into(),
             "production".into(),
             "critical".into(),
         );
         assert_eq!(req.status, RequestStatus::Draft);
         assert!(req.dry_run_required);
-        assert_eq!(req.site, "LOVE");
+        assert_eq!(req.site, "DEFRA");
     }
 
     #[test]
@@ -921,7 +921,7 @@ mod tests {
             ci_id: "ci-001".into(),
             ci_name: "server01".into(),
             ci_type: "Windows Server".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             environment: "production".into(),
             owner: "".into(),
             support_group: "".into(),

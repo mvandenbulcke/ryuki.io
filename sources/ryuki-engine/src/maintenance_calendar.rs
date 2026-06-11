@@ -6,10 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MaintenanceWindow {
@@ -339,11 +336,11 @@ pub fn seed_example_windows() {
     let examples = vec![
         MaintenanceWindow {
             id: "mw-example-001".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             start_time: (now + Days::new(3)).to_rfc3339(),
             end_time: (now + Days::new(3) + chrono::Duration::hours(8)).to_rfc3339(),
             reason: "Scheduled SQL Server patching".into(),
-            affected_cis: vec!["sql-love-01".into(), "sql-love-02".into()],
+            affected_cis: vec!["sql-defra-01".into(), "sql-defra-02".into()],
             status: MaintenanceWindowStatus::Planned,
             created_by: "patch-team".into(),
             created_at: now.to_rfc3339(),
@@ -354,14 +351,14 @@ pub fn seed_example_windows() {
         },
         MaintenanceWindow {
             id: "mw-example-002".into(),
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             start_time: (now + Days::new(5)).to_rfc3339(),
             end_time: (now + Days::new(5) + chrono::Duration::hours(4)).to_rfc3339(),
             reason: "Hypervisor firmware upgrade".into(),
             affected_cis: vec![
-                "esx-bur1-01".into(),
-                "esx-bur1-02".into(),
-                "esx-bur1-03".into(),
+                "esx-gblon-01".into(),
+                "esx-gblon-02".into(),
+                "esx-gblon-03".into(),
             ],
             status: MaintenanceWindowStatus::Planned,
             created_by: "infra-team".into(),
@@ -373,11 +370,11 @@ pub fn seed_example_windows() {
         },
         MaintenanceWindow {
             id: "mw-example-003".into(),
-            site: "CCSS".into(),
+            site: "FRPAR".into(),
             start_time: (now + Days::new(7)).to_rfc3339(),
             end_time: (now + Days::new(7) + chrono::Duration::hours(6)).to_rfc3339(),
             reason: "Network switch firmware upgrade".into(),
-            affected_cis: vec!["sw-ccss-core-01".into(), "sw-ccss-core-02".into()],
+            affected_cis: vec!["sw-frpar-core-01".into(), "sw-frpar-core-02".into()],
             status: MaintenanceWindowStatus::Planned,
             created_by: "network-team".into(),
             created_at: now.to_rfc3339(),
@@ -388,11 +385,11 @@ pub fn seed_example_windows() {
         },
         MaintenanceWindow {
             id: "mw-example-004".into(),
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             start_time: (now + Days::new(14)).to_rfc3339(),
             end_time: (now + Days::new(14) + chrono::Duration::hours(2)).to_rfc3339(),
             reason: "Load balancer certificate rotation".into(),
-            affected_cis: vec!["lb-love-01".into()],
+            affected_cis: vec!["lb-defra-01".into()],
             status: MaintenanceWindowStatus::Planned,
             created_by: "sec-team".into(),
             created_at: now.to_rfc3339(),
@@ -543,10 +540,10 @@ mod tests {
     fn test_schedule_window_creates_window() {
         let start = future_time(10, 0);
         let end = future_time(10, 4);
-        let window = schedule_window("LOVE", &start, &end, "Test maintenance", make_cis()).unwrap();
+        let window = schedule_window("DEFRA", &start, &end, "Test maintenance", make_cis()).unwrap();
 
         assert!(window.id.starts_with("mw-"));
-        assert_eq!(window.site, "LOVE");
+        assert_eq!(window.site, "DEFRA");
         assert_eq!(window.status, MaintenanceWindowStatus::Planned);
         assert_eq!(window.affected_cis.len(), 2);
         assert_eq!(window.reason, "Test maintenance");
@@ -557,8 +554,8 @@ mod tests {
         let start = future_time(20, 0);
         let end = future_time(20, 4);
 
-        schedule_window("BUR1", &start, &end, "First window", make_cis()).unwrap();
-        let result = schedule_window("BUR1", &start, &end, "Conflicting window", make_cis());
+        schedule_window("GBLON", &start, &end, "First window", make_cis()).unwrap();
+        let result = schedule_window("GBLON", &start, &end, "Conflicting window", make_cis());
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Conflict detected"));
@@ -580,7 +577,7 @@ mod tests {
     #[test]
     fn test_schedule_window_invalid_time_range() {
         let result = schedule_window(
-            "LOVE",
+            "DEFRA",
             &future_time(10, 4),
             &future_time(10, 0),
             "Bad range",
@@ -597,8 +594,8 @@ mod tests {
         let start_b = future_time(15, 3);
         let end_b = future_time(15, 9);
 
-        schedule_window("TOR1", &start_a, &end_a, "Window A", make_cis()).unwrap();
-        let conflicts = check_conflicts("TOR1", &start_b, &end_b);
+        schedule_window("NLAMS", &start_a, &end_a, "Window A", make_cis()).unwrap();
+        let conflicts = check_conflicts("NLAMS", &start_b, &end_b);
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].reason, "Window A");
@@ -611,8 +608,8 @@ mod tests {
         let start_b = future_time(12, 5);
         let end_b = future_time(12, 9);
 
-        schedule_window("CCSS", &start_a, &end_a, "Window A", make_cis()).unwrap();
-        let conflicts = check_conflicts("CCSS", &start_b, &end_b);
+        schedule_window("FRPAR", &start_a, &end_a, "Window A", make_cis()).unwrap();
+        let conflicts = check_conflicts("FRPAR", &start_b, &end_b);
 
         assert!(conflicts.is_empty());
     }
@@ -621,7 +618,7 @@ mod tests {
     fn test_cancel_window() {
         let start = future_time(30, 0);
         let end = future_time(30, 4);
-        let window = schedule_window("ALBI", &start, &end, "To be cancelled", make_cis()).unwrap();
+        let window = schedule_window("FRPAR", &start, &end, "To be cancelled", make_cis()).unwrap();
 
         let cancelled = cancel_window(&window.id).unwrap();
         assert_eq!(cancelled.status, MaintenanceWindowStatus::Cancelled);
@@ -640,10 +637,10 @@ mod tests {
         let far_start = future_time(40, 0);
         let far_end = future_time(40, 2);
 
-        schedule_window("TRUJ", &near_start, &near_end, "Near window", make_cis()).unwrap();
-        schedule_window("TRUJ", &far_start, &far_end, "Far window", make_cis()).unwrap();
+        schedule_window("DEBER", &near_start, &near_end, "Near window", make_cis()).unwrap();
+        schedule_window("DEBER", &far_start, &far_end, "Far window", make_cis()).unwrap();
 
-        let upcoming = get_upcoming("TRUJ");
+        let upcoming = get_upcoming("DEBER");
         assert_eq!(upcoming.len(), 1);
         assert_eq!(upcoming[0].reason, "Near window");
     }
@@ -654,8 +651,8 @@ mod tests {
         let start = (now - Duration::hours(1)).to_rfc3339();
         let end = (now + Duration::hours(1)).to_rfc3339();
 
-        schedule_window("VILL", &start, &end, "Active window", make_cis()).unwrap();
-        let active = get_active("VILL");
+        schedule_window("DEFRA", &start, &end, "Active window", make_cis()).unwrap();
+        let active = get_active("DEFRA");
 
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].reason, "Active window");
@@ -668,8 +665,8 @@ mod tests {
         let start = format!("{}-01T10:00:00Z", month);
         let end = format!("{}-02T14:00:00Z", month);
 
-        schedule_window("AOST", &start, &end, "Monthly window", make_cis()).unwrap();
-        let calendar = get_calendar("AOST", &month).unwrap();
+        schedule_window("GBLON", &start, &end, "Monthly window", make_cis()).unwrap();
+        let calendar = get_calendar("GBLON", &month).unwrap();
 
         assert_eq!(calendar.len(), 1);
         assert_eq!(calendar[0].reason, "Monthly window");
@@ -677,10 +674,10 @@ mod tests {
 
     #[test]
     fn test_get_dependency_warnings_patch_wave_overlap() {
-        crate::patch_engine::plan_patch_wave("MACL", "windows", "high").unwrap();
+        crate::patch_engine::plan_patch_wave("NLAMS", "windows", "high").unwrap();
 
         let window = schedule_window(
-            "MACL",
+            "NLAMS",
             "2026-06-15T22:00:00Z",
             "2026-06-16T06:00:00Z",
             "Overlapping window",

@@ -95,7 +95,7 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
         ImpactNode {
             ci_name: "app-portal".into(),
             ci_type: CiType::Application,
-            relationships: vec!["env-prod-love".into(), "db-portal".into()],
+            relationships: vec!["env-prod-defra".into(), "db-portal".into()],
             criticality: Criticality::Critical,
         },
     );
@@ -105,20 +105,20 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
         ImpactNode {
             ci_name: "app-billing".into(),
             ci_type: CiType::Application,
-            relationships: vec!["env-prod-love".into(), "db-billing".into()],
+            relationships: vec!["env-prod-defra".into(), "db-billing".into()],
             criticality: Criticality::High,
         },
     );
 
     graph.insert(
-        "env-prod-love".into(),
+        "env-prod-defra".into(),
         ImpactNode {
-            ci_name: "env-prod-love".into(),
+            ci_name: "env-prod-defra".into(),
             ci_type: CiType::Server,
             relationships: vec![
-                "vm-love-web01".into(),
-                "vm-love-web02".into(),
-                "san-love-tier1".into(),
+                "vm-defra-web01".into(),
+                "vm-defra-web02".into(),
+                "san-defra-tier1".into(),
             ],
             criticality: Criticality::Critical,
         },
@@ -129,7 +129,7 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
         ImpactNode {
             ci_name: "db-portal".into(),
             ci_type: CiType::Database,
-            relationships: vec!["vm-love-db01".into(), "san-love-tier1".into()],
+            relationships: vec!["vm-defra-db01".into(), "san-defra-tier1".into()],
             criticality: Criticality::Critical,
         },
     );
@@ -139,55 +139,55 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
         ImpactNode {
             ci_name: "db-billing".into(),
             ci_type: CiType::Database,
-            relationships: vec!["vm-love-db02".into(), "san-love-tier2".into()],
+            relationships: vec!["vm-defra-db02".into(), "san-defra-tier2".into()],
             criticality: Criticality::High,
         },
     );
 
     graph.insert(
-        "vm-love-web01".into(),
+        "vm-defra-web01".into(),
         ImpactNode {
-            ci_name: "vm-love-web01".into(),
+            ci_name: "vm-defra-web01".into(),
             ci_type: CiType::Server,
-            relationships: vec!["san-love-tier1".into(), "net-love-vlan100".into()],
+            relationships: vec!["san-defra-tier1".into(), "net-defra-vlan100".into()],
             criticality: Criticality::High,
         },
     );
 
     graph.insert(
-        "vm-love-web02".into(),
+        "vm-defra-web02".into(),
         ImpactNode {
-            ci_name: "vm-love-web02".into(),
+            ci_name: "vm-defra-web02".into(),
             ci_type: CiType::Server,
-            relationships: vec!["san-love-tier1".into(), "net-love-vlan100".into()],
+            relationships: vec!["san-defra-tier1".into(), "net-defra-vlan100".into()],
             criticality: Criticality::High,
         },
     );
 
     graph.insert(
-        "vm-love-db01".into(),
+        "vm-defra-db01".into(),
         ImpactNode {
-            ci_name: "vm-love-db01".into(),
+            ci_name: "vm-defra-db01".into(),
             ci_type: CiType::Server,
-            relationships: vec!["san-love-tier1".into(), "net-love-vlan200".into()],
+            relationships: vec!["san-defra-tier1".into(), "net-defra-vlan200".into()],
             criticality: Criticality::Critical,
         },
     );
 
     graph.insert(
-        "vm-love-db02".into(),
+        "vm-defra-db02".into(),
         ImpactNode {
-            ci_name: "vm-love-db02".into(),
+            ci_name: "vm-defra-db02".into(),
             ci_type: CiType::Server,
-            relationships: vec!["san-love-tier2".into(), "net-love-vlan200".into()],
+            relationships: vec!["san-defra-tier2".into(), "net-defra-vlan200".into()],
             criticality: Criticality::High,
         },
     );
 
     graph.insert(
-        "san-love-tier1".into(),
+        "san-defra-tier1".into(),
         ImpactNode {
-            ci_name: "san-love-tier1".into(),
+            ci_name: "san-defra-tier1".into(),
             ci_type: CiType::Storage,
             relationships: vec![],
             criticality: Criticality::Critical,
@@ -195,9 +195,9 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
     );
 
     graph.insert(
-        "san-love-tier2".into(),
+        "san-defra-tier2".into(),
         ImpactNode {
-            ci_name: "san-love-tier2".into(),
+            ci_name: "san-defra-tier2".into(),
             ci_type: CiType::Storage,
             relationships: vec![],
             criticality: Criticality::High,
@@ -205,9 +205,9 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
     );
 
     graph.insert(
-        "net-love-vlan100".into(),
+        "net-defra-vlan100".into(),
         ImpactNode {
-            ci_name: "net-love-vlan100".into(),
+            ci_name: "net-defra-vlan100".into(),
             ci_type: CiType::Network,
             relationships: vec![],
             criticality: Criticality::High,
@@ -215,9 +215,9 @@ fn seed_graph() -> HashMap<String, ImpactNode> {
     );
 
     graph.insert(
-        "net-love-vlan200".into(),
+        "net-defra-vlan200".into(),
         ImpactNode {
-            ci_name: "net-love-vlan200".into(),
+            ci_name: "net-defra-vlan200".into(),
             ci_type: CiType::Network,
             relationships: vec![],
             criticality: Criticality::High,
@@ -380,7 +380,7 @@ mod tests {
         assert!(graph.len() >= 10);
         let names: HashSet<&str> = graph.iter().map(|n| n.ci_name.as_str()).collect();
         assert!(names.contains("app-portal"));
-        assert!(names.contains("san-love-tier1"));
+        assert!(names.contains("san-defra-tier1"));
     }
 
     #[test]
@@ -388,30 +388,30 @@ mod tests {
         let deps = get_downstream_dependencies("app-portal");
         assert!(!deps.is_empty());
         let dep_names: Vec<&str> = deps.iter().map(|d| d.ci_name.as_str()).collect();
-        assert!(dep_names.contains(&"env-prod-love"));
+        assert!(dep_names.contains(&"env-prod-defra"));
         assert!(dep_names.contains(&"db-portal"));
     }
 
     #[test]
     fn test_upstream_dependencies() {
-        let deps = get_upstream_dependencies("san-love-tier1");
+        let deps = get_upstream_dependencies("san-defra-tier1");
         assert!(!deps.is_empty());
         let dep_names: Vec<&str> = deps.iter().map(|d| d.ci_name.as_str()).collect();
-        assert!(dep_names.contains(&"env-prod-love"));
-        assert!(dep_names.contains(&"vm-love-web01"));
+        assert!(dep_names.contains(&"env-prod-defra"));
+        assert!(dep_names.contains(&"vm-defra-web01"));
     }
 
     #[test]
     fn test_analyze_impact_single_ci() {
         let result =
-            analyze_impact("Patch san-love-tier1 firmware", &["san-love-tier1".into()]).unwrap();
+            analyze_impact("Patch san-defra-tier1 firmware", &["san-defra-tier1".into()]).unwrap();
         assert_eq!(result.risk_level, RiskLevel::Critical);
         assert!(!result.affected_cis.is_empty());
         assert!(
             result
                 .affected_cis
                 .iter()
-                .any(|ci| ci.ci_name == "san-love-tier1" && ci.is_direct)
+                .any(|ci| ci.ci_name == "san-defra-tier1" && ci.is_direct)
         );
     }
 
@@ -431,7 +431,7 @@ mod tests {
     fn test_analyze_impact_multiple_targets() {
         let result = analyze_impact(
             "Network maintenance for VLAN100 and VLAN200",
-            &["net-love-vlan100".into(), "net-love-vlan200".into()],
+            &["net-defra-vlan100".into(), "net-defra-vlan200".into()],
         )
         .unwrap();
         assert!(result.affected_cis.len() >= 2);
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_downstream_dependencies_leaf_ci() {
-        let deps = get_downstream_dependencies("san-love-tier1");
+        let deps = get_downstream_dependencies("san-defra-tier1");
         assert!(deps.is_empty());
     }
 

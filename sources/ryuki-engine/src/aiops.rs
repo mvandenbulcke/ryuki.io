@@ -82,16 +82,16 @@ fn seed_suggestions() -> AIOpsStore {
         AIOpsSuggestion {
             id: "aiops-0001".into(),
             suggestion_type: SuggestionType::RightSizing,
-            title: "Downsize love-web-01 from 8 GB to 4 GB memory".into(),
-            description: "love-web-01 averages 31% memory utilization over 90 days. Reducing from 8 GB to 4 GB aligns allocation with observed demand while maintaining a 2x headroom.".into(),
-            affected_components: vec!["love-web-01".into(), "love-web-cluster".into()],
+            title: "Downsize defra-web-01 from 8 GB to 4 GB memory".into(),
+            description: "defra-web-01 averages 31% memory utilization over 90 days. Reducing from 8 GB to 4 GB aligns allocation with observed demand while maintaining a 2x headroom.".into(),
+            affected_components: vec!["defra-web-01".into(), "defra-web-cluster".into()],
             estimated_savings: Some(192.00),
             confidence_score: 0.89,
             status: SuggestionStatus::New,
             reviewer: None,
             rejection_reason: None,
             implementation_plan: None,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             created_at: "2026-06-01T08:00:00Z".into(),
             updated_at: "2026-06-01T08:00:00Z".into(),
         },
@@ -99,63 +99,63 @@ fn seed_suggestions() -> AIOpsStore {
             id: "aiops-0002".into(),
             suggestion_type: SuggestionType::CostOptimization,
             title: "Shutdown idle dev VMs during non-business hours".into(),
-            description: "love-dev-01 and love-dev-02 show < 4% CPU utilization outside 08:00-18:00. Automated power schedule could save ~65% of their monthly cost.".into(),
-            affected_components: vec!["love-dev-01".into(), "love-dev-02".into(), "love-general-cluster".into()],
+            description: "defra-dev-01 and defra-dev-02 show < 4% CPU utilization outside 08:00-18:00. Automated power schedule could save ~65% of their monthly cost.".into(),
+            affected_components: vec!["defra-dev-01".into(), "defra-dev-02".into(), "defra-general-cluster".into()],
             estimated_savings: Some(348.40),
             confidence_score: 0.95,
             status: SuggestionStatus::New,
             reviewer: None,
             rejection_reason: None,
             implementation_plan: None,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             created_at: "2026-06-03T12:00:00Z".into(),
             updated_at: "2026-06-03T12:00:00Z".into(),
         },
         AIOpsSuggestion {
             id: "aiops-0003".into(),
             suggestion_type: SuggestionType::Migration,
-            title: "Migrate love-legacy-01 from VMware to newer cluster".into(),
-            description: "love-legacy-01 runs at 95% CPU / 92% memory on aging hardware with no vMotion compatibility. Migrate to love-general-cluster to reduce contention and improve availability.".into(),
-            affected_components: vec!["love-legacy-01".into(), "vCenter".into(), "love-general-cluster".into()],
+            title: "Migrate defra-legacy-01 from VMware to newer cluster".into(),
+            description: "defra-legacy-01 runs at 95% CPU / 92% memory on aging hardware with no vMotion compatibility. Migrate to defra-general-cluster to reduce contention and improve availability.".into(),
+            affected_components: vec!["defra-legacy-01".into(), "vCenter".into(), "defra-general-cluster".into()],
             estimated_savings: None,
             confidence_score: 0.82,
             status: SuggestionStatus::New,
             reviewer: None,
             rejection_reason: None,
             implementation_plan: None,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             created_at: "2026-06-05T09:00:00Z".into(),
             updated_at: "2026-06-05T09:00:00Z".into(),
         },
         AIOpsSuggestion {
             id: "aiops-0004".into(),
             suggestion_type: SuggestionType::Consolidation,
-            title: "Consolidate bur1-web-01 and bur1-qa-01 onto shared host".into(),
+            title: "Consolidate gblon-web-01 and gblon-qa-01 onto shared host".into(),
             description: "Both VMs run on separate hosts with combined utilization under 25%. Consolidating frees one hypervisor license and reduces power draw.".into(),
-            affected_components: vec!["bur1-web-01".into(), "bur1-qa-01".into(), "bur1-web-cluster".into()],
+            affected_components: vec!["gblon-web-01".into(), "gblon-qa-01".into(), "gblon-web-cluster".into()],
             estimated_savings: Some(1280.00),
             confidence_score: 0.78,
             status: SuggestionStatus::New,
             reviewer: None,
             rejection_reason: None,
             implementation_plan: None,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             created_at: "2026-06-07T14:00:00Z".into(),
             updated_at: "2026-06-07T14:00:00Z".into(),
         },
         AIOpsSuggestion {
             id: "aiops-0005".into(),
             suggestion_type: SuggestionType::RiskReduction,
-            title: "Update backup policy for bur1-dr-01 — last verified 90+ days ago".into(),
-            description: "bur1-dr-01 backup verification is 90+ days stale. A failed restore test would leave DR site unrecoverable. Schedule immediate verification and increase frequency to weekly.".into(),
-            affected_components: vec!["bur1-dr-01".into(), "Veeam".into(), "bur1-dr-cluster".into()],
+            title: "Update backup policy for gblon-dr-01 — last verified 90+ days ago".into(),
+            description: "gblon-dr-01 backup verification is 90+ days stale. A failed restore test would leave DR site unrecoverable. Schedule immediate verification and increase frequency to weekly.".into(),
+            affected_components: vec!["gblon-dr-01".into(), "Veeam".into(), "gblon-dr-cluster".into()],
             estimated_savings: None,
             confidence_score: 0.97,
             status: SuggestionStatus::New,
             reviewer: None,
             rejection_reason: None,
             implementation_plan: None,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             created_at: "2026-06-09T16:00:00Z".into(),
             updated_at: "2026-06-09T16:00:00Z".into(),
         },
@@ -442,18 +442,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_suggestions_for_love() {
-        let result = generate_suggestions("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+    fn test_generate_suggestions_for_defra() {
+        let result = generate_suggestions("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["source"], "dry-run");
         let suggestions = result["suggestions"].as_array().unwrap();
         assert!(suggestions.len() >= 3);
     }
 
     #[test]
-    fn test_generate_suggestions_for_bur1() {
-        let result = generate_suggestions("BUR1").unwrap();
-        assert_eq!(result["site"], "BUR1");
+    fn test_generate_suggestions_for_gblon() {
+        let result = generate_suggestions("GBLON").unwrap();
+        assert_eq!(result["site"], "GBLON");
         let suggestions = result["suggestions"].as_array().unwrap();
         assert!(suggestions.len() >= 2);
     }
@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn test_review_then_accept_suggestion() {
         let tid = "test-lc-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "LOVE"));
+        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
 
         let review = review_suggestion(tid, "alice").unwrap();
         assert_eq!(review["status"], "reviewed");
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn test_reject_suggestion() {
         let tid = "test-rej-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "LOVE"));
+        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
 
         let reject = reject_suggestion(tid, "Insufficient data for cost projection").unwrap();
         assert_eq!(reject["status"], "rejected");
@@ -485,7 +485,7 @@ mod tests {
     #[test]
     fn test_implement_suggestion_requires_accepted() {
         let tid = "test-imp-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "LOVE"));
+        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
 
         // Should fail — not reviewed/accepted yet
         let result = implement_suggestion(tid);
@@ -514,8 +514,8 @@ mod tests {
 
     #[test]
     fn test_get_savings_summary_format() {
-        let result = get_savings_summary("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_savings_summary("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["accepted_count"].as_u64().is_some());
         assert!(result["total_potential_savings"].as_f64().unwrap() >= 0.0);
         assert!(result.get("breakdown").is_some());
@@ -523,8 +523,8 @@ mod tests {
 
     #[test]
     fn test_get_suggestion_stats() {
-        let result = get_suggestion_stats("LOVE").unwrap();
-        assert_eq!(result["site"], "LOVE");
+        let result = get_suggestion_stats("DEFRA").unwrap();
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["total"].as_u64().unwrap() >= 3);
         assert!(result.get("by_type").is_some());
         let accepted = result["accepted"].as_u64().unwrap();
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_reject_already_accepted_fails() {
         let tid = "test-rej-accepted-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "LOVE"));
+        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
 
         review_suggestion(tid, "alice").unwrap();
         accept_suggestion(tid).unwrap();
@@ -571,14 +571,14 @@ mod tests {
     #[test]
     fn test_full_lifecycle() {
         let tid = "test-lifecycle-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "BUR1"));
+        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "GBLON"));
 
         review_suggestion(tid, "carol").unwrap();
         accept_suggestion(tid).unwrap();
         let implement = implement_suggestion(tid).unwrap();
         assert_eq!(implement["status"], "implemented");
 
-        let stats = get_suggestion_stats("BUR1").unwrap();
+        let stats = get_suggestion_stats("GBLON").unwrap();
         assert!(stats["implemented"].as_u64().unwrap() >= 1);
     }
 }

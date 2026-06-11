@@ -21,8 +21,8 @@ CREATE INDEX idx_access_reviews_next_due ON access_reviews (next_review_due);
 CREATE INDEX idx_access_reviews_type ON access_reviews (target_type);
 
 INSERT INTO access_reviews (id, target_type, target_name, owner, last_reviewed, next_review_due, status, risk_level, site, reviewer, decision, review_history) VALUES
-    ('c0000200-1000-1000-1000-000000000001', 'Role', 'Domain Admins', 'alice.smith', NOW() - INTERVAL '120 days', NOW() - INTERVAL '30 days', 'Overdue', 'High', 'LOVE', NULL, NULL, '[]'),
-    ('c0000200-1000-1000-1000-000000000002', 'Group', 'Backup Operators', 'bob.jones', NOW() - INTERVAL '100 days', NOW() - INTERVAL '10 days', 'Overdue', 'Med', 'LOVE', NULL, NULL, '[]'),
-    ('c0000200-1000-1000-1000-000000000003', 'ServiceAccount', 'svc_scom_sa', 'carol.wong', NULL, NOW() + INTERVAL '45 days', 'Current', 'Low', 'BUR1', NULL, NULL, '[]'),
-    ('c0000200-1000-1000-1000-000000000004', 'FileShare', '\\\\fs01\\finance', 'dave.kim', NOW() - INTERVAL '60 days', NOW() + INTERVAL '5 days', 'UnderReview', 'High', 'BUR1', 'auditor.lee', NULL, '[{"timestamp": "' || NOW() - INTERVAL '3 days' || '", "action": "initiated", "reviewer": "auditor.lee", "detail": "Review initiated for finance share recertification"}]'),
-    ('c0000200-1000-1000-1000-000000000005', 'ServiceAccount', 'svc_backup_sa', 'eve.taylor', NOW() - INTERVAL '150 days', NOW() - INTERVAL '5 days', 'Overdue', 'Med', 'LOVE', NULL, NULL, '[]');
+    ('c0000200-1000-1000-1000-000000000001', 'Role', 'Domain Admins', 'alice.smith', NOW() - INTERVAL '120 days', NOW() - INTERVAL '30 days', 'Overdue', 'High', 'DEFRA', NULL, NULL, '[]'),
+    ('c0000200-1000-1000-1000-000000000002', 'Group', 'Backup Operators', 'bob.jones', NOW() - INTERVAL '100 days', NOW() - INTERVAL '10 days', 'Overdue', 'Med', 'DEFRA', NULL, NULL, '[]'),
+    ('c0000200-1000-1000-1000-000000000003', 'ServiceAccount', 'svc_scom_sa', 'carol.wong', NULL, NOW() + INTERVAL '45 days', 'Current', 'Low', 'GBLON', NULL, NULL, '[]'),
+    ('c0000200-1000-1000-1000-000000000004', 'FileShare', '\\\\fs01\\finance', 'dave.kim', NOW() - INTERVAL '60 days', NOW() + INTERVAL '5 days', 'UnderReview', 'High', 'GBLON', 'auditor.lee', NULL, '[{"timestamp": "' || NOW() - INTERVAL '3 days' || '", "action": "initiated", "reviewer": "auditor.lee", "detail": "Review initiated for finance share recertification"}]'),
+    ('c0000200-1000-1000-1000-000000000005', 'ServiceAccount', 'svc_backup_sa', 'eve.taylor', NOW() - INTERVAL '150 days', NOW() - INTERVAL '5 days', 'Overdue', 'Med', 'DEFRA', NULL, NULL, '[]');

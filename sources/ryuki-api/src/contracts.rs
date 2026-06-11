@@ -3229,19 +3229,11 @@ async fn catalog_site_catalog() -> Json<Value> {
         "rawProviderPayloadsAllowed": false, "rawSiteInventoryRowsAllowed": false, "rawRecipientDataAllowed": false,
         "windowsBehavior": ["Sysprep","VM-name generator","Change SID"],
         "sites": [
+            {"spec":"deber-windows-customization","country":"DE","site":"DEBER","timezoneCode":105},
             {"spec":"defra-windows-customization","country":"DE","site":"DEFRA","timezoneCode":105},
-            {"spec":"gblon-windows-customization","country":"GB","site":"GBLON","timezoneCode":105},
-            {"spec":"esccss-windows-customization","country":"ES","site":"CCSS","timezoneCode":105},
-            {"spec":"estor1-windows-customization","country":"ES","site":"TOR1","timezoneCode":105},
-            {"spec":"estruj-windows-customization","country":"ES","site":"TRUJ","timezoneCode":105},
-            {"spec":"esvill-windows-customization","country":"ES","site":"VILL","timezoneCode":105},
-            {"spec":"fralbi-windows-customization","country":"FR","site":"ALBI","timezoneCode":105},
-            {"spec":"fraost-windows-customization","country":"FR","site":"AOST","timezoneCode":105},
-            {"spec":"frmacl-windows-customization","country":"FR","site":"MACL","timezoneCode":105},
-            {"spec":"frssym-windows-customization","country":"FR","site":"SSYM","timezoneCode":105},
-            {"spec":"nlwijh-windows-customization","country":"NL","site":"WIJH","timezoneCode":105},
-            {"spec":"ptrma1-windows-customization","country":"PT","site":"RMA1","timezoneCode":85},
-            {"spec":"ropite-windows-customization","country":"RO","site":"PITE","timezoneCode":130}
+            {"spec":"frpar-windows-customization","country":"FR","site":"FRPAR","timezoneCode":105},
+            {"spec":"gblon-windows-customization","country":"GB","site":"GBLON","timezoneCode":85},
+            {"spec":"nlams-windows-customization","country":"NL","site":"NLAMS","timezoneCode":105}
         ],
         "requiredEvidence": ["Site catalog summary","Safe XML fact review","OU pattern review","Windows behavior review","Validation result","Evidence references"]
     }))
@@ -3622,7 +3614,7 @@ async fn gmsa_contract() -> Json<Value> {
         "dryRunRequired": true,
         "supportedWorkflows": ["gmsa-create", "gmsa-validate", "gmsa-assign", "gmsa-remove", "gmsa-rotate", "gmsa-test-retrieval", "gmsa-inventory", "gmsa-expiring"],
         "validStatuses": ["Active", "Expiring", "Expired", "Revoked"],
-        "namingConvention": "svc-PURPOSE-SITE (e.g. svc-webappool-bur1)",
+        "namingConvention": "svc-PURPOSE-SITE (e.g. svc-webappool-gblon)",
         "requiredInputs": ["name", "hosts", "spns", "site"],
         "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "live-directory-changes-disabled", "raw-service-account-data-disabled"],
         "examples": serde_json::to_value(examples).unwrap()
@@ -5808,7 +5800,7 @@ async fn analytics_capacity_cluster(
     Query(params): Query<AnalyticsClusterQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    let cluster = params.cluster.as_deref().unwrap_or("love-general-cluster");
+    let cluster = params.cluster.as_deref().unwrap_or("defra-general-cluster");
     cost_capacity::get_cluster_capacity(site, cluster)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -7718,7 +7710,7 @@ async fn network_capacity(
 async fn network_ports_inventory(
     Query(query): Query<NetworkSwitchQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let switch = query.switch.unwrap_or_else(|| "love-sw-01".to_string());
+    let switch = query.switch.unwrap_or_else(|| "defra-sw-01".to_string());
     match network_readiness::get_port_inventory(&switch) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),

@@ -279,7 +279,7 @@ rules:
       - Delegated authority
       - Emergency flag
 siteBindings:
-  ALBI:
+  DEBER:
     policyFamilies: &defaultSiteFamilies
       - naming
       - tagging
@@ -293,27 +293,11 @@ siteBindings:
       - evidence
       - dryRun
       - capacity
-  AOST:
+  DEFRA:
     policyFamilies: *defaultSiteFamilies
-  BUR1:
+  FRPAR:
     policyFamilies: *defaultSiteFamilies
-  CCSS:
+  GBLON:
     policyFamilies: *defaultSiteFamilies
-  LOVE:
-    policyFamilies: *defaultSiteFamilies
-  MACL:
-    policyFamilies: *defaultSiteFamilies
-  PITE:
-    policyFamilies: *defaultSiteFamilies
-  RMA1:
-    policyFamilies: *defaultSiteFamilies
-  SSYM:
-    policyFamilies: *defaultSiteFamilies
-  TOR1:
-    policyFamilies: *defaultSiteFamilies
-  TRUJ:
-    policyFamilies: *defaultSiteFamilies
-  VILL:
-    policyFamilies: *defaultSiteFamilies
-  WIJH:
+  NLAMS:
     policyFamilies: *defaultSiteFamilies

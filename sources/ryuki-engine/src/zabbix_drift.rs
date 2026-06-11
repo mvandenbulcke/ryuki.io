@@ -5,10 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriftReport {
@@ -488,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_detect_drift_returns_entries() {
-        let reports = detect_drift("LOVE").unwrap();
+        let reports = detect_drift("DEFRA").unwrap();
         assert!(reports.len() >= 4);
         assert!(
             reports
@@ -509,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_plan_remediation_generates_steps() {
-        let reports = detect_drift("BUR1").unwrap();
+        let reports = detect_drift("GBLON").unwrap();
         let first_id = reports[0].id.clone();
 
         let planned = plan_remediation(&first_id).unwrap();
@@ -524,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_validate_remediation_passes() {
-        let reports = detect_drift("TOR1").unwrap();
+        let reports = detect_drift("NLAMS").unwrap();
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();
@@ -535,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_execute_remediation_returns_evidence() {
-        let reports = detect_drift("VILL").unwrap();
+        let reports = detect_drift("DEFRA").unwrap();
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();
@@ -547,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_verify_remediation_passes() {
-        let reports = detect_drift("AOST").unwrap();
+        let reports = detect_drift("GBLON").unwrap();
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();
@@ -564,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_verify_remediation_not_remediated_fails() {
-        let reports = detect_drift("SSYM").unwrap();
+        let reports = detect_drift("DEBER").unwrap();
         let first_id = reports[0].id.clone();
 
         assert!(verify_remediation(&first_id).is_err());
@@ -572,10 +569,10 @@ mod tests {
 
     #[test]
     fn test_get_drift_summary() {
-        let summary = get_drift_summary("LOVE").unwrap();
+        let summary = get_drift_summary("DEFRA").unwrap();
         assert_eq!(summary["source"], "dry-run");
         assert_eq!(summary["dry_run"], true);
-        assert_eq!(summary["site"], "LOVE");
+        assert_eq!(summary["site"], "DEFRA");
         assert!(summary["total_drift_reports"].as_u64().unwrap() >= 4);
     }
 
@@ -586,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_plan_remediation_already_planned_fails() {
-        let reports = detect_drift("MACL").unwrap();
+        let reports = detect_drift("NLAMS").unwrap();
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();

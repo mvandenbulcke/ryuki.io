@@ -4,10 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 static PATCH_WAVE_STORE: OnceLock<Mutex<Vec<PatchWave>>> = OnceLock::new();
 
@@ -501,19 +498,19 @@ pub fn get_patch_compliance() -> Result<Value, String> {
         "source": "dry-run",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "sites": [
-            {"site": "LOVE", "windows": {"patched": 42, "pending": 3, "compliant": true}, "linux": {"patched": 18, "pending": 1, "compliant": true}},
-            {"site": "BUR1", "windows": {"patched": 35, "pending": 5, "compliant": true}, "linux": {"patched": 12, "pending": 2, "compliant": false}},
-            {"site": "CCSS", "windows": {"patched": 28, "pending": 7, "compliant": false}, "linux": {"patched": 9, "pending": 0, "compliant": true}},
-            {"site": "TOR1", "windows": {"patched": 31, "pending": 4, "compliant": true}, "linux": {"patched": 14, "pending": 1, "compliant": true}},
-            {"site": "TRUJ", "windows": {"patched": 20, "pending": 2, "compliant": true}, "linux": {"patched": 6, "pending": 0, "compliant": true}},
-            {"site": "VILL", "windows": {"patched": 25, "pending": 3, "compliant": true}, "linux": {"patched": 11, "pending": 1, "compliant": true}},
-            {"site": "ALBI", "windows": {"patched": 33, "pending": 6, "compliant": false}, "linux": {"patched": 8, "pending": 2, "compliant": false}},
-            {"site": "AOST", "windows": {"patched": 19, "pending": 1, "compliant": true}, "linux": {"patched": 10, "pending": 0, "compliant": true}},
-            {"site": "MACL", "windows": {"patched": 27, "pending": 4, "compliant": true}, "linux": {"patched": 13, "pending": 1, "compliant": true}},
-            {"site": "SSYM", "windows": {"patched": 22, "pending": 2, "compliant": true}, "linux": {"patched": 7, "pending": 0, "compliant": true}},
-            {"site": "WIJH", "windows": {"patched": 30, "pending": 3, "compliant": true}, "linux": {"patched": 15, "pending": 2, "compliant": true}},
-            {"site": "RMA1", "windows": {"patched": 24, "pending": 5, "compliant": false}, "linux": {"patched": 5, "pending": 0, "compliant": true}},
-            {"site": "PITE", "windows": {"patched": 16, "pending": 1, "compliant": true}, "linux": {"patched": 4, "pending": 0, "compliant": true}}
+            {"site": "DEFRA", "windows": {"patched": 42, "pending": 3, "compliant": true}, "linux": {"patched": 18, "pending": 1, "compliant": true}},
+            {"site": "GBLON", "windows": {"patched": 35, "pending": 5, "compliant": true}, "linux": {"patched": 12, "pending": 2, "compliant": false}},
+            {"site": "FRPAR", "windows": {"patched": 28, "pending": 7, "compliant": false}, "linux": {"patched": 9, "pending": 0, "compliant": true}},
+            {"site": "NLAMS", "windows": {"patched": 31, "pending": 4, "compliant": true}, "linux": {"patched": 14, "pending": 1, "compliant": true}},
+            {"site": "DEBER", "windows": {"patched": 20, "pending": 2, "compliant": true}, "linux": {"patched": 6, "pending": 0, "compliant": true}},
+            {"site": "DEFRA", "windows": {"patched": 25, "pending": 3, "compliant": true}, "linux": {"patched": 11, "pending": 1, "compliant": true}},
+            {"site": "FRPAR", "windows": {"patched": 33, "pending": 6, "compliant": false}, "linux": {"patched": 8, "pending": 2, "compliant": false}},
+            {"site": "GBLON", "windows": {"patched": 19, "pending": 1, "compliant": true}, "linux": {"patched": 10, "pending": 0, "compliant": true}},
+            {"site": "NLAMS", "windows": {"patched": 27, "pending": 4, "compliant": true}, "linux": {"patched": 13, "pending": 1, "compliant": true}},
+            {"site": "DEBER", "windows": {"patched": 22, "pending": 2, "compliant": true}, "linux": {"patched": 7, "pending": 0, "compliant": true}},
+            {"site": "GBLON", "windows": {"patched": 30, "pending": 3, "compliant": true}, "linux": {"patched": 15, "pending": 2, "compliant": true}},
+            {"site": "FRPAR", "windows": {"patched": 24, "pending": 5, "compliant": false}, "linux": {"patched": 5, "pending": 0, "compliant": true}},
+            {"site": "NLAMS", "windows": {"patched": 16, "pending": 1, "compliant": true}, "linux": {"patched": 4, "pending": 0, "compliant": true}}
         ],
         "overall_compliance_percentage": 87.5,
         "dry_run": true
@@ -525,11 +522,11 @@ pub fn get_pending_reboots() -> Result<Value, String> {
         "source": "dry-run",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "pending_reboots": [
-            {"server": "w-love-srv-01", "site": "LOVE", "os_family": "windows", "reason": "Patch KB5034127 requires reboot", "since": "2026-06-10T22:00:00Z"},
-            {"server": "w-bur1-srv-03", "site": "BUR1", "os_family": "windows", "reason": "Patch KB5034285 requires reboot", "since": "2026-06-10T22:30:00Z"},
-            {"server": "w-ccss-srv-02", "site": "CCSS", "os_family": "windows", "reason": "Patch KB5034441 requires reboot", "since": "2026-06-11T01:00:00Z"},
-            {"server": "l-albi-srv-01", "site": "ALBI", "os_family": "linux", "reason": "Kernel update 5.15.0-91 requires reboot", "since": "2026-06-11T02:00:00Z"},
-            {"server": "w-rma1-srv-01", "site": "RMA1", "os_family": "windows", "reason": "Patch KB5034439 requires reboot", "since": "2026-06-10T23:00:00Z"}
+            {"server": "w-defra-srv-01", "site": "DEFRA", "os_family": "windows", "reason": "Patch KB5034127 requires reboot", "since": "2026-06-10T22:00:00Z"},
+            {"server": "w-gblon-srv-03", "site": "GBLON", "os_family": "windows", "reason": "Patch KB5034285 requires reboot", "since": "2026-06-10T22:30:00Z"},
+            {"server": "w-frpar-srv-02", "site": "FRPAR", "os_family": "windows", "reason": "Patch KB5034441 requires reboot", "since": "2026-06-11T01:00:00Z"},
+            {"server": "l-frpar-srv-01", "site": "FRPAR", "os_family": "linux", "reason": "Kernel update 5.15.0-91 requires reboot", "since": "2026-06-11T02:00:00Z"},
+            {"server": "w-frpar-srv-01", "site": "FRPAR", "os_family": "windows", "reason": "Patch KB5034439 requires reboot", "since": "2026-06-10T23:00:00Z"}
         ],
         "total_pending": 5,
         "dry_run": true
@@ -571,9 +568,9 @@ mod tests {
     #[test]
     fn test_plan_patch_wave_creates_wave() {
         let servers = vec![
-            make_test_server("srv-001", "web01", "LOVE", "production", "high"),
-            make_test_server("srv-002", "app01", "LOVE", "production", "critical"),
-            make_test_server("srv-003", "db01", "BUR1", "production", "critical"),
+            make_test_server("srv-001", "web01", "DEFRA", "production", "high"),
+            make_test_server("srv-002", "app01", "DEFRA", "production", "critical"),
+            make_test_server("srv-003", "db01", "GBLON", "production", "critical"),
         ];
 
         let wave = plan_patch_wave_from_servers(&servers).unwrap();
@@ -595,7 +592,7 @@ mod tests {
         let servers = vec![make_test_server(
             "srv-001",
             "web01",
-            "LOVE",
+            "DEFRA",
             "production",
             "high",
         )];
@@ -649,8 +646,8 @@ mod tests {
     #[test]
     fn test_orchestrate_reboot_generates_stages() {
         let servers = vec![
-            make_test_server("srv-001", "web01", "LOVE", "production", "high"),
-            make_test_server("srv-002", "app01", "BUR1", "production", "critical"),
+            make_test_server("srv-001", "web01", "DEFRA", "production", "high"),
+            make_test_server("srv-002", "app01", "GBLON", "production", "critical"),
         ];
         let wave = plan_patch_wave_from_servers(&servers).unwrap();
         let stages = orchestrate_reboot(&wave).unwrap();
@@ -696,7 +693,7 @@ mod tests {
         let servers = vec![make_test_server(
             "srv-001",
             "web01",
-            "LOVE",
+            "DEFRA",
             "production",
             "high",
         )];
@@ -719,11 +716,11 @@ mod tests {
 
     #[test]
     fn test_plan_patch_wave_by_site() {
-        let wave = plan_patch_wave("LOVE", "windows", "critical").unwrap();
+        let wave = plan_patch_wave("DEFRA", "windows", "critical").unwrap();
         assert!(wave.id.starts_with("pw-"));
         assert_eq!(wave.status, PatchWaveStatus::Draft);
         assert_eq!(wave.servers.len(), 3);
-        assert_eq!(wave.site_scope, vec!["LOVE"]);
+        assert_eq!(wave.site_scope, vec!["DEFRA"]);
         assert_eq!(wave.metadata.get("os_family").unwrap(), "windows");
         assert_eq!(wave.metadata.get("criticality").unwrap(), "critical");
         assert_eq!(wave.metadata.get("dry_run").unwrap(), "true");
@@ -736,17 +733,17 @@ mod tests {
 
     #[test]
     fn test_plan_patch_wave_invalid_os_fails() {
-        assert!(plan_patch_wave("LOVE", "solaris", "high").is_err());
+        assert!(plan_patch_wave("DEFRA", "solaris", "high").is_err());
     }
 
     #[test]
     fn test_plan_patch_wave_empty_os_fails() {
-        assert!(plan_patch_wave("LOVE", "", "high").is_err());
+        assert!(plan_patch_wave("DEFRA", "", "high").is_err());
     }
 
     #[test]
     fn test_validate_patch_wave_by_id() {
-        let wave = plan_patch_wave("BUR1", "linux", "high").unwrap();
+        let wave = plan_patch_wave("GBLON", "linux", "high").unwrap();
         let result = validate_patch_wave(&wave.id).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());
@@ -759,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_approve_patch_wave() {
-        let wave = plan_patch_wave("TOR1", "windows", "medium").unwrap();
+        let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
         let approved = approve_patch_wave(&wave.id).unwrap();
         assert_eq!(approved.status, PatchWaveStatus::Approved);
         assert_eq!(
@@ -775,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_execute_patch_wave() {
-        let wave = plan_patch_wave("VILL", "windows", "high").unwrap();
+        let wave = plan_patch_wave("DEFRA", "windows", "high").unwrap();
         let approved = approve_patch_wave(&wave.id).unwrap();
         let evidence = execute_patch_wave(&approved.id).unwrap();
         assert!(evidence.len() >= 5);
@@ -786,7 +783,7 @@ mod tests {
 
     #[test]
     fn test_execute_patch_wave_not_approved_fails() {
-        let wave = plan_patch_wave("AOST", "linux", "low").unwrap();
+        let wave = plan_patch_wave("GBLON", "linux", "low").unwrap();
         assert!(execute_patch_wave(&wave.id).is_err());
     }
 
@@ -797,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_verify_patch_wave() {
-        let wave = plan_patch_wave("WIJH", "linux", "critical").unwrap();
+        let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
         let result = verify_patch_wave(&wave.id).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());

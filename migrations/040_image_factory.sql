@@ -32,10 +32,10 @@ CREATE INDEX idx_build_test_results_image ON build_test_results(image_id);
 
 INSERT INTO golden_images (id, image_name, os_family, os_version, distro, build_date, status, supersedes_image_id, site_scope, build_log)
 VALUES
-    ('e0000400-4000-4000-4000-000000000001', 'win-svr-2022-love-v1', 'Windows', '2022', 'Windows Server 2022 Datacenter', '2026-05-01 06:00:00+00', 'promoted', NULL, 'LOVE', 'Build completed: 2026-05-01T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.'),
-    ('e0000400-4000-4000-4000-000000000002', 'ubuntu-2404-love-v1', 'Linux', '24.04', 'Ubuntu 24.04 LTS', '2026-05-02 06:00:00+00', 'promoted', NULL, 'LOVE', 'Build completed: 2026-05-02T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.'),
-    ('e0000400-4000-4000-4000-000000000003', 'win-svr-2025-bur1-v0', 'Windows', '2025', 'Windows Server 2025 Datacenter', '2026-06-10 08:00:00+00', 'building', NULL, 'BUR1', 'Build started: 2026-06-10T08:00:00Z. Status: OS installation completed, agent installation in progress.'),
-    ('e0000400-4000-4000-4000-000000000004', 'win-svr-2019-love-v0', 'Windows', '2019', 'Windows Server 2019 Datacenter', '2026-04-01 06:00:00+00', 'superseded', NULL, 'LOVE', 'Superseded by img-001 (Windows Server 2022) on 2026-05-01. No further builds scheduled.');
+    ('e0000400-4000-4000-4000-000000000001', 'win-svr-2022-defra-v1', 'Windows', '2022', 'Windows Server 2022 Datacenter', '2026-05-01 06:00:00+00', 'promoted', NULL, 'DEFRA', 'Build completed: 2026-05-01T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.'),
+    ('e0000400-4000-4000-4000-000000000002', 'ubuntu-2404-defra-v1', 'Linux', '24.04', 'Ubuntu 24.04 LTS', '2026-05-02 06:00:00+00', 'promoted', NULL, 'DEFRA', 'Build completed: 2026-05-02T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.'),
+    ('e0000400-4000-4000-4000-000000000003', 'win-svr-2025-gblon-v0', 'Windows', '2025', 'Windows Server 2025 Datacenter', '2026-06-10 08:00:00+00', 'building', NULL, 'GBLON', 'Build started: 2026-06-10T08:00:00Z. Status: OS installation completed, agent installation in progress.'),
+    ('e0000400-4000-4000-4000-000000000004', 'win-svr-2019-defra-v0', 'Windows', '2019', 'Windows Server 2019 Datacenter', '2026-04-01 06:00:00+00', 'superseded', NULL, 'DEFRA', 'Superseded by img-001 (Windows Server 2022) on 2026-05-01. No further builds scheduled.');
 
 INSERT INTO build_test_results (id, image_id, test_phase, passed, details, run_at)
 VALUES

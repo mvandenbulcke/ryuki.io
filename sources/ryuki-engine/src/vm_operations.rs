@@ -2,10 +2,7 @@ use crate::models::*;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 pub fn plan_vm_day2_change(
     target_ci_key: &str,
@@ -233,7 +230,7 @@ mod tests {
             "ci-vm-001",
             VmChangeType::ResizeCpu,
             8,
-            "LOVE",
+            "DEFRA",
             "production",
             "app-team",
             "EU-Overnight-2026-06-15",
@@ -252,7 +249,7 @@ mod tests {
             "ci-vm-002",
             VmChangeType::ExtendDisk,
             50,
-            "BUR1",
+            "GBLON",
             "production",
             "db-team",
             "EU-Overnight-2026-06-16",
@@ -269,7 +266,7 @@ mod tests {
                 "",
                 VmChangeType::ResizeCpu,
                 4,
-                "LOVE",
+                "DEFRA",
                 "production",
                 "owner",
                 "window"
@@ -300,7 +297,7 @@ mod tests {
             "ci-vm-001",
             VmChangeType::ResizeMemory,
             32,
-            "LOVE",
+            "DEFRA",
             "production",
             "app-team",
             "EU-Overnight",
@@ -316,7 +313,7 @@ mod tests {
             "ci-vm-001",
             VmChangeType::ResizeCpu,
             4,
-            "LOVE",
+            "DEFRA",
             "production",
             "app-team",
             "EU-Overnight",
@@ -333,7 +330,7 @@ mod tests {
             "ci-vm-001",
             VmChangeType::MigrateHost,
             0,
-            "LOVE",
+            "DEFRA",
             "production",
             "app-team",
             "EU-Overnight",
@@ -350,7 +347,7 @@ mod tests {
             "ci-vm-001",
             VmChangeType::ResizeCpu,
             8,
-            "LOVE",
+            "DEFRA",
             "production",
             "app-team",
             "EU-Overnight",

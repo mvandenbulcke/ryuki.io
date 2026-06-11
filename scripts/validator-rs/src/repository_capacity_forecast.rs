@@ -143,7 +143,7 @@ const REQUIRED_RULES: &[RuleDetail] = &[
     RuleDetail {
         id: "hub-spoke-impact-required",
         decision: "block",
-        requirement: "ESBUR1/BUR1 hub-spoke capacity impact must be visible for shared target planning.",
+        requirement: "GBLON hub-spoke capacity impact must be visible for shared target planning.",
         evidence: "Hub-spoke capacity impact",
     },
     RuleDetail {

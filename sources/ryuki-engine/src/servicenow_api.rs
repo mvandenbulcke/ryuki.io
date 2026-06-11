@@ -72,14 +72,14 @@ fn seed_requests() -> Vec<ServiceNowRequest> {
             request_type: ServiceNowRequestType::Incident,
             external_ref: "INC-2026-0042".into(),
             status: ServiceNowSubmissionStatus::Submitted,
-            ci_name: "srv-love-web01.corp.local".into(),
+            ci_name: "srv-defra-web01.corp.local".into(),
             payload_summary: "High CPU alert — incident created, ops-lead assigned".into(),
             created_at: now.clone(),
             submitted_at: Some(now.clone()),
             metadata: HashMap::from([
                 ("urgency".into(), "2".into()),
                 ("assignment_group".into(), "Wintel-Operations".into()),
-                ("site".into(), "LOVE".into()),
+                ("site".into(), "DEFRA".into()),
             ]),
         },
         ServiceNowRequest {
@@ -87,7 +87,7 @@ fn seed_requests() -> Vec<ServiceNowRequest> {
             request_type: ServiceNowRequestType::Change,
             external_ref: "CHG-2026-0127".into(),
             status: ServiceNowSubmissionStatus::Ready,
-            ci_name: "srv-bur1-db01.corp.local".into(),
+            ci_name: "srv-gblon-db01.corp.local".into(),
             payload_summary: "Planned memory upgrade from 64 GB to 128 GB — maintenance window 2026-06-15 02:00-04:00 UTC".into(),
             created_at: now.clone(),
             submitted_at: None,
@@ -96,7 +96,7 @@ fn seed_requests() -> Vec<ServiceNowRequest> {
                 ("risk".into(), "Low".into()),
                 ("planned_start".into(), "2026-06-15T02:00:00Z".into()),
                 ("planned_end".into(), "2026-06-15T04:00:00Z".into()),
-                ("site".into(), "BUR1".into()),
+                ("site".into(), "GBLON".into()),
             ]),
         },
         ServiceNowRequest {
@@ -104,13 +104,13 @@ fn seed_requests() -> Vec<ServiceNowRequest> {
             request_type: ServiceNowRequestType::Request,
             external_ref: "REQ-2026-0399".into(),
             status: ServiceNowSubmissionStatus::Draft,
-            ci_name: "srv-tor1-mon01.corp.local".into(),
+            ci_name: "srv-nlams-mon01.corp.local".into(),
             payload_summary: "Request for Zabbix agent upgrade on monitoring server — pending validation".into(),
             created_at: now.clone(),
             submitted_at: None,
             metadata: HashMap::from([
                 ("request_type".into(), "software-upgrade".into()),
-                ("site".into(), "TOR1".into()),
+                ("site".into(), "NLAMS".into()),
             ]),
         },
         ServiceNowRequest {
@@ -118,13 +118,13 @@ fn seed_requests() -> Vec<ServiceNowRequest> {
             request_type: ServiceNowRequestType::Knowledge,
             external_ref: "KB-2026-0182".into(),
             status: ServiceNowSubmissionStatus::Pending,
-            ci_name: "srv-wijh-fs01.corp.local".into(),
+            ci_name: "srv-gblon-fs01.corp.local".into(),
             payload_summary: "VSS writer recovery procedure for file server backup failures — draft KB article".into(),
             created_at: now.clone(),
             submitted_at: None,
             metadata: HashMap::from([
                 ("knowledge_base".into(), "Operations".into()),
-                ("site".into(), "WIJH".into()),
+                ("site".into(), "GBLON".into()),
             ]),
         },
     ]
@@ -568,14 +568,14 @@ mod tests {
     fn test_prepare_incident_creates_draft() {
         fresh_store();
         let result = prepare_incident(
-            "srv-love-app01.corp.local",
+            "srv-defra-app01.corp.local",
             "Disk space critical — 95% used on C:",
             "1",
             "Wintel-Operations",
         )
         .unwrap();
         assert_eq!(result["request_type"], "incident");
-        assert_eq!(result["ci_name"], "srv-love-app01.corp.local");
+        assert_eq!(result["ci_name"], "srv-defra-app01.corp.local");
         assert_eq!(result["status"], "Draft");
         assert_eq!(result["source"], "static-dry-run");
         assert!(result["id"].as_str().is_some());
@@ -588,7 +588,7 @@ mod tests {
     fn test_prepare_change_requires_planned_window() {
         fresh_store();
         assert!(prepare_change(
-            "srv-bur1-db01.corp.local",
+            "srv-gblon-db01.corp.local",
             "Normal",
             "",
             "2026-06-15T02:00:00Z",
@@ -598,7 +598,7 @@ mod tests {
         .is_err());
 
         assert!(prepare_change(
-            "srv-bur1-db01.corp.local",
+            "srv-gblon-db01.corp.local",
             "Normal",
             "Memory upgrade",
             "",
@@ -684,8 +684,8 @@ mod tests {
     #[test]
     fn test_get_submission_history_by_ci() {
         fresh_store();
-        let history = get_submission_history("srv-love-web01.corp.local");
-        assert_eq!(history["ci_name"], "srv-love-web01.corp.local");
+        let history = get_submission_history("srv-defra-web01.corp.local");
+        assert_eq!(history["ci_name"], "srv-defra-web01.corp.local");
         assert_eq!(history["count"].as_u64().unwrap(), 1);
         let items = history["items"].as_array().unwrap();
         assert_eq!(items[0]["id"], "sn-req-001");

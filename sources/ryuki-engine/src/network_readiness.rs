@@ -15,7 +15,7 @@ fn seed_data() -> NetworkStore {
     let mut ports = Vec::new();
     let mut vlans = Vec::new();
 
-    for (site_idx, site) in ["LOVE", "BUR1"].iter().enumerate() {
+    for (site_idx, site) in ["DEFRA", "GBLON"].iter().enumerate() {
         for sw_idx in 0..3 {
             let switch_name = format!("{}-sw-{:02}", site.to_lowercase(), sw_idx + 1);
             for p in 0..8 {
@@ -477,17 +477,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_check_port_readiness_love() {
-        let result = check_port_readiness("LOVE", 10).unwrap();
+    fn test_check_port_readiness_defra() {
+        let result = check_port_readiness("DEFRA", 10).unwrap();
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["available_ports"].as_u64().unwrap() > 0);
         assert!(result["dry_run"].as_bool().unwrap());
     }
 
     #[test]
     fn test_check_vlan_readiness_found() {
-        let result = check_vlan_readiness("LOVE", 100, 5).unwrap();
+        let result = check_vlan_readiness("DEFRA", 100, 5).unwrap();
         assert_eq!(result["vlan_id"], 100);
         assert_eq!(result["satisfied"], true);
         assert!(result["available_ips"].as_u64().unwrap() >= 5);
@@ -495,12 +495,12 @@ mod tests {
 
     #[test]
     fn test_check_vlan_readiness_not_found() {
-        assert!(check_vlan_readiness("LOVE", 999, 1).is_err());
+        assert!(check_vlan_readiness("DEFRA", 999, 1).is_err());
     }
 
     #[test]
     fn test_reserve_ports_success() {
-        let result = reserve_ports("BUR1", 3, "vm-deployment").unwrap();
+        let result = reserve_ports("GBLON", 3, "vm-deployment").unwrap();
         assert_eq!(result["reserved_count"], 3);
         assert_eq!(result["status"], "reserved");
         assert!(!result["reservation_id"].as_str().unwrap().is_empty());
@@ -508,19 +508,19 @@ mod tests {
 
     #[test]
     fn test_reserve_ports_insufficient() {
-        assert!(reserve_ports("LOVE", 50, "too-many").is_err());
+        assert!(reserve_ports("DEFRA", 50, "too-many").is_err());
     }
 
     #[test]
     fn test_reserve_ips_success() {
-        let result = reserve_ips("LOVE", 100, 10, "server-deploy").unwrap();
+        let result = reserve_ips("DEFRA", 100, 10, "server-deploy").unwrap();
         assert_eq!(result["resource_type"], "ips");
         assert_eq!(result["reserved_ip_count"], 10);
     }
 
     #[test]
     fn test_release_reservation_success() {
-        let reserve = reserve_ports("BUR1", 2, "test-release").unwrap();
+        let reserve = reserve_ports("GBLON", 2, "test-release").unwrap();
         let resv_id = reserve["reservation_id"].as_str().unwrap().to_string();
         let release = release_reservation(&resv_id).unwrap();
         assert_eq!(release["status"], "released");
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_get_site_capacity() {
-        let result = get_site_capacity("LOVE").unwrap();
+        let result = get_site_capacity("DEFRA").unwrap();
         assert_eq!(result["source"], "dry-run");
         assert!(result["ports"]["total"].as_u64().unwrap() > 0);
         assert!(!result["vlans"].as_array().unwrap().is_empty());
@@ -542,8 +542,8 @@ mod tests {
 
     #[test]
     fn test_get_port_inventory_found() {
-        let result = get_port_inventory("love-sw-01").unwrap();
-        assert_eq!(result["switch_name"], "love-sw-01");
+        let result = get_port_inventory("defra-sw-01").unwrap();
+        assert_eq!(result["switch_name"], "defra-sw-01");
         assert!(result["total_ports"].as_u64().unwrap() > 0);
     }
 
@@ -554,24 +554,24 @@ mod tests {
 
     #[test]
     fn test_get_vlan_inventory() {
-        let result = get_vlan_inventory("BUR1").unwrap();
-        assert_eq!(result["site"], "BUR1");
+        let result = get_vlan_inventory("GBLON").unwrap();
+        assert_eq!(result["site"], "GBLON");
         assert!(result["total_vlans"].as_u64().unwrap() > 0);
     }
 
     #[test]
     fn test_release_reservation_restores_ports() {
-        let initial = get_site_capacity("LOVE").unwrap();
+        let initial = get_site_capacity("DEFRA").unwrap();
         let initial_available = initial["ports"]["available"].as_u64().unwrap();
 
-        let reserve = reserve_ports("LOVE", 2, "restore-test").unwrap();
-        let mid = get_site_capacity("LOVE").unwrap();
+        let reserve = reserve_ports("DEFRA", 2, "restore-test").unwrap();
+        let mid = get_site_capacity("DEFRA").unwrap();
         let mid_available = mid["ports"]["available"].as_u64().unwrap();
         assert_eq!(mid_available, initial_available - 2);
 
         let resv_id = reserve["reservation_id"].as_str().unwrap().to_string();
         release_reservation(&resv_id).unwrap();
-        let after = get_site_capacity("LOVE").unwrap();
+        let after = get_site_capacity("DEFRA").unwrap();
         let after_available = after["ports"]["available"].as_u64().unwrap();
         assert_eq!(after_available, initial_available);
     }

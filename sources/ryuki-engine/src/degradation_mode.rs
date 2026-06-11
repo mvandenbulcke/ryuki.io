@@ -103,9 +103,9 @@ pub struct DegradationRule {
 }
 
 fn seed_sites() -> Vec<SiteStatus> {
-    let mut love = SiteStatus::healthy("LOVE");
-    let mut bur1 = SiteStatus {
-        site: "BUR1".into(),
+    let mut defra = SiteStatus::healthy("DEFRA");
+    let mut gblon = SiteStatus {
+        site: "GBLON".into(),
         state: SiteDegradationState::Degraded,
         api_status: ComponentStatus::Degraded,
         db_status: ComponentStatus::Up,
@@ -119,8 +119,8 @@ fn seed_sites() -> Vec<SiteStatus> {
         degradation_reason: Some("Hyper-V and Veeam adapters reporting degraded connectivity".into()),
         last_check: Utc::now().to_rfc3339(),
     };
-    let mut tor1 = SiteStatus {
-        site: "TOR1".into(),
+    let mut nlams = SiteStatus {
+        site: "NLAMS".into(),
         state: SiteDegradationState::Unreachable,
         api_status: ComponentStatus::Down,
         db_status: ComponentStatus::Down,
@@ -131,15 +131,15 @@ fn seed_sites() -> Vec<SiteStatus> {
             veeam: ComponentStatus::Down,
             zabbix: ComponentStatus::Down,
         },
-        degradation_reason: Some("Site TOR1 network unreachable, all components down".into()),
+        degradation_reason: Some("Site NLAMS network unreachable, all components down".into()),
         last_check: Utc::now().to_rfc3339(),
     };
 
-    love.last_check = Utc::now().to_rfc3339();
-    bur1.last_check = Utc::now().to_rfc3339();
-    tor1.last_check = Utc::now().to_rfc3339();
+    defra.last_check = Utc::now().to_rfc3339();
+    gblon.last_check = Utc::now().to_rfc3339();
+    nlams.last_check = Utc::now().to_rfc3339();
 
-    vec![love, bur1, tor1]
+    vec![defra, gblon, nlams]
 }
 
 pub fn get_site_statuses() -> Vec<SiteStatus> {
@@ -258,10 +258,10 @@ pub fn get_degradation_rules() -> Vec<DegradationRule> {
             evidence: "Affected scope".into(),
         },
         DegradationRule {
-            id: "no-automatic-failover".into(),
+            id: "no-automatic-faidefrar".into(),
             decision: "block".into(),
             requirement:
-                "Degradation mode can suggest safe remediation but must not perform automatic failover."
+                "Degradation mode can suggest safe remediation but must not perform automatic faidefrar."
                     .into(),
             evidence: "Safe remediation".into(),
         },
@@ -274,7 +274,7 @@ pub fn get_degradation_contract() -> serde_json::Value {
         "degradationMode": "fail-safe-read-only",
         "providerCallsEnabled": false,
         "liveExecutionAllowed": false,
-        "failoverAutomationAllowed": false,
+        "faidefrarAutomationAllowed": false,
         "rawProviderPayloadsAllowed": false,
         "degradationScopes": ["site","provider","adapter","dependency","workflow","evidence"],
         "degradationStates": ["normal","degraded-read-only","stale-read-only","blocked","recovering"],
@@ -287,7 +287,7 @@ pub fn get_degradation_contract() -> serde_json::Value {
             {"id":"write-execution-blocked-when-degraded","decision":"block","requirement":"Write-capable workflows remain blocked while affected scope is degraded or stale.","evidence":"Blocked execution decision"},
             {"id":"stale-data-must-be-marked","decision":"block","requirement":"Cached or stale data must be marked before read-only views can be shown.","evidence":"Stale-data marker"},
             {"id":"affected-scope-required","decision":"block","requirement":"Degraded site, provider, adapter, dependency, workflow, or evidence scope must be explicit.","evidence":"Affected scope"},
-            {"id":"no-automatic-failover","decision":"block","requirement":"Degradation mode can suggest safe remediation but must not perform automatic failover.","evidence":"Safe remediation"}
+            {"id":"no-automatic-faidefrar","decision":"block","requirement":"Degradation mode can suggest safe remediation but must not perform automatic faidefrar.","evidence":"Safe remediation"}
         ]
     })
 }
@@ -298,19 +298,19 @@ mod tests {
 
     #[test]
     fn test_check_site_health_known_sites() {
-        let love = check_site_health("LOVE");
-        assert_eq!(love.site, "LOVE");
-        assert_eq!(love.state, SiteDegradationState::Healthy);
-        assert_eq!(love.api_status, ComponentStatus::Up);
+        let defra = check_site_health("DEFRA");
+        assert_eq!(defra.site, "DEFRA");
+        assert_eq!(defra.state, SiteDegradationState::Healthy);
+        assert_eq!(defra.api_status, ComponentStatus::Up);
 
-        let bur1 = check_site_health("BUR1");
-        assert_eq!(bur1.site, "BUR1");
-        assert_eq!(bur1.state, SiteDegradationState::Degraded);
-        assert_eq!(bur1.adapter_status.hyperv, ComponentStatus::Degraded);
+        let gblon = check_site_health("GBLON");
+        assert_eq!(gblon.site, "GBLON");
+        assert_eq!(gblon.state, SiteDegradationState::Degraded);
+        assert_eq!(gblon.adapter_status.hyperv, ComponentStatus::Degraded);
 
-        let tor1 = check_site_health("TOR1");
-        assert_eq!(tor1.site, "TOR1");
-        assert_eq!(tor1.state, SiteDegradationState::Unreachable);
+        let nlams = check_site_health("NLAMS");
+        assert_eq!(nlams.site, "NLAMS");
+        assert_eq!(nlams.state, SiteDegradationState::Unreachable);
     }
 
     #[test]
@@ -337,14 +337,14 @@ mod tests {
         let degraded = get_degraded_sites();
         assert_eq!(degraded.len(), 2);
         let sites: Vec<&str> = degraded.iter().map(|s| s.site.as_str()).collect();
-        assert!(sites.contains(&"BUR1"));
-        assert!(sites.contains(&"TOR1"));
+        assert!(sites.contains(&"GBLON"));
+        assert!(sites.contains(&"NLAMS"));
     }
 
     #[test]
     fn test_enter_degradation_mode_marks_all_components_degraded() {
-        let status = enter_degradation_mode("LOVE", "Scheduled maintenance");
-        assert_eq!(status.site, "LOVE");
+        let status = enter_degradation_mode("DEFRA", "Scheduled maintenance");
+        assert_eq!(status.site, "DEFRA");
         assert_eq!(status.state, SiteDegradationState::Degraded);
         assert_eq!(status.api_status, ComponentStatus::Degraded);
         assert_eq!(status.db_status, ComponentStatus::Degraded);
@@ -355,8 +355,8 @@ mod tests {
 
     #[test]
     fn test_exit_degradation_mode_sets_recovering_state() {
-        let status = exit_degradation_mode("BUR1");
-        assert_eq!(status.site, "BUR1");
+        let status = exit_degradation_mode("GBLON");
+        assert_eq!(status.site, "GBLON");
         assert_eq!(status.state, SiteDegradationState::Recovering);
         assert!(status.degradation_reason.unwrap().contains("DRY-RUN"));
         assert_eq!(status.api_status, ComponentStatus::Up);
@@ -370,7 +370,7 @@ mod tests {
         assert!(ids.contains(&"write-execution-blocked-when-degraded"));
         assert!(ids.contains(&"stale-data-must-be-marked"));
         assert!(ids.contains(&"affected-scope-required"));
-        assert!(ids.contains(&"no-automatic-failover"));
+        assert!(ids.contains(&"no-automatic-faidefrar"));
         for rule in &rules {
             assert_eq!(rule.decision, "block");
         }
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(contract["degradationMode"], "fail-safe-read-only");
         assert_eq!(contract["providerCallsEnabled"], false);
         assert_eq!(contract["liveExecutionAllowed"], false);
-        assert_eq!(contract["failoverAutomationAllowed"], false);
+        assert_eq!(contract["faidefrarAutomationAllowed"], false);
         assert_eq!(contract["rawProviderPayloadsAllowed"], false);
         assert!(contract["degradationScopes"].as_array().unwrap().len() == 6);
         assert!(contract["rules"].as_array().unwrap().len() == 4);
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_site_status_serialization_roundtrip() {
-        let status = check_site_health("LOVE");
+        let status = check_site_health("DEFRA");
         let json = serde_json::to_string(&status).expect("Failed to serialize");
         let deserialized: SiteStatus =
             serde_json::from_str(&json).expect("Failed to deserialize");

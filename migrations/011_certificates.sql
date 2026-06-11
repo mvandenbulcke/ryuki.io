@@ -11,6 +11,6 @@ CREATE TABLE certificates (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 INSERT INTO certificates (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) VALUES
-    ('*.corp.local', 'CN=*.corp.local', NOW() - INTERVAL '30 days', NOW() + INTERVAL '60 days', 'IIS', 'web01.corp.local', 'BUR1', 'Expiring'),
-    ('vcenter.corp.local', 'CN=vcenter.corp.local', NOW() - INTERVAL '180 days', NOW() + INTERVAL '185 days', 'VMware', 'vcenter.corp.local', 'BUR1', 'Active'),
-    ('esxi01.corp.local', 'CN=esxi01.corp.local', NOW() - INTERVAL '400 days', NOW() - INTERVAL '30 days', 'ESXi', 'esxi01.corp.local', 'ALBI', 'Expired');
+    ('*.corp.local', 'CN=*.corp.local', NOW() - INTERVAL '30 days', NOW() + INTERVAL '60 days', 'IIS', 'web01.corp.local', 'GBLON', 'Expiring'),
+    ('vcenter.corp.local', 'CN=vcenter.corp.local', NOW() - INTERVAL '180 days', NOW() + INTERVAL '185 days', 'VMware', 'vcenter.corp.local', 'GBLON', 'Active'),
+    ('esxi01.corp.local', 'CN=esxi01.corp.local', NOW() - INTERVAL '400 days', NOW() - INTERVAL '30 days', 'ESXi', 'esxi01.corp.local', 'FRPAR', 'Expired');

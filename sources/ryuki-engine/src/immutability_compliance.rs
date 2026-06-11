@@ -70,19 +70,16 @@ pub struct RemediationPlan {
     pub estimated_effort: String,
 }
 
-const VALID_SITES: &[&str] = &[
-    "LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1",
-    "PITE",
-];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 fn seed_repositories() -> Vec<ImmutabilityCheck> {
     let now = chrono::Utc::now();
     vec![
         ImmutabilityCheck {
             id: "imm-00000000-0000-0000-0000-000000000001".into(),
-            repository_name: "repo-love-storeonce-01".into(),
+            repository_name: "repo-defra-storeonce-01".into(),
             repository_type: RepositoryType::StoreOnce,
-            site: "LOVE".into(),
+            site: "DEFRA".into(),
             immutability_enabled: true,
             retention_lock_set: true,
             min_retention_days: 90,
@@ -91,9 +88,9 @@ fn seed_repositories() -> Vec<ImmutabilityCheck> {
         },
         ImmutabilityCheck {
             id: "imm-00000000-0000-0000-0000-000000000002".into(),
-            repository_name: "repo-bur1-hlr-01".into(),
+            repository_name: "repo-gblon-hlr-01".into(),
             repository_type: RepositoryType::HardenedLinux,
-            site: "BUR1".into(),
+            site: "GBLON".into(),
             immutability_enabled: true,
             retention_lock_set: false,
             min_retention_days: 30,
@@ -102,9 +99,9 @@ fn seed_repositories() -> Vec<ImmutabilityCheck> {
         },
         ImmutabilityCheck {
             id: "imm-00000000-0000-0000-0000-000000000003".into(),
-            repository_name: "repo-ccss-objstore-01".into(),
+            repository_name: "repo-frpar-objstore-01".into(),
             repository_type: RepositoryType::ObjectStorage,
-            site: "CCSS".into(),
+            site: "FRPAR".into(),
             immutability_enabled: false,
             retention_lock_set: false,
             min_retention_days: 0,
@@ -113,9 +110,9 @@ fn seed_repositories() -> Vec<ImmutabilityCheck> {
         },
         ImmutabilityCheck {
             id: "imm-00000000-0000-0000-0000-000000000004".into(),
-            repository_name: "repo-tor1-storeonce-02".into(),
+            repository_name: "repo-nlams-storeonce-02".into(),
             repository_type: RepositoryType::StoreOnce,
-            site: "TOR1".into(),
+            site: "NLAMS".into(),
             immutability_enabled: true,
             retention_lock_set: true,
             min_retention_days: 60,
@@ -345,7 +342,7 @@ mod tests {
     fn test_check_immutability_compliant() {
         let result = check_immutability("imm-00000000-0000-0000-0000-000000000001")
             .expect("should find repo");
-        assert_eq!(result.repository_name, "repo-love-storeonce-01");
+        assert_eq!(result.repository_name, "repo-defra-storeonce-01");
         assert!(result.immutability_enabled);
         assert_eq!(result.status, ComplianceStatus::Compliant);
     }
@@ -387,9 +384,9 @@ mod tests {
 
     #[test]
     fn test_verify_all_repositories_for_site() {
-        let results = verify_all_repositories("LOVE").expect("should return results");
+        let results = verify_all_repositories("DEFRA").expect("should return results");
         assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.site == "LOVE"));
+        assert!(results.iter().all(|r| r.site == "DEFRA"));
     }
 
     #[test]
@@ -407,8 +404,8 @@ mod tests {
 
     #[test]
     fn test_get_compliance_report() {
-        let report = get_compliance_report("LOVE").expect("should generate report");
-        assert_eq!(report.site, "LOVE");
+        let report = get_compliance_report("DEFRA").expect("should generate report");
+        assert_eq!(report.site, "DEFRA");
         assert!(report.total_repositories > 0);
         assert!(report.compliant + report.at_risk + report.non_compliant == report.total_repositories);
     }
@@ -426,10 +423,10 @@ mod tests {
         assert!(noncompliant
             .iter()
             .all(|r| r.status == ComplianceStatus::NonCompliant));
-        let ccss_repo = noncompliant
+        let frpar_repo = noncompliant
             .iter()
-            .find(|r| r.repository_name == "repo-ccss-objstore-01");
-        assert!(ccss_repo.is_some());
+            .find(|r| r.repository_name == "repo-frpar-objstore-01");
+        assert!(frpar_repo.is_some());
     }
 
     #[test]

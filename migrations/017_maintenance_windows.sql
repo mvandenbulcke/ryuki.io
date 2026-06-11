@@ -16,7 +16,7 @@ CREATE INDEX idx_maintenance_windows_times ON maintenance_windows(start_time, en
 CREATE INDEX idx_maintenance_windows_status ON maintenance_windows(status);
 
 INSERT INTO maintenance_windows (id, site, start_time, end_time, reason, affected_cis, status, created_by) VALUES
-    ('c0000000-0000-0000-0000-000000000001', 'LOVE', '2026-06-15 22:00:00+00', '2026-06-16 06:00:00+00', 'Scheduled SQL Server patching', ARRAY['sql-love-01', 'sql-love-02'], 'Planned', 'patch-team'),
-    ('c0000000-0000-0000-0000-000000000002', 'BUR1', '2026-06-17 00:00:00+00', '2026-06-17 04:00:00+00', 'Hypervisor firmware upgrade', ARRAY['esx-bur1-01', 'esx-bur1-02', 'esx-bur1-03'], 'Planned', 'infra-team'),
-    ('c0000000-0000-0000-0000-000000000003', 'CCSS', '2026-06-20 01:00:00+00', '2026-06-20 07:00:00+00', 'Network switch firmware upgrade', ARRAY['sw-ccss-core-01', 'sw-ccss-core-02'], 'Planned', 'network-team'),
-    ('c0000000-0000-0000-0000-000000000004', 'LOVE', '2026-06-28 02:00:00+00', '2026-06-28 04:00:00+00', 'Load balancer certificate rotation', ARRAY['lb-love-01'], 'Planned', 'sec-team');
+    ('c0000000-0000-0000-0000-000000000001', 'DEFRA', '2026-06-15 22:00:00+00', '2026-06-16 06:00:00+00', 'Scheduled SQL Server patching', ARRAY['sql-defra-01', 'sql-defra-02'], 'Planned', 'patch-team'),
+    ('c0000000-0000-0000-0000-000000000002', 'GBLON', '2026-06-17 00:00:00+00', '2026-06-17 04:00:00+00', 'Hypervisor firmware upgrade', ARRAY['esx-gblon-01', 'esx-gblon-02', 'esx-gblon-03'], 'Planned', 'infra-team'),
+    ('c0000000-0000-0000-0000-000000000003', 'FRPAR', '2026-06-20 01:00:00+00', '2026-06-20 07:00:00+00', 'Network switch firmware upgrade', ARRAY['sw-frpar-core-01', 'sw-frpar-core-02'], 'Planned', 'network-team'),
+    ('c0000000-0000-0000-0000-000000000004', 'DEFRA', '2026-06-28 02:00:00+00', '2026-06-28 04:00:00+00', 'Load balancer certificate rotation', ARRAY['lb-defra-01'], 'Planned', 'sec-team');

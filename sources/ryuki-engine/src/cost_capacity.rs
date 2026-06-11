@@ -46,31 +46,31 @@ fn seed_data() -> CostCapacityStore {
 
     let sites: [(&str, &[(&str, u32, u32, u32, f64, f64, bool, bool, u32)]); 2] = [
         (
-            "LOVE",
+            "DEFRA",
             &[
-                ("love-srv-01", 8, 32, 200, 72.5, 65.0, false, false, 0),
-                ("love-srv-02", 4, 16, 100, 18.2, 22.1, false, false, 0),
-                ("love-srv-03", 16, 64, 500, 85.3, 78.0, false, false, 0),
-                ("love-db-01", 12, 48, 400, 91.2, 88.5, false, false, 0),
-                ("love-web-01", 2, 8, 80, 12.0, 35.0, false, true, 0),
-                ("love-web-02", 2, 8, 80, 14.0, 31.0, false, true, 0),
-                ("love-dev-01", 4, 16, 100, 2.1, 5.3, true, false, 0),
-                ("love-dev-02", 4, 16, 120, 3.5, 6.2, true, false, 50),
-                ("love-legacy-01", 2, 4, 60, 95.0, 92.0, false, false, 0),
-                ("love-dc-01", 4, 16, 100, 45.0, 48.0, false, false, 0),
+                ("defra-srv-01", 8, 32, 200, 72.5, 65.0, false, false, 0),
+                ("defra-srv-02", 4, 16, 100, 18.2, 22.1, false, false, 0),
+                ("defra-srv-03", 16, 64, 500, 85.3, 78.0, false, false, 0),
+                ("defra-db-01", 12, 48, 400, 91.2, 88.5, false, false, 0),
+                ("defra-web-01", 2, 8, 80, 12.0, 35.0, false, true, 0),
+                ("defra-web-02", 2, 8, 80, 14.0, 31.0, false, true, 0),
+                ("defra-dev-01", 4, 16, 100, 2.1, 5.3, true, false, 0),
+                ("defra-dev-02", 4, 16, 120, 3.5, 6.2, true, false, 50),
+                ("defra-legacy-01", 2, 4, 60, 95.0, 92.0, false, false, 0),
+                ("defra-dc-01", 4, 16, 100, 45.0, 48.0, false, false, 0),
             ],
         ),
         (
-            "BUR1",
+            "GBLON",
             &[
-                ("bur1-srv-01", 8, 32, 200, 68.0, 60.0, false, false, 0),
-                ("bur1-srv-02", 4, 16, 100, 22.0, 28.0, false, false, 0),
-                ("bur1-srv-03", 16, 64, 500, 80.0, 75.0, false, false, 0),
-                ("bur1-db-01", 12, 48, 400, 88.0, 82.0, false, false, 0),
-                ("bur1-dr-01", 8, 32, 300, 3.0, 4.5, true, false, 0),
-                ("bur1-web-01", 2, 8, 60, 18.0, 42.0, false, true, 0),
-                ("bur1-qa-01", 4, 16, 100, 4.0, 7.0, true, false, 0),
-                ("bur1-qa-02", 8, 32, 200, 5.0, 8.5, true, true, 100),
+                ("gblon-srv-01", 8, 32, 200, 68.0, 60.0, false, false, 0),
+                ("gblon-srv-02", 4, 16, 100, 22.0, 28.0, false, false, 0),
+                ("gblon-srv-03", 16, 64, 500, 80.0, 75.0, false, false, 0),
+                ("gblon-db-01", 12, 48, 400, 88.0, 82.0, false, false, 0),
+                ("gblon-dr-01", 8, 32, 300, 3.0, 4.5, true, false, 0),
+                ("gblon-web-01", 2, 8, 60, 18.0, 42.0, false, true, 0),
+                ("gblon-qa-01", 4, 16, 100, 4.0, 7.0, true, false, 0),
+                ("gblon-qa-02", 8, 32, 200, 5.0, 8.5, true, true, 100),
             ],
         ),
     ];
@@ -508,10 +508,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_get_site_capacity_love() {
-        let result = get_site_capacity("LOVE").unwrap();
+    fn test_get_site_capacity_defra() {
+        let result = get_site_capacity("DEFRA").unwrap();
         assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], "DEFRA");
         assert!(result["total_cpu_cores"].as_u64().unwrap() > 0);
         assert!(result["total_memory_gb"].as_u64().unwrap() > 0);
         assert!(result["vm_count"].as_u64().unwrap() > 0);
@@ -519,24 +519,24 @@ mod tests {
     }
 
     #[test]
-    fn test_get_site_capacity_bur1() {
-        let result = get_site_capacity("BUR1").unwrap();
-        assert_eq!(result["site"], "BUR1");
+    fn test_get_site_capacity_gblon() {
+        let result = get_site_capacity("GBLON").unwrap();
+        assert_eq!(result["site"], "GBLON");
         assert!(result["clusters"].as_array().unwrap().len() > 0);
     }
 
     #[test]
     fn test_get_cluster_capacity() {
-        let result = get_cluster_capacity("LOVE", "love-general-cluster").unwrap();
-        assert_eq!(result["site"], "LOVE");
-        assert_eq!(result["cluster"], "love-general-cluster");
+        let result = get_cluster_capacity("DEFRA", "defra-general-cluster").unwrap();
+        assert_eq!(result["site"], "DEFRA");
+        assert_eq!(result["cluster"], "defra-general-cluster");
         assert!(result["vm_count"].as_u64().unwrap() > 0);
         assert!(result["vms"].as_array().is_some());
     }
 
     #[test]
     fn test_forecast_capacity() {
-        let result = forecast_capacity("LOVE", 6).unwrap();
+        let result = forecast_capacity("DEFRA", 6).unwrap();
         assert_eq!(result["forecast_months"], 6);
         let projected_cpu = result["projected"]["cpu_utilization_pct"].as_f64().unwrap();
         let current_cpu = result["current"]["cpu_utilization_pct"].as_f64().unwrap();
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_get_cost_summary() {
-        let result = get_cost_summary("BUR1").unwrap();
+        let result = get_cost_summary("GBLON").unwrap();
         assert!(result["total_monthly_spend"].as_f64().unwrap() > 0.0);
         assert!(result["vm_count"].as_u64().unwrap() > 0);
         assert!(result["avg_cost_per_vm"].as_f64().unwrap() > 0.0);
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_get_waste_report() {
-        let result = get_waste_report("LOVE").unwrap();
+        let result = get_waste_report("DEFRA").unwrap();
         assert!(result["idle_count"].as_u64().unwrap() > 0);
         assert!(result["idle_monthly_cost"].as_f64().unwrap() > 0.0);
         assert!(result["total_waste_monthly"].as_f64().unwrap() > 0.0);
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_get_rightsizing_recommendations() {
-        let result = get_rightsizing_recommendations("BUR1").unwrap();
+        let result = get_rightsizing_recommendations("GBLON").unwrap();
         assert!(result["recommendation_count"].as_u64().unwrap() > 0);
         let recs = result["recommendations"].as_array().unwrap();
         assert!(!recs.is_empty());
@@ -572,9 +572,9 @@ mod tests {
 
     #[test]
     fn test_get_trend_report() {
-        let result = get_trend_report("LOVE", "cpu").unwrap();
+        let result = get_trend_report("DEFRA", "cpu").unwrap();
         assert_eq!(result["metric"], "cpu");
-        assert_eq!(result["site"], "LOVE");
+        assert_eq!(result["site"], "DEFRA");
         let points = result["data_points"].as_array().unwrap();
         assert_eq!(points.len(), 12);
         assert!(points[0]["date"].as_str().is_some());
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_get_trend_report_invalid_metric() {
-        assert!(get_trend_report("LOVE", "network").is_err());
+        assert!(get_trend_report("DEFRA", "network").is_err());
     }
 
     #[test]
@@ -595,13 +595,13 @@ mod tests {
 
     #[test]
     fn test_trend_report_memory() {
-        let result = get_trend_report("BUR1", "memory").unwrap();
+        let result = get_trend_report("GBLON", "memory").unwrap();
         assert_eq!(result["metric"], "memory");
     }
 
     #[test]
     fn test_trend_report_storage() {
-        let result = get_trend_report("LOVE", "storage").unwrap();
+        let result = get_trend_report("DEFRA", "storage").unwrap();
         assert_eq!(result["metric"], "storage");
     }
 }
