@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
@@ -343,6 +344,7 @@ async fn main() {
         .allow_headers(Any);
 
     let body_limit = app_config.server.max_body_size_bytes;
+    let timeout_secs = app_config.server.request_timeout_secs;
 
     let app = Router::new()
         .route("/health", get(health))
@@ -357,11 +359,34 @@ async fn main() {
         .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(request_counter_middleware))
         .layer(middleware::from_fn(request_id_middleware))
-        .layer(middleware::from_fn(move |req, next| {
-            let limiter = rate_limiter.clone();
-            async move { rate_limit_middleware(limiter, req, next).await }
-        }))
+        .layer(middleware::from_fn(
+            move |req: HttpRequest<Body>, next: middleware::Next| {
+                let limiter = rate_limiter.clone();
+                async move { rate_limit_middleware(limiter, req, next).await }
+            },
+        ))
         .layer(middleware::from_fn(auth_middleware))
+        .layer(middleware::from_fn(
+            move |req: HttpRequest<Body>, next: middleware::Next| async move {
+                let path = req.uri().path().to_string();
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
+                    Ok(response) => response,
+                    Err(_elapsed) => {
+                        tracing::warn!(path = %path, timeout_secs, "request timeout");
+                        let body = serde_json::to_string(&ApiError::new(
+                            "REQUEST_TIMEOUT",
+                            format!("Request exceeded {}s timeout", timeout_secs),
+                        ))
+                        .unwrap();
+                        Response::builder()
+                            .status(StatusCode::GATEWAY_TIMEOUT)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }
+            },
+        ))
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(cors)
         .layer(CompressionLayer::new())

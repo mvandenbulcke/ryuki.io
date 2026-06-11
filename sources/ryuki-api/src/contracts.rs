@@ -18,6 +18,12 @@ use uuid::Uuid;
 use crate::database::get_db;
 use crate::problem_details;
 use crate::ProblemDetails;
+
+#[derive(Debug, Deserialize)]
+struct PaginationParams {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
 use ryuki_engine::access_recertification;
 use ryuki_engine::ad_computer_lifecycle;
 use ryuki_engine::aiops;
@@ -6529,11 +6535,16 @@ async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
     })))
 }
 
-async fn requests_list() -> Json<Value> {
+async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
     if let Some(pool) = get_db() {
         let rows: Vec<DbRequestRow> = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests ORDER BY created_at DESC"
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests ORDER BY created_at DESC LIMIT $1 OFFSET $2"
         )
+        .bind(limit as i64)
+        .bind(offset as i64)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -6556,6 +6567,8 @@ async fn requests_list() -> Json<Value> {
     let store = request_store().lock().await;
     let summaries: Vec<Value> = store
         .iter()
+        .skip(offset)
+        .take(limit)
         .map(|r| {
             json!({
                 "request_id": r.request_id,
