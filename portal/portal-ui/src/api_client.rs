@@ -1,13 +1,18 @@
 use crate::api::{
     cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
-    cmdb_relationship_graph_path, dry_run_plan_path, evidence_summary_path,
-    inventory_resource_overview_path, operation_runs_path, policy_outcomes_path,
-    request_intake_path, request_list_path, same_origin_api_path, secret_references_path,
-    ApiPathError,
+    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
+    datacenter_check_rack_space_path, datacenter_check_switchports_path,
+    datacenter_failing_checks_path, datacenter_full_readiness_path,
+    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
+    dry_run_plan_path, evidence_summary_path, inventory_resource_overview_path,
+    operation_runs_path, policy_outcomes_path, request_intake_path, request_list_path,
+    same_origin_api_path, secret_references_path, ApiPathError,
 };
 use crate::models::{
     CapacityAdmissionSummary, CmdbFileExchangeSummary, CmdbReconciliationSummary,
-    CmdbRelationshipSummary, DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary,
+    CmdbRelationshipSummary, DatacenterFailingChecksSummary, DatacenterFullReadiness,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
+    DatacenterSitesCatalog, DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary,
     OperationRunSummary, PolicyOutcome, RequestIntakeSummary, RequestSummary,
     SecretReferenceCatalogStatus,
 };
@@ -112,6 +117,42 @@ pub fn operation_runs_resource() -> ApiResource<Vec<OperationRunSummary>> {
 
 pub fn request_list_resource() -> ApiResource<Vec<RequestSummary>> {
     ApiResource::new("request-list", request_list_path())
+}
+
+pub fn datacenter_readiness_score_resource() -> ApiResource<DatacenterReadinessScore> {
+    ApiResource::new("datacenter-readiness-score", datacenter_readiness_score_path())
+}
+
+pub fn datacenter_site_report_resource() -> ApiResource<DatacenterSiteReport> {
+    ApiResource::new("datacenter-site-report", datacenter_site_report_path())
+}
+
+pub fn datacenter_failing_checks_resource() -> ApiResource<DatacenterFailingChecksSummary> {
+    ApiResource::new("datacenter-failing-checks", datacenter_failing_checks_path())
+}
+
+pub fn datacenter_check_power_resource() -> ApiResource<DatacenterSingleCheck> {
+    ApiResource::new("datacenter-check-power", datacenter_check_power_path())
+}
+
+pub fn datacenter_check_cooling_resource() -> ApiResource<DatacenterSingleCheck> {
+    ApiResource::new("datacenter-check-cooling", datacenter_check_cooling_path())
+}
+
+pub fn datacenter_check_rack_space_resource() -> ApiResource<DatacenterSingleCheck> {
+    ApiResource::new("datacenter-check-rack-space", datacenter_check_rack_space_path())
+}
+
+pub fn datacenter_check_switchports_resource() -> ApiResource<DatacenterSingleCheck> {
+    ApiResource::new("datacenter-check-switchports", datacenter_check_switchports_path())
+}
+
+pub fn datacenter_full_readiness_resource() -> ApiResource<DatacenterFullReadiness> {
+    ApiResource::new("datacenter-full-readiness", datacenter_full_readiness_path())
+}
+
+pub fn datacenter_sites_resource() -> ApiResource<DatacenterSitesCatalog> {
+    ApiResource::new("datacenter-sites", datacenter_sites_path())
 }
 
 #[cfg(test)]
