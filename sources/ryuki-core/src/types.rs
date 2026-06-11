@@ -245,6 +245,7 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         "aws-secrets-manager",
         "azure-key-vault",
         "gcp-secret-manager",
+        "bitwarden-secrets-manager",
         "none",
     ];
     if !valid_secret_providers.contains(&config.secret_provider.as_str()) {

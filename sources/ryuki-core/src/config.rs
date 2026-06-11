@@ -62,6 +62,16 @@ impl DatabaseProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CloudNativePg => "cloudnativepg",
+            Self::PostgresLocal => "postgres-local",
+            Self::AwsRds => "aws-rds",
+            Self::AzurePostgresql => "azure-postgresql",
+            Self::GcpCloudSql => "gcp-cloud-sql",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -72,6 +82,7 @@ pub enum SecretProvider {
     AwsSecretsManager,
     AzureKeyVault,
     GcpSecretManager,
+    BitwardenSecretsManager,
     None,
 }
 
@@ -82,8 +93,20 @@ impl SecretProvider {
             "aws-secrets-manager" => Some(Self::AwsSecretsManager),
             "azure-key-vault" => Some(Self::AzureKeyVault),
             "gcp-secret-manager" => Some(Self::GcpSecretManager),
+            "bitwarden-secrets-manager" => Some(Self::BitwardenSecretsManager),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HashicorpVault => "hashicorp-vault",
+            Self::AwsSecretsManager => "aws-secrets-manager",
+            Self::AzureKeyVault => "azure-key-vault",
+            Self::GcpSecretManager => "gcp-secret-manager",
+            Self::BitwardenSecretsManager => "bitwarden-secrets-manager",
+            Self::None => "none",
         }
     }
 }
@@ -114,6 +137,19 @@ impl KubernetesRuntime {
             "rancher" => Some(Self::Rancher),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::VsphereVks => "vsphere-vks",
+            Self::DockerCompose => "docker-compose",
+            Self::Aks => "aks",
+            Self::Eks => "eks",
+            Self::Gke => "gke",
+            Self::OpenShift => "openshift",
+            Self::Rancher => "rancher",
+            Self::None => "none",
         }
     }
 }
@@ -182,6 +218,17 @@ impl MonitoringProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Zabbix => "zabbix",
+            Self::Prometheus => "prometheus",
+            Self::Datadog => "datadog",
+            Self::Grafana => "grafana",
+            Self::SolarWinds => "solarwinds",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -206,6 +253,17 @@ impl BackupProvider {
             "netbackup" => Some(Self::NetBackup),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Veeam => "veeam",
+            Self::Commvault => "commvault",
+            Self::Rubrik => "rubrik",
+            Self::Cohesity => "cohesity",
+            Self::NetBackup => "netbackup",
+            Self::None => "none",
         }
     }
 }
@@ -234,6 +292,17 @@ impl StorageProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NetApp => "netapp",
+            Self::PureStorage => "pure-storage",
+            Self::DellPowerStore => "dell-powerstore",
+            Self::HpeAlletra => "hpe-alletra",
+            Self::AzureBlob => "azure-blob",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -258,6 +327,16 @@ impl DnsProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Infoblox => "infoblox",
+            Self::BlueCat => "bluecat",
+            Self::WindowsDns => "windows-dns",
+            Self::Route53 => "route53",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -278,6 +357,15 @@ impl IpamProvider {
             "netbox" => Some(Self::NetBox),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Infoblox => "infoblox",
+            Self::PhpIpam => "phpipam",
+            Self::NetBox => "netbox",
+            Self::None => "none",
         }
     }
 }
@@ -304,6 +392,16 @@ impl LoadBalancerProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F5BigIp => "f5-bigip",
+            Self::CitrixAdc => "citrix-adc",
+            Self::HAProxy => "haproxy",
+            Self::Nginx => "nginx",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -326,6 +424,16 @@ impl FirewallProvider {
             "cisco-asa" => Some(Self::CiscoAsa),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PaloAlto => "palo-alto",
+            Self::CheckPoint => "checkpoint",
+            Self::Fortinet => "fortinet",
+            Self::CiscoAsa => "cisco-asa",
+            Self::None => "none",
         }
     }
 }
@@ -352,6 +460,16 @@ impl BuildProvider {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Jenkins => "jenkins",
+            Self::GitHubActions => "github-actions",
+            Self::AzureDevOps => "azure-devops",
+            Self::ArgoCD => "argocd",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -372,6 +490,15 @@ impl NetworkProvider {
             "evpn" => Some(Self::Evpn),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CiscoAci => "cisco-aci",
+            Self::VmwareNsx => "vmware-nsx",
+            Self::Evpn => "evpn",
+            Self::None => "none",
         }
     }
 }
@@ -876,7 +1003,47 @@ impl RyukiConfig {
 
         // Future: if monitoring_provider is Zabbix, validate a zabbix_url field once added
         if self.monitoring_provider == MonitoringProvider::Zabbix {
-            // Zabbix currently requires no additional in-process config — add URL validation here when zabbix_url is added to RyukiConfig
+            // Zabbix currently requires no additional in-process config
+        }
+
+        if self.server.compression_quality > 9 {
+            errors.push("server.compression_quality must be between 0 and 9".into());
+        }
+
+        if self.auth_mode == AuthMode::EntraId && self.entra_client_id.is_empty() {
+            errors.push("entra_client_id is required when auth_mode is entra-id".into());
+        }
+
+        if self.security.hsts_enabled && self.security.hsts_max_age_secs == 0 {
+            errors.push(
+                "security.hsts_max_age_secs must be greater than 0 when hsts is enabled".into(),
+            );
+        }
+
+        if !self.server.bind_address.contains(':') {
+            errors.push(format!(
+                "server.bind_address '{}' must include a port (e.g. 0.0.0.0:8080)",
+                self.server.bind_address
+            ));
+        }
+
+        if self.server.pool_acquire_timeout_secs > self.server.request_timeout_secs {
+            errors.push(
+                "server.pool_acquire_timeout_secs should not exceed server.request_timeout_secs"
+                    .into(),
+            );
+        }
+
+        if self.smtp.enabled {
+            if self.smtp.host.is_empty() {
+                errors.push("smtp.host is required when smtp.enabled is true".into());
+            }
+            if self.smtp.port == 0 {
+                errors.push("smtp.port must be greater than 0 when smtp.enabled is true".into());
+            }
+            if self.smtp.from_address.is_empty() {
+                errors.push("smtp.from_address is required when smtp.enabled is true".into());
+            }
         }
 
         errors
