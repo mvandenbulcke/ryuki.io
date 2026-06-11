@@ -737,9 +737,11 @@ fn validate_rust_api(contracts: &str, main_rs: &str, errors: &mut Vec<String>) {
         "Rust API main.rs must use axum::serve to start the server",
     );
     expect(
-        main_rs.contains("0.0.0.0:8080") || main_rs.contains("api_bind_addr"),
+        main_rs.contains("0.0.0.0:8080")
+            || main_rs.contains("api_bind_addr")
+            || main_rs.contains("TcpListener::bind(&app_config.server.bind_address)"),
         errors,
-        "Rust API must bind to 0.0.0.0:8080 or use api_bind_addr config",
+        "Rust API must bind to 0.0.0.0:8080 or use Rust server bind_address config",
     );
     expect(
         main_rs.contains("ryuki_engine::auth::AuthSession::static_dry_run()"),

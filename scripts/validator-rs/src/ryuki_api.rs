@@ -251,9 +251,11 @@ fn validate_main_rs(main_rs: &str, errors: &mut Vec<String>) {
         "ryuki-api main.rs must use axum",
     );
     expect(
-        main_rs.contains(r#"bind("0.0.0.0:8080")"#) || main_rs.contains("api_bind_addr"),
+        main_rs.contains(r#"bind("0.0.0.0:8080")"#)
+            || main_rs.contains("api_bind_addr")
+            || main_rs.contains("TcpListener::bind(&app_config.server.bind_address)"),
         errors,
-        "ryuki-api must bind to 0.0.0.0:8080 or use api_bind_addr config",
+        "ryuki-api must bind to 0.0.0.0:8080 or use Rust server bind_address config",
     );
     expect(
         main_rs.contains("contracts::routes()"),
