@@ -19,6 +19,7 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -269,6 +270,7 @@ async fn main() {
         }))
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors)
+        .layer(CompressionLayer::new())
         .layer(middleware::from_fn(timing_middleware));
 
     let listener = tokio::net::TcpListener::bind(&app_config.server.bind_address)
