@@ -38,3 +38,4 @@ git diff --check
 - Validators are self-contained modules in `scripts/validator-rs/src/`.
 - Database migrations live in `migrations/` and run via sqlx on startup.
 - Commit messages: conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`).
+- AI agent co-authoring is permitted. `Co-Authored-By` trailers are allowed on commits.
