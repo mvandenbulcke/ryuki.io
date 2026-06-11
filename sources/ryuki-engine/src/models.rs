@@ -367,6 +367,10 @@ pub enum AdapterType {
     Cohesity,
     NetBackup,
     Zabbix,
+    Prometheus,
+    Datadog,
+    Grafana,
+    SolarWinds,
     ServiceNow,
 }
 
@@ -386,6 +390,10 @@ impl std::fmt::Display for AdapterType {
             AdapterType::Cohesity => write!(f, "cohesity"),
             AdapterType::NetBackup => write!(f, "netbackup"),
             AdapterType::Zabbix => write!(f, "zabbix"),
+            AdapterType::Prometheus => write!(f, "prometheus"),
+            AdapterType::Datadog => write!(f, "datadog"),
+            AdapterType::Grafana => write!(f, "grafana"),
+            AdapterType::SolarWinds => write!(f, "solarwinds"),
             AdapterType::ServiceNow => write!(f, "servicenow"),
         }
     }

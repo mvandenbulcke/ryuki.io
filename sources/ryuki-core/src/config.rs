@@ -43,6 +43,12 @@ pub enum DatabaseProvider {
     CloudNativePg,
     #[serde(alias = "postgres-local")]
     PostgresLocal,
+    #[serde(alias = "aws-rds")]
+    AwsRds,
+    #[serde(alias = "azure-postgresql")]
+    AzurePostgresql,
+    #[serde(alias = "gcp-cloud-sql")]
+    GcpCloudSql,
 }
 
 impl DatabaseProvider {
@@ -50,6 +56,9 @@ impl DatabaseProvider {
         match s {
             "cloudnativepg" => Some(Self::CloudNativePg),
             "postgres-local" => Some(Self::PostgresLocal),
+            "aws-rds" => Some(Self::AwsRds),
+            "azure-postgresql" => Some(Self::AzurePostgresql),
+            "gcp-cloud-sql" => Some(Self::GcpCloudSql),
             _ => None,
         }
     }
@@ -60,6 +69,9 @@ impl DatabaseProvider {
 pub enum SecretProvider {
     #[default]
     HashicorpVault,
+    AwsSecretsManager,
+    AzureKeyVault,
+    GcpSecretManager,
     None,
 }
 
@@ -67,6 +79,9 @@ impl SecretProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "hashicorp-vault" => Some(Self::HashicorpVault),
+            "aws-secrets-manager" => Some(Self::AwsSecretsManager),
+            "azure-key-vault" => Some(Self::AzureKeyVault),
+            "gcp-secret-manager" => Some(Self::GcpSecretManager),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -79,6 +94,11 @@ pub enum KubernetesRuntime {
     #[default]
     VsphereVks,
     DockerCompose,
+    Aks,
+    Eks,
+    Gke,
+    OpenShift,
+    Rancher,
     None,
 }
 
@@ -87,6 +107,11 @@ impl KubernetesRuntime {
         match s {
             "vsphere-vks" => Some(Self::VsphereVks),
             "docker-compose" => Some(Self::DockerCompose),
+            "aks" => Some(Self::Aks),
+            "eks" => Some(Self::Eks),
+            "gke" => Some(Self::Gke),
+            "openshift" => Some(Self::OpenShift),
+            "rancher" => Some(Self::Rancher),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -138,6 +163,10 @@ impl HypervisorProvider {
 pub enum MonitoringProvider {
     #[default]
     Zabbix,
+    Prometheus,
+    Datadog,
+    Grafana,
+    SolarWinds,
     None,
 }
 
@@ -145,6 +174,10 @@ impl MonitoringProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "zabbix" => Some(Self::Zabbix),
+            "prometheus" => Some(Self::Prometheus),
+            "datadog" => Some(Self::Datadog),
+            "grafana" => Some(Self::Grafana),
+            "solarwinds" => Some(Self::SolarWinds),
             "none" => Some(Self::None),
             _ => None,
         }

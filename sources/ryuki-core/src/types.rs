@@ -176,7 +176,13 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         ));
     }
 
-    let valid_db_providers = ["cloudnativepg", "postgres-local"];
+    let valid_db_providers = [
+        "cloudnativepg",
+        "postgres-local",
+        "aws-rds",
+        "azure-postgresql",
+        "gcp-cloud-sql",
+    ];
     if !valid_db_providers.contains(&config.database_provider.as_str()) {
         errors.push(format!(
             "invalid database_provider '{}': must be one of {:?}",
@@ -184,7 +190,13 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         ));
     }
 
-    let valid_secret_providers = ["hashicorp-vault", "none"];
+    let valid_secret_providers = [
+        "hashicorp-vault",
+        "aws-secrets-manager",
+        "azure-key-vault",
+        "gcp-secret-manager",
+        "none",
+    ];
     if !valid_secret_providers.contains(&config.secret_provider.as_str()) {
         errors.push(format!(
             "invalid secret_provider '{}': must be one of {:?}",
@@ -192,7 +204,16 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         ));
     }
 
-    let valid_k8s_runtimes = ["vsphere-vks", "docker-compose", "none"];
+    let valid_k8s_runtimes = [
+        "vsphere-vks",
+        "docker-compose",
+        "aks",
+        "eks",
+        "gke",
+        "openshift",
+        "rancher",
+        "none",
+    ];
     if !valid_k8s_runtimes.contains(&config.kubernetes_runtime.as_str()) {
         errors.push(format!(
             "invalid kubernetes_runtime '{}': must be one of {:?}",
@@ -200,7 +221,14 @@ pub fn validate_platform_config(config: &PlatformConfig) -> Vec<String> {
         ));
     }
 
-    let valid_mon_providers = ["zabbix", "none"];
+    let valid_mon_providers = [
+        "zabbix",
+        "prometheus",
+        "datadog",
+        "grafana",
+        "solarwinds",
+        "none",
+    ];
     if !valid_mon_providers.contains(&config.monitoring_provider.as_str()) {
         errors.push(format!(
             "invalid monitoring_provider '{}': must be one of {:?}",
@@ -432,7 +460,7 @@ mod tests {
     #[test]
     fn validate_platform_config_invalid_secret_provider() {
         let mut config = PlatformConfig::default();
-        config.secret_provider = "aws-secrets-manager".into();
+        config.secret_provider = "azure-keyvault-private".into();
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("secret_provider")));
@@ -441,7 +469,7 @@ mod tests {
     #[test]
     fn validate_platform_config_invalid_kubernetes_runtime() {
         let mut config = PlatformConfig::default();
-        config.kubernetes_runtime = "aks".into();
+        config.kubernetes_runtime = "pks".into();
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("kubernetes_runtime")));
@@ -450,7 +478,7 @@ mod tests {
     #[test]
     fn validate_platform_config_invalid_monitoring_provider() {
         let mut config = PlatformConfig::default();
-        config.monitoring_provider = "datadog".into();
+        config.monitoring_provider = "splunk".into();
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("monitoring_provider")));

@@ -892,6 +892,294 @@ impl ProviderAdapter for ZabbixAdapter {
     }
 }
 
+pub struct PrometheusAdapter {
+    pub config: AdapterConfig,
+}
+
+impl PrometheusAdapter {
+    pub fn static_dry_run() -> Self {
+        PrometheusAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Prometheus,
+                name: "Prometheus SIMULATED".into(),
+                endpoint: "https://prometheus.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "2.45 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for PrometheusAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "prometheus-mock-001".into(),
+            name: "prometheus-server-mock".into(),
+            item_type: InventoryType::MonitoringHost,
+            owner: "monitoring-team".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "prometheus".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("version".into(), "2.45".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Prometheus", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct DatadogAdapter {
+    pub config: AdapterConfig,
+}
+
+impl DatadogAdapter {
+    pub fn static_dry_run() -> Self {
+        DatadogAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Datadog,
+                name: "Datadog SIMULATED".into(),
+                endpoint: "https://datadog.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "v2 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for DatadogAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "datadog-mock-001".into(),
+            name: "datadog-agent-mock".into(),
+            item_type: InventoryType::MonitoringHost,
+            owner: "monitoring-team".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            criticality: "high".into(),
+            last_synced: now.clone(),
+            source: "datadog".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("version".into(), "v2".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Datadog", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct GrafanaAdapter {
+    pub config: AdapterConfig,
+}
+
+impl GrafanaAdapter {
+    pub fn static_dry_run() -> Self {
+        GrafanaAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::Grafana,
+                name: "Grafana SIMULATED".into(),
+                endpoint: "https://grafana.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "10.4 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for GrafanaAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "grafana-mock-001".into(),
+            name: "grafana-instance-mock".into(),
+            item_type: InventoryType::MonitoringHost,
+            owner: "monitoring-team".into(),
+            site: "FRPAR".into(),
+            environment: "production".into(),
+            criticality: "high".into(),
+            last_synced: now.clone(),
+            source: "grafana".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("version".into(), "10.4".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("Grafana", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+pub struct SolarWindsAdapter {
+    pub config: AdapterConfig,
+}
+
+impl SolarWindsAdapter {
+    pub fn static_dry_run() -> Self {
+        SolarWindsAdapter {
+            config: AdapterConfig {
+                id: format!(
+                    "ad-{}",
+                    Uuid::new_v4()
+                        .to_string()
+                        .split('-')
+                        .next()
+                        .unwrap_or("unknown")
+                ),
+                adapter_type: AdapterType::SolarWinds,
+                name: "SolarWinds SIMULATED".into(),
+                endpoint: "https://solarwinds.example.invalid (DRY-RUN)".into(),
+                status: AdapterStatus::Configured,
+                readiness: ReadinessState::Configured,
+                api_version: "2024.2 (simulated)".into(),
+                health_check_at: None,
+                stale: false,
+                metadata: HashMap::from([("dry_run".into(), "true".into())]),
+            },
+        }
+    }
+}
+
+impl ProviderAdapter for SolarWindsAdapter {
+    fn connect(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn health_check(&self) -> Result<AdapterStatus, String> {
+        Ok(AdapterStatus::Connected)
+    }
+
+    fn sync_inventory(&self) -> Result<Vec<InventoryItem>, String> {
+        let now = Utc::now().to_rfc3339();
+        Ok(vec![InventoryItem {
+            id: "solarwinds-mock-001".into(),
+            name: "solarwinds-orion-mock".into(),
+            item_type: InventoryType::MonitoringHost,
+            owner: "monitoring-team".into(),
+            site: "GBLON".into(),
+            environment: "production".into(),
+            criticality: "critical".into(),
+            last_synced: now.clone(),
+            source: "solarwinds".into(),
+            stale: false,
+            metadata: HashMap::from([
+                ("simulated".into(), "true".into()),
+                ("version".into(), "2024.2".into()),
+            ]),
+        }])
+    }
+
+    fn execute(
+        &self,
+        operation: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        Ok(sanitized_dry_run_result("SolarWinds", operation))
+    }
+
+    fn disconnect(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub struct ServiceNowAdapter {
     pub config: AdapterConfig,
 }
@@ -1141,6 +1429,10 @@ mod tests {
             Box::new(CohesityAdapter::static_dry_run()),
             Box::new(NetBackupAdapter::static_dry_run()),
             Box::new(ZabbixAdapter::static_dry_run()),
+            Box::new(PrometheusAdapter::static_dry_run()),
+            Box::new(DatadogAdapter::static_dry_run()),
+            Box::new(GrafanaAdapter::static_dry_run()),
+            Box::new(SolarWindsAdapter::static_dry_run()),
             Box::new(ServiceNowAdapter::static_dry_run()),
         ];
 
@@ -1169,6 +1461,10 @@ mod tests {
         let cohesity = CohesityAdapter::static_dry_run();
         let netbackup = NetBackupAdapter::static_dry_run();
         let zabbix = ZabbixAdapter::static_dry_run();
+        let prometheus = PrometheusAdapter::static_dry_run();
+        let datadog = DatadogAdapter::static_dry_run();
+        let grafana = GrafanaAdapter::static_dry_run();
+        let solarwinds = SolarWindsAdapter::static_dry_run();
         let servicenow = ServiceNowAdapter::static_dry_run();
 
         assert_eq!(vmware.config.readiness, ReadinessState::Configured);
@@ -1183,6 +1479,10 @@ mod tests {
         assert_eq!(cohesity.config.readiness, ReadinessState::Configured);
         assert_eq!(netbackup.config.readiness, ReadinessState::Configured);
         assert_eq!(zabbix.config.readiness, ReadinessState::Configured);
+        assert_eq!(prometheus.config.readiness, ReadinessState::Configured);
+        assert_eq!(datadog.config.readiness, ReadinessState::Configured);
+        assert_eq!(grafana.config.readiness, ReadinessState::Configured);
+        assert_eq!(solarwinds.config.readiness, ReadinessState::Configured);
         assert_eq!(servicenow.config.readiness, ReadinessState::Configured);
     }
 
@@ -1218,6 +1518,10 @@ mod tests {
             Box::new(CohesityAdapter::static_dry_run()),
             Box::new(NetBackupAdapter::static_dry_run()),
             Box::new(ZabbixAdapter::static_dry_run()),
+            Box::new(PrometheusAdapter::static_dry_run()),
+            Box::new(DatadogAdapter::static_dry_run()),
+            Box::new(GrafanaAdapter::static_dry_run()),
+            Box::new(SolarWindsAdapter::static_dry_run()),
             Box::new(ServiceNowAdapter::static_dry_run()),
         ];
         let mut params = HashMap::new();

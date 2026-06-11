@@ -439,6 +439,22 @@ pub fn routes() -> Router {
             get(integrations_zabbix_readiness),
         )
         .route(
+            "/api/integrations/prometheus/readiness",
+            get(integrations_prometheus_readiness),
+        )
+        .route(
+            "/api/integrations/datadog/readiness",
+            get(integrations_datadog_readiness),
+        )
+        .route(
+            "/api/integrations/grafana/readiness",
+            get(integrations_grafana_readiness),
+        )
+        .route(
+            "/api/integrations/solarwinds/readiness",
+            get(integrations_solarwinds_readiness),
+        )
+        .route(
             "/api/integrations/servicenow/readiness",
             get(integrations_servicenow_readiness),
         )
@@ -2432,6 +2448,10 @@ fn components() -> Value {
         "cohesity-adapter",
         "netbackup-adapter",
         "zabbix-adapter",
+        "prometheus-adapter",
+        "datadog-adapter",
+        "grafana-adapter",
+        "solarwinds-adapter",
         "servicenow-adapter",
         "image-factory-controller",
         "evidence-service"
@@ -4030,6 +4050,10 @@ async fn integrations_readiness() -> Json<Value> {
             {"id":"cohesity","component":"cohesity-adapter","apiGroup":"/api/integrations/cohesity","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"netbackup","component":"netbackup-adapter","apiGroup":"/api/integrations/netbackup","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"prometheus","component":"prometheus-adapter","apiGroup":"/api/integrations/prometheus","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"datadog","component":"datadog-adapter","apiGroup":"/api/integrations/datadog","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"grafana","component":"grafana-adapter","apiGroup":"/api/integrations/grafana","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+            {"id":"solarwinds","component":"solarwinds-adapter","apiGroup":"/api/integrations/solarwinds","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
             {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
         ]
     }))
@@ -4049,6 +4073,10 @@ fn adapter_json(id: &str) -> Value {
         {"id":"cohesity","component":"cohesity-adapter","apiGroup":"/api/integrations/cohesity","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"netbackup","component":"netbackup-adapter","apiGroup":"/api/integrations/netbackup","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"zabbix","component":"zabbix-adapter","apiGroup":"/api/integrations/zabbix","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"prometheus","component":"prometheus-adapter","apiGroup":"/api/integrations/prometheus","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"datadog","component":"datadog-adapter","apiGroup":"/api/integrations/datadog","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"grafana","component":"grafana-adapter","apiGroup":"/api/integrations/grafana","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
+        {"id":"solarwinds","component":"solarwinds-adapter","apiGroup":"/api/integrations/solarwinds","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","dry-run-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","provider-endpoint-unconfigured","approval-route-required"]},
         {"id":"servicenow","component":"servicenow-adapter","apiGroup":"/api/integrations/servicenow","status":"blocked","readinessState":"missing-secret-reference","providerCallsEnabled":false,"dryRunOnly":true,"requiresSecretReference":true,"requiresApproval":true,"safeCapabilities":["readiness","file-exchange-contract","stale-data-marker"],"blockedReasons":["secret-reference-missing","live-api-not-approved","approval-route-required"]}
     ]);
     let adapter = adapters
@@ -4081,6 +4109,18 @@ async fn integrations_veeam_readiness() -> Json<Value> {
 }
 async fn integrations_zabbix_readiness() -> Json<Value> {
     Json(adapter_json("zabbix"))
+}
+async fn integrations_prometheus_readiness() -> Json<Value> {
+    Json(adapter_json("prometheus"))
+}
+async fn integrations_datadog_readiness() -> Json<Value> {
+    Json(adapter_json("datadog"))
+}
+async fn integrations_grafana_readiness() -> Json<Value> {
+    Json(adapter_json("grafana"))
+}
+async fn integrations_solarwinds_readiness() -> Json<Value> {
+    Json(adapter_json("solarwinds"))
 }
 async fn integrations_servicenow_readiness() -> Json<Value> {
     Json(adapter_json("servicenow"))
@@ -4173,7 +4213,7 @@ async fn integrations_netbackup_readiness() -> Json<Value> {
 async fn integrations_adapter_matrix() -> Json<Value> {
     Json(json!({
         "source": "static-seed", "providerCallsEnabled": false,
-        "adapters": ["vmware","hyperv","proxmox","nutanix","xen","kvm","veeam-br","veeam-one","commvault","rubrik","cohesity","netbackup","zabbix","servicenow-file-exchange"],
+        "adapters": ["vmware","hyperv","proxmox","nutanix","xen","kvm","veeam-br","veeam-one","commvault","rubrik","cohesity","netbackup","zabbix","prometheus","datadog","grafana","solarwinds","servicenow-file-exchange"],
         "states": ["ready","degraded","stale","blocked","unknown"],
         "dimensions": ["secretReference","endpointReachability","apiVersionCompatibility","permissionScope","dryRunCapability","staleDataMarker","ownerSupport","evidenceReadiness"],
         "guards": ["secret-reference-known","endpoint-not-raw","api-version-reviewed","permissions-reviewed","stale-data-marked","owner-known","support-group-known","evidence-redacted"],
