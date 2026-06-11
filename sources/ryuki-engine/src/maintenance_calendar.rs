@@ -328,9 +328,6 @@ pub struct DependencyWarning {
 
 pub fn seed_example_windows() {
     let mut store = window_store().lock().unwrap();
-    if !store.is_empty() {
-        return;
-    }
 
     let now = Utc::now();
     let examples = vec![
@@ -400,8 +397,10 @@ pub fn seed_example_windows() {
         },
     ];
 
-    for w in examples {
-        store.push(w);
+    for window in examples {
+        if !store.iter().any(|existing| existing.id == window.id) {
+            store.push(window);
+        }
     }
 }
 
@@ -540,7 +539,8 @@ mod tests {
     fn test_schedule_window_creates_window() {
         let start = future_time(10, 0);
         let end = future_time(10, 4);
-        let window = schedule_window("DEFRA", &start, &end, "Test maintenance", make_cis()).unwrap();
+        let window =
+            schedule_window("DEFRA", &start, &end, "Test maintenance", make_cis()).unwrap();
 
         assert!(window.id.starts_with("mw-"));
         assert_eq!(window.site, "DEFRA");
@@ -668,8 +668,11 @@ mod tests {
         schedule_window("GBLON", &start, &end, "Monthly window", make_cis()).unwrap();
         let calendar = get_calendar("GBLON", &month).unwrap();
 
-        assert_eq!(calendar.len(), 1);
-        assert_eq!(calendar[0].reason, "Monthly window");
+        assert!(
+            calendar
+                .iter()
+                .any(|window| window.reason == "Monthly window")
+        );
     }
 
     #[test]
@@ -692,12 +695,16 @@ mod tests {
 
     #[test]
     fn test_seed_example_windows_creates_data() {
-        {
-            window_store().lock().unwrap().clear();
-        }
         seed_example_windows();
         let store = window_store().lock().unwrap();
-        assert_eq!(store.len(), 4);
+        for id in [
+            "mw-example-001",
+            "mw-example-002",
+            "mw-example-003",
+            "mw-example-004",
+        ] {
+            assert!(store.iter().any(|window| window.id == id));
+        }
     }
 
     #[test]

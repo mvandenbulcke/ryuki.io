@@ -1,6 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -236,13 +236,15 @@ pub fn get_shift_summary() -> Value {
     let mut by_type: HashMap<String, Value> = HashMap::new();
     for item in &open {
         let key = item.item_type.to_string();
-        let entry = by_type.entry(key).or_insert_with(|| json!({
-            "count": 0,
-            "items": [],
-            "p1_count": 0,
-            "p2_count": 0,
-            "unacknowledged": 0,
-        }));
+        let entry = by_type.entry(key).or_insert_with(|| {
+            json!({
+                "count": 0,
+                "items": [],
+                "p1_count": 0,
+                "p2_count": 0,
+                "unacknowledged": 0,
+            })
+        });
         let obj = entry.as_object_mut().unwrap();
         obj["count"] = json!(obj["count"].as_u64().unwrap() + 1);
         if item.priority == Priority::P1 {
@@ -401,15 +403,15 @@ pub fn get_handover_report() -> Value {
     let mut recently_resolved: Vec<Value> = Vec::new();
     let cutoff = Utc::now() - Duration::hours(12);
     for item in store.iter().filter(|i| i.resolved) {
-        if let Ok(ts) = DateTime::parse_from_rfc3339(&item.resolved_at.clone().unwrap_or_default()) {
-            if ts >= cutoff {
-                recently_resolved.push(json!({
-                    "id": item.id,
-                    "title": item.title,
-                    "resolution": item.resolution,
-                    "resolved_at": item.resolved_at,
-                }));
-            }
+        if let Ok(ts) = DateTime::parse_from_rfc3339(&item.resolved_at.clone().unwrap_or_default())
+            && ts >= cutoff
+        {
+            recently_resolved.push(json!({
+                "id": item.id,
+                "title": item.title,
+                "resolution": item.resolution,
+                "resolved_at": item.resolved_at,
+            }));
         }
     }
 
@@ -618,7 +620,12 @@ mod tests {
         let summary = get_shift_summary();
         assert_eq!(summary["source"], "static-dry-run");
         assert!(summary["total_open"].as_u64().is_some());
-        assert!(summary["by_type"].as_object().unwrap().contains_key("active-incident"));
+        assert!(
+            summary["by_type"]
+                .as_object()
+                .unwrap()
+                .contains_key("active-incident")
+        );
     }
 
     #[test]
@@ -669,9 +676,16 @@ mod tests {
     #[test]
     fn test_resolve_item_marks_as_done() {
         fresh_store();
-        let result = resolve_item("shift-006", "Manual cert renewal completed, auto-renewal job fixed").unwrap();
+        let result = resolve_item(
+            "shift-006",
+            "Manual cert renewal completed, auto-renewal job fixed",
+        )
+        .unwrap();
         assert_eq!(result["status"], "resolved");
-        assert_eq!(result["resolution"], "Manual cert renewal completed, auto-renewal job fixed");
+        assert_eq!(
+            result["resolution"],
+            "Manual cert renewal completed, auto-renewal job fixed"
+        );
         assert!(result["resolved_at"].as_str().is_some());
     }
 
@@ -728,13 +742,19 @@ mod tests {
 
     #[test]
     fn test_shift_item_type_display() {
-        assert_eq!(ShiftItemType::FailedOperation.to_string(), "failed-operation");
+        assert_eq!(
+            ShiftItemType::FailedOperation.to_string(),
+            "failed-operation"
+        );
         assert_eq!(ShiftItemType::BlockedRequest.to_string(), "blocked-request");
         assert_eq!(ShiftItemType::ActiveIncident.to_string(), "active-incident");
         assert_eq!(ShiftItemType::VeeamFailure.to_string(), "veeam-failure");
         assert_eq!(ShiftItemType::ZabbixProblem.to_string(), "zabbix-problem");
         assert_eq!(ShiftItemType::ExpiringCert.to_string(), "expiring-cert");
-        assert_eq!(ShiftItemType::PendingApproval.to_string(), "pending-approval");
+        assert_eq!(
+            ShiftItemType::PendingApproval.to_string(),
+            "pending-approval"
+        );
     }
 
     #[test]

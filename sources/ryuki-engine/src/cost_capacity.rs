@@ -76,7 +76,9 @@ fn seed_data() -> CostCapacityStore {
     ];
 
     for (site, site_vms) in &sites {
-        for &(name, cpu, mem, storage, cpu_pct, mem_pct, idle, oversized, orphaned_disk) in site_vms.iter() {
+        for &(name, cpu, mem, storage, cpu_pct, mem_pct, idle, oversized, orphaned_disk) in
+            site_vms.iter()
+        {
             let cluster = if name.contains("db") {
                 format!("{}-db-cluster", site.to_lowercase())
             } else if name.contains("web") {
@@ -125,8 +127,12 @@ pub fn get_site_capacity(site: &str) -> Result<Value, String> {
     let total_mem: u32 = vms.iter().map(|v| v.memory_gb).sum();
     let total_storage: u32 = vms.iter().map(|v| v.storage_gb).sum();
 
-    let used_cpu = (total_cpu as f64 * vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / (vms.len() as f64 * 100.0)).round() as u32;
-    let used_mem = (total_mem as f64 * vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / (vms.len() as f64 * 100.0)).round() as u32;
+    let used_cpu = (total_cpu as f64 * vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>()
+        / (vms.len() as f64 * 100.0))
+        .round() as u32;
+    let used_mem = (total_mem as f64 * vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
+        / (vms.len() as f64 * 100.0))
+        .round() as u32;
     let used_storage = total_storage; // storage is allocated, not dynamic
 
     let cpu_util = vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / vms.len() as f64;
@@ -159,8 +165,10 @@ fn cluster_summary(_site: &str, vms: &[&VmUtilization]) -> Value {
         .map(|(name, cluster_vms)| {
             let total_cpu: u32 = cluster_vms.iter().map(|v| v.cpu_cores).sum();
             let total_mem: u32 = cluster_vms.iter().map(|v| v.memory_gb).sum();
-            let cpu_util = cluster_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
-            let mem_util = cluster_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
+            let cpu_util =
+                cluster_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
+            let mem_util = cluster_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
+                / cluster_vms.len() as f64;
             json!({
                 "cluster_name": name,
                 "total_cpu_cores": total_cpu,
@@ -183,13 +191,20 @@ pub fn get_cluster_capacity(site: &str, cluster: &str) -> Result<Value, String> 
         .collect();
 
     if vms.is_empty() {
-        return Err(format!("Cluster '{}' not found in site '{}'", cluster, site));
+        return Err(format!(
+            "Cluster '{}' not found in site '{}'",
+            cluster, site
+        ));
     }
 
     let total_cpu: u32 = vms.iter().map(|v| v.cpu_cores).sum();
-    let used_cpu = (total_cpu as f64 * vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / (vms.len() as f64 * 100.0)).round() as u32;
+    let used_cpu = (total_cpu as f64 * vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>()
+        / (vms.len() as f64 * 100.0))
+        .round() as u32;
     let total_mem: u32 = vms.iter().map(|v| v.memory_gb).sum();
-    let used_mem = (total_mem as f64 * vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / (vms.len() as f64 * 100.0)).round() as u32;
+    let used_mem = (total_mem as f64 * vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
+        / (vms.len() as f64 * 100.0))
+        .round() as u32;
     let cpu_util = vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / vms.len() as f64;
     let mem_util = vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / vms.len() as f64;
 
@@ -286,8 +301,14 @@ pub fn get_cost_summary(site: &str) -> Result<Value, String> {
     let vm_count = vms.len() as u32;
     let avg_cost = total_spend / vm_count as f64;
 
-    let compute_cost: f64 = vms.iter().map(|v| v.cpu_cores as f64 * store.1.cost_per_core).sum();
-    let storage_cost: f64 = vms.iter().map(|v| v.storage_gb as f64 * store.1.cost_per_gb_storage).sum();
+    let compute_cost: f64 = vms
+        .iter()
+        .map(|v| v.cpu_cores as f64 * store.1.cost_per_core)
+        .sum();
+    let storage_cost: f64 = vms
+        .iter()
+        .map(|v| v.storage_gb as f64 * store.1.cost_per_gb_storage)
+        .sum();
     let license_cost: f64 = vms.iter().map(|_| store.1.license_cost_per_vm).sum();
 
     Ok(json!({
@@ -371,7 +392,10 @@ pub fn get_waste_report(site: &str) -> Result<Value, String> {
         .filter_map(|v| v["monthly_cost"].as_f64())
         .map(|c| c * 0.5)
         .sum();
-    let orphaned_waste: f64 = orphaned.iter().filter_map(|v| v["monthly_cost"].as_f64()).sum();
+    let orphaned_waste: f64 = orphaned
+        .iter()
+        .filter_map(|v| v["monthly_cost"].as_f64())
+        .sum();
 
     Ok(json!({
         "source": "dry-run",
@@ -399,7 +423,12 @@ pub fn get_rightsizing_recommendations(site: &str) -> Result<Value, String> {
 
     let recommendations: Vec<Value> = vms
         .iter()
-        .filter(|v| v.idle || v.oversized || v.cpu_usage_pct > 85.0 || v.cpu_usage_pct < 15.0 && v.cpu_cores > 2)
+        .filter(|v| {
+            v.idle
+                || v.oversized
+                || v.cpu_usage_pct > 85.0
+                || v.cpu_usage_pct < 15.0 && v.cpu_cores > 2
+        })
         .map(|v| {
             let (rec_cpu, rec_mem, reason) = if v.idle {
                 (0, 0, "VM is idle — consider decommissioning")
@@ -541,7 +570,12 @@ mod tests {
         let projected_cpu = result["projected"]["cpu_utilization_pct"].as_f64().unwrap();
         let current_cpu = result["current"]["cpu_utilization_pct"].as_f64().unwrap();
         assert!(projected_cpu > current_cpu);
-        assert!(result["risk_flags"]["cpu_at_risk"].as_bool().unwrap_or(false) || true);
+        assert!(
+            result["risk_flags"]["cpu_at_risk"]
+                .as_bool()
+                .unwrap_or(false)
+                || true
+        );
     }
 
     #[test]

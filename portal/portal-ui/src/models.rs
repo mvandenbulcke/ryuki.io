@@ -1258,28 +1258,118 @@ pub fn datacenter_readiness_score_fallback(site: &str) -> DatacenterReadinessSco
 pub fn datacenter_site_report_fallback(site: &str) -> DatacenterSiteReport {
     let check_type_details: Vec<(&str, &str, &str, &str)> = match site {
         "DEFRA" => vec![
-            ("power", "passed", "PDU A+B redundant, UPS load 62% with 28 min runtime", "2026-06-11T10:00:00Z"),
-            ("cooling", "passed", "CRAC units nominal, return air 22 C, supply 16 C", "2026-06-11T10:00:00Z"),
-            ("rack-space", "warning", "12 rack units free across 3 racks (limited headroom)", "2026-06-11T10:00:00Z"),
-            ("switchport", "passed", "18 switchports available across prod/dmz/mgmt VLANs", "2026-06-11T10:00:00Z"),
-            ("firmware", "warning", "2 PDUs on firmware v2.8 (current v3.1), SFP modules current", "2026-06-11T10:00:00Z"),
-            ("capacity", "passed", "Compute 78% allocated, storage 64%, network fabric 42%", "2026-06-11T10:00:00Z"),
+            (
+                "power",
+                "passed",
+                "PDU A+B redundant, UPS load 62% with 28 min runtime",
+                "2026-06-11T10:00:00Z",
+            ),
+            (
+                "cooling",
+                "passed",
+                "CRAC units nominal, return air 22 C, supply 16 C",
+                "2026-06-11T10:00:00Z",
+            ),
+            (
+                "rack-space",
+                "warning",
+                "12 rack units free across 3 racks (limited headroom)",
+                "2026-06-11T10:00:00Z",
+            ),
+            (
+                "switchport",
+                "passed",
+                "18 switchports available across prod/dmz/mgmt VLANs",
+                "2026-06-11T10:00:00Z",
+            ),
+            (
+                "firmware",
+                "warning",
+                "2 PDUs on firmware v2.8 (current v3.1), SFP modules current",
+                "2026-06-11T10:00:00Z",
+            ),
+            (
+                "capacity",
+                "passed",
+                "Compute 78% allocated, storage 64%, network fabric 42%",
+                "2026-06-11T10:00:00Z",
+            ),
         ],
         "GBLON" => vec![
-            ("power", "failed", "UPS-B in bypass mode, PDU-3 overload alarm at 91%", "2026-06-11T09:30:00Z"),
-            ("cooling", "warning", "CRAC-2 compressor cycling, return air 26 C (threshold 24 C)", "2026-06-11T09:30:00Z"),
-            ("rack-space", "failed", "Zero rack units free, 2 racks over-populated (48U in 42U)", "2026-06-11T09:30:00Z"),
-            ("switchport", "passed", "22 switchports available, fabric links healthy", "2026-06-11T09:30:00Z"),
-            ("firmware", "failed", "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs", "2026-06-11T09:30:00Z"),
-            ("capacity", "warning", "Compute 94% allocated (critical), storage 88%, network 71%", "2026-06-11T09:30:00Z"),
+            (
+                "power",
+                "failed",
+                "UPS-B in bypass mode, PDU-3 overload alarm at 91%",
+                "2026-06-11T09:30:00Z",
+            ),
+            (
+                "cooling",
+                "warning",
+                "CRAC-2 compressor cycling, return air 26 C (threshold 24 C)",
+                "2026-06-11T09:30:00Z",
+            ),
+            (
+                "rack-space",
+                "failed",
+                "Zero rack units free, 2 racks over-populated (48U in 42U)",
+                "2026-06-11T09:30:00Z",
+            ),
+            (
+                "switchport",
+                "passed",
+                "22 switchports available, fabric links healthy",
+                "2026-06-11T09:30:00Z",
+            ),
+            (
+                "firmware",
+                "failed",
+                "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs",
+                "2026-06-11T09:30:00Z",
+            ),
+            (
+                "capacity",
+                "warning",
+                "Compute 94% allocated (critical), storage 88%, network 71%",
+                "2026-06-11T09:30:00Z",
+            ),
         ],
         _ => vec![
-            ("power", "passed", "PDU A+B nominal, UPS load 45%", "2026-06-11T08:00:00Z"),
-            ("cooling", "passed", "All CRAC units healthy, supply temp 15 C per ASHRAE A1", "2026-06-11T08:00:00Z"),
-            ("rack-space", "passed", "42 rack units free across 7 empty racks (new buildout)", "2026-06-11T08:00:00Z"),
-            ("switchport", "not-checked", "Switch fabric not yet provisioned, awaiting L2 install", "2026-06-11T08:00:00Z"),
-            ("firmware", "not-checked", "Hardware not yet racked, firmware baseline pending", "2026-06-11T08:00:00Z"),
-            ("capacity", "passed", "Greenfield site, 100% free across compute/storage/network", "2026-06-11T08:00:00Z"),
+            (
+                "power",
+                "passed",
+                "PDU A+B nominal, UPS load 45%",
+                "2026-06-11T08:00:00Z",
+            ),
+            (
+                "cooling",
+                "passed",
+                "All CRAC units healthy, supply temp 15 C per ASHRAE A1",
+                "2026-06-11T08:00:00Z",
+            ),
+            (
+                "rack-space",
+                "passed",
+                "42 rack units free across 7 empty racks (new buildout)",
+                "2026-06-11T08:00:00Z",
+            ),
+            (
+                "switchport",
+                "not-checked",
+                "Switch fabric not yet provisioned, awaiting L2 install",
+                "2026-06-11T08:00:00Z",
+            ),
+            (
+                "firmware",
+                "not-checked",
+                "Hardware not yet racked, firmware baseline pending",
+                "2026-06-11T08:00:00Z",
+            ),
+            (
+                "capacity",
+                "passed",
+                "Greenfield site, 100% free across compute/storage/network",
+                "2026-06-11T08:00:00Z",
+            ),
         ],
     };
 
@@ -1333,8 +1423,7 @@ pub fn datacenter_failing_checks_fallback() -> DatacenterFailingChecksSummary {
             DatacenterFailingCheck {
                 site: "GBLON".into(),
                 check_type: "firmware".into(),
-                details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs"
-                    .into(),
+                details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs".into(),
                 last_checked: "2026-06-11T09:30:00Z".into(),
             },
         ],

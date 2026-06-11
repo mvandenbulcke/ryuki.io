@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 type OobStore = Vec<OOBEndpoint>;
@@ -120,10 +120,7 @@ pub fn test_endpoint(endpoint_id: &str) -> Result<Value, String> {
     drop(store);
 
     let mut store = oob_store().lock().unwrap();
-    let endpoint = store
-        .iter_mut()
-        .find(|e| e.id == endpoint_id)
-        .unwrap();
+    let endpoint = store.iter_mut().find(|e| e.id == endpoint_id).unwrap();
 
     endpoint.last_tested = now.to_rfc3339();
     endpoint.reachable = true;

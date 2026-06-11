@@ -348,9 +348,7 @@ pub fn get_active_holds(site: &str) -> Vec<LegalHold> {
     let store = HOLD_STORE.lock().unwrap();
     store
         .iter()
-        .filter(|h| {
-            h.status == HoldStatus::Active && (site.is_empty() || h.site == site)
-        })
+        .filter(|h| h.status == HoldStatus::Active && (site.is_empty() || h.site == site))
         .cloned()
         .collect()
 }
@@ -505,10 +503,12 @@ mod tests {
         let extended = extend_hold(&hold.id, new_expiry).expect("extend should succeed");
         assert_eq!(extended.expiry_date, new_expiry);
         assert_eq!(extended.audit_trail.len(), 2);
-        assert!(extended
-            .audit_trail
-            .iter()
-            .any(|e| e.action == "hold_extended"));
+        assert!(
+            extended
+                .audit_trail
+                .iter()
+                .any(|e| e.action == "hold_extended")
+        );
     }
 
     #[test]
@@ -527,14 +527,17 @@ mod tests {
             "GBLON",
         )
         .unwrap();
-        let released = release_hold(&hold.id, "compliance-officer").expect("release should succeed");
+        let released =
+            release_hold(&hold.id, "compliance-officer").expect("release should succeed");
         assert_eq!(released.status, HoldStatus::Released);
         assert_eq!(released.released_by, Some("compliance-officer".into()));
         assert!(released.released_date.is_some());
-        assert!(released
-            .audit_trail
-            .iter()
-            .any(|e| e.action == "hold_released"));
+        assert!(
+            released
+                .audit_trail
+                .iter()
+                .any(|e| e.action == "hold_released")
+        );
     }
 
     #[test]
@@ -572,10 +575,11 @@ mod tests {
     fn test_get_expiring_holds_finds_near_expiry() {
         let expiring = get_expiring_holds();
         // At least the seed hold lh-...003 with 15 days to expiry should be found
-        let frpar_hold = expiring
-            .iter()
-            .find(|h| h.site == "FRPAR");
-        assert!(frpar_hold.is_some(), "Expected FRPAR investigation hold to be expiring within 30 days");
+        let frpar_hold = expiring.iter().find(|h| h.site == "FRPAR");
+        assert!(
+            frpar_hold.is_some(),
+            "Expected FRPAR investigation hold to be expiring within 30 days"
+        );
     }
 
     #[test]
@@ -595,8 +599,8 @@ mod tests {
 
     #[test]
     fn test_check_compliance_server_under_hold() {
-        let result = check_compliance("srv-defra-finance")
-            .expect("compliance check should succeed");
+        let result =
+            check_compliance("srv-defra-finance").expect("compliance check should succeed");
         assert!(result.under_hold);
         assert!(!result.active_holds.is_empty());
         assert!(result.message.contains("under"));
@@ -604,8 +608,7 @@ mod tests {
 
     #[test]
     fn test_check_compliance_server_not_under_hold() {
-        let result = check_compliance("srv-nonexistent")
-            .expect("compliance check should succeed");
+        let result = check_compliance("srv-nonexistent").expect("compliance check should succeed");
         assert!(!result.under_hold);
         assert!(result.active_holds.is_empty());
         assert!(result.message.contains("No active legal holds"));
@@ -630,10 +633,8 @@ mod tests {
     fn test_seed_holds_has_three_entries() {
         let holds = seed_holds();
         assert_eq!(holds.len(), 3);
-        let types: std::collections::HashSet<String> = holds
-            .iter()
-            .map(|h| h.hold_type.to_string())
-            .collect();
+        let types: std::collections::HashSet<String> =
+            holds.iter().map(|h| h.hold_type.to_string()).collect();
         assert!(types.len() >= 3_i32.try_into().unwrap_or(1));
     }
 

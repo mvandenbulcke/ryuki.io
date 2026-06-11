@@ -1,5 +1,5 @@
 use crate::models::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -414,7 +414,10 @@ pub fn execute_deployment(request_id: &str) -> Result<Vec<EvidenceItem>, String>
     });
 
     evidence.push(EvidenceItem {
-        key: format!("install-{}", record.package_name.to_lowercase().replace(' ', "-")),
+        key: format!(
+            "install-{}",
+            record.package_name.to_lowercase().replace(' ', "-")
+        ),
         value: format!(
             "DRY-RUN: {} v{} installed on {} (simulated, no provider calls)",
             record.package_name, record.target_version, record.server_name
@@ -495,9 +498,11 @@ pub fn get_package_compliance(site: &str) -> Result<Value, String> {
         let mut compliant_servers: Vec<String> = Vec::new();
 
         for server in &servers {
-            let has_deployment = deployments
-                .iter()
-                .any(|d| d.server_name == *server && d.package_id == pkg.id && d.status == DeploymentStatus::Completed);
+            let has_deployment = deployments.iter().any(|d| {
+                d.server_name == *server
+                    && d.package_id == pkg.id
+                    && d.status == DeploymentStatus::Completed
+            });
             if has_deployment {
                 compliant_servers.push(server.clone());
             } else {
@@ -558,12 +563,16 @@ mod tests {
         assert!(defra_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
         assert!(defra_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
         assert!(defra_packages.iter().any(|p| p.id == "pkg-qualys-agent"));
-        assert!(defra_packages.iter().any(|p| p.id == "pkg-crowdstrike-sensor"));
+        assert!(
+            defra_packages
+                .iter()
+                .any(|p| p.id == "pkg-crowdstrike-sensor")
+        );
         assert!(defra_packages.iter().any(|p| p.id == "pkg-ms-teams"));
 
-        let nlams_packages = get_approved_packages(Some("NLAMS"));
-        assert!(nlams_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
-        assert!(!nlams_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
+        let frpar_packages = get_approved_packages(Some("FRPAR"));
+        assert!(frpar_packages.iter().any(|p| p.id == "pkg-zabbix-agent"));
+        assert!(!frpar_packages.iter().any(|p| p.id == "pkg-veeam-agent"));
     }
 
     #[test]
@@ -591,7 +600,12 @@ mod tests {
         };
         let result = validate_deployment(&request).unwrap();
         assert!(!result.passed);
-        assert!(result.errors.iter().any(|e| e.contains("not in the approved catalog")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("not in the approved catalog"))
+        );
     }
 
     #[test]
@@ -670,7 +684,11 @@ mod tests {
         let evidence = execute_deployment(&approved.id).unwrap();
         assert!(evidence.len() >= 3);
         assert!(evidence.iter().any(|e| e.key == "pre-flight-check"));
-        assert!(evidence.iter().any(|e| e.key == "post-install-health-check"));
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.key == "post-install-health-check")
+        );
     }
 
     #[test]

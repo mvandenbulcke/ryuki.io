@@ -222,11 +222,8 @@ pub fn get_compliance_report(site: &str) -> Result<ComplianceReport, String> {
     }
 
     let store = REPOSITORY_STORE.lock().unwrap();
-    let site_repos: Vec<ImmutabilityCheck> = store
-        .iter()
-        .filter(|r| r.site == site)
-        .cloned()
-        .collect();
+    let site_repos: Vec<ImmutabilityCheck> =
+        store.iter().filter(|r| r.site == site).cloned().collect();
 
     let total = site_repos.len();
     let compliant = site_repos
@@ -296,7 +293,8 @@ pub fn get_remediation_plan(repository_id: &str) -> Result<RemediationPlan, Stri
     if !repo.retention_lock_set {
         issues.push("Retention lock is not configured".into());
         actions.push(
-            "DRY-RUN: Configure retention lock policy with minimum retention days (simulated)".into(),
+            "DRY-RUN: Configure retention lock policy with minimum retention days (simulated)"
+                .into(),
         );
     }
     if repo.min_retention_days < 30 {
@@ -377,8 +375,8 @@ mod tests {
 
     #[test]
     fn test_check_air_gap_storeonce_at_risk() {
-        let result = check_air_gap("imm-00000000-0000-0000-0000-000000000001")
-            .expect("should find repo");
+        let result =
+            check_air_gap("imm-00000000-0000-0000-0000-000000000001").expect("should find repo");
         assert_eq!(result.status, ComplianceStatus::AtRisk);
     }
 
@@ -407,7 +405,9 @@ mod tests {
         let report = get_compliance_report("DEFRA").expect("should generate report");
         assert_eq!(report.site, "DEFRA");
         assert!(report.total_repositories > 0);
-        assert!(report.compliant + report.at_risk + report.non_compliant == report.total_repositories);
+        assert!(
+            report.compliant + report.at_risk + report.non_compliant == report.total_repositories
+        );
     }
 
     #[test]
@@ -420,9 +420,11 @@ mod tests {
     fn test_get_noncompliant() {
         let noncompliant = get_noncompliant();
         assert!(!noncompliant.is_empty());
-        assert!(noncompliant
-            .iter()
-            .all(|r| r.status == ComplianceStatus::NonCompliant));
+        assert!(
+            noncompliant
+                .iter()
+                .all(|r| r.status == ComplianceStatus::NonCompliant)
+        );
         let frpar_repo = noncompliant
             .iter()
             .find(|r| r.repository_name == "repo-frpar-objstore-01");
@@ -433,7 +435,11 @@ mod tests {
     fn test_get_retention_risk() {
         let at_risk = get_retention_risk();
         assert!(!at_risk.is_empty());
-        assert!(at_risk.iter().all(|r| r.status != ComplianceStatus::Compliant));
+        assert!(
+            at_risk
+                .iter()
+                .all(|r| r.status != ComplianceStatus::Compliant)
+        );
     }
 
     #[test]
@@ -444,10 +450,11 @@ mod tests {
         assert!(plan.priority.contains("P1"));
         assert!(!plan.issues.is_empty());
         assert!(!plan.suggested_actions.is_empty());
-        assert!(plan
-            .issues
-            .iter()
-            .any(|i| i.contains("Immutability is not enabled")));
+        assert!(
+            plan.issues
+                .iter()
+                .any(|i| i.contains("Immutability is not enabled"))
+        );
     }
 
     #[test]
@@ -455,10 +462,11 @@ mod tests {
         let plan = get_remediation_plan("imm-00000000-0000-0000-0000-000000000002")
             .expect("should return plan");
         assert_eq!(plan.current_status, ComplianceStatus::AtRisk);
-        assert!(plan
-            .issues
-            .iter()
-            .any(|i| i.contains("Retention lock is not configured")));
+        assert!(
+            plan.issues
+                .iter()
+                .any(|i| i.contains("Retention lock is not configured"))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -39,8 +39,7 @@ fn seed_data() -> EmergencyStore {
         },
         EmergencyChange {
             id: "emg-gblon-001".into(),
-            change_description: "Emergency storage capacity expansion — datastore at 97%"
-                .into(),
+            change_description: "Emergency storage capacity expansion — datastore at 97%".into(),
             affected_systems: vec!["gblon-vsan-cluster".into(), "gblon-datastore-prod".into()],
             initiated_by: "bob.engineer".into(),
             reason_override: "Capacity alert GBLON-DS-PROD-001 — risk of VM outage".into(),
@@ -127,7 +126,10 @@ pub fn initiate_emergency(
 
     let now = Utc::now();
     let change = EmergencyChange {
-        id: format!("emg-{}", Uuid::new_v4().to_string().split('-').next().unwrap()),
+        id: format!(
+            "emg-{}",
+            Uuid::new_v4().to_string().split('-').next().unwrap()
+        ),
         change_description: description.into(),
         affected_systems: systems,
         initiated_by: initiated_by.into(),
@@ -166,19 +168,17 @@ pub fn auto_approve(change_id: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("Emergency change {} not found", change_id))?;
 
     if change.status != EmergencyChangeStatus::Initiated {
-        return Err(format!(
-            "Cannot approve change in {} status",
-            change.status
-        ));
+        return Err(format!("Cannot approve change in {} status", change.status));
     }
 
     let now = Utc::now();
     change.status = EmergencyChangeStatus::Approved;
     change.approved_by = Some("EMERGENCY — auto-approved per break-glass policy".into());
     change.updated_at = now.to_rfc3339();
-    change
-        .audit_evidence
-        .push(format!("EMERGENCY flag — auto-approved at {}", now.to_rfc3339()));
+    change.audit_evidence.push(format!(
+        "EMERGENCY flag — auto-approved at {}",
+        now.to_rfc3339()
+    ));
 
     Ok(json!({
         "source": "dry-run",
@@ -377,9 +377,7 @@ pub fn get_emergency_stats(site: &str) -> Result<Value, String> {
     top_initiators.sort_by(|a, b| b.1.cmp(&a.1));
     let top_initiators: Vec<Value> = top_initiators
         .into_iter()
-        .map(|(name, count)| {
-            json!({ "initiator": name, "count": count })
-        })
+        .map(|(name, count)| json!({ "initiator": name, "count": count }))
         .collect();
 
     let mut monthly: Vec<Value> = by_month
@@ -444,10 +442,12 @@ mod tests {
 
         let result = auto_approve(id).unwrap();
         assert_eq!(result["status"], "Approved");
-        assert!(result["approved_by"]
-            .as_str()
-            .unwrap()
-            .contains("EMERGENCY"));
+        assert!(
+            result["approved_by"]
+                .as_str()
+                .unwrap()
+                .contains("EMERGENCY")
+        );
     }
 
     #[test]
@@ -484,14 +484,8 @@ mod tests {
 
     #[test]
     fn test_cannot_execute_without_approval() {
-        let init = initiate_emergency(
-            "unapproved change",
-            vec!["h".into()],
-            "c",
-            "r",
-            "DEFRA",
-        )
-        .unwrap();
+        let init =
+            initiate_emergency("unapproved change", vec!["h".into()], "c", "r", "DEFRA").unwrap();
         let id = init["change_id"].as_str().unwrap();
         let result = execute_emergency(id);
         assert!(result.is_err());
@@ -499,14 +493,7 @@ mod tests {
 
     #[test]
     fn test_cannot_verify_without_execution() {
-        let init = initiate_emergency(
-            "early verify",
-            vec!["h".into()],
-            "d",
-            "r",
-            "DEFRA",
-        )
-        .unwrap();
+        let init = initiate_emergency("early verify", vec!["h".into()], "d", "r", "DEFRA").unwrap();
         let id = init["change_id"].as_str().unwrap();
         auto_approve(id).unwrap();
         let result = verify_emergency(id);

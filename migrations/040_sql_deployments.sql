@@ -43,5 +43,5 @@ CREATE INDEX idx_sql_deployment_operations_type ON sql_deployment_operations(dep
 
 INSERT INTO sql_deployments (id, instance_name, sql_version, edition, cpu, memory_gb, data_disk_gb, log_disk_gb, tempdb_disk_gb, collation, service_account, site, cluster_mode, status)
 VALUES
-    ('e0000400-4000-4000-4000-000000000001', 'DEFRA-SQL-PROD-01', '2022', 'Enterprise', 8, 64, 500, 200, 100, 'Latin1_General_CI_AS', 'svc-sql-defra-prod@ryuki.local', 'DEFRA', 'AG', 'draft'),
-    ('e0000400-4000-4000-4000-000000000002', 'GBLON-SQL-PROD-01', '2019', 'Standard', 4, 32, 250, 100, 50, 'SQL_Latin1_General_CP1_CI_AS', 'svc-sql-gblon-prod@ryuki.local', 'GBLON', 'Standalone', 'draft');
+    ('e0000400-4000-4000-4000-000000000001', 'DEFRA-SQL-PROD-01', '2022', 'Enterprise', 8, 64, 500, 200, 100, 'Latin1_General_CI_AS', 'service-account@example.local', 'DEFRA', 'AG', 'draft'),
+    ('e0000400-4000-4000-4000-000000000002', 'GBLON-SQL-PROD-01', '2019', 'Standard', 4, 32, 250, 100, 50, 'SQL_Latin1_General_CP1_CI_AS', 'service-account@example.local', 'GBLON', 'Standalone', 'draft');

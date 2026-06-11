@@ -287,18 +287,19 @@ pub fn get_outage_report(site: &str) -> Vec<OutageEntry> {
             .filter(|r| r.check_id == check.id && r.status == CheckResultStatus::Fail)
             .collect();
 
-        if let Some(first_fail) = recent_fails.last() {
-            if let Ok(executed) = chrono::DateTime::parse_from_rfc3339(&first_fail.executed_at) {
-                let duration = now.signed_duration_since(executed);
-                if duration > threshold {
-                    let check_type_str = match check.check_type {
-                        CheckType::Http => "HTTP",
-                        CheckType::Tcp => "TCP",
-                        CheckType::Dns => "DNS",
-                        CheckType::Certificate => "Certificate",
-                    };
+        if let Some(first_fail) = recent_fails.last()
+            && let Ok(executed) = chrono::DateTime::parse_from_rfc3339(&first_fail.executed_at)
+        {
+            let duration = now.signed_duration_since(executed);
+            if duration > threshold {
+                let check_type_str = match check.check_type {
+                    CheckType::Http => "HTTP",
+                    CheckType::Tcp => "TCP",
+                    CheckType::Dns => "DNS",
+                    CheckType::Certificate => "Certificate",
+                };
 
-                    outages.push(OutageEntry {
+                outages.push(OutageEntry {
                         check_id: check.id.clone(),
                         check_name: check.name.clone(),
                         check_type: check_type_str.to_string(),
@@ -310,7 +311,6 @@ pub fn get_outage_report(site: &str) -> Vec<OutageEntry> {
                             check.name, first_fail.executed_at
                         ),
                     });
-                }
             }
         }
     }

@@ -27,18 +27,18 @@ CREATE INDEX idx_gmsa_host_assignments_host ON gmsa_host_assignments(host);
 CREATE INDEX idx_gmsa_host_assignments_gmsa ON gmsa_host_assignments(gmsa_account_id);
 
 INSERT INTO gmsa_accounts (name, sam_account_name, dns_host_name, service_principal_names, site, status, managed_password_interval_days, created_at, last_rotation_at) VALUES
-    ('svc-webappool-gblon', 'svc-webappool-gblon$', 'svc-webappool-gblon.corp.local', ARRAY['HTTP/webapp01.corp.local', 'HTTP/webapp02.corp.local'], 'GBLON', 'Active', 30, NOW() - INTERVAL '45 days', NOW() - INTERVAL '15 days'),
-    ('svc-sqlagent-defra', 'svc-sqlagent-defra$', 'svc-sqlagent-defra.corp.local', ARRAY['MSSQLSvc/sql01.corp.local:1433'], 'DEFRA', 'Expiring', 60, NOW() - INTERVAL '180 days', NOW() - INTERVAL '55 days'),
-    ('svc-iisworker-frpar', 'svc-iisworker-frpar$', 'svc-iisworker-frpar.corp.local', ARRAY['HTTP/iis-frpar.corp.local'], 'FRPAR', 'Expired', 30, NOW() - INTERVAL '400 days', NOW() - INTERVAL '35 days');
+    ('svc-webappool-gblon', 'svc-webappool-gblon$', 'svc-webappool-gblon.example.local', ARRAY['HTTP/webapp01.example.local', 'HTTP/webapp02.example.local'], 'GBLON', 'Active', 30, NOW() - INTERVAL '45 days', NOW() - INTERVAL '15 days'),
+    ('svc-sqlagent-defra', 'svc-sqlagent-defra$', 'svc-sqlagent-defra.example.local', ARRAY['MSSQLSvc/sql01.example.local:1433'], 'DEFRA', 'Expiring', 60, NOW() - INTERVAL '180 days', NOW() - INTERVAL '55 days'),
+    ('svc-iisworker-frpar', 'svc-iisworker-frpar$', 'svc-iisworker-frpar.example.local', ARRAY['HTTP/iis-frpar.example.local'], 'FRPAR', 'Expired', 30, NOW() - INTERVAL '400 days', NOW() - INTERVAL '35 days');
 
 INSERT INTO gmsa_host_assignments (gmsa_account_id, host)
-    SELECT id, unnest(ARRAY['webapp01.corp.local', 'webapp02.corp.local'])
+    SELECT id, unnest(ARRAY['webapp01.example.local', 'webapp02.example.local'])
     FROM gmsa_accounts WHERE name = 'svc-webappool-gblon';
 
 INSERT INTO gmsa_host_assignments (gmsa_account_id, host)
-    SELECT id, 'sql01.corp.local'
+    SELECT id, 'sql01.example.local'
     FROM gmsa_accounts WHERE name = 'svc-sqlagent-defra';
 
 INSERT INTO gmsa_host_assignments (gmsa_account_id, host)
-    SELECT id, 'iis-frpar.corp.local'
+    SELECT id, 'iis-frpar.example.local'
     FROM gmsa_accounts WHERE name = 'svc-iisworker-frpar';

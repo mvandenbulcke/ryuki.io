@@ -83,9 +83,7 @@ pub fn plan_vm_day2_change(
                 VmChangeType::MigrateStorage => "datastore=datastore-01",
             }
         ),
-        verification_plan: format!(
-            "DRY-RUN: Post-change verification: service health, CPU/memory/disk metrics, backup status (simulated)"
-        ),
+        verification_plan: "DRY-RUN: Post-change verification: service health, CPU/memory/disk metrics, backup status (simulated)".to_string(),
     };
 
     Ok(VmDay2ChangeRequest {

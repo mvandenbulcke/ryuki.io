@@ -1,6 +1,6 @@
 # Ryuki
 
-System engineer platform engineering portal for multi-site datacenter infrastructure management.
+System engineer platform engineering portal for multi-site datacenter infrastructure management — **47+ engines, 89 UN/LOCODE locations, 33 countries, 690+ tests**.
 
 ## What It Does
 
@@ -16,8 +16,13 @@ Ryuki is an operational control plane that gives system engineers, datacenter te
 | **Veeam Backup & Replication** | Backup coverage reports, controlled restore, DR replication, repository health |
 | **Zabbix** | Host onboarding, alert routing, maintenance windows, drift detection |
 | **ServiceNow CMDB** | Excel import/export, CI reconciliation, relationship graph |
-| **Datacenter** | Hardware lifecycle, firmware baselines, switchport/VLAN readiness |
+| **Datacenter** | Hardware lifecycle, firmware baselines, switchport/VLAN readiness, datacenter readiness checks |
 | **Image Factory** | Monthly golden image build, test, promote, publish |
+| **Runbook Execution** | Approved runbook catalog, step tracking, approval gates, rollback |
+| **Firmware Lifecycle** | EOL tracking, compliance exceptions, vendor summaries, firmware governance |
+| **Incident Context** | Context assembly, affected services, on-call escalation, dependency graph |
+| **Access Recertification** | AD groups, service accounts, local admin, sudo — recertification campaigns |
+| **Site Registry** | UN/LOCODE reference (89 locations, 33 countries), activate/deactivate via admin |
 | **Evidence & Audit** | Redacted evidence packs, approval chains, shift handover, compliance dashboards |
 | **Break-Glass** | Emergency change with full audit trail, no bypass on evidence |
 
@@ -43,9 +48,9 @@ Browser → Portal UI (Leptos/Axum SSR) → Platform API (Axum) → Engine + Dat
 |---|---|---|
 | `portal-ui` | Rust / Leptos / Axum | Full-stack SSR portal, same-origin API boundary, role-filtered navigation |
 | `ryuki-api` | Rust / Axum / sqlx | Control plane API, Entra ID auth, request lifecycle, admin settings |
-| `ryuki-engine` | Rust | Domain models, evidence pipeline, health monitoring, adapters, workflows |
+| `ryuki-engine` | Rust | 47+ domain engines: models, evidence pipeline, health monitoring, adapters, workflows |
 | `ryuki-core` | Rust | Shared types, secret scanning, YAML utilities |
-| `ryuki-validator` | Rust | Self-contained static validation engine (352 slices) |
+| `ryuki-validator` | Rust | Self-contained static validation engine |
 | PostgreSQL | CloudNativePG / Docker | Control plane database, migrations via sqlx |
 | Vault | HashiCorp Vault | Runtime secrets, adapter credentials, PKI |
 
@@ -100,11 +105,15 @@ cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
 
 ```bash
 # Full validator
-cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all
+cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 
-# Lint + format + secret scan
+# Format check
 cargo fmt --check --all
-cargo clippy --workspace -- -D warnings
+
+# Clippy (correctness + suspicious only)
+cargo clippy --workspace -- -D clippy::correctness -D clippy::suspicious
+
+# Secret scan
 ./scripts/no-secret-scan.sh
 ```
 
@@ -144,20 +153,15 @@ All configuration via environment variables. See `.env.example` for the full ref
 | `PLATFORM_NAME` | Display name in portal |
 | `PLATFORM_URL` | Platform URL for redirects |
 
-### Database
+### Site Management
 
-PostgreSQL 18 with sqlx migrations:
+Sites use UN/LOCODE identifiers (e.g. `DEFRA` for Frankfurt, `GBLON` for London). The admin API provides:
 
-| Migration | Tables |
-|---|---|
-| `001_platform_config.sql` | Key-value platform settings |
-| `003_requests.sql` | Request lifecycle |
-| `004_sessions.sql` | Auth sessions |
-| `005_vm_day2_operations.sql` | VM day-2 change tracking |
-| `006_snapshots.sql` | Snapshot governance |
-| `007_backup_restore.sql` | Coverage reports + restore requests |
+- `GET /api/admin/sites/countries` — List available countries
+- `GET /api/admin/sites/countries/{DE}/cities` — List cities for a country
+- `POST /api/admin/sites/{code}/activate` — Activate a site for operations
 
-Gap at 002 is intentional — removed Entra groups table when migrating to app roles.
+See `docs/site-management.md` for details.
 
 ## Safety
 

@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -263,8 +263,7 @@ pub fn validate_request(request_id: &str) -> Result<Value, String> {
     if req.status != ServiceNowSubmissionStatus::Draft {
         return Err(format!(
             "Request {} is not in Draft status (current: {})",
-            request_id,
-            req.status.to_string()
+            request_id, req.status
         ));
     }
 
@@ -325,7 +324,9 @@ pub fn queue_for_submission(request_id: &str) -> Result<Value, String> {
     if req.status == ServiceNowSubmissionStatus::Failed {
         return Err("Cannot queue — request has failed".into());
     }
-    if req.status != ServiceNowSubmissionStatus::Ready && req.status != ServiceNowSubmissionStatus::Pending {
+    if req.status != ServiceNowSubmissionStatus::Ready
+        && req.status != ServiceNowSubmissionStatus::Pending
+    {
         req.status = ServiceNowSubmissionStatus::Ready;
     }
 
@@ -418,10 +419,7 @@ pub fn cancel_request(request_id: &str) -> Result<Value, String> {
 pub fn get_submission_history(ci_name: &str) -> Value {
     seed_requests_if_empty();
     let store = sn_store().lock().unwrap();
-    let items: Vec<&ServiceNowRequest> = store
-        .iter()
-        .filter(|r| r.ci_name == ci_name)
-        .collect();
+    let items: Vec<&ServiceNowRequest> = store.iter().filter(|r| r.ci_name == ci_name).collect();
 
     let entries: Vec<Value> = items
         .iter()
@@ -547,6 +545,13 @@ pub fn get_snow_contract() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex as TestMutex, MutexGuard};
+
+    static TEST_LOCK: LazyLock<TestMutex<()>> = LazyLock::new(|| TestMutex::new(()));
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
 
     fn fresh_store() {
         let mut guard = sn_store().lock().unwrap();
@@ -555,6 +560,7 @@ mod tests {
 
     #[test]
     fn test_seed_requests_populates_store() {
+        let _guard = test_guard();
         fresh_store();
         let store = sn_store().lock().unwrap();
         assert_eq!(store.len(), 4);
@@ -566,6 +572,7 @@ mod tests {
 
     #[test]
     fn test_prepare_incident_creates_draft() {
+        let _guard = test_guard();
         fresh_store();
         let result = prepare_incident(
             "srv-defra-app01.corp.local",
@@ -586,61 +593,74 @@ mod tests {
 
     #[test]
     fn test_prepare_change_requires_planned_window() {
+        let _guard = test_guard();
         fresh_store();
-        assert!(prepare_change(
-            "srv-gblon-db01.corp.local",
-            "Normal",
-            "",
-            "2026-06-15T02:00:00Z",
-            "2026-06-15T04:00:00Z",
-            "Low"
-        )
-        .is_err());
+        assert!(
+            prepare_change(
+                "srv-gblon-db01.corp.local",
+                "Normal",
+                "",
+                "2026-06-15T02:00:00Z",
+                "2026-06-15T04:00:00Z",
+                "Low"
+            )
+            .is_err()
+        );
 
-        assert!(prepare_change(
-            "srv-gblon-db01.corp.local",
-            "Normal",
-            "Memory upgrade",
-            "",
-            "",
-            "Low"
-        )
-        .is_err());
+        assert!(
+            prepare_change(
+                "srv-gblon-db01.corp.local",
+                "Normal",
+                "Memory upgrade",
+                "",
+                "",
+                "Low"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_validate_request_checks_required_fields() {
+        let _guard = test_guard();
         fresh_store();
         let result = validate_request("sn-req-003").unwrap();
         assert_eq!(result["status"], "validated");
         assert!(result["passed"].as_bool().unwrap());
-        assert!(result["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("DRY-RUN")));
+        assert!(
+            result["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("DRY-RUN"))
+        );
     }
 
     #[test]
     fn test_approve_request_gates_pending() {
+        let _guard = test_guard();
         fresh_store();
         let result = approve_request("sn-req-004").unwrap();
         assert_eq!(result["status"], "approved");
         assert_eq!(result["source"], "static-dry-run");
-        assert!(result["note"]
-            .as_str()
-            .unwrap()
-            .contains("pending approval"));
+        assert!(
+            result["note"]
+                .as_str()
+                .unwrap()
+                .contains("pending approval")
+        );
     }
 
     #[test]
     fn test_cannot_approve_already_submitted() {
+        let _guard = test_guard();
         fresh_store();
         assert!(approve_request("sn-req-001").is_err());
     }
 
     #[test]
     fn test_queue_for_submission_marks_pending() {
+        let _guard = test_guard();
         fresh_store();
         let result = queue_for_submission("sn-req-002").unwrap();
         assert_eq!(result["status"], "Pending");
@@ -654,6 +674,7 @@ mod tests {
 
     #[test]
     fn test_cancel_request_marks_failed() {
+        let _guard = test_guard();
         fresh_store();
         let result = cancel_request("sn-req-003").unwrap();
         assert_eq!(result["status"], "cancelled");
@@ -666,12 +687,14 @@ mod tests {
 
     #[test]
     fn test_cannot_cancel_already_submitted() {
+        let _guard = test_guard();
         fresh_store();
         assert!(cancel_request("sn-req-001").is_err());
     }
 
     #[test]
     fn test_get_pending_submissions_filters_correctly() {
+        let _guard = test_guard();
         fresh_store();
         let pending = get_pending_submissions();
         assert_eq!(pending["source"], "static-dry-run");
@@ -683,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_get_submission_history_by_ci() {
+        let _guard = test_guard();
         fresh_store();
         let history = get_submission_history("srv-defra-web01.corp.local");
         assert_eq!(history["ci_name"], "srv-defra-web01.corp.local");
@@ -693,6 +717,7 @@ mod tests {
 
     #[test]
     fn test_get_submission_history_empty_for_unknown_ci() {
+        let _guard = test_guard();
         fresh_store();
         let history = get_submission_history("nonexistent.ci.local");
         assert_eq!(history["count"].as_u64().unwrap(), 0);
@@ -701,6 +726,7 @@ mod tests {
 
     #[test]
     fn test_request_not_found_errors() {
+        let _guard = test_guard();
         fresh_store();
         assert!(validate_request("sn-req-999").is_err());
         assert!(approve_request("sn-req-999").is_err());
@@ -711,6 +737,7 @@ mod tests {
 
     #[test]
     fn test_get_submission_status_returns_full_detail() {
+        let _guard = test_guard();
         fresh_store();
         let status = get_submission_status("sn-req-001").unwrap();
         assert_eq!(status["id"], "sn-req-001");
@@ -742,6 +769,7 @@ mod tests {
 
     #[test]
     fn test_get_snow_contract_returns_valid_structure() {
+        let _guard = test_guard();
         fresh_store();
         let contract = get_snow_contract();
         assert_eq!(contract["source"], "static-seed");
@@ -749,10 +777,12 @@ mod tests {
         assert_eq!(contract["providerCallsEnabled"], false);
         assert_eq!(contract["liveApiDisabled"], true);
         assert!(contract["rules"].as_array().unwrap().len() >= 4);
-        assert!(contract["blockedReasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|r| r.as_str().unwrap() == "live-api-disabled"));
+        assert!(
+            contract["blockedReasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap() == "live-api-disabled")
+        );
     }
 }

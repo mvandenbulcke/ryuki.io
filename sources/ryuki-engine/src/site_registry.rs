@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,157 +19,768 @@ pub struct SiteEntry {
 fn reference_sites() -> Vec<SiteEntry> {
     vec![
         // ── Germany (DE) ──
-        SiteEntry { unlocode: "DEBER".into(), name: "Berlin".into(), country: "Germany".into(), country_code: "DE".into(), timezone: "Europe/Berlin".into(), active: true },
-        SiteEntry { unlocode: "DEFRA".into(), name: "Frankfurt".into(), country: "Germany".into(), country_code: "DE".into(), timezone: "Europe/Berlin".into(), active: true },
-        SiteEntry { unlocode: "DEMUC".into(), name: "München".into(), country: "Germany".into(), country_code: "DE".into(), timezone: "Europe/Berlin".into(), active: false },
-        SiteEntry { unlocode: "DEHAM".into(), name: "Hamburg".into(), country: "Germany".into(), country_code: "DE".into(), timezone: "Europe/Berlin".into(), active: false },
-        SiteEntry { unlocode: "DEDUS".into(), name: "Düsseldorf".into(), country: "Germany".into(), country_code: "DE".into(), timezone: "Europe/Berlin".into(), active: false },
+        SiteEntry {
+            unlocode: "DEBER".into(),
+            name: "Berlin".into(),
+            country: "Germany".into(),
+            country_code: "DE".into(),
+            timezone: "Europe/Berlin".into(),
+            active: true,
+        },
+        SiteEntry {
+            unlocode: "DEFRA".into(),
+            name: "Frankfurt".into(),
+            country: "Germany".into(),
+            country_code: "DE".into(),
+            timezone: "Europe/Berlin".into(),
+            active: true,
+        },
+        SiteEntry {
+            unlocode: "DEMUC".into(),
+            name: "München".into(),
+            country: "Germany".into(),
+            country_code: "DE".into(),
+            timezone: "Europe/Berlin".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "DEHAM".into(),
+            name: "Hamburg".into(),
+            country: "Germany".into(),
+            country_code: "DE".into(),
+            timezone: "Europe/Berlin".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "DEDUS".into(),
+            name: "Düsseldorf".into(),
+            country: "Germany".into(),
+            country_code: "DE".into(),
+            timezone: "Europe/Berlin".into(),
+            active: false,
+        },
         // ── France (FR) ──
-        SiteEntry { unlocode: "FRPAR".into(), name: "Paris".into(), country: "France".into(), country_code: "FR".into(), timezone: "Europe/Paris".into(), active: true },
-        SiteEntry { unlocode: "FRMRS".into(), name: "Marseille".into(), country: "France".into(), country_code: "FR".into(), timezone: "Europe/Paris".into(), active: false },
-        SiteEntry { unlocode: "FRLYS".into(), name: "Lyon".into(), country: "France".into(), country_code: "FR".into(), timezone: "Europe/Paris".into(), active: false },
-        SiteEntry { unlocode: "FRNCE".into(), name: "Nice".into(), country: "France".into(), country_code: "FR".into(), timezone: "Europe/Paris".into(), active: false },
+        SiteEntry {
+            unlocode: "FRPAR".into(),
+            name: "Paris".into(),
+            country: "France".into(),
+            country_code: "FR".into(),
+            timezone: "Europe/Paris".into(),
+            active: true,
+        },
+        SiteEntry {
+            unlocode: "FRMRS".into(),
+            name: "Marseille".into(),
+            country: "France".into(),
+            country_code: "FR".into(),
+            timezone: "Europe/Paris".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "FRLYS".into(),
+            name: "Lyon".into(),
+            country: "France".into(),
+            country_code: "FR".into(),
+            timezone: "Europe/Paris".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "FRNCE".into(),
+            name: "Nice".into(),
+            country: "France".into(),
+            country_code: "FR".into(),
+            timezone: "Europe/Paris".into(),
+            active: false,
+        },
         // ── United Kingdom (GB) ──
-        SiteEntry { unlocode: "GBLON".into(), name: "London".into(), country: "United Kingdom".into(), country_code: "GB".into(), timezone: "Europe/London".into(), active: true },
-        SiteEntry { unlocode: "GBMAN".into(), name: "Manchester".into(), country: "United Kingdom".into(), country_code: "GB".into(), timezone: "Europe/London".into(), active: false },
-        SiteEntry { unlocode: "GBBIR".into(), name: "Birmingham".into(), country: "United Kingdom".into(), country_code: "GB".into(), timezone: "Europe/London".into(), active: false },
-        SiteEntry { unlocode: "GBEDB".into(), name: "Edinburgh".into(), country: "United Kingdom".into(), country_code: "GB".into(), timezone: "Europe/London".into(), active: false },
+        SiteEntry {
+            unlocode: "GBLON".into(),
+            name: "London".into(),
+            country: "United Kingdom".into(),
+            country_code: "GB".into(),
+            timezone: "Europe/London".into(),
+            active: true,
+        },
+        SiteEntry {
+            unlocode: "GBMAN".into(),
+            name: "Manchester".into(),
+            country: "United Kingdom".into(),
+            country_code: "GB".into(),
+            timezone: "Europe/London".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "GBBIR".into(),
+            name: "Birmingham".into(),
+            country: "United Kingdom".into(),
+            country_code: "GB".into(),
+            timezone: "Europe/London".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "GBEDB".into(),
+            name: "Edinburgh".into(),
+            country: "United Kingdom".into(),
+            country_code: "GB".into(),
+            timezone: "Europe/London".into(),
+            active: false,
+        },
         // ── Netherlands (NL) ──
-        SiteEntry { unlocode: "NLAMS".into(), name: "Amsterdam".into(), country: "Netherlands".into(), country_code: "NL".into(), timezone: "Europe/Amsterdam".into(), active: true },
-        SiteEntry { unlocode: "NLRTM".into(), name: "Rotterdam".into(), country: "Netherlands".into(), country_code: "NL".into(), timezone: "Europe/Amsterdam".into(), active: false },
-        SiteEntry { unlocode: "NLEIN".into(), name: "Eindhoven".into(), country: "Netherlands".into(), country_code: "NL".into(), timezone: "Europe/Amsterdam".into(), active: false },
+        SiteEntry {
+            unlocode: "NLAMS".into(),
+            name: "Amsterdam".into(),
+            country: "Netherlands".into(),
+            country_code: "NL".into(),
+            timezone: "Europe/Amsterdam".into(),
+            active: true,
+        },
+        SiteEntry {
+            unlocode: "NLRTM".into(),
+            name: "Rotterdam".into(),
+            country: "Netherlands".into(),
+            country_code: "NL".into(),
+            timezone: "Europe/Amsterdam".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "NLEIN".into(),
+            name: "Eindhoven".into(),
+            country: "Netherlands".into(),
+            country_code: "NL".into(),
+            timezone: "Europe/Amsterdam".into(),
+            active: false,
+        },
         // ── Spain (ES) ──
-        SiteEntry { unlocode: "ESMAD".into(), name: "Madrid".into(), country: "Spain".into(), country_code: "ES".into(), timezone: "Europe/Madrid".into(), active: false },
-        SiteEntry { unlocode: "ESBCN".into(), name: "Barcelona".into(), country: "Spain".into(), country_code: "ES".into(), timezone: "Europe/Madrid".into(), active: false },
+        SiteEntry {
+            unlocode: "ESMAD".into(),
+            name: "Madrid".into(),
+            country: "Spain".into(),
+            country_code: "ES".into(),
+            timezone: "Europe/Madrid".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "ESBCN".into(),
+            name: "Barcelona".into(),
+            country: "Spain".into(),
+            country_code: "ES".into(),
+            timezone: "Europe/Madrid".into(),
+            active: false,
+        },
         // ── Italy (IT) ──
-        SiteEntry { unlocode: "ITMIL".into(), name: "Milano".into(), country: "Italy".into(), country_code: "IT".into(), timezone: "Europe/Rome".into(), active: false },
-        SiteEntry { unlocode: "ITROM".into(), name: "Roma".into(), country: "Italy".into(), country_code: "IT".into(), timezone: "Europe/Rome".into(), active: false },
+        SiteEntry {
+            unlocode: "ITMIL".into(),
+            name: "Milano".into(),
+            country: "Italy".into(),
+            country_code: "IT".into(),
+            timezone: "Europe/Rome".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "ITROM".into(),
+            name: "Roma".into(),
+            country: "Italy".into(),
+            country_code: "IT".into(),
+            timezone: "Europe/Rome".into(),
+            active: false,
+        },
         // ── Switzerland (CH) ──
-        SiteEntry { unlocode: "CHZRH".into(), name: "Zürich".into(), country: "Switzerland".into(), country_code: "CH".into(), timezone: "Europe/Zurich".into(), active: false },
-        SiteEntry { unlocode: "CHGVA".into(), name: "Genève".into(), country: "Switzerland".into(), country_code: "CH".into(), timezone: "Europe/Zurich".into(), active: false },
+        SiteEntry {
+            unlocode: "CHZRH".into(),
+            name: "Zürich".into(),
+            country: "Switzerland".into(),
+            country_code: "CH".into(),
+            timezone: "Europe/Zurich".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "CHGVA".into(),
+            name: "Genève".into(),
+            country: "Switzerland".into(),
+            country_code: "CH".into(),
+            timezone: "Europe/Zurich".into(),
+            active: false,
+        },
         // ── Austria (AT) ──
-        SiteEntry { unlocode: "ATVIE".into(), name: "Wien".into(), country: "Austria".into(), country_code: "AT".into(), timezone: "Europe/Vienna".into(), active: false },
+        SiteEntry {
+            unlocode: "ATVIE".into(),
+            name: "Wien".into(),
+            country: "Austria".into(),
+            country_code: "AT".into(),
+            timezone: "Europe/Vienna".into(),
+            active: false,
+        },
         // ── Belgium (BE) ──
-        SiteEntry { unlocode: "BEANR".into(), name: "Antwerpen".into(), country: "Belgium".into(), country_code: "BE".into(), timezone: "Europe/Brussels".into(), active: false },
-        SiteEntry { unlocode: "BEBRU".into(), name: "Brussels".into(), country: "Belgium".into(), country_code: "BE".into(), timezone: "Europe/Brussels".into(), active: false },
+        SiteEntry {
+            unlocode: "BEANR".into(),
+            name: "Antwerpen".into(),
+            country: "Belgium".into(),
+            country_code: "BE".into(),
+            timezone: "Europe/Brussels".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "BEBRU".into(),
+            name: "Brussels".into(),
+            country: "Belgium".into(),
+            country_code: "BE".into(),
+            timezone: "Europe/Brussels".into(),
+            active: false,
+        },
         // ── Sweden (SE) ──
-        SiteEntry { unlocode: "SE STO".into(), name: "Stockholm".into(), country: "Sweden".into(), country_code: "SE".into(), timezone: "Europe/Stockholm".into(), active: false },
-        SiteEntry { unlocode: "SE GOT".into(), name: "Göteborg".into(), country: "Sweden".into(), country_code: "SE".into(), timezone: "Europe/Stockholm".into(), active: false },
+        SiteEntry {
+            unlocode: "SE STO".into(),
+            name: "Stockholm".into(),
+            country: "Sweden".into(),
+            country_code: "SE".into(),
+            timezone: "Europe/Stockholm".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "SE GOT".into(),
+            name: "Göteborg".into(),
+            country: "Sweden".into(),
+            country_code: "SE".into(),
+            timezone: "Europe/Stockholm".into(),
+            active: false,
+        },
         // ── Denmark (DK) ──
-        SiteEntry { unlocode: "DKCPH".into(), name: "København".into(), country: "Denmark".into(), country_code: "DK".into(), timezone: "Europe/Copenhagen".into(), active: false },
+        SiteEntry {
+            unlocode: "DKCPH".into(),
+            name: "København".into(),
+            country: "Denmark".into(),
+            country_code: "DK".into(),
+            timezone: "Europe/Copenhagen".into(),
+            active: false,
+        },
         // ── Norway (NO) ──
-        SiteEntry { unlocode: "NOOSL".into(), name: "Oslo".into(), country: "Norway".into(), country_code: "NO".into(), timezone: "Europe/Oslo".into(), active: false },
+        SiteEntry {
+            unlocode: "NOOSL".into(),
+            name: "Oslo".into(),
+            country: "Norway".into(),
+            country_code: "NO".into(),
+            timezone: "Europe/Oslo".into(),
+            active: false,
+        },
         // ── Finland (FI) ──
-        SiteEntry { unlocode: "FI HEL".into(), name: "Helsinki".into(), country: "Finland".into(), country_code: "FI".into(), timezone: "Europe/Helsinki".into(), active: false },
+        SiteEntry {
+            unlocode: "FI HEL".into(),
+            name: "Helsinki".into(),
+            country: "Finland".into(),
+            country_code: "FI".into(),
+            timezone: "Europe/Helsinki".into(),
+            active: false,
+        },
         // ── Ireland (IE) ──
-        SiteEntry { unlocode: "IE DUB".into(), name: "Dublin".into(), country: "Ireland".into(), country_code: "IE".into(), timezone: "Europe/Dublin".into(), active: false },
+        SiteEntry {
+            unlocode: "IE DUB".into(),
+            name: "Dublin".into(),
+            country: "Ireland".into(),
+            country_code: "IE".into(),
+            timezone: "Europe/Dublin".into(),
+            active: false,
+        },
         // ── Portugal (PT) ──
-        SiteEntry { unlocode: "PT LIS".into(), name: "Lisboa".into(), country: "Portugal".into(), country_code: "PT".into(), timezone: "Europe/Lisbon".into(), active: false },
+        SiteEntry {
+            unlocode: "PT LIS".into(),
+            name: "Lisboa".into(),
+            country: "Portugal".into(),
+            country_code: "PT".into(),
+            timezone: "Europe/Lisbon".into(),
+            active: false,
+        },
         // ── Poland (PL) ──
-        SiteEntry { unlocode: "PL WAW".into(), name: "Warszawa".into(), country: "Poland".into(), country_code: "PL".into(), timezone: "Europe/Warsaw".into(), active: false },
+        SiteEntry {
+            unlocode: "PL WAW".into(),
+            name: "Warszawa".into(),
+            country: "Poland".into(),
+            country_code: "PL".into(),
+            timezone: "Europe/Warsaw".into(),
+            active: false,
+        },
         // ── Czech Republic (CZ) ──
-        SiteEntry { unlocode: "CZPRG".into(), name: "Praha".into(), country: "Czech Republic".into(), country_code: "CZ".into(), timezone: "Europe/Prague".into(), active: false },
+        SiteEntry {
+            unlocode: "CZPRG".into(),
+            name: "Praha".into(),
+            country: "Czech Republic".into(),
+            country_code: "CZ".into(),
+            timezone: "Europe/Prague".into(),
+            active: false,
+        },
         // ── Hungary (HU) ──
-        SiteEntry { unlocode: "HU BUD".into(), name: "Budapest".into(), country: "Hungary".into(), country_code: "HU".into(), timezone: "Europe/Budapest".into(), active: false },
+        SiteEntry {
+            unlocode: "HU BUD".into(),
+            name: "Budapest".into(),
+            country: "Hungary".into(),
+            country_code: "HU".into(),
+            timezone: "Europe/Budapest".into(),
+            active: false,
+        },
         // ── Romania (RO) ──
-        SiteEntry { unlocode: "RO BUH".into(), name: "Bucuresti".into(), country: "Romania".into(), country_code: "RO".into(), timezone: "Europe/Bucharest".into(), active: false },
+        SiteEntry {
+            unlocode: "RO BUH".into(),
+            name: "Bucuresti".into(),
+            country: "Romania".into(),
+            country_code: "RO".into(),
+            timezone: "Europe/Bucharest".into(),
+            active: false,
+        },
         // ── Greece (GR) ──
-        SiteEntry { unlocode: "GR ATH".into(), name: "Athina".into(), country: "Greece".into(), country_code: "GR".into(), timezone: "Europe/Athens".into(), active: false },
+        SiteEntry {
+            unlocode: "GR ATH".into(),
+            name: "Athina".into(),
+            country: "Greece".into(),
+            country_code: "GR".into(),
+            timezone: "Europe/Athens".into(),
+            active: false,
+        },
         // ── Bulgaria (BG) ──
-        SiteEntry { unlocode: "BG SOF".into(), name: "Sofia".into(), country: "Bulgaria".into(), country_code: "BG".into(), timezone: "Europe/Sofia".into(), active: false },
+        SiteEntry {
+            unlocode: "BG SOF".into(),
+            name: "Sofia".into(),
+            country: "Bulgaria".into(),
+            country_code: "BG".into(),
+            timezone: "Europe/Sofia".into(),
+            active: false,
+        },
         // ── Croatia (HR) ──
-        SiteEntry { unlocode: "HR ZAG".into(), name: "Zagreb".into(), country: "Croatia".into(), country_code: "HR".into(), timezone: "Europe/Zagreb".into(), active: false },
+        SiteEntry {
+            unlocode: "HR ZAG".into(),
+            name: "Zagreb".into(),
+            country: "Croatia".into(),
+            country_code: "HR".into(),
+            timezone: "Europe/Zagreb".into(),
+            active: false,
+        },
         // ── Slovakia (SK) ──
-        SiteEntry { unlocode: "SK BTS".into(), name: "Bratislava".into(), country: "Slovakia".into(), country_code: "SK".into(), timezone: "Europe/Bratislava".into(), active: false },
+        SiteEntry {
+            unlocode: "SK BTS".into(),
+            name: "Bratislava".into(),
+            country: "Slovakia".into(),
+            country_code: "SK".into(),
+            timezone: "Europe/Bratislava".into(),
+            active: false,
+        },
         // ── Slovenia (SI) ──
-        SiteEntry { unlocode: "SI LJU".into(), name: "Ljubljana".into(), country: "Slovenia".into(), country_code: "SI".into(), timezone: "Europe/Ljubljana".into(), active: false },
+        SiteEntry {
+            unlocode: "SI LJU".into(),
+            name: "Ljubljana".into(),
+            country: "Slovenia".into(),
+            country_code: "SI".into(),
+            timezone: "Europe/Ljubljana".into(),
+            active: false,
+        },
         // ── Estonia (EE) ──
-        SiteEntry { unlocode: "EE TLL".into(), name: "Tallinn".into(), country: "Estonia".into(), country_code: "EE".into(), timezone: "Europe/Tallinn".into(), active: false },
+        SiteEntry {
+            unlocode: "EE TLL".into(),
+            name: "Tallinn".into(),
+            country: "Estonia".into(),
+            country_code: "EE".into(),
+            timezone: "Europe/Tallinn".into(),
+            active: false,
+        },
         // ── Latvia (LV) ──
-        SiteEntry { unlocode: "LV RIX".into(), name: "Riga".into(), country: "Latvia".into(), country_code: "LV".into(), timezone: "Europe/Riga".into(), active: false },
+        SiteEntry {
+            unlocode: "LV RIX".into(),
+            name: "Riga".into(),
+            country: "Latvia".into(),
+            country_code: "LV".into(),
+            timezone: "Europe/Riga".into(),
+            active: false,
+        },
         // ── Lithuania (LT) ──
-        SiteEntry { unlocode: "LT VNO".into(), name: "Vilnius".into(), country: "Lithuania".into(), country_code: "LT".into(), timezone: "Europe/Vilnius".into(), active: false },
+        SiteEntry {
+            unlocode: "LT VNO".into(),
+            name: "Vilnius".into(),
+            country: "Lithuania".into(),
+            country_code: "LT".into(),
+            timezone: "Europe/Vilnius".into(),
+            active: false,
+        },
         // ── Iceland (IS) ──
-        SiteEntry { unlocode: "IS REY".into(), name: "Reykjavik".into(), country: "Iceland".into(), country_code: "IS".into(), timezone: "Atlantic/Reykjavik".into(), active: false },
-
+        SiteEntry {
+            unlocode: "IS REY".into(),
+            name: "Reykjavik".into(),
+            country: "Iceland".into(),
+            country_code: "IS".into(),
+            timezone: "Atlantic/Reykjavik".into(),
+            active: false,
+        },
         // ──── NORTH AMERICA ────
 
         // ── United States (US) ──
-        SiteEntry { unlocode: "USNYC".into(), name: "New York".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/New_York".into(), active: false },
-        SiteEntry { unlocode: "USASH".into(), name: "Ashburn".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/New_York".into(), active: false },
-        SiteEntry { unlocode: "USCHI".into(), name: "Chicago".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Chicago".into(), active: false },
-        SiteEntry { unlocode: "USDAL".into(), name: "Dallas".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Chicago".into(), active: false },
-        SiteEntry { unlocode: "USLAX".into(), name: "Los Angeles".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Los_Angeles".into(), active: false },
-        SiteEntry { unlocode: "USSFO".into(), name: "San Francisco".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Los_Angeles".into(), active: false },
-        SiteEntry { unlocode: "USSEA".into(), name: "Seattle".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Los_Angeles".into(), active: false },
-        SiteEntry { unlocode: "USPHX".into(), name: "Phoenix".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Phoenix".into(), active: false },
-        SiteEntry { unlocode: "USDEN".into(), name: "Denver".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/Denver".into(), active: false },
-        SiteEntry { unlocode: "USMIA".into(), name: "Miami".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/New_York".into(), active: false },
-        SiteEntry { unlocode: "USATL".into(), name: "Atlanta".into(), country: "United States".into(), country_code: "US".into(), timezone: "America/New_York".into(), active: false },
+        SiteEntry {
+            unlocode: "USNYC".into(),
+            name: "New York".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/New_York".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USASH".into(),
+            name: "Ashburn".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/New_York".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USCHI".into(),
+            name: "Chicago".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Chicago".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USDAL".into(),
+            name: "Dallas".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Chicago".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USLAX".into(),
+            name: "Los Angeles".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Los_Angeles".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USSFO".into(),
+            name: "San Francisco".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Los_Angeles".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USSEA".into(),
+            name: "Seattle".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Los_Angeles".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USPHX".into(),
+            name: "Phoenix".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Phoenix".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USDEN".into(),
+            name: "Denver".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/Denver".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USMIA".into(),
+            name: "Miami".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/New_York".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "USATL".into(),
+            name: "Atlanta".into(),
+            country: "United States".into(),
+            country_code: "US".into(),
+            timezone: "America/New_York".into(),
+            active: false,
+        },
         // ── Canada (CA) ──
-        SiteEntry { unlocode: "CA TOR".into(), name: "Toronto".into(), country: "Canada".into(), country_code: "CA".into(), timezone: "America/Toronto".into(), active: false },
-        SiteEntry { unlocode: "CA VAN".into(), name: "Vancouver".into(), country: "Canada".into(), country_code: "CA".into(), timezone: "America/Vancouver".into(), active: false },
-        SiteEntry { unlocode: "CA MTR".into(), name: "Montréal".into(), country: "Canada".into(), country_code: "CA".into(), timezone: "America/Toronto".into(), active: false },
-
+        SiteEntry {
+            unlocode: "CA TOR".into(),
+            name: "Toronto".into(),
+            country: "Canada".into(),
+            country_code: "CA".into(),
+            timezone: "America/Toronto".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "CA VAN".into(),
+            name: "Vancouver".into(),
+            country: "Canada".into(),
+            country_code: "CA".into(),
+            timezone: "America/Vancouver".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "CA MTR".into(),
+            name: "Montréal".into(),
+            country: "Canada".into(),
+            country_code: "CA".into(),
+            timezone: "America/Toronto".into(),
+            active: false,
+        },
         // ──── ASIA-PACIFIC ────
 
         // ── Japan (JP) ──
-        SiteEntry { unlocode: "JP TYO".into(), name: "Tokyo".into(), country: "Japan".into(), country_code: "JP".into(), timezone: "Asia/Tokyo".into(), active: false },
-        SiteEntry { unlocode: "JP OSA".into(), name: "Osaka".into(), country: "Japan".into(), country_code: "JP".into(), timezone: "Asia/Tokyo".into(), active: false },
+        SiteEntry {
+            unlocode: "JP TYO".into(),
+            name: "Tokyo".into(),
+            country: "Japan".into(),
+            country_code: "JP".into(),
+            timezone: "Asia/Tokyo".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "JP OSA".into(),
+            name: "Osaka".into(),
+            country: "Japan".into(),
+            country_code: "JP".into(),
+            timezone: "Asia/Tokyo".into(),
+            active: false,
+        },
         // ── South Korea (KR) ──
-        SiteEntry { unlocode: "KR SEL".into(), name: "Seoul".into(), country: "South Korea".into(), country_code: "KR".into(), timezone: "Asia/Seoul".into(), active: false },
-        SiteEntry { unlocode: "KR PUS".into(), name: "Busan".into(), country: "South Korea".into(), country_code: "KR".into(), timezone: "Asia/Seoul".into(), active: false },
+        SiteEntry {
+            unlocode: "KR SEL".into(),
+            name: "Seoul".into(),
+            country: "South Korea".into(),
+            country_code: "KR".into(),
+            timezone: "Asia/Seoul".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "KR PUS".into(),
+            name: "Busan".into(),
+            country: "South Korea".into(),
+            country_code: "KR".into(),
+            timezone: "Asia/Seoul".into(),
+            active: false,
+        },
         // ── Singapore (SG) ──
-        SiteEntry { unlocode: "SGSIN".into(), name: "Singapore".into(), country: "Singapore".into(), country_code: "SG".into(), timezone: "Asia/Singapore".into(), active: false },
+        SiteEntry {
+            unlocode: "SGSIN".into(),
+            name: "Singapore".into(),
+            country: "Singapore".into(),
+            country_code: "SG".into(),
+            timezone: "Asia/Singapore".into(),
+            active: false,
+        },
         // ── Hong Kong (HK) ──
-        SiteEntry { unlocode: "HK HKG".into(), name: "Hong Kong".into(), country: "Hong Kong".into(), country_code: "HK".into(), timezone: "Asia/Hong_Kong".into(), active: false },
+        SiteEntry {
+            unlocode: "HK HKG".into(),
+            name: "Hong Kong".into(),
+            country: "Hong Kong".into(),
+            country_code: "HK".into(),
+            timezone: "Asia/Hong_Kong".into(),
+            active: false,
+        },
         // ── Taiwan (TW) ──
-        SiteEntry { unlocode: "TW TPE".into(), name: "Taipei".into(), country: "Taiwan".into(), country_code: "TW".into(), timezone: "Asia/Taipei".into(), active: false },
+        SiteEntry {
+            unlocode: "TW TPE".into(),
+            name: "Taipei".into(),
+            country: "Taiwan".into(),
+            country_code: "TW".into(),
+            timezone: "Asia/Taipei".into(),
+            active: false,
+        },
         // ── China (CN) ──
-        SiteEntry { unlocode: "CN SHA".into(), name: "Shanghai".into(), country: "China".into(), country_code: "CN".into(), timezone: "Asia/Shanghai".into(), active: false },
-        SiteEntry { unlocode: "CN BJS".into(), name: "Beijing".into(), country: "China".into(), country_code: "CN".into(), timezone: "Asia/Shanghai".into(), active: false },
+        SiteEntry {
+            unlocode: "CN SHA".into(),
+            name: "Shanghai".into(),
+            country: "China".into(),
+            country_code: "CN".into(),
+            timezone: "Asia/Shanghai".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "CN BJS".into(),
+            name: "Beijing".into(),
+            country: "China".into(),
+            country_code: "CN".into(),
+            timezone: "Asia/Shanghai".into(),
+            active: false,
+        },
         // ── India (IN) ──
-        SiteEntry { unlocode: "IN BOM".into(), name: "Mumbai".into(), country: "India".into(), country_code: "IN".into(), timezone: "Asia/Kolkata".into(), active: false },
-        SiteEntry { unlocode: "IN DEL".into(), name: "Delhi".into(), country: "India".into(), country_code: "IN".into(), timezone: "Asia/Kolkata".into(), active: false },
-        SiteEntry { unlocode: "IN BLR".into(), name: "Bangalore".into(), country: "India".into(), country_code: "IN".into(), timezone: "Asia/Kolkata".into(), active: false },
-        SiteEntry { unlocode: "IN HYD".into(), name: "Hyderabad".into(), country: "India".into(), country_code: "IN".into(), timezone: "Asia/Kolkata".into(), active: false },
+        SiteEntry {
+            unlocode: "IN BOM".into(),
+            name: "Mumbai".into(),
+            country: "India".into(),
+            country_code: "IN".into(),
+            timezone: "Asia/Kolkata".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "IN DEL".into(),
+            name: "Delhi".into(),
+            country: "India".into(),
+            country_code: "IN".into(),
+            timezone: "Asia/Kolkata".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "IN BLR".into(),
+            name: "Bangalore".into(),
+            country: "India".into(),
+            country_code: "IN".into(),
+            timezone: "Asia/Kolkata".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "IN HYD".into(),
+            name: "Hyderabad".into(),
+            country: "India".into(),
+            country_code: "IN".into(),
+            timezone: "Asia/Kolkata".into(),
+            active: false,
+        },
         // ── Australia (AU) ──
-        SiteEntry { unlocode: "AU SYD".into(), name: "Sydney".into(), country: "Australia".into(), country_code: "AU".into(), timezone: "Australia/Sydney".into(), active: false },
-        SiteEntry { unlocode: "AU MEL".into(), name: "Melbourne".into(), country: "Australia".into(), country_code: "AU".into(), timezone: "Australia/Melbourne".into(), active: false },
+        SiteEntry {
+            unlocode: "AU SYD".into(),
+            name: "Sydney".into(),
+            country: "Australia".into(),
+            country_code: "AU".into(),
+            timezone: "Australia/Sydney".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "AU MEL".into(),
+            name: "Melbourne".into(),
+            country: "Australia".into(),
+            country_code: "AU".into(),
+            timezone: "Australia/Melbourne".into(),
+            active: false,
+        },
         // ── New Zealand (NZ) ──
-        SiteEntry { unlocode: "NZ AKL".into(), name: "Auckland".into(), country: "New Zealand".into(), country_code: "NZ".into(), timezone: "Pacific/Auckland".into(), active: false },
-
+        SiteEntry {
+            unlocode: "NZ AKL".into(),
+            name: "Auckland".into(),
+            country: "New Zealand".into(),
+            country_code: "NZ".into(),
+            timezone: "Pacific/Auckland".into(),
+            active: false,
+        },
         // ──── MIDDLE EAST ────
 
         // ── United Arab Emirates (AE) ──
-        SiteEntry { unlocode: "AE DXB".into(), name: "Dubai".into(), country: "United Arab Emirates".into(), country_code: "AE".into(), timezone: "Asia/Dubai".into(), active: false },
-        SiteEntry { unlocode: "AE AUH".into(), name: "Abu Dhabi".into(), country: "United Arab Emirates".into(), country_code: "AE".into(), timezone: "Asia/Dubai".into(), active: false },
+        SiteEntry {
+            unlocode: "AE DXB".into(),
+            name: "Dubai".into(),
+            country: "United Arab Emirates".into(),
+            country_code: "AE".into(),
+            timezone: "Asia/Dubai".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "AE AUH".into(),
+            name: "Abu Dhabi".into(),
+            country: "United Arab Emirates".into(),
+            country_code: "AE".into(),
+            timezone: "Asia/Dubai".into(),
+            active: false,
+        },
         // ── Saudi Arabia (SA) ──
-        SiteEntry { unlocode: "SA RUH".into(), name: "Riyadh".into(), country: "Saudi Arabia".into(), country_code: "SA".into(), timezone: "Asia/Riyadh".into(), active: false },
+        SiteEntry {
+            unlocode: "SA RUH".into(),
+            name: "Riyadh".into(),
+            country: "Saudi Arabia".into(),
+            country_code: "SA".into(),
+            timezone: "Asia/Riyadh".into(),
+            active: false,
+        },
         // ── Qatar (QA) ──
-        SiteEntry { unlocode: "QA DOH".into(), name: "Doha".into(), country: "Qatar".into(), country_code: "QA".into(), timezone: "Asia/Qatar".into(), active: false },
+        SiteEntry {
+            unlocode: "QA DOH".into(),
+            name: "Doha".into(),
+            country: "Qatar".into(),
+            country_code: "QA".into(),
+            timezone: "Asia/Qatar".into(),
+            active: false,
+        },
         // ── Israel (IL) ──
-        SiteEntry { unlocode: "IL TLV".into(), name: "Tel Aviv".into(), country: "Israel".into(), country_code: "IL".into(), timezone: "Asia/Jerusalem".into(), active: false },
-
+        SiteEntry {
+            unlocode: "IL TLV".into(),
+            name: "Tel Aviv".into(),
+            country: "Israel".into(),
+            country_code: "IL".into(),
+            timezone: "Asia/Jerusalem".into(),
+            active: false,
+        },
         // ──── SOUTH AMERICA ────
 
         // ── Brazil (BR) ──
-        SiteEntry { unlocode: "BR SAO".into(), name: "São Paulo".into(), country: "Brazil".into(), country_code: "BR".into(), timezone: "America/Sao_Paulo".into(), active: false },
-        SiteEntry { unlocode: "BR RIO".into(), name: "Rio de Janeiro".into(), country: "Brazil".into(), country_code: "BR".into(), timezone: "America/Sao_Paulo".into(), active: false },
+        SiteEntry {
+            unlocode: "BR SAO".into(),
+            name: "São Paulo".into(),
+            country: "Brazil".into(),
+            country_code: "BR".into(),
+            timezone: "America/Sao_Paulo".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "BR RIO".into(),
+            name: "Rio de Janeiro".into(),
+            country: "Brazil".into(),
+            country_code: "BR".into(),
+            timezone: "America/Sao_Paulo".into(),
+            active: false,
+        },
         // ── Argentina (AR) ──
-        SiteEntry { unlocode: "AR BUE".into(), name: "Buenos Aires".into(), country: "Argentina".into(), country_code: "AR".into(), timezone: "America/Argentina/Buenos_Aires".into(), active: false },
+        SiteEntry {
+            unlocode: "AR BUE".into(),
+            name: "Buenos Aires".into(),
+            country: "Argentina".into(),
+            country_code: "AR".into(),
+            timezone: "America/Argentina/Buenos_Aires".into(),
+            active: false,
+        },
         // ── Chile (CL) ──
-        SiteEntry { unlocode: "CL SCL".into(), name: "Santiago".into(), country: "Chile".into(), country_code: "CL".into(), timezone: "America/Santiago".into(), active: false },
-
+        SiteEntry {
+            unlocode: "CL SCL".into(),
+            name: "Santiago".into(),
+            country: "Chile".into(),
+            country_code: "CL".into(),
+            timezone: "America/Santiago".into(),
+            active: false,
+        },
         // ──── AFRICA ────
 
         // ── South Africa (ZA) ──
-        SiteEntry { unlocode: "ZA JNB".into(), name: "Johannesburg".into(), country: "South Africa".into(), country_code: "ZA".into(), timezone: "Africa/Johannesburg".into(), active: false },
-        SiteEntry { unlocode: "ZA CPT".into(), name: "Cape Town".into(), country: "South Africa".into(), country_code: "ZA".into(), timezone: "Africa/Johannesburg".into(), active: false },
+        SiteEntry {
+            unlocode: "ZA JNB".into(),
+            name: "Johannesburg".into(),
+            country: "South Africa".into(),
+            country_code: "ZA".into(),
+            timezone: "Africa/Johannesburg".into(),
+            active: false,
+        },
+        SiteEntry {
+            unlocode: "ZA CPT".into(),
+            name: "Cape Town".into(),
+            country: "South Africa".into(),
+            country_code: "ZA".into(),
+            timezone: "Africa/Johannesburg".into(),
+            active: false,
+        },
         // ── Kenya (KE) ──
-        SiteEntry { unlocode: "KE NBO".into(), name: "Nairobi".into(), country: "Kenya".into(), country_code: "KE".into(), timezone: "Africa/Nairobi".into(), active: false },
+        SiteEntry {
+            unlocode: "KE NBO".into(),
+            name: "Nairobi".into(),
+            country: "Kenya".into(),
+            country_code: "KE".into(),
+            timezone: "Africa/Nairobi".into(),
+            active: false,
+        },
         // ── Nigeria (NG) ──
-        SiteEntry { unlocode: "NG LOS".into(), name: "Lagos".into(), country: "Nigeria".into(), country_code: "NG".into(), timezone: "Africa/Lagos".into(), active: false },
+        SiteEntry {
+            unlocode: "NG LOS".into(),
+            name: "Lagos".into(),
+            country: "Nigeria".into(),
+            country_code: "NG".into(),
+            timezone: "Africa/Lagos".into(),
+            active: false,
+        },
     ]
 }
 
@@ -277,9 +888,12 @@ pub fn search_sites(query: &str) -> Result<Value, String> {
 
 pub fn list_countries() -> Result<Value, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
-    let mut countries: std::collections::BTreeMap<String, (String, usize)> = std::collections::BTreeMap::new();
+    let mut countries: std::collections::BTreeMap<String, (String, usize)> =
+        std::collections::BTreeMap::new();
     for s in store.iter() {
-        let entry = countries.entry(s.country_code.clone()).or_insert((s.country.clone(), 0));
+        let entry = countries
+            .entry(s.country_code.clone())
+            .or_insert((s.country.clone(), 0));
         entry.1 += 1;
     }
     let result: Vec<Value> = countries
@@ -316,12 +930,20 @@ pub fn list_cities_by_country(country_code: &str) -> Result<Value, String> {
 
 pub fn get_active_site_codes() -> Result<Vec<String>, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
-    Ok(store.iter().filter(|s| s.active).map(|s| s.unlocode.clone()).collect())
+    Ok(store
+        .iter()
+        .filter(|s| s.active)
+        .map(|s| s.unlocode.clone())
+        .collect())
 }
 
 pub fn get_active_site_names() -> Result<Vec<String>, String> {
     let store = site_store().lock().map_err(|e| e.to_string())?;
-    Ok(store.iter().filter(|s| s.active).map(|s| s.name.clone()).collect())
+    Ok(store
+        .iter()
+        .filter(|s| s.active)
+        .map(|s| s.name.clone())
+        .collect())
 }
 
 pub fn is_valid_site(unlocode: &str) -> bool {
@@ -409,7 +1031,10 @@ mod tests {
         let result = list_countries().unwrap();
         assert!(result["count"].as_u64().unwrap() >= 20);
         let countries = result["countries"].as_array().unwrap();
-        let de = countries.iter().find(|c| c["country_code"] == "DE").unwrap();
+        let de = countries
+            .iter()
+            .find(|c| c["country_code"] == "DE")
+            .unwrap();
         assert_eq!(de["country"], "Germany");
     }
 

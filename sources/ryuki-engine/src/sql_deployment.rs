@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,7 +97,8 @@ fn deployment_store() -> &'static Mutex<DeploymentStore> {
 }
 
 fn seed_data() -> DeploymentStore {
-    let sites = crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()]);
+    let sites = crate::site_registry::get_active_site_codes()
+        .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()]);
     let s0 = sites.first().map(|s| s.as_str()).unwrap_or("DEFRA");
     let s1 = sites.get(1).map(|s| s.as_str()).unwrap_or("GBLON");
 
@@ -172,7 +173,9 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
     let data_disk_gb = req["data_disk_gb"].as_u64().unwrap_or(100) as u32;
     let log_disk_gb = req["log_disk_gb"].as_u64().unwrap_or(50) as u32;
     let tempdb_disk_gb = req["tempdb_disk_gb"].as_u64().unwrap_or(30) as u32;
-    let collation = req["collation"].as_str().unwrap_or("SQL_Latin1_General_CP1_CI_AS");
+    let collation = req["collation"]
+        .as_str()
+        .unwrap_or("SQL_Latin1_General_CP1_CI_AS");
     let service_account = req["service_account"]
         .as_str()
         .ok_or("service_account is required")?;
@@ -182,27 +185,36 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
     let sql_version = match version_str {
         "2019" => SQLVersion::Sql2019,
         "2022" => SQLVersion::Sql2022,
-        v => return Err(format!("Unsupported SQL version '{}'. Must be 2019 or 2022", v)),
+        v => {
+            return Err(format!(
+                "Unsupported SQL version '{}'. Must be 2019 or 2022",
+                v
+            ));
+        }
     };
 
     let edition: SQLEdition = match edition_str {
         "Standard" => SQLEdition::Standard,
         "Enterprise" => SQLEdition::Enterprise,
         "Developer" => SQLEdition::Developer,
-        e => return Err(format!(
-            "Unsupported edition '{}'. Must be Standard, Enterprise, or Developer",
-            e
-        )),
+        e => {
+            return Err(format!(
+                "Unsupported edition '{}'. Must be Standard, Enterprise, or Developer",
+                e
+            ));
+        }
     };
 
     let cluster_mode: ClusterMode = match cluster_str {
         "Standalone" => ClusterMode::Standalone,
         "FCI" => ClusterMode::FCI,
         "AG" => ClusterMode::AG,
-        m => return Err(format!(
-            "Unsupported cluster mode '{}'. Must be Standalone, FCI, or AG",
-            m
-        )),
+        m => {
+            return Err(format!(
+                "Unsupported cluster mode '{}'. Must be Standalone, FCI, or AG",
+                m
+            ));
+        }
     };
 
     let total_disk = data_disk_gb + log_disk_gb + tempdb_disk_gb;
@@ -212,7 +224,11 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         format!(
             "Memory allocation: {} GB total, recommended max server memory: {} GB",
             memory_gb,
-            if memory_gb > 4 { memory_gb - 2 } else { memory_gb / 2 }
+            if memory_gb > 4 {
+                memory_gb - 2
+            } else {
+                memory_gb / 2
+            }
         )
     };
 
@@ -302,12 +318,16 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
     }
 
     if !version_str.is_empty() && version_str != "2019" && version_str != "2022" {
-        errors.push(format!("Unsupported SQL version '{}'. Must be 2019 or 2022", version_str));
+        errors.push(format!(
+            "Unsupported SQL version '{}'. Must be 2019 or 2022",
+            version_str
+        ));
     }
 
     if version_str == "2019" {
         warnings.push("SQL Server 2019 mainstream support ended 2025-01-07. Consider 2022 for new deployments.".into());
-        remediation.push("Upgrade target version to 2022 unless legacy application requires 2019".into());
+        remediation
+            .push("Upgrade target version to 2022 unless legacy application requires 2019".into());
     }
 
     if !edition_str.is_empty()
@@ -342,7 +362,9 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
             warnings.push("FCI deployments benefit from at least 4 CPU cores".into());
         }
         warnings.push("FCI requires shared storage (SAN/FC) and Windows Server Faidefrar Clustering pre-configured".into());
-        remediation.push("Verify WSFC cluster exists and shared storage is available before deployment".into());
+        remediation.push(
+            "Verify WSFC cluster exists and shared storage is available before deployment".into(),
+        );
     }
 
     if cluster_str == "AG" {
@@ -352,8 +374,10 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
         if cpu < 4 {
             warnings.push("AG deployments benefit from at least 4 CPU cores per node".into());
         }
-        warnings.push("AG requires Windows Server Faidefrar Clustering and at least 2 nodes".into());
-        remediation.push("Ensure 2+ nodes, WSFC, and AG listener DNS record are pre-provisioned".into());
+        warnings
+            .push("AG requires Windows Server Faidefrar Clustering and at least 2 nodes".into());
+        remediation
+            .push("Ensure 2+ nodes, WSFC, and AG listener DNS record are pre-provisioned".into());
     }
 
     if cpu == 0 {
@@ -365,7 +389,10 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
     if memory_gb == 0 {
         errors.push("memory_gb is required and must be >= 1".into());
     } else if memory_gb > 24576 {
-        errors.push(format!("memory_gb {} exceeds maximum 24 TB for SQL Server", memory_gb));
+        errors.push(format!(
+            "memory_gb {} exceeds maximum 24 TB for SQL Server",
+            memory_gb
+        ));
     } else if memory_gb < 2 {
         errors.push("minimum 2 GB memory required for SQL Server".into());
         remediation.push("Increase memory to at least 4 GB for production workloads".into());
@@ -429,7 +456,11 @@ pub fn configure_sql(deployment_id: &str) -> Result<Value, String> {
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
 
-    let maxdop = if deployment.cpu >= 8 { 8 } else { deployment.cpu };
+    let maxdop = if deployment.cpu >= 8 {
+        8
+    } else {
+        deployment.cpu
+    };
     let max_memory_mb = if deployment.memory_gb > 4 {
         (deployment.memory_gb - 2) * 1024
     } else {
@@ -652,7 +683,12 @@ mod tests {
         assert_eq!(result["instance_name"], "DEFRA-SQL-TEST-01");
         assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["status"], "planned");
-        assert!(result["deployment_id"].as_str().unwrap().starts_with("sql-"));
+        assert!(
+            result["deployment_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("sql-")
+        );
         assert!(result["disk_layout"]["data"]["size_gb"].as_u64().unwrap() == 200);
         assert!(result["total_disk_gb"].as_u64().unwrap() == 350);
     }
@@ -758,27 +794,43 @@ mod tests {
 
         let config_result = configure_sql(&deployment_id).unwrap();
         assert_eq!(config_result["status"], "configuring");
-        assert!(config_result["config_applied"]["backup_compression_default"].as_u64().unwrap() == 1);
+        assert!(
+            config_result["config_applied"]["backup_compression_default"]
+                .as_u64()
+                .unwrap()
+                == 1
+        );
 
         let verify_result = verify_sql(&deployment_id).unwrap();
         assert_eq!(verify_result["status"], "verified");
-        assert!(verify_result["checks"]["connectivity"]["passed"].as_bool().unwrap());
+        assert!(
+            verify_result["checks"]["connectivity"]["passed"]
+                .as_bool()
+                .unwrap()
+        );
 
         let backup_result = add_to_backup(&deployment_id).unwrap();
         assert_eq!(backup_result["status"], "backed-up");
-        assert!(backup_result["veeam_config"]["application_aware_processing"].as_bool().unwrap());
+        assert!(
+            backup_result["veeam_config"]["application_aware_processing"]
+                .as_bool()
+                .unwrap()
+        );
 
         let monitoring_result = add_to_monitoring(&deployment_id).unwrap();
         assert_eq!(monitoring_result["status"], "monitored");
-        assert!(monitoring_result["zabbix_config"]["items_monitored"]
-            .as_array()
-            .unwrap()
-            .len()
-            >= 5);
+        assert!(
+            monitoring_result["zabbix_config"]["items_monitored"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 5
+        );
     }
 
     fn active_sites() -> Vec<String> {
-        crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()])
+        crate::site_registry::get_active_site_codes()
+            .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()])
     }
 
     #[test]

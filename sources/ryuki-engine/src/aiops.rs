@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -206,8 +206,7 @@ pub fn review_suggestion(id: &str, reviewer: &str) -> Result<Value, String> {
     if suggestion.status != SuggestionStatus::New {
         return Err(format!(
             "Suggestion '{}' is already {}",
-            id,
-            suggestion.status.to_string()
+            id, suggestion.status
         ));
     }
 
@@ -234,14 +233,15 @@ pub fn accept_suggestion(id: &str) -> Result<Value, String> {
     if suggestion.status != SuggestionStatus::Reviewed {
         return Err(format!(
             "Suggestion '{}' must be reviewed before accepting (current status: {})",
-            id,
-            suggestion.status.to_string()
+            id, suggestion.status
         ));
     }
 
     suggestion.status = SuggestionStatus::Accepted;
-    suggestion.implementation_plan =
-        Some(format!("Implementation plan for {}: dry-run assessment, maintenance window scheduling, execution, verification.", suggestion.title));
+    suggestion.implementation_plan = Some(format!(
+        "Implementation plan for {}: dry-run assessment, maintenance window scheduling, execution, verification.",
+        suggestion.title
+    ));
     suggestion.updated_at = now_iso();
 
     Ok(json!({
@@ -260,11 +260,11 @@ pub fn reject_suggestion(id: &str, reason: &str) -> Result<Value, String> {
         .find(|s| s.id == id)
         .ok_or_else(|| format!("Suggestion '{}' not found", id))?;
 
-    if suggestion.status != SuggestionStatus::New && suggestion.status != SuggestionStatus::Reviewed {
+    if suggestion.status != SuggestionStatus::New && suggestion.status != SuggestionStatus::Reviewed
+    {
         return Err(format!(
             "Suggestion '{}' cannot be rejected (current status: {})",
-            id,
-            suggestion.status.to_string()
+            id, suggestion.status
         ));
     }
 
@@ -291,8 +291,7 @@ pub fn implement_suggestion(id: &str) -> Result<Value, String> {
     if suggestion.status != SuggestionStatus::Accepted {
         return Err(format!(
             "Suggestion '{}' must be accepted before implementation (current status: {})",
-            id,
-            suggestion.status.to_string()
+            id, suggestion.status
         ));
     }
 
@@ -377,8 +376,7 @@ pub fn get_savings_summary(site: &str) -> Result<Value, String> {
 pub fn get_suggestion_stats(site: &str) -> Result<Value, String> {
     let store = aiops_store().lock().map_err(|e| e.to_string())?;
 
-    let site_suggestions: Vec<&AIOpsSuggestion> =
-        store.iter().filter(|s| s.site == site).collect();
+    let site_suggestions: Vec<&AIOpsSuggestion> = store.iter().filter(|s| s.site == site).collect();
 
     let accepted = site_suggestions
         .iter()
@@ -398,12 +396,10 @@ pub fn get_suggestion_stats(site: &str) -> Result<Value, String> {
         .count();
 
     let by_type: HashMap<String, usize> =
-        site_suggestions
-            .iter()
-            .fold(HashMap::new(), |mut acc, s| {
-                *acc.entry(s.suggestion_type.to_string()).or_default() += 1;
-                acc
-            });
+        site_suggestions.iter().fold(HashMap::new(), |mut acc, s| {
+            *acc.entry(s.suggestion_type.to_string()).or_default() += 1;
+            acc
+        });
 
     Ok(json!({
         "source": "dry-run",
@@ -461,7 +457,10 @@ mod tests {
     #[test]
     fn test_review_then_accept_suggestion() {
         let tid = "test-lc-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
+        aiops_store()
+            .lock()
+            .unwrap()
+            .push(seed_test_suggestion(tid, "DEFRA"));
 
         let review = review_suggestion(tid, "alice").unwrap();
         assert_eq!(review["status"], "reviewed");
@@ -469,23 +468,39 @@ mod tests {
 
         let accept = accept_suggestion(tid).unwrap();
         assert_eq!(accept["status"], "accepted");
-        assert!(accept["implementation_plan"].as_str().unwrap().contains("Implementation plan"));
+        assert!(
+            accept["implementation_plan"]
+                .as_str()
+                .unwrap()
+                .contains("Implementation plan")
+        );
     }
 
     #[test]
     fn test_reject_suggestion() {
         let tid = "test-rej-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
+        aiops_store()
+            .lock()
+            .unwrap()
+            .push(seed_test_suggestion(tid, "DEFRA"));
 
         let reject = reject_suggestion(tid, "Insufficient data for cost projection").unwrap();
         assert_eq!(reject["status"], "rejected");
-        assert!(reject["rejection_reason"].as_str().unwrap().contains("Insufficient data"));
+        assert!(
+            reject["rejection_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Insufficient data")
+        );
     }
 
     #[test]
     fn test_implement_suggestion_requires_accepted() {
         let tid = "test-imp-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
+        aiops_store()
+            .lock()
+            .unwrap()
+            .push(seed_test_suggestion(tid, "DEFRA"));
 
         // Should fail — not reviewed/accepted yet
         let result = implement_suggestion(tid);
@@ -540,7 +555,10 @@ mod tests {
     #[test]
     fn test_reject_already_accepted_fails() {
         let tid = "test-rej-accepted-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "DEFRA"));
+        aiops_store()
+            .lock()
+            .unwrap()
+            .push(seed_test_suggestion(tid, "DEFRA"));
 
         review_suggestion(tid, "alice").unwrap();
         accept_suggestion(tid).unwrap();
@@ -552,11 +570,17 @@ mod tests {
     #[test]
     fn test_suggestion_type_display() {
         assert_eq!(SuggestionType::RightSizing.to_string(), "right-sizing");
-        assert_eq!(SuggestionType::CostOptimization.to_string(), "cost-optimization");
+        assert_eq!(
+            SuggestionType::CostOptimization.to_string(),
+            "cost-optimization"
+        );
         assert_eq!(SuggestionType::Migration.to_string(), "migration");
         assert_eq!(SuggestionType::Consolidation.to_string(), "consolidation");
         assert_eq!(SuggestionType::RiskReduction.to_string(), "risk-reduction");
-        assert_eq!(SuggestionType::PerformanceImprovement.to_string(), "performance-improvement");
+        assert_eq!(
+            SuggestionType::PerformanceImprovement.to_string(),
+            "performance-improvement"
+        );
     }
 
     #[test]
@@ -571,7 +595,10 @@ mod tests {
     #[test]
     fn test_full_lifecycle() {
         let tid = "test-lifecycle-001";
-        aiops_store().lock().unwrap().push(seed_test_suggestion(tid, "GBLON"));
+        aiops_store()
+            .lock()
+            .unwrap()
+            .push(seed_test_suggestion(tid, "GBLON"));
 
         review_suggestion(tid, "carol").unwrap();
         accept_suggestion(tid).unwrap();

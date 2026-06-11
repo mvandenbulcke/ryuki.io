@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
@@ -123,8 +123,7 @@ fn ensure_seeded() {
         let now = Utc::now().to_rfc3339();
         for (server_name, _site) in &servers {
             for check in checks.iter() {
-                let compliant = !(server_name.contains("db")
-                    && check.id == "bc-004"
+                let compliant = !(server_name.contains("db") && check.id == "bc-004"
                     || server_name.contains("app") && check.id == "bc-001"
                     || server_name.contains("fs") && check.id == "bc-003");
                 let actual_value = if compliant {

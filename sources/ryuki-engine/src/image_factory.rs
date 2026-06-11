@@ -1,5 +1,5 @@
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -187,8 +187,7 @@ pub fn promote_image(image_id: &str) -> Result<Value, String> {
         .iter()
         .find(|i| i.id == image_id)
         .map(|i| i.status.clone());
-    let current_status = current_status
-        .ok_or_else(|| format!("Image '{}' not found", image_id))?;
+    let current_status = current_status.ok_or_else(|| format!("Image '{}' not found", image_id))?;
     if current_status != BuildStatus::Testing {
         return Err(format!(
             "Image '{}' is not in Testing status (current: {:?})",
@@ -281,10 +280,7 @@ pub fn get_active_images(site: &str) -> Result<Value, String> {
 
 pub fn get_build_history(site: &str) -> Result<Value, String> {
     let store = image_store().lock().map_err(|e| e.to_string())?;
-    let images: Vec<&GoldenImage> = store
-        .iter()
-        .filter(|i| i.site_scope == site)
-        .collect();
+    let images: Vec<&GoldenImage> = store.iter().filter(|i| i.site_scope == site).collect();
 
     if images.is_empty() {
         return Err(format!("No build history found for site '{}'", site));
@@ -305,7 +301,7 @@ pub fn get_superseded() -> Result<Value, String> {
     let superseded: Vec<Value> = store
         .iter()
         .filter(|i| i.status == BuildStatus::Superseded)
-        .map(|i| image_to_json(i))
+        .map(image_to_json)
         .collect();
 
     Ok(json!({
@@ -315,11 +311,7 @@ pub fn get_superseded() -> Result<Value, String> {
     }))
 }
 
-pub fn schedule_monthly_build(
-    site: &str,
-    os_family: &str,
-    distro: &str,
-) -> Result<Value, String> {
+pub fn schedule_monthly_build(site: &str, os_family: &str, distro: &str) -> Result<Value, String> {
     let mut store = image_store().lock().map_err(|e| e.to_string())?;
     let id = next_id(&store);
     let image_name = format!(
@@ -382,7 +374,8 @@ mod tests {
 
     #[test]
     fn test_promote_image() {
-        let build = initiate_build("test-promote", "Windows", "WinSvr2025", "2025", "GBLON").unwrap();
+        let build =
+            initiate_build("test-promote", "Windows", "WinSvr2025", "2025", "GBLON").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         run_tests(image_id).unwrap();
         let result = promote_image(image_id).unwrap();
@@ -398,12 +391,16 @@ mod tests {
     #[test]
     fn test_promote_supersedes_previous() {
         // img-002 is Ubuntu promoted at DEFRA. Build a new Ubuntu, test, and promote it.
-        let build = initiate_build("ubuntu-2404-v2", "Linux", "Ubuntu 24.04", "24.04", "DEFRA").unwrap();
+        let build =
+            initiate_build("ubuntu-2404-v2", "Linux", "Ubuntu 24.04", "24.04", "DEFRA").unwrap();
         let image_id = build["image"]["id"].as_str().unwrap();
         run_tests(image_id).unwrap();
         let result = promote_image(image_id).unwrap();
         let superseded = result["superseded"].as_array().unwrap();
-        assert!(!superseded.is_empty(), "should supersede the existing Ubuntu image at DEFRA");
+        assert!(
+            !superseded.is_empty(),
+            "should supersede the existing Ubuntu image at DEFRA"
+        );
         assert!(superseded.iter().any(|s| s.as_str() == Some("img-002")));
     }
 

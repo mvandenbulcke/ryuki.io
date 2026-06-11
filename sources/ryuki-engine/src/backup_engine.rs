@@ -274,7 +274,15 @@ mod tests {
     #[test]
     fn test_plan_restore_empty_ci_key_fails() {
         assert!(
-            plan_restore("", RestoreType::FullVm, "rp", "DEFRA", "production", "owner").is_err()
+            plan_restore(
+                "",
+                RestoreType::FullVm,
+                "rp",
+                "DEFRA",
+                "production",
+                "owner"
+            )
+            .is_err()
         );
     }
 

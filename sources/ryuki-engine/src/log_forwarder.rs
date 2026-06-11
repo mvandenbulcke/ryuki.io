@@ -241,20 +241,14 @@ pub fn validate_config(hostname: &str) -> Result<ConfigValidationResult, String>
     }
 
     let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds
-        .iter()
-        .filter(|hs| hs.hostname == hostname)
-        .collect();
+    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(ConfigValidationResult {
             valid: false,
             hostname: hostname.into(),
             configured_sources: vec![],
-            missing_sources: vec![
-                LogSourceType::WindowsEventLog,
-                LogSourceType::Syslog,
-            ],
+            missing_sources: vec![LogSourceType::WindowsEventLog, LogSourceType::Syslog],
             errors: vec![format!(
                 "DRY-RUN: No log forwarding configuration found for {}",
                 hostname
@@ -264,7 +258,9 @@ pub fn validate_config(hostname: &str) -> Result<ConfigValidationResult, String>
 
     let configured: Vec<LogSourceType> = host_sources
         .iter()
-        .filter(|hs| hs.status == ForwardingStatus::Configured || hs.status == ForwardingStatus::Active)
+        .filter(|hs| {
+            hs.status == ForwardingStatus::Configured || hs.status == ForwardingStatus::Active
+        })
         .map(|hs| hs.source_type.clone())
         .collect();
 
@@ -317,10 +313,7 @@ pub fn verify_forwarding(hostname: &str) -> Result<VerificationResult, String> {
     }
 
     let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds
-        .iter()
-        .filter(|hs| hs.hostname == hostname)
-        .collect();
+    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(VerificationResult {
@@ -346,8 +339,7 @@ pub fn verify_forwarding(hostname: &str) -> Result<VerificationResult, String> {
         siem_received,
         message: format!(
             "DRY-RUN: SIEM verification simulated. {} log source(s) actively forwarding from {}.",
-            active_count,
-            hostname
+            active_count, hostname
         ),
     })
 }
@@ -358,10 +350,7 @@ pub fn get_coverage_report(site: &str) -> Result<CoverageReport, String> {
     }
 
     let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds
-        .into_iter()
-        .filter(|hs| hs.site == site)
-        .collect();
+    let site_hosts: Vec<LogSource> = seeds.into_iter().filter(|hs| hs.site == site).collect();
 
     let total_hosts = site_hosts.len();
     let hosts_with_forwarding: Vec<&LogSource> = site_hosts
@@ -395,11 +384,7 @@ pub fn get_gap_report(site: &str) -> Result<GapReport, String> {
     }
 
     let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds
-        .iter()
-        .filter(|hs| hs.site == site)
-        .cloned()
-        .collect();
+    let site_hosts: Vec<LogSource> = seeds.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let required_sources = vec![
         LogSourceType::WindowsEventLog,
@@ -411,7 +396,9 @@ pub fn get_gap_report(site: &str) -> Result<GapReport, String> {
 
     let collected_sources: Vec<LogSourceType> = site_hosts
         .iter()
-        .filter(|hs| hs.status == ForwardingStatus::Active || hs.status == ForwardingStatus::Configured)
+        .filter(|hs| {
+            hs.status == ForwardingStatus::Active || hs.status == ForwardingStatus::Configured
+        })
         .map(|hs| hs.source_type.clone())
         .collect();
 
@@ -423,7 +410,9 @@ pub fn get_gap_report(site: &str) -> Result<GapReport, String> {
 
     let hosts_with_gaps: Vec<String> = site_hosts
         .iter()
-        .filter(|hs| hs.status == ForwardingStatus::NotConfigured || hs.status == ForwardingStatus::Failed)
+        .filter(|hs| {
+            hs.status == ForwardingStatus::NotConfigured || hs.status == ForwardingStatus::Failed
+        })
         .map(|hs| hs.hostname.clone())
         .collect();
 
@@ -442,11 +431,7 @@ pub fn get_volume_report(site: &str) -> Result<VolumeReport, String> {
     }
 
     let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds
-        .iter()
-        .filter(|hs| hs.site == site)
-        .cloned()
-        .collect();
+    let site_hosts: Vec<LogSource> = seeds.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let mut host_map: HashMap<String, HostVolume> = HashMap::new();
     for hs in &site_hosts {
@@ -484,21 +469,23 @@ pub fn get_retention_status(site: &str) -> Result<RetentionStatus, String> {
     let mut hosts_at_risk: Vec<RetentionHost> = Vec::new();
     let mut hosts_approaching_limit: Vec<RetentionHost> = Vec::new();
 
-    let site_hosts: Vec<LogSource> = seeds
-        .into_iter()
-        .filter(|hs| hs.site == site)
-        .collect();
+    let site_hosts: Vec<LogSource> = seeds.into_iter().filter(|hs| hs.site == site).collect();
 
     let mut host_retention: HashMap<String, u32> = HashMap::new();
     for hs in &site_hosts {
-        let entry = host_retention.entry(hs.hostname.clone()).or_insert(hs.retention_days);
+        let entry = host_retention
+            .entry(hs.hostname.clone())
+            .or_insert(hs.retention_days);
         if hs.retention_days < *entry {
             *entry = hs.retention_days;
         }
     }
 
     for hs in &site_hosts {
-        let configured = host_retention.get(&hs.hostname).copied().unwrap_or(hs.retention_days);
+        let configured = host_retention
+            .get(&hs.hostname)
+            .copied()
+            .unwrap_or(hs.retention_days);
         if configured >= retention_limit_days {
             hosts_at_risk.push(RetentionHost {
                 hostname: hs.hostname.clone(),
@@ -532,10 +519,7 @@ pub fn disable_forwarding(hostname: &str) -> Result<DisableResult, String> {
     }
 
     let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds
-        .iter()
-        .filter(|hs| hs.hostname == hostname)
-        .collect();
+    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(DisableResult {
@@ -629,8 +613,7 @@ mod tests {
 
     #[test]
     fn test_verify_forwarding_active_host() {
-        let result = verify_forwarding("srv-defra-01.ryuki.local")
-            .expect("verify should succeed");
+        let result = verify_forwarding("srv-defra-01.ryuki.local").expect("verify should succeed");
         assert!(result.verified);
         assert!(result.siem_received);
         assert!(result.message.contains("DRY-RUN"));
@@ -638,8 +621,7 @@ mod tests {
 
     #[test]
     fn test_verify_forwarding_unknown_host() {
-        let result = verify_forwarding("srv-unknown.ryuki.local")
-            .expect("verify should succeed");
+        let result = verify_forwarding("srv-unknown.ryuki.local").expect("verify should succeed");
         assert!(!result.verified);
         assert!(!result.siem_received);
     }
@@ -680,16 +662,15 @@ mod tests {
 
     #[test]
     fn test_disable_forwarding_known_host() {
-        let result = disable_forwarding("srv-defra-01.ryuki.local")
-            .expect("disable should succeed");
+        let result =
+            disable_forwarding("srv-defra-01.ryuki.local").expect("disable should succeed");
         assert!(result.success);
         assert!(result.message.contains("DRY-RUN"));
     }
 
     #[test]
     fn test_disable_forwarding_unknown_host() {
-        let result = disable_forwarding("srv-unknown.ryuki.local")
-            .expect("disable should succeed");
+        let result = disable_forwarding("srv-unknown.ryuki.local").expect("disable should succeed");
         assert!(result.success);
         assert!(result.disabled_sources.is_empty());
     }
@@ -699,16 +680,23 @@ mod tests {
         let hosts = seed_hosts();
         let unique_hostnames: std::collections::HashSet<&str> =
             hosts.iter().map(|h| h.hostname.as_str()).collect();
-        assert!(unique_hostnames.len() >= 5, "expected at least 5 unique hostnames");
+        assert!(
+            unique_hostnames.len() >= 5,
+            "expected at least 5 unique hostnames"
+        );
     }
 
     #[test]
     fn test_seed_hosts_has_mixed_statuses() {
         let hosts = seed_hosts();
         let has_active = hosts.iter().any(|h| h.status == ForwardingStatus::Active);
-        let has_configured = hosts.iter().any(|h| h.status == ForwardingStatus::Configured);
+        let has_configured = hosts
+            .iter()
+            .any(|h| h.status == ForwardingStatus::Configured);
         let has_failed = hosts.iter().any(|h| h.status == ForwardingStatus::Failed);
-        let has_not_configured = hosts.iter().any(|h| h.status == ForwardingStatus::NotConfigured);
+        let has_not_configured = hosts
+            .iter()
+            .any(|h| h.status == ForwardingStatus::NotConfigured);
         assert!(has_active);
         assert!(has_configured);
         assert!(has_failed);
@@ -717,7 +705,10 @@ mod tests {
 
     #[test]
     fn test_log_source_type_display() {
-        assert_eq!(LogSourceType::WindowsEventLog.to_string(), "windows-event-log");
+        assert_eq!(
+            LogSourceType::WindowsEventLog.to_string(),
+            "windows-event-log"
+        );
         assert_eq!(LogSourceType::Syslog.to_string(), "syslog");
         assert_eq!(LogSourceType::Auditd.to_string(), "auditd");
         assert_eq!(LogSourceType::IIS.to_string(), "iis");
@@ -726,7 +717,10 @@ mod tests {
 
     #[test]
     fn test_forwarding_status_display() {
-        assert_eq!(ForwardingStatus::NotConfigured.to_string(), "not-configured");
+        assert_eq!(
+            ForwardingStatus::NotConfigured.to_string(),
+            "not-configured"
+        );
         assert_eq!(ForwardingStatus::Configured.to_string(), "configured");
         assert_eq!(ForwardingStatus::Active.to_string(), "active");
         assert_eq!(ForwardingStatus::Failed.to_string(), "failed");

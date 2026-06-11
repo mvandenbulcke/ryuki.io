@@ -81,7 +81,10 @@ async fn main() {
     database::migrate_if_connected().await;
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin(tower_http::cors::AllowOrigin::list([
+            "http://localhost:3000".parse().unwrap(),
+            "http://127.0.0.1:3000".parse().unwrap(),
+        ]))
         .allow_methods(Any)
         .allow_headers(Any);
 

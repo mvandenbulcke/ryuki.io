@@ -11,10 +11,9 @@ use crate::api::{
 use crate::models::{
     CapacityAdmissionSummary, CmdbFileExchangeSummary, CmdbReconciliationSummary,
     CmdbRelationshipSummary, DatacenterFailingChecksSummary, DatacenterFullReadiness,
-    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
-    DatacenterSitesCatalog, DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary,
-    OperationRunSummary, PolicyOutcome, RequestIntakeSummary, RequestSummary,
-    SecretReferenceCatalogStatus,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
+    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, OperationRunSummary,
+    PolicyOutcome, RequestIntakeSummary, RequestSummary, SecretReferenceCatalogStatus,
 };
 use serde::de::DeserializeOwned;
 use std::marker::PhantomData;
@@ -120,7 +119,10 @@ pub fn request_list_resource() -> ApiResource<Vec<RequestSummary>> {
 }
 
 pub fn datacenter_readiness_score_resource() -> ApiResource<DatacenterReadinessScore> {
-    ApiResource::new("datacenter-readiness-score", datacenter_readiness_score_path())
+    ApiResource::new(
+        "datacenter-readiness-score",
+        datacenter_readiness_score_path(),
+    )
 }
 
 pub fn datacenter_site_report_resource() -> ApiResource<DatacenterSiteReport> {
@@ -128,7 +130,10 @@ pub fn datacenter_site_report_resource() -> ApiResource<DatacenterSiteReport> {
 }
 
 pub fn datacenter_failing_checks_resource() -> ApiResource<DatacenterFailingChecksSummary> {
-    ApiResource::new("datacenter-failing-checks", datacenter_failing_checks_path())
+    ApiResource::new(
+        "datacenter-failing-checks",
+        datacenter_failing_checks_path(),
+    )
 }
 
 pub fn datacenter_check_power_resource() -> ApiResource<DatacenterSingleCheck> {
@@ -140,15 +145,24 @@ pub fn datacenter_check_cooling_resource() -> ApiResource<DatacenterSingleCheck>
 }
 
 pub fn datacenter_check_rack_space_resource() -> ApiResource<DatacenterSingleCheck> {
-    ApiResource::new("datacenter-check-rack-space", datacenter_check_rack_space_path())
+    ApiResource::new(
+        "datacenter-check-rack-space",
+        datacenter_check_rack_space_path(),
+    )
 }
 
 pub fn datacenter_check_switchports_resource() -> ApiResource<DatacenterSingleCheck> {
-    ApiResource::new("datacenter-check-switchports", datacenter_check_switchports_path())
+    ApiResource::new(
+        "datacenter-check-switchports",
+        datacenter_check_switchports_path(),
+    )
 }
 
 pub fn datacenter_full_readiness_resource() -> ApiResource<DatacenterFullReadiness> {
-    ApiResource::new("datacenter-full-readiness", datacenter_full_readiness_path())
+    ApiResource::new(
+        "datacenter-full-readiness",
+        datacenter_full_readiness_path(),
+    )
 }
 
 pub fn datacenter_sites_resource() -> ApiResource<DatacenterSitesCatalog> {

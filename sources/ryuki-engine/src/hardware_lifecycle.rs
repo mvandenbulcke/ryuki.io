@@ -321,16 +321,15 @@ pub fn get_refresh_plan(site: &str) -> Vec<RefreshPlanEntry> {
                 || a.support_status == SupportStatus::Expiring
         })
         .map(|a| {
-            let age_days = if let Ok(expiry) =
-                chrono::DateTime::parse_from_rfc3339(&a.warranty_expiry)
-            {
-                let expiry_utc = expiry.with_timezone(&chrono::Utc);
-                let duration = now.signed_duration_since(expiry_utc);
-                let age_seconds = duration.num_seconds() as f64;
-                (age_seconds / 86400.0).max(0.0)
-            } else {
-                0.0
-            };
+            let age_days =
+                if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&a.warranty_expiry) {
+                    let expiry_utc = expiry.with_timezone(&chrono::Utc);
+                    let duration = now.signed_duration_since(expiry_utc);
+                    let age_seconds = duration.num_seconds() as f64;
+                    (age_seconds / 86400.0).max(0.0)
+                } else {
+                    0.0
+                };
             let age_years = age_days / 365.25;
             let action = if a.support_status == SupportStatus::Expired {
                 "Immediate replacement recommended"
@@ -587,10 +586,50 @@ mod tests {
 
     #[test]
     fn test_add_asset_empty_fields() {
-        assert!(add_asset("", "model", "site", "cluster", "serial", "2028-01-01T00:00:00Z").is_err());
-        assert!(add_asset("HPE", "", "site", "cluster", "serial", "2028-01-01T00:00:00Z").is_err());
-        assert!(add_asset("HPE", "model", "", "cluster", "serial", "2028-01-01T00:00:00Z").is_err());
-        assert!(add_asset("HPE", "model", "site", "cluster", "", "2028-01-01T00:00:00Z").is_err());
+        assert!(
+            add_asset(
+                "",
+                "model",
+                "site",
+                "cluster",
+                "serial",
+                "2028-01-01T00:00:00Z"
+            )
+            .is_err()
+        );
+        assert!(
+            add_asset(
+                "HPE",
+                "",
+                "site",
+                "cluster",
+                "serial",
+                "2028-01-01T00:00:00Z"
+            )
+            .is_err()
+        );
+        assert!(
+            add_asset(
+                "HPE",
+                "model",
+                "",
+                "cluster",
+                "serial",
+                "2028-01-01T00:00:00Z"
+            )
+            .is_err()
+        );
+        assert!(
+            add_asset(
+                "HPE",
+                "model",
+                "site",
+                "cluster",
+                "",
+                "2028-01-01T00:00:00Z"
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,7 +71,8 @@ fn readiness_store() -> &'static Mutex<ReadinessStore> {
 }
 
 fn seed_data() -> ReadinessStore {
-    let sites = crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()]);
+    let sites = crate::site_registry::get_active_site_codes()
+        .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()]);
     let s0 = sites.first().map(|s| s.as_str()).unwrap_or("DEFRA");
     let s1 = sites.get(1).map(|s| s.as_str()).unwrap_or("GBLON");
     let s2 = sites.get(2).map(|s| s.as_str()).unwrap_or("FRPAR");
@@ -171,7 +172,8 @@ fn seed_data() -> ReadinessStore {
                     check_type: CheckType::Firmware,
                     status: CheckStatus::Failed,
                     last_checked: "2026-06-11T09:30:00Z".into(),
-                    details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs".into(),
+                    details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs"
+                        .into(),
                 },
                 ReadinessCheck {
                     id: format!("dc-check-{}-capacity", s1.to_lowercase()),
@@ -514,12 +516,19 @@ mod tests {
     use super::*;
 
     fn sites() -> Vec<String> {
-        crate::site_registry::get_active_site_codes().unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()])
+        crate::site_registry::get_active_site_codes()
+            .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into(), "FRPAR".into()])
     }
 
-    fn s0() -> String { sites()[0].clone() }
-    fn s1() -> String { sites()[1].clone() }
-    fn s2() -> String { sites()[2].clone() }
+    fn s0() -> String {
+        sites()[0].clone()
+    }
+    fn s1() -> String {
+        sites()[1].clone()
+    }
+    fn s2() -> String {
+        sites()[2].clone()
+    }
 
     #[test]
     fn test_check_power_healthy_site() {
@@ -599,7 +608,12 @@ mod tests {
         let site = s2();
         let result = check_switchports(&site).unwrap();
         assert_eq!(result["status"], "not-checked");
-        assert!(result["details"].as_str().unwrap().contains("not yet provisioned"));
+        assert!(
+            result["details"]
+                .as_str()
+                .unwrap()
+                .contains("not yet provisioned")
+        );
     }
 
     #[test]

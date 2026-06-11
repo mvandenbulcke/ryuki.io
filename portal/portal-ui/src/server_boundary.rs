@@ -4,20 +4,20 @@ use crate::api::{
     approval_decision_readiness_path, auth_login_path, auth_logout_path, auth_session_path,
     auth_status_path, boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
     catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
-    cmdb_reconciliation_path, cmdb_relationship_graph_path,
-    datacenter_check_cooling_path, datacenter_check_power_path,
-    datacenter_check_rack_space_path, datacenter_check_switchports_path,
-    datacenter_failing_checks_path, datacenter_full_readiness_path,
-    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
-    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
-    evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
-    inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
-    operations_runbook_launch_path, platform_health_path, platform_status_path,
-    platform_summary_path, policy_outcomes_path, request_approve_path, request_create_path,
-    request_detail_path, request_execute_path, request_intake_form_preview_path,
-    request_intake_path, request_list_path, request_lock_path, request_plan_path,
-    request_preflight_path, request_validate_path, request_verify_path, same_origin_api_path,
-    secret_references_path, shift_queue_path, site_catalog_path, ApiPathError,
+    cmdb_reconciliation_path, cmdb_relationship_graph_path, datacenter_check_cooling_path,
+    datacenter_check_power_path, datacenter_check_rack_space_path,
+    datacenter_check_switchports_path, datacenter_failing_checks_path,
+    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
+    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
+    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
+    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
+    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
+    platform_status_path, platform_summary_path, policy_outcomes_path, request_approve_path,
+    request_create_path, request_detail_path, request_execute_path,
+    request_intake_form_preview_path, request_intake_path, request_list_path, request_lock_path,
+    request_plan_path, request_preflight_path, request_validate_path, request_verify_path,
+    same_origin_api_path, secret_references_path, shift_queue_path, site_catalog_path,
+    ApiPathError,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -29,8 +29,7 @@ use crate::api_client::{
 use crate::models::request_intake_form_fallback;
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
-    cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks,
-    datacenter_failing_checks_fallback,
+    cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks, datacenter_failing_checks_fallback,
     datacenter_full_readiness_fallback, datacenter_readiness_score_fallback,
     datacenter_single_check_fallback, datacenter_site_report_fallback,
     datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
@@ -38,13 +37,12 @@ use crate::models::{
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
     CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
-    CreateRequestPayload, DatacenterFailingChecksSummary,
-    DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck,
-    DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary, EvidenceSummary,
-    InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,
-    PlatformSettingsSummary, PlatformStatus, PolicyGuardrailSummary, PolicyOutcome,
-    RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary,
-    SecretReferenceSummary, StageActionResponse,
+    CreateRequestPayload, DatacenterFailingChecksSummary, DatacenterFullReadiness,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
+    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, LoginResponse,
+    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
+    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
+    RequestIntakeSummary, RequestSummary, SecretReferenceSummary, StageActionResponse,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{
@@ -600,12 +598,10 @@ impl PortalDatacenterReadinessSnapshot {
         let boundary = PortalServerBoundary::static_dry_run();
         let readiness_score_path =
             boundary.validate_platform_api_path(datacenter_readiness_score_path())?;
-        let site_report_path =
-            boundary.validate_platform_api_path(datacenter_site_report_path())?;
+        let site_report_path = boundary.validate_platform_api_path(datacenter_site_report_path())?;
         let failing_checks_path =
             boundary.validate_platform_api_path(datacenter_failing_checks_path())?;
-        let check_power_path =
-            boundary.validate_platform_api_path(datacenter_check_power_path())?;
+        let check_power_path = boundary.validate_platform_api_path(datacenter_check_power_path())?;
         let check_cooling_path =
             boundary.validate_platform_api_path(datacenter_check_cooling_path())?;
         let check_rack_space_path =

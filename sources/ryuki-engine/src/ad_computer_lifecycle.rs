@@ -607,7 +607,11 @@ mod tests {
         assert_eq!(result.total_ad_objects, 3);
         assert_eq!(result.total_cmdb_objects, 2);
         assert_eq!(result.missing_from_cmdb.len(), 1);
-        assert!(result.missing_from_cmdb.contains(&"DEFRA-WS-01".to_string()));
+        assert!(
+            result
+                .missing_from_cmdb
+                .contains(&"DEFRA-WS-01".to_string())
+        );
         assert!(result.dry_run);
     }
 

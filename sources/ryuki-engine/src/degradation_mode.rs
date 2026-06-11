@@ -116,7 +116,9 @@ fn seed_sites() -> Vec<SiteStatus> {
             veeam: ComponentStatus::Degraded,
             zabbix: ComponentStatus::Up,
         },
-        degradation_reason: Some("Hyper-V and Veeam adapters reporting degraded connectivity".into()),
+        degradation_reason: Some(
+            "Hyper-V and Veeam adapters reporting degraded connectivity".into(),
+        ),
         last_check: Utc::now().to_rfc3339(),
     };
     let mut nlams = SiteStatus {
@@ -228,7 +230,8 @@ pub fn enter_degradation_mode(site: &str, reason: &str) -> SiteStatus {
 pub fn exit_degradation_mode(site: &str) -> SiteStatus {
     let mut status = SiteStatus::healthy(site);
     status.state = SiteDegradationState::Recovering;
-    status.degradation_reason = Some("DRY-RUN: Site marked as recovering, exiting degradation mode".into());
+    status.degradation_reason =
+        Some("DRY-RUN: Site marked as recovering, exiting degradation mode".into());
     status
 }
 
@@ -350,7 +353,10 @@ mod tests {
         assert_eq!(status.db_status, ComponentStatus::Degraded);
         assert_eq!(status.adapter_status.vmware, ComponentStatus::Degraded);
         assert_eq!(status.adapter_status.zabbix, ComponentStatus::Degraded);
-        assert_eq!(status.degradation_reason, Some("Scheduled maintenance".into()));
+        assert_eq!(
+            status.degradation_reason,
+            Some("Scheduled maintenance".into())
+        );
     }
 
     #[test]
@@ -393,8 +399,7 @@ mod tests {
     fn test_site_status_serialization_roundtrip() {
         let status = check_site_health("DEFRA");
         let json = serde_json::to_string(&status).expect("Failed to serialize");
-        let deserialized: SiteStatus =
-            serde_json::from_str(&json).expect("Failed to deserialize");
+        let deserialized: SiteStatus = serde_json::from_str(&json).expect("Failed to deserialize");
         assert_eq!(status.site, deserialized.site);
         assert_eq!(status.state, deserialized.state);
     }

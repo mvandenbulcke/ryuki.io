@@ -1,6 +1,6 @@
 use chrono::{Days, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -194,7 +194,12 @@ pub fn create_notice(
         "Med" => ImpactLevel::Med,
         "High" => ImpactLevel::High,
         "Critical" => ImpactLevel::Critical,
-        other => return Err(format!("Invalid impact_level: {}. Must be None, Low, Med, High, or Critical", other)),
+        other => {
+            return Err(format!(
+                "Invalid impact_level: {}. Must be None, Low, Med, High, or Critical",
+                other
+            ));
+        }
     };
 
     let id = format!(
@@ -214,17 +219,21 @@ pub fn create_notice(
         start_time: start_time.to_string(),
         end_time: end_time.to_string(),
         impact_level: impact,
-        message_template: format!(
-            "Maintenance on {{site}}. Systems affected: {{systems}}. Impact: {{impact}}. Window: {{start}} to {{end}} UTC."
-        ),
+        message_template: "Maintenance on {site}. Systems affected: {systems}. Impact: {impact}. Window: {start} to {end} UTC.".to_string(),
         status: NoticeStatus::Draft,
         sent_at: None,
         acknowledged_by: None,
         created_at: now_iso(),
         updated_at: now_iso(),
         metadata: vec![
-            NoticeMetadata { key: "source".into(), value: "static-seed".into() },
-            NoticeMetadata { key: "dry_run".into(), value: "true".into() },
+            NoticeMetadata {
+                key: "source".into(),
+                value: "static-seed".into(),
+            },
+            NoticeMetadata {
+                key: "dry_run".into(),
+                value: "true".into(),
+            },
         ],
     };
 
@@ -790,7 +799,12 @@ mod tests {
         let contract = get_outage_contract();
         assert_eq!(contract["source"], "static-seed");
         assert_eq!(contract["dryRunRequired"], true);
-        assert!(!contract["supportedWorkflows"].as_array().unwrap().is_empty());
+        assert!(
+            !contract["supportedWorkflows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(!contract["impactLevels"].as_array().unwrap().is_empty());
     }
 
@@ -816,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_get_notice_history_empty_for_new_site() {
-        let history = get_notice_history("NLAMS");
+        let history = get_notice_history("DEHAM");
         assert!(history.is_empty());
     }
 

@@ -120,17 +120,17 @@ pub fn flag_stale_snapshots(records: &[SnapshotRecord]) -> Result<Vec<SnapshotRe
         if record.status == SnapshotStatus::Expired || record.status == SnapshotStatus::Completed {
             continue;
         }
-        if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&record.requested_expiry) {
-            if expiry < now {
-                let mut stale = record.clone();
-                stale.status = SnapshotStatus::StaleFlagged;
-                stale.updated_at = now.to_rfc3339();
-                stale.metadata.insert(
-                    "stale_reason".into(),
-                    format!("Snapshot expired at {}", record.requested_expiry),
-                );
-                flagged.push(stale);
-            }
+        if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&record.requested_expiry)
+            && expiry < now
+        {
+            let mut stale = record.clone();
+            stale.status = SnapshotStatus::StaleFlagged;
+            stale.updated_at = now.to_rfc3339();
+            stale.metadata.insert(
+                "stale_reason".into(),
+                format!("Snapshot expired at {}", record.requested_expiry),
+            );
+            flagged.push(stale);
         }
     }
 

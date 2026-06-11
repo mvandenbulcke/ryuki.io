@@ -197,12 +197,7 @@ pub fn get_shares(site: &str) -> Vec<FileShare> {
     if site.is_empty() {
         store.0.clone()
     } else {
-        store
-            .0
-            .iter()
-            .filter(|s| s.site == site)
-            .cloned()
-            .collect()
+        store.0.iter().filter(|s| s.site == site).cloned().collect()
     }
 }
 
@@ -215,10 +210,7 @@ pub fn get_share_detail(share_id: &str) -> Option<ShareDetail> {
         .filter(|p| p.file_share_id == share_id)
         .cloned()
         .collect();
-    Some(ShareDetail {
-        share,
-        permissions,
-    })
+    Some(ShareDetail { share, permissions })
 }
 
 pub fn check_recertification_due(site: &str) -> Vec<FileShare> {
@@ -330,9 +322,7 @@ pub fn revoke_permission(share_id: &str, ad_group: &str) -> Result<String, Strin
         .1
         .iter()
         .position(|p| p.file_share_id == share_id && p.ad_group == ad_group)
-        .ok_or_else(|| {
-            format!("Permission not found for share {share_id} and group {ad_group}")
-        })?;
+        .ok_or_else(|| format!("Permission not found for share {share_id} and group {ad_group}"))?;
     store.1.remove(pos);
     Ok(format!(
         "Revoked {ad_group} from share {share_id} (dry-run: no live AD changes)"
@@ -382,7 +372,10 @@ mod tests {
     fn test_recertify_share_updates_status() {
         let due = check_recertification_due("");
         assert!(!due.is_empty());
-        let share = due.iter().find(|s| s.status == ShareStatus::Overdue).unwrap();
+        let share = due
+            .iter()
+            .find(|s| s.status == ShareStatus::Overdue)
+            .unwrap();
         let result = recertify_share(&share.id, "auditor");
         assert!(result.is_ok());
         let updated = result.unwrap();
@@ -423,10 +416,7 @@ mod tests {
         let result = revoke_permission(&defra.id, "Everyone");
         assert!(result.is_ok());
         let detail = get_share_detail(&defra.id).unwrap();
-        let everyone_left = detail
-            .permissions
-            .iter()
-            .any(|p| p.ad_group == "Everyone");
+        let everyone_left = detail.permissions.iter().any(|p| p.ad_group == "Everyone");
         assert!(!everyone_left);
     }
 

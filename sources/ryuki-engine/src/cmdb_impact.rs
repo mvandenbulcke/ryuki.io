@@ -403,8 +403,11 @@ mod tests {
 
     #[test]
     fn test_analyze_impact_single_ci() {
-        let result =
-            analyze_impact("Patch san-defra-tier1 firmware", &["san-defra-tier1".into()]).unwrap();
+        let result = analyze_impact(
+            "Patch san-defra-tier1 firmware",
+            &["san-defra-tier1".into()],
+        )
+        .unwrap();
         assert_eq!(result.risk_level, RiskLevel::Critical);
         assert!(!result.affected_cis.is_empty());
         assert!(

@@ -1,5 +1,5 @@
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,7 +104,11 @@ fn effective_days_until_full(total_tb: f64, used_tb: f64, growth_gb_per_day: f64
 }
 
 fn repo_days(repo: &Repository) -> f64 {
-    effective_days_until_full(repo.total_capacity_tb, repo.used_capacity_tb, repo.growth_rate_gb_per_day)
+    effective_days_until_full(
+        repo.total_capacity_tb,
+        repo.used_capacity_tb,
+        repo.growth_rate_gb_per_day,
+    )
 }
 
 fn repo_status(repo: &Repository) -> CapacityStatus {
@@ -171,14 +175,19 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
         .find(|r| r.id == repository_id)
         .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
 
-    let projected_used_gb = repo.used_capacity_tb * 1000.0 + repo.growth_rate_gb_per_day * days as f64;
+    let projected_used_gb =
+        repo.used_capacity_tb * 1000.0 + repo.growth_rate_gb_per_day * days as f64;
     let projected_used_tb = (projected_used_gb / 1000.0 * 100.0).round() / 100.0;
     let projected_pct = if repo.total_capacity_tb > 0.0 {
         (projected_used_tb / repo.total_capacity_tb * 100.0 * 10.0).round() / 10.0
     } else {
         0.0
     };
-    let projected_days = effective_days_until_full(repo.total_capacity_tb, projected_used_tb, repo.growth_rate_gb_per_day);
+    let projected_days = effective_days_until_full(
+        repo.total_capacity_tb,
+        projected_used_tb,
+        repo.growth_rate_gb_per_day,
+    );
     let projected_status = compute_status(projected_days);
 
     Ok(json!({
@@ -245,9 +254,18 @@ pub fn get_capacity_report(site: &str) -> Result<Value, String> {
     } else {
         0.0
     };
-    let critical_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Critical).count();
-    let warning_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Warning).count();
-    let healthy_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Healthy).count();
+    let critical_count = repos
+        .iter()
+        .filter(|r| repo_status(r) == CapacityStatus::Critical)
+        .count();
+    let warning_count = repos
+        .iter()
+        .filter(|r| repo_status(r) == CapacityStatus::Warning)
+        .count();
+    let healthy_count = repos
+        .iter()
+        .filter(|r| repo_status(r) == CapacityStatus::Healthy)
+        .count();
     let total_growth_gb_per_day: f64 = repos.iter().map(|r| r.growth_rate_gb_per_day).sum();
 
     let repo_list: Vec<Value> = repos.iter().map(|r| repo_to_json(r)).collect();
@@ -438,8 +456,12 @@ mod tests {
         assert_eq!(result["repository_id"], "repo-003");
         assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 248.0);
         let new_days = result["days_until_full"].as_f64().unwrap();
-        assert!(new_days < initial_days,
-            "days until full should decrease when usage increases ({} -> {})", initial_days, new_days);
+        assert!(
+            new_days < initial_days,
+            "days until full should decrease when usage increases ({} -> {})",
+            initial_days,
+            new_days
+        );
     }
 
     #[test]
@@ -449,18 +471,27 @@ mod tests {
         assert_eq!(result["forecast_days"].as_u64().unwrap(), 30);
         let projected_pct = result["projected"]["utilization_pct"].as_f64().unwrap();
         let current_pct = result["current"]["utilization_pct"].as_f64().unwrap();
-        assert!(projected_pct >= current_pct,
-            "projected utilization ({}%) must be >= current ({}%)", projected_pct, current_pct);
+        assert!(
+            projected_pct >= current_pct,
+            "projected utilization ({}%) must be >= current ({}%)",
+            projected_pct,
+            current_pct
+        );
     }
 
     #[test]
     fn test_get_at_risk() {
         let result = get_at_risk().unwrap();
         let repos = result["repositories"].as_array().unwrap();
-        assert!(!repos.is_empty(), "should have at least one at-risk repository");
+        assert!(
+            !repos.is_empty(),
+            "should have at least one at-risk repository"
+        );
         // repo-001 is always critical (6.3 days), repo-002 is always warning (14.3 days)
-        assert!(repos.iter().any(|r| r["id"] == "repo-001"),
-            "repo-001 should always be at risk");
+        assert!(
+            repos.iter().any(|r| r["id"] == "repo-001"),
+            "repo-001 should always be at risk"
+        );
     }
 
     #[test]

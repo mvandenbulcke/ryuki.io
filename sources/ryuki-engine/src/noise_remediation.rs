@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,12 +257,27 @@ pub fn get_noise_report(site: &str) -> Result<Value, String> {
         .filter(|t| site_from_host(&t.host) == site)
         .collect();
 
-    let active = site_triggers.iter().filter(|t| t.status == NoiseStatus::Active).count();
-    let under_review = site_triggers.iter().filter(|t| t.status == NoiseStatus::UnderReview).count();
-    let suppressed = site_triggers.iter().filter(|t| t.status == NoiseStatus::Suppressed).count();
-    let resolved = site_triggers.iter().filter(|t| t.status == NoiseStatus::Resolved).count();
+    let active = site_triggers
+        .iter()
+        .filter(|t| t.status == NoiseStatus::Active)
+        .count();
+    let under_review = site_triggers
+        .iter()
+        .filter(|t| t.status == NoiseStatus::UnderReview)
+        .count();
+    let suppressed = site_triggers
+        .iter()
+        .filter(|t| t.status == NoiseStatus::Suppressed)
+        .count();
+    let resolved = site_triggers
+        .iter()
+        .filter(|t| t.status == NoiseStatus::Resolved)
+        .count();
     let flapping = site_triggers.iter().filter(|t| t.flapping).count();
-    let noisy = site_triggers.iter().filter(|t| t.event_count_last_24h > 10).count();
+    let noisy = site_triggers
+        .iter()
+        .filter(|t| t.event_count_last_24h > 10)
+        .count();
 
     Ok(json!({
         "site": site,
@@ -365,7 +380,10 @@ mod tests {
     fn test_resolve_noise() {
         let result = resolve_noise("noise-003", "Fixed via log rotation expansion").unwrap();
         assert_eq!(result.status, NoiseStatus::Resolved);
-        assert_eq!(result.resolution, Some("Fixed via log rotation expansion".into()));
+        assert_eq!(
+            result.resolution,
+            Some("Fixed via log rotation expansion".into())
+        );
     }
 
     #[test]
@@ -390,7 +408,11 @@ mod tests {
     fn test_get_suppressed_triggers() {
         let suppressed = get_suppressed_triggers().unwrap();
         assert!(!suppressed.is_empty());
-        assert!(suppressed.iter().all(|t| t.status == NoiseStatus::Suppressed));
+        assert!(
+            suppressed
+                .iter()
+                .all(|t| t.status == NoiseStatus::Suppressed)
+        );
     }
 
     #[test]
