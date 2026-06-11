@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="96" alt="Ryuki logo — a dragon's eye in a hexagon">
+  <img src="docs/assets/logo.svg" width="96" alt="Ryuki logo — a dragon's eye in a hexagon">
 </p>
 
 <h1 align="center">Ryuki</h1>

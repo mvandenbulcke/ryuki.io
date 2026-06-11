@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documentation — Ryuki</title>
+<meta name="description" content="Ryuki platform documentation.">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<script>
+(function(){
+  var k='ryuki-theme',s=null;
+  try{s=localStorage.getItem(k)}catch(e){}
+  var mode=s||'system';
+  var theme=mode==='system'
+    ?(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')
+    :mode;
+  var h=document.documentElement;
+  h.setAttribute('data-theme',theme);
+  h.setAttribute('data-theme-mode',mode);
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --font:'Inter',system-ui,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+  --radius:10px;--transition:220ms ease;
+}
+:root,[data-theme="light"]{
+  --bg:#ffffff;--bg-secondary:#f6f8fb;--text:#14181f;--text-secondary:#525a6b;
+  --border:#e2e6ee;--border-strong:#cdd4e0;
+  --accent:#8B0000;--accent-bg:#fdeeee;
+  --code-bg:#0f1420;--code-text:#d6deeb;--inline-code:#f3eaea;
+  --header-bg:rgba(255,255,255,.86);
+}
+[data-theme="dark"]{
+  --bg:#0b0d12;--bg-secondary:#11141b;--text:#e7eaf1;--text-secondary:#9aa2b2;
+  --border:#222734;--border-strong:#313848;
+  --accent:#e25d5d;--accent-bg:#3a1313;
+  --code-bg:#0d1119;--code-text:#d6deeb;--inline-code:#1c1517;
+  --header-bg:rgba(11,13,18,.86);
+}
+body{font-family:var(--font);background:var(--bg);color:var(--text);
+  transition:background var(--transition),color var(--transition);line-height:1.65}
+::selection{background:var(--accent);color:#fff}
+.site-header{position:sticky;top:0;z-index:10;background:var(--header-bg);
+  -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--border)}
+.header-inner{max-width:880px;margin:0 auto;padding:0 1.5rem;height:58px;
+  display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.brand{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:1.08rem;
+  letter-spacing:-.02em;color:var(--text);text-decoration:none}
+.brand img{width:25px;height:25px}
+.brand .io{color:var(--accent)}
+.header-nav{display:flex;align-items:center;gap:.9rem;font-size:.85rem}
+.header-nav a{color:var(--text-secondary);text-decoration:none;font-weight:500}
+.header-nav a:hover{color:var(--accent)}
+.theme-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;
+  border:1px solid var(--border-strong);border-radius:8px;background:transparent;
+  color:var(--text-secondary);cursor:pointer;padding:0}
+.theme-btn:hover{color:var(--accent);border-color:var(--accent)}
+.theme-btn svg{width:16px;height:16px}
+.theme-btn .icon-sun{display:none}
+[data-theme="dark"] .theme-btn .icon-sun{display:block}
+[data-theme="dark"] .theme-btn .icon-moon{display:none}
+main{max-width:880px;margin:0 auto;padding:2.6rem 1.5rem 5rem}
+.crumb{font-size:.82rem;margin-bottom:1.6rem}
+.crumb a{color:var(--accent);text-decoration:none}
+.crumb a:hover{text-decoration:underline}
+.crumb span{color:var(--text-secondary)}
+h1{font-size:2.1rem;letter-spacing:-.02em;margin-bottom:1.2rem}
+h2{font-size:1.4rem;letter-spacing:-.01em;margin:2.4rem 0 .8rem;
+  padding-top:1.2rem;border-top:1px solid var(--border)}
+h3{font-size:1.08rem;margin:1.8rem 0 .6rem}
+h4{font-size:.95rem;margin:1.4rem 0 .5rem}
+p{margin:.85rem 0;color:var(--text-secondary)}
+p strong{color:var(--text)}
+li strong{color:var(--text)}
+a{color:var(--accent)}
+ul,ol{margin:.85rem 0 .85rem 1.4rem;color:var(--text-secondary)}
+li{margin:.35rem 0}
+code{font-family:var(--mono);font-size:.86em;background:var(--inline-code);
+  padding:.12em .38em;border-radius:5px}
+pre{background:var(--code-bg);color:var(--code-text);border-radius:var(--radius);
+  padding:1.1rem 1.2rem;overflow-x:auto;margin:1rem 0;font-size:.84rem;line-height:1.55}
+pre code{background:none;padding:0;font-size:1em;color:inherit}
+table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.9rem}
+th,td{text-align:left;padding:.55rem .8rem;border:1px solid var(--border)}
+th{background:var(--bg-secondary)}
+td code{white-space:nowrap}
+.doc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+  gap:1rem;margin-top:1.8rem}
+.doc-card{display:block;border:1px solid var(--border);border-radius:var(--radius);
+  padding:1.15rem 1.25rem;text-decoration:none;
+  transition:border-color var(--transition),background var(--transition)}
+.doc-card:hover{border-color:var(--accent);background:var(--accent-bg)}
+.doc-card h2{font-size:1.02rem;margin:0 0 .35rem;padding:0;border:0;color:var(--text)}
+.doc-card p{font-size:.85rem;margin:0;color:var(--text-secondary)}
+.foot-nav{display:flex;justify-content:space-between;gap:1rem;margin-top:3rem;
+  padding-top:1.4rem;border-top:1px solid var(--border);font-size:.88rem}
+.foot-nav a{text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<header class="site-header">
+  <div class="header-inner">
+    <a href="/" class="brand"><img src="/assets/logo.svg" alt="Ryuki logo"><span>ryuki<span class="io">.io</span></span></a>
+    <nav class="header-nav">
+      <a href="/documentation.html">Docs</a>
+      <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
+      <button class="theme-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
+        <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </nav>
+  </div>
+</header>
+<main>
+
+<h1>Documentation</h1><p>Everything you need to run Ryuki — the governed control plane for multi-site infrastructure.</p><div class="doc-grid"><a class="doc-card" href="/getting-started.html"><h2>Getting Started</h2><p>Prerequisites, database setup, first build and run.</p></a>
+<a class="doc-card" href="/architecture.html"><h2>Architecture</h2><p>The stack, component diagram, key decisions and network policy.</p></a>
+<a class="doc-card" href="/configuration.html"><h2>Configuration</h2><p>Environment variables, providers and platform configuration.</p></a>
+<a class="doc-card" href="/entra-app-registration.html"><h2>Entra App Registration</h2><p>OIDC / OAuth2 app registration and role setup for Entra ID.</p></a>
+<a class="doc-card" href="/site-management.html"><h2>Site Management</h2><p>UN/LOCODE locations, activation and the admin API.</p></a></div>
+
+</main>
+<script>
+(function(){
+  var html=document.documentElement;
+  var btn=document.getElementById('theme-toggle');
+  function prefers(){return window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}
+  function resolve(mode){return mode==='system'||!mode?prefers():mode}
+  function apply(mode){
+    html.setAttribute('data-theme-mode',mode);
+    html.setAttribute('data-theme',resolve(mode));
+    btn.title='Theme: '+mode;
+  }
+  btn.addEventListener('click',function(){
+    var cur=html.getAttribute('data-theme-mode');
+    var next=cur==='system'
+      ?(resolve('system')==='dark'?'light':'dark')
+      :cur==='light'?'dark':'system';
+    try{localStorage.setItem('ryuki-theme',next)}catch(e){}
+    apply(next);
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){
+    if(html.getAttribute('data-theme-mode')==='system') apply('system');
+  });
+})();
+</script>
+</body>
+</html>
