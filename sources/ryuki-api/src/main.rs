@@ -109,6 +109,7 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
 struct RequestId(String);
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+static START_TIME: OnceLock<Instant> = OnceLock::new();
 
 async fn request_counter_middleware(
     request: HttpRequest<Body>,
@@ -224,6 +225,7 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() {
+    START_TIME.set(Instant::now()).ok();
     let app_config = config::load_config();
     config_store::init_with_config("platform-config.json", &app_config);
 
@@ -272,6 +274,7 @@ async fn main() {
         .route("/metrics", get(metrics))
         .route("/api/validation/run", get(validation_run))
         .route("/api/platform/status", get(platform_status))
+        .route("/api/platform/uptime", get(uptime))
         .merge(contracts::routes())
         .merge(boundary::routes())
         .layer(middleware::from_fn(request_counter_middleware))
@@ -427,6 +430,25 @@ async fn platform_status(Extension(request_id): Extension<RequestId>) -> Json<se
         map.insert("request_id".into(), serde_json::Value::String(request_id.0));
     }
     Json(status)
+}
+
+async fn uptime() -> Json<serde_json::Value> {
+    let elapsed = START_TIME
+        .get()
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    Json(serde_json::json!({
+        "uptime_seconds": elapsed,
+        "uptime_human": format_uptime(elapsed),
+    }))
+}
+
+fn format_uptime(seconds: u64) -> String {
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    format!("{days}d {hours}h {minutes}m {secs}s")
 }
 
 #[cfg(test)]
