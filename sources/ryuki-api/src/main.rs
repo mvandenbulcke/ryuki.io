@@ -16,6 +16,7 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::filter::LevelFilter;
@@ -94,6 +95,16 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
 
 #[derive(Debug, Clone)]
 struct RequestId(String);
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+async fn request_counter_middleware(
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    next.run(request).await
+}
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
@@ -221,6 +232,7 @@ async fn main() {
         .route("/api/platform/status", get(platform_status))
         .merge(contracts::routes())
         .merge(boundary::routes())
+        .layer(middleware::from_fn(request_counter_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(middleware::from_fn(move |req, next| {
             let limiter = rate_limiter.clone();
@@ -306,7 +318,8 @@ async fn validation_run(
 }
 
 async fn metrics() -> Response {
-    let body = ryuki_engine::health_monitor::metrics_text();
+    let count = REQUEST_COUNTER.load(Ordering::Relaxed);
+    let body = ryuki_engine::health_monitor::metrics_text_with_api_requests(count);
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")

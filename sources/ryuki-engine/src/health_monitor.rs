@@ -181,6 +181,10 @@ pub fn check_adapter_health(adapter: &str) -> HealthCheck {
 }
 
 pub fn metrics_text() -> String {
+    metrics_text_with_api_requests(0)
+}
+
+pub fn metrics_text_with_api_requests(total_api_requests: u64) -> String {
     let health = run_all_checks();
     let mut out = String::new();
 
@@ -201,7 +205,10 @@ pub fn metrics_text() -> String {
 
     out.push_str("# HELP ryuki_api_requests_total Total API requests\n");
     out.push_str("# TYPE ryuki_api_requests_total counter\n");
-    out.push_str("ryuki_api_requests_total{method=\"GET\",path=\"/metrics\",status=\"200\"} 0\n");
+    out.push_str(&format!(
+        "ryuki_api_requests_total{{method=\"ALL\",path=\"ALL\",status=\"ALL\"}} {}\n",
+        total_api_requests
+    ));
 
     out.push_str("# HELP ryuki_platform_info Platform version info\n");
     out.push_str("# TYPE ryuki_platform_info gauge\n");
@@ -336,6 +343,23 @@ mod tests {
         assert!(!metrics.contains("token"));
         assert!(!metrics.contains("credential"));
         assert!(!metrics.contains("api_key"));
+    }
+
+    #[test]
+    fn test_metrics_text_with_api_requests_injects_counter_value() {
+        let metrics = metrics_text_with_api_requests(42);
+        assert!(
+            metrics.contains(
+                "ryuki_api_requests_total{method=\"ALL\",path=\"ALL\",status=\"ALL\"} 42"
+            )
+        );
+        // Ensure we still have the expected families and no duplicate HELP/TYPE blocks.
+        assert!(metrics.contains("ryuki_platform_health"));
+        assert!(metrics.contains("ryuki_platform_info"));
+        let help_count = metrics.matches("# HELP ryuki_api_requests_total").count();
+        assert_eq!(help_count, 1, "must not duplicate HELP block");
+        let type_count = metrics.matches("# TYPE ryuki_api_requests_total").count();
+        assert_eq!(type_count, 1, "must not duplicate TYPE block");
     }
 
     #[test]
