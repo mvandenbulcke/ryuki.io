@@ -20,15 +20,29 @@ pub fn load_config() -> RyukiConfig {
     }
 }
 
+fn is_entra_configured(tenant_id: &str, client_id: &str) -> bool {
+    !tenant_id.is_empty() && !client_id.is_empty()
+}
+
+fn is_tls_configured(cert_path: &Option<String>, key_path: &Option<String>) -> bool {
+    cert_path.is_some() && key_path.is_some()
+}
+
 pub fn get_platform_status() -> serde_json::Value {
     let config = crate::config_store::get_app_config();
     let validation_errors = config.validate();
+    let entra_tenant_configured = !config.entra_tenant_id.is_empty();
+    let entra_client_configured = !config.entra_client_id.is_empty();
+    let tls_configured =
+        is_tls_configured(&config.server.tls_cert_path, &config.server.tls_key_path);
     serde_json::json!({
         "platform_name": config.platform_name,
         "platform_url": config.platform_url,
         "auth_mode": config.auth_mode.as_str(),
         "entra_authority": config.entra_authority,
-        "entra_configured": !config.entra_tenant_id.is_empty(),
+        "entra_configured": is_entra_configured(&config.entra_tenant_id, &config.entra_client_id),
+        "entra_tenant_configured": entra_tenant_configured,
+        "entra_client_configured": entra_client_configured,
         "database": {
             "url": "[redacted]",
             "provider": config.database_provider.as_str(),
@@ -61,7 +75,9 @@ pub fn get_platform_status() -> serde_json::Value {
             "compression_quality": config.server.compression_quality,
             "keep_alive_timeout_secs": config.server.keep_alive_timeout_secs,
             "max_concurrent_connections": config.server.max_concurrent_connections,
-            "tls_enabled": config.server.tls_cert_path.is_some(),
+            "tls_configured": tls_configured,
+            "tls_enabled": false,
+            "tls_runtime": "plain-http",
         },
         "rate_limit": {
             "enabled": config.rate_limit.enabled,
@@ -119,4 +135,25 @@ pub fn get_platform_status() -> serde_json::Value {
         },
         "validation_errors": validation_errors,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entra_configured_requires_tenant_and_client() {
+        assert!(!is_entra_configured("tenant", ""));
+        assert!(!is_entra_configured("", "client"));
+        assert!(is_entra_configured("tenant", "client"));
+    }
+
+    #[test]
+    fn test_tls_configured_requires_cert_and_key() {
+        let cert = Some("/tmp/server.crt".to_string());
+        let key = Some("/tmp/server.key".to_string());
+        assert!(!is_tls_configured(&cert, &None));
+        assert!(!is_tls_configured(&None, &key));
+        assert!(is_tls_configured(&cert, &key));
+    }
 }

@@ -615,7 +615,7 @@ async fn health(
         "status": status,
         "database": {
             "connected": db_connected,
-            "provider": format!("{:?}", app_config.database_provider),
+            "provider": app_config.database_provider.as_str(),
         },
         "config": {
             "valid": validation_errors.is_empty(),
