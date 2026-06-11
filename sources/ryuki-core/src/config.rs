@@ -39,7 +39,9 @@ impl AuthMode {
 #[serde(rename_all = "kebab-case")]
 pub enum DatabaseProvider {
     #[default]
+    #[serde(alias = "cloudnativepg")]
     CloudNativePg,
+    #[serde(alias = "postgres-local")]
     PostgresLocal,
 }
 

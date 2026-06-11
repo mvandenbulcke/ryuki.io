@@ -2330,6 +2330,7 @@ dependencies = [
 name = "ryuki-validator"
 version = "0.1.0"
 dependencies = [
+ "figment",
  "rayon",
  "ryuki-core",
  "serde",

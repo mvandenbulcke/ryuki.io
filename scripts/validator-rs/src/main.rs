@@ -39,6 +39,7 @@ mod backlog_coverage;
 mod backup_coverage_gap;
 mod backup_dr_assignment;
 mod catalog;
+mod check_config;
 mod certificate_lifecycle;
 mod cluster_capacity_admission;
 mod cmdb_file_exchange;
@@ -2255,12 +2256,16 @@ fn run() -> Result<(), String> {
             let output = run_batch_validate(&root, &slices)?;
             print_json(&output)
         }
+        "check-config" => {
+            check_config::run();
+            Ok(())
+        }
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate> <slice> [options]"
+    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|check-config> <slice> [options]"
         .to_string()
 }
 
