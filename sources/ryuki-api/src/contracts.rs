@@ -16,12 +16,16 @@ use uuid::Uuid;
 
 use crate::database::get_db;
 use ryuki_engine::alert_routing_engine;
+use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
+use ryuki_engine::certificate_lifecycle;
+use ryuki_engine::cmdb_impact;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::patch_engine;
 use ryuki_engine::server_decommission;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::vm_operations;
+use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
     Router::new()
@@ -471,6 +475,17 @@ pub fn routes() -> Router {
             "/api/cmdb/impact-analysis-contract",
             get(cmdb_impact_analysis),
         )
+        .route("/api/cmdb/impact/analyze", post(cmdb_impact_analyze))
+        .route("/api/cmdb/impact/graph", get(cmdb_impact_graph))
+        .route(
+            "/api/cmdb/impact/upstream/{ci_name}",
+            get(cmdb_impact_upstream),
+        )
+        .route(
+            "/api/cmdb/impact/downstream/{ci_name}",
+            get(cmdb_impact_downstream),
+        )
+        .route("/api/cmdb/impact-contract", get(cmdb_impact_contract))
         .route(
             "/api/admin/worker-capability-contract",
             get(admin_worker_capability),
@@ -537,6 +552,70 @@ pub fn routes() -> Router {
         )
         .route("/api/monitoring/alerts/resolve", post(alert_resolve))
         .route("/api/monitoring/alerts/unrouted", get(alert_unrouted))
+        // ─── Zabbix Drift Remediation ───
+        .route("/api/monitoring/zabbix/drift", get(zabbix_drift_summary))
+        .route(
+            "/api/monitoring/zabbix/drift/detect",
+            post(zabbix_drift_detect),
+        )
+        .route(
+            "/api/monitoring/zabbix/drift/plan/{drift_id}",
+            post(zabbix_drift_plan),
+        )
+        .route(
+            "/api/monitoring/zabbix/drift/execute/{drift_id}",
+            post(zabbix_drift_execute),
+        )
+        .route(
+            "/api/monitoring/zabbix/drift/verify/{drift_id}",
+            post(zabbix_drift_verify),
+        )
+        .route(
+            "/api/monitoring/zabbix-drift-contract",
+            get(zabbix_drift_contract),
+        )
+        // ─── Certificate Lifecycle ───
+        .route(
+            "/api/maintain/certificates/request",
+            post(certificates_request),
+        )
+        .route(
+            "/api/maintain/certificates/validate",
+            post(certificates_validate),
+        )
+        .route(
+            "/api/maintain/certificates/approve/{id}",
+            post(certificates_approve),
+        )
+        .route(
+            "/api/maintain/certificates/install/{id}",
+            post(certificates_install),
+        )
+        .route(
+            "/api/maintain/certificates/verify/{id}",
+            post(certificates_verify),
+        )
+        .route(
+            "/api/maintain/certificates/renew/{id}",
+            post(certificates_renew),
+        )
+        .route(
+            "/api/maintain/certificates/revoke/{id}",
+            post(certificates_revoke),
+        )
+        .route(
+            "/api/maintain/certificates/expiring",
+            get(certificates_expiring),
+        )
+        .route(
+            "/api/maintain/certificates/inventory",
+            get(certificates_inventory),
+        )
+        .route("/api/maintain/certificates/{id}", get(certificates_get))
+        .route(
+            "/api/maintain/certificate-contract",
+            get(certificate_lifecycle_contract),
+        )
         // ─── VM Day-2 Operations ───
         .route("/api/vm/day2/plan", post(vm_day2_plan))
         .route("/api/vm/day2/validate", post(vm_day2_validate))
@@ -594,6 +673,34 @@ pub fn routes() -> Router {
             "/api/build/linux-deploy-contract",
             get(linux_deploy_contract),
         )
+        // ─── Application Environment Deployment ───
+        .route("/api/build/app-environment/plan", post(app_env_plan))
+        .route(
+            "/api/build/app-environment/validate",
+            post(app_env_validate),
+        )
+        .route(
+            "/api/build/app-environment/approve/{id}",
+            post(app_env_approve),
+        )
+        .route(
+            "/api/build/app-environment/deploy/{id}",
+            post(app_env_deploy),
+        )
+        .route(
+            "/api/build/app-environment/verify/{id}",
+            post(app_env_verify),
+        )
+        .route(
+            "/api/build/app-environment/status/{id}",
+            get(app_env_status),
+        )
+        .route("/api/build/app-environment/list", get(app_env_list))
+        .route(
+            "/api/build/app-environment/retire/{id}",
+            post(app_env_retire),
+        )
+        .route("/api/build/app-environment-contract", get(app_env_contract))
         // ─── Server Decommission ───
         .route("/api/retire/decommission/plan", post(decommission_plan))
         .route(
@@ -806,6 +913,32 @@ struct LinuxDeployVerifyRequest {
     hardening_profile: String,
 }
 
+// ─── Application environment request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AppEnvPlanRequest {
+    #[serde(rename = "appName")]
+    app_name: String,
+    environment: String,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AppEnvValidateRequest {
+    #[serde(rename = "appName")]
+    app_name: String,
+    environment: String,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AppEnvListQuery {
+    site: Option<String>,
+}
+
 // ─── Alert routing request types ───
 
 #[derive(Debug, Deserialize)]
@@ -845,6 +978,50 @@ struct AlertResolveRequest {
     host_group: String,
 }
 
+// ─── Certificate lifecycle request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CertificateRequestRequest {
+    #[serde(rename = "commonName")]
+    common_name: String,
+    subject: String,
+    #[serde(rename = "serviceType")]
+    service_type: String,
+    hostname: String,
+    site: String,
+    #[serde(rename = "validityDays")]
+    validity_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CertificateValidateRequest {
+    #[serde(rename = "commonName")]
+    common_name: String,
+    subject: String,
+    #[serde(rename = "serviceType")]
+    service_type: String,
+    hostname: String,
+    site: String,
+    #[serde(rename = "validityDays")]
+    validity_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CertificateRenewRequest {
+    #[serde(rename = "validityDays")]
+    validity_days: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CertificateExpiringQuery {
+    site: Option<String>,
+    days: Option<i64>,
+}
+
 // ─── Patch wave request types ───
 
 #[derive(Debug, Deserialize)]
@@ -861,6 +1038,20 @@ struct PatchPlanRequest {
 struct PatchActionRequest {
     #[serde(rename = "waveId")]
     wave_id: String,
+}
+
+// ─── Zabbix drift request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ZabbixDriftSiteRequest {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ZabbixDriftQuery {
+    site: Option<String>,
 }
 
 // ─── Request lifecycle types ───
@@ -2832,6 +3023,119 @@ async fn observe_zabbix_drift() -> Json<Value> {
     )
 }
 
+// ─── Zabbix drift remediation endpoints ───
+
+async fn zabbix_drift_summary(
+    Query(query): Query<ZabbixDriftQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match zabbix_drift::get_drift_summary(&site) {
+        Ok(summary) => Ok(Json(summary)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn zabbix_drift_detect(
+    Json(body): Json<ZabbixDriftSiteRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match zabbix_drift::detect_drift(&body.site) {
+        Ok(reports) => Ok(Json(serde_json::to_value(reports).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn zabbix_drift_plan(
+    Path(drift_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match zabbix_drift::plan_remediation(&drift_id) {
+        Ok(planned) => Ok(Json(serde_json::to_value(planned).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn zabbix_drift_execute(
+    Path(drift_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match zabbix_drift::execute_remediation(&drift_id) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn zabbix_drift_verify(
+    Path(drift_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match zabbix_drift::verify_remediation(&drift_id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn zabbix_drift_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveRemediationAllowed": false,
+        "zabbixMutationAllowed": false,
+        "rawEventPayloadsAllowed": false,
+        "dryRunRequired": true,
+        "workflows": [
+            "host-group-drift-review",
+            "template-drift-review",
+            "proxy-drift-review",
+            "maintenance-window-drift-review",
+            "remediation-request-draft",
+            "evidence-pack-review"
+        ],
+        "signals": [
+            "host-group-mismatch",
+            "template-mismatch",
+            "proxy-mismatch",
+            "maintenance-window-mismatch",
+            "owner-mismatch",
+            "stale-monitoring-data",
+            "policy-exception"
+        ],
+        "requiredGuards": [
+            "monitoring-profile-known",
+            "host-identity-known",
+            "zabbix-mapping-reviewed",
+            "owner-known",
+            "remediation-request-dry-run",
+            "approval-route-assigned",
+            "evidence-redacted"
+        ],
+        "planSections": [
+            "driftSummary",
+            "expectedMapping",
+            "observedMapping",
+            "remediationRequest",
+            "maintenanceImpact",
+            "ownerReview",
+            "approvalRoute",
+            "evidenceReferences"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-remediation-disabled",
+            "zabbix-mutation-disabled",
+            "host-identity-unknown",
+            "monitoring-profile-missing",
+            "mapping-ambiguous",
+            "owner-unknown",
+            "approval-missing",
+            "evidence-not-redacted"
+        ],
+        "endpoints": {
+            "GET /api/monitoring/zabbix/drift": "Get per-site Zabbix drift summary",
+            "POST /api/monitoring/zabbix/drift/detect": "Detect Zabbix configuration drift for a site",
+            "POST /api/monitoring/zabbix/drift/plan/{drift_id}": "Plan remediation steps for a drift report",
+            "POST /api/monitoring/zabbix/drift/execute/{drift_id}": "Execute remediation for a drift report",
+            "POST /api/monitoring/zabbix/drift/verify/{drift_id}": "Verify remediation was applied successfully"
+        }
+    }))
+}
+
 async fn observe_synthetic_health() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["web-endpoint-check","api-check","dns-resolution-check","certificate-expiry-check","load-balancer-check","iis-service-check","evidence-pack-review"],"signals":["endpoint-unreachable","api-error","dns-resolution-risk","certificate-expiry-risk","load-balancer-risk","iis-service-risk","stale-check-definition"],"requiredGuards":["check-target-reviewed","check-type-supported","owner-known","maintenance-window-known","synthetic-definition-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["checkSummary","targetScope","syntheticDefinition","expectedResult","alertImpact","maintenanceImpact","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-checks-disabled","external-probes-disabled","zabbix-mutation-disabled","target-scope-unknown","unsupported-check-type","owner-unknown","approval-missing","evidence-not-redacted"]}),
@@ -2872,6 +3176,79 @@ async fn cmdb_impact_analysis() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"domains":["application","environment","vm","database","network","storage","backup","monitoring","owner","service"],"impactSignals":["upstream-dependency","downstream-dependency","single-point-of-failure","missing-owner","stale-relationship","criticality-mismatch","monitoring-gap","backup-gap"],"qualitySignals":["relationship-complete","direction-known","owner-known","criticality-known","source-current","duplicate-free","evidence-redacted"],"syncStates":["file-imported","update-export-pending","ready-for-review","blocked","future-api-disabled"],"requiredGuards":["cmdb-file-contract-validated","relationship-graph-reviewed","impact-scope-reviewed","dependency-quality-reviewed","sync-state-reviewed","reviewer-approval-assigned","evidence-redacted"],"blockedReasons":["cmdb-impact-live-api-disabled","cmdb-impact-cmdb-mutation-disabled","cmdb-impact-relationship-mutation-disabled","cmdb-impact-provider-calls-disabled","cmdb-impact-raw-rows-disabled","cmdb-impact-raw-relationship-rows-disabled","cmdb-impact-raw-impact-rows-disabled","cmdb-impact-raw-provider-payloads-disabled","cmdb-impact-raw-log-content-disabled","cmdb-impact-raw-recipient-data-disabled","cmdb-impact-credential-values-disabled","cmdb-impact-tenant-identifiers-disabled","cmdb-impact-object-identifiers-disabled","cmdb-impact-private-network-values-disabled","cmdb-impact-serials-disabled","impact-scope-missing","dependency-quality-unknown","sync-state-unknown","reviewer-approval-missing","evidence-not-redacted"]}),
     )
+}
+
+async fn cmdb_impact_analyze(
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let change_description = body
+        .get("changeDescription")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_cis: Vec<String> = body
+        .get("targetCis")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match cmdb_impact::analyze_impact(&change_description, &target_cis) {
+        Ok(analysis) => Ok(Json(serde_json::to_value(analysis).unwrap_or_default())),
+        Err(err) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": err})))),
+    }
+}
+
+async fn cmdb_impact_graph() -> Json<Value> {
+    let graph = cmdb_impact::get_ci_graph();
+    Json(serde_json::to_value(&graph).unwrap_or_default())
+}
+
+async fn cmdb_impact_upstream(Path(ci_name): Path<String>) -> Json<Value> {
+    let deps = cmdb_impact::get_upstream_dependencies(&ci_name);
+    Json(serde_json::to_value(&deps).unwrap_or_default())
+}
+
+async fn cmdb_impact_downstream(Path(ci_name): Path<String>) -> Json<Value> {
+    let deps = cmdb_impact::get_downstream_dependencies(&ci_name);
+    Json(serde_json::to_value(&deps).unwrap_or_default())
+}
+
+async fn cmdb_impact_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "impactEngineMode": "mock-graph-traversal",
+        "providerCallsEnabled": false,
+        "liveCmdbMutationAllowed": false,
+        "liveRelationshipMutationAllowed": false,
+        "endpoints": {
+            "analyze": "POST /api/cmdb/impact/analyze",
+            "graph": "GET /api/cmdb/impact/graph",
+            "upstream": "GET /api/cmdb/impact/upstream/{ci_name}",
+            "downstream": "GET /api/cmdb/impact/downstream/{ci_name}"
+        },
+        "ciTypes": ["Server", "Application", "Database", "Network", "Storage"],
+        "criticalityLevels": ["Low", "Medium", "High", "Critical"],
+        "riskLevels": ["Low", "Medium", "High", "Critical"],
+        "requiredGuards": [
+            "provider-calls-disabled",
+            "live-cmdb-mutation-disabled",
+            "target-cis-known",
+            "impact-scope-reviewed",
+            "dry-run-only",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-cmdb-mutation-disabled",
+            "target-cis-missing",
+            "impact-scope-not-reviewed",
+            "evidence-not-redacted"
+        ]
+    }))
 }
 
 async fn admin_worker_capability() -> Json<Value> {
@@ -4242,6 +4619,267 @@ async fn linux_deploy_contract() -> Json<Value> {
         "requiredGuards": ["site-known","distro-version-supported","capacity-admission-ready","network-profile-known","hostname-valid","hardening-profile-known","approval-route-assigned","evidence-redacted"],
         "blockedReasons": ["provider-calls-disabled","live-deployment-disabled","live-hypervisor-calls-disabled","site-unknown","distro-version-not-supported","capacity-not-approved","network-profile-missing","hostname-invalid","hardening-profile-unknown","raw-hypervisor-payloads-disabled","credential-values-disabled","object-identifiers-disabled","private-network-values-disabled","evidence-not-redacted"],
         "requiredEvidence": ["Linux deployment plan","Placement decision","Cloud-init configuration","Validation result","Execution evidence","Post-deploy verification","Evidence references"]
+    }))
+}
+
+// ─── Application environment handlers ───
+
+fn parse_environment_type(e: &str) -> app_environment::EnvironmentType {
+    match e {
+        "dev" => app_environment::EnvironmentType::Dev,
+        "test" => app_environment::EnvironmentType::Test,
+        "staging" => app_environment::EnvironmentType::Staging,
+        "prod" => app_environment::EnvironmentType::Prod,
+        _ => app_environment::EnvironmentType::Dev,
+    }
+}
+
+async fn app_env_plan(Json(body): Json<AppEnvPlanRequest>) -> ApiResult {
+    let env_type = parse_environment_type(&body.environment);
+    match app_environment::plan_environment(&body.app_name, env_type, &body.site) {
+        Ok(tiers) => Ok(Json(serde_json::to_value(tiers).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn app_env_validate(Json(body): Json<AppEnvValidateRequest>) -> ApiResult {
+    let env_type = parse_environment_type(&body.environment);
+    let tiers = app_environment::plan_environment(&body.app_name, env_type, &body.site)
+        .map_err(|e| status_400(&e))?;
+    let mut results = Vec::new();
+    for tier in &tiers {
+        match app_environment::validate_environment(tier) {
+            Ok(result) => results.push(serde_json::to_value(result).unwrap()),
+            Err(e) => return Err(status_400(&e)),
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "validated": true,
+        "tiers": tiers.len(),
+        "results": results
+    })))
+}
+
+async fn app_env_approve(Path(id): Path<String>) -> ApiResult {
+    let tiers = app_environment::seed_examples();
+    let target = tiers
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| status_404(&id))?;
+    match app_environment::approve_environment(target) {
+        Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
+        Err(e) => Err(status_409(&e)),
+    }
+}
+
+async fn app_env_deploy(Path(id): Path<String>) -> ApiResult {
+    let tiers = app_environment::seed_examples();
+    let target = tiers
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| status_404(&id))?;
+    if !matches!(target.status, app_environment::EnvironmentStatus::Approved) {
+        return Err(status_409("Environment must be approved before deployment"));
+    }
+    match app_environment::deploy_environment(target) {
+        Ok(deployed) => Ok(Json(serde_json::to_value(deployed).unwrap())),
+        Err(e) => Err(status_409(&e)),
+    }
+}
+
+async fn app_env_verify(Path(id): Path<String>) -> ApiResult {
+    let tiers = app_environment::seed_examples();
+    let target = tiers
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| status_404(&id))?;
+    match app_environment::verify_environment(target) {
+        Ok(verification) => Ok(Json(serde_json::to_value(verification).unwrap())),
+        Err(e) => Err(status_409(&e)),
+    }
+}
+
+async fn app_env_status(Path(id): Path<String>) -> ApiResult {
+    let tiers = app_environment::seed_examples();
+    let target = tiers
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::json!({
+        "id": target.id,
+        "app_name": target.app_name,
+        "environment": target.environment.to_string(),
+        "tier": target.tier.to_string(),
+        "status": target.status.to_string(),
+        "site": target.site,
+        "vm_count": target.vm_count,
+        "network_zone": target.network_zone,
+        "updated_at": target.updated_at
+    })))
+}
+
+async fn app_env_list(Query(query): Query<AppEnvListQuery>) -> Json<Value> {
+    let all = app_environment::seed_examples();
+    let filtered: Vec<&app_environment::AppEnvironment> = if let Some(ref site) = query.site {
+        all.iter().filter(|e| e.site == *site).collect()
+    } else {
+        all.iter().collect()
+    };
+    let summaries: Vec<Value> = filtered
+        .iter()
+        .map(|e| {
+            json!({
+                "id": e.id,
+                "app_name": e.app_name,
+                "environment": e.environment.to_string(),
+                "tier": e.tier.to_string(),
+                "site": e.site,
+                "status": e.status.to_string()
+            })
+        })
+        .collect();
+    Json(json!(summaries))
+}
+
+async fn app_env_retire(Path(id): Path<String>) -> ApiResult {
+    let tiers = app_environment::seed_examples();
+    let target = tiers
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| status_404(&id))?;
+    match app_environment::retire_environment(target) {
+        Ok(retired) => Ok(Json(serde_json::to_value(retired).unwrap())),
+        Err(e) => Err(status_409(&e)),
+    }
+}
+
+async fn app_env_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "deployMode": "dry-run-deployment",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveDeploymentAllowed": false,
+        "environmentTypes": ["dev","test","staging","prod"],
+        "tiers": ["front","mid","back"],
+        "requiredInputs": ["appName","environment","site"],
+        "requiredGuards": ["site-known","network-zone-valid","capacity-admission-ready","approval-route-assigned","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-deployment-disabled","live-hypervisor-calls-disabled","site-unknown","network-zone-missing","capacity-not-approved","approval-missing","evidence-not-redacted"],
+        "requiredEvidence": ["Environment plan","Tier topology","Validation result","Deployment evidence","Verification report","Evidence references"]
+    }))
+}
+
+// ─── Certificate lifecycle handlers ───
+
+async fn certificates_request(Json(body): Json<CertificateRequestRequest>) -> ApiResult {
+    let req = certificate_lifecycle::CertificateRequest {
+        common_name: body.common_name,
+        subject: body.subject,
+        service_type: body.service_type,
+        hostname: body.hostname,
+        site: body.site,
+        validity_days: body.validity_days,
+    };
+    match certificate_lifecycle::request_certificate(&req) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn certificates_validate(Json(body): Json<CertificateValidateRequest>) -> ApiResult {
+    let req = certificate_lifecycle::CertificateRequest {
+        common_name: body.common_name,
+        subject: body.subject,
+        service_type: body.service_type,
+        hostname: body.hostname,
+        site: body.site,
+        validity_days: body.validity_days,
+    };
+    match certificate_lifecycle::validate_certificate_request(&req) {
+        Ok(()) => Ok(Json(
+            serde_json::json!({"valid": true, "message": "Certificate request is valid"}),
+        )),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn certificates_approve(Path(id): Path<String>) -> ApiResult {
+    match certificate_lifecycle::approve_certificate(&id) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn certificates_install(Path(id): Path<String>) -> ApiResult {
+    match certificate_lifecycle::install_certificate(&id) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn certificates_verify(Path(id): Path<String>) -> ApiResult {
+    match certificate_lifecycle::verify_certificate(&id) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn certificates_renew(
+    Path(id): Path<String>,
+    Json(body): Json<CertificateRenewRequest>,
+) -> ApiResult {
+    match certificate_lifecycle::renew_certificate(&id, body.validity_days) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn certificates_revoke(Path(id): Path<String>) -> ApiResult {
+    match certificate_lifecycle::revoke_certificate(&id) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn certificates_expiring(Query(query): Query<CertificateExpiringQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let days = query.days.unwrap_or(90);
+    let results = certificate_lifecycle::check_expiry(site, days);
+    Json(serde_json::to_value(results).unwrap())
+}
+
+async fn certificates_inventory() -> Json<Value> {
+    let inventory = certificate_lifecycle::get_inventory();
+    Json(serde_json::to_value(inventory).unwrap())
+}
+
+async fn certificates_get(Path(id): Path<String>) -> ApiResult {
+    match certificate_lifecycle::get_certificate(&id) {
+        Some(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        None => Err(status_404(&id)),
+    }
+}
+
+async fn certificate_lifecycle_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionAllowed": false,
+        "dryRunRequired": true,
+        "supportedWorkflows": ["certificate-request","certificate-validate","certificate-approve","certificate-install","certificate-verify","certificate-renew","certificate-revoke","certificate-expiry-check","certificate-inventory"],
+        "validStatuses": ["Active","Expiring","Expired","Revoked"],
+        "validServiceTypes": ["IIS","VMware","ESXi","RDP","SQL Server","Apache","Nginx","LDAP","SMTP","Custom"],
+        "requiredInputs": ["commonName","subject","serviceType","hostname","site","validityDays"],
+        "requiredGuards": ["common-name-known","subject-known","service-type-known","hostname-known","site-known","validity-days-valid","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-execution-disabled","unknown-certificate","invalid-validity-days","missing-common-name","missing-service-type","missing-hostname","missing-site","evidence-not-redacted"],
+        "requiredEvidence": ["Certificate request summary","Validation result","Approval decision","Install evidence","Post-install verification","Expiry report","Inventory summary","Evidence references"],
+        "rules": [
+            {"id":"no-live-certificate-action","decision":"block","requirement":"Certificate lifecycle returns dry-run decisions only and never calls a live CA, mutates certificate stores, or deploys certificates to endpoints.","evidence":"Certificate request summary"},
+            {"id":"validation-before-approval-required","decision":"block","requirement":"Every certificate request must pass field validation before approval readiness can be represented.","evidence":"Validation result"},
+            {"id":"post-install-verification-required","decision":"block","requirement":"Certificate install must be followed by a verify step before the lifecycle can move to maintain.","evidence":"Post-install verification"},
+            {"id":"expiry-monitoring-required","decision":"block","requirement":"Expiring and expired certificates must be surfaced through the expiry check endpoint with site and days-window filtering.","evidence":"Expiry report"},
+            {"id":"raw-certificate-data-not-exposed","decision":"block","requirement":"Certificate lifecycle evidence must use safe summaries only and must not expose private keys, certificate signing requests, CA endpoints, raw certificate blobs, or provider payloads.","evidence":"Evidence references"}
+        ]
     }))
 }
 

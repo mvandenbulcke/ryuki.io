@@ -10,9 +10,12 @@ const RYUKI_ENGINE_ADAPTER_FRAMEWORK_RS_PATH: &str =
 const DECLARED_MODULES: &[&str] = &[
     "adapter_framework",
     "alert_routing_engine",
+    "app_environment",
     "auth",
+    "certificate_lifecycle",
     "backup_engine",
     "cmdb_engine",
+    "cmdb_impact",
     "evidence_pipeline",
     "health_monitor",
     "inventory_sync",
@@ -23,6 +26,7 @@ const DECLARED_MODULES: &[&str] = &[
     "server_decommission",
     "snapshot_engine",
     "vm_operations",
+    "zabbix_drift",
 ];
 
 const REQUIRED_ADAPTER_TYPES: &[&str] = &[

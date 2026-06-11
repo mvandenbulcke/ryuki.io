@@ -1,8 +1,11 @@
 pub mod adapter_framework;
 pub mod alert_routing_engine;
+pub mod app_environment;
 pub mod auth;
 pub mod backup_engine;
+pub mod certificate_lifecycle;
 pub mod cmdb_engine;
+pub mod cmdb_impact;
 pub mod evidence_pipeline;
 pub mod health_monitor;
 pub mod inventory_sync;
@@ -13,3 +16,4 @@ pub mod request_lifecycle;
 pub mod server_decommission;
 pub mod snapshot_engine;
 pub mod vm_operations;
+pub mod zabbix_drift;
