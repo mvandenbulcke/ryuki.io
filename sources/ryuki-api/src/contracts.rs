@@ -4,7 +4,7 @@ use axum::{
     routing::delete,
     routing::put,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use ryuki_core::config::AuthMode;
 use ryuki_core::types::{ApiError, PlatformConfig};
@@ -6055,8 +6055,7 @@ async fn auth_status() -> Json<Value> {
     }))
 }
 
-async fn auth_session() -> Json<Value> {
-    let session = ryuki_engine::auth::AuthSession::static_dry_run();
+async fn auth_session(Extension(session): Extension<AuthSession>) -> Json<Value> {
     Json(serde_json::to_value(session).unwrap_or_default())
 }
 
@@ -11340,6 +11339,15 @@ mod unit_tests {
     fn test_auth_extractor_rejects_unverified_entra_session() {
         let session = AuthSession::unverified_entra();
         assert!(!auth_session_is_verified_or_static(&session));
+    }
+
+    #[tokio::test]
+    async fn test_auth_session_returns_injected_session() {
+        let mut session = AuthSession::unverified_entra();
+        session.user_id = "session-user".to_string();
+        let Json(body) = auth_session(Extension(session)).await;
+        assert_eq!(body["user_id"], "session-user");
+        assert_eq!(body["provider_mode"], "entra-id-unverified");
     }
 
     #[test]
