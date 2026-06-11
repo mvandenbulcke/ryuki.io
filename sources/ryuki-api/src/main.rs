@@ -29,7 +29,9 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use ryuki_core::config::AuthMode;
 use ryuki_core::types::{ApiError, ValidationResult};
+use ryuki_engine::auth::AuthSession;
 
 /// ProblemDetails error type alias: HTTP status code + structured ApiError JSON body.
 pub type ProblemDetails = (StatusCode, Json<ApiError>);
@@ -56,10 +58,21 @@ struct AuthLogFields {
 
 /// Resolves auth log metadata from an optional Authorization header value.
 /// Never exposes raw header content.
-fn resolve_auth_metadata(header: Option<&str>) -> AuthLogFields {
+fn resolve_auth_metadata(header: Option<&str>, provider_mode: &'static str) -> AuthLogFields {
     AuthLogFields {
         auth_header_present: header.is_some(),
-        provider_mode: "static-dry-run",
+        provider_mode,
+    }
+}
+
+fn auth_session_for_request(auth_mode: AuthMode, auth_header: Option<&str>) -> AuthSession {
+    match auth_mode {
+        AuthMode::MockDryRun | AuthMode::StaticDryRun | AuthMode::Local => {
+            AuthSession::static_dry_run()
+        }
+        AuthMode::EntraId => auth_header
+            .map(ryuki_engine::auth::validate_token)
+            .unwrap_or_else(AuthSession::unverified_entra),
     }
 }
 
@@ -69,17 +82,14 @@ async fn auth_middleware(
     next: middleware::Next,
 ) -> Response {
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
-    let log = resolve_auth_metadata(auth_header);
+    let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
+    let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
     tracing::info!(
         auth_header_present = log.auth_header_present,
         provider_mode = log.provider_mode,
         "auth middleware"
     );
-    let session = if let Some(header_value) = auth_header {
-        ryuki_engine::auth::validate_token(header_value)
-    } else {
-        ryuki_engine::auth::AuthSession::static_dry_run()
-    };
+    let session = auth_session_for_request(auth_mode, auth_header);
 
     request.extensions_mut().insert(session);
     next.run(request).await
@@ -793,14 +803,14 @@ mod tests {
 
     #[test]
     fn test_auth_log_metadata_header_present() {
-        let fields = resolve_auth_metadata(Some("Bearer secret-token-123"));
+        let fields = resolve_auth_metadata(Some("Bearer redacted-token"), "static-dry-run");
         assert!(fields.auth_header_present);
         assert_eq!(fields.provider_mode, "static-dry-run");
     }
 
     #[test]
     fn test_auth_log_metadata_header_absent() {
-        let fields = resolve_auth_metadata(None);
+        let fields = resolve_auth_metadata(None, "static-dry-run");
         assert!(!fields.auth_header_present);
         assert_eq!(fields.provider_mode, "static-dry-run");
     }
@@ -808,8 +818,31 @@ mod tests {
     #[test]
     fn test_auth_log_metadata_with_invalid_utf8_header() {
         // invalid header fallback: still present but unusable bytes
-        let fields = resolve_auth_metadata(Some("invalid"));
+        let fields = resolve_auth_metadata(Some("invalid"), "entra-id");
         assert!(fields.auth_header_present);
+        assert_eq!(fields.provider_mode, "entra-id");
+    }
+
+    #[test]
+    fn test_static_auth_mode_ignores_authorization_header() {
+        let session = auth_session_for_request(
+            AuthMode::MockDryRun,
+            Some("header.eyJyb2xlcyI6WyJQbGF0Zm9ybUFkbWluIl19.signature"),
+        );
+        assert_eq!(session.provider_mode, "static-dry-run");
+        assert_eq!(session.roles, vec!["PlatformAdmin"]);
+        assert!(!session.token_valid);
+    }
+
+    #[test]
+    fn test_entra_auth_mode_rejects_unsigned_roles_claim() {
+        let session = auth_session_for_request(
+            AuthMode::EntraId,
+            Some("header.eyJyb2xlcyI6WyJQbGF0Zm9ybUFkbWluIl19.signature"),
+        );
+        assert_eq!(session.provider_mode, "entra-id-unverified");
+        assert!(session.roles.is_empty());
+        assert!(!session.token_valid);
     }
 
     #[test]

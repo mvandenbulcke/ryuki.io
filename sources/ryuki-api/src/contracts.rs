@@ -6602,6 +6602,10 @@ async fn admin_platform_settings_reset() -> Json<Value> {
 /// Custom extractor: pulls AuthSession from request extensions injected by auth middleware.
 struct AuthExtractor(AuthSession);
 
+fn auth_session_is_verified_or_static(session: &AuthSession) -> bool {
+    session.token_valid || session.provider_mode == "static-dry-run"
+}
+
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthExtractor {
     type Rejection = (StatusCode, Json<serde_json::Value>);
 
@@ -6609,17 +6613,25 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthExtractor {
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts
+        let session = parts
             .extensions
             .get::<AuthSession>()
             .cloned()
-            .map(AuthExtractor)
             .ok_or_else(|| {
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(json!({"error": "No session found"})),
                 )
-            })
+            })?;
+
+        if !auth_session_is_verified_or_static(&session) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Auth token is not verified"})),
+            ));
+        }
+
+        Ok(AuthExtractor(session))
     }
 }
 
@@ -11202,6 +11214,18 @@ mod unit_tests {
         assert_eq!(part["source"], "static-seed");
         assert_eq!(part["mode"], "static-dry-run");
         assert_eq!(part["providerCallsAllowed"], false);
+    }
+
+    #[test]
+    fn test_auth_extractor_accepts_static_dry_run_session() {
+        let session = AuthSession::static_dry_run();
+        assert!(auth_session_is_verified_or_static(&session));
+    }
+
+    #[test]
+    fn test_auth_extractor_rejects_unverified_entra_session() {
+        let session = AuthSession::unverified_entra();
+        assert!(!auth_session_is_verified_or_static(&session));
     }
 
     #[test]

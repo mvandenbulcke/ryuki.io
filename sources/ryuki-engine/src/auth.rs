@@ -73,6 +73,16 @@ impl AuthSession {
             provider_mode: "static-dry-run".to_string(),
         }
     }
+
+    pub fn unverified_entra() -> Self {
+        Self {
+            user_id: "unverified-entra-user".to_string(),
+            display_name: "Unverified Entra ID User".to_string(),
+            roles: vec![],
+            token_valid: false,
+            provider_mode: "entra-id-unverified".to_string(),
+        }
+    }
 }
 
 pub fn get_rbac_roles() -> Vec<RbacRole> {
@@ -199,18 +209,8 @@ fn base64_decode_internal(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn validate_token(token: &str) -> AuthSession {
-    let roles = get_roles_from_token(token);
-    if !roles.is_empty() {
-        return AuthSession {
-            user_id: "entra-user".to_string(),
-            display_name: "Entra ID User".to_string(),
-            roles,
-            token_valid: true,
-            provider_mode: "entra-id-live".to_string(),
-        };
-    }
-    AuthSession::static_dry_run()
+pub fn validate_token(_token: &str) -> AuthSession {
+    AuthSession::unverified_entra()
 }
 
 pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
@@ -267,6 +267,15 @@ mod tests {
     }
 
     #[test]
+    fn test_unverified_entra_session_has_no_roles() {
+        let session = AuthSession::unverified_entra();
+        assert_eq!(session.user_id, "unverified-entra-user");
+        assert!(!session.token_valid);
+        assert_eq!(session.provider_mode, "entra-id-unverified");
+        assert!(session.roles.is_empty());
+    }
+
+    #[test]
     fn test_check_permission_returns_true_for_matching_role() {
         let mut session = AuthSession::static_dry_run();
         session.roles = vec![APP_ROLE_PLATFORM_ADMIN.to_string()];
@@ -309,13 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_token_returns_static_session_on_empty_or_junk() {
+    fn test_validate_token_returns_unverified_entra_on_empty_or_junk() {
         let session1 = validate_token("");
-        assert_eq!(session1.provider_mode, "static-dry-run");
+        assert_eq!(session1.provider_mode, "entra-id-unverified");
         assert!(!session1.token_valid);
 
         let session2 = validate_token("some-fake-jwt-token");
-        assert_eq!(session2.provider_mode, "static-dry-run");
+        assert_eq!(session2.provider_mode, "entra-id-unverified");
         assert!(!session2.token_valid);
     }
 
@@ -343,14 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_token_with_roles_claim() {
+    fn test_validate_token_rejects_unsigned_roles_claim() {
         let header = base64_url_encode(r#"{"alg":"RS256"}"#);
         let payload = base64_url_encode(r#"{"roles":["VMwareOperator"]}"#);
         let token = format!("{}.{}", header, payload);
         let session = validate_token(&token);
-        assert!(session.token_valid);
-        assert_eq!(session.provider_mode, "entra-id-live");
-        assert_eq!(session.roles, vec!["VMwareOperator"]);
+        assert!(!session.token_valid);
+        assert_eq!(session.provider_mode, "entra-id-unverified");
+        assert!(session.roles.is_empty());
     }
 
     fn base64_url_encode(input: &str) -> String {
