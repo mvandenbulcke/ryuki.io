@@ -187,12 +187,36 @@ async fn request_counter_middleware(
     next: middleware::Next,
 ) -> Response {
     REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let label = format!("{} {}", request.method(), request.uri().path());
+    let label = format!(
+        "{} {}",
+        request.method(),
+        normalize_metrics_path(request.uri().path())
+    );
     {
         let mut counts = per_endpoint().counts.lock().unwrap();
         *counts.entry(label).or_insert(0) += 1;
     }
     next.run(request).await
+}
+
+fn normalize_metrics_path(path: &str) -> String {
+    let segments: Vec<String> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if Uuid::parse_str(segment).is_ok() || segment.chars().all(|c| c.is_ascii_digit()) {
+                "{id}".to_string()
+            } else {
+                segment.to_ascii_lowercase()
+            }
+        })
+        .collect();
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
 }
 
 /// Stores request durations in microseconds, capped at 10,000 entries.
@@ -843,6 +867,23 @@ mod tests {
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
+    }
+
+    #[test]
+    fn test_normalize_metrics_path_replaces_uuid_segments() {
+        assert_eq!(
+            normalize_metrics_path("/api/requests/550e8400-e29b-41d4-a716-446655440000/execute"),
+            "/api/requests/{id}/execute"
+        );
+    }
+
+    #[test]
+    fn test_normalize_metrics_path_replaces_numeric_segments() {
+        assert_eq!(
+            normalize_metrics_path("/api/catalog/items/12345"),
+            "/api/catalog/items/{id}"
+        );
+        assert_eq!(normalize_metrics_path("/"), "/");
     }
 
     #[test]
