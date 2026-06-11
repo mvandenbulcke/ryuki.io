@@ -34,18 +34,7 @@ impl ConfigStore {
         if Path::new(&self.path).exists() {
             if let Ok(contents) = std::fs::read_to_string(&self.path) {
                 if let Ok(file_config) = serde_json::from_str::<PlatformConfig>(&contents) {
-                    if !file_config.entra_tenant_id.is_empty() {
-                        config.entra_tenant_id = file_config.entra_tenant_id;
-                    }
-                    if !file_config.entra_client_id.is_empty() {
-                        config.entra_client_id = file_config.entra_client_id;
-                    }
-                    if !file_config.entra_authority.is_empty() {
-                        config.entra_authority = file_config.entra_authority;
-                    }
-                    if !file_config.auth_mode.is_empty() {
-                        config.auth_mode = file_config.auth_mode;
-                    }
+                    return file_config;
                 }
             }
         }
@@ -58,6 +47,41 @@ impl ConfigStore {
             .map_err(|e| format!("failed to serialize config: {e}"))?;
         std::fs::write(&self.path, contents)
             .map_err(|e| format!("failed to write config file: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_config_path() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("ryuki-platform-config-{nanos}.json"))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn test_load_config_reads_full_file_config() {
+        let path = temp_config_path();
+        let mut expected = PlatformConfig::default();
+        expected.storage_provider = "netapp".to_string();
+        expected.retention_daily_backups = 45;
+        expected.max_concurrent_connections = 1024;
+        std::fs::write(&path, serde_json::to_string(&expected).unwrap()).unwrap();
+
+        let store = ConfigStore::new(&path);
+        let loaded = store.load_config();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.storage_provider, "netapp");
+        assert_eq!(loaded.retention_daily_backups, 45);
+        assert_eq!(loaded.max_concurrent_connections, 1024);
     }
 }
 
