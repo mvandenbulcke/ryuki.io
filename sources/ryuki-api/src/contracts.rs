@@ -6803,7 +6803,7 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
             json!({
                 "request_id": r.id,
                 "request_type": r.request_type.to_string(),
-                "status": format!("{:?}", r.status).to_lowercase(),
+                "status": r.status.as_str(),
                 "name": r.requester,
                 "site": r.site,
                 "created_at": r.created_at

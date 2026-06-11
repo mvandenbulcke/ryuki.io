@@ -111,6 +111,23 @@ pub enum RequestStatus {
     Failed,
 }
 
+impl RequestStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Intake => "intake",
+            Self::Validated => "validated",
+            Self::Planned => "planned",
+            Self::Approved => "approved",
+            Self::Locked => "locked",
+            Self::Executing => "executing",
+            Self::Verifying => "verifying",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Stage {
     pub name: String,

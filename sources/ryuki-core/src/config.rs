@@ -637,7 +637,7 @@ pub struct SecurityConfig {
 }
 
 fn default_csp_directive() -> String {
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'"
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline';"
         .to_string()
 }
 
