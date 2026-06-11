@@ -247,8 +247,18 @@ async fn rate_limit_middleware(
             .trim()
             .to_string();
 
-        if limiter.check_key(&client_key).is_err() {
-            tracing::warn!(client = %client_key, "rate limit exceeded");
+        let path_group = request
+            .uri()
+            .path()
+            .split('/')
+            .nth(1)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("root");
+
+        let key = format!("{path_group}:{client_key}");
+
+        if limiter.check_key(&key).is_err() {
+            tracing::warn!(client = %client_key, path_group, "rate limit exceeded");
             let api_error = ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests");
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
