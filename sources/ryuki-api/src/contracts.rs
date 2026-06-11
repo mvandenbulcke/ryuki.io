@@ -15,6 +15,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::database::get_db;
+use crate::problem_details;
+use crate::ProblemDetails;
 use ryuki_engine::ad_computer_lifecycle;
 use ryuki_engine::aiops;
 use ryuki_engine::alert_routing_engine;
@@ -42,6 +44,7 @@ use ryuki_engine::server_decommission;
 use ryuki_engine::shift_queue;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::software_deployment;
+use ryuki_engine::sql_deployment;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::log_forwarder;
@@ -366,6 +369,16 @@ pub fn routes() -> Router {
             "/api/workflows/sql-server/deployment-contract",
             get(workflows_sql_server),
         )
+        // ─── SQL Server Deployment Engine ───
+        .route("/api/build/sql/plan", post(sql_deploy_plan))
+        .route("/api/build/sql/validate", post(sql_deploy_validate))
+        .route("/api/build/sql/install/{id}", post(sql_deploy_install))
+        .route("/api/build/sql/configure/{id}", post(sql_deploy_configure))
+        .route("/api/build/sql/verify/{id}", post(sql_deploy_verify))
+        .route("/api/build/sql/backup/{id}", post(sql_deploy_backup))
+        .route("/api/build/sql/monitoring/{id}", post(sql_deploy_monitoring))
+        .route("/api/build/sql/inventory", get(sql_deploy_inventory))
+        .route("/api/build/sql-contract", get(sql_deployment_contract))
         .route(
             "/api/workflows/azure-landing-zone/validation-contract",
             get(workflows_azure_lz),

@@ -30,7 +30,7 @@ use crate::models::request_intake_form_fallback;
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
     cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks,
-    datacenter_check_power_fallback, datacenter_failing_checks_fallback,
+    datacenter_failing_checks_fallback,
     datacenter_full_readiness_fallback, datacenter_readiness_score_fallback,
     datacenter_single_check_fallback, datacenter_site_report_fallback,
     datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
@@ -38,7 +38,7 @@ use crate::models::{
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
     CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
-    CreateRequestPayload, DatacenterCheckDetail, DatacenterFailingChecksSummary,
+    CreateRequestPayload, DatacenterFailingChecksSummary,
     DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck,
     DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary, EvidenceSummary,
     InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,

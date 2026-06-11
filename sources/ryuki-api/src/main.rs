@@ -17,9 +17,9 @@ use tower_http::cors::{Any, CorsLayer};
 use ryuki_core::types::{ApiError, ValidationResult};
 
 /// ProblemDetails error type alias: HTTP status code + structured ApiError JSON body.
-type ProblemDetails = (StatusCode, Json<ApiError>);
+pub type ProblemDetails = (StatusCode, Json<ApiError>);
 
-fn problem_details(
+pub fn problem_details(
     status: StatusCode,
     error: impl Into<String>,
     message: impl Into<String>,
