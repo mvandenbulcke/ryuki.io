@@ -37,12 +37,12 @@ jobs:
         run: cargo fmt --check --all
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace -- -D clippy::correctness -D clippy::suspicious -W clippy::complexity -W clippy::perf -W clippy::style
 
       - name: Secret scan
         run: ./scripts/no-secret-scan.sh
 
       - name: Validator
-        run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all
+        run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 
 

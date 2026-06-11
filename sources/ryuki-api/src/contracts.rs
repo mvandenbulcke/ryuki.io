@@ -17,10 +17,10 @@ use uuid::Uuid;
 use crate::database::get_db;
 use crate::problem_details;
 use crate::ProblemDetails;
+use ryuki_engine::access_recertification;
 use ryuki_engine::ad_computer_lifecycle;
 use ryuki_engine::aiops;
 use ryuki_engine::alert_routing_engine;
-use ryuki_engine::file_share_ntfs;
 use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
@@ -28,39 +28,39 @@ use ryuki_engine::cmdb_engine;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::datacenter_readiness;
+use ryuki_engine::degradation_mode;
+use ryuki_engine::emergency_change;
+use ryuki_engine::evidence_pipeline;
+use ryuki_engine::file_share_ntfs;
+use ryuki_engine::firmware_lifecycle;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
 use ryuki_engine::health_monitor;
 use ryuki_engine::image_factory;
-use ryuki_engine::inventory_sync;
 use ryuki_engine::immutability_compliance;
+use ryuki_engine::incident_context;
+use ryuki_engine::inventory_sync;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
+use ryuki_engine::log_forwarder;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
 use ryuki_engine::noise_remediation;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::outage_comms;
-use ryuki_engine::runbook_execution;
-use ryuki_engine::firmware_lifecycle;
-use ryuki_engine::incident_context;
-use ryuki_engine::access_recertification;
 use ryuki_engine::patch_engine;
 use ryuki_engine::repository_capacity;
+use ryuki_engine::runbook_execution;
 use ryuki_engine::server_decommission;
+use ryuki_engine::servicenow_api;
 use ryuki_engine::shift_queue;
+use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::software_deployment;
 use ryuki_engine::sql_deployment;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
-use ryuki_engine::log_forwarder;
-use ryuki_engine::degradation_mode;
-use ryuki_engine::emergency_change;
-use ryuki_engine::evidence_pipeline;
-use ryuki_engine::servicenow_api;
-use ryuki_engine::site_registry;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -189,19 +189,55 @@ pub fn routes() -> Router {
             get(identity_entra_rbac),
         )
         // ─── Access Recertification Engine ───
-        .route("/api/identity/access-review/reviews", get(access_reviews_list))
-        .route("/api/identity/access-review/review/{id}", get(access_review_get))
+        .route(
+            "/api/identity/access-review/reviews",
+            get(access_reviews_list),
+        )
+        .route(
+            "/api/identity/access-review/review/{id}",
+            get(access_review_get),
+        )
         .route("/api/identity/access-review/due", get(access_reviews_due))
-        .route("/api/identity/access-review/expiring", get(access_reviews_expiring))
-        .route("/api/identity/access-review/{id}/start", post(access_review_start))
-        .route("/api/identity/access-review/{id}/approve", post(access_review_approve))
-        .route("/api/identity/access-review/{id}/revoke", post(access_review_revoke))
-        .route("/api/identity/access-review/{id}/exempt", post(access_review_exempt))
-        .route("/api/identity/access-review/summary", get(access_review_summary))
-        .route("/api/identity/access-review/campaign", post(access_campaign_create))
-        .route("/api/identity/access-review/campaign/{id}", get(access_campaign_get))
-        .route("/api/identity/access-review/campaigns", get(access_campaigns_list))
-        .route("/api/identity/access-review-contract", get(access_review_contract))
+        .route(
+            "/api/identity/access-review/expiring",
+            get(access_reviews_expiring),
+        )
+        .route(
+            "/api/identity/access-review/{id}/start",
+            post(access_review_start),
+        )
+        .route(
+            "/api/identity/access-review/{id}/approve",
+            post(access_review_approve),
+        )
+        .route(
+            "/api/identity/access-review/{id}/revoke",
+            post(access_review_revoke),
+        )
+        .route(
+            "/api/identity/access-review/{id}/exempt",
+            post(access_review_exempt),
+        )
+        .route(
+            "/api/identity/access-review/summary",
+            get(access_review_summary),
+        )
+        .route(
+            "/api/identity/access-review/campaign",
+            post(access_campaign_create),
+        )
+        .route(
+            "/api/identity/access-review/campaign/{id}",
+            get(access_campaign_get),
+        )
+        .route(
+            "/api/identity/access-review/campaigns",
+            get(access_campaigns_list),
+        )
+        .route(
+            "/api/identity/access-review-contract",
+            get(access_review_contract),
+        )
         .route(
             "/api/identity/access-review-recertification-contract",
             get(identity_access_review),
@@ -228,14 +264,8 @@ pub fn routes() -> Router {
         )
         .route("/api/identity/gmsa/create", post(gmsa_create))
         .route("/api/identity/gmsa/validate", post(gmsa_validate))
-        .route(
-            "/api/identity/gmsa/assign/{name}/{host}",
-            post(gmsa_assign),
-        )
-        .route(
-            "/api/identity/gmsa/remove/{name}/{host}",
-            post(gmsa_remove),
-        )
+        .route("/api/identity/gmsa/assign/{name}/{host}", post(gmsa_assign))
+        .route("/api/identity/gmsa/remove/{name}/{host}", post(gmsa_remove))
         .route("/api/identity/gmsa/rotate/{name}", post(gmsa_rotate))
         .route("/api/identity/gmsa/test/{name}/{host}", post(gmsa_test))
         .route("/api/identity/gmsa/inventory", get(gmsa_inventory))
@@ -275,15 +305,15 @@ pub fn routes() -> Router {
             "/api/identity/shares/revoke/{id}/{group}",
             post(shares_revoke),
         )
-        .route(
-            "/api/identity/shares-contract",
-            get(shares_contract),
-        )
+        .route("/api/identity/shares-contract", get(shares_contract))
         // ─── Evidence Pipeline Engine ───
         .route("/api/evidence/collect", post(evidence_collect))
         .route("/api/evidence/redact", post(evidence_redact))
         .route("/api/evidence/export", get(evidence_export))
-        .route("/api/evidence/verify-compliance", post(evidence_verify_compliance))
+        .route(
+            "/api/evidence/verify-compliance",
+            post(evidence_verify_compliance),
+        )
         .route(
             "/api/evidence/export-retention-contract",
             get(evidence_export_retention),
@@ -363,8 +393,14 @@ pub fn routes() -> Router {
         )
         // ─── Inventory Sync Engine ───
         .route("/api/inventory/sync", post(inventory_run_sync))
-        .route("/api/inventory/reconcile", post(inventory_run_reconciliation))
-        .route("/api/inventory/ownership-risks", get(inventory_ownership_risks))
+        .route(
+            "/api/inventory/reconcile",
+            post(inventory_run_reconciliation),
+        )
+        .route(
+            "/api/inventory/ownership-risks",
+            get(inventory_ownership_risks),
+        )
         .route("/api/inventory/coverage-contract", get(inventory_coverage))
         .route(
             "/api/inventory/resource-overview-contract",
@@ -409,7 +445,10 @@ pub fn routes() -> Router {
         .route("/api/build/sql/configure/{id}", post(sql_deploy_configure))
         .route("/api/build/sql/verify/{id}", post(sql_deploy_verify))
         .route("/api/build/sql/backup/{id}", post(sql_deploy_backup))
-        .route("/api/build/sql/monitoring/{id}", post(sql_deploy_monitoring))
+        .route(
+            "/api/build/sql/monitoring/{id}",
+            post(sql_deploy_monitoring),
+        )
         .route("/api/build/sql/inventory", get(sql_deploy_inventory))
         .route("/api/build/sql-contract", get(sql_deployment_contract))
         .route(
@@ -427,8 +466,14 @@ pub fn routes() -> Router {
         // ─── Runbook Execution Engine ───
         .route("/api/ops/runbook/catalog", get(runbook_catalog))
         .route("/api/ops/runbook/start", post(runbook_start))
-        .route("/api/ops/runbook/execution/{id}", get(runbook_get_execution))
-        .route("/api/ops/runbook/step/{id}/{step}", post(runbook_execute_step))
+        .route(
+            "/api/ops/runbook/execution/{id}",
+            get(runbook_get_execution),
+        )
+        .route(
+            "/api/ops/runbook/step/{id}/{step}",
+            post(runbook_execute_step),
+        )
         .route("/api/ops/runbook/approve/{id}", post(runbook_approve))
         .route("/api/ops/runbook/complete/{id}", post(runbook_complete))
         .route("/api/ops/runbook/fail/{id}", post(runbook_fail))
@@ -517,7 +562,10 @@ pub fn routes() -> Router {
         .route("/api/ops/incident/{id}/resolve", post(incident_resolve))
         .route("/api/ops/incident/{id}/add-ci", post(incident_add_ci))
         .route("/api/ops/incident/{id}/escalate", post(incident_escalate))
-        .route("/api/ops/incident-context-contract", get(incident_context_contract))
+        .route(
+            "/api/ops/incident-context-contract",
+            get(incident_context_contract),
+        )
         .route(
             "/api/operations/incident-context-contract",
             get(operations_incident_context),
@@ -582,10 +630,7 @@ pub fn routes() -> Router {
             "/api/platform/degradation/check/{site}",
             post(degradation_check),
         )
-        .route(
-            "/api/platform/degradation/global",
-            get(degradation_global),
-        )
+        .route("/api/platform/degradation/global", get(degradation_global))
         .route(
             "/api/platform/degradation/degraded",
             get(degradation_degraded),
@@ -598,10 +643,7 @@ pub fn routes() -> Router {
             "/api/platform/degradation/exit/{site}",
             post(degradation_exit),
         )
-        .route(
-            "/api/platform/degradation/rules",
-            get(degradation_rules),
-        )
+        .route("/api/platform/degradation/rules", get(degradation_rules))
         .route(
             "/api/platform/degradation-contract",
             get(degradation_contract),
@@ -648,10 +690,7 @@ pub fn routes() -> Router {
             "/api/maintain/software/packages",
             get(software_packages_list),
         )
-        .route(
-            "/api/maintain/software/validate",
-            post(software_validate),
-        )
+        .route("/api/maintain/software/validate", post(software_validate))
         .route("/api/maintain/software/plan", post(software_plan))
         .route(
             "/api/maintain/software/approve/{id}",
@@ -661,10 +700,7 @@ pub fn routes() -> Router {
             "/api/maintain/software/execute/{id}",
             post(software_execute),
         )
-        .route(
-            "/api/maintain/software/verify/{id}",
-            post(software_verify),
-        )
+        .route("/api/maintain/software/verify/{id}", post(software_verify))
         .route(
             "/api/maintain/software/history/{server}",
             get(software_history),
@@ -673,10 +709,7 @@ pub fn routes() -> Router {
             "/api/maintain/software/compliance",
             get(software_compliance),
         )
-        .route(
-            "/api/maintain/software-contract",
-            get(software_contract),
-        )
+        .route("/api/maintain/software-contract", get(software_contract))
         // ─── OS baseline compliance ───
         .route(
             "/api/maintain/baseline/check/{server}",
@@ -690,22 +723,13 @@ pub fn routes() -> Router {
             "/api/maintain/baseline/noncompliant",
             get(baseline_noncompliant),
         )
-        .route(
-            "/api/maintain/baseline/trend",
-            get(baseline_trend),
-        )
-        .route(
-            "/api/maintain/baseline/coverage",
-            get(baseline_coverage),
-        )
+        .route("/api/maintain/baseline/trend", get(baseline_trend))
+        .route("/api/maintain/baseline/coverage", get(baseline_coverage))
         .route(
             "/api/maintain/baseline/remediate/{server}/{check_id}",
             post(baseline_remediate),
         )
-        .route(
-            "/api/maintain/baseline-contract",
-            get(baseline_contract),
-        )
+        .route("/api/maintain/baseline-contract", get(baseline_contract))
         .route(
             "/api/protect/controlled-restore-contract",
             get(protect_controlled_restore),
@@ -809,14 +833,8 @@ pub fn routes() -> Router {
             "/api/protect/legal-hold/release/{id}",
             post(legal_hold_release),
         )
-        .route(
-            "/api/protect/legal-hold/active",
-            get(legal_hold_active),
-        )
-        .route(
-            "/api/protect/legal-hold/expiring",
-            get(legal_hold_expiring),
-        )
+        .route("/api/protect/legal-hold/active", get(legal_hold_active))
+        .route("/api/protect/legal-hold/expiring", get(legal_hold_expiring))
         .route(
             "/api/protect/legal-hold/evidence/{id}",
             get(legal_hold_evidence),
@@ -825,10 +843,7 @@ pub fn routes() -> Router {
             "/api/protect/legal-hold/compliance/{server}",
             get(legal_hold_compliance),
         )
-        .route(
-            "/api/protect/legal-hold-contract",
-            get(legal_hold_contract),
-        )
+        .route("/api/protect/legal-hold-contract", get(legal_hold_contract))
         .route(
             "/api/protect/legal-hold-retention-contract",
             get(protect_legal_hold),
@@ -878,22 +893,13 @@ pub fn routes() -> Router {
         )
         // ─── Log Forwarder Onboarding Engine ───
         .route("/api/observe/logs/onboard", post(logs_onboard))
-        .route(
-            "/api/observe/logs/validate/{hostname}",
-            post(logs_validate),
-        )
-        .route(
-            "/api/observe/logs/verify/{hostname}",
-            post(logs_verify),
-        )
+        .route("/api/observe/logs/validate/{hostname}", post(logs_validate))
+        .route("/api/observe/logs/verify/{hostname}", post(logs_verify))
         .route("/api/observe/logs/coverage", get(logs_coverage))
         .route("/api/observe/logs/gaps", get(logs_gaps))
         .route("/api/observe/logs/volume", get(logs_volume))
         .route("/api/observe/logs/retention", get(logs_retention))
-        .route(
-            "/api/observe/logs/disable/{hostname}",
-            post(logs_disable),
-        )
+        .route("/api/observe/logs/disable/{hostname}", post(logs_disable))
         .route("/api/observe/logs-contract", get(logs_contract))
         // ─── CMDB Engine ───
         .route("/api/cmdb/import", post(cmdb_import_records))
@@ -923,18 +929,9 @@ pub fn routes() -> Router {
         )
         .route("/api/cmdb/impact-contract", get(cmdb_impact_contract))
         // ─── ServiceNow API Integration ───
-        .route(
-            "/api/cmdb/servicenow/incident",
-            post(servicenow_incident),
-        )
-        .route(
-            "/api/cmdb/servicenow/change",
-            post(servicenow_change),
-        )
-        .route(
-            "/api/cmdb/servicenow/request",
-            post(servicenow_request),
-        )
+        .route("/api/cmdb/servicenow/incident", post(servicenow_incident))
+        .route("/api/cmdb/servicenow/change", post(servicenow_change))
+        .route("/api/cmdb/servicenow/request", post(servicenow_request))
         .route(
             "/api/cmdb/servicenow/validate/{id}",
             post(servicenow_validate),
@@ -943,27 +940,12 @@ pub fn routes() -> Router {
             "/api/cmdb/servicenow/approve/{id}",
             post(servicenow_approve),
         )
-        .route(
-            "/api/cmdb/servicenow/submit/{id}",
-            post(servicenow_submit),
-        )
-        .route(
-            "/api/cmdb/servicenow/status/{id}",
-            get(servicenow_status),
-        )
+        .route("/api/cmdb/servicenow/submit/{id}", post(servicenow_submit))
+        .route("/api/cmdb/servicenow/status/{id}", get(servicenow_status))
         .route("/api/cmdb/servicenow/pending", get(servicenow_pending))
-        .route(
-            "/api/cmdb/servicenow/cancel/{id}",
-            post(servicenow_cancel),
-        )
-        .route(
-            "/api/cmdb/servicenow/history/{ci}",
-            get(servicenow_history),
-        )
-        .route(
-            "/api/cmdb/servicenow-contract",
-            get(servicenow_contract),
-        )
+        .route("/api/cmdb/servicenow/cancel/{id}", post(servicenow_cancel))
+        .route("/api/cmdb/servicenow/history/{ci}", get(servicenow_history))
+        .route("/api/cmdb/servicenow-contract", get(servicenow_contract))
         .route(
             "/api/admin/worker-capability-contract",
             get(admin_worker_capability),
@@ -979,12 +961,24 @@ pub fn routes() -> Router {
         // ─── Site Registry (UN/LOCODE) ───
         .route("/api/admin/sites", get(site_registry_list))
         .route("/api/admin/sites/countries", get(site_registry_countries))
-        .route("/api/admin/sites/countries/{code}/cities", get(site_registry_cities_by_country))
+        .route(
+            "/api/admin/sites/countries/{code}/cities",
+            get(site_registry_cities_by_country),
+        )
         .route("/api/admin/sites/{unlocode}", get(site_registry_get))
-        .route("/api/admin/sites/{unlocode}/activate", post(site_registry_activate))
-        .route("/api/admin/sites/{unlocode}/deactivate", post(site_registry_deactivate))
+        .route(
+            "/api/admin/sites/{unlocode}/activate",
+            post(site_registry_activate),
+        )
+        .route(
+            "/api/admin/sites/{unlocode}/deactivate",
+            post(site_registry_deactivate),
+        )
         .route("/api/admin/sites/search", get(site_registry_search))
-        .route("/api/admin/site-registry-contract", get(site_registry_contract))
+        .route(
+            "/api/admin/site-registry-contract",
+            get(site_registry_contract),
+        )
         .route(
             "/api/admin/delegation-boundary-contract",
             get(admin_delegation_boundary),
@@ -1024,52 +1018,28 @@ pub fn routes() -> Router {
         )
         .route("/api/analytics/cost/summary", get(analytics_cost_summary))
         .route("/api/analytics/waste", get(analytics_waste))
-        .route(
-            "/api/analytics/rightsizing",
-            get(analytics_rightsizing),
-        )
+        .route("/api/analytics/rightsizing", get(analytics_rightsizing))
         .route("/api/analytics/trend", get(analytics_trend))
         .route("/api/analytics/contract", get(analytics_contract))
-        .route(
-            "/api/analytics/aiops/generate",
-            post(aiops_generate),
-        )
-        .route(
-            "/api/analytics/aiops/review/{id}",
-            post(aiops_review),
-        )
-        .route(
-            "/api/analytics/aiops/accept/{id}",
-            post(aiops_accept),
-        )
-        .route(
-            "/api/analytics/aiops/reject/{id}",
-            post(aiops_reject),
-        )
-        .route(
-            "/api/analytics/aiops/implement/{id}",
-            post(aiops_implement),
-        )
-        .route(
-            "/api/analytics/aiops/type",
-            get(aiops_type),
-        )
-        .route(
-            "/api/analytics/aiops/savings",
-            get(aiops_savings),
-        )
-        .route(
-            "/api/analytics/aiops/stats",
-            get(aiops_stats),
-        )
-        .route(
-            "/api/analytics/aiops-contract",
-            get(aiops_contract),
-        )
+        .route("/api/analytics/aiops/generate", post(aiops_generate))
+        .route("/api/analytics/aiops/review/{id}", post(aiops_review))
+        .route("/api/analytics/aiops/accept/{id}", post(aiops_accept))
+        .route("/api/analytics/aiops/reject/{id}", post(aiops_reject))
+        .route("/api/analytics/aiops/implement/{id}", post(aiops_implement))
+        .route("/api/analytics/aiops/type", get(aiops_type))
+        .route("/api/analytics/aiops/savings", get(aiops_savings))
+        .route("/api/analytics/aiops/stats", get(aiops_stats))
+        .route("/api/analytics/aiops-contract", get(aiops_contract))
         // ─── Health Monitor Engine ───
         .route("/api/platform/health/all", get(platform_health_all_checks))
-        .route("/api/platform/health/check/{adapter}", get(platform_health_check_adapter))
-        .route("/api/platform/health/metrics", get(platform_health_metrics_text))
+        .route(
+            "/api/platform/health/check/{adapter}",
+            get(platform_health_check_adapter),
+        )
+        .route(
+            "/api/platform/health/metrics",
+            get(platform_health_metrics_text),
+        )
         .route("/api/platform/health", get(platform_health))
         .route(
             "/api/platform/health/components",
@@ -1119,32 +1089,20 @@ pub fn routes() -> Router {
             get(zabbix_drift_contract),
         )
         // ─── Noise Remediation ───
-        .route(
-            "/api/monitoring/noise/detect",
-            post(noise_detect),
-        )
+        .route("/api/monitoring/noise/detect", post(noise_detect))
         .route(
             "/api/monitoring/noise/flapping",
             post(noise_flapping_detect),
         )
-        .route(
-            "/api/monitoring/noise/suggest/{id}",
-            post(noise_suggest),
-        )
-        .route(
-            "/api/monitoring/noise/suppress/{id}",
-            post(noise_suppress),
-        )
-        .route(
-            "/api/monitoring/noise/resolve/{id}",
-            post(noise_resolve),
-        )
+        .route("/api/monitoring/noise/suggest/{id}", post(noise_suggest))
+        .route("/api/monitoring/noise/suppress/{id}", post(noise_suppress))
+        .route("/api/monitoring/noise/resolve/{id}", post(noise_resolve))
         .route("/api/monitoring/noise/report", get(noise_report))
-        .route("/api/monitoring/noise/suppressed", get(noise_suppressed_list))
         .route(
-            "/api/monitoring/noise-contract",
-            get(noise_contract),
+            "/api/monitoring/noise/suppressed",
+            get(noise_suppressed_list),
         )
+        .route("/api/monitoring/noise-contract", get(noise_contract))
         // ─── Certificate Lifecycle ───
         .route(
             "/api/maintain/certificates/request",
@@ -1456,21 +1414,45 @@ pub fn routes() -> Router {
             "/api/datacenter/hardware/update-firmware/{id}",
             post(hardware_update_firmware),
         )
-        .route(
-            "/api/datacenter/hardware-contract",
-            get(hardware_contract),
-        )
+        .route("/api/datacenter/hardware-contract", get(hardware_contract))
         // ─── Firmware Lifecycle Engine ───
-        .route("/api/datacenter/firmware/devices", get(firmware_devices_list))
-        .route("/api/datacenter/firmware/device/{id}", get(firmware_device_get))
-        .route("/api/datacenter/firmware/check/{id}", post(firmware_check_compliance))
-        .route("/api/datacenter/firmware/noncompliant", get(firmware_noncompliant))
+        .route(
+            "/api/datacenter/firmware/devices",
+            get(firmware_devices_list),
+        )
+        .route(
+            "/api/datacenter/firmware/device/{id}",
+            get(firmware_device_get),
+        )
+        .route(
+            "/api/datacenter/firmware/check/{id}",
+            post(firmware_check_compliance),
+        )
+        .route(
+            "/api/datacenter/firmware/noncompliant",
+            get(firmware_noncompliant),
+        )
         .route("/api/datacenter/firmware/eol", get(firmware_eol))
-        .route("/api/datacenter/firmware/exception", post(firmware_request_exception))
-        .route("/api/datacenter/firmware/exceptions", get(firmware_exceptions_list))
-        .route("/api/datacenter/firmware/revoke/{id}", post(firmware_revoke_exception))
-        .route("/api/datacenter/firmware/report", get(firmware_compliance_report))
-        .route("/api/datacenter/firmware/vendor-summary", get(firmware_vendor_summary))
+        .route(
+            "/api/datacenter/firmware/exception",
+            post(firmware_request_exception),
+        )
+        .route(
+            "/api/datacenter/firmware/exceptions",
+            get(firmware_exceptions_list),
+        )
+        .route(
+            "/api/datacenter/firmware/revoke/{id}",
+            post(firmware_revoke_exception),
+        )
+        .route(
+            "/api/datacenter/firmware/report",
+            get(firmware_compliance_report),
+        )
+        .route(
+            "/api/datacenter/firmware/vendor-summary",
+            get(firmware_vendor_summary),
+        )
         .route("/api/datacenter/firmware-contract", get(firmware_contract))
         .route(
             "/api/datacenter/image-factory/initiate-build",
@@ -3726,7 +3708,9 @@ async fn shares_permission_report(Path(id): Path<String>) -> ApiResult {
 
 async fn shares_revoke(Path((id, group)): Path<(String, String)>) -> ApiResult {
     match file_share_ntfs::revoke_permission(&id, &group) {
-        Ok(msg) => Ok(Json(serde_json::json!({"message": msg, "share_id": id, "ad_group": group, "dry_run": true}))),
+        Ok(msg) => Ok(Json(
+            serde_json::json!({"message": msg, "share_id": id, "ad_group": group, "dry_run": true}),
+        )),
         Err(e) => Err(status_404(&e)),
     }
 }
@@ -4139,37 +4123,48 @@ async fn shift_acknowledge(
     Path(id): Path<String>,
     Json(body): Json<ShiftActionRequest>,
 ) -> Json<Value> {
-    Json(shift_queue::acknowledge_item(&id, &body.user).map_err(|e| json!({"error": e})).unwrap_or_default())
+    Json(
+        shift_queue::acknowledge_item(&id, &body.user)
+            .map_err(|e| json!({"error": e}))
+            .unwrap_or_default(),
+    )
 }
 
-async fn shift_assign(
-    Path(id): Path<String>,
-    Json(body): Json<ShiftActionRequest>,
-) -> Json<Value> {
-    Json(shift_queue::assign_item(&id, &body.user).map_err(|e| json!({"error": e})).unwrap_or_default())
+async fn shift_assign(Path(id): Path<String>, Json(body): Json<ShiftActionRequest>) -> Json<Value> {
+    Json(
+        shift_queue::assign_item(&id, &body.user)
+            .map_err(|e| json!({"error": e}))
+            .unwrap_or_default(),
+    )
 }
 
 async fn shift_escalate(
     Path(id): Path<String>,
     Json(body): Json<ShiftEscalateRequest>,
 ) -> Json<Value> {
-    Json(shift_queue::escalate_item(&id, &body.reason).map_err(|e| json!({"error": e})).unwrap_or_default())
+    Json(
+        shift_queue::escalate_item(&id, &body.reason)
+            .map_err(|e| json!({"error": e}))
+            .unwrap_or_default(),
+    )
 }
 
 async fn shift_resolve(
     Path(id): Path<String>,
     Json(body): Json<ShiftResolveRequest>,
 ) -> Json<Value> {
-    Json(shift_queue::resolve_item(&id, &body.resolution).map_err(|e| json!({"error": e})).unwrap_or_default())
+    Json(
+        shift_queue::resolve_item(&id, &body.resolution)
+            .map_err(|e| json!({"error": e}))
+            .unwrap_or_default(),
+    )
 }
 
 async fn shift_handover() -> Json<Value> {
     Json(shift_queue::get_handover_report())
 }
 
-async fn shift_my_items(
-    Query(params): Query<ShiftMyItemsQuery>,
-) -> Json<Value> {
+async fn shift_my_items(Query(params): Query<ShiftMyItemsQuery>) -> Json<Value> {
     let user = params.user.unwrap_or_default();
     Json(shift_queue::get_my_items(&user))
 }
@@ -4673,6 +4668,7 @@ struct SoftwarePackagesQuery {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SoftwareActionRequest {
     #[serde(rename = "requestId")]
     request_id: String,
@@ -4704,7 +4700,10 @@ async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>)
     }
 }
 
-async fn software_approve(Path(id): Path<String>, Json(body): Json<SoftwareActionRequest>) -> ApiResult {
+async fn software_approve(
+    Path(id): Path<String>,
+    Json(body): Json<SoftwareActionRequest>,
+) -> ApiResult {
     let approver = body.approver.unwrap_or_else(|| "admin".into());
     match software_deployment::approve_deployment(&id, &approver) {
         Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
@@ -5018,7 +5017,9 @@ async fn legal_hold_place(
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid hold_type: {}. Must be Investigation, Litigation, Compliance, or Retention.", req.hold_type)})),
+                Json(
+                    json!({"error": format!("Invalid hold_type: {}. Must be Investigation, Litigation, Compliance, or Retention.", req.hold_type)}),
+                ),
             ))
         }
     };
@@ -5057,9 +5058,7 @@ async fn legal_hold_release(
     }
 }
 
-async fn legal_hold_active(
-    Query(q): Query<LegalHoldActiveQuery>,
-) -> Json<Value> {
+async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> Json<Value> {
     let site = q.site.unwrap_or_default();
     let holds = legal_hold::get_active_holds(&site);
     Json(serde_json::to_value(holds).unwrap())
@@ -5301,9 +5300,7 @@ async fn noise_flapping_detect(
     }
 }
 
-async fn noise_suggest(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn noise_suggest(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match noise_remediation::suggest_remediation(&id) {
         Ok(suggestions) => Ok(Json(suggestions)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -5420,7 +5417,9 @@ async fn observe_log_forwarder() -> Json<Value> {
 fn parse_source_types(raw: &[String]) -> Result<Vec<log_forwarder::LogSourceType>, String> {
     raw.iter()
         .map(|s| match s.as_str() {
-            "windows-event-log" | "WindowsEventLog" => Ok(log_forwarder::LogSourceType::WindowsEventLog),
+            "windows-event-log" | "WindowsEventLog" => {
+                Ok(log_forwarder::LogSourceType::WindowsEventLog)
+            }
             "syslog" | "Syslog" => Ok(log_forwarder::LogSourceType::Syslog),
             "auditd" | "Auditd" => Ok(log_forwarder::LogSourceType::Auditd),
             "iis" | "IIS" => Ok(log_forwarder::LogSourceType::IIS),
@@ -5944,9 +5943,7 @@ async fn aiops_review(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
-async fn aiops_accept(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn aiops_accept(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     aiops::accept_suggestion(&id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
@@ -5961,9 +5958,7 @@ async fn aiops_reject(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
-async fn aiops_implement(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn aiops_implement(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     aiops::implement_suggestion(&id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
@@ -7782,21 +7777,27 @@ async fn network_contract() -> Json<Value> {
 
 // ─── OOB Access Validation handlers ───
 
-async fn oob_test_endpoint(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn oob_test_endpoint(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match oob_access::test_endpoint(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
     }
 }
 
-async fn oob_validate_cert(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn oob_validate_cert(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match oob_access::validate_certificate(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
     }
 }
 
-async fn oob_check_defaults(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn oob_check_defaults(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match oob_access::check_default_credentials(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -7948,9 +7949,7 @@ struct ServicenowRequestRequest {
 
 // ─── ServiceNow API handlers ───
 
-async fn servicenow_incident(
-    Json(body): Json<ServicenowIncidentRequest>,
-) -> ApiResult {
+async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> ApiResult {
     match servicenow_api::prepare_incident(
         &body.ci_name,
         &body.description,
@@ -7962,9 +7961,7 @@ async fn servicenow_incident(
     }
 }
 
-async fn servicenow_change(
-    Json(body): Json<ServicenowChangeRequest>,
-) -> ApiResult {
+async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResult {
     match servicenow_api::prepare_change(
         &body.ci_name,
         &body.change_type,
@@ -7978,14 +7975,8 @@ async fn servicenow_change(
     }
 }
 
-async fn servicenow_request(
-    Json(body): Json<ServicenowRequestRequest>,
-) -> ApiResult {
-    match servicenow_api::prepare_request(
-        &body.ci_name,
-        &body.request_type,
-        &body.description,
-    ) {
+async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiResult {
+    match servicenow_api::prepare_request(&body.ci_name, &body.request_type, &body.description) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err(status_400(&e)),
     }
@@ -8124,9 +8115,7 @@ async fn repo_capacity_recommendations(
 
 // ─── Hardware lifecycle handlers ───
 
-async fn hardware_inventory(
-    Query(query): Query<HardwareInventoryQuery>,
-) -> Json<Value> {
+async fn hardware_inventory(Query(query): Query<HardwareInventoryQuery>) -> Json<Value> {
     let site = query.site.as_deref().unwrap_or("");
     let inventory = hardware_lifecycle::get_inventory(site);
     Json(serde_json::to_value(inventory).unwrap())
@@ -8144,25 +8133,19 @@ async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
     }
 }
 
-async fn hardware_firmware_gaps(
-    Query(query): Query<HardwareFirmwareGapsQuery>,
-) -> Json<Value> {
+async fn hardware_firmware_gaps(Query(query): Query<HardwareFirmwareGapsQuery>) -> Json<Value> {
     let site = query.site.as_deref().unwrap_or("");
     let gaps = hardware_lifecycle::get_firmware_gaps(site);
     Json(serde_json::to_value(gaps).unwrap())
 }
 
-async fn hardware_support_risk(
-    Query(query): Query<HardwareSupportRiskQuery>,
-) -> Json<Value> {
+async fn hardware_support_risk(Query(query): Query<HardwareSupportRiskQuery>) -> Json<Value> {
     let site = query.site.as_deref().unwrap_or("");
     let risk = hardware_lifecycle::get_support_risk(site);
     Json(serde_json::to_value(risk).unwrap())
 }
 
-async fn hardware_refresh_plan(
-    Query(query): Query<HardwareRefreshPlanQuery>,
-) -> Json<Value> {
+async fn hardware_refresh_plan(Query(query): Query<HardwareRefreshPlanQuery>) -> Json<Value> {
     let site = query.site.as_deref().unwrap_or("");
     let plan = hardware_lifecycle::get_refresh_plan(site);
     Json(serde_json::to_value(plan).unwrap())
@@ -8290,17 +8273,13 @@ async fn hardware_contract() -> Json<Value> {
 
 // ─── Outage communications handlers ───
 
-async fn outage_notices_list(
-    Query(query): Query<OutageNoticeListQuery>,
-) -> Json<Value> {
+async fn outage_notices_list(Query(query): Query<OutageNoticeListQuery>) -> Json<Value> {
     let site = query.site.as_deref().unwrap_or("");
     let notices = outage_comms::get_all_notices(site);
     Json(serde_json::to_value(notices).unwrap())
 }
 
-async fn outage_notices_create(
-    Json(body): Json<OutageNoticeCreateRequest>,
-) -> ApiResult {
+async fn outage_notices_create(Json(body): Json<OutageNoticeCreateRequest>) -> ApiResult {
     match outage_comms::create_notice(
         &body.site,
         body.affected_systems,
@@ -8358,23 +8337,17 @@ async fn outage_notices_cancel(Path(id): Path<String>) -> ApiResult {
     }
 }
 
-async fn outage_notices_active(
-    Query(query): Query<OutageNoticeActiveQuery>,
-) -> Json<Value> {
+async fn outage_notices_active(Query(query): Query<OutageNoticeActiveQuery>) -> Json<Value> {
     let active = outage_comms::get_active_notices(&query.site);
     Json(serde_json::to_value(active).unwrap())
 }
 
-async fn outage_notices_history(
-    Query(query): Query<OutageNoticeHistoryQuery>,
-) -> Json<Value> {
+async fn outage_notices_history(Query(query): Query<OutageNoticeHistoryQuery>) -> Json<Value> {
     let history = outage_comms::get_notice_history(&query.site);
     Json(serde_json::to_value(history).unwrap())
 }
 
-async fn outage_notices_upcoming(
-    Query(query): Query<OutageNoticeUpcomingQuery>,
-) -> Json<Value> {
+async fn outage_notices_upcoming(Query(query): Query<OutageNoticeUpcomingQuery>) -> Json<Value> {
     let upcoming = outage_comms::get_upcoming(&query.site);
     Json(serde_json::to_value(upcoming).unwrap())
 }
@@ -8406,9 +8379,7 @@ struct ImageFactoryScheduleBody {
     distro: String,
 }
 
-async fn image_factory_initiate_build(
-    Json(body): Json<ImageFactoryBuildBody>,
-) -> ApiResult {
+async fn image_factory_initiate_build(Json(body): Json<ImageFactoryBuildBody>) -> ApiResult {
     image_factory::initiate_build(
         &body.image_name,
         &body.os_family,
@@ -8420,17 +8391,13 @@ async fn image_factory_initiate_build(
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
-async fn image_factory_run_tests(
-    Path(id): Path<String>,
-) -> ApiResult {
+async fn image_factory_run_tests(Path(id): Path<String>) -> ApiResult {
     image_factory::run_tests(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn image_factory_promote(
-    Path(id): Path<String>,
-) -> ApiResult {
+async fn image_factory_promote(Path(id): Path<String>) -> ApiResult {
     image_factory::promote_image(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -8445,17 +8412,13 @@ async fn image_factory_reject(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn image_factory_active(
-    Path(site): Path<String>,
-) -> ApiResult {
+async fn image_factory_active(Path(site): Path<String>) -> ApiResult {
     image_factory::get_active_images(&site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn image_factory_history(
-    Path(site): Path<String>,
-) -> ApiResult {
+async fn image_factory_history(Path(site): Path<String>) -> ApiResult {
     image_factory::get_build_history(&site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -8467,9 +8430,7 @@ async fn image_factory_superseded() -> ApiResult {
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 
-async fn image_factory_schedule_monthly(
-    Json(body): Json<ImageFactoryScheduleBody>,
-) -> ApiResult {
+async fn image_factory_schedule_monthly(Json(body): Json<ImageFactoryScheduleBody>) -> ApiResult {
     image_factory::schedule_monthly_build(&body.site, &body.os_family, &body.distro)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
@@ -8635,7 +8596,8 @@ struct EvidenceExportQuery {
     format: Option<String>,
 }
 
-async fn evidence_collect() -> Result<Json<ryuki_engine::models::EvidencePack>, (StatusCode, Json<Value>)> {
+async fn evidence_collect(
+) -> Result<Json<ryuki_engine::models::EvidencePack>, (StatusCode, Json<Value>)> {
     let req = ryuki_engine::models::Request::new(
         "req-evidence-001".into(),
         "offering-vm".into(),
@@ -8656,7 +8618,10 @@ async fn evidence_redact(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut pack: ryuki_engine::models::EvidencePack =
         serde_json::from_value(body.pack).map_err(|e| {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
         })?;
     evidence_pipeline::redact_evidence(&mut pack)
         .map(|_| Json(serde_json::to_value(&pack).unwrap_or_default()))
@@ -8689,10 +8654,15 @@ async fn evidence_verify_compliance(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pack: ryuki_engine::models::EvidencePack =
         serde_json::from_value(body.pack).map_err(|e| {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
         })?;
     evidence_pipeline::verify_evidence_compliance(&pack)
-        .map(|issues| Json(json!({"source": "dry-run", "compliant": issues.is_empty(), "issues": issues})))
+        .map(|issues| {
+            Json(json!({"source": "dry-run", "compliant": issues.is_empty(), "issues": issues}))
+        })
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
@@ -8983,7 +8953,10 @@ async fn firmware_request_exception(
     Json(body): Json<FirmwareExceptionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     firmware_lifecycle::request_exception(
-        &body.device_id, &body.reason, &body.approved_by, body.expiry_days,
+        &body.device_id,
+        &body.reason,
+        &body.approved_by,
+        body.expiry_days,
     )
     .map(Json)
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
@@ -9072,14 +9045,17 @@ struct IncidentEscalateRequest {
 async fn incident_assemble(
     Json(body): Json<IncidentAssembleRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::assemble_context(&body.incident_title, &body.severity, body.affected_ci_names, &body.site)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    incident_context::assemble_context(
+        &body.incident_title,
+        &body.severity,
+        body.affected_ci_names,
+        &body.site,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
-async fn incident_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn incident_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     incident_context::get_context(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -9099,9 +9075,7 @@ async fn incident_services(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn incident_oncall(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn incident_oncall(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     incident_context::get_on_call(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -9264,13 +9238,9 @@ async fn access_review_revoke(
     Path(id): Path<String>,
     Json(body): Json<AccessReviewActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::revoke_review(
-        &id,
-        &body.reviewer,
-        &body.reason.unwrap_or_default(),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    access_recertification::revoke_review(&id, &body.reviewer, &body.reason.unwrap_or_default())
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
 async fn access_review_exempt(
@@ -9369,9 +9339,9 @@ async fn datacenter_site_report_endpoint(
 }
 
 async fn datacenter_failing_checks_endpoint() -> Json<Value> {
-    Json(datacenter_readiness::get_failing_checks().unwrap_or_else(|e| {
-        json!({"source": "dry-run", "error": e, "failing_count": 0, "failing_checks": []})
-    }))
+    Json(datacenter_readiness::get_failing_checks().unwrap_or_else(
+        |e| json!({"source": "dry-run", "error": e, "failing_count": 0, "failing_checks": []}),
+    ))
 }
 
 async fn datacenter_check_power_endpoint(
@@ -9415,9 +9385,10 @@ async fn datacenter_full_readiness_endpoint(
 }
 
 async fn datacenter_sites_endpoint() -> Json<Value> {
-    Json(datacenter_readiness::get_sites().unwrap_or_else(|e| {
-        json!({"source": "dry-run", "error": e, "sites": []})
-    }))
+    Json(
+        datacenter_readiness::get_sites()
+            .unwrap_or_else(|e| json!({"source": "dry-run", "error": e, "sites": []})),
+    )
 }
 
 // ─── SQL Server Deployment request types ───
