@@ -42,6 +42,10 @@ use ryuki_engine::noise_remediation;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::outage_comms;
+use ryuki_engine::runbook_execution;
+use ryuki_engine::firmware_lifecycle;
+use ryuki_engine::incident_context;
+use ryuki_engine::access_recertification;
 use ryuki_engine::patch_engine;
 use ryuki_engine::repository_capacity;
 use ryuki_engine::server_decommission;
@@ -183,6 +187,20 @@ pub fn routes() -> Router {
             "/api/identity/entra-rbac-approval-readiness-contract",
             get(identity_entra_rbac),
         )
+        // ─── Access Recertification Engine ───
+        .route("/api/identity/access-review/reviews", get(access_reviews_list))
+        .route("/api/identity/access-review/review/{id}", get(access_review_get))
+        .route("/api/identity/access-review/due", get(access_reviews_due))
+        .route("/api/identity/access-review/expiring", get(access_reviews_expiring))
+        .route("/api/identity/access-review/{id}/start", post(access_review_start))
+        .route("/api/identity/access-review/{id}/approve", post(access_review_approve))
+        .route("/api/identity/access-review/{id}/revoke", post(access_review_revoke))
+        .route("/api/identity/access-review/{id}/exempt", post(access_review_exempt))
+        .route("/api/identity/access-review/summary", get(access_review_summary))
+        .route("/api/identity/access-review/campaign", post(access_campaign_create))
+        .route("/api/identity/access-review/campaign/{id}", get(access_campaign_get))
+        .route("/api/identity/access-review/campaigns", get(access_campaigns_list))
+        .route("/api/identity/access-review-contract", get(access_review_contract))
         .route(
             "/api/identity/access-review-recertification-contract",
             get(identity_access_review),
@@ -405,6 +423,18 @@ pub fn routes() -> Router {
             "/api/operations/certificate-lifecycle-contract",
             get(operations_certificate_lifecycle),
         )
+        // ─── Runbook Execution Engine ───
+        .route("/api/ops/runbook/catalog", get(runbook_catalog))
+        .route("/api/ops/runbook/start", post(runbook_start))
+        .route("/api/ops/runbook/execution/{id}", get(runbook_get_execution))
+        .route("/api/ops/runbook/step/{id}/{step}", post(runbook_execute_step))
+        .route("/api/ops/runbook/approve/{id}", post(runbook_approve))
+        .route("/api/ops/runbook/complete/{id}", post(runbook_complete))
+        .route("/api/ops/runbook/fail/{id}", post(runbook_fail))
+        .route("/api/ops/runbook/rollback/{id}", post(runbook_rollback))
+        .route("/api/ops/runbook/executions", get(runbook_executions_list))
+        .route("/api/ops/runbook/active", get(runbook_active))
+        .route("/api/ops/runbook-contract", get(runbook_contract))
         .route(
             "/api/operations/runbook-launch-contract",
             get(operations_runbook_launch),
@@ -476,6 +506,17 @@ pub fn routes() -> Router {
             "/api/operations/platform-health-contract",
             get(operations_platform_health),
         )
+        // ─── Incident Context Engine ───
+        .route("/api/ops/incident/assemble", post(incident_assemble))
+        .route("/api/ops/incident/{id}", get(incident_get))
+        .route("/api/ops/incident/active", get(incident_active))
+        .route("/api/ops/incident/{id}/services", get(incident_services))
+        .route("/api/ops/incident/{id}/oncall", get(incident_oncall))
+        .route("/api/ops/incident/{id}/changes", get(incident_changes))
+        .route("/api/ops/incident/{id}/resolve", post(incident_resolve))
+        .route("/api/ops/incident/{id}/add-ci", post(incident_add_ci))
+        .route("/api/ops/incident/{id}/escalate", post(incident_escalate))
+        .route("/api/ops/incident-context-contract", get(incident_context_contract))
         .route(
             "/api/operations/incident-context-contract",
             get(operations_incident_context),
@@ -1409,6 +1450,18 @@ pub fn routes() -> Router {
             "/api/datacenter/hardware-contract",
             get(hardware_contract),
         )
+        // ─── Firmware Lifecycle Engine ───
+        .route("/api/datacenter/firmware/devices", get(firmware_devices_list))
+        .route("/api/datacenter/firmware/device/{id}", get(firmware_device_get))
+        .route("/api/datacenter/firmware/check/{id}", post(firmware_check_compliance))
+        .route("/api/datacenter/firmware/noncompliant", get(firmware_noncompliant))
+        .route("/api/datacenter/firmware/eol", get(firmware_eol))
+        .route("/api/datacenter/firmware/exception", post(firmware_request_exception))
+        .route("/api/datacenter/firmware/exceptions", get(firmware_exceptions_list))
+        .route("/api/datacenter/firmware/revoke/{id}", post(firmware_revoke_exception))
+        .route("/api/datacenter/firmware/report", get(firmware_compliance_report))
+        .route("/api/datacenter/firmware/vendor-summary", get(firmware_vendor_summary))
+        .route("/api/datacenter/firmware-contract", get(firmware_contract))
         .route(
             "/api/datacenter/image-factory/initiate-build",
             post(image_factory_initiate_build),
@@ -8658,6 +8711,554 @@ async fn platform_health_metrics_text() -> axum::response::Response {
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(axum::body::Body::from(health_monitor::metrics_text()))
         .unwrap()
+}
+
+// ─── Runbook Execution handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RunbookStartRequest {
+    #[serde(rename = "runbookId")]
+    runbook_id: String,
+    site: String,
+    #[serde(rename = "startedBy")]
+    started_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RunbookApproveRequest {
+    approver: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RunbookFailRequest {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RunbookListQuery {
+    site: Option<String>,
+}
+
+async fn runbook_catalog() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::list_runbooks()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn runbook_start(
+    Json(body): Json<RunbookStartRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::start_runbook(&body.runbook_id, &body.site, &body.started_by)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn runbook_get_execution(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::get_execution(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_execute_step(
+    Path(params): Path<(String, u32)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (id, step) = params;
+    runbook_execution::execute_step(&id, step)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_approve(
+    Path(id): Path<String>,
+    Json(body): Json<RunbookApproveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::approve_execution(&id, &body.approver)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_complete(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::complete_execution(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_fail(
+    Path(id): Path<String>,
+    Json(body): Json<RunbookFailRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::fail_execution(&id, &body.reason)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_rollback(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::rollback_execution(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn runbook_executions_list(
+    Query(params): Query<RunbookListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::list_executions(params.site.as_deref())
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn runbook_active() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    runbook_execution::get_active_executions()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn runbook_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "endpoints": [
+            {"method":"GET","path":"/api/ops/runbook/catalog"},
+            {"method":"POST","path":"/api/ops/runbook/start"},
+            {"method":"GET","path":"/api/ops/runbook/execution/{id}"},
+            {"method":"POST","path":"/api/ops/runbook/step/{id}/{step}"},
+            {"method":"POST","path":"/api/ops/runbook/approve/{id}"},
+            {"method":"POST","path":"/api/ops/runbook/complete/{id}"},
+            {"method":"POST","path":"/api/ops/runbook/fail/{id}"},
+            {"method":"POST","path":"/api/ops/runbook/rollback/{id}"},
+            {"method":"GET","path":"/api/ops/runbook/executions"},
+            {"method":"GET","path":"/api/ops/runbook/active"}
+        ]
+    }))
+}
+
+// ─── Firmware Lifecycle handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FirmwareDeviceQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FirmwareExceptionRequest {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    reason: String,
+    #[serde(rename = "approvedBy")]
+    approved_by: String,
+    #[serde(rename = "expiryDays")]
+    expiry_days: i64,
+}
+
+async fn firmware_devices_list(
+    Query(params): Query<FirmwareDeviceQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::list_devices(params.site.as_deref().unwrap_or(""))
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_device_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::get_device(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn firmware_check_compliance(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::check_compliance(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn firmware_noncompliant() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::get_noncompliant()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_eol() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::get_eol_devices()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_request_exception(
+    Json(body): Json<FirmwareExceptionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::request_exception(
+        &body.device_id, &body.reason, &body.approved_by, body.expiry_days,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn firmware_exceptions_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::list_exceptions()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_revoke_exception(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::revoke_exception(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn firmware_compliance_report() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::get_compliance_report()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_vendor_summary() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    firmware_lifecycle::get_vendor_summary()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn firmware_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "endpoints": [
+            {"method":"GET","path":"/api/datacenter/firmware/devices"},
+            {"method":"GET","path":"/api/datacenter/firmware/device/{id}"},
+            {"method":"POST","path":"/api/datacenter/firmware/check/{id}"},
+            {"method":"GET","path":"/api/datacenter/firmware/noncompliant"},
+            {"method":"GET","path":"/api/datacenter/firmware/eol"},
+            {"method":"POST","path":"/api/datacenter/firmware/exception"},
+            {"method":"GET","path":"/api/datacenter/firmware/exceptions"},
+            {"method":"POST","path":"/api/datacenter/firmware/revoke/{id}"},
+            {"method":"GET","path":"/api/datacenter/firmware/report"},
+            {"method":"GET","path":"/api/datacenter/firmware/vendor-summary"}
+        ]
+    }))
+}
+
+// ─── Incident Context handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct IncidentAssembleRequest {
+    #[serde(rename = "incidentTitle")]
+    incident_title: String,
+    severity: String,
+    #[serde(rename = "affectedCiNames")]
+    affected_ci_names: Vec<String>,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct IncidentResolveRequest {
+    resolution: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct IncidentAddCiRequest {
+    #[serde(rename = "ciName")]
+    ci_name: String,
+    #[serde(rename = "ciType")]
+    ci_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct IncidentEscalateRequest {
+    reason: String,
+}
+
+async fn incident_assemble(
+    Json(body): Json<IncidentAssembleRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::assemble_context(&body.incident_title, &body.severity, body.affected_ci_names, &body.site)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn incident_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::get_context(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_active() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::list_active_incidents()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn incident_services(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::get_affected_services(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_oncall(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::get_on_call(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_changes(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::get_recent_changes(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_resolve(
+    Path(id): Path<String>,
+    Json(body): Json<IncidentResolveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::resolve_incident(&id, &body.resolution)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_add_ci(
+    Path(id): Path<String>,
+    Json(body): Json<IncidentAddCiRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::add_affected_ci(&id, &body.ci_name, &body.ci_type)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_escalate(
+    Path(id): Path<String>,
+    Json(body): Json<IncidentEscalateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    incident_context::escalate(&id, &body.reason)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn incident_context_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "endpoints": [
+            {"method":"POST","path":"/api/ops/incident/assemble"},
+            {"method":"GET","path":"/api/ops/incident/{id}"},
+            {"method":"GET","path":"/api/ops/incident/active"},
+            {"method":"GET","path":"/api/ops/incident/{id}/services"},
+            {"method":"GET","path":"/api/ops/incident/{id}/oncall"},
+            {"method":"GET","path":"/api/ops/incident/{id}/changes"},
+            {"method":"POST","path":"/api/ops/incident/{id}/resolve"},
+            {"method":"POST","path":"/api/ops/incident/{id}/add-ci"},
+            {"method":"POST","path":"/api/ops/incident/{id}/escalate"}
+        ]
+    }))
+}
+
+// ─── Access Recertification handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AccessReviewQuery {
+    site: Option<String>,
+    #[serde(rename = "reviewType")]
+    review_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AccessReviewActionRequest {
+    reviewer: String,
+    justification: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AccessReviewExemptRequest {
+    reviewer: String,
+    justification: String,
+    #[serde(rename = "exemptionExpiry")]
+    exemption_expiry: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AccessReviewExpiringQuery {
+    days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AccessCampaignCreateRequest {
+    name: String,
+    #[serde(rename = "reviewType")]
+    review_type: String,
+    #[serde(rename = "reviewerGroup")]
+    reviewer_group: String,
+    days: i64,
+}
+
+async fn access_reviews_list(
+    Query(params): Query<AccessReviewQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::list_reviews(
+        params.site.as_deref().unwrap_or(""),
+        params.review_type.as_deref().unwrap_or(""),
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn access_review_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::get_review(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_reviews_due() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::list_due_reviews()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn access_reviews_expiring(
+    Query(params): Query<AccessReviewExpiringQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::list_expiring(params.days.unwrap_or(30))
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn access_review_start(
+    Path(id): Path<String>,
+    Json(body): Json<AccessReviewActionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::start_review(&id, &body.reviewer)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_review_approve(
+    Path(id): Path<String>,
+    Json(body): Json<AccessReviewActionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::approve_review(
+        &id,
+        &body.reviewer,
+        &body.justification.unwrap_or_default(),
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_review_revoke(
+    Path(id): Path<String>,
+    Json(body): Json<AccessReviewActionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::revoke_review(
+        &id,
+        &body.reviewer,
+        &body.reason.unwrap_or_default(),
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_review_exempt(
+    Path(id): Path<String>,
+    Json(body): Json<AccessReviewExemptRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::exempt_review(
+        &id,
+        &body.reviewer,
+        &body.justification,
+        &body.exemption_expiry,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_review_summary() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::get_summary()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn access_campaign_create(
+    Json(body): Json<AccessCampaignCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::create_campaign(
+        &body.name,
+        &body.review_type,
+        &body.reviewer_group,
+        body.days,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn access_campaign_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::get_campaign(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn access_campaigns_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    access_recertification::list_campaigns()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn access_review_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "endpoints": [
+            {"method":"GET","path":"/api/identity/access-review/reviews"},
+            {"method":"GET","path":"/api/identity/access-review/review/{id}"},
+            {"method":"GET","path":"/api/identity/access-review/due"},
+            {"method":"GET","path":"/api/identity/access-review/expiring"},
+            {"method":"POST","path":"/api/identity/access-review/{id}/start"},
+            {"method":"POST","path":"/api/identity/access-review/{id}/approve"},
+            {"method":"POST","path":"/api/identity/access-review/{id}/revoke"},
+            {"method":"POST","path":"/api/identity/access-review/{id}/exempt"},
+            {"method":"GET","path":"/api/identity/access-review/summary"},
+            {"method":"POST","path":"/api/identity/access-review/campaign"},
+            {"method":"GET","path":"/api/identity/access-review/campaign/{id}"},
+            {"method":"GET","path":"/api/identity/access-review/campaigns"}
+        ]
+    }))
 }
 
 // ─── Datacenter Readiness request types ───
