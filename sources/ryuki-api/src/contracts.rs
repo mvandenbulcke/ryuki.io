@@ -24,12 +24,15 @@ use ryuki_engine::file_share_ntfs;
 use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
+use ryuki_engine::cmdb_engine;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::datacenter_readiness;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
+use ryuki_engine::health_monitor;
 use ryuki_engine::image_factory;
+use ryuki_engine::inventory_sync;
 use ryuki_engine::immutability_compliance;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
@@ -51,6 +54,7 @@ use ryuki_engine::vm_operations;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::degradation_mode;
 use ryuki_engine::emergency_change;
+use ryuki_engine::evidence_pipeline;
 use ryuki_engine::servicenow_api;
 use ryuki_engine::zabbix_drift;
 
@@ -256,6 +260,11 @@ pub fn routes() -> Router {
             "/api/identity/shares-contract",
             get(shares_contract),
         )
+        // ─── Evidence Pipeline Engine ───
+        .route("/api/evidence/collect", post(evidence_collect))
+        .route("/api/evidence/redact", post(evidence_redact))
+        .route("/api/evidence/export", get(evidence_export))
+        .route("/api/evidence/verify-compliance", post(evidence_verify_compliance))
         .route(
             "/api/evidence/export-retention-contract",
             get(evidence_export_retention),
@@ -333,6 +342,10 @@ pub fn routes() -> Router {
             "/api/integrations/servicenow/future-api-contract",
             get(integrations_servicenow_future_api),
         )
+        // ─── Inventory Sync Engine ───
+        .route("/api/inventory/sync", post(inventory_run_sync))
+        .route("/api/inventory/reconcile", post(inventory_run_reconciliation))
+        .route("/api/inventory/ownership-risks", get(inventory_ownership_risks))
         .route("/api/inventory/coverage-contract", get(inventory_coverage))
         .route(
             "/api/inventory/resource-overview-contract",
@@ -840,6 +853,10 @@ pub fn routes() -> Router {
             post(logs_disable),
         )
         .route("/api/observe/logs-contract", get(logs_contract))
+        // ─── CMDB Engine ───
+        .route("/api/cmdb/import", post(cmdb_import_records))
+        .route("/api/cmdb/reconcile", post(cmdb_run_reconciliation))
+        .route("/api/cmdb/export", get(cmdb_export_records))
         .route(
             "/api/cmdb/reconciliation-contract",
             get(cmdb_reconciliation),
@@ -998,6 +1015,10 @@ pub fn routes() -> Router {
             "/api/analytics/aiops-contract",
             get(aiops_contract),
         )
+        // ─── Health Monitor Engine ───
+        .route("/api/platform/health/all", get(platform_health_all_checks))
+        .route("/api/platform/health/check/{adapter}", get(platform_health_check_adapter))
+        .route("/api/platform/health/metrics", get(platform_health_metrics_text))
         .route("/api/platform/health", get(platform_health))
         .route(
             "/api/platform/health/components",
@@ -8474,6 +8495,169 @@ async fn image_factory_contract() -> Json<Value> {
             }
         ]
     }))
+}
+
+// ─── CMDB Engine handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CmdbImportRequest {
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CmdbExportQuery {
+    format: Option<String>,
+}
+
+async fn cmdb_import_records(
+    Json(body): Json<CmdbImportRequest>,
+) -> Result<Json<Vec<ryuki_engine::models::CmdbRecord>>, (StatusCode, Json<Value>)> {
+    cmdb_engine::import_cmdb_records(&body.source)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn cmdb_run_reconciliation() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let inventory = inventory_sync::sync_inventory_sources()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    let cmdb_records = cmdb_engine::import_cmdb_records("cmdb-excel-export")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    cmdb_engine::reconcile_cmdb(&inventory, &cmdb_records)
+        .map(|results| Json(json!({"source": "dry-run", "reconciliation_results": results})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn cmdb_export_records(
+    Query(params): Query<CmdbExportQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let records = cmdb_engine::import_cmdb_records("cmdb-excel-export")
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    let format_str = params.format.as_deref().unwrap_or("json");
+    cmdb_engine::export_cmdb(&records, format_str)
+        .map(|s| Json(json!({"source": "dry-run", "format": format_str, "data": s})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+// ─── Inventory Sync handlers ───
+
+async fn inventory_run_sync(
+) -> Result<Json<Vec<ryuki_engine::models::InventoryItem>>, (StatusCode, Json<Value>)> {
+    inventory_sync::sync_inventory_sources()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn inventory_run_reconciliation() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let items = inventory_sync::sync_inventory_sources()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    let source = "all-sources";
+    inventory_sync::reconcile_inventory(source, &items)
+        .map(|diffs| Json(json!({"source": "dry-run", "differences": diffs})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn inventory_ownership_risks() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let items = inventory_sync::sync_inventory_sources()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    inventory_sync::detect_ownership_risks(&items)
+        .map(|risks| Json(json!({"source": "dry-run", "risks": risks})))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+// ─── Evidence Pipeline handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EvidenceRedactRequest {
+    pack: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EvidenceExportQuery {
+    format: Option<String>,
+}
+
+async fn evidence_collect() -> Result<Json<ryuki_engine::models::EvidencePack>, (StatusCode, Json<Value>)> {
+    let req = ryuki_engine::models::Request::new(
+        "req-evidence-001".into(),
+        "offering-vm".into(),
+        ryuki_engine::models::RequestType::ServerDeployment,
+        "system-engineer".into(),
+        "app-team-web".into(),
+        "LOVE".into(),
+        "production".into(),
+        "high".into(),
+    );
+    evidence_pipeline::collect_evidence(&req)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn evidence_redact(
+    Json(body): Json<EvidenceRedactRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut pack: ryuki_engine::models::EvidencePack =
+        serde_json::from_value(body.pack).map_err(|e| {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+        })?;
+    evidence_pipeline::redact_evidence(&mut pack)
+        .map(|_| Json(serde_json::to_value(&pack).unwrap_or_default()))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn evidence_export(
+    Query(params): Query<EvidenceExportQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let req = ryuki_engine::models::Request::new(
+        "req-evidence-export".into(),
+        "offering-vm".into(),
+        ryuki_engine::models::RequestType::ServerDeployment,
+        "system-engineer".into(),
+        "app-team-web".into(),
+        "LOVE".into(),
+        "production".into(),
+        "high".into(),
+    );
+    let pack = evidence_pipeline::collect_evidence(&req)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let format_str = params.format.as_deref().unwrap_or("json");
+    evidence_pipeline::export_evidence(&pack, format_str)
+        .map(|data| Json(json!({"source": "dry-run", "format": format_str, "data": data})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn evidence_verify_compliance(
+    Json(body): Json<EvidenceRedactRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pack: ryuki_engine::models::EvidencePack =
+        serde_json::from_value(body.pack).map_err(|e| {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+        })?;
+    evidence_pipeline::verify_evidence_compliance(&pack)
+        .map(|issues| Json(json!({"source": "dry-run", "compliant": issues.is_empty(), "issues": issues})))
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+// ─── Health Monitor handlers ───
+
+async fn platform_health_all_checks() -> Json<ryuki_engine::health_monitor::PlatformHealth> {
+    Json(health_monitor::run_all_checks())
+}
+
+async fn platform_health_check_adapter(
+    Path(adapter): Path<String>,
+) -> Json<ryuki_engine::health_monitor::HealthCheck> {
+    Json(health_monitor::check_adapter_health(&adapter))
+}
+
+async fn platform_health_metrics_text() -> axum::response::Response {
+    axum::response::Response::builder()
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(axum::body::Body::from(health_monitor::metrics_text()))
+        .unwrap()
 }
 
 // ─── Datacenter Readiness request types ───
