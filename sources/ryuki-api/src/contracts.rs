@@ -3227,8 +3227,8 @@ async fn catalog_site_catalog() -> Json<Value> {
         "rawProviderPayloadsAllowed": false, "rawSiteInventoryRowsAllowed": false, "rawRecipientDataAllowed": false,
         "windowsBehavior": ["Sysprep","VM-name generator","Change SID"],
         "sites": [
-            {"spec":"belove-windows-customization","country":"BE","site":"LOVE","timezoneCode":105},
-            {"spec":"esbur1-windows-customization","country":"ES","site":"BUR1","timezoneCode":105},
+            {"spec":"defra-windows-customization","country":"DE","site":"DEFRA","timezoneCode":105},
+            {"spec":"gblon-windows-customization","country":"GB","site":"GBLON","timezoneCode":105},
             {"spec":"esccss-windows-customization","country":"ES","site":"CCSS","timezoneCode":105},
             {"spec":"estor1-windows-customization","country":"ES","site":"TOR1","timezoneCode":105},
             {"spec":"estruj-windows-customization","country":"ES","site":"TRUJ","timezoneCode":105},
@@ -3521,7 +3521,7 @@ async fn ad_delete(Path(name): Path<String>) -> ApiResult {
 }
 
 async fn ad_reconcile(Query(query): Query<AdReconcileQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("LOVE");
+    let site = query.site.as_deref().unwrap_or("DEFRA");
     match ad_computer_lifecycle::reconcile_computers(site) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -3529,7 +3529,7 @@ async fn ad_reconcile(Query(query): Query<AdReconcileQuery>) -> ApiResult {
 }
 
 async fn ad_orphaned(Query(query): Query<AdOrphanedQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("LOVE");
+    let site = query.site.as_deref().unwrap_or("DEFRA");
     match ad_computer_lifecycle::get_orphaned(site) {
         Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -3546,8 +3546,8 @@ async fn ad_computer_contract() -> Json<Value> {
         "lifecycleModes": ["prestage", "validate", "move", "disable", "enable", "delete", "reconcile"],
         "computerStatuses": ["Active", "Disabled", "Quarantined", "Deleted"],
         "supportedOs": ["Windows Server 2022", "Windows Server 2019", "Windows Server 2016", "Windows 11", "Windows 10"],
-        "validSites": ["LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1", "PITE"],
-        "namingPattern": "SITE-ROLE-NN (e.g. LOVE-SRV-01)",
+        "validSites": ["DEBER","DEFRA","DEDUS","DEMUC","FRPAR","FRMRS","GBLON","GBMAN","NLAMS","NLEIN","ESMAD","ESBCN","ITMIL","ITROM","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
+        "namingPattern": "SITE-ROLE-NN (e.g. DEFRA-SRV-01, GBLON-DB-01)",
         "validRoles": ["SRV", "WS", "DC", "MGMT", "TEST", "DEV"],
         "validOuPrefixes": ["OU=Servers", "OU=Workstations", "OU=DMZ", "OU=Management", "OU=Testing", "OU=Development"],
         "requiredInputs": ["name", "site", "ouPath"],
@@ -3758,7 +3758,7 @@ async fn shares_contract() -> Json<Value> {
             "POST /api/identity/shares/revoke/{id}/{group}": "Revoke permission (dry-run)",
             "GET /api/identity/shares-contract": "File share NTFS recertification contract"
         },
-        "validSites": ["LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1", "PITE"],
+        "validSites": ["DEBER","DEFRA","DEDUS","DEMUC","FRPAR","FRMRS","GBLON","GBMAN","NLAMS","NLEIN","ESMAD","ESBCN","ITMIL","ITROM","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
         "validStatuses": ["Compliant", "Overdue", "NeedsRecertification"],
         "validPermissionTypes": ["Read", "Write", "Modify", "FullControl"],
         "riskLevels": ["Critical", "High", "Medium", "Low"],
@@ -4663,7 +4663,7 @@ async fn patch_contract() -> Json<Value> {
         "supportedWorkflows": ["patch-plan","patch-validate","patch-approve","patch-execute","patch-verify","patch-compliance","pending-reboots"],
         "waveDimensions": ["site","osFamily","criticality","maintenanceWindow","rebootPolicy","dependencyGroup","backupState"],
         "validOsFamilies": ["windows","linux"],
-        "validSites": ["LOVE","BUR1","CCSS","TOR1","TRUJ","VILL","ALBI","AOST","MACL","SSYM","WIJH","RMA1","PITE"],
+        "validSites": ["DEBER","DEFRA","DEDUS","FRPAR","GBLON","NLAMS","ESMAD","ITMIL","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
         "requiredInputs": ["site","osFamily","criticality"],
         "requiredGuards": ["patch-policy-imported","inventory-coverage-current","backup-state-known","maintenance-window-known","approval-route-assigned","evidence-redacted"],
         "blockedReasons": ["provider-calls-disabled","live-execution-disabled","unknown-site","invalid-os-family","backup-state-unknown","maintenance-window-missing","approval-missing","evidence-not-redacted"],
@@ -4761,7 +4761,7 @@ async fn baseline_check(Path(server): Path<String>) -> ApiResult {
 }
 
 async fn baseline_compliance(Query(query): Query<BaselineQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match os_baseline::check_site_compliance(&site) {
         Ok(summary) => Ok(Json(serde_json::to_value(summary).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -4769,7 +4769,7 @@ async fn baseline_compliance(Query(query): Query<BaselineQuery>) -> ApiResult {
 }
 
 async fn baseline_noncompliant(Query(query): Query<BaselineQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match os_baseline::get_noncompliant(&site) {
         Ok(servers) => Ok(Json(serde_json::to_value(servers).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -4777,7 +4777,7 @@ async fn baseline_noncompliant(Query(query): Query<BaselineQuery>) -> ApiResult 
 }
 
 async fn baseline_trend(Query(query): Query<BaselineQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match os_baseline::get_compliance_trend(&site) {
         Ok(trend) => Ok(Json(serde_json::to_value(trend).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -4816,7 +4816,7 @@ async fn baseline_contract() -> Json<Value> {
             {"id": "bc-003", "check_name": "Zabbix Agent", "category": "Monitoring", "severity": "High"},
             {"id": "bc-004", "check_name": "Windows Firewall", "category": "Configuration", "severity": "Critical"}
         ],
-        "validSites": ["LOVE","BUR1","CCSS","TOR1","TRUJ","VILL","ALBI","AOST","MACL","SSYM","WIJH","RMA1","PITE"],
+        "validSites": ["DEBER","DEFRA","DEDUS","FRPAR","GBLON","NLAMS","ESMAD","ITMIL","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],
         "requiredGuards": [
             "site-known",
             "server-name-known",
@@ -5179,7 +5179,7 @@ async fn observe_zabbix_drift() -> Json<Value> {
 async fn zabbix_drift_summary(
     Query(query): Query<ZabbixDriftQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match zabbix_drift::get_drift_summary(&site) {
         Ok(summary) => Ok(Json(summary)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -5339,7 +5339,7 @@ async fn noise_resolve(
 async fn noise_report(
     Query(q): Query<NoiseSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = q.site.unwrap_or_else(|| "DEFRA".to_string());
     match noise_remediation::get_noise_report(&site) {
         Ok(report) => Ok(Json(report)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -5374,7 +5374,7 @@ struct SyntheticRunAllQuery {
 }
 
 async fn synthetic_run_all(Query(query): Query<SyntheticRunAllQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("LOVE");
+    let site = query.site.as_deref().unwrap_or("DEFRA");
     let results = synthetic_health::run_all_checks(site);
     Ok(Json(serde_json::to_value(results).unwrap()))
 }
@@ -5392,13 +5392,13 @@ struct SyntheticDashboardQuery {
 }
 
 async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
-    let site = query.site.as_deref().unwrap_or("LOVE");
+    let site = query.site.as_deref().unwrap_or("DEFRA");
     let dashboard = synthetic_health::get_dashboard(site);
     Json(serde_json::to_value(dashboard).unwrap())
 }
 
 async fn synthetic_outages(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
-    let site = query.site.as_deref().unwrap_or("LOVE");
+    let site = query.site.as_deref().unwrap_or("DEFRA");
     let outages = synthetic_health::get_outage_report(site);
     Json(serde_json::to_value(outages).unwrap())
 }
@@ -5796,7 +5796,7 @@ struct AnalyticsTrendQuery {
 async fn analytics_capacity(
     Query(params): Query<AnalyticsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     cost_capacity::get_site_capacity(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5805,7 +5805,7 @@ async fn analytics_capacity(
 async fn analytics_capacity_cluster(
     Query(params): Query<AnalyticsClusterQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     let cluster = params.cluster.as_deref().unwrap_or("love-general-cluster");
     cost_capacity::get_cluster_capacity(site, cluster)
         .map(Json)
@@ -5815,7 +5815,7 @@ async fn analytics_capacity_cluster(
 async fn analytics_capacity_forecast(
     Query(params): Query<AnalyticsForecastQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     let months = params.months.unwrap_or(6);
     cost_capacity::forecast_capacity(site, months)
         .map(Json)
@@ -5825,7 +5825,7 @@ async fn analytics_capacity_forecast(
 async fn analytics_cost_summary(
     Query(params): Query<AnalyticsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     cost_capacity::get_cost_summary(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5834,7 +5834,7 @@ async fn analytics_cost_summary(
 async fn analytics_waste(
     Query(params): Query<AnalyticsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     cost_capacity::get_waste_report(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5843,7 +5843,7 @@ async fn analytics_waste(
 async fn analytics_rightsizing(
     Query(params): Query<AnalyticsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     cost_capacity::get_rightsizing_recommendations(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5852,7 +5852,7 @@ async fn analytics_rightsizing(
 async fn analytics_trend(
     Query(params): Query<AnalyticsTrendQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     let metric = params.metric.as_deref().unwrap_or("cpu");
     cost_capacity::get_trend_report(site, metric)
         .map(Json)
@@ -5883,7 +5883,7 @@ async fn analytics_contract() -> Json<Value> {
             "contract": "/api/analytics/contract"
         },
         "metrics": ["cpu", "memory", "storage"],
-        "sites": ["LOVE", "BUR1"],
+        "sites": ["DEFRA", "GBLON"],
         "signals": [
             "capacity-pressure",
             "underutilization-signal",
@@ -5935,7 +5935,7 @@ struct AiopsRejectRequest {
 async fn aiops_generate(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     aiops::generate_suggestions(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5986,7 +5986,7 @@ async fn aiops_type(
 async fn aiops_savings(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     aiops::get_savings_summary(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -5995,7 +5995,7 @@ async fn aiops_savings(
 async fn aiops_stats(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     aiops::get_suggestion_stats(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -6036,7 +6036,7 @@ async fn aiops_contract() -> Json<Value> {
             "stats": "GET /api/analytics/aiops/stats?site=",
             "contract": "GET /api/analytics/aiops-contract"
         },
-        "sites": ["LOVE", "BUR1"],
+        "sites": ["DEFRA", "GBLON"],
         "requiredGuards": [
             "suggestion-static-analysis-only",
             "no-live-provider-calls",
@@ -6909,7 +6909,7 @@ async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiRe
         source_ci_key: "ci-001".to_string(),
         restore_type: ryuki_engine::models::RestoreType::FullVm,
         restore_point: "2026-06-10T02:00:00Z".to_string(),
-        target_site: "LOVE".to_string(),
+        target_site: "DEFRA".to_string(),
         target_environment: "production".to_string(),
         verification_plan: String::new(),
         retention_need: String::new(),
@@ -6932,7 +6932,7 @@ async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiRe
         source_ci_key: "ci-001".to_string(),
         restore_type: ryuki_engine::models::RestoreType::FullVm,
         restore_point: "2026-06-10T02:00:00Z".to_string(),
-        target_site: "LOVE".to_string(),
+        target_site: "DEFRA".to_string(),
         target_environment: "production".to_string(),
         verification_plan: String::new(),
         retention_need: String::new(),
@@ -7640,7 +7640,7 @@ async fn monitoring_alert_routing_contract() -> Json<Value> {
 async fn network_readiness_check(
     Query(query): Query<NetworkReadinessQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     let port_count = query.ports.unwrap_or(1);
     let vlan = query.vlan;
     let ip_count = query.ips.unwrap_or(1);
@@ -7706,7 +7706,7 @@ async fn network_release(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
 async fn network_capacity(
     Query(query): Query<NetworkSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match network_readiness::get_site_capacity(&site) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -7726,7 +7726,7 @@ async fn network_ports_inventory(
 async fn network_vlans_inventory(
     Query(query): Query<NetworkSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     match network_readiness::get_vlan_inventory(&site) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -8069,7 +8069,7 @@ struct RepoCapacityTrendQuery {
 async fn repo_capacity_list(
     Query(params): Query<RepoCapacitySiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     repository_capacity::get_repositories(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -8104,7 +8104,7 @@ async fn repo_capacity_at_risk() -> Result<Json<Value>, (StatusCode, Json<Value>
 async fn repo_capacity_report(
     Query(params): Query<RepoCapacitySiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("LOVE");
+    let site = params.site.as_deref().unwrap_or("DEFRA");
     repository_capacity::get_capacity_report(site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -8648,7 +8648,7 @@ async fn evidence_collect() -> Result<Json<ryuki_engine::models::EvidencePack>, 
         ryuki_engine::models::RequestType::ServerDeployment,
         "system-engineer".into(),
         "app-team-web".into(),
-        "LOVE".into(),
+        "DEFRA".into(),
         "production".into(),
         "high".into(),
     );
@@ -8678,7 +8678,7 @@ async fn evidence_export(
         ryuki_engine::models::RequestType::ServerDeployment,
         "system-engineer".into(),
         "app-team-web".into(),
-        "LOVE".into(),
+        "DEFRA".into(),
         "production".into(),
         "high".into(),
     );
@@ -9572,7 +9572,7 @@ async fn sql_deployment_contract() -> Json<Value> {
         "topologies": ["standalone", "failover-cluster", "availability-group"],
         "supportedVersions": ["2019", "2022"],
         "supportedEditions": ["Standard", "Enterprise", "Developer"],
-        "supportedSites": ["LOVE", "BUR1"],
+        "supportedSites": ["DEBER","DEFRA","FRPAR","GBLON","NLAMS"],
         "maxCpu": 256,
         "maxMemoryGb": 24576,
         "endpoints": [
