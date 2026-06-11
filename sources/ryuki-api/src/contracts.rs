@@ -17,10 +17,13 @@ use uuid::Uuid;
 use crate::database::get_db;
 use ryuki_engine::ad_computer_lifecycle;
 use ryuki_engine::alert_routing_engine;
+use ryuki_engine::file_share_ntfs;
 use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_impact;
+use ryuki_engine::cost_capacity;
+use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
@@ -29,6 +32,7 @@ use ryuki_engine::server_decommission;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
+use ryuki_engine::log_forwarder;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -180,6 +184,21 @@ pub fn routes() -> Router {
             "/api/identity/gmsa-lifecycle-contract",
             get(identity_gmsa_lifecycle),
         )
+        .route("/api/identity/gmsa/create", post(gmsa_create))
+        .route("/api/identity/gmsa/validate", post(gmsa_validate))
+        .route(
+            "/api/identity/gmsa/assign/{name}/{host}",
+            post(gmsa_assign),
+        )
+        .route(
+            "/api/identity/gmsa/remove/{name}/{host}",
+            post(gmsa_remove),
+        )
+        .route("/api/identity/gmsa/rotate/{name}", post(gmsa_rotate))
+        .route("/api/identity/gmsa/test/{name}/{host}", post(gmsa_test))
+        .route("/api/identity/gmsa/inventory", get(gmsa_inventory))
+        .route("/api/identity/gmsa/expiring", get(gmsa_expiring))
+        .route("/api/identity/gmsa-contract", get(gmsa_contract))
         .route(
             "/api/identity/local-privilege-access-contract",
             get(identity_local_privilege),
@@ -187,6 +206,36 @@ pub fn routes() -> Router {
         .route(
             "/api/identity/file-share-ntfs-recertification-contract",
             get(identity_file_share_ntfs),
+        )
+        .route("/api/identity/shares", get(shares_list))
+        .route("/api/identity/shares/{id}", get(shares_get))
+        .route(
+            "/api/identity/shares/recertification-due",
+            get(shares_recertification_due),
+        )
+        .route(
+            "/api/identity/shares/recertify/{id}",
+            post(shares_recertify),
+        )
+        .route(
+            "/api/identity/shares/open-access/{id}",
+            get(shares_open_access),
+        )
+        .route(
+            "/api/identity/shares/stale-owners",
+            get(shares_stale_owners),
+        )
+        .route(
+            "/api/identity/shares/permissions/{id}",
+            get(shares_permission_report),
+        )
+        .route(
+            "/api/identity/shares/revoke/{id}/{group}",
+            post(shares_revoke),
+        )
+        .route(
+            "/api/identity/shares-contract",
+            get(shares_contract),
         )
         .route(
             "/api/evidence/export-retention-contract",
@@ -490,6 +539,25 @@ pub fn routes() -> Router {
             "/api/observe/log-forwarder-onboarding-contract",
             get(observe_log_forwarder),
         )
+        // ─── Log Forwarder Onboarding Engine ───
+        .route("/api/observe/logs/onboard", post(logs_onboard))
+        .route(
+            "/api/observe/logs/validate/{hostname}",
+            post(logs_validate),
+        )
+        .route(
+            "/api/observe/logs/verify/{hostname}",
+            post(logs_verify),
+        )
+        .route("/api/observe/logs/coverage", get(logs_coverage))
+        .route("/api/observe/logs/gaps", get(logs_gaps))
+        .route("/api/observe/logs/volume", get(logs_volume))
+        .route("/api/observe/logs/retention", get(logs_retention))
+        .route(
+            "/api/observe/logs/disable/{hostname}",
+            post(logs_disable),
+        )
+        .route("/api/observe/logs-contract", get(logs_contract))
         .route(
             "/api/cmdb/reconciliation-contract",
             get(cmdb_reconciliation),
@@ -553,6 +621,23 @@ pub fn routes() -> Router {
             "/api/analytics/cost-capacity-contract",
             get(analytics_cost_capacity),
         )
+        .route("/api/analytics/capacity", get(analytics_capacity))
+        .route(
+            "/api/analytics/capacity/cluster",
+            get(analytics_capacity_cluster),
+        )
+        .route(
+            "/api/analytics/capacity/forecast",
+            get(analytics_capacity_forecast),
+        )
+        .route("/api/analytics/cost/summary", get(analytics_cost_summary))
+        .route("/api/analytics/waste", get(analytics_waste))
+        .route(
+            "/api/analytics/rightsizing",
+            get(analytics_rightsizing),
+        )
+        .route("/api/analytics/trend", get(analytics_trend))
+        .route("/api/analytics/contract", get(analytics_contract))
         .route("/api/platform/health", get(platform_health))
         .route(
             "/api/platform/health/components",
@@ -1147,6 +1232,55 @@ struct AdOrphanedQuery {
     site: Option<String>,
 }
 
+// ─── gMSA lifecycle request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GmsaCreateRequest {
+    name: String,
+    hosts: Vec<String>,
+    spns: Vec<String>,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GmsaValidateRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GmsaInventoryQuery {
+    site: Option<String>,
+}
+
+// ─── File Share NTFS recertification request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SharesQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SharesRecertificationDueQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SharesStaleOwnersQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct RecertifyShareRequest {
+    reviewer: String,
+}
+
 // ─── Patch wave request types ───
 
 #[derive(Debug, Deserialize)]
@@ -1461,6 +1595,29 @@ fn ret_blocked() -> Value {
         "timeline-source-missing",
         "evidence-not-redacted"
     ])
+}
+
+// ─── Log forwarder request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LogsOnboardRequest {
+    hostname: String,
+    #[serde(rename = "sourceTypes", default)]
+    source_types: Vec<String>,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LogsSiteQuery {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LogsHostnamePath {
+    hostname: String,
 }
 
 // ─── Endpoint handlers ───
@@ -2613,6 +2770,77 @@ async fn ad_computer_contract() -> Json<Value> {
     }))
 }
 
+// ─── gMSA lifecycle handlers ───
+
+async fn gmsa_create(Json(body): Json<GmsaCreateRequest>) -> ApiResult {
+    match gmsa_lifecycle::create_gmsa(&body.name, body.hosts, body.spns, &body.site) {
+        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_validate(Json(body): Json<GmsaValidateRequest>) -> ApiResult {
+    match gmsa_lifecycle::validate_gmsa(&body.name) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_assign(Path((name, host)): Path<(String, String)>) -> ApiResult {
+    match gmsa_lifecycle::assign_to_host(&name, &host) {
+        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_remove(Path((name, host)): Path<(String, String)>) -> ApiResult {
+    match gmsa_lifecycle::remove_from_host(&name, &host) {
+        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_rotate(Path(name): Path<String>) -> ApiResult {
+    match gmsa_lifecycle::rotate_password(&name) {
+        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_test(Path((name, host)): Path<(String, String)>) -> ApiResult {
+    match gmsa_lifecycle::test_retrieval(&name, &host) {
+        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn gmsa_inventory(Query(query): Query<GmsaInventoryQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let inventory = gmsa_lifecycle::get_gmsa_inventory(site);
+    Json(serde_json::to_value(inventory).unwrap())
+}
+
+async fn gmsa_expiring() -> Json<Value> {
+    let expiring = gmsa_lifecycle::get_expiring();
+    Json(serde_json::to_value(expiring).unwrap())
+}
+
+async fn gmsa_contract() -> Json<Value> {
+    let examples = gmsa_lifecycle::seed_examples();
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionAllowed": false,
+        "dryRunRequired": true,
+        "supportedWorkflows": ["gmsa-create", "gmsa-validate", "gmsa-assign", "gmsa-remove", "gmsa-rotate", "gmsa-test-retrieval", "gmsa-inventory", "gmsa-expiring"],
+        "validStatuses": ["Active", "Expiring", "Expired", "Revoked"],
+        "namingConvention": "svc-PURPOSE-SITE (e.g. svc-webappool-bur1)",
+        "requiredInputs": ["name", "hosts", "spns", "site"],
+        "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "live-directory-changes-disabled", "raw-service-account-data-disabled"],
+        "examples": serde_json::to_value(examples).unwrap()
+    }))
+}
+
 async fn identity_gmsa_lifecycle() -> Json<Value> {
     Json(json!({
         "source": "static-seed", "lifecycleMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
@@ -2662,6 +2890,93 @@ async fn identity_file_share_ntfs() -> Json<Value> {
         "requiredGuards": ["recertification-scope-summarized","owner-attestation-reviewed","group-access-reviewed","ntfs-acl-reviewed","share-permission-reviewed","stale-access-reviewed","exception-route-assigned","approval-route-assigned","remediation-plan-ready","evidence-redacted"],
         "planSections": ["recertificationSummary","shareScope","ownershipReview","groupAccessReview","ntfsAclReview","sharePermissionReview","staleAccessReview","exceptionDecision","remediationPlan","evidenceReferences"],
         "blockedReasons": ["provider-calls-disabled","worker-execution-disabled","live-directory-change-disabled","live-share-change-disabled","live-ntfs-acl-change-disabled","live-servicenow-change-disabled","ad-group-membership-change-disabled","share-permission-change-disabled","ntfs-acl-change-disabled","inheritance-change-disabled","owner-change-disabled","raw-share-data-disabled","raw-acl-rows-disabled","raw-membership-rows-disabled","raw-path-data-disabled","raw-provider-payloads-disabled","principal-identifiers-disabled","share-identifiers-disabled","path-values-disabled","credential-values-disabled","recertification-scope-missing","owner-attestation-missing","approval-missing","remediation-plan-missing","evidence-not-redacted"]
+    }))
+}
+
+// ─── File Share NTFS recertification handlers ───
+
+async fn shares_list(Query(query): Query<SharesQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let shares = file_share_ntfs::get_shares(site);
+    Json(serde_json::to_value(shares).unwrap())
+}
+
+async fn shares_get(Path(id): Path<String>) -> ApiResult {
+    match file_share_ntfs::get_share_detail(&id) {
+        Some(detail) => Ok(Json(serde_json::to_value(detail).unwrap())),
+        None => Err(status_404(&id)),
+    }
+}
+
+async fn shares_recertification_due(
+    Query(query): Query<SharesRecertificationDueQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let due = file_share_ntfs::check_recertification_due(site);
+    Json(serde_json::to_value(due).unwrap())
+}
+
+async fn shares_recertify(
+    Path(id): Path<String>,
+    Json(body): Json<RecertifyShareRequest>,
+) -> ApiResult {
+    match file_share_ntfs::recertify_share(&id, &body.reviewer) {
+        Ok(share) => Ok(Json(serde_json::to_value(share).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn shares_open_access(Path(id): Path<String>) -> Json<Value> {
+    let open = file_share_ntfs::detect_open_access(&id);
+    Json(serde_json::to_value(open).unwrap())
+}
+
+async fn shares_stale_owners(Query(query): Query<SharesStaleOwnersQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let stale = file_share_ntfs::get_owner_stale(site);
+    Json(serde_json::to_value(stale).unwrap())
+}
+
+async fn shares_permission_report(Path(id): Path<String>) -> ApiResult {
+    match file_share_ntfs::get_permission_report(&id) {
+        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn shares_revoke(Path((id, group)): Path<(String, String)>) -> ApiResult {
+    match file_share_ntfs::revoke_permission(&id, &group) {
+        Ok(msg) => Ok(Json(serde_json::json!({"message": msg, "share_id": id, "ad_group": group, "dry_run": true}))),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn shares_contract() -> Json<Value> {
+    let shares = file_share_ntfs::get_shares("");
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveDirectoryChangesAllowed": false,
+        "liveShareChangesAllowed": false,
+        "liveNtfsAclChangesAllowed": false,
+        "dryRunRequired": true,
+        "totalShares": shares.len(),
+        "endpoints": {
+            "GET /api/identity/shares": "List file shares, optionally filtered by site",
+            "GET /api/identity/shares/{id}": "Get share detail with NTFS permissions",
+            "GET /api/identity/shares/recertification-due": "Shares needing recertification",
+            "POST /api/identity/shares/recertify/{id}": "Mark share as recertified",
+            "GET /api/identity/shares/open-access/{id}": "Detect open access (Everyone/Domain Users FullControl)",
+            "GET /api/identity/shares/stale-owners": "Shares where owner hasn't recertified in 365+ days",
+            "GET /api/identity/shares/permissions/{id}": "Permission report with risk levels",
+            "POST /api/identity/shares/revoke/{id}/{group}": "Revoke permission (dry-run)",
+            "GET /api/identity/shares-contract": "File share NTFS recertification contract"
+        },
+        "validSites": ["LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1", "PITE"],
+        "validStatuses": ["Compliant", "Overdue", "NeedsRecertification"],
+        "validPermissionTypes": ["Read", "Write", "Modify", "FullControl"],
+        "riskLevels": ["Critical", "High", "Medium", "Low"],
+        "blockedReasons": ["provider-calls-disabled", "live-directory-change-disabled", "live-share-change-disabled", "live-ntfs-acl-change-disabled", "raw-share-data-disabled", "raw-acl-rows-disabled", "principal-identifiers-disabled", "share-identifiers-disabled", "path-values-disabled", "credential-values-disabled", "recertification-scope-missing", "owner-attestation-missing", "evidence-not-redacted"]
     }))
 }
 
@@ -3536,6 +3851,121 @@ async fn observe_log_forwarder() -> Json<Value> {
     )
 }
 
+// ─── Log Forwarder Onboarding Engine handlers ───
+
+fn parse_source_types(raw: &[String]) -> Result<Vec<log_forwarder::LogSourceType>, String> {
+    raw.iter()
+        .map(|s| match s.as_str() {
+            "windows-event-log" | "WindowsEventLog" => Ok(log_forwarder::LogSourceType::WindowsEventLog),
+            "syslog" | "Syslog" => Ok(log_forwarder::LogSourceType::Syslog),
+            "auditd" | "Auditd" => Ok(log_forwarder::LogSourceType::Auditd),
+            "iis" | "IIS" => Ok(log_forwarder::LogSourceType::IIS),
+            "apache" | "Apache" => Ok(log_forwarder::LogSourceType::Apache),
+            other => Err(format!("Unknown source type: {}", other)),
+        })
+        .collect()
+}
+
+async fn logs_onboard(
+    Json(body): Json<LogsOnboardRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let source_types = match parse_source_types(&body.source_types) {
+        Ok(types) => types,
+        Err(e) => return Err(status_400(&e)),
+    };
+    match log_forwarder::onboard_host(&body.hostname, &source_types, &body.site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_validate(
+    Path(hostname): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::validate_config(&hostname) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_verify(
+    Path(hostname): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::verify_forwarding(&hostname) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_coverage(
+    Query(params): Query<LogsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::get_coverage_report(&params.site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_gaps(
+    Query(params): Query<LogsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::get_gap_report(&params.site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_volume(
+    Query(params): Query<LogsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::get_volume_report(&params.site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_retention(
+    Query(params): Query<LogsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::get_retention_status(&params.site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_disable(
+    Path(hostname): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match log_forwarder::disable_forwarding(&hostname) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn logs_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "endpoints": {
+            "onboard": "POST /api/observe/logs/onboard",
+            "validate": "POST /api/observe/logs/validate/{hostname}",
+            "verify": "POST /api/observe/logs/verify/{hostname}",
+            "coverage": "GET /api/observe/logs/coverage?site=",
+            "gaps": "GET /api/observe/logs/gaps?site=",
+            "volume": "GET /api/observe/logs/volume?site=",
+            "retention": "GET /api/observe/logs/retention?site=",
+            "disable": "POST /api/observe/logs/disable/{hostname}"
+        },
+        "sourceTypes": ["windows-event-log", "syslog", "auditd", "iis", "apache"],
+        "statuses": ["not-configured", "configured", "active", "failed"],
+        "hosts": log_forwarder::seed_hosts(),
+        "workflows": ["windows-event-forwarding-readiness","linux-rsyslog-readiness","linux-auditd-readiness","siem-routing-review","agent-policy-review","evidence-pack-review"],
+        "signals": ["missing-log-forwarder","unsupported-agent","policy-mismatch","stale-log-source","routing-missing","owner-missing","evidence-missing"],
+        "requiredGuards": ["os-family-supported","log-profile-known","forwarding-policy-known","owner-known","support-group-known","route-reviewed","installation-plan-dry-run","evidence-redacted"],
+        "blockedReasons": ["provider-calls-disabled","live-agent-install-disabled","live-config-change-disabled","log-platform-mutation-disabled","unsupported-os-family","log-profile-missing","forwarding-policy-missing","owner-unknown","support-group-unknown","evidence-not-redacted"]
+    }))
+}
+
 async fn cmdb_reconciliation() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["cmdb-import","cmdb-update-export","cmdb-ci-reconciliation"],"signals":["identity-match","owner-match","support-group-match","site-placement-match","backup-policy-match","monitoring-profile-match","relationship-match"],"decisions":["accept","reject","review","export-update"],"requiredGuards":["cmdb-file-contract-validated","header-mapping-complete","inventory-coverage-current","relationship-evidence-ready","reviewer-approval-assigned","evidence-redacted"],"blockedReasons":["live-api-disabled","missing-ci-identity","ambiguous-ci-identity","stale-inventory","relationship-evidence-missing","reviewer-approval-missing","evidence-not-redacted"]}),
@@ -3768,6 +4198,145 @@ async fn analytics_cost_capacity() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"platformScope":["vmware","hyperv","proxmox"],"domains":["compute-capacity","storage-capacity","backup-capacity","growth-trend","cost-trend","efficiency-opportunity","forecast-risk"],"signals":["capacity-pressure","storage-growth-risk","backup-growth-risk","cost-anomaly","underutilization-signal","stale-usage-data","forecast-window-missing"],"requiredGuards":["analytics-scope-summarized","aggregate-usage-known","cost-band-known","growth-trend-known","forecast-window-set","owner-known","remediation-plan-ready","evidence-redacted"],"planSections":["analyticsSummary","capacityForecast","storageForecast","backupForecast","costTrend","efficiencyOpportunities","remediationOptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","billing-export-ingestion-disabled","raw-cost-rows-disabled","raw-inventory-rows-disabled","resource-identifiers-disabled","tenant-identifiers-disabled","object-identifiers-disabled","raw-provider-payloads-disabled","analytics-scope-missing","aggregate-usage-missing","cost-band-missing","growth-trend-unknown","forecast-window-missing","owner-unknown","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct AnalyticsSiteQuery {
+    site: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnalyticsClusterQuery {
+    site: Option<String>,
+    cluster: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnalyticsForecastQuery {
+    site: Option<String>,
+    months: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct AnalyticsTrendQuery {
+    site: Option<String>,
+    metric: Option<String>,
+}
+
+async fn analytics_capacity(
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    cost_capacity::get_site_capacity(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_capacity_cluster(
+    Query(params): Query<AnalyticsClusterQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    let cluster = params.cluster.as_deref().unwrap_or("love-general-cluster");
+    cost_capacity::get_cluster_capacity(site, cluster)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_capacity_forecast(
+    Query(params): Query<AnalyticsForecastQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    let months = params.months.unwrap_or(6);
+    cost_capacity::forecast_capacity(site, months)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_cost_summary(
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    cost_capacity::get_cost_summary(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_waste(
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    cost_capacity::get_waste_report(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_rightsizing(
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    cost_capacity::get_rightsizing_recommendations(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn analytics_trend(
+    Query(params): Query<AnalyticsTrendQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    let metric = params.metric.as_deref().unwrap_or("cpu");
+    cost_capacity::get_trend_report(site, metric)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn analytics_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "domains": [
+            "compute-capacity",
+            "storage-capacity",
+            "cost-trend",
+            "waste-identification",
+            "rightsizing-recommendation",
+            "capacity-forecast",
+            "trend-analysis"
+        ],
+        "endpoints": {
+            "capacity": "/api/analytics/capacity?site=",
+            "capacity_cluster": "/api/analytics/capacity/cluster?site=&cluster=",
+            "capacity_forecast": "/api/analytics/capacity/forecast?site=&months=",
+            "cost_summary": "/api/analytics/cost/summary?site=",
+            "waste": "/api/analytics/waste?site=",
+            "rightsizing": "/api/analytics/rightsizing?site=",
+            "trend": "/api/analytics/trend?site=&metric=",
+            "contract": "/api/analytics/contract"
+        },
+        "metrics": ["cpu", "memory", "storage"],
+        "sites": ["LOVE", "BUR1"],
+        "signals": [
+            "capacity-pressure",
+            "underutilization-signal",
+            "idle-vm-detected",
+            "oversized-vm-detected",
+            "orphaned-disk-detected",
+            "cost-anomaly",
+            "forecast-risk"
+        ],
+        "requiredGuards": [
+            "aggregate-usage-only",
+            "no-live-provider-calls",
+            "cost-bands-summarized",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-remediation-disabled",
+            "raw-cost-rows-disabled",
+            "resource-identifiers-disabled",
+            "tenant-identifiers-disabled"
+        ]
+    }))
 }
 
 async fn platform_health() -> Json<Value> {

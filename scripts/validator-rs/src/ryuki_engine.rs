@@ -17,6 +17,7 @@ const DECLARED_MODULES: &[&str] = &[
     "backup_engine",
     "cmdb_engine",
     "cmdb_impact",
+    "cost_capacity",
     "evidence_pipeline",
     "health_monitor",
     "inventory_sync",
