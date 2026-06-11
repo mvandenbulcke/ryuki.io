@@ -24,15 +24,19 @@ use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::gmsa_lifecycle;
+use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
+use ryuki_engine::oob_access;
+use ryuki_engine::os_baseline;
 use ryuki_engine::patch_engine;
 use ryuki_engine::server_decommission;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::log_forwarder;
+use ryuki_engine::degradation_mode;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -428,6 +432,34 @@ pub fn routes() -> Router {
             get(operations_degradation_mode),
         )
         .route(
+            "/api/platform/degradation/check/{site}",
+            post(degradation_check),
+        )
+        .route(
+            "/api/platform/degradation/global",
+            get(degradation_global),
+        )
+        .route(
+            "/api/platform/degradation/degraded",
+            get(degradation_degraded),
+        )
+        .route(
+            "/api/platform/degradation/enter/{site}",
+            post(degradation_enter),
+        )
+        .route(
+            "/api/platform/degradation/exit/{site}",
+            post(degradation_exit),
+        )
+        .route(
+            "/api/platform/degradation/rules",
+            get(degradation_rules),
+        )
+        .route(
+            "/api/platform/degradation-contract",
+            get(degradation_contract),
+        )
+        .route(
             "/api/operations/aiops-suggestion-contract",
             get(operations_aiops_suggestion),
         )
@@ -464,6 +496,35 @@ pub fn routes() -> Router {
             get(patch_pending_reboots),
         )
         .route("/api/maintain/patch-contract", get(patch_contract))
+        // ─── OS baseline compliance ───
+        .route(
+            "/api/maintain/baseline/check/{server}",
+            post(baseline_check),
+        )
+        .route(
+            "/api/maintain/baseline/compliance",
+            get(baseline_compliance),
+        )
+        .route(
+            "/api/maintain/baseline/noncompliant",
+            get(baseline_noncompliant),
+        )
+        .route(
+            "/api/maintain/baseline/trend",
+            get(baseline_trend),
+        )
+        .route(
+            "/api/maintain/baseline/coverage",
+            get(baseline_coverage),
+        )
+        .route(
+            "/api/maintain/baseline/remediate/{server}/{check_id}",
+            post(baseline_remediate),
+        )
+        .route(
+            "/api/maintain/baseline-contract",
+            get(baseline_contract),
+        )
         .route(
             "/api/protect/controlled-restore-contract",
             get(protect_controlled_restore),
@@ -491,6 +552,40 @@ pub fn routes() -> Router {
         .route(
             "/api/protect/restore-testing-contract",
             get(protect_restore_testing),
+        )
+        // ─── Legal Hold & Extended Retention Engine ───
+        .route("/api/protect/legal-hold/place", post(legal_hold_place))
+        .route(
+            "/api/protect/legal-hold/validate/{id}",
+            post(legal_hold_validate),
+        )
+        .route(
+            "/api/protect/legal-hold/extend/{id}",
+            post(legal_hold_extend),
+        )
+        .route(
+            "/api/protect/legal-hold/release/{id}",
+            post(legal_hold_release),
+        )
+        .route(
+            "/api/protect/legal-hold/active",
+            get(legal_hold_active),
+        )
+        .route(
+            "/api/protect/legal-hold/expiring",
+            get(legal_hold_expiring),
+        )
+        .route(
+            "/api/protect/legal-hold/evidence/{id}",
+            get(legal_hold_evidence),
+        )
+        .route(
+            "/api/protect/legal-hold/compliance/{server}",
+            get(legal_hold_compliance),
+        )
+        .route(
+            "/api/protect/legal-hold-contract",
+            get(legal_hold_contract),
         )
         .route(
             "/api/protect/legal-hold-retention-contract",
@@ -904,6 +999,28 @@ pub fn routes() -> Router {
             get(network_vlans_inventory),
         )
         .route("/api/datacenter/network-contract", get(network_contract))
+        // ─── OOB Access Validation ───
+        .route("/api/datacenter/oob/test/{id}", post(oob_test_endpoint))
+        .route(
+            "/api/datacenter/oob/validate-cert/{id}",
+            post(oob_validate_cert),
+        )
+        .route(
+            "/api/datacenter/oob/check-defaults/{id}",
+            post(oob_check_defaults),
+        )
+        .route("/api/datacenter/oob/inventory", get(oob_inventory))
+        .route("/api/datacenter/oob/failing", get(oob_failing))
+        .route("/api/datacenter/oob/cert-expiring", get(oob_cert_expiring))
+        .route(
+            "/api/datacenter/oob/firmware-outdated",
+            get(oob_firmware_outdated),
+        )
+        .route(
+            "/api/datacenter/oob/validate-site/{site}",
+            post(oob_validate_site),
+        )
+        .route("/api/datacenter/oob-contract", get(oob_contract))
 }
 
 // ─── Shared data ───
@@ -1009,6 +1126,39 @@ struct RestoreActionRequest {
     #[serde(rename = "restoreId")]
     restore_id: String,
     approver: Option<String>,
+}
+
+// ─── Legal hold request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LegalHoldPlaceRequest {
+    target: String,
+    #[serde(rename = "holdType")]
+    hold_type: String,
+    reason: String,
+    by: String,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LegalHoldExtendRequest {
+    #[serde(rename = "newExpiry")]
+    new_expiry: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LegalHoldReleaseRequest {
+    #[serde(rename = "releasedBy")]
+    released_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LegalHoldActiveQuery {
+    site: Option<String>,
 }
 
 // ─── Linux deployment request types ───
@@ -1351,6 +1501,20 @@ struct NetworkSwitchQuery {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct NetworkSiteQuery {
+    site: Option<String>,
+}
+
+// ─── OOB Access request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OobInventoryQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OobFailingQuery {
     site: Option<String>,
 }
 
@@ -3403,6 +3567,51 @@ async fn operations_degradation_mode() -> Json<Value> {
     )
 }
 
+// ─── Degradation Mode functional endpoints ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DegradationEnterRequest {
+    reason: String,
+}
+
+async fn degradation_check(Path(site): Path<String>) -> Json<Value> {
+    let status = degradation_mode::check_site_health(&site);
+    Json(serde_json::to_value(status).unwrap())
+}
+
+async fn degradation_global() -> Json<Value> {
+    let global = degradation_mode::get_global_status();
+    Json(serde_json::to_value(global).unwrap())
+}
+
+async fn degradation_degraded() -> Json<Value> {
+    let degraded = degradation_mode::get_degraded_sites();
+    Json(serde_json::to_value(degraded).unwrap())
+}
+
+async fn degradation_enter(
+    Path(site): Path<String>,
+    Json(body): Json<DegradationEnterRequest>,
+) -> Json<Value> {
+    let status = degradation_mode::enter_degradation_mode(&site, &body.reason);
+    Json(serde_json::to_value(status).unwrap())
+}
+
+async fn degradation_exit(Path(site): Path<String>) -> Json<Value> {
+    let status = degradation_mode::exit_degradation_mode(&site);
+    Json(serde_json::to_value(status).unwrap())
+}
+
+async fn degradation_rules() -> Json<Value> {
+    let rules = degradation_mode::get_degradation_rules();
+    Json(serde_json::to_value(rules).unwrap())
+}
+
+async fn degradation_contract() -> Json<Value> {
+    Json(degradation_mode::get_degradation_contract())
+}
+
 async fn operations_aiops_suggestion() -> Json<Value> {
     Json(
         json!({"source":"static-seed","suggestionMode":"recommendation-only","dryRunRequired":true,"providerCallsEnabled":false,"liveCorrelationAllowed":false,"liveRemediationAllowed":false,"liveTicketMutationAllowed":false,"automationDispatchAllowed":false,"rawOperationRowsAllowed":false,"rawHealthRowsAllowed":false,"rawLogPayloadsAllowed":false,"rawUserDataAllowed":false,"rawRecipientDataAllowed":false,"rawProviderPayloadsAllowed":false,"suggestionSources":["operation-health-pattern","platform-health-pattern","incident-context-pattern","shift-queue-pattern","failed-run-pattern","degradation-pattern","evidence-gap-pattern"],"suggestionSignals":["repeat-failure","blocked-workflow","correlated-degradation","rising-risk","stale-data","evidence-gap","owner-unknown"],"requiredInputs":["signalSummary","affectedWorkflow","healthDomain","impactBand","owner","supportGroup","reviewer","evidenceManifest"],"requiredGuards":["signal-summary-redacted","correlation-static-only","impact-band-known","owner-route-known","reviewer-assigned","recommendation-redacted","automation-disabled","evidence-redacted"],"planSections":["signalSummary","correlationSummary","impactAssessment","recommendationCandidate","ownerRoute","reviewRoute","safeNextAction","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-correlation-disabled","live-remediation-disabled","live-ticket-mutation-disabled","automation-dispatch-disabled","raw-operation-rows-disabled","raw-health-rows-disabled","raw-log-payloads-disabled","raw-user-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","signal-summary-missing","reviewer-missing","recommendation-not-redacted","evidence-not-redacted"],"requiredEvidence":["AIOps signal summary","Static correlation summary","Impact assessment","Recommendation candidate","Owner route","Review route","Safe next action","Evidence references"],"rules":[{"id":"no-live-correlation","decision":"block","requirement":"AIOps suggestions use static, aggregate, or manually reviewed summaries only and never query live provider, ticket, monitoring, backup, inventory, or log systems.","evidence":"Static correlation summary"},{"id":"no-live-remediation","decision":"block","requirement":"AIOps suggestions recommend safe next actions only and never dispatch workers, mutate workflows, suppress alerts, restart services, remediate providers, or create tickets.","evidence":"Safe next action"},{"id":"reviewer-route-required","decision":"block","requirement":"Each suggestion requires a reviewer, owner route, support group, impact band, and redacted evidence before it can be exported or shown as actionable.","evidence":"Review route"},{"id":"raw-aiops-data-not-exposed","decision":"block","requirement":"AIOps suggestion evidence must use safe summaries only and must not expose raw operation rows, raw health rows, raw logs, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, tenant IDs, object IDs, private IPs, serial numbers, live endpoints, or provider payloads.","evidence":"Evidence references"}]}),
@@ -3602,6 +3811,93 @@ async fn patch_contract() -> Json<Value> {
     }))
 }
 
+// ─── OS baseline compliance handlers ───
+
+#[derive(Debug, Deserialize)]
+struct BaselineQuery {
+    site: Option<String>,
+}
+
+async fn baseline_check(Path(server): Path<String>) -> ApiResult {
+    let results = os_baseline::check_server_compliance(&server);
+    Ok(Json(serde_json::to_value(results).unwrap()))
+}
+
+async fn baseline_compliance(Query(query): Query<BaselineQuery>) -> ApiResult {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match os_baseline::check_site_compliance(&site) {
+        Ok(summary) => Ok(Json(serde_json::to_value(summary).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn baseline_noncompliant(Query(query): Query<BaselineQuery>) -> ApiResult {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match os_baseline::get_noncompliant(&site) {
+        Ok(servers) => Ok(Json(serde_json::to_value(servers).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn baseline_trend(Query(query): Query<BaselineQuery>) -> ApiResult {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match os_baseline::get_compliance_trend(&site) {
+        Ok(trend) => Ok(Json(serde_json::to_value(trend).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn baseline_coverage() -> Json<Value> {
+    let coverage = os_baseline::get_check_coverage();
+    Json(serde_json::to_value(coverage).unwrap())
+}
+
+async fn baseline_remediate(Path((server, check_id)): Path<(String, String)>) -> ApiResult {
+    match os_baseline::remediate_finding(&server, &check_id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn baseline_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveRemediationAllowed": false,
+        "dryRunRequired": true,
+        "supportedWorkflows": [
+            "baseline-check",
+            "baseline-compliance",
+            "baseline-noncompliant",
+            "baseline-trend",
+            "baseline-coverage",
+            "baseline-remediate"
+        ],
+        "baselineChecks": [
+            {"id": "bc-001", "check_name": "CrowdStrike Falcon Agent", "category": "Security", "severity": "Critical"},
+            {"id": "bc-002", "check_name": "VMware Tools", "category": "Tools", "severity": "High"},
+            {"id": "bc-003", "check_name": "Zabbix Agent", "category": "Monitoring", "severity": "High"},
+            {"id": "bc-004", "check_name": "Windows Firewall", "category": "Configuration", "severity": "Critical"}
+        ],
+        "validSites": ["LOVE","BUR1","CCSS","TOR1","TRUJ","VILL","ALBI","AOST","MACL","SSYM","WIJH","RMA1","PITE"],
+        "requiredGuards": [
+            "site-known",
+            "server-name-known",
+            "check-id-known",
+            "dry-run-only",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-remediation-disabled",
+            "unknown-site",
+            "unknown-server",
+            "unknown-check",
+            "evidence-not-redacted"
+        ]
+    }))
+}
+
 async fn protect_controlled_restore() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"restoreTypes":["file","vm","application","sql"],"requiredGuards":["restore-point-known","target-isolation-reviewed","owner-approval-assigned","backup-operator-approval-assigned","verification-plan-ready","evidence-redacted"],"planSections":["restoreScope","restorePointSummary","targetSelection","isolationPlan","verificationPlan","riskNotes","rollbackNotes"],"blockedReasons":["provider-calls-disabled","restore-point-unknown","target-selection-missing","target-isolation-not-reviewed","approval-missing","verification-plan-missing","evidence-not-redacted"]}),
@@ -3648,6 +3944,145 @@ async fn protect_legal_hold() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["legal-hold-intake-review","extended-retention-exception","protected-scope-review","expiration-review","release-readiness-review","evidence-pack-review"],"signals":["legal-hold-requested","retention-extension-needed","scope-ambiguity","approval-missing","expiry-missing","release-review-due","stale-evidence"],"requiredGuards":["hold-scope-summarized","retention-policy-known","approval-route-assigned","backup-impact-reviewed","expiry-date-set","review-cadence-set","release-process-defined","evidence-redacted"],"planSections":["holdSummary","scopeReview","retentionDecision","backupImpactReview","approvalRoute","expiryAndReview","releaseReadiness","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-retention-change-disabled","veeam-mutation-disabled","servicenow-mutation-disabled","raw-case-data-disabled","raw-recipient-data-disabled","raw-backup-rows-disabled","raw-provider-payloads-disabled","hold-scope-missing","retention-policy-missing","approval-missing","expiry-missing","release-process-missing","evidence-not-redacted"]}),
     )
+}
+
+// ─── Legal Hold Engine Handlers ───
+
+async fn legal_hold_place(
+    Json(req): Json<LegalHoldPlaceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let hold_type = match req.hold_type.to_lowercase().as_str() {
+        "investigation" => legal_hold::HoldType::Investigation,
+        "litigation" => legal_hold::HoldType::Litigation,
+        "compliance" => legal_hold::HoldType::Compliance,
+        "retention" => legal_hold::HoldType::Retention,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid hold_type: {}. Must be Investigation, Litigation, Compliance, or Retention.", req.hold_type)})),
+            ))
+        }
+    };
+    match legal_hold::place_hold(&req.target, hold_type, &req.reason, &req.by, &req.site) {
+        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_validate(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match legal_hold::validate_hold(&id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_extend(
+    Path(id): Path<String>,
+    Json(req): Json<LegalHoldExtendRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match legal_hold::extend_hold(&id, &req.new_expiry) {
+        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_release(
+    Path(id): Path<String>,
+    Json(req): Json<LegalHoldReleaseRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match legal_hold::release_hold(&id, &req.released_by) {
+        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_active(
+    Query(q): Query<LegalHoldActiveQuery>,
+) -> Json<Value> {
+    let site = q.site.unwrap_or_default();
+    let holds = legal_hold::get_active_holds(&site);
+    Json(serde_json::to_value(holds).unwrap())
+}
+
+async fn legal_hold_expiring() -> Json<Value> {
+    let holds = legal_hold::get_expiring_holds();
+    Json(serde_json::to_value(holds).unwrap())
+}
+
+async fn legal_hold_evidence(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match legal_hold::get_hold_evidence(&id) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_compliance(
+    Path(server): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match legal_hold::check_compliance(&server) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn legal_hold_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "exceptionMode": "review-only",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveRetentionChangesAllowed": false,
+        "veeamMutationAllowed": false,
+        "serviceNowMutationAllowed": false,
+        "rawCaseDataAllowed": false,
+        "rawRecipientDataAllowed": false,
+        "rawBackupRowsAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "supportedWorkflows": [
+            "legal-hold-place",
+            "legal-hold-validate",
+            "legal-hold-extend",
+            "legal-hold-release",
+            "legal-hold-active-query",
+            "legal-hold-expiring-alert",
+            "legal-hold-evidence-audit",
+            "legal-hold-compliance-check"
+        ],
+        "requiredGuards": [
+            "hold-scope-summarized",
+            "retention-policy-known",
+            "approval-route-assigned",
+            "backup-impact-reviewed",
+            "expiry-date-set",
+            "review-cadence-set",
+            "release-process-defined",
+            "evidence-redacted"
+        ],
+        "planSections": [
+            "holdSummary",
+            "scopeReview",
+            "retentionDecision",
+            "backupImpactReview",
+            "approvalRoute",
+            "expiryAndReview",
+            "releaseReadiness",
+            "evidenceReferences"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-retention-change-disabled",
+            "veeam-mutation-disabled",
+            "servicenow-mutation-disabled",
+            "raw-case-data-disabled",
+            "raw-recipient-data-disabled",
+            "raw-backup-rows-disabled",
+            "raw-provider-payloads-disabled"
+        ]
+    }))
 }
 
 async fn observe_zabbix_onboarding() -> Json<Value> {
@@ -6066,6 +6501,134 @@ async fn network_contract() -> Json<Value> {
             "GET /api/datacenter/network/ports": "Get port inventory for a switch",
             "GET /api/datacenter/network/vlans": "Get VLAN inventory for a site",
             "GET /api/datacenter/network-contract": "Network readiness contract"
+        }
+    }))
+}
+
+// ─── OOB Access Validation handlers ───
+
+async fn oob_test_endpoint(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::test_endpoint(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_validate_cert(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::validate_certificate(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_check_defaults(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::check_default_credentials(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_inventory(
+    Query(query): Query<OobInventoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_default();
+    match oob_access::get_inventory(&site) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_failing(
+    Query(query): Query<OobFailingQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_default();
+    match oob_access::get_failing(&site) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::get_cert_expiring() {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::get_firmware_outdated() {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_validate_site(
+    Path(site): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match oob_access::run_site_validation(&site) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn oob_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveAccessChecksAllowed": false,
+        "liveCertificateChecksAllowed": false,
+        "rawInventoryRowsAllowed": false,
+        "endpointIdentifiersAllowed": false,
+        "serialNumbersAllowed": false,
+        "dryRunRequired": true,
+        "supportedConsoleTypes": ["iLO", "iDRAC", "XCC", "IPMI"],
+        "workflows": [
+            "oob-access-test",
+            "oob-certificate-verify",
+            "oob-default-credentials-check",
+            "oob-inventory",
+            "oob-failing-endpoints",
+            "oob-cert-expiry-scan",
+            "oob-firmware-baseline",
+            "oob-site-validation"
+        ],
+        "requiredGuards": [
+            "site-known",
+            "endpoint-type-known",
+            "certificate-reviewed",
+            "default-credentials-reviewed",
+            "firmware-baseline-reviewed",
+            "evidence-redacted"
+        ],
+        "planSections": [
+            "readinessSummary",
+            "accessTestResults",
+            "certificateReview",
+            "credentialReview",
+            "firmwareBaseline",
+            "exceptionDecision",
+            "evidenceReferences"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-access-checks-disabled",
+            "live-certificate-checks-disabled",
+            "raw-inventory-rows-disabled",
+            "endpoint-identifiers-disabled",
+            "serial-numbers-disabled",
+            "site-unknown",
+            "evidence-not-redacted"
+        ],
+        "endpoints": {
+            "POST /api/datacenter/oob/test/{id}": "Mock connectivity test for an OOB endpoint",
+            "POST /api/datacenter/oob/validate-cert/{id}": "Check certificate validity for an OOB endpoint",
+            "POST /api/datacenter/oob/check-defaults/{id}": "Verify default credentials changed",
+            "GET /api/datacenter/oob/inventory": "List all OOB endpoints (optional ?site= filter)",
+            "GET /api/datacenter/oob/failing": "List endpoints that failed last test (optional ?site= filter)",
+            "GET /api/datacenter/oob/cert-expiring": "Certificates expiring within 30 days",
+            "GET /api/datacenter/oob/firmware-outdated": "Endpoints behind current firmware baseline",
+            "POST /api/datacenter/oob/validate-site/{site}": "Run validation for all endpoints at a site",
+            "GET /api/datacenter/oob-contract": "OOB access validation contract"
         }
     }))
 }
