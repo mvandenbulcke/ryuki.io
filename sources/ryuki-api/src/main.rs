@@ -193,6 +193,27 @@ fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<S
     Some(Arc::new(RateLimiter::keyed(quota)))
 }
 
+async fn security_headers_middleware(
+    request: HttpRequest<Body>,
+    next: middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    response
+}
+
 async fn shutdown_signal(timeout_secs: u64) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -278,6 +299,8 @@ async fn main() {
         .route("/api/platform/uptime", get(uptime))
         .merge(contracts::routes())
         .merge(boundary::routes())
+        .fallback(not_found)
+        .layer(middleware::from_fn(security_headers_middleware))
         .layer(middleware::from_fn(request_counter_middleware))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(middleware::from_fn(move |req, next| {
@@ -450,6 +473,13 @@ fn format_uptime(seconds: u64) -> String {
     let minutes = (seconds % 3600) / 60;
     let secs = seconds % 60;
     format!("{days}d {hours}h {minutes}m {secs}s")
+}
+
+async fn not_found() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError::new("NOT_FOUND", "The requested resource was not found")),
+    )
 }
 
 #[cfg(test)]
