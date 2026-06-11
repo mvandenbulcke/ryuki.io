@@ -33,13 +33,6 @@ const ADMIN_PLATFORM_SETTINGS_PATH: &str = "/api/admin/platform-settings";
 const REQUEST_INTAKE_FORM_PREVIEW_PATH: &str = "/api/requests/intake-form";
 const REQUEST_LIST_PATH: &str = "/api/requests";
 const REQUEST_CREATE_PATH: &str = "/api/requests";
-const REQUEST_DETAIL_PATH: &str = "/api/requests/detail";
-const REQUEST_VALIDATE_PATH: &str = "/api/requests/validate";
-const REQUEST_PLAN_PATH: &str = "/api/requests/plan";
-const REQUEST_APPROVE_PATH: &str = "/api/requests/approve";
-const REQUEST_LOCK_PATH: &str = "/api/requests/lock";
-const REQUEST_EXECUTE_PATH: &str = "/api/requests/execute";
-const REQUEST_VERIFY_PATH: &str = "/api/requests/verify";
 const SECRET_REFERENCES_PATH: &str = "/api/catalog/secret-references";
 const POLICY_OUTCOMES_PATH: &str = "/api/catalog/policy-guardrails-contract";
 const EVIDENCE_SUMMARY_PATH: &str = "/api/catalog/evidence-redaction-contract";
@@ -60,6 +53,7 @@ pub enum ApiPathError {
     AbsoluteTarget,
     OutsideApiPrefix,
     Fragment,
+    UnsafePathSegment,
 }
 
 pub fn same_origin_api_path(path: &str) -> Result<&str, ApiPathError> {
@@ -75,6 +69,39 @@ pub fn same_origin_api_path(path: &str) -> Result<&str, ApiPathError> {
     if !path.starts_with(API_PREFIX) {
         return Err(ApiPathError::OutsideApiPrefix);
     }
+    Ok(path)
+}
+
+fn safe_request_id(request_id: &str) -> Result<&str, ApiPathError> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err(ApiPathError::Empty);
+    }
+    if request_id.contains("://")
+        || request_id.starts_with("//")
+        || request_id.contains('/')
+        || request_id.contains('\\')
+        || request_id.contains('?')
+        || request_id.contains('#')
+        || request_id == "."
+        || request_id == ".."
+        || request_id.contains("..")
+        || !request_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return Err(ApiPathError::UnsafePathSegment);
+    }
+    Ok(request_id)
+}
+
+fn request_lifecycle_path(request_id: &str, suffix: Option<&str>) -> Result<String, ApiPathError> {
+    let request_id = safe_request_id(request_id)?;
+    let path = match suffix {
+        Some(suffix) => format!("/api/requests/{request_id}/{suffix}"),
+        None => format!("/api/requests/{request_id}"),
+    };
+    same_origin_api_path(&path)?;
     Ok(path)
 }
 
@@ -277,30 +304,87 @@ pub fn request_create_path() -> &'static str {
     REQUEST_CREATE_PATH
 }
 
-pub fn request_detail_path() -> &'static str {
-    REQUEST_DETAIL_PATH
+pub fn request_detail_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, None)
 }
 
-pub fn request_validate_path() -> &'static str {
-    REQUEST_VALIDATE_PATH
+pub fn request_validate_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("validate"))
 }
 
-pub fn request_plan_path() -> &'static str {
-    REQUEST_PLAN_PATH
+pub fn request_plan_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("plan"))
 }
 
-pub fn request_approve_path() -> &'static str {
-    REQUEST_APPROVE_PATH
+pub fn request_approve_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("approve"))
 }
 
-pub fn request_lock_path() -> &'static str {
-    REQUEST_LOCK_PATH
+pub fn request_lock_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("lock"))
 }
 
-pub fn request_execute_path() -> &'static str {
-    REQUEST_EXECUTE_PATH
+pub fn request_execute_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("execute"))
 }
 
-pub fn request_verify_path() -> &'static str {
-    REQUEST_VERIFY_PATH
+pub fn request_verify_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("verify"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_lifecycle_paths_match_api_contract() {
+        let request_id = "REQ-123";
+
+        assert_eq!(
+            request_detail_path(request_id),
+            Ok("/api/requests/REQ-123".to_string())
+        );
+        assert_eq!(
+            request_validate_path(request_id),
+            Ok("/api/requests/REQ-123/validate".to_string())
+        );
+        assert_eq!(
+            request_plan_path(request_id),
+            Ok("/api/requests/REQ-123/plan".to_string())
+        );
+        assert_eq!(
+            request_approve_path(request_id),
+            Ok("/api/requests/REQ-123/approve".to_string())
+        );
+        assert_eq!(
+            request_lock_path(request_id),
+            Ok("/api/requests/REQ-123/lock".to_string())
+        );
+        assert_eq!(
+            request_execute_path(request_id),
+            Ok("/api/requests/REQ-123/execute".to_string())
+        );
+        assert_eq!(
+            request_verify_path(request_id),
+            Ok("/api/requests/REQ-123/verify".to_string())
+        );
+    }
+
+    #[test]
+    fn request_lifecycle_paths_reject_unsafe_request_ids() {
+        for request_id in [
+            "",
+            "https://example.test/request",
+            "//example.test/request",
+            "REQ/123",
+            r"REQ\123",
+            "../REQ-123",
+            "REQ 123",
+            "REQ%2F123",
+            "REQ-123?stage=validate",
+            "REQ-123#validate",
+        ] {
+            assert!(request_detail_path(request_id).is_err());
+        }
+    }
 }

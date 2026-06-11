@@ -1,14 +1,10 @@
-use crate::api::{platform_summary_path, request_detail_path, same_origin_api_path};
+use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::request_detail_fallback;
 use crate::server_boundary::{
     approve_request, execute_request, get_request_detail, lock_request, plan_request,
     validate_request, verify_request,
 };
 use leptos::prelude::*;
-
-fn api_path(path: &'static str) -> &'static str {
-    same_origin_api_path(path).unwrap_or(platform_summary_path())
-}
 
 fn status_badge_class(status: &str) -> &'static str {
     match status {
@@ -49,7 +45,10 @@ fn action_label(action: &str) -> &'static str {
 
 #[component]
 pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) -> impl IntoView {
-    let detail_path_guard = api_path(request_detail_path());
+    let detail_path_guard =
+        request_detail_path(&request_id).unwrap_or_else(|_| platform_summary_path().to_string());
+    let loading_detail_path = detail_path_guard.clone();
+    let content_detail_path = detail_path_guard;
     let detail_resource = Resource::new(move || request_id.clone(), get_request_detail);
 
     #[allow(deprecated)]
@@ -193,12 +192,13 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         <div class="request-detail-view">
             <Suspense fallback=move || {
                 view! {
-                    <div class="request-detail-loading" aria-busy="true" data-api-path=detail_path_guard>
+                    <div class="request-detail-loading" aria-busy="true" data-api-path=loading_detail_path.clone()>
                         <p>"Loading request detail..."</p>
                     </div>
                 }
             }>
                 {move || {
+                    let content_detail_path = content_detail_path.clone();
                     Suspend::new(async move {
                         let detail = match detail_resource.await {
                             Ok(d) => d,
@@ -215,7 +215,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
                             <article
                                 class="request-detail-panel"
                                 aria-label="Request detail"
-                                data-api-path=detail_path_guard
+                                data-api-path=content_detail_path.clone()
                                 data-request-id=detail.id.clone()
                             >
                                 <div class="request-detail-head">

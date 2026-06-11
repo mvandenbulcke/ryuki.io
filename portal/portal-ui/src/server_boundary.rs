@@ -34,15 +34,16 @@ use crate::models::{
     datacenter_single_check_fallback, datacenter_site_report_fallback,
     datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
-    policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
-    secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
-    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
-    CreateRequestPayload, DatacenterFailingChecksSummary, DatacenterFullReadiness,
-    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
-    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, LoginResponse,
-    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
-    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
-    RequestIntakeSummary, RequestSummary, SecretReferenceSummary, StageActionResponse,
+    policy_outcome_fallbacks, request_detail_fallback, request_intake_fallbacks,
+    request_summary_fallbacks, secret_reference_catalog_fallback, secret_reference_fallbacks,
+    ActivityQueueSummary, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
+    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload,
+    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
+    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
+    EvidenceSummary, InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,
+    PlatformSettingsSummary, PlatformStatus, PolicyGuardrailSummary, PolicyOutcome,
+    RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary,
+    SecretReferenceSummary, StageActionResponse,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{
@@ -73,13 +74,6 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     request_intake_form_preview_path,
     request_list_path,
     request_create_path,
-    request_detail_path,
-    request_validate_path,
-    request_plan_path,
-    request_approve_path,
-    request_lock_path,
-    request_execute_path,
-    request_verify_path,
     dry_run_plan_path,
     inventory_resource_overview_path,
     inventory_ownership_risk_path,
@@ -133,6 +127,47 @@ fn execution_mode_label(mode: &ExecutionMode) -> &'static str {
     }
 }
 
+fn is_allowed_request_lifecycle_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/requests/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(request_id) = segments.next() else {
+        return false;
+    };
+    if request_id.is_empty()
+        || request_id == "."
+        || request_id == ".."
+        || request_id.contains("..")
+        || request_id.contains("\\")
+        || request_id.contains('?')
+        || request_id.contains('#')
+        || request_id.contains("://")
+        || request_id.starts_with("//")
+        || !request_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return false;
+    }
+    if matches!(
+        request_id,
+        "detail" | "validate" | "plan" | "approve" | "lock" | "execute" | "verify"
+    ) {
+        return false;
+    }
+    matches!(
+        (segments.next(), segments.next()),
+        (None, None)
+            | (Some("validate"), None)
+            | (Some("plan"), None)
+            | (Some("approve"), None)
+            | (Some("lock"), None)
+            | (Some("execute"), None)
+            | (Some("verify"), None)
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalBoundaryError {
     ApiPath(ApiPathError),
@@ -172,15 +207,26 @@ impl PortalServerBoundary {
         }
     }
 
-    pub fn validate_platform_api_path(
+    pub fn validate_platform_api_path<'a>(
         &self,
-        path: &'static str,
-    ) -> Result<&'static str, PortalBoundaryError> {
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if ALLOWED_PORTAL_API_PATHS
             .iter()
             .any(|allowed| allowed() == guarded)
         {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    pub fn validate_request_lifecycle_api_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_request_lifecycle_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -1070,8 +1116,10 @@ pub async fn get_request_list() -> Result<Vec<RequestSummary>, ServerFnError> {
 #[server(prefix = "/portal/api", endpoint = "request-detail-data")]
 pub async fn get_request_detail(request_id: String) -> Result<RequestDetail, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_detail_path(&request_id)
+        .map_err(|_| ServerFnError::new("request detail API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_detail_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request detail API path failed same-origin guard"))?;
     Ok(request_detail_fallback(&request_id))
 }
@@ -1096,8 +1144,10 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
 #[server(prefix = "/portal/api", endpoint = "request-validate")]
 pub async fn validate_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_validate_path(&request_id)
+        .map_err(|_| ServerFnError::new("request validate API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_validate_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request validate API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1110,8 +1160,10 @@ pub async fn validate_request(request_id: String) -> Result<StageActionResponse,
 #[server(prefix = "/portal/api", endpoint = "request-plan")]
 pub async fn plan_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_plan_path(&request_id)
+        .map_err(|_| ServerFnError::new("request plan API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_plan_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request plan API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1124,8 +1176,10 @@ pub async fn plan_request(request_id: String) -> Result<StageActionResponse, Ser
 #[server(prefix = "/portal/api", endpoint = "request-approve")]
 pub async fn approve_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_approve_path(&request_id)
+        .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_approve_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1138,8 +1192,10 @@ pub async fn approve_request(request_id: String) -> Result<StageActionResponse, 
 #[server(prefix = "/portal/api", endpoint = "request-lock")]
 pub async fn lock_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_lock_path(&request_id)
+        .map_err(|_| ServerFnError::new("request lock API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_lock_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request lock API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1152,8 +1208,10 @@ pub async fn lock_request(request_id: String) -> Result<StageActionResponse, Ser
 #[server(prefix = "/portal/api", endpoint = "request-execute")]
 pub async fn execute_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_execute_path(&request_id)
+        .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_execute_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1166,8 +1224,10 @@ pub async fn execute_request(request_id: String) -> Result<StageActionResponse, 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
 pub async fn verify_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_verify_path(&request_id)
+        .map_err(|_| ServerFnError::new("request verify API path failed same-origin guard"))?;
     boundary
-        .validate_platform_api_path(request_verify_path())
+        .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request verify API path failed same-origin guard"))?;
     Ok(StageActionResponse {
         request_id,
@@ -1189,9 +1249,48 @@ mod tests {
             Ok(request_intake_path())
         );
         assert_eq!(
+            boundary.validate_platform_api_path("/api/requests/detail"),
+            Err(PortalBoundaryError::OutsidePortalAllowlist)
+        );
+        assert_eq!(
             boundary.validate_platform_api_path("/api/not-allowlisted"),
             Err(PortalBoundaryError::OutsidePortalAllowlist)
         );
+    }
+
+    #[test]
+    fn boundary_validates_generated_request_lifecycle_paths() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let request_id = "REQ-123";
+
+        for path in [
+            request_detail_path(request_id),
+            request_validate_path(request_id),
+            request_plan_path(request_id),
+            request_approve_path(request_id),
+            request_lock_path(request_id),
+            request_execute_path(request_id),
+            request_verify_path(request_id),
+        ] {
+            let path = path.expect("request lifecycle path must build");
+            assert_eq!(
+                boundary.validate_request_lifecycle_api_path(&path),
+                Ok(path.as_str())
+            );
+        }
+
+        for path in [
+            "/api/requests/detail",
+            "/api/requests/REQ-123/validate/extra",
+            "/api/requests/REQ 123/validate",
+            "/api/requests/REQ%2F123/validate",
+            "/api/requests/REQ-123?stage=validate",
+        ] {
+            assert_eq!(
+                boundary.validate_request_lifecycle_api_path(path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist)
+            );
+        }
     }
 
     #[test]
