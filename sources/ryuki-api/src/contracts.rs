@@ -82,7 +82,10 @@ use ryuki_engine::zabbix_drift;
 pub fn routes() -> Router {
     Router::new()
         .route("/api/platform/summary", get(platform_summary))
-        .route("/api/platform/status", get(platform_status))
+        .route(
+            "/api/platform/status-contract",
+            get(platform_status_contract),
+        )
         .route(
             "/api/dashboard/global-overview-contract",
             get(dashboard_global_overview),
@@ -2657,7 +2660,7 @@ async fn platform_summary() -> Json<Value> {
     }))
 }
 
-async fn platform_status() -> Json<Value> {
+async fn platform_status_contract() -> Json<Value> {
     Json(json!({
         "source": "static-seed",
         "mode": "static-dry-run",
@@ -11191,6 +11194,14 @@ mod unit_tests {
         assert_eq!(part["catalogMode"], "planned-offerings");
         assert!(part["offerings"].as_array().unwrap().len() >= 1);
         assert_eq!(part["categories"].as_array().unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_platform_status_contract_is_static_seed() {
+        let Json(part) = platform_status_contract().await;
+        assert_eq!(part["source"], "static-seed");
+        assert_eq!(part["mode"], "static-dry-run");
+        assert_eq!(part["providerCallsAllowed"], false);
     }
 
     #[test]
