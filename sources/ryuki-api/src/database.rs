@@ -1,6 +1,7 @@
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static POOL: OnceLock<Option<PgPool>> = OnceLock::new();
 
@@ -37,9 +38,20 @@ pub fn pool_metrics() -> PoolMetrics {
     }
 }
 
-pub async fn connect(url: &str, max_connections: u32) -> PgPool {
+pub async fn connect(
+    url: &str,
+    max_connections: u32,
+    min_connections: u32,
+    idle_timeout_secs: u64,
+    acquire_timeout_secs: u64,
+    max_lifetime_secs: u64,
+) -> PgPool {
     PgPoolOptions::new()
         .max_connections(max_connections)
+        .min_connections(min_connections)
+        .idle_timeout(Duration::from_secs(idle_timeout_secs))
+        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+        .max_lifetime(Duration::from_secs(max_lifetime_secs))
         .connect(url)
         .await
         .expect("failed to connect to PostgreSQL")
@@ -52,9 +64,20 @@ pub async fn run_migrations(pool: &PgPool) {
         .expect("failed to run database migrations");
 }
 
-pub async fn try_connect_with_url(url: &str, max_connections: u32) {
+pub async fn try_connect_with_url(
+    url: &str,
+    max_connections: u32,
+    min_connections: u32,
+    idle_timeout_secs: u64,
+    acquire_timeout_secs: u64,
+    max_lifetime_secs: u64,
+) {
     let pool = match PgPoolOptions::new()
         .max_connections(max_connections)
+        .min_connections(min_connections)
+        .idle_timeout(Duration::from_secs(idle_timeout_secs))
+        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+        .max_lifetime(Duration::from_secs(max_lifetime_secs))
         .connect(url)
         .await
     {

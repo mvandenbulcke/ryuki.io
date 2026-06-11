@@ -395,6 +395,10 @@ async fn main() {
     database::try_connect_with_url(
         &app_config.database_url,
         app_config.server.pool_max_connections,
+        app_config.server.pool_min_connections,
+        app_config.server.pool_idle_timeout_secs,
+        app_config.server.pool_acquire_timeout_secs,
+        app_config.server.pool_max_lifetime_secs,
     )
     .await;
     database::migrate_if_connected().await;
@@ -758,7 +762,7 @@ mod db_tests {
             return;
         }
         let url = std::env::var("DATABASE_URL").unwrap();
-        crate::database::try_connect_with_url(&url, 5).await;
+        crate::database::try_connect_with_url(&url, 5, 2, 300, 30, 1800).await;
         let db = crate::database::get_db().expect("database should be available");
         crate::database::run_migrations(db).await;
 

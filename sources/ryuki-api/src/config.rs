@@ -47,6 +47,10 @@ pub fn get_platform_status() -> serde_json::Value {
             "request_timeout_secs": config.server.request_timeout_secs,
             "max_body_size_bytes": config.server.max_body_size_bytes,
             "pool_max_connections": config.server.pool_max_connections,
+            "pool_min_connections": config.server.pool_min_connections,
+            "pool_idle_timeout_secs": config.server.pool_idle_timeout_secs,
+            "pool_acquire_timeout_secs": config.server.pool_acquire_timeout_secs,
+            "pool_max_lifetime_secs": config.server.pool_max_lifetime_secs,
             "tls_enabled": config.server.tls_cert_path.is_some(),
         },
         "rate_limit": {

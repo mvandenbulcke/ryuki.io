@@ -229,6 +229,14 @@ pub struct ServerConfig {
     pub tls_key_path: Option<String>,
     #[serde(default = "default_pool_max_connections")]
     pub pool_max_connections: u32,
+    #[serde(default = "default_pool_min_connections")]
+    pub pool_min_connections: u32,
+    #[serde(default = "default_pool_idle_timeout")]
+    pub pool_idle_timeout_secs: u64,
+    #[serde(default = "default_pool_acquire_timeout")]
+    pub pool_acquire_timeout_secs: u64,
+    #[serde(default = "default_pool_max_lifetime")]
+    pub pool_max_lifetime_secs: u64,
 }
 
 fn default_bind_address() -> String {
@@ -251,6 +259,22 @@ fn default_pool_max_connections() -> u32 {
     5
 }
 
+fn default_pool_min_connections() -> u32 {
+    2
+}
+
+fn default_pool_idle_timeout() -> u64 {
+    300
+}
+
+fn default_pool_acquire_timeout() -> u64 {
+    30
+}
+
+fn default_pool_max_lifetime() -> u64 {
+    1800
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -261,6 +285,10 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             pool_max_connections: default_pool_max_connections(),
+            pool_min_connections: default_pool_min_connections(),
+            pool_idle_timeout_secs: default_pool_idle_timeout(),
+            pool_acquire_timeout_secs: default_pool_acquire_timeout(),
+            pool_max_lifetime_secs: default_pool_max_lifetime(),
         }
     }
 }
@@ -500,6 +528,24 @@ impl RyukiConfig {
             errors.push("server.pool_max_connections must be greater than 0".into());
         }
 
+        if self.server.pool_min_connections > self.server.pool_max_connections {
+            errors.push(
+                "server.pool_min_connections must not exceed server.pool_max_connections".into(),
+            );
+        }
+
+        if self.server.pool_idle_timeout_secs == 0 {
+            errors.push("server.pool_idle_timeout_secs must be greater than 0".into());
+        }
+
+        if self.server.pool_acquire_timeout_secs == 0 {
+            errors.push("server.pool_acquire_timeout_secs must be greater than 0".into());
+        }
+
+        if self.server.pool_max_lifetime_secs == 0 {
+            errors.push("server.pool_max_lifetime_secs must be greater than 0".into());
+        }
+
         let has_cert = self.server.tls_cert_path.is_some();
         let has_key = self.server.tls_key_path.is_some();
         if has_cert != has_key {
@@ -572,6 +618,11 @@ mod tests {
         assert!(!config.rate_limit.enabled);
         assert_eq!(config.rate_limit.requests_per_second, 50);
         assert_eq!(config.server.shutdown_timeout_secs, 30);
+        assert_eq!(config.server.pool_max_connections, 5);
+        assert_eq!(config.server.pool_min_connections, 2);
+        assert_eq!(config.server.pool_idle_timeout_secs, 300);
+        assert_eq!(config.server.pool_acquire_timeout_secs, 30);
+        assert_eq!(config.server.pool_max_lifetime_secs, 1800);
     }
 
     #[test]
@@ -640,5 +691,22 @@ mod tests {
         assert!(!rl.enabled);
         assert_eq!(rl.requests_per_second, 50);
         assert_eq!(rl.burst_size, 100);
+    }
+
+    #[test]
+    fn test_validate_pool_min_exceeds_max() {
+        let mut config = RyukiConfig::default();
+        config.server.pool_min_connections = 10;
+        config.server.pool_max_connections = 5;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("pool_min_connections")));
+    }
+
+    #[test]
+    fn test_validate_pool_timeouts_zero() {
+        let mut config = RyukiConfig::default();
+        config.server.pool_idle_timeout_secs = 0;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("pool_idle_timeout_secs")));
     }
 }

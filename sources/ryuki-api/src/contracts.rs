@@ -6022,12 +6022,14 @@ async fn auth_local_logout() -> Json<Value> {
 
 async fn auth_status() -> Json<Value> {
     let app_cfg = crate::config_store::get_app_config();
-    let config = ryuki_engine::auth::get_entra_config_from_env(
-        &app_cfg.entra_tenant_id,
-        &app_cfg.entra_client_id,
-        &app_cfg.entra_authority,
-    );
-    Json(serde_json::to_value(config).unwrap_or_default())
+    let tenant_configured = !app_cfg.entra_tenant_id.is_empty();
+    let client_configured = !app_cfg.entra_client_id.is_empty();
+    Json(json!({
+        "tenant_configured": tenant_configured,
+        "client_configured": client_configured,
+        "enabled": tenant_configured && client_configured,
+        "instance": app_cfg.entra_authority,
+    }))
 }
 
 async fn auth_session() -> Json<Value> {
@@ -6961,7 +6963,13 @@ async fn requests_approve(
     Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
-async fn requests_lock(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_lock(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(
@@ -7002,7 +7010,13 @@ async fn requests_lock(Path(request_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
 
-async fn requests_execute(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_execute(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(
@@ -7043,7 +7057,13 @@ async fn requests_execute(Path(request_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
 
-async fn requests_verify(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_verify(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(

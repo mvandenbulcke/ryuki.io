@@ -187,12 +187,13 @@ TEMPLATE = """<!doctype html>
   --code-bg:#0d1119;--code-text:#d6deeb;--inline-code:#1c1517;
   --header-bg:rgba(11,13,18,.86);
 }}
+@media (prefers-reduced-motion: no-preference){{html{{scroll-behavior:smooth}}}}
 body{{font-family:var(--font);background:var(--bg);color:var(--text);
   transition:background var(--transition),color var(--transition);line-height:1.65}}
 ::selection{{background:var(--accent);color:#fff}}
 .site-header{{position:sticky;top:0;z-index:10;background:var(--header-bg);
   -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--border)}}
-.header-inner{{max-width:880px;margin:0 auto;padding:0 1.5rem;height:58px;
+.header-inner{{max-width:1140px;margin:0 auto;padding:0 1.5rem;height:58px;
   display:flex;align-items:center;justify-content:space-between;gap:1rem}}
 .brand{{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:1.08rem;
   letter-spacing:-.02em;color:var(--text);text-decoration:none}}
@@ -209,7 +210,47 @@ body{{font-family:var(--font);background:var(--bg);color:var(--text);
 .theme-btn .icon-sun{{display:none}}
 [data-theme="dark"] .theme-btn .icon-sun{{display:block}}
 [data-theme="dark"] .theme-btn .icon-moon{{display:none}}
-main{{max-width:880px;margin:0 auto;padding:2.6rem 1.5rem 5rem}}
+/* ── Docs shell: sticky left nav + content column ── */
+.docs-shell{{max-width:1140px;margin:0 auto;padding:0 1.5rem;
+  display:grid;grid-template-columns:240px minmax(0,1fr);gap:2.8rem;align-items:start}}
+main{{min-width:0;max-width:820px;padding:2.6rem 0 5rem}}
+.docs-sidebar{{position:sticky;top:58px;max-height:calc(100vh - 58px);overflow-y:auto;
+  padding:1.9rem 1.2rem 2rem 0;border-right:1px solid var(--border)}}
+.sb-label{{display:block;font-size:.68rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--text-secondary);text-decoration:none;margin-bottom:.75rem}}
+.sb-label:hover{{color:var(--accent)}}
+.sb-label.active{{color:var(--accent)}}
+.sb-list{{list-style:none;margin:0;padding:0}}
+.sb-list>li{{margin:0}}
+.sb-link{{display:block;font-size:.85rem;font-weight:500;color:var(--text-secondary);
+  text-decoration:none;padding:.36rem .65rem;border-left:2px solid transparent;
+  border-radius:0 6px 6px 0;
+  transition:color var(--transition),background var(--transition),border-color var(--transition)}}
+.sb-link:hover{{color:var(--text);background:var(--bg-secondary)}}
+.sb-link.active{{color:var(--accent);font-weight:600;border-left-color:var(--accent);background:var(--accent-bg)}}
+.sb-sections{{list-style:none;margin:.2rem 0 .5rem .65rem;padding:0 0 0 .55rem;
+  border-left:1px solid var(--border)}}
+.sb-sections li{{margin:0}}
+.sb-sections a{{display:block;font-size:.78rem;color:var(--text-secondary);text-decoration:none;
+  padding:.24rem .55rem;border-radius:5px;
+  transition:color var(--transition),background var(--transition)}}
+.sb-sections a:hover{{color:var(--text);background:var(--bg-secondary)}}
+.sb-sections a.active{{color:var(--accent);font-weight:600}}
+.sb-toggle{{display:none}}
+@media(max-width:940px){{
+  .docs-shell{{display:block}}
+  main{{max-width:760px;margin:0 auto;padding:2rem 0 4rem}}
+  .sb-toggle{{display:flex;align-items:center;justify-content:space-between;width:100%;
+    background:var(--bg-secondary);border:1px solid var(--border);border-radius:8px;
+    font-family:var(--font);font-size:.85rem;font-weight:600;color:var(--text);
+    padding:.6rem .9rem;margin-top:1rem;cursor:pointer}}
+  .sb-toggle svg{{width:14px;height:14px;transition:transform .2s ease}}
+  .sb-toggle[aria-expanded="true"] svg{{transform:rotate(180deg)}}
+  .docs-sidebar{{display:none;position:static;max-height:none;border-right:0;
+    padding:1rem .2rem .6rem;border-bottom:1px solid var(--border)}}
+  .docs-sidebar.open{{display:block}}
+}}
+h1,h2,h3,h4{{scroll-margin-top:74px}}
 .crumb{{font-size:.82rem;margin-bottom:1.6rem}}
 .crumb a{{color:var(--accent);text-decoration:none}}
 .crumb a:hover{{text-decoration:underline}}
@@ -268,11 +309,14 @@ td code{{white-space:nowrap}}
     </nav>
   </div>
 </header>
+<div class="docs-shell">
+{sidebar}
 <main>
 {crumb}
 {content}
 {footnav}
 </main>
+</div>
 <script>
 (function(){{
   var html=document.documentElement;
@@ -295,6 +339,38 @@ td code{{white-space:nowrap}}
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){{
     if(html.getAttribute('data-theme-mode')==='system') apply('system');
   }});
+
+  /* docs sidebar: mobile accordion toggle */
+  var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
+  if(tg&&sb){{
+    tg.addEventListener('click',function(){{
+      var open=sb.classList.toggle('open');
+      tg.setAttribute('aria-expanded',open?'true':'false');
+    }});
+  }}
+
+  /* docs sidebar: scroll-spy on the current article's sections */
+  var secLinks=Array.prototype.slice.call(document.querySelectorAll('.sb-sections a[href^="#"]'));
+  if(secLinks.length&&'IntersectionObserver' in window){{
+    var byId={{}};
+    var targets=[];
+    secLinks.forEach(function(l){{
+      var id=decodeURIComponent(l.getAttribute('href').slice(1));
+      var el=document.getElementById(id);
+      if(el){{byId[id]=l;targets.push(el)}}
+    }});
+    if(targets.length){{
+      var spy=new IntersectionObserver(function(entries){{
+        entries.forEach(function(en){{
+          if(en.isIntersecting){{
+            secLinks.forEach(function(l){{l.classList.remove('active')}});
+            byId[en.target.id].classList.add('active');
+          }}
+        }});
+      }},{{rootMargin:'-72px 0px -68% 0px',threshold:0}});
+      targets.forEach(function(t){{spy.observe(t)}});
+    }}
+  }}
 }})();
 </script>
 </body>
@@ -302,17 +378,67 @@ td code{{white-space:nowrap}}
 """
 
 
-def render(name, title, description, content, crumb, footnav):
+def sections(md: str):
+    """(slug, title) of every h2 in the markdown, skipping code fences."""
+    out, fence = [], False
+    for line in md.splitlines():
+        if line.startswith("```"):
+            fence = not fence
+            continue
+        if fence:
+            continue
+        m = re.match(r"^##\s+(.*)$", line)
+        if m:
+            title = m.group(1).strip()
+            out.append((slug(title), title))
+    return out
+
+
+CHEVRON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+           'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+           '<polyline points="6 9 12 15 18 9"/></svg>')
+
+
+def build_sidebar(current: str, sections_map: dict) -> str:
+    """Left nav pane: every article, the current one expanded with its h2s."""
+    items = []
+    for name, title, _ in PAGES:
+        if name == current:
+            sub = ""
+            secs = sections_map.get(name, [])
+            if secs:
+                sub = ('<ul class="sb-sections">'
+                       + "".join(f'<li><a href="#{sid}">{html_mod.escape(stitle, quote=False)}</a></li>'
+                                 for sid, stitle in secs)
+                       + "</ul>")
+            items.append(f'<li><a class="sb-link active" aria-current="page" '
+                         f'href="/{name}.html">{title}</a>{sub}</li>')
+        else:
+            items.append(f'<li><a class="sb-link" href="/{name}.html">{title}</a></li>')
+    overview_cls = " active" if current == "documentation" else ""
+    return ('<button class="sb-toggle" id="sb-toggle" aria-expanded="false" '
+            f'aria-controls="docs-sidebar">Docs navigation {CHEVRON}</button>\n'
+            '<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation">'
+            f'<a class="sb-label{overview_cls}" href="/documentation.html">Documentation</a>'
+            '<ul class="sb-list">' + "".join(items) + "</ul></nav></aside>")
+
+
+def render(name, title, description, content, crumb, footnav, sidebar):
     return TEMPLATE.format(title=title, description=description,
-                           content=content, crumb=crumb, footnav=footnav)
+                           content=content, crumb=crumb, footnav=footnav,
+                           sidebar=sidebar)
 
 
 def main():
-    for idx, (name, title, description) in enumerate(PAGES):
+    sections_map = {}
+    for name, _, _ in PAGES:
         src = DOCS / f"{name}.md"
         if not src.exists():
             sys.exit(f"missing {src}")
-        body = convert(src.read_text())
+        sections_map[name] = sections(src.read_text())
+
+    for idx, (name, title, description) in enumerate(PAGES):
+        body = convert((DOCS / f"{name}.md").read_text())
         crumb = '<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ ' + title + "</span></nav>"
         prev_page = PAGES[idx - 1] if idx > 0 else None
         next_page = PAGES[idx + 1] if idx + 1 < len(PAGES) else None
@@ -320,7 +446,8 @@ def main():
         right = f'<a href="/{next_page[0]}.html">{next_page[1]} &rarr;</a>' if next_page else "<span></span>"
         footnav = f'<nav class="foot-nav">{left}{right}</nav>'
         (DOCS / f"{name}.html").write_text(
-            render(name, title, description, body, crumb, footnav))
+            render(name, title, description, body, crumb, footnav,
+                   build_sidebar(name, sections_map)))
         print(f"docs/{name}.html")
 
     cards = "\n".join(
@@ -332,7 +459,7 @@ def main():
                      f'<div class="doc-grid">{cards}</div>')
     (DOCS / "documentation.html").write_text(
         render("documentation", "Documentation", "Ryuki platform documentation.",
-               index_content, "", ""))
+               index_content, "", "", build_sidebar("documentation", sections_map)))
     print("docs/documentation.html")
 
 

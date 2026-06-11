@@ -203,6 +203,13 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 [data-theme="dark"] .theme-btn .icon-sun{display:block}
 [data-theme="dark"] .theme-btn .icon-moon{display:none}
 
+/* ── Scroll progress ────────────────────────────────────── */
+#scroll-progress{
+  position:fixed;top:0;left:0;height:2.5px;width:0;z-index:200;
+  background:var(--grad-accent);pointer-events:none;
+  box-shadow:0 0 8px var(--accent-glow);
+}
+
 /* ── Hero ───────────────────────────────────────────────── */
 .hero{
   position:relative;
@@ -211,25 +218,41 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   overflow:hidden;
 }
 /* ── Hero backdrop: the hidden ryū ────────────────────────
-   An imposing Japanese dragon — deer antlers, ox ear, open jaw,
-   mustache barbels, three-taloned eagle claws, the sacred
-   pearl — drawn once in <defs> and layered twice: a barely-
-   visible base and a bright copy masked by a soft spotlight
-   that follows the cursor (#ryu-spot-c, moved by the script at
-   the end of <body>). Sweep the pointer across the hero and
-   the dragon reveals itself where the light touches. Where the
-   reveal can't run (touch, reduced motion) the base layer is
-   simply drawn stronger. */
+   An imposing Japanese dragon — deer antlers, open jaw, whisker
+   barbels, three-taloned eagle claws, the sacred pearl — drawn
+   once in <defs> and layered three times: a barely-visible
+   base, a bright copy masked by a soft spotlight that follows
+   the cursor (#ryu-spot-c, moved by the script at the end of
+   <body>), and an ink layer that draws the dragon in on page
+   load. On touch screens the spotlight sweeps the art by
+   itself; under reduced motion the base is simply drawn
+   stronger. */
 .hero-bg{position:absolute;inset:0;pointer-events:none;overflow:hidden}
-.dragon-art{position:absolute;inset:0;width:100%;height:100%}
+.dragon-art{position:absolute;inset:0;width:100%;height:100%;will-change:transform}
 .dragon-art .ryu-base{stroke:var(--dragon-line)}
 .dragon-art .ryu-reveal{stroke:var(--dragon-reveal)}
+/* ink intro: every path carries pathLength="1", so a normalized dash
+   can draw the whole dragon in one stroke-dashoffset animation */
+.dragon-art .ryu-ink{stroke:var(--dragon-reveal);opacity:0;visibility:hidden}
+.dragon-art.play-ink .ryu-ink{
+  visibility:visible;
+  stroke-dasharray:1 1.1;
+  animation:ryu-draw 3s var(--ease-out) forwards,ryu-ink-fade 1.4s ease 3.1s forwards;
+}
+@keyframes ryu-draw{from{stroke-dashoffset:1.05;opacity:0}10%{opacity:.85}to{stroke-dashoffset:0;opacity:.85}}
+@keyframes ryu-ink-fade{to{opacity:0;visibility:hidden}}
 @media (pointer:coarse),(prefers-reduced-motion:reduce){
   .dragon-art .ryu-base{stroke:var(--dragon-line-strong)}
+}
+@media (prefers-reduced-motion:reduce){
+  .dragon-art.play-ink .ryu-ink{animation:none;visibility:hidden}
 }
 
 .hero-inner{position:relative}
 .hero .mark{width:74px;height:74px;margin:0 auto 1.6rem;filter:drop-shadow(0 10px 26px var(--accent-glow))}
+.js .hero .mark{cursor:pointer}
+@keyframes markPop{0%{transform:scale(1)}35%{transform:scale(1.16) rotate(-5deg)}70%{transform:scale(.97)}100%{transform:scale(1)}}
+.hero .mark.pop{animation:fadeUp .01s linear forwards,markPop .6s var(--ease-out)}
 .hero-pill{
   display:inline-flex;align-items:center;gap:.5rem;
   font-size:.78rem;font-weight:600;color:var(--text-secondary);
@@ -342,6 +365,9 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .feature-card:hover{transform:translateY(-4px);box-shadow:var(--card-shadow-hover);border-color:var(--border-strong)}
 .feature-card:hover::before{opacity:1}
+/* fine pointers get a 3D tilt driven by --rx/--ry from the script */
+.js.fine .feature-card{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
+.js.fine .feature-card:hover{--lift:-4px}
 /* spotlight ring that follows the cursor along the card border */
 .js .feature-card::after{
   content:"";position:absolute;inset:-1px;border-radius:var(--radius);
@@ -405,8 +431,23 @@ section.alt .stage{background:var(--section-alt)}
   4%{border-color:var(--accent);color:var(--accent);box-shadow:0 0 18px -2px var(--accent-glow)}
   9%{border-color:var(--border-strong);color:var(--text-secondary);box-shadow:0 0 0 0 transparent}
 }
+.js .stage{cursor:pointer}
+.js .stage:hover{animation-play-state:paused;border-color:var(--accent);color:var(--accent)}
+.stage:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.js .stage.active{
+  animation:none;
+  border-color:var(--accent);color:var(--accent);
+  box-shadow:0 0 18px -2px var(--accent-glow);
+  transform:translateY(-2px);
+}
+.pipeline-detail{
+  margin-top:1.5rem;text-align:center;font-size:.9rem;color:var(--text-secondary);
+  min-height:1.7em;transition:opacity .2s ease;
+}
+.pipeline-detail strong{color:var(--accent);font-weight:700}
+.pipeline-detail.swap{opacity:0}
 .pipeline-note{
-  margin-top:1.6rem;text-align:center;font-size:.84rem;color:var(--text-muted);
+  margin-top:.8rem;text-align:center;font-size:.84rem;color:var(--text-muted);
 }
 .pipeline-note code{
   font-size:.78rem;background:var(--bg-tertiary);border:1px solid var(--border);
@@ -635,6 +676,8 @@ section.alt .stage{background:var(--section-alt)}
 </head>
 <body>
 
+<div id="scroll-progress" aria-hidden="true"></div>
+
 <header class="site-header" id="site-header">
   <div class="header-inner">
     <a href="/" class="brand" aria-label="Ryuki home">
@@ -710,10 +753,11 @@ section.alt .stage{background:var(--section-alt)}
     </defs>
     <use href="#ryu-art" class="ryu-base"/>
     <use href="#ryu-art" class="ryu-reveal" mask="url(#ryu-spot)"/>
+    <use href="#ryu-art" class="ryu-ink"/>
   </svg>
   </div>
   <div class="container hero-inner">
-    <svg class="mark fx" style="--d:.05s" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ryuki logo">
+    <svg class="mark fx" id="hero-mark" style="--d:.05s" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ryuki logo">
   <path d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2" fill="none" stroke="var(--logo-red)" stroke-width="7.5" stroke-linecap="round"/>
   <path d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2" fill="none" stroke="var(--logo-red)" stroke-width="2.7" stroke-linecap="round"/>
   <path d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3" fill="none" stroke="var(--logo-red)" stroke-width="3" stroke-linecap="round"/>
@@ -870,6 +914,7 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage" style="--i:10"><span class="stage-num">11</span>Retire</li>
       </ol>
     </div>
+    <p class="pipeline-detail" id="pipeline-detail" data-reveal aria-live="polite">Select a stage to see what it governs.</p>
     <p class="pipeline-note" data-reveal>Break-glass emergency changes follow the same pipeline &mdash; full audit trail, <code>no bypass on evidence</code>.</p>
   </div>
 </section>
@@ -1102,10 +1147,19 @@ section.alt .stage{background:var(--section-alt)}
     if(html.getAttribute('data-theme-mode')==='system') apply('system');
   });
 
-  /* ── Header shadow on scroll ── */
+  /* ── Header shadow + scroll progress ── */
   var header=document.getElementById('site-header');
-  function onScroll(){header.classList.toggle('scrolled',window.scrollY>8)}
+  var prog=document.getElementById('scroll-progress');
+  function onScroll(){
+    header.classList.toggle('scrolled',window.scrollY>8);
+    if(prog){
+      var de=document.documentElement;
+      var max=de.scrollHeight-de.clientHeight;
+      prog.style.width=max>0?(window.scrollY/max*100).toFixed(2)+'%':'0';
+    }
+  }
   window.addEventListener('scroll',onScroll,{passive:true});
+  window.addEventListener('resize',onScroll,{passive:true});
   onScroll();
 
   /* ── Scroll reveal ── */
@@ -1174,30 +1228,46 @@ section.alt .stage{background:var(--section-alt)}
     });
   }
 
-  /* ── Dragon Knight (竜騎): the dragon shows itself ────────
-     The ryū behind the hero is barely there — until the cursor
-     passes over it. A soft spotlight (an SVG mask) follows the
-     pointer and reveals the dragon where the light touches. */
+  /* ── The ryū engine (竜騎): the dragon shows itself ───────
+     On load the dragon inks itself in, then fades to a faint
+     base. A soft spotlight (an SVG mask) reveals it again — it
+     follows the cursor on fine pointers and sweeps the art on
+     its own on touch screens while the hero is visible.
+     Clicking the hero mark, or typing "ryu", wakes it fully. */
   var fine=window.matchMedia('(pointer: fine)').matches;
-  if(fine&&!reduced){
-    var art=document.querySelector('.dragon-art');
-    var spot=document.getElementById('ryu-spot-c');
-    if(art&&spot){
-      var sx=600,sy=310,cx2=600,cy2=310,r=0,tr=0,rafId=null;
-      function step(){
-        sx+=(cx2-sx)*.16;
-        sy+=(cy2-sy)*.16;
-        r+=(tr-r)*.10;
-        spot.setAttribute('cx',sx.toFixed(1));
-        spot.setAttribute('cy',sy.toFixed(1));
-        spot.setAttribute('r',Math.max(0,r).toFixed(1));
-        if(Math.abs(cx2-sx)+Math.abs(cy2-sy)>.5||Math.abs(tr-r)>.5){
-          rafId=requestAnimationFrame(step);
-        }else{
-          rafId=null;
-        }
+  var art=document.querySelector('.dragon-art');
+  var spot=document.getElementById('ryu-spot-c');
+  var heroEl=document.querySelector('.hero');
+
+  if(fine&&!reduced)document.documentElement.classList.add('fine');
+  if(art&&!reduced)requestAnimationFrame(function(){art.classList.add('play-ink')});
+
+  if(art&&spot&&!reduced){
+    var sx=600,sy=310,cx2=600,cy2=310,r=0,tr=0,rafId=null;
+    var sweeping=!fine,heroVisible=true,roaring=false;
+    var step=function(ts){
+      if(sweeping&&!roaring){
+        cx2=600+430*Math.sin(ts*.00031);
+        cy2=305+175*Math.sin(ts*.00052+1.4);
+        tr=heroVisible?170:0;
       }
+      sx+=(cx2-sx)*.16;
+      sy+=(cy2-sy)*.16;
+      r+=(tr-r)*.10;
+      spot.setAttribute('cx',sx.toFixed(1));
+      spot.setAttribute('cy',sy.toFixed(1));
+      spot.setAttribute('r',Math.max(0,r).toFixed(1));
+      if((sweeping&&heroVisible)||Math.abs(cx2-sx)+Math.abs(cy2-sy)>.5||Math.abs(tr-r)>.5){
+        rafId=requestAnimationFrame(step);
+      }else{
+        rafId=null;
+      }
+    };
+    var wake=function(){if(rafId===null)rafId=requestAnimationFrame(step)};
+
+    if(fine){
       document.addEventListener('mousemove',function(e){
+        if(roaring)return;
         var m=art.getScreenCTM();
         if(!m)return;
         var det=m.a*m.d-m.b*m.c;
@@ -1207,19 +1277,127 @@ section.alt .stage{background:var(--section-alt)}
         var y=(m.a*py-m.b*px)/det;
         if(x>-60&&x<1260&&y>-60&&y<680){cx2=x;cy2=y;tr=185}
         else{tr=0}
-        if(rafId===null)rafId=requestAnimationFrame(step);
+        wake();
       },{passive:true});
+    }else if(heroEl&&'IntersectionObserver' in window){
+      var sweepIo=new IntersectionObserver(function(entries){
+        heroVisible=entries[0].isIntersecting;
+        if(heroVisible)wake();
+      },{threshold:.15});
+      sweepIo.observe(heroEl);
+      wake();
     }
 
-    /* feature cards: spotlight ring follows the cursor */
-    Array.prototype.forEach.call(document.querySelectorAll('.feature-card'),function(card){
-      card.addEventListener('mousemove',function(e){
-        var r=card.getBoundingClientRect();
-        card.style.setProperty('--mx',(e.clientX-r.left)+'px');
-        card.style.setProperty('--my',(e.clientY-r.top)+'px');
-      },{passive:true});
+    /* roar: a full reveal pulse across the whole canvas */
+    var roar=function(){
+      roaring=true;cx2=600;cy2=300;tr=1500;wake();
+      setTimeout(function(){roaring=false;tr=sweeping?170:0;wake()},1200);
+    };
+    var heroMark=document.getElementById('hero-mark');
+    if(heroMark){
+      heroMark.addEventListener('click',function(){
+        heroMark.classList.remove('pop');
+        heroMark.getBoundingClientRect();
+        heroMark.classList.add('pop');
+        roar();
+      });
+    }
+    /* type "ryu" anywhere: the dragon redraws itself */
+    var buf='';
+    document.addEventListener('keydown',function(e){
+      if(e.key.length!==1)return;
+      buf=(buf+e.key.toLowerCase()).slice(-3);
+      if(buf==='ryu'){
+        art.classList.remove('play-ink');
+        art.getBoundingClientRect();
+        art.classList.add('play-ink');
+        roar();
+      }
     });
   }
+
+  /* ── Hero parallax: the dragon drifts with scroll & cursor ── */
+  if(art&&!reduced){
+    var pdx=0,pdy=0;
+    var applyPar=function(){
+      var sc=Math.min(120,window.scrollY*.12);
+      art.style.transform='translate3d('+pdx.toFixed(1)+'px,'+(pdy+sc).toFixed(1)+'px,0)';
+    };
+    window.addEventListener('scroll',applyPar,{passive:true});
+    if(fine){
+      document.addEventListener('mousemove',function(e){
+        pdx=(e.clientX/window.innerWidth-.5)*16;
+        pdy=(e.clientY/window.innerHeight-.5)*10;
+        applyPar();
+      },{passive:true});
+    }
+  }
+
+  /* ── Lifecycle pipeline: pick a stage to see what it governs ── */
+  var stageInfo=[
+    'Request captured with owner, purpose, environment, and target site.',
+    'Static checks against catalog contracts, naming, and capacity.',
+    'Execution plan rendered with impact analysis and a rollback path.',
+    'Role-based approval chain &mdash; CAB-ready, fully attributed.',
+    'Change window locked, resources reserved, conflicts blocked.',
+    'Adapters execute against approved provider endpoints only.',
+    'Post-change health probes and configuration drift checks.',
+    'Backup coverage confirmed and monitoring enrolled.',
+    'CMDB reconciled and the redacted evidence pack generated.',
+    'Patching, compliance, and ownership through the service life.',
+    'Governed decommission &mdash; quarantine, final evidence, teardown.'
+  ];
+  var stages=document.querySelectorAll('.pipeline .stage');
+  var detail=document.getElementById('pipeline-detail');
+  if(stages.length&&detail){
+    var defaultMsg=detail.innerHTML;
+    Array.prototype.forEach.call(stages,function(li,idx){
+      li.setAttribute('tabindex','0');
+      li.setAttribute('role','button');
+      li.setAttribute('aria-pressed','false');
+      var activate=function(){
+        var wasOn=li.classList.contains('active');
+        Array.prototype.forEach.call(stages,function(s){
+          s.classList.remove('active');
+          s.setAttribute('aria-pressed','false');
+        });
+        detail.classList.add('swap');
+        setTimeout(function(){
+          if(wasOn){
+            detail.innerHTML=defaultMsg;
+          }else{
+            li.classList.add('active');
+            li.setAttribute('aria-pressed','true');
+            var name=li.textContent.replace(/^\s*\d+\s*/,'').trim();
+            detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> &mdash; '+stageInfo[idx];
+          }
+          detail.classList.remove('swap');
+        },150);
+      };
+      li.addEventListener('click',activate);
+      li.addEventListener('keydown',function(e){
+        if(e.key==='Enter'||e.key===' '){e.preventDefault();activate()}
+      });
+    });
+  }
+
+  /* ── Feature cards: cursor ring + 3D tilt ── */
+  Array.prototype.forEach.call(document.querySelectorAll('.feature-card'),function(card){
+    card.addEventListener('mousemove',function(e){
+      var r=card.getBoundingClientRect();
+      var x=e.clientX-r.left,y=e.clientY-r.top;
+      card.style.setProperty('--mx',x+'px');
+      card.style.setProperty('--my',y+'px');
+      card.style.setProperty('--ry',(((x/r.width)-.5)*6).toFixed(2)+'deg');
+      card.style.setProperty('--rx',((.5-(y/r.height))*6).toFixed(2)+'deg');
+    },{passive:true});
+    card.addEventListener('mouseleave',function(){
+      card.style.setProperty('--rx','0deg');
+      card.style.setProperty('--ry','0deg');
+    });
+  });
+
+  try{console.log('%c竜騎 Ryuki%c — the dragon is in the details. (psst: type "ryu")','font-weight:700;color:#c0392b','color:inherit')}catch(e){}
 })();
 </script>
 
