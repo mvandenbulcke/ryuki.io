@@ -713,8 +713,8 @@ pub struct SmtpConfig {
     pub port: u16,
     #[serde(default)]
     pub username: String,
-    #[serde(default)]
-    pub password: String,
+    #[serde(default, rename = "password")]
+    pub credential: String,
     #[serde(default = "default_smtp_from")]
     pub from_address: String,
     #[serde(default)]
@@ -740,7 +740,7 @@ impl Default for SmtpConfig {
             host: default_smtp_host(),
             port: default_smtp_port(),
             username: String::new(),
-            password: String::new(),
+            credential: String::new(),
             from_address: default_smtp_from(),
             use_tls: true,
         }
@@ -1150,11 +1150,29 @@ impl RyukiConfig {
             );
         }
 
+        if self.rate_limit.enabled && self.rate_limit.requests_per_second > u32::MAX as u64 {
+            errors.push(format!(
+                "rate_limit.requests_per_second must be less than or equal to {}",
+                u32::MAX
+            ));
+        }
+
         if self.rate_limit.enabled {
             for (path, override_cfg) in &self.rate_limit.path_overrides {
                 if override_cfg.requests_per_second == 0 {
                     errors.push(format!(
-                        "rate_limit.path_overrides.{path}.requests_per_second is 0 — override will deny all requests for this group"
+                        "rate_limit.path_overrides.{path}.requests_per_second must be greater than 0"
+                    ));
+                }
+                if override_cfg.requests_per_second > u32::MAX as u64 {
+                    errors.push(format!(
+                        "rate_limit.path_overrides.{path}.requests_per_second must be less than or equal to {}",
+                        u32::MAX
+                    ));
+                }
+                if override_cfg.burst_size == 0 {
+                    errors.push(format!(
+                        "rate_limit.path_overrides.{path}.burst_size must be greater than 0"
                     ));
                 }
             }
@@ -1397,11 +1415,39 @@ mod tests {
     }
 
     #[test]
+    fn test_smtp_config_accepts_password_key() {
+        let config: SmtpConfig =
+            serde_json::from_str(r#"{"password":"smtp-placeholder"}"#).unwrap();
+        assert_eq!(config.credential, "smtp-placeholder");
+    }
+
+    #[test]
     fn test_rate_limit_config_defaults() {
         let rl = RateLimitConfig::default();
         assert!(!rl.enabled);
         assert_eq!(rl.requests_per_second, 50);
         assert_eq!(rl.burst_size, 100);
+    }
+
+    #[test]
+    fn test_validate_rate_limit_path_overrides() {
+        let mut config = RyukiConfig::default();
+        config.rate_limit.enabled = true;
+        config.rate_limit.path_overrides.insert(
+            "health".into(),
+            RateLimitPathOverride {
+                requests_per_second: 0,
+                burst_size: 0,
+            },
+        );
+
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains(
+            "rate_limit.path_overrides.health.requests_per_second must be greater than 0"
+        )));
+        assert!(errors.iter().any(|e| {
+            e.contains("rate_limit.path_overrides.health.burst_size must be greater than 0")
+        }));
     }
 
     #[test]

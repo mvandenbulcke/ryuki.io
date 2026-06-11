@@ -232,12 +232,31 @@ async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
+#[derive(Clone)]
+struct RateLimiters {
+    default: SharedRateLimiter,
+    path_overrides: Arc<HashMap<String, SharedRateLimiter>>,
+}
+
+impl RateLimiters {
+    fn for_path_group(&self, path_group: &str) -> &SharedRateLimiter {
+        self.path_overrides.get(path_group).unwrap_or(&self.default)
+    }
+
+    #[cfg(test)]
+    fn has_override(&self, path_group: &str) -> bool {
+        self.path_overrides.contains_key(path_group)
+    }
+}
+
+type SharedRateLimiters = Arc<RateLimiters>;
+
 async fn rate_limit_middleware(
-    limiter: Option<SharedRateLimiter>,
+    limiter: Option<SharedRateLimiters>,
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
-    if let Some(ref limiter) = limiter {
+    if let Some(ref limiters) = limiter {
         let client_key = request
             .headers()
             .get("x-forwarded-for")
@@ -249,15 +268,10 @@ async fn rate_limit_middleware(
             .trim()
             .to_string();
 
-        let path_group = request
-            .uri()
-            .path()
-            .split('/')
-            .nth(1)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("root");
+        let path_group = rate_limit_path_group(request.uri().path());
 
         let key = format!("{path_group}:{client_key}");
+        let limiter = limiters.for_path_group(&path_group);
 
         if limiter.check_key(&key).is_err() {
             tracing::warn!(client = %client_key, path_group, "rate limit exceeded");
@@ -277,20 +291,56 @@ async fn rate_limit_middleware(
     next.run(request).await
 }
 
-fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<SharedRateLimiter> {
+fn rate_limit_path_group(path: &str) -> String {
+    path.split('/')
+        .nth(1)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("root")
+        .to_ascii_lowercase()
+}
+
+fn normalize_rate_limit_override_key(path_group: &str) -> String {
+    let normalized = path_group.trim_matches('/').trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "root".into()
+    } else {
+        normalized
+    }
+}
+
+fn rate_limit_quota(requests_per_second: u64, burst_size: u32) -> Quota {
+    let requests_per_second = u32::try_from(requests_per_second).unwrap_or(u32::MAX);
+    Quota::per_second(NonZeroU32::new(requests_per_second).unwrap_or(NonZeroU32::MIN))
+        .allow_burst(NonZeroU32::new(burst_size).unwrap_or(NonZeroU32::MIN))
+}
+
+fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<SharedRateLimiters> {
     if !config.enabled {
         return None;
     }
-    let quota = Quota::per_second(
-        NonZeroU32::new(config.requests_per_second as u32).unwrap_or(NonZeroU32::MIN),
-    )
-    .allow_burst(NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::MIN));
-    // TODO: path_overrides are config-only for now. The governor library's KeyedRateLimiter uses a
-    // single global quota for all keys. Per-path quotas require multiple RateLimiter instances —
-    // one per overridden path group plus one default. Expose overrides via platform_status so
-    // operators can see them, but actual enforcement uses the single default quota until
-    // multi-limiter support is added.
-    Some(Arc::new(RateLimiter::keyed(quota)))
+    let default = Arc::new(RateLimiter::keyed(rate_limit_quota(
+        config.requests_per_second,
+        config.burst_size,
+    )));
+
+    let path_overrides = config
+        .path_overrides
+        .iter()
+        .map(|(path_group, override_config)| {
+            (
+                normalize_rate_limit_override_key(path_group),
+                Arc::new(RateLimiter::keyed(rate_limit_quota(
+                    override_config.requests_per_second,
+                    override_config.burst_size,
+                ))),
+            )
+        })
+        .collect();
+
+    Some(Arc::new(RateLimiters {
+        default,
+        path_overrides: Arc::new(path_overrides),
+    }))
 }
 
 async fn security_headers_middleware(
@@ -746,6 +796,68 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_limit_path_group_normalizes_first_path_segment() {
+        assert_eq!(rate_limit_path_group("/health"), "health");
+        assert_eq!(rate_limit_path_group("/API/platform/status"), "api");
+        assert_eq!(rate_limit_path_group("/"), "root");
+    }
+
+    #[test]
+    fn test_create_rate_limiter_normalizes_override_keys() {
+        let mut config = ryuki_core::config::RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+            path_overrides: HashMap::new(),
+        };
+        config.path_overrides.insert(
+            "/HEALTH/".into(),
+            ryuki_core::config::RateLimitPathOverride {
+                requests_per_second: 2,
+                burst_size: 2,
+            },
+        );
+
+        let limiters = create_rate_limiter(&config).expect("rate limiter should be enabled");
+        assert!(limiters.has_override("health"));
+        assert!(!limiters.has_override("api"));
+        assert!(!Arc::ptr_eq(
+            limiters.for_path_group("health"),
+            limiters.for_path_group("api")
+        ));
+    }
+
+    #[test]
+    fn test_path_override_limiter_enforces_separate_quota() {
+        let mut config = ryuki_core::config::RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+            path_overrides: HashMap::new(),
+        };
+        config.path_overrides.insert(
+            "health".into(),
+            ryuki_core::config::RateLimitPathOverride {
+                requests_per_second: 2,
+                burst_size: 2,
+            },
+        );
+
+        let limiters = create_rate_limiter(&config).expect("rate limiter should be enabled");
+        let default_key = "api:client-a".to_string();
+        let health_key = "health:client-a".to_string();
+
+        let default_limiter = limiters.for_path_group("api");
+        assert!(default_limiter.check_key(&default_key).is_ok());
+        assert!(default_limiter.check_key(&default_key).is_err());
+
+        let health_limiter = limiters.for_path_group("health");
+        assert!(health_limiter.check_key(&health_key).is_ok());
+        assert!(health_limiter.check_key(&health_key).is_ok());
+        assert!(health_limiter.check_key(&health_key).is_err());
+    }
+
+    #[test]
     fn test_problem_details_without_detail() {
         let (status, Json(body)) = problem_details(
             StatusCode::BAD_REQUEST,
@@ -799,7 +911,9 @@ mod db_tests {
         let url = std::env::var("DATABASE_URL").unwrap();
         crate::database::try_connect_with_url(&url, 5, 2, 300, 30, 1800).await;
         let db = crate::database::get_db().expect("database should be available");
-        crate::database::run_migrations(db).await;
+        crate::database::run_migrations(db)
+            .await
+            .expect("migrations should run");
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM platform_config")
             .fetch_one(db)

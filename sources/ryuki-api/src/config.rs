@@ -67,6 +67,7 @@ pub fn get_platform_status() -> serde_json::Value {
             "enabled": config.rate_limit.enabled,
             "requests_per_second": config.rate_limit.requests_per_second,
             "burst_size": config.rate_limit.burst_size,
+            "path_overrides_enforced": true,
             "path_overrides": config.rate_limit.path_overrides.iter().map(|(path, ov)| {
                 (path.clone(), serde_json::json!({
                     "requests_per_second": ov.requests_per_second,
