@@ -159,6 +159,21 @@ pub fn quarantine_server(request: &DecommissionRequest) -> Result<DecommissionRe
         ));
     }
 
+    if request.status != DecommissionStatus::Approved {
+        return Err(format!(
+            "Cannot quarantine server in status {:?}. Must be Approved first.",
+            request.status
+        ));
+    }
+
+    let validation = validate_decommission(request)?;
+    if !validation.passed {
+        return Err(format!(
+            "Cannot quarantine server before validation passes: {}",
+            validation.failed_rules.join(", ")
+        ));
+    }
+
     let quarantine_until = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::days(request.quarantine_days as i64))
         .unwrap_or(chrono::Utc::now())
@@ -185,6 +200,13 @@ pub fn execute_decommission(request: &DecommissionRequest) -> Result<Decommissio
     {
         return Err(format!(
             "Cannot execute decommission in terminal status: {:?}",
+            request.status
+        ));
+    }
+
+    if request.status != DecommissionStatus::Quarantined {
+        return Err(format!(
+            "Cannot execute decommission in status {:?}. Must be Quarantined first.",
             request.status
         ));
     }
@@ -498,12 +520,39 @@ mod tests {
     #[test]
     fn test_quarantine_server() {
         let mut req = make_test_request();
+        req.status = DecommissionStatus::Approved;
         req.backup_confirmed = true;
         req.approvals_collected = vec!["Datacenter Approver".into()];
         let quarantined = quarantine_server(&req).unwrap();
         assert_eq!(quarantined.status, DecommissionStatus::Quarantined);
         assert!(quarantined.quarantine_until.is_some());
         assert!(quarantined.metadata.contains_key("quarantine_action"));
+    }
+
+    #[test]
+    fn test_quarantine_server_refuses_unapproved_status() {
+        for status in [
+            DecommissionStatus::Draft,
+            DecommissionStatus::Planned,
+            DecommissionStatus::Validated,
+        ] {
+            let mut req = make_test_request();
+            req.status = status;
+            req.backup_confirmed = true;
+            req.approvals_collected = vec!["Datacenter Approver".into()];
+            assert!(quarantine_server(&req).is_err());
+        }
+    }
+
+    #[test]
+    fn test_quarantine_server_requires_validation_to_pass() {
+        let mut req = make_test_request();
+        req.status = DecommissionStatus::Approved;
+        req.approvals_collected = vec!["Datacenter Approver".into()];
+
+        let err = quarantine_server(&req).unwrap_err();
+
+        assert!(err.contains("p0-backup-not-confirmed"));
     }
 
     #[test]
@@ -527,10 +576,43 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_decommission_refuses_unsafe_early_statuses() {
+        for status in [
+            DecommissionStatus::Draft,
+            DecommissionStatus::Planned,
+            DecommissionStatus::Validated,
+            DecommissionStatus::Approved,
+        ] {
+            let mut req = make_test_request();
+            req.status = status;
+
+            let err = execute_decommission(&req).unwrap_err();
+
+            assert!(err.contains("Must be Quarantined first"));
+        }
+    }
+
+    #[test]
     fn test_execute_decommission_refuses_terminal_status() {
         let mut req = make_test_request();
         req.status = DecommissionStatus::Completed;
         assert!(execute_decommission(&req).is_err());
+    }
+
+    #[test]
+    fn test_decommission_happy_path_to_execution_and_verification() {
+        let mut req = make_test_request();
+        req.status = DecommissionStatus::Approved;
+        req.backup_confirmed = true;
+        req.approvals_collected = vec!["Datacenter Approver".into(), "Application Owner".into()];
+
+        let quarantined = quarantine_server(&req).unwrap();
+        let executed = execute_decommission(&quarantined).unwrap();
+        let evidence = verify_decommission(&executed).unwrap();
+
+        assert_eq!(quarantined.status, DecommissionStatus::Quarantined);
+        assert_eq!(executed.status, DecommissionStatus::Executed);
+        assert_eq!(evidence.len(), 5);
     }
 
     #[test]
