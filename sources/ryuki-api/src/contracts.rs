@@ -25,6 +25,8 @@ use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::gmsa_lifecycle;
+use ryuki_engine::hardware_lifecycle;
+use ryuki_engine::immutability_compliance;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::maintenance_calendar;
@@ -33,6 +35,7 @@ use ryuki_engine::noise_remediation;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::patch_engine;
+use ryuki_engine::repository_capacity;
 use ryuki_engine::server_decommission;
 use ryuki_engine::shift_queue;
 use ryuki_engine::snapshot_engine;
@@ -41,6 +44,7 @@ use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::degradation_mode;
+use ryuki_engine::emergency_change;
 use ryuki_engine::servicenow_api;
 use ryuki_engine::zabbix_drift;
 
@@ -397,6 +401,16 @@ pub fn routes() -> Router {
         .route("/api/ops/shift/my-items", get(shift_my_items))
         .route("/api/ops/shift/stale", get(shift_stale))
         .route("/api/ops/shift-contract", get(shift_contract))
+        // ─── Emergency Change (Break-Glass) Engine ───
+        .route("/api/ops/emergency/initiate", post(emergency_initiate))
+        .route("/api/ops/emergency/approve/{id}", post(emergency_approve))
+        .route("/api/ops/emergency/execute/{id}", post(emergency_execute))
+        .route("/api/ops/emergency/verify/{id}", post(emergency_verify))
+        .route("/api/ops/emergency/close/{id}", post(emergency_close))
+        .route("/api/ops/emergency/active", get(emergency_active))
+        .route("/api/ops/emergency/history", get(emergency_history))
+        .route("/api/ops/emergency/stats", get(emergency_stats))
+        .route("/api/ops/emergency-contract", get(emergency_contract))
         .route(
             "/api/operations/dependency-replay-contract",
             get(operations_dependency_replay),
@@ -585,9 +599,70 @@ pub fn routes() -> Router {
             "/api/protect/repository-capacity-contract",
             get(protect_repository_capacity),
         )
+        .route("/api/protect/repository-capacity", get(repo_capacity_list))
+        .route(
+            "/api/protect/repository-capacity/update/{id}",
+            post(repo_capacity_update),
+        )
+        .route(
+            "/api/protect/repository-capacity/forecast/{id}",
+            get(repo_capacity_forecast),
+        )
+        .route(
+            "/api/protect/repository-capacity/at-risk",
+            get(repo_capacity_at_risk),
+        )
+        .route(
+            "/api/protect/repository-capacity/report",
+            get(repo_capacity_report),
+        )
+        .route(
+            "/api/protect/repository-capacity/trend/{id}",
+            get(repo_capacity_trend),
+        )
+        .route(
+            "/api/protect/repository-capacity/recommendations/{id}",
+            get(repo_capacity_recommendations),
+        )
         .route(
             "/api/protect/immutability-air-gap-compliance-contract",
             get(protect_immutability_air_gap),
+        )
+        .route(
+            "/api/protect/immutability/check/{id}",
+            post(immutability_check),
+        )
+        .route(
+            "/api/protect/immutability/retention-lock/{id}",
+            post(immutability_retention_lock),
+        )
+        .route(
+            "/api/protect/immutability/air-gap/{id}",
+            post(immutability_air_gap),
+        )
+        .route(
+            "/api/protect/immutability/verify-all",
+            post(immutability_verify_all),
+        )
+        .route(
+            "/api/protect/immutability/compliance",
+            get(immutability_compliance_report),
+        )
+        .route(
+            "/api/protect/immutability/noncompliant",
+            get(immutability_noncompliant),
+        )
+        .route(
+            "/api/protect/immutability/retention-risk",
+            get(immutability_retention_risk),
+        )
+        .route(
+            "/api/protect/immutability/remediation/{id}",
+            get(immutability_remediation),
+        )
+        .route(
+            "/api/protect/immutability-contract",
+            get(immutability_contract),
         )
         .route(
             "/api/protect/application-aware-backup-validation-contract",
@@ -1174,6 +1249,44 @@ pub fn routes() -> Router {
             post(oob_validate_site),
         )
         .route("/api/datacenter/oob-contract", get(oob_contract))
+        // ─── Hardware Lifecycle ───
+        .route(
+            "/api/datacenter/hardware/inventory",
+            get(hardware_inventory),
+        )
+        .route(
+            "/api/datacenter/hardware/warranty-expiring",
+            get(hardware_warranty_expiring),
+        )
+        .route(
+            "/api/datacenter/hardware/firmware-check/{id}",
+            post(hardware_firmware_check),
+        )
+        .route(
+            "/api/datacenter/hardware/firmware-gaps",
+            get(hardware_firmware_gaps),
+        )
+        .route(
+            "/api/datacenter/hardware/support-risk",
+            get(hardware_support_risk),
+        )
+        .route(
+            "/api/datacenter/hardware/refresh-plan",
+            get(hardware_refresh_plan),
+        )
+        .route(
+            "/api/datacenter/hardware/lifecycle-report",
+            get(hardware_lifecycle_report),
+        )
+        .route("/api/datacenter/hardware/add", post(hardware_add))
+        .route(
+            "/api/datacenter/hardware/update-firmware/{id}",
+            post(hardware_update_firmware),
+        )
+        .route(
+            "/api/datacenter/hardware-contract",
+            get(hardware_contract),
+        )
 }
 
 // ─── Shared data ───
@@ -1306,6 +1419,20 @@ struct LegalHoldExtendRequest {
 struct LegalHoldReleaseRequest {
     #[serde(rename = "releasedBy")]
     released_by: String,
+}
+
+// ─── Immutability compliance request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ImmutabilityVerifyAllQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ImmutabilityComplianceQuery {
+    site: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3746,6 +3873,173 @@ async fn shift_contract() -> Json<Value> {
     Json(shift_queue::get_shift_contract())
 }
 
+// ─── Emergency Change (Break-Glass) request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EmergencyInitiateRequest {
+    description: String,
+    systems: Vec<String>,
+    #[serde(rename = "initiatedBy")]
+    initiated_by: String,
+    reason: String,
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EmergencyCloseRequest {
+    #[serde(rename = "postReviewNotes")]
+    post_review_notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmergencySiteQuery {
+    site: Option<String>,
+}
+
+// ─── Emergency Change (Break-Glass) handlers ───
+
+async fn emergency_initiate(
+    Json(body): Json<EmergencyInitiateRequest>,
+) -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::initiate_emergency(
+        &body.description,
+        body.systems,
+        &body.initiated_by,
+        &body.reason,
+        &body.site,
+    ) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "EMERGENCY_INITIATE_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::auto_approve(&id) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "EMERGENCY_APPROVE_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::execute_emergency(&id) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "EMERGENCY_EXECUTE_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::verify_emergency(&id) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "EMERGENCY_VERIFY_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_close(
+    Path(id): Path<String>,
+    Json(body): Json<EmergencyCloseRequest>,
+) -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::close_emergency(&id, &body.post_review_notes) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::BAD_REQUEST,
+            "EMERGENCY_CLOSE_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
+    match emergency_change::get_active_emergencies() {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EMERGENCY_ACTIVE_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_history(
+    Query(params): Query<EmergencySiteQuery>,
+) -> Result<Json<Value>, ProblemDetails> {
+    let site = params.site.unwrap_or_default();
+    match emergency_change::get_emergency_history(&site) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EMERGENCY_HISTORY_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_stats(
+    Query(params): Query<EmergencySiteQuery>,
+) -> Result<Json<Value>, ProblemDetails> {
+    let site = params.site.unwrap_or_default();
+    match emergency_change::get_emergency_stats(&site) {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err(problem_details(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EMERGENCY_STATS_FAILED",
+            e,
+            None::<&str>,
+        )),
+    }
+}
+
+async fn emergency_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "modes": ["break-glass", "urgent-remediation", "incident-containment", "service-restoration"],
+        "requiredGuards": ["emergency-role-authorized", "incident-or-ticket-linked", "emergency-approver-assigned", "scope-bounded", "dry-run-ready", "lock-record-ready", "evidence-redacted"],
+        "planSections": ["emergencySummary", "businessImpact", "targetScope", "riskJustification", "approvalPath", "rollbackNotes", "verificationPlan", "handoverNotes"],
+        "blockedReasons": ["live-execution-disabled", "privileged-worker-disabled", "role-not-authorized", "incident-context-missing", "approval-missing", "scope-too-broad", "lock-conflict", "evidence-not-redacted"],
+        "endpoints": {
+            "initiate": {"method": "POST", "path": "/api/ops/emergency/initiate"},
+            "approve": {"method": "POST", "path": "/api/ops/emergency/approve/{id}"},
+            "execute": {"method": "POST", "path": "/api/ops/emergency/execute/{id}"},
+            "verify": {"method": "POST", "path": "/api/ops/emergency/verify/{id}"},
+            "close": {"method": "POST", "path": "/api/ops/emergency/close/{id}"},
+            "active": {"method": "GET", "path": "/api/ops/emergency/active"},
+            "history": {"method": "GET", "path": "/api/ops/emergency/history"},
+            "stats": {"method": "GET", "path": "/api/ops/emergency/stats"}
+        },
+        "rules": [
+            {"id": "no-live-emergency-execution", "decision": "block", "requirement": "Emergency changes remain dry-run only until live execution is explicitly enabled by policy.", "evidence": "Dry-run plan summary"},
+            {"id": "emergency-approval-required", "decision": "block", "requirement": "Emergency approval and delegated authority must be recorded before execution can be considered.", "evidence": "Approval decisions"},
+            {"id": "bounded-scope-required", "decision": "block", "requirement": "Emergency scope must be bounded and locked to avoid uncontrolled blast radius.", "evidence": "Scope and lock record"},
+            {"id": "audit-evidence-required", "decision": "block", "requirement": "Redacted evidence, verification, and privileged worker log references are mandatory for audit.", "evidence": "Evidence references"}
+        ]
+    }))
+}
+
 async fn operations_dependency_replay() -> Json<Value> {
     Json(
         json!({"source":"static-seed","operationDependencyReplayMode":"static-dependency-replay","dependencyGraphReadOnly":true,"replaySimulationDryRunOnly":true,"lockStateReadOnly":true,"liveReplayAllowed":false,"operationMutationAllowed":false,"childOperationMutationAllowed":false,"lockMutationAllowed":false,"retryMutationAllowed":false,"providerCallsAllowed":false,"workflowMutationAllowed":false,"rawOperationRowsAllowed":false,"rawExecutionLogsAllowed":false,"rawReplayPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"serialNumbersAllowed":false,"graphNodeTypes":["operation-run","child-operation","lock-scope","dependency","blocked-reason","evidence-reference","retry-policy"],"graphEdgeTypes":["depends-on","blocks","owns-lock","emits-evidence","retries-after","resolves-blocker"],"replayPhases":["snapshot-load","dependency-sort","lock-evaluation","blocker-evaluation","retry-evaluation","evidence-preview","decision-summary"],"requiredGuards":["graph-source-reviewed","dependency-order-reviewed","lock-scope-reviewed","blocker-state-reviewed","retry-policy-reviewed","replay-dry-run-only","evidence-redacted"],"blockedReasons":["operation-replay-live-disabled","operation-mutation-disabled","operation-child-mutation-disabled","operation-lock-mutation-disabled","operation-retry-mutation-disabled","operation-provider-calls-disabled","operation-workflow-mutation-disabled","operation-raw-rows-disabled","operation-raw-logs-disabled","operation-raw-replay-payloads-disabled","operation-raw-provider-payloads-disabled","operation-raw-recipient-data-disabled","operation-credential-values-disabled","operation-tenant-identifiers-disabled","operation-object-identifiers-disabled","operation-private-network-values-disabled","operation-serials-disabled","dependency-graph-missing","replay-snapshot-missing","lock-scope-unknown","blocker-state-unknown","evidence-not-redacted"],"requiredEvidence":["Dependency graph summary","Replay phase summary","Lock evaluation summary","Blocked reason summary","Retry policy summary","Evidence references"],"rules":[{"id":"dependency-graph-read-only","decision":"block","requirement":"Operation dependency graph summaries are read-only and must not mutate operation runs, child operations, locks, retries, or workflow state.","evidence":"Dependency graph summary"},{"id":"replay-simulation-dry-run-only","decision":"block","requirement":"Replay simulation uses static snapshots only and must not replay live work, call providers, or emit live execution steps.","evidence":"Replay phase summary"},{"id":"operation-mutations-disabled","decision":"block","requirement":"Dependency replay cannot create, update, retry, unlock, close, or re-order operation runs or child operations.","evidence":"Lock evaluation summary"},{"id":"raw-activity-data-not-exposed","decision":"block","requirement":"Operation dependency replay evidence must use safe summaries only and must not expose raw operation rows, raw execution logs, raw replay payloads, raw provider payloads, recipient data, credential values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.","evidence":"Evidence references"}]}),
@@ -4246,8 +4540,136 @@ async fn protect_repository_capacity() -> Json<Value> {
 
 async fn protect_immutability_air_gap() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["immutability-posture-review","air-gap-readiness-review","retention-lock-review","copy-isolation-review","compliance-evidence-review","repository-transition-readiness-review","current-storeonce-posture-review","hardened-linux-repository-readiness-review","cutover-readiness-review","capacity-runway-review","rollback-fallback-review"],"signals":["immutability-disabled","retention-lock-missing","air-gap-gap","policy-mismatch","stale-evidence","unsupported-repository-type","repository-transition-risk","backup-copy-isolation-gap","immutable-retention-gap","capacity-runway-risk","rollback-fallback-gap"],"repositoryPostureProfiles":["current-storeonce-appliance","planned-hardened-repository-2027"],"repositoryTransitionStates":["current-storeonce-protected","hardened-repository-target-planned","transition-readiness-review-required"],"requiredGuards":["repository-summary-known","immutability-policy-known","retention-policy-known","air-gap-strategy-known","repository-transition-reviewed","isolation-path-reviewed","backup-copy-isolation-known","immutable-retention-known","capacity-runway-known","rollback-fallback-known","cutover-readiness-reviewed","owner-known","evidence-redacted"],"planSections":["postureSummary","currentStoreOncePosture","hardenedLinuxRepositoryReadiness","immutabilityControls","airGapControls","retentionLock","isolationReview","repositoryTransitionReadiness","cutoverReadiness","backupCopyIsolation","immutableRetention","capacityRunway","rollbackFallback","policyExceptions","remediationOptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","repository-summary-missing","immutability-policy-missing","retention-policy-missing","air-gap-strategy-missing","repository-transition-review-missing","isolation-path-unknown","backup-copy-isolation-missing","immutable-retention-missing","capacity-runway-missing","rollback-fallback-missing","cutover-readiness-missing","owner-unknown","evidence-not-redacted"]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["immutability-posture-review","air-gap-readiness-review","retention-lock-review","copy-isolation-review","compliance-evidence-review","repository-transition-readiness-review","current-storeonce-posture-review","hardened-linux-repository-readiness-review","cutover-readiness-review","capacity-runway-review","rollback-fallback-review"],"signals":["immutability-disabled","retention-lock-missing","air-gap-gap","policy-mismatch","stale-evidence","unsupported-repository-type","repository-transition-risk","backup-copy-isolation-gap","immutable-retention-gap","capacity-runway-risk","rollback-fallback-gap"],"repositoryPostureProfiles":["current-storeonce-appliance","planned-hardened-repository-2027"],"repositoryTransitionStates":["current-storeonce-protected","hardened-repository-target-planned","transition-readiness-review-required"],"requiredGuards":["repository-summary-known","immutability-policy-known","retention-policy-known","air-gap-strategy-known","repository-transition-reviewed","isolation-path-reviewed","backup-copy-isolation-known","immutable-retention-known","capacity-runway-known","rollback-fallback-known","cutover-readiness-reviewed","owner-known","evidence-redacted"],"planSections":["postureSummary","currentStoreOncePosture","hardenedLinuxRepositoryReadiness","immutabilityControls","airGapControls","retentionLock","isolationReview","repositoryTransitionReadiness","cutoverReadiness","backupCopyIsolation","immutableRetention","capacityRunway","rollbackFallback","policyExceptions","remediationOptions","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-remediation-disabled","repository-summary-missing","immutability-policy-missing","retention-policy-missing","air-gap-strategy-missing","repository-transition-review-missing","isolation-path-unknown","backup-copy-isolation-missing","immutable-retention-missing","capacity-runway-missing","rollback-fallback-missing","cutover-readiness-review-missing","owner-unknown","evidence-not-redacted"]}),
     )
+}
+
+// ─── Immutability Compliance Engine Handlers ───
+
+async fn immutability_check(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match immutability_compliance::check_immutability(&id) {
+        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_retention_lock(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match immutability_compliance::check_retention_lock(&id) {
+        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_air_gap(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match immutability_compliance::check_air_gap(&id) {
+        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_verify_all(
+    Query(q): Query<ImmutabilityVerifyAllQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = q.site.unwrap_or_default();
+    if site.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Query parameter 'site' is required"})),
+        ));
+    }
+    match immutability_compliance::verify_all_repositories(&site) {
+        Ok(repos) => Ok(Json(serde_json::to_value(repos).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_compliance_report(
+    Query(q): Query<ImmutabilityComplianceQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = q.site.unwrap_or_default();
+    if site.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Query parameter 'site' is required"})),
+        ));
+    }
+    match immutability_compliance::get_compliance_report(&site) {
+        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_noncompliant() -> Json<Value> {
+    let repos = immutability_compliance::get_noncompliant();
+    Json(serde_json::to_value(repos).unwrap())
+}
+
+async fn immutability_retention_risk() -> Json<Value> {
+    let repos = immutability_compliance::get_retention_risk();
+    Json(serde_json::to_value(repos).unwrap())
+}
+
+async fn immutability_remediation(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match immutability_compliance::get_remediation_plan(&id) {
+        Ok(plan) => Ok(Json(serde_json::to_value(plan).unwrap())),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
+    }
+}
+
+async fn immutability_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "exceptionMode": "review-only",
+        "dryRunRequired": true,
+        "providerCallsEnabled": false,
+        "liveRemediationAllowed": false,
+        "veeamMutationAllowed": false,
+        "rawRepositoryDataAllowed": false,
+        "rawProviderPayloadsAllowed": false,
+        "credentialValuesAllowed": false,
+        "tenantIdentifiersAllowed": false,
+        "privateNetworkValuesAllowed": false,
+        "workflows": [
+            "immutability-verification",
+            "retention-lock-verification",
+            "air-gap-verification",
+            "site-compliance-reporting",
+            "compliance-remediation"
+        ],
+        "requiredGuards": [
+            "repository-summary-known",
+            "immutability-policy-known",
+            "retention-policy-known",
+            "air-gap-strategy-known",
+            "compliance-status-reviewed",
+            "owner-known",
+            "evidence-redacted"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-remediation-disabled",
+            "veeam-mutation-disabled",
+            "raw-repository-data-disabled",
+            "raw-provider-payloads-disabled",
+            "credential-values-disabled",
+            "tenant-identifiers-disabled",
+            "private-network-values-disabled",
+            "repository-summary-missing",
+            "immutability-policy-missing",
+            "retention-policy-missing",
+            "air-gap-strategy-missing",
+            "owner-unknown",
+            "evidence-not-redacted"
+        ]
+    }))
 }
 
 async fn protect_app_aware_backup() -> Json<Value> {
@@ -7305,6 +7727,90 @@ async fn servicenow_history(Path(ci): Path<String>) -> Json<Value> {
 
 async fn servicenow_contract() -> Json<Value> {
     Json(servicenow_api::get_snow_contract())
+}
+
+// ─── Repository Capacity Forecasting ───
+
+#[derive(Deserialize)]
+struct RepoCapacitySiteQuery {
+    site: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RepoCapacityUpdateBody {
+    used_tb: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct RepoCapacityForecastQuery {
+    days: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RepoCapacityTrendQuery {
+    months: Option<u32>,
+}
+
+async fn repo_capacity_list(
+    Query(params): Query<RepoCapacitySiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    repository_capacity::get_repositories(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_update(
+    Path(id): Path<String>,
+    Json(body): Json<RepoCapacityUpdateBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let used_tb = body.used_tb.unwrap_or(0.0);
+    repository_capacity::update_usage(&id, used_tb)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_forecast(
+    Path(id): Path<String>,
+    Query(params): Query<RepoCapacityForecastQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let days = params.days.unwrap_or(30);
+    repository_capacity::forecast_capacity(&id, days)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_at_risk() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    repository_capacity::get_at_risk()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_report(
+    Query(params): Query<RepoCapacitySiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("LOVE");
+    repository_capacity::get_capacity_report(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_trend(
+    Path(id): Path<String>,
+    Query(params): Query<RepoCapacityTrendQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let months = params.months.unwrap_or(3);
+    repository_capacity::get_trend(&id, months)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn repo_capacity_recommendations(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    repository_capacity::get_recommendations(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
 #[cfg(test)]
