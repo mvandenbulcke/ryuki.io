@@ -181,12 +181,16 @@ async fn main() {
         ryuki_core::config::LogLevel::Warn => LevelFilter::WARN,
         ryuki_core::config::LogLevel::Error => LevelFilter::ERROR,
     };
-    let env_filter =
-        EnvFilter::builder().with_default_directive(level_filter.into()).from_env_lossy();
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(level_filter.into())
+        .from_env_lossy();
 
     match app_config.logging.format {
         ryuki_core::config::LogFormat::Json => {
-            tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+            tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(env_filter)
+                .init();
         }
         ryuki_core::config::LogFormat::Text => {
             tracing_subscriber::fmt().with_env_filter(env_filter).init();

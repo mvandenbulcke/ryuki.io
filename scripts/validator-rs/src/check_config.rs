@@ -9,8 +9,14 @@ pub fn run() {
 
             println!("Server:");
             println!("  bind_address: {}", config.server.bind_address);
-            println!("  shutdown_timeout_secs: {}", config.server.shutdown_timeout_secs);
-            println!("  request_timeout_secs: {}", config.server.request_timeout_secs);
+            println!(
+                "  shutdown_timeout_secs: {}",
+                config.server.shutdown_timeout_secs
+            );
+            println!(
+                "  request_timeout_secs: {}",
+                config.server.request_timeout_secs
+            );
             println!();
 
             println!("Platform:");
@@ -30,7 +36,10 @@ pub fn run() {
             println!("Rate Limit:");
             println!("  enabled: {}", config.rate_limit.enabled);
             if config.rate_limit.enabled {
-                println!("  requests_per_second: {}", config.rate_limit.requests_per_second);
+                println!(
+                    "  requests_per_second: {}",
+                    config.rate_limit.requests_per_second
+                );
                 println!("  burst_size: {}", config.rate_limit.burst_size);
             }
             println!();
