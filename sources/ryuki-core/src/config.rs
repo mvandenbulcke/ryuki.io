@@ -583,6 +583,27 @@ impl RyukiConfig {
             errors.push("security.content_security_policy must not be empty".into());
         }
 
+        if self.kubernetes_runtime == KubernetesRuntime::None
+            && self.database_provider == DatabaseProvider::CloudNativePg
+        {
+            errors.push(
+                "database_provider cloudnativepg typically requires a kubernetes_runtime — consider setting one"
+                    .into(),
+            );
+        }
+
+        if self.secret_provider == SecretProvider::HashicorpVault {
+            errors.push(
+                "secret_provider is hashicorp-vault; ensure VAULT_ADDR and vault token are configured externally"
+                    .into(),
+            );
+        }
+
+        // Future: if monitoring_provider is Zabbix, validate a zabbix_url field once added
+        if self.monitoring_provider == MonitoringProvider::Zabbix {
+            // Zabbix currently requires no additional in-process config — add URL validation here when zabbix_url is added to RyukiConfig
+        }
+
         errors
     }
 }
@@ -629,7 +650,13 @@ mod tests {
     fn test_validate_ryuki_config_valid() {
         let config = RyukiConfig::default();
         let errors = config.validate();
-        assert!(errors.is_empty(), "expected no errors, got: {:?}", errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "default config should produce exactly one warning (hashicorp-vault), got: {:?}",
+            errors
+        );
+        assert!(errors.iter().any(|e| e.contains("hashicorp-vault")));
     }
 
     #[test]

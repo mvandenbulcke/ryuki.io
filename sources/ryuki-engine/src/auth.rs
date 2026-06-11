@@ -225,15 +225,6 @@ pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
     false
 }
 
-pub fn get_entra_config() -> EntraConfig {
-    get_entra_config_from_env(
-        &std::env::var("ENTRA_TENANT_ID").unwrap_or_default(),
-        &std::env::var("ENTRA_CLIENT_ID").unwrap_or_default(),
-        &std::env::var("ENTRA_AUTHORITY")
-            .unwrap_or_else(|_| "https://login.microsoftonline.com".into()),
-    )
-}
-
 pub fn get_entra_config_from_env(tenant_id: &str, client_id: &str, instance: &str) -> EntraConfig {
     let enabled = !tenant_id.is_empty() && !client_id.is_empty();
     EntraConfig {
@@ -436,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_get_entra_config_returns_disabled_config() {
-        let config = get_entra_config();
+        let config = get_entra_config_from_env("", "", "https://login.microsoftonline.com");
         assert!(!config.enabled);
     }
 
@@ -451,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_avoid_secrets_never_validate_real_tokens() {
-        let config = get_entra_config();
+        let config = get_entra_config_from_env("", "", "https://login.microsoftonline.com");
         assert!(!config.enabled);
         assert!(config.tenant_id.contains("placeholder"));
         assert!(config.client_id.contains("placeholder"));

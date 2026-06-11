@@ -409,7 +409,13 @@ async fn main() {
         .cors
         .allowed_origins
         .iter()
-        .map(|o| o.parse().unwrap())
+        .filter_map(|o| {
+            o.parse()
+                .inspect_err(
+                    |e| tracing::warn!(origin = %o, error = %e, "invalid CORS origin, skipping"),
+                )
+                .ok()
+        })
         .collect();
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::list(cors_origins))
@@ -467,14 +473,25 @@ async fn main() {
         .layer(middleware::from_fn(cache_control_middleware))
         .layer(middleware::from_fn(timing_middleware));
 
-    let listener = tokio::net::TcpListener::bind(&app_config.server.bind_address)
-        .await
-        .unwrap();
+    let listener = match tokio::net::TcpListener::bind(&app_config.server.bind_address).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(
+                address = %app_config.server.bind_address,
+                error = %e,
+                "failed to bind to address"
+            );
+            std::process::exit(1);
+        }
+    };
     tracing::info!("ryuki-api listening on {}", app_config.server.bind_address);
-    axum::serve(listener, app)
+    if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(app_config.server.shutdown_timeout_secs))
         .await
-        .unwrap();
+    {
+        tracing::error!(error = %e, "server error");
+        std::process::exit(1);
+    }
 }
 
 async fn health(
