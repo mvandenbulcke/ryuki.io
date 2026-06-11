@@ -12,26 +12,34 @@ pub struct PoolMetrics {
     pub connected: bool,
     pub size: usize,
     pub idle: usize,
+    pub active: usize,
 }
 
 pub fn pool_metrics() -> PoolMetrics {
     match get_db() {
-        Some(pool) => PoolMetrics {
-            connected: true,
-            size: pool.size() as usize,
-            idle: pool.num_idle(),
-        },
+        Some(pool) => {
+            let size = pool.size() as usize;
+            let idle = pool.num_idle();
+            let active = size.saturating_sub(idle);
+            PoolMetrics {
+                connected: true,
+                size,
+                idle,
+                active,
+            }
+        }
         None => PoolMetrics {
             connected: false,
             size: 0,
             idle: 0,
+            active: 0,
         },
     }
 }
 
-pub async fn connect(url: &str) -> PgPool {
+pub async fn connect(url: &str, max_connections: u32) -> PgPool {
     PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections)
         .connect(url)
         .await
         .expect("failed to connect to PostgreSQL")
@@ -44,8 +52,12 @@ pub async fn run_migrations(pool: &PgPool) {
         .expect("failed to run database migrations");
 }
 
-pub async fn try_connect_with_url(url: &str) {
-    let pool = match PgPoolOptions::new().max_connections(5).connect(url).await {
+pub async fn try_connect_with_url(url: &str, max_connections: u32) {
+    let pool = match PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(url)
+        .await
+    {
         Ok(pool) => {
             tracing::info!("database connected");
             Some(pool)

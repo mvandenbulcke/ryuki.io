@@ -179,6 +179,8 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<String>,
     #[serde(default)]
     pub tls_key_path: Option<String>,
+    #[serde(default = "default_pool_max_connections")]
+    pub pool_max_connections: u32,
 }
 
 fn default_bind_address() -> String {
@@ -197,6 +199,10 @@ fn default_max_body_size() -> usize {
     10 * 1024 * 1024
 }
 
+fn default_pool_max_connections() -> u32 {
+    5
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -206,6 +212,7 @@ impl Default for ServerConfig {
             max_body_size_bytes: default_max_body_size(),
             tls_cert_path: None,
             tls_key_path: None,
+            pool_max_connections: default_pool_max_connections(),
         }
     }
 }
@@ -246,6 +253,8 @@ impl Default for SecurityConfig {
 pub struct CorsConfig {
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_secs: u64,
 }
 
 fn default_allowed_origins() -> Vec<String> {
@@ -255,10 +264,15 @@ fn default_allowed_origins() -> Vec<String> {
     ]
 }
 
+fn default_cors_max_age() -> u64 {
+    3600
+}
+
 impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: default_allowed_origins(),
+            max_age_secs: default_cors_max_age(),
         }
     }
 }
@@ -406,10 +420,53 @@ impl RyukiConfig {
 
         if self.database_url.is_empty() {
             errors.push("database_url is required".into());
+        } else if !self.database_url.starts_with("postgres://")
+            && !self.database_url.starts_with("postgresql://")
+        {
+            errors.push(format!(
+                "database_url '{}' must start with postgres:// or postgresql://",
+                self.database_url
+            ));
         }
 
         if self.server.bind_address.is_empty() {
             errors.push("server.bind_address is required".into());
+        }
+
+        if self.server.shutdown_timeout_secs == 0 {
+            errors.push("server.shutdown_timeout_secs must be greater than 0".into());
+        }
+
+        if self.server.request_timeout_secs == 0 {
+            errors.push("server.request_timeout_secs must be greater than 0".into());
+        }
+
+        if self.server.max_body_size_bytes == 0 {
+            errors.push("server.max_body_size_bytes must be greater than 0".into());
+        }
+
+        if self.server.pool_max_connections == 0 {
+            errors.push("server.pool_max_connections must be greater than 0".into());
+        }
+
+        let has_cert = self.server.tls_cert_path.is_some();
+        let has_key = self.server.tls_key_path.is_some();
+        if has_cert != has_key {
+            errors.push(
+                "server.tls_cert_path and server.tls_key_path must both be set or both be absent"
+                    .into(),
+            );
+        }
+
+        if self.auth_mode == AuthMode::EntraId && self.entra_tenant_id.is_empty() {
+            errors.push("entra_tenant_id is required when auth_mode is entra-id".into());
+        }
+
+        if self.rate_limit.enabled && self.rate_limit.requests_per_second == 0 {
+            errors.push(
+                "rate_limit.requests_per_second must be greater than 0 when rate_limit is enabled"
+                    .into(),
+            );
         }
 
         if self.platform_name.is_empty() {
@@ -423,6 +480,10 @@ impl RyukiConfig {
                 "platform_url '{}' must start with http:// or https://",
                 self.platform_url
             ));
+        }
+
+        if self.security.content_security_policy.is_empty() {
+            errors.push("security.content_security_policy must not be empty".into());
         }
 
         errors

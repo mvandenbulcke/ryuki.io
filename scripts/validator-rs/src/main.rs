@@ -1154,7 +1154,7 @@ fn run() -> Result<(), String> {
                     })?;
                     ryuki_api::validate_context_file(&path)?
                 }
-                _ => unreachable!(),
+                _ => return Err(format!("validate not implemented for slice: {slice}")),
             };
             print_json(&ErrorsOutput { errors })
         }

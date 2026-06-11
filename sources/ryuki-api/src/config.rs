@@ -45,6 +45,7 @@ pub fn get_platform_status() -> serde_json::Value {
             "shutdown_timeout_secs": config.server.shutdown_timeout_secs,
             "request_timeout_secs": config.server.request_timeout_secs,
             "max_body_size_bytes": config.server.max_body_size_bytes,
+            "pool_max_connections": config.server.pool_max_connections,
             "tls_enabled": config.server.tls_cert_path.is_some(),
         },
         "rate_limit": {
@@ -54,6 +55,7 @@ pub fn get_platform_status() -> serde_json::Value {
         },
         "cors": {
             "allowed_origins": config.cors.allowed_origins,
+            "max_age_secs": config.cors.max_age_secs,
         },
         "logging": {
             "level": format!("{:?}", config.logging.level),

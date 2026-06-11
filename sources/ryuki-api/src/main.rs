@@ -348,7 +348,11 @@ async fn main() {
         }
     }
 
-    database::try_connect_with_url(&app_config.database_url).await;
+    database::try_connect_with_url(
+        &app_config.database_url,
+        app_config.server.pool_max_connections,
+    )
+    .await;
     database::migrate_if_connected().await;
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
@@ -362,7 +366,8 @@ async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::list(cors_origins))
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .max_age(Duration::from_secs(app_config.cors.max_age_secs));
 
     let body_limit = app_config.server.max_body_size_bytes;
     let timeout_secs = app_config.server.request_timeout_secs;
@@ -581,6 +586,10 @@ async fn metrics() -> Response {
         pool.idle
     ));
     body.push_str(&format!(
+        "ryuki_db_pool_connections{{state=\"active\"}} {}\n",
+        pool.active
+    ));
+    body.push_str(&format!(
         "ryuki_db_pool_connected {}\n",
         if pool.connected { 1 } else { 0 }
     ));
@@ -704,7 +713,7 @@ mod db_tests {
             return;
         }
         let url = std::env::var("DATABASE_URL").unwrap();
-        crate::database::try_connect_with_url(&url).await;
+        crate::database::try_connect_with_url(&url, 5).await;
         let db = crate::database::get_db().expect("database should be available");
         crate::database::run_migrations(db).await;
 
