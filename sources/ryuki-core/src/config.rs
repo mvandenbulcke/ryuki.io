@@ -732,6 +732,41 @@ impl Default for SmtpConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SessionConfig {
+    #[serde(default = "default_session_cookie_max_age")]
+    pub cookie_max_age_secs: u64,
+    #[serde(default = "default_true")]
+    pub cookie_secure: bool,
+    #[serde(default = "default_true")]
+    pub cookie_http_only: bool,
+    #[serde(default = "default_same_site")]
+    pub cookie_same_site: String,
+}
+
+fn default_session_cookie_max_age() -> u64 {
+    86400
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_same_site() -> String {
+    "lax".to_string()
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            cookie_max_age_secs: default_session_cookie_max_age(),
+            cookie_secure: default_true(),
+            cookie_http_only: default_true(),
+            cookie_same_site: default_same_site(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
     pub enabled: bool,
@@ -817,6 +852,8 @@ pub struct RyukiConfig {
     pub security: SecurityConfig,
     #[serde(default)]
     pub smtp: SmtpConfig,
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 fn default_database_url() -> String {
@@ -864,6 +901,7 @@ impl Default for RyukiConfig {
             logging: LogConfig::default(),
             security: SecurityConfig::default(),
             smtp: SmtpConfig::default(),
+            session: SessionConfig::default(),
         }
     }
 }
@@ -1044,6 +1082,17 @@ impl RyukiConfig {
             if self.smtp.from_address.is_empty() {
                 errors.push("smtp.from_address is required when smtp.enabled is true".into());
             }
+        }
+
+        let valid_same_site = ["lax", "strict", "none"];
+        if !valid_same_site.contains(&self.session.cookie_same_site.as_str()) {
+            errors.push(format!(
+                "session.cookie_same_site must be one of: {:?}",
+                valid_same_site
+            ));
+        }
+        if self.session.cookie_max_age_secs == 0 {
+            errors.push("session.cookie_max_age_secs must be greater than 0".into());
         }
 
         errors

@@ -86,6 +86,12 @@ pub fn get_platform_status() -> serde_json::Value {
             "from_address": config.smtp.from_address,
             "use_tls": config.smtp.use_tls,
         },
+        "session": {
+            "cookie_max_age_secs": config.session.cookie_max_age_secs,
+            "cookie_secure": config.session.cookie_secure,
+            "cookie_http_only": config.session.cookie_http_only,
+            "cookie_same_site": config.session.cookie_same_site,
+        },
         "validation_errors": validation_errors,
     })
 }
