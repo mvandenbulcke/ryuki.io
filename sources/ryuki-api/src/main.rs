@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
+use tracing::Instrument;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -83,11 +84,20 @@ async fn auth_middleware(
 
 async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware::Next) -> Response {
     let request_id = Uuid::new_v4().to_string();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
     request
         .extensions_mut()
         .insert(RequestId(request_id.clone()));
 
-    let mut response = next.run(request).await;
+    let span = tracing::info_span!(
+        "request",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+    );
+
+    let mut response = next.run(request).instrument(span).await;
     response.headers_mut().insert(
         HeaderName::from_static("x-request-id"),
         HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("unknown")),
@@ -125,6 +135,8 @@ async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -
     let start = Instant::now();
     let response = next.run(request).await;
     let duration_us = start.elapsed().as_micros() as u64;
+
+    tracing::info!(duration_us, "request completed");
 
     let tracker = duration_tracker();
     let mut durations = tracker.durations.lock().unwrap();
@@ -286,6 +298,11 @@ async fn main() {
 async fn health(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    tracing::info!(
+        simulate = %params.get("simulate").unwrap_or(&String::new()),
+        "health check requested"
+    );
+
     if params.get("simulate") == Some(&"error".to_string()) {
         return Err(problem_details(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -298,8 +315,23 @@ async fn health(
     let app_config = crate::config_store::get_app_config();
     let validation_errors = app_config.validate();
 
+    let status = if db_connected && validation_errors.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    tracing::info!(
+        status,
+        db_connected,
+        config_valid = validation_errors.is_empty(),
+        config_errors = validation_errors.len(),
+        auth_mode = %app_config.auth_mode.as_str(),
+        rate_limit_enabled = app_config.rate_limit.enabled,
+        "health check result"
+    );
+
     Ok(Json(serde_json::json!({
-        "status": if db_connected && validation_errors.is_empty() { "healthy" } else { "degraded" },
+        "status": status,
         "database": {
             "connected": db_connected,
             "provider": format!("{:?}", app_config.database_provider),
@@ -316,6 +348,11 @@ async fn health(
 async fn ready(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ProblemDetails> {
+    tracing::info!(
+        simulate = %params.get("simulate").unwrap_or(&String::new()),
+        "readiness check requested"
+    );
+
     if params.get("simulate") == Some(&"error".to_string()) {
         return Err(problem_details(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -325,8 +362,11 @@ async fn ready(
         ));
     }
     let db_connected = crate::database::get_db().is_some();
+    let status = if db_connected { "ready" } else { "degraded" };
+    tracing::info!(status, db_connected, "readiness check result");
+
     Ok(Json(serde_json::json!({
-        "status": if db_connected { "ready" } else { "degraded" },
+        "status": status,
         "database": { "connected": db_connected },
     })))
 }
