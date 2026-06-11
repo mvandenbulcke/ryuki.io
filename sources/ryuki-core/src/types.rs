@@ -440,7 +440,11 @@ mod tests {
         let mut config = PlatformConfig::default();
         config.auth_mode = "mock-dry-run".into();
         let errors = validate_platform_config(&config);
-        assert!(errors.is_empty(), "mock-dry-run should be valid, got: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "mock-dry-run should be valid, got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -448,7 +452,11 @@ mod tests {
         let mut config = PlatformConfig::default();
         config.auth_mode = "entra-id".into();
         let errors = validate_platform_config(&config);
-        assert!(errors.is_empty(), "entra-id should be valid, got: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "entra-id should be valid, got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -456,7 +464,11 @@ mod tests {
         let mut config = PlatformConfig::default();
         config.secret_provider = "none".into();
         let errors = validate_platform_config(&config);
-        assert!(errors.is_empty(), "none should be valid for secret_provider, got: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "none should be valid for secret_provider, got: {:?}",
+            errors
+        );
     }
 
     #[test]
