@@ -38,30 +38,8 @@ pub fn pool_metrics() -> PoolMetrics {
     }
 }
 
-pub async fn connect(
-    url: &str,
-    max_connections: u32,
-    min_connections: u32,
-    idle_timeout_secs: u64,
-    acquire_timeout_secs: u64,
-    max_lifetime_secs: u64,
-) -> PgPool {
-    PgPoolOptions::new()
-        .max_connections(max_connections)
-        .min_connections(min_connections)
-        .idle_timeout(Duration::from_secs(idle_timeout_secs))
-        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-        .max_lifetime(Duration::from_secs(max_lifetime_secs))
-        .connect(url)
-        .await
-        .expect("failed to connect to PostgreSQL")
-}
-
-pub async fn run_migrations(pool: &PgPool) {
-    sqlx::migrate!("../../migrations")
-        .run(pool)
-        .await
-        .expect("failed to run database migrations");
+pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("../../migrations").run(pool).await
 }
 
 pub async fn try_connect_with_url(
@@ -95,6 +73,8 @@ pub async fn try_connect_with_url(
 
 pub async fn migrate_if_connected() {
     if let Some(pool) = get_db() {
-        run_migrations(pool).await;
+        if let Err(e) = run_migrations(pool).await {
+            tracing::error!(error = %e, "database migration failed");
+        }
     }
 }

@@ -1227,4 +1227,45 @@ mod tests {
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("pool_idle_timeout_secs")));
     }
+
+    #[test]
+    fn test_validate_entra_id_requires_tenant() {
+        let mut config = RyukiConfig::default();
+        config.auth_mode = AuthMode::EntraId;
+        config.entra_tenant_id = String::new();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("entra_tenant_id")));
+    }
+
+    #[test]
+    fn test_validate_compression_quality_range() {
+        let mut config = RyukiConfig::default();
+        config.server.compression_quality = 10;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("compression_quality")));
+    }
+
+    #[test]
+    fn test_validate_bind_address_requires_port() {
+        let mut config = RyukiConfig::default();
+        config.server.bind_address = "0.0.0.0".into();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("bind_address")));
+    }
+
+    #[test]
+    fn test_validate_csp_not_empty() {
+        let mut config = RyukiConfig::default();
+        config.security.content_security_policy = String::new();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("content_security_policy")));
+    }
+
+    #[test]
+    fn test_validate_same_site_invalid() {
+        let mut config = RyukiConfig::default();
+        config.session.cookie_same_site = "invalid".into();
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("cookie_same_site")));
+    }
 }

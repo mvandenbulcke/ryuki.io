@@ -261,11 +261,15 @@ async fn rate_limit_middleware(
 
         if limiter.check_key(&key).is_err() {
             tracing::warn!(client = %client_key, path_group, "rate limit exceeded");
-            let api_error = ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests");
+            let body =
+                serde_json::to_string(&ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests"))
+                    .unwrap_or_else(|_| {
+                        r#"{"error":"RATE_LIMIT_EXCEEDED","message":"Too many requests"}"#.into()
+                    });
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_string(&api_error).unwrap()))
+                .body(Body::from(body))
                 .unwrap();
         }
     }
@@ -464,7 +468,9 @@ async fn main() {
                             "REQUEST_TIMEOUT",
                             format!("Request exceeded {}s timeout", timeout_secs),
                         ))
-                        .unwrap();
+                        .unwrap_or_else(|_| {
+                            format!(r#"{{"error":"REQUEST_TIMEOUT","message":"Request exceeded {}s timeout"}}"#, timeout_secs)
+                        });
                         Response::builder()
                             .status(StatusCode::GATEWAY_TIMEOUT)
                             .header("content-type", "application/json")
