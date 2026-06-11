@@ -6868,9 +6868,23 @@ fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str
     }
 }
 
+fn completed_request_stage(
+    name: &str,
+    evidence: Vec<ryuki_engine::models::EvidenceItem>,
+) -> ryuki_engine::models::Stage {
+    ryuki_engine::models::Stage {
+        name: name.into(),
+        status: ryuki_engine::models::StageStatus::Completed,
+        started_at: None,
+        completed_at: None,
+        evidence,
+        metadata: std::collections::HashMap::from([("dry_run".into(), "true".into())]),
+    }
+}
+
 fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::models::Request {
     use ryuki_engine::models::Request;
-    Request {
+    let mut request = Request {
         id: request_id.to_string(),
         offering_id: row.request_type.clone(),
         request_type: parse_request_type(&row.request_type)
@@ -6888,7 +6902,43 @@ fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::mode
         approval_route: Vec::new(),
         evidence_manifest_id: None,
         metadata: std::collections::HashMap::new(),
+    };
+
+    if row.stage == "validate" || row.stage == "plan" {
+        request
+            .stages
+            .push(completed_request_stage("validate", Vec::new()));
     }
+
+    if row.stage == "plan" {
+        request.stages.push(completed_request_stage(
+            "plan",
+            vec![ryuki_engine::models::EvidenceItem {
+                key: "dry-run-plan".into(),
+                value: format!(
+                    "DRY-RUN: Planned execution for {} in site {} environment {} (simulated, no provider calls)",
+                    request.request_type, request.site, request.environment
+                ),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: ryuki_engine::models::EvidenceType::Plan,
+            }],
+        ));
+    }
+
+    request
+}
+
+fn validation_failed_response(
+    result: &ryuki_engine::models::ValidationResult,
+) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "Validation failed",
+            "validation": result,
+        })),
+    )
 }
 
 async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
@@ -7029,6 +7079,10 @@ async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
         let request = db_row_to_request(&current, &request_id);
         let result = request_lifecycle::validate_request(&request).map_err(map_engine_error)?;
 
+        if !result.passed {
+            return Err(validation_failed_response(&result));
+        }
+
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Validated);
         let _row: DbRequestRow = sqlx::query_as(
             "UPDATE requests SET status = $1, stage = 'validate', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
@@ -7050,7 +7104,31 @@ async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
 
     let result = request_lifecycle::validate_request(&store[idx]).map_err(map_engine_error)?;
 
+    if !result.passed {
+        store[idx].stages.push(ryuki_engine::models::Stage {
+            name: "validate".into(),
+            status: ryuki_engine::models::StageStatus::Failed,
+            started_at: Some(now_iso()),
+            completed_at: Some(now_iso()),
+            evidence: Vec::new(),
+            metadata: std::collections::HashMap::from([(
+                "failed_rules".into(),
+                result.failed_rules.join(","),
+            )]),
+        });
+        store[idx].updated_at = now_iso();
+        return Err(validation_failed_response(&result));
+    }
+
     store[idx].status = ryuki_engine::models::RequestStatus::Validated;
+    store[idx].stages.push(ryuki_engine::models::Stage {
+        name: "validate".into(),
+        status: ryuki_engine::models::StageStatus::Completed,
+        started_at: Some(now_iso()),
+        completed_at: Some(now_iso()),
+        evidence: Vec::new(),
+        metadata: std::collections::HashMap::new(),
+    });
     store[idx].updated_at = now_iso();
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
@@ -11376,6 +11454,91 @@ mod unit_tests {
     fn test_auth_extractor_rejects_unverified_entra_session() {
         let session = AuthSession::unverified_entra();
         assert!(!auth_session_is_verified_or_static(&session));
+    }
+
+    fn test_request(id: &str) -> ryuki_engine::models::Request {
+        let mut request = request_lifecycle::create_request(
+            "windows-server-deployment",
+            ryuki_engine::models::RequestType::ServerDeployment,
+            "alice",
+            "bob",
+            "DEFRA",
+            "production",
+            "standard",
+        )
+        .unwrap();
+        request.id = id.into();
+        request
+    }
+
+    #[tokio::test]
+    async fn requests_validate_failure_does_not_mark_request_validated() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        let mut request = test_request(&id);
+        request.site = "INVALID".into();
+
+        request_store().lock().await.push(request);
+
+        let Err((status, Json(body))) = requests_validate(Path(id.clone())).await else {
+            panic!("invalid request should fail validation");
+        };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "Validation failed");
+        assert_eq!(body["validation"]["passed"], false);
+
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|request| request.id == id).unwrap();
+        assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Intake);
+        assert!(stored.stages.iter().any(|stage| {
+            stage.name == "validate" && stage.status == ryuki_engine::models::StageStatus::Failed
+        }));
+    }
+
+    #[tokio::test]
+    async fn requests_plan_requires_successful_validation() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+
+        let Err((status, Json(body))) = requests_plan(Path(id.clone())).await else {
+            panic!("unvalidated request should not plan");
+        };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("successfully validated"));
+
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|request| request.id == id).unwrap();
+        assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Intake);
+    }
+
+    #[tokio::test]
+    async fn requests_validate_plan_approve_happy_path_still_works() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+
+        let Json(validation) = requests_validate(Path(id.clone()))
+            .await
+            .expect("validation should pass");
+        assert_eq!(validation["passed"], true);
+
+        let Json(stages) = requests_plan(Path(id.clone()))
+            .await
+            .expect("planning should pass after validation");
+        assert!(stages
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stage| { stage["name"] == "plan" && stage["status"] == "Completed" }));
+
+        let Json(approved) =
+            requests_approve(Path(id), AuthExtractor(AuthSession::static_dry_run()))
+                .await
+                .expect("approval should pass after planning");
+        assert_eq!(approved["status"], "Approved");
     }
 
     #[tokio::test]

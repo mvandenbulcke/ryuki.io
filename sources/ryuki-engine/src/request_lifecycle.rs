@@ -7,6 +7,13 @@ const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 const VALID_ENVIRONMENTS: &[&str] = &["development", "test", "acceptance", "production"];
 const BLOCKED_STATUSES: &[RequestStatus] = &[RequestStatus::Failed, RequestStatus::Completed];
 
+fn has_completed_stage(request: &Request, name: &str) -> bool {
+    request
+        .stages
+        .iter()
+        .any(|stage| stage.name == name && stage.status == StageStatus::Completed)
+}
+
 pub fn create_request(
     offering_id: &str,
     request_type: RequestType,
@@ -172,9 +179,9 @@ pub fn validate_request(request: &Request) -> Result<ValidationResult, String> {
 }
 
 pub fn plan_request(request: &Request) -> Result<Vec<Stage>, String> {
-    if request.status == RequestStatus::Failed || request.status == RequestStatus::Completed {
+    if request.status != RequestStatus::Validated {
         return Err(format!(
-            "Cannot plan request in status: {:?}",
+            "Cannot plan request in status {:?}. Request must be successfully validated first.",
             request.status
         ));
     }
@@ -183,18 +190,18 @@ pub fn plan_request(request: &Request) -> Result<Vec<Stage>, String> {
 
     stages.push(Stage {
         name: "validate".into(),
-        status: StageStatus::Pending,
-        started_at: None,
-        completed_at: None,
+        status: StageStatus::Completed,
+        started_at: Some(Utc::now().to_rfc3339()),
+        completed_at: Some(Utc::now().to_rfc3339()),
         evidence: Vec::new(),
         metadata: HashMap::from([("step".into(), "1".into())]),
     });
 
     stages.push(Stage {
         name: "plan".into(),
-        status: StageStatus::Pending,
-        started_at: None,
-        completed_at: None,
+        status: StageStatus::Completed,
+        started_at: Some(Utc::now().to_rfc3339()),
+        completed_at: Some(Utc::now().to_rfc3339()),
         evidence: vec![EvidenceItem {
             key: "dry-run-plan".into(),
             value: format!(
@@ -278,17 +285,15 @@ pub fn plan_request(request: &Request) -> Result<Vec<Stage>, String> {
 }
 
 pub fn approve_request(request: &Request, approver: &str) -> Result<Request, String> {
-    if request.status == RequestStatus::Draft || request.status == RequestStatus::Intake {
+    if request.status != RequestStatus::Planned {
         return Err(format!(
-            "Cannot approve request in status {:?}. Request must be Validated or Planned first.",
+            "Cannot approve request in status {:?}. Request must have a successful dry-run plan first.",
             request.status
         ));
     }
-    if BLOCKED_STATUSES.contains(&request.status) {
-        return Err(format!(
-            "Cannot approve request in terminal status: {:?}",
-            request.status
-        ));
+
+    if !has_completed_stage(request, "plan") {
+        return Err("Cannot approve request without a completed dry-run plan stage.".into());
     }
 
     let mut approved = request.clone();
@@ -539,8 +544,6 @@ mod tests {
     fn test_validate_request_passes_for_valid_request() {
         let mut req = make_test_request();
         req.approval_route.push("Datacenter Approver".into());
-        let plan = plan_request(&req).unwrap();
-        req.stages.extend(plan);
         let result = validate_request(&req).unwrap();
         assert!(result.passed);
     }
@@ -568,10 +571,19 @@ mod tests {
 
     #[test]
     fn test_plan_request_generates_stages() {
-        let req = make_test_request();
+        let req = make_validated_request();
         let stages = plan_request(&req).unwrap();
+        let plan_stage = stages.iter().find(|s| s.name == "plan").unwrap();
+        assert_eq!(plan_stage.status, StageStatus::Completed);
         assert!(stages.iter().any(|s| s.name == "execute"));
         assert!(stages.iter().any(|s| s.name == "verify"));
+    }
+
+    #[test]
+    fn test_plan_request_requires_validated_status() {
+        let req = make_test_request();
+        let error = plan_request(&req).unwrap_err();
+        assert!(error.contains("successfully validated"));
     }
 
     fn make_validated_request() -> Request {
@@ -580,15 +592,30 @@ mod tests {
     }
 
     fn make_planned_request() -> Request {
-        let validated = make_validated_request();
+        let mut validated = make_validated_request();
+        validated.stages = plan_request(&validated).unwrap();
         transition_status(&validated, RequestStatus::Planned).unwrap()
     }
 
     #[test]
-    fn test_approve_request_from_validated() {
-        let req = make_validated_request();
+    fn test_approve_request_from_planned() {
+        let req = make_planned_request();
         let result = approve_request(&req, "Datacenter Approver").unwrap();
         assert_eq!(result.status, RequestStatus::Approved);
+    }
+
+    #[test]
+    fn test_approve_request_from_validated_without_plan_fails() {
+        let req = make_validated_request();
+        let error = approve_request(&req, "Datacenter Approver").unwrap_err();
+        assert!(error.contains("dry-run plan"));
+    }
+
+    #[test]
+    fn test_approve_request_from_planned_without_completed_plan_fails() {
+        let req = transition_status(&make_validated_request(), RequestStatus::Planned).unwrap();
+        let error = approve_request(&req, "Datacenter Approver").unwrap_err();
+        assert!(error.contains("completed dry-run plan"));
     }
 
     #[test]
@@ -699,7 +726,8 @@ mod tests {
         assert_eq!(req.status, RequestStatus::Intake);
 
         let validated = transition_status(&req, RequestStatus::Validated).unwrap();
-        let planned = transition_status(&validated, RequestStatus::Planned).unwrap();
+        let mut planned = transition_status(&validated, RequestStatus::Planned).unwrap();
+        planned.stages = plan_request(&validated).unwrap();
         let approved = approve_request(&planned, "Datacenter Approver").unwrap();
         let locked = lock_request(&approved).unwrap();
         let executed = execute_request(&locked).unwrap();

@@ -237,6 +237,7 @@ mod tests {
         )
         .unwrap();
         req.approval_route.push("Datacenter Approver".into());
+        req = request_lifecycle::transition_status(&req, RequestStatus::Validated).unwrap();
         let stages = request_lifecycle::plan_request(&req).unwrap();
         req.stages.extend(stages);
         req
