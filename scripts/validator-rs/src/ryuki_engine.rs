@@ -8,6 +8,7 @@ const RYUKI_ENGINE_ADAPTER_FRAMEWORK_RS_PATH: &str =
     "sources/ryuki-engine/src/adapter_framework.rs";
 
 const DECLARED_MODULES: &[&str] = &[
+    "ad_computer_lifecycle",
     "adapter_framework",
     "alert_routing_engine",
     "app_environment",
@@ -20,11 +21,14 @@ const DECLARED_MODULES: &[&str] = &[
     "health_monitor",
     "inventory_sync",
     "linux_deployment",
+    "maintenance_calendar",
     "models",
+    "network_readiness",
     "patch_engine",
     "request_lifecycle",
     "server_decommission",
     "snapshot_engine",
+    "synthetic_health",
     "vm_operations",
     "zabbix_drift",
 ];

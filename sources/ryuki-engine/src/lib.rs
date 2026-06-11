@@ -1,3 +1,4 @@
+pub mod ad_computer_lifecycle;
 pub mod adapter_framework;
 pub mod alert_routing_engine;
 pub mod app_environment;
@@ -10,10 +11,13 @@ pub mod evidence_pipeline;
 pub mod health_monitor;
 pub mod inventory_sync;
 pub mod linux_deployment;
+pub mod maintenance_calendar;
 pub mod models;
+pub mod network_readiness;
 pub mod patch_engine;
 pub mod request_lifecycle;
 pub mod server_decommission;
 pub mod snapshot_engine;
+pub mod synthetic_health;
 pub mod vm_operations;
 pub mod zabbix_drift;

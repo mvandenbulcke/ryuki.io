@@ -3577,6 +3577,16 @@ fn build_slice_context(
         }
         // test removed: Ruby file no longer exists
         "certificate-lifecycle" => {}
+        "synthetic-health-check" => {
+            if let Ok(raw) =
+                fs::read_to_string(root.join("sources/ryuki-engine/src/synthetic_health.rs"))
+            {
+                map.insert(
+                    "synthetic_health_rs".to_string(),
+                    serde_json::Value::String(raw),
+                );
+            }
+        }
         "design-system" => {
             if let Ok(raw) = fs::read_to_string(root.join("docs/ui/design-system.md")) {
                 map.insert("ui_design".to_string(), serde_json::Value::String(raw));

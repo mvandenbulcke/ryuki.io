@@ -15,15 +15,19 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::database::get_db;
+use ryuki_engine::ad_computer_lifecycle;
 use ryuki_engine::alert_routing_engine;
 use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::linux_deployment;
+use ryuki_engine::maintenance_calendar;
+use ryuki_engine::network_readiness;
 use ryuki_engine::patch_engine;
 use ryuki_engine::server_decommission;
 use ryuki_engine::snapshot_engine;
+use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::zabbix_drift;
 
@@ -159,6 +163,18 @@ pub fn routes() -> Router {
         .route(
             "/api/identity/ad-computer-lifecycle-contract",
             get(identity_ad_computer),
+        )
+        .route("/api/identity/ad/prestage", post(ad_prestage))
+        .route("/api/identity/ad/validate", post(ad_validate))
+        .route("/api/identity/ad/move/{name}", post(ad_move))
+        .route("/api/identity/ad/disable/{name}", post(ad_disable))
+        .route("/api/identity/ad/enable/{name}", post(ad_enable))
+        .route("/api/identity/ad/delete/{name}", post(ad_delete))
+        .route("/api/identity/ad/reconcile", get(ad_reconcile))
+        .route("/api/identity/ad/orphaned", get(ad_orphaned))
+        .route(
+            "/api/identity/ad-computer-contract",
+            get(ad_computer_contract),
         )
         .route(
             "/api/identity/gmsa-lifecycle-contract",
@@ -449,8 +465,19 @@ pub fn routes() -> Router {
         )
         .route(
             "/api/observe/synthetic-health-check-contract",
-            get(observe_synthetic_health),
+            get(observe_synthetic_health_check_contract),
         )
+        .route(
+            "/api/observe/synthetic/run/{check_id}",
+            post(synthetic_run_check),
+        )
+        .route("/api/observe/synthetic/run-all", post(synthetic_run_all))
+        .route(
+            "/api/observe/synthetic/status/{check_id}",
+            get(synthetic_status),
+        )
+        .route("/api/observe/synthetic/dashboard", get(synthetic_dashboard))
+        .route("/api/observe/synthetic/outages", get(synthetic_outages))
         .route(
             "/api/observe/noise-flapping-remediation-contract",
             get(observe_noise_flapping),
@@ -736,6 +763,62 @@ pub fn routes() -> Router {
             "/api/retire/decommission-contract",
             get(decommission_contract),
         )
+        // ─── Maintenance Calendar ───
+        .route(
+            "/api/maintain/calendar/schedule",
+            post(maintenance_calendar_schedule),
+        )
+        .route(
+            "/api/maintain/calendar/conflicts",
+            get(maintenance_calendar_conflicts),
+        )
+        .route(
+            "/api/maintain/calendar/upcoming",
+            get(maintenance_calendar_upcoming),
+        )
+        .route(
+            "/api/maintain/calendar/active",
+            get(maintenance_calendar_active),
+        )
+        .route(
+            "/api/maintain/calendar/month",
+            get(maintenance_calendar_month),
+        )
+        .route(
+            "/api/maintain/calendar/cancel/{id}",
+            post(maintenance_calendar_cancel),
+        )
+        .route(
+            "/api/maintain/calendar-contract",
+            get(maintenance_calendar_contract),
+        )
+        // ─── Network Port & VLAN Readiness ───
+        .route(
+            "/api/datacenter/network/readiness",
+            get(network_readiness_check),
+        )
+        .route(
+            "/api/datacenter/network/reserve-ports",
+            post(network_reserve_ports),
+        )
+        .route(
+            "/api/datacenter/network/reserve-ips",
+            post(network_reserve_ips),
+        )
+        .route(
+            "/api/datacenter/network/release/{id}",
+            post(network_release),
+        )
+        .route("/api/datacenter/network/capacity", get(network_capacity))
+        .route(
+            "/api/datacenter/network/ports",
+            get(network_ports_inventory),
+        )
+        .route(
+            "/api/datacenter/network/vlans",
+            get(network_vlans_inventory),
+        )
+        .route("/api/datacenter/network-contract", get(network_contract))
 }
 
 // ─── Shared data ───
@@ -1022,6 +1105,48 @@ struct CertificateExpiringQuery {
     days: Option<i64>,
 }
 
+// ─── AD computer lifecycle request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdPrestageRequest {
+    name: String,
+    site: String,
+    #[serde(rename = "ouPath")]
+    ou_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdValidateRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdMoveRequest {
+    #[serde(rename = "targetOu")]
+    target_ou: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdDisableRequest {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdReconcileQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct AdOrphanedQuery {
+    site: Option<String>,
+}
+
 // ─── Patch wave request types ───
 
 #[derive(Debug, Deserialize)]
@@ -1051,6 +1176,47 @@ struct ZabbixDriftSiteRequest {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct ZabbixDriftQuery {
+    site: Option<String>,
+}
+
+// ─── Network readiness request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetworkReadinessQuery {
+    site: Option<String>,
+    ports: Option<u32>,
+    vlan: Option<u32>,
+    ips: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetworkReservePortsRequest {
+    site: String,
+    count: u32,
+    purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetworkReserveIpsRequest {
+    site: String,
+    vlan_id: u32,
+    count: u32,
+    purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetworkSwitchQuery {
+    #[serde(rename = "switch")]
+    switch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct NetworkSiteQuery {
     site: Option<String>,
 }
 
@@ -2365,6 +2531,88 @@ async fn identity_ad_computer() -> Json<Value> {
     }))
 }
 
+// ─── AD computer lifecycle handlers ───
+
+async fn ad_prestage(Json(body): Json<AdPrestageRequest>) -> ApiResult {
+    match ad_computer_lifecycle::prestage_computer(&body.name, &body.site, &body.ou_path) {
+        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_validate(Json(body): Json<AdValidateRequest>) -> ApiResult {
+    match ad_computer_lifecycle::validate_computer(&body.name) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_move(Path(name): Path<String>, Json(body): Json<AdMoveRequest>) -> ApiResult {
+    match ad_computer_lifecycle::move_computer(&name, &body.target_ou) {
+        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_disable(Path(name): Path<String>, Json(body): Json<AdDisableRequest>) -> ApiResult {
+    match ad_computer_lifecycle::disable_computer(&name, &body.reason) {
+        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_enable(Path(name): Path<String>) -> ApiResult {
+    match ad_computer_lifecycle::enable_computer(&name) {
+        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_delete(Path(name): Path<String>) -> ApiResult {
+    match ad_computer_lifecycle::delete_computer(&name) {
+        Ok(()) => Ok(Json(
+            serde_json::json!({"deleted": true, "computer": name, "dry_run": true}),
+        )),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_reconcile(Query(query): Query<AdReconcileQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("LOVE");
+    match ad_computer_lifecycle::reconcile_computers(site) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_orphaned(Query(query): Query<AdOrphanedQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("LOVE");
+    match ad_computer_lifecycle::get_orphaned(site) {
+        Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn ad_computer_contract() -> Json<Value> {
+    let examples = ad_computer_lifecycle::seed_examples();
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionAllowed": false,
+        "dryRunRequired": true,
+        "lifecycleModes": ["prestage", "validate", "move", "disable", "enable", "delete", "reconcile"],
+        "computerStatuses": ["Active", "Disabled", "Quarantined", "Deleted"],
+        "supportedOs": ["Windows Server 2022", "Windows Server 2019", "Windows Server 2016", "Windows 11", "Windows 10"],
+        "validSites": ["LOVE", "BUR1", "CCSS", "TOR1", "TRUJ", "VILL", "ALBI", "AOST", "MACL", "SSYM", "WIJH", "RMA1", "PITE"],
+        "namingPattern": "SITE-ROLE-NN (e.g. LOVE-SRV-01)",
+        "validRoles": ["SRV", "WS", "DC", "MGMT", "TEST", "DEV"],
+        "validOuPrefixes": ["OU=Servers", "OU=Workstations", "OU=DMZ", "OU=Management", "OU=Testing", "OU=Development"],
+        "requiredInputs": ["name", "site", "ouPath"],
+        "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "live-directory-changes-disabled", "raw-ad-data-disabled"],
+        "examples": serde_json::to_value(examples).unwrap()
+    }))
+}
+
 async fn identity_gmsa_lifecycle() -> Json<Value> {
     Json(json!({
         "source": "static-seed", "lifecycleMode": "metadata-only", "providerCallsEnabled": false, "workerExecutionAllowed": false,
@@ -2882,6 +3130,94 @@ async fn patching_maintenance_calendar() -> Json<Value> {
     )
 }
 
+// ─── Maintenance Calendar handlers ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MaintenanceCalendarScheduleRequest {
+    site: String,
+    #[serde(rename = "startTime")]
+    start_time: String,
+    #[serde(rename = "endTime")]
+    end_time: String,
+    reason: String,
+    #[serde(rename = "affectedCis")]
+    affected_cis: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MaintenanceCalendarConflictsQuery {
+    site: String,
+    start: String,
+    end: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MaintenanceCalendarSiteQuery {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MaintenanceCalendarMonthQuery {
+    site: String,
+    month: String,
+}
+
+async fn maintenance_calendar_schedule(
+    Json(body): Json<MaintenanceCalendarScheduleRequest>,
+) -> ApiResult {
+    match maintenance_calendar::schedule_window(
+        &body.site,
+        &body.start_time,
+        &body.end_time,
+        &body.reason,
+        body.affected_cis,
+    ) {
+        Ok(window) => Ok(Json(serde_json::to_value(window).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn maintenance_calendar_conflicts(
+    Query(q): Query<MaintenanceCalendarConflictsQuery>,
+) -> Json<Value> {
+    let conflicts = maintenance_calendar::check_conflicts(&q.site, &q.start, &q.end);
+    Json(serde_json::to_value(conflicts).unwrap())
+}
+
+async fn maintenance_calendar_upcoming(
+    Query(q): Query<MaintenanceCalendarSiteQuery>,
+) -> Json<Value> {
+    let windows = maintenance_calendar::get_upcoming(&q.site);
+    Json(serde_json::to_value(windows).unwrap())
+}
+
+async fn maintenance_calendar_active(Query(q): Query<MaintenanceCalendarSiteQuery>) -> Json<Value> {
+    let windows = maintenance_calendar::get_active(&q.site);
+    Json(serde_json::to_value(windows).unwrap())
+}
+
+async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuery>) -> ApiResult {
+    match maintenance_calendar::get_calendar(&q.site, &q.month) {
+        Ok(windows) => Ok(Json(serde_json::to_value(windows).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn maintenance_calendar_cancel(Path(id): Path<String>) -> ApiResult {
+    match maintenance_calendar::cancel_window(&id) {
+        Ok(window) => Ok(Json(serde_json::to_value(window).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn maintenance_calendar_contract() -> Json<Value> {
+    Json(maintenance_calendar::get_calendar_contract())
+}
+
 // ─── Patch wave orchestration handlers ───
 
 async fn patch_plan(Json(body): Json<PatchPlanRequest>) -> ApiResult {
@@ -3136,10 +3472,50 @@ async fn zabbix_drift_contract() -> Json<Value> {
     }))
 }
 
-async fn observe_synthetic_health() -> Json<Value> {
+async fn observe_synthetic_health_check_contract() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["web-endpoint-check","api-check","dns-resolution-check","certificate-expiry-check","load-balancer-check","iis-service-check","evidence-pack-review"],"signals":["endpoint-unreachable","api-error","dns-resolution-risk","certificate-expiry-risk","load-balancer-risk","iis-service-risk","stale-check-definition"],"requiredGuards":["check-target-reviewed","check-type-supported","owner-known","maintenance-window-known","synthetic-definition-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["checkSummary","targetScope","syntheticDefinition","expectedResult","alertImpact","maintenanceImpact","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-checks-disabled","external-probes-disabled","zabbix-mutation-disabled","target-scope-unknown","unsupported-check-type","owner-unknown","approval-missing","evidence-not-redacted"]}),
+        json!({"source":"static-seed","checkMode":"dry-run-definition","dryRunRequired":true,"providerCallsEnabled":false,"liveChecksAllowed":false,"externalProbesAllowed":false,"zabbixMutationAllowed":false,"rawProbeOutputAllowed":false,"supportedWorkflows":["web-endpoint-check","api-check","dns-resolution-check","certificate-expiry-check","load-balancer-check","iis-service-check","evidence-pack-review"],"checkSignals":["endpoint-unreachable","api-error","dns-resolution-risk","certificate-expiry-risk","load-balancer-risk","iis-service-risk","stale-check-definition"],"requiredInputs":["serviceName","application","site","environment","checkType","targetSummary","owner","supportGroup","evidenceManifest"],"requiredGuards":["check-target-reviewed","check-type-supported","owner-known","maintenance-window-known","synthetic-definition-dry-run","approval-route-assigned","evidence-redacted"],"planSections":["checkSummary","targetScope","syntheticDefinition","expectedResult","alertImpact","maintenanceImpact","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-checks-disabled","external-probes-disabled","zabbix-mutation-disabled","target-scope-unknown","unsupported-check-type","owner-unknown","approval-missing","evidence-not-redacted"],"requiredEvidence":["Synthetic check summary","Target scope summary","Synthetic definition draft","Expected result","Alert impact","Maintenance impact","Approval route","Evidence references"],"rules":[{"id":"no-live-synthetic-probes","decision":"block","requirement":"Synthetic health checks produce definition drafts only, never running live probes or calling external endpoints.","evidence":"Synthetic definition draft"},{"id":"no-zabbix-mutation","decision":"block","requirement":"Synthetic definitions do not create, update, or delete Zabbix checks until live integration gates exist.","evidence":"Synthetic definition draft"},{"id":"target-scope-required","decision":"block","requirement":"Target scope must be reviewed and aggregate-safe before a synthetic check can be drafted.","evidence":"Target scope summary"},{"id":"maintenance-impact-required","decision":"block","requirement":"Maintenance-window and alert-impact behavior must be reviewed before check definitions are approved.","evidence":"Maintenance impact"},{"id":"raw-probe-output-not-exposed","decision":"block","requirement":"Operators receive synthetic check summaries only, not raw probe output, alert payloads, certificate serials, or provider output.","evidence":"Synthetic check summary"}]}),
     )
+}
+
+async fn synthetic_run_check(Path(check_id): Path<String>) -> ApiResult {
+    let result = synthetic_health::run_check(&check_id);
+    Ok(Json(serde_json::to_value(result).unwrap()))
+}
+
+#[derive(Deserialize)]
+struct SyntheticRunAllQuery {
+    site: Option<String>,
+}
+
+async fn synthetic_run_all(Query(query): Query<SyntheticRunAllQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("LOVE");
+    let results = synthetic_health::run_all_checks(site);
+    Ok(Json(serde_json::to_value(results).unwrap()))
+}
+
+async fn synthetic_status(Path(check_id): Path<String>) -> ApiResult {
+    match synthetic_health::get_check_status(&check_id) {
+        Some(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        None => Err(status_404(&check_id)),
+    }
+}
+
+#[derive(Deserialize)]
+struct SyntheticDashboardQuery {
+    site: Option<String>,
+}
+
+async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("LOVE");
+    let dashboard = synthetic_health::get_dashboard(site);
+    Json(serde_json::to_value(dashboard).unwrap())
+}
+
+async fn synthetic_outages(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("LOVE");
+    let outages = synthetic_health::get_outage_report(site);
+    Json(serde_json::to_value(outages).unwrap())
 }
 
 async fn observe_noise_flapping() -> Json<Value> {
@@ -4971,6 +5347,157 @@ async fn monitoring_alert_routing_contract() -> Json<Value> {
             {"id":"severity-must-be-valid","decision":"block","requirement":"Alert severity must be one of: info, warning, average, high, disaster.","evidence":"Validation result"},
             {"id":"raw-data-not-exposed","decision":"block","requirement":"Alert routing evidence must use safe summaries only and must not expose raw Zabbix or ServiceNow payloads.","evidence":"Evidence references"}
         ]
+    }))
+}
+
+// ─── Network Port & VLAN Readiness handlers ───
+
+async fn network_readiness_check(
+    Query(query): Query<NetworkReadinessQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    let port_count = query.ports.unwrap_or(1);
+    let vlan = query.vlan;
+    let ip_count = query.ips.unwrap_or(1);
+
+    let port_result = network_readiness::check_port_readiness(&site, port_count);
+
+    let mut response = json!({
+        "source": "dry-run",
+        "site": site,
+        "port_readiness": null,
+        "vlan_readiness": null,
+        "dry_run": true
+    });
+
+    match port_result {
+        Ok(pr) => {
+            response["port_readiness"] = pr;
+        }
+        Err(e) => {
+            response["port_readiness"] = json!({"error": e});
+        }
+    }
+
+    if let Some(vlan_id) = vlan {
+        match network_readiness::check_vlan_readiness(&site, vlan_id, ip_count) {
+            Ok(vr) => {
+                response["vlan_readiness"] = vr;
+            }
+            Err(e) => {
+                response["vlan_readiness"] = json!({"error": e});
+            }
+        }
+    }
+
+    Ok(Json(response))
+}
+
+async fn network_reserve_ports(
+    Json(body): Json<NetworkReservePortsRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match network_readiness::reserve_ports(&body.site, body.count, &body.purpose) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_reserve_ips(
+    Json(body): Json<NetworkReserveIpsRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match network_readiness::reserve_ips(&body.site, body.vlan_id, body.count, &body.purpose) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_release(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match network_readiness::release_reservation(&id) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_capacity(
+    Query(query): Query<NetworkSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match network_readiness::get_site_capacity(&site) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_ports_inventory(
+    Query(query): Query<NetworkSwitchQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let switch = query.switch.unwrap_or_else(|| "love-sw-01".to_string());
+    match network_readiness::get_port_inventory(&switch) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_vlans_inventory(
+    Query(query): Query<NetworkSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = query.site.unwrap_or_else(|| "LOVE".to_string());
+    match network_readiness::get_vlan_inventory(&site) {
+        Ok(result) => Ok(Json(result)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
+}
+
+async fn network_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveNetworkChangesAllowed": false,
+        "rawInventoryRowsAllowed": false,
+        "networkIdentifiersAllowed": false,
+        "dryRunRequired": true,
+        "workflows": [
+            "host-network-readiness",
+            "workload-vlan-readiness",
+            "switchport-capacity-review",
+            "portgroup-policy-review",
+            "vlan-catalog-review",
+            "network-exception-review"
+        ],
+        "requiredGuards": [
+            "site-known",
+            "network-scope-known",
+            "vlan-catalog-reviewed",
+            "switchport-capacity-reviewed",
+            "evidence-redacted"
+        ],
+        "planSections": [
+            "readinessSummary",
+            "vlanPolicyReview",
+            "portgroupPolicyReview",
+            "switchportCapacityReview",
+            "exceptionDecision",
+            "evidenceReferences"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-network-change-disabled",
+            "raw-inventory-rows-disabled",
+            "network-identifiers-disabled",
+            "site-unknown",
+            "vlan-catalog-missing",
+            "evidence-not-redacted"
+        ],
+        "endpoints": {
+            "GET /api/datacenter/network/readiness": "Check network port and VLAN readiness for a site",
+            "POST /api/datacenter/network/reserve-ports": "Reserve ports for a site (dry-run)",
+            "POST /api/datacenter/network/reserve-ips": "Reserve IPs on a VLAN (dry-run)",
+            "POST /api/datacenter/network/release/{id}": "Release a port or IP reservation",
+            "GET /api/datacenter/network/capacity": "Get site port and VLAN capacity summary",
+            "GET /api/datacenter/network/ports": "Get port inventory for a switch",
+            "GET /api/datacenter/network/vlans": "Get VLAN inventory for a site",
+            "GET /api/datacenter/network-contract": "Network readiness contract"
+        }
     }))
 }
 

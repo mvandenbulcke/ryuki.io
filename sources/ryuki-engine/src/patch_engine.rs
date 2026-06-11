@@ -11,8 +11,12 @@ const VALID_SITES: &[&str] = &[
 
 static PATCH_WAVE_STORE: OnceLock<Mutex<Vec<PatchWave>>> = OnceLock::new();
 
-fn patch_wave_store() -> &'static Mutex<Vec<PatchWave>> {
+pub(crate) fn patch_wave_store() -> &'static Mutex<Vec<PatchWave>> {
     PATCH_WAVE_STORE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn get_patch_waves() -> Vec<PatchWave> {
+    patch_wave_store().lock().unwrap().clone()
 }
 
 pub fn plan_patch_wave_from_servers(servers: &[Server]) -> Result<PatchWave, String> {
