@@ -217,6 +217,51 @@ pub fn metrics_text_with_api_requests(total_api_requests: u64) -> String {
     out
 }
 
+/// Appends Prometheus summary metrics for API request duration.
+///
+/// Generates `ryuki_api_request_duration_milliseconds` with quantiles estimated
+/// from the stored min/max/avg, plus `_sum` and `_count` lines.
+/// All metrics use the stable label set `{method="ALL",path="ALL"}`.
+pub fn append_duration_metrics(
+    text: &mut String,
+    count: u64,
+    sum_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    avg_ms: f64,
+) {
+    text.push_str(
+        "# HELP ryuki_api_request_duration_milliseconds API request duration in milliseconds\n",
+    );
+    text.push_str("# TYPE ryuki_api_request_duration_milliseconds summary\n");
+
+    let labels = "method=\"ALL\",path=\"ALL\"";
+
+    // Estimate quantiles using min, avg, and max:
+    // p50 ≈ (min + 2·avg) / 3  (biased toward central tendency)
+    // p95 ≈ avg + 0.94·(max - avg)
+    // p99 ≈ max
+    let p50 = (min_ms + 2.0 * avg_ms) / 3.0;
+    let p95 = avg_ms + (max_ms - avg_ms) * 0.94;
+    let p99 = max_ms;
+
+    text.push_str(&format!(
+        "ryuki_api_request_duration_milliseconds{{quantile=\"0.5\",{labels}}} {p50:.3}\n"
+    ));
+    text.push_str(&format!(
+        "ryuki_api_request_duration_milliseconds{{quantile=\"0.95\",{labels}}} {p95:.3}\n"
+    ));
+    text.push_str(&format!(
+        "ryuki_api_request_duration_milliseconds{{quantile=\"0.99\",{labels}}} {p99:.3}\n"
+    ));
+    text.push_str(&format!(
+        "ryuki_api_request_duration_milliseconds_sum{{{labels}}} {sum_ms:.3}\n"
+    ));
+    text.push_str(&format!(
+        "ryuki_api_request_duration_milliseconds_count{{{labels}}} {count}\n"
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

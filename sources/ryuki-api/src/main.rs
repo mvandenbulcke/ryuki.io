@@ -17,7 +17,8 @@ use governor::{Quota, RateLimiter};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -104,6 +105,34 @@ async fn request_counter_middleware(
 ) -> Response {
     REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     next.run(request).await
+}
+
+/// Stores request durations in microseconds, capped at 10,000 entries.
+struct DurationTracker {
+    durations: Mutex<Vec<u64>>,
+}
+
+static DURATION_TRACKER: OnceLock<DurationTracker> = OnceLock::new();
+
+fn duration_tracker() -> &'static DurationTracker {
+    DURATION_TRACKER.get_or_init(|| DurationTracker {
+        durations: Mutex::new(Vec::with_capacity(10_000)),
+    })
+}
+
+async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -> Response {
+    let start = Instant::now();
+    let response = next.run(request).await;
+    let duration_us = start.elapsed().as_micros() as u64;
+
+    let tracker = duration_tracker();
+    let mut durations = tracker.durations.lock().unwrap();
+    if durations.len() >= 10_000 {
+        durations.remove(0);
+    }
+    durations.push(duration_us);
+
+    response
 }
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
@@ -239,7 +268,8 @@ async fn main() {
             async move { rate_limit_middleware(limiter, req, next).await }
         }))
         .layer(middleware::from_fn(auth_middleware))
-        .layer(cors);
+        .layer(cors)
+        .layer(middleware::from_fn(timing_middleware));
 
     let listener = tokio::net::TcpListener::bind(&app_config.server.bind_address)
         .await
@@ -319,7 +349,29 @@ async fn validation_run(
 
 async fn metrics() -> Response {
     let count = REQUEST_COUNTER.load(Ordering::Relaxed);
-    let body = ryuki_engine::health_monitor::metrics_text_with_api_requests(count);
+    let mut body = ryuki_engine::health_monitor::metrics_text_with_api_requests(count);
+
+    let tracker = duration_tracker();
+    let durations = tracker.durations.lock().unwrap();
+    if !durations.is_empty() {
+        let dur_count = durations.len() as u64;
+        let sum_ms: f64 = durations.iter().map(|&d| d as f64 / 1000.0).sum();
+        let min_ms = durations
+            .iter()
+            .min()
+            .map(|&d| d as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let max_ms = durations
+            .iter()
+            .max()
+            .map(|&d| d as f64 / 1000.0)
+            .unwrap_or(0.0);
+        let avg_ms = sum_ms / dur_count as f64;
+        ryuki_engine::health_monitor::append_duration_metrics(
+            &mut body, dur_count, sum_ms, min_ms, max_ms, avg_ms,
+        );
+    }
+
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4")
