@@ -32,6 +32,7 @@ use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::patch_engine;
 use ryuki_engine::server_decommission;
+use ryuki_engine::shift_queue;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
@@ -383,6 +384,15 @@ pub fn routes() -> Router {
             "/api/operations/shift-queue-contract",
             get(operations_shift_queue),
         )
+        .route("/api/ops/shift/summary", get(shift_summary))
+        .route("/api/ops/shift/acknowledge/{id}", post(shift_acknowledge))
+        .route("/api/ops/shift/assign/{id}", post(shift_assign))
+        .route("/api/ops/shift/escalate/{id}", post(shift_escalate))
+        .route("/api/ops/shift/resolve/{id}", post(shift_resolve))
+        .route("/api/ops/shift/handover", get(shift_handover))
+        .route("/api/ops/shift/my-items", get(shift_my_items))
+        .route("/api/ops/shift/stale", get(shift_stale))
+        .route("/api/ops/shift-contract", get(shift_contract))
         .route(
             "/api/operations/dependency-replay-contract",
             get(operations_dependency_replay),
@@ -3493,6 +3503,77 @@ async fn operations_shift_queue() -> Json<Value> {
     Json(
         json!({"source":"static-seed","queueMode":"aggregate-safe","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawProviderPayloadsAllowed":false,"queueSources":["blocked-request","failed-operation","pending-approval","active-incident","backup-failure","monitoring-problem","handover-note"],"queueStates":["new","triage","owner-assigned","waiting-approval","waiting-dependency","ready-for-handover","closed"],"requiredInputs":["queueItemSource","severity","owner","supportGroup","safeNextAction","handoverNotes","evidenceManifest"],"requiredGuards":["owner-known","support-group-known","severity-assigned","safe-next-action-set","evidence-redacted","stale-data-marked"],"blockedReasons":["owner-unknown","support-group-unknown","missing-safe-next-action","approval-pending","dependency-unhealthy","stale-data","evidence-not-redacted"],"requiredEvidence":["Queue item summary","Owner assignment","Safe next action","Approval state","Dependency health","Handover notes","Evidence references"],"rules":[{"id":"no-raw-provider-payloads","decision":"block","requirement":"Shift queue items summarize provider state without exposing raw provider payloads.","evidence":"Queue item summary"},{"id":"safe-next-action-required","decision":"block","requirement":"Every visible queue item must include a safe next action for the assigned team.","evidence":"Safe next action"},{"id":"owner-and-support-required","decision":"block","requirement":"Owner and support group must be known before a queue item can leave triage.","evidence":"Owner assignment"},{"id":"handover-evidence-required","decision":"block","requirement":"Queue items that cross shifts must keep handover notes and evidence references.","evidence":"Handover notes"}]}),
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct ShiftActionRequest {
+    user: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShiftEscalateRequest {
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShiftResolveRequest {
+    resolution: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShiftMyItemsQuery {
+    user: Option<String>,
+}
+
+async fn shift_summary() -> Json<Value> {
+    Json(shift_queue::get_shift_summary())
+}
+
+async fn shift_acknowledge(
+    Path(id): Path<String>,
+    Json(body): Json<ShiftActionRequest>,
+) -> Json<Value> {
+    Json(shift_queue::acknowledge_item(&id, &body.user).map_err(|e| json!({"error": e})).unwrap_or_default())
+}
+
+async fn shift_assign(
+    Path(id): Path<String>,
+    Json(body): Json<ShiftActionRequest>,
+) -> Json<Value> {
+    Json(shift_queue::assign_item(&id, &body.user).map_err(|e| json!({"error": e})).unwrap_or_default())
+}
+
+async fn shift_escalate(
+    Path(id): Path<String>,
+    Json(body): Json<ShiftEscalateRequest>,
+) -> Json<Value> {
+    Json(shift_queue::escalate_item(&id, &body.reason).map_err(|e| json!({"error": e})).unwrap_or_default())
+}
+
+async fn shift_resolve(
+    Path(id): Path<String>,
+    Json(body): Json<ShiftResolveRequest>,
+) -> Json<Value> {
+    Json(shift_queue::resolve_item(&id, &body.resolution).map_err(|e| json!({"error": e})).unwrap_or_default())
+}
+
+async fn shift_handover() -> Json<Value> {
+    Json(shift_queue::get_handover_report())
+}
+
+async fn shift_my_items(
+    Query(params): Query<ShiftMyItemsQuery>,
+) -> Json<Value> {
+    let user = params.user.unwrap_or_default();
+    Json(shift_queue::get_my_items(&user))
+}
+
+async fn shift_stale() -> Json<Value> {
+    Json(shift_queue::get_stale_items())
+}
+
+async fn shift_contract() -> Json<Value> {
+    Json(shift_queue::get_shift_contract())
 }
 
 async fn operations_dependency_replay() -> Json<Value> {

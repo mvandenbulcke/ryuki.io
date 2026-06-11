@@ -25,6 +25,7 @@ pub mod os_baseline;
 pub mod patch_engine;
 pub mod request_lifecycle;
 pub mod server_decommission;
+pub mod shift_queue;
 pub mod snapshot_engine;
 pub mod synthetic_health;
 pub mod vm_operations;
