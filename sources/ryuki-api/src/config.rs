@@ -43,6 +43,9 @@ pub fn get_platform_status() -> serde_json::Value {
         "server": {
             "bind_address": config.server.bind_address,
             "shutdown_timeout_secs": config.server.shutdown_timeout_secs,
+            "request_timeout_secs": config.server.request_timeout_secs,
+            "max_body_size_bytes": config.server.max_body_size_bytes,
+            "tls_enabled": config.server.tls_cert_path.is_some(),
         },
         "rate_limit": {
             "enabled": config.rate_limit.enabled,
@@ -55,6 +58,11 @@ pub fn get_platform_status() -> serde_json::Value {
         "logging": {
             "level": format!("{:?}", config.logging.level),
             "format": format!("{:?}", config.logging.format),
+        },
+        "security": {
+            "csp": config.security.content_security_policy,
+            "hsts_enabled": config.security.hsts_enabled,
+            "hsts_max_age_secs": config.security.hsts_max_age_secs,
         },
         "validation_errors": validation_errors,
     })

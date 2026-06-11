@@ -175,6 +175,10 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_max_body_size")]
     pub max_body_size_bytes: usize,
+    #[serde(default)]
+    pub tls_cert_path: Option<String>,
+    #[serde(default)]
+    pub tls_key_path: Option<String>,
 }
 
 fn default_bind_address() -> String {
@@ -200,6 +204,8 @@ impl Default for ServerConfig {
             shutdown_timeout_secs: default_shutdown_timeout(),
             request_timeout_secs: default_request_timeout(),
             max_body_size_bytes: default_max_body_size(),
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -208,16 +214,30 @@ impl Default for ServerConfig {
 pub struct SecurityConfig {
     #[serde(default = "default_csp_directive")]
     pub content_security_policy: String,
+    #[serde(default = "default_hsts_enabled")]
+    pub hsts_enabled: bool,
+    #[serde(default = "default_hsts_max_age")]
+    pub hsts_max_age_secs: u64,
 }
 
 fn default_csp_directive() -> String {
     "default-src 'self'".to_string()
 }
 
+fn default_hsts_enabled() -> bool {
+    false
+}
+
+fn default_hsts_max_age() -> u64 {
+    31536000
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             content_security_policy: default_csp_directive(),
+            hsts_enabled: default_hsts_enabled(),
+            hsts_max_age_secs: default_hsts_max_age(),
         }
     }
 }

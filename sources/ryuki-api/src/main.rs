@@ -242,9 +242,7 @@ async fn security_headers_middleware(
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
-    let csp = &crate::config_store::get_app_config()
-        .security
-        .content_security_policy;
+    let security = &crate::config_store::get_app_config().security;
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -260,8 +258,31 @@ async fn security_headers_middleware(
         HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
+        HeaderName::from_static("x-permitted-cross-domain-policies"),
+        HeaderValue::from_static("none"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-download-options"),
+        HeaderValue::from_static("noopen"),
+    );
+    headers.insert(
         HeaderName::from_static("content-security-policy"),
-        HeaderValue::from_str(csp).unwrap_or(HeaderValue::from_static("default-src 'self'")),
+        HeaderValue::from_str(&security.content_security_policy)
+            .unwrap_or(HeaderValue::from_static("default-src 'self'")),
+    );
+    if security.hsts_enabled {
+        headers.insert(
+            HeaderName::from_static("strict-transport-security"),
+            HeaderValue::from_str(&format!(
+                "max-age={}; includeSubDomains",
+                security.hsts_max_age_secs
+            ))
+            .unwrap_or(HeaderValue::from_static("max-age=31536000")),
+        );
+    }
+    headers.insert(
+        HeaderName::from_static("x-api-version"),
+        HeaderValue::from_static("0.1.0"),
     );
     response
 }
