@@ -228,6 +228,15 @@ pub fn get_certificate(id: &str) -> Option<CertificateRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static CERTIFICATE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn fresh_certificate_store() -> MutexGuard<'static, ()> {
+        let guard = CERTIFICATE_TEST_LOCK.lock().unwrap();
+        *CERTIFICATE_STORE.lock().unwrap() = seed_certificates();
+        guard
+    }
 
     fn valid_request() -> CertificateRequest {
         CertificateRequest {
@@ -269,6 +278,7 @@ mod tests {
 
     #[test]
     fn test_request_certificate_creates_record() {
+        let _guard = fresh_certificate_store();
         let req = valid_request();
         let result = request_certificate(&req);
         assert!(result.is_ok());
@@ -280,6 +290,7 @@ mod tests {
 
     #[test]
     fn test_get_inventory_returns_seeded_certs() {
+        let _guard = fresh_certificate_store();
         let inventory = get_inventory();
         assert!(inventory.len() >= 3);
         let names: Vec<&str> = inventory.iter().map(|c| c.common_name.as_str()).collect();
@@ -290,6 +301,7 @@ mod tests {
 
     #[test]
     fn test_check_expiry_finds_expiring() {
+        let _guard = fresh_certificate_store();
         let results = check_expiry("GBLON", 90);
         assert!(!results.is_empty());
         let expiring: Vec<&CertificateRecord> = results
@@ -301,12 +313,14 @@ mod tests {
 
     #[test]
     fn test_check_expiry_empty_site_returns_all() {
+        let _guard = fresh_certificate_store();
         let results = check_expiry("", 365);
         assert!(!results.is_empty());
     }
 
     #[test]
     fn test_renew_certificate_updates_dates() {
+        let _guard = fresh_certificate_store();
         let inventory = get_inventory();
         let cert = inventory.first().unwrap();
         let result = renew_certificate(&cert.id, 180);
@@ -317,6 +331,7 @@ mod tests {
 
     #[test]
     fn test_revoke_certificate_sets_status() {
+        let _guard = fresh_certificate_store();
         let inventory = get_inventory();
         let cert = inventory.first().unwrap();
         let result = revoke_certificate(&cert.id);
@@ -332,6 +347,7 @@ mod tests {
 
     #[test]
     fn test_get_certificate_found() {
+        let _guard = fresh_certificate_store();
         let inventory = get_inventory();
         let cert = inventory.first().unwrap();
         let found = get_certificate(&cert.id);

@@ -608,15 +608,20 @@ pub fn get_shift_contract() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    fn fresh_store() {
+    static SHIFT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn fresh_store() -> MutexGuard<'static, ()> {
+        let test_guard = SHIFT_TEST_LOCK.lock().unwrap();
         let mut guard = shift_store().lock().unwrap();
         *guard = seed_shift_items();
+        test_guard
     }
 
     #[test]
     fn test_get_shift_summary_returns_open_items() {
-        fresh_store();
+        let _guard = fresh_store();
         let summary = get_shift_summary();
         assert_eq!(summary["source"], "static-dry-run");
         assert!(summary["total_open"].as_u64().is_some());
@@ -630,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_acknowledge_item_marks_as_seen() {
-        fresh_store();
+        let _guard = fresh_store();
         let result = acknowledge_item("shift-002", "ops-lead").unwrap();
         assert_eq!(result["status"], "acknowledged");
         assert_eq!(result["acknowledged_by"], "ops-lead");
@@ -639,20 +644,20 @@ mod tests {
 
     #[test]
     fn test_acknowledge_already_acknowledged_fails() {
-        fresh_store();
+        let _guard = fresh_store();
         assert!(acknowledge_item("shift-001", "someone").is_err());
     }
 
     #[test]
     fn test_acknowledge_resolved_fails() {
-        fresh_store();
+        let _guard = fresh_store();
         resolve_item("shift-003", "Done").unwrap();
         assert!(acknowledge_item("shift-003", "someone").is_err());
     }
 
     #[test]
     fn test_assign_item_updates_owner() {
-        fresh_store();
+        let _guard = fresh_store();
         let result = assign_item("shift-002", "network-team").unwrap();
         assert_eq!(result["status"], "assigned");
         assert_eq!(result["assigned_to"], "network-team");
@@ -660,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_escalate_item_flags_and_logs_reason() {
-        fresh_store();
+        let _guard = fresh_store();
         let result = escalate_item("shift-005", "No backup for 36 hours — critical gap").unwrap();
         assert_eq!(result["status"], "escalated");
         assert!(result["reason"].as_str().unwrap().contains("critical"));
@@ -669,13 +674,13 @@ mod tests {
 
     #[test]
     fn test_escalate_already_escalated_fails() {
-        fresh_store();
+        let _guard = fresh_store();
         assert!(escalate_item("shift-004", "double escalate").is_err());
     }
 
     #[test]
     fn test_resolve_item_marks_as_done() {
-        fresh_store();
+        let _guard = fresh_store();
         let result = resolve_item(
             "shift-006",
             "Manual cert renewal completed, auto-renewal job fixed",
@@ -691,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_get_handover_report_includes_open_and_recently_resolved() {
-        fresh_store();
+        let _guard = fresh_store();
         resolve_item("shift-003", "Approval obtained, decommission in progress").unwrap();
         let report = get_handover_report();
         assert_eq!(report["source"], "static-dry-run");
@@ -703,7 +708,7 @@ mod tests {
 
     #[test]
     fn test_get_my_items_filters_by_user() {
-        fresh_store();
+        let _guard = fresh_store();
         let my = get_my_items("ops-lead");
         assert_eq!(my["user"], "ops-lead");
         let items = my["items"].as_array().unwrap();
@@ -713,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_get_my_items_returns_empty_for_unknown_user() {
-        fresh_store();
+        let _guard = fresh_store();
         let my = get_my_items("nonexistent-user");
         assert_eq!(my["count"].as_u64().unwrap(), 0);
         assert!(my["items"].as_array().unwrap().is_empty());
@@ -721,7 +726,7 @@ mod tests {
 
     #[test]
     fn test_get_stale_items_finds_unacknowledged_old_items() {
-        fresh_store();
+        let _guard = fresh_store();
         let stale = get_stale_items();
         assert_eq!(stale["source"], "static-dry-run");
         assert_eq!(stale["stale_threshold_hours"].as_u64().unwrap(), 4);
@@ -732,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_get_shift_contract_returns_valid_structure() {
-        fresh_store();
+        let _guard = fresh_store();
         let contract = get_shift_contract();
         assert_eq!(contract["source"], "static-seed");
         assert_eq!(contract["queueMode"], "aggregate-safe");
@@ -768,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_item_not_found_errors() {
-        fresh_store();
+        let _guard = fresh_store();
         assert!(acknowledge_item("shift-999", "user").is_err());
         assert!(assign_item("shift-999", "user").is_err());
         assert!(escalate_item("shift-999", "reason").is_err());
@@ -777,7 +782,7 @@ mod tests {
 
     #[test]
     fn test_resolve_already_resolved_fails() {
-        fresh_store();
+        let _guard = fresh_store();
         {
             let mut guard = shift_store().lock().unwrap();
             let item = guard.iter_mut().find(|i| i.id == "shift-003").unwrap();
