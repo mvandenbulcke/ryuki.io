@@ -6627,6 +6627,63 @@ fn platform_config_entries(config: &PlatformConfig) -> Vec<(&'static str, String
     ]
 }
 
+const PLATFORM_SETTINGS_PERSISTENCE_FAILED: &str = "PLATFORM_SETTINGS_PERSISTENCE_FAILED";
+
+fn platform_settings_persistence_problem() -> ProblemDetails {
+    problem_details(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        PLATFORM_SETTINGS_PERSISTENCE_FAILED,
+        "Platform settings could not be persisted",
+        None::<&str>,
+    )
+}
+
+fn map_platform_settings_persistence_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    backend: &str,
+    key: Option<&str>,
+) -> Result<T, ProblemDetails> {
+    result.map_err(|error| {
+        tracing::error!(
+            backend,
+            key = ?key,
+            error = %error,
+            "platform settings persistence failed"
+        );
+        platform_settings_persistence_problem()
+    })
+}
+
+async fn upsert_platform_config_entries(
+    pool: &sqlx::PgPool,
+    config: &PlatformConfig,
+) -> Result<(), ProblemDetails> {
+    let entries = platform_config_entries(config);
+    for (key, value) in &entries {
+        map_platform_settings_persistence_result(
+            sqlx::query(
+                "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
+                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await,
+            "database",
+            Some(key),
+        )?;
+    }
+    Ok(())
+}
+
+async fn save_platform_config_file(config: &PlatformConfig) -> Result<(), ProblemDetails> {
+    map_platform_settings_persistence_result(
+        crate::config_store::save_config(config).await,
+        "file",
+        None,
+    )
+}
+
 async fn admin_platform_settings(
     AuthExtractor(session): AuthExtractor,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
@@ -6666,19 +6723,9 @@ async fn admin_platform_settings_update(
     }
 
     if let Some(pool) = get_db() {
-        let entries = platform_config_entries(&body);
-        for (key, value) in &entries {
-            let _ = sqlx::query(
-                "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
-                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            )
-            .bind(key)
-            .bind(value)
-            .execute(pool)
-            .await;
-        }
+        upsert_platform_config_entries(pool, &body).await?;
     }
-    let _ = crate::config_store::save_config(&body).await;
+    save_platform_config_file(&body).await?;
     let config = if get_db().is_some() {
         body
     } else {
@@ -6694,19 +6741,9 @@ async fn admin_platform_settings_reset(
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
-        let entries = platform_config_entries(&defaults);
-        for (key, value) in &entries {
-            let _ = sqlx::query(
-                "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
-                 ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()",
-            )
-            .bind(key)
-            .bind(value)
-            .execute(pool)
-            .await;
-        }
+        upsert_platform_config_entries(pool, &defaults).await?;
     }
-    let _ = crate::config_store::save_config(&defaults).await;
+    save_platform_config_file(&defaults).await?;
     Ok(Json(serde_json::to_value(defaults).unwrap_or_default()))
 }
 
@@ -11385,6 +11422,34 @@ mod unit_tests {
         assert!(keys.contains(&"maintenance_window_start_hour"));
         assert!(keys.contains(&"keep_alive_timeout_secs"));
         assert!(keys.contains(&"max_concurrent_connections"));
+    }
+
+    #[test]
+    fn test_platform_settings_persistence_result_keeps_success_value() {
+        let result = map_platform_settings_persistence_result::<_, &str>(Ok("saved"), "file", None)
+            .expect("successful persistence should pass through");
+
+        assert_eq!(result, "saved");
+    }
+
+    #[test]
+    fn test_platform_settings_persistence_result_returns_safe_500() {
+        let raw_error = "internal persistence marker should stay out of response";
+        let Err((status, Json(body))) = map_platform_settings_persistence_result::<(), _>(
+            Err(raw_error),
+            "database",
+            Some("auth_mode"),
+        ) else {
+            panic!("persistence failure should map to ProblemDetails");
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, PLATFORM_SETTINGS_PERSISTENCE_FAILED);
+        assert_eq!(body.message, "Platform settings could not be persisted");
+        assert_eq!(body.detail, None);
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("internal persistence marker"));
     }
 
     #[test]
