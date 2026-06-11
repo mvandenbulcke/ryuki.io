@@ -457,10 +457,7 @@ async fn platform_status(Extension(request_id): Extension<RequestId>) -> Json<se
 }
 
 async fn uptime() -> Json<serde_json::Value> {
-    let elapsed = START_TIME
-        .get()
-        .map(|t| t.elapsed().as_secs())
-        .unwrap_or(0);
+    let elapsed = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     Json(serde_json::json!({
         "uptime_seconds": elapsed,
         "uptime_human": format_uptime(elapsed),
@@ -478,7 +475,10 @@ fn format_uptime(seconds: u64) -> String {
 async fn not_found() -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::NOT_FOUND,
-        Json(ApiError::new("NOT_FOUND", "The requested resource was not found")),
+        Json(ApiError::new(
+            "NOT_FOUND",
+            "The requested resource was not found",
+        )),
     )
 }
 
