@@ -85,7 +85,20 @@ async fn auth_middleware(
 }
 
 async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware::Next) -> Response {
-    let request_id = Uuid::new_v4().to_string();
+    let request_id = request
+        .headers()
+        .get("traceparent")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| {
+            let parts: Vec<&str> = v.splitn(4, '-').collect();
+            if parts.len() >= 2 && parts[1].len() == 32 {
+                Some(parts[1].to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     request
@@ -100,9 +113,17 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
     );
 
     let mut response = next.run(request).instrument(span).await;
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         HeaderName::from_static("x-request-id"),
         HeaderValue::from_str(&request_id).unwrap_or(HeaderValue::from_static("unknown")),
+    );
+    let span_id = Uuid::new_v4().to_string().replace('-', "");
+    headers.insert(
+        HeaderName::from_static("traceresponse"),
+        HeaderValue::from_str(&format!("00-{}-{}-01", request_id, &span_id[..16])).unwrap_or(
+            HeaderValue::from_static("00-00000000000000000000000000000000-0000000000000000-01"),
+        ),
     );
     response
 }
@@ -133,6 +154,19 @@ fn set_draining() {
 
 fn is_draining() -> bool {
     DRAINING.load(Ordering::Acquire)
+}
+
+async fn cache_control_middleware(request: HttpRequest<Body>, next: middleware::Next) -> Response {
+    let path = request.uri().path().to_string();
+    let is_contract = path.contains("-contract") || path.contains("/contract");
+    let mut response = next.run(request).await;
+    if is_contract && response.status().is_success() {
+        response.headers_mut().insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_static("public, max-age=300"),
+        );
+    }
+    response
 }
 
 async fn request_counter_middleware(
@@ -416,6 +450,7 @@ async fn main() {
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(cors)
         .layer(CompressionLayer::new())
+        .layer(middleware::from_fn(cache_control_middleware))
         .layer(middleware::from_fn(timing_middleware));
 
     let listener = tokio::net::TcpListener::bind(&app_config.server.bind_address)
