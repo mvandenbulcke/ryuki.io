@@ -1,13 +1,16 @@
+# macOS
 .DS_Store
-bin/
-obj/
-publish/
-TestResults/
-coverage/
-*.log
+
+# Rust
+target/
+per-target/
+
+# Environment
 .env
 .env.*
 !.env.example
+
+# Secrets & crypto
 *.key
 *.pem
 *.pfx
@@ -16,12 +19,13 @@ coverage/
 *.cer
 *.jks
 *.keystore
-appsettings.*.json
-target/
-per-target/
-*.sln
-/sources/*.xlsx
-/sources/*.xlsm
+
+# Platform
 platform-config.json
-sources/exportGroups_2026-6-10.csv
+*.log
+
+# Docker volumes
+pgdata/
+
+# Tooling artifacts
 .graphify_python
