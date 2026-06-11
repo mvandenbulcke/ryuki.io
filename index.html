@@ -151,22 +151,30 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 @keyframes blink{0%,93.5%,97%,100%{transform:scaleY(1)}95.2%{transform:scaleY(.06)}}
 .mark-pupil{will-change:transform}
 
-/* ── Dragon's breath: cursor-following glow ─────────────── */
+/* ── Dragon's breath: site-wide cursor glow ──────────────
+   Ryuki (竜騎, "Dragon Knight"): the dragon's eye in the logo
+   tracks the cursor, and its breath trails behind it — the hue
+   sweeps from azure toward violet as it crosses the page, and a
+   fast strike of the cursor makes the breath flare hot and
+   bright before it cools and settles. Driven per-frame via
+   --breath-hue (deg) and --breath-flare (0–1) from the script
+   at the end of <body>. */
 .cursor-glow{
   position:fixed;left:0;top:0;width:560px;height:560px;
   margin:-280px 0 0 -280px;border-radius:50%;
   pointer-events:none;z-index:60;opacity:0;
   background:radial-gradient(circle,rgba(74,144,217,.085) 0%,rgba(108,92,231,.05) 38%,transparent 68%);
   transition:opacity .8s ease;
-  will-change:transform;
+  filter:hue-rotate(calc(var(--breath-hue,0)*1deg))
+         saturate(calc(1 + var(--breath-flare,0)*.7))
+         brightness(calc(1 + var(--breath-flare,0)*.3));
+  will-change:transform,filter;
 }
 [data-theme="dark"] .cursor-glow{
   background:radial-gradient(circle,rgba(95,168,236,.13) 0%,rgba(125,105,240,.07) 38%,transparent 68%);
   mix-blend-mode:screen;
 }
 .js .cursor-glow.on{opacity:1}
-.js .cursor-glow{animation:breathHue 16s ease-in-out infinite}
-@keyframes breathHue{0%,100%{filter:hue-rotate(0deg)}50%{filter:hue-rotate(45deg)}}
 @media (pointer:coarse){.cursor-glow{display:none}}
 
 /* ── Header ─────────────────────────────────────────────── */
@@ -1186,13 +1194,17 @@ section.alt .stage{background:var(--section-alt)}
     });
   }
 
-  /* ── Dragon Knight: the eye follows the cursor ── */
+  /* ── Dragon Knight (竜騎): the eye follows the cursor ──
+     The dragon watches: logo pupils deflect toward the pointer.
+     The dragon breathes: a glow trails the cursor, its hue riding
+     with it across the page; fast movement makes it flare. */
   var fine=window.matchMedia('(pointer: fine)').matches;
   if(fine&&!reduced){
     var marks=Array.prototype.slice.call(document.querySelectorAll('.mark-track .mark-pupil'))
       .map(function(g){return {g:g,svg:g.ownerSVGElement,x:0,y:0}});
     var glow=document.querySelector('.cursor-glow');
     var mx=-1,my=-1,gx=window.innerWidth/2,gy=window.innerHeight/2;
+    var lastX=null,lastY=null,travel=0,flare=0,hue=0;
     var rafId=null;
 
     function frame(){
@@ -1214,12 +1226,19 @@ section.alt .stage{background:var(--section-alt)}
         m.g.setAttribute('transform','translate('+m.x.toFixed(2)+' '+m.y.toFixed(2)+')');
       }
 
-      /* dragon's breath glow trails the cursor */
+      /* dragon's breath glow trails the cursor; its colour rides with
+         it — hue sweeps across the page, flares hot on a fast strike */
       if(glow){
         gx+=(mx-gx)*.09;
         gy+=(my-gy)*.09;
-        if(Math.abs(mx-gx)>.5||Math.abs(my-gy)>.5)settled=false;
-        glow.style.transform='translate('+gx.toFixed(1)+'px,'+gy.toFixed(1)+'px)';
+        var drive=Math.min(1,travel/26);travel=0;
+        flare+=(drive-flare)*(drive>flare?.18:.045);
+        var hueTo=gx/window.innerWidth*54+flare*120;
+        hue+=(hueTo-hue)*.1;
+        if(Math.abs(mx-gx)>.5||Math.abs(my-gy)>.5||flare>.005||Math.abs(hueTo-hue)>.5)settled=false;
+        glow.style.transform='translate('+gx.toFixed(1)+'px,'+gy.toFixed(1)+'px) scale('+(1+flare*.18).toFixed(3)+')';
+        glow.style.setProperty('--breath-hue',hue.toFixed(1));
+        glow.style.setProperty('--breath-flare',flare.toFixed(3));
       }
 
       rafId=settled?null:requestAnimationFrame(frame);
@@ -1227,6 +1246,8 @@ section.alt .stage{background:var(--section-alt)}
 
     document.addEventListener('mousemove',function(e){
       mx=e.clientX;my=e.clientY;
+      if(lastX!==null)travel+=Math.abs(mx-lastX)+Math.abs(my-lastY);
+      lastX=mx;lastY=my;
       if(glow)glow.classList.add('on');
       if(rafId===null)rafId=requestAnimationFrame(frame);
     },{passive:true});
