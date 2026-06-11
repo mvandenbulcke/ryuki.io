@@ -113,6 +113,19 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
+/// Per-endpoint request counts keyed by "METHOD /path".
+struct PerEndpointCounter {
+    counts: Mutex<HashMap<String, u64>>,
+}
+
+static PER_ENDPOINT: OnceLock<PerEndpointCounter> = OnceLock::new();
+
+fn per_endpoint() -> &'static PerEndpointCounter {
+    PER_ENDPOINT.get_or_init(|| PerEndpointCounter {
+        counts: Mutex::new(HashMap::new()),
+    })
+}
+
 fn set_draining() {
     DRAINING.store(true, Ordering::Release);
 }
@@ -126,6 +139,11 @@ async fn request_counter_middleware(
     next: middleware::Next,
 ) -> Response {
     REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label = format!("{} {}", request.method(), request.uri().path());
+    {
+        let mut counts = per_endpoint().counts.lock().unwrap();
+        *counts.entry(label).or_insert(0) += 1;
+    }
     next.run(request).await
 }
 
@@ -223,7 +241,9 @@ async fn security_headers_middleware(
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
-    let csp = &crate::config_store::get_app_config().security.content_security_policy;
+    let csp = &crate::config_store::get_app_config()
+        .security
+        .content_security_policy;
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
@@ -485,6 +505,39 @@ async fn metrics() -> Response {
             &mut body, dur_count, sum_ms, min_ms, max_ms, avg_ms,
         );
     }
+
+    body.push_str("# HELP ryuki_api_requests_per_endpoint_total Requests per endpoint\n");
+    body.push_str("# TYPE ryuki_api_requests_per_endpoint_total counter\n");
+    let counts = per_endpoint().counts.lock().unwrap();
+    let mut sorted: Vec<_> = counts.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    for (label, n) in &sorted {
+        let parts: Vec<&str> = label.splitn(2, ' ').collect();
+        let (method, path) = match parts.as_slice() {
+            [m, p] => (*m, *p),
+            _ => ("UNKNOWN", label.as_str()),
+        };
+        body.push_str(&format!(
+            "ryuki_api_requests_per_endpoint_total{{method=\"{}\",path=\"{}\"}} {}\n",
+            method, path, n
+        ));
+    }
+
+    let pool = crate::database::pool_metrics();
+    body.push_str("# HELP ryuki_db_pool_connections Database connection pool\n");
+    body.push_str("# TYPE ryuki_db_pool_connections gauge\n");
+    body.push_str(&format!(
+        "ryuki_db_pool_connections{{state=\"size\"}} {}\n",
+        pool.size
+    ));
+    body.push_str(&format!(
+        "ryuki_db_pool_connections{{state=\"idle\"}} {}\n",
+        pool.idle
+    ));
+    body.push_str(&format!(
+        "ryuki_db_pool_connected {}\n",
+        if pool.connected { 1 } else { 0 }
+    ));
 
     Response::builder()
         .status(StatusCode::OK)

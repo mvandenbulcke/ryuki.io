@@ -8,6 +8,27 @@ pub fn get_db() -> Option<&'static PgPool> {
     POOL.get().and_then(|o| o.as_ref())
 }
 
+pub struct PoolMetrics {
+    pub connected: bool,
+    pub size: usize,
+    pub idle: usize,
+}
+
+pub fn pool_metrics() -> PoolMetrics {
+    match get_db() {
+        Some(pool) => PoolMetrics {
+            connected: true,
+            size: pool.size() as usize,
+            idle: pool.num_idle(),
+        },
+        None => PoolMetrics {
+            connected: false,
+            size: 0,
+            idle: 0,
+        },
+    }
+}
+
 pub async fn connect(url: &str) -> PgPool {
     PgPoolOptions::new()
         .max_connections(5)
