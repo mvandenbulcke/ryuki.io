@@ -35,6 +35,7 @@ use ryuki_engine::network_readiness;
 use ryuki_engine::noise_remediation;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
+use ryuki_engine::outage_comms;
 use ryuki_engine::patch_engine;
 use ryuki_engine::repository_capacity;
 use ryuki_engine::server_decommission;
@@ -455,6 +456,54 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/maintenance-communications-contract",
             get(operations_maintenance_comm),
+        )
+        .route(
+            "/api/operations/outage-comms/notices",
+            get(outage_notices_list),
+        )
+        .route(
+            "/api/operations/outage-comms/notices",
+            post(outage_notices_create),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}",
+            get(outage_notices_get),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}/preview",
+            get(outage_notices_preview),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}/send",
+            post(outage_notices_send),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}/acknowledge",
+            post(outage_notices_acknowledge),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}/complete",
+            post(outage_notices_complete),
+        )
+        .route(
+            "/api/operations/outage-comms/notices/{id}/cancel",
+            post(outage_notices_cancel),
+        )
+        .route(
+            "/api/operations/outage-comms/active",
+            get(outage_notices_active),
+        )
+        .route(
+            "/api/operations/outage-comms/history",
+            get(outage_notices_history),
+        )
+        .route(
+            "/api/operations/outage-comms/upcoming",
+            get(outage_notices_upcoming),
+        )
+        .route(
+            "/api/operations/outage-comms-contract",
+            get(outage_contract),
         )
         .route(
             "/api/operations/degradation-mode-contract",
@@ -1910,6 +1959,52 @@ struct HardwareAddRequest {
 #[allow(dead_code)]
 struct HardwareUpdateFirmwareRequest {
     version: String,
+}
+
+// ─── Outage comms request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeCreateRequest {
+    site: String,
+    #[serde(rename = "affectedSystems")]
+    affected_systems: Vec<String>,
+    #[serde(rename = "startTime")]
+    start_time: String,
+    #[serde(rename = "endTime")]
+    end_time: String,
+    #[serde(rename = "impactLevel")]
+    impact_level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeListQuery {
+    site: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeActiveQuery {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeHistoryQuery {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeUpcomingQuery {
+    site: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct OutageNoticeAcknowledgeRequest {
+    user: String,
 }
 
 // ─── Request lifecycle types ───
@@ -8064,6 +8159,101 @@ async fn hardware_contract() -> Json<Value> {
             }
         ]
     }))
+}
+
+// ─── Outage communications handlers ───
+
+async fn outage_notices_list(
+    Query(query): Query<OutageNoticeListQuery>,
+) -> Json<Value> {
+    let site = query.site.as_deref().unwrap_or("");
+    let notices = outage_comms::get_all_notices(site);
+    Json(serde_json::to_value(notices).unwrap())
+}
+
+async fn outage_notices_create(
+    Json(body): Json<OutageNoticeCreateRequest>,
+) -> ApiResult {
+    match outage_comms::create_notice(
+        &body.site,
+        body.affected_systems,
+        &body.start_time,
+        &body.end_time,
+        &body.impact_level,
+    ) {
+        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn outage_notices_get(Path(id): Path<String>) -> ApiResult {
+    match outage_comms::get_notice(&id) {
+        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn outage_notices_preview(Path(id): Path<String>) -> ApiResult {
+    match outage_comms::preview_notice(&id) {
+        Ok(preview) => Ok(Json(preview)),
+        Err(e) => Err(status_404(&e)),
+    }
+}
+
+async fn outage_notices_send(Path(id): Path<String>) -> ApiResult {
+    match outage_comms::send_notice(&id) {
+        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn outage_notices_acknowledge(
+    Path(id): Path<String>,
+    Json(body): Json<OutageNoticeAcknowledgeRequest>,
+) -> ApiResult {
+    match outage_comms::acknowledge_notice(&id, &body.user) {
+        Ok(ack) => Ok(Json(serde_json::to_value(ack).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn outage_notices_complete(Path(id): Path<String>) -> ApiResult {
+    match outage_comms::complete_notice(&id) {
+        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn outage_notices_cancel(Path(id): Path<String>) -> ApiResult {
+    match outage_comms::cancel_notice(&id) {
+        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
+}
+
+async fn outage_notices_active(
+    Query(query): Query<OutageNoticeActiveQuery>,
+) -> Json<Value> {
+    let active = outage_comms::get_active_notices(&query.site);
+    Json(serde_json::to_value(active).unwrap())
+}
+
+async fn outage_notices_history(
+    Query(query): Query<OutageNoticeHistoryQuery>,
+) -> Json<Value> {
+    let history = outage_comms::get_notice_history(&query.site);
+    Json(serde_json::to_value(history).unwrap())
+}
+
+async fn outage_notices_upcoming(
+    Query(query): Query<OutageNoticeUpcomingQuery>,
+) -> Json<Value> {
+    let upcoming = outage_comms::get_upcoming(&query.site);
+    Json(serde_json::to_value(upcoming).unwrap())
+}
+
+async fn outage_contract() -> Json<Value> {
+    Json(outage_comms::get_outage_contract())
 }
 
 // ─── Image factory handlers ───
