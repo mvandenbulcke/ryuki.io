@@ -6488,7 +6488,22 @@ async fn admin_rbac_roles() -> Json<Value> {
     Json(serde_json::to_value(roles).unwrap_or_default())
 }
 
-async fn admin_platform_settings() -> Json<Value> {
+fn require_admin_permission(session: &AuthSession) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if check_permission(session, "admin") {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new("FORBIDDEN", "Admin permission required")),
+        ))
+    }
+}
+
+async fn admin_platform_settings(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
     if let Some(pool) = get_db() {
         let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM platform_config")
             .fetch_all(pool)
@@ -6511,15 +6526,18 @@ async fn admin_platform_settings() -> Json<Value> {
                 _ => {}
             }
         }
-        return Json(serde_json::to_value(config).unwrap_or_default());
+        return Ok(Json(serde_json::to_value(config).unwrap_or_default()));
     }
     let config = crate::config_store::load_config().await;
-    Json(serde_json::to_value(config).unwrap_or_default())
+    Ok(Json(serde_json::to_value(config).unwrap_or_default()))
 }
 
 async fn admin_platform_settings_update(
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<PlatformConfig>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
     let validation_errors = ryuki_core::types::validate_platform_config(&body);
     if !validation_errors.is_empty() {
         return Err((
@@ -6566,7 +6584,11 @@ async fn admin_platform_settings_update(
     Ok(Json(serde_json::to_value(config).unwrap_or_default()))
 }
 
-async fn admin_platform_settings_reset() -> Json<Value> {
+async fn admin_platform_settings_reset(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
         let entries = [
@@ -6594,7 +6616,7 @@ async fn admin_platform_settings_reset() -> Json<Value> {
         }
     }
     let _ = crate::config_store::save_config(&defaults).await;
-    Json(serde_json::to_value(defaults).unwrap_or_default())
+    Ok(Json(serde_json::to_value(defaults).unwrap_or_default()))
 }
 
 // ─── Request lifecycle handlers ───
@@ -11226,6 +11248,23 @@ mod unit_tests {
     fn test_auth_extractor_rejects_unverified_entra_session() {
         let session = AuthSession::unverified_entra();
         assert!(!auth_session_is_verified_or_static(&session));
+    }
+
+    #[test]
+    fn test_admin_permission_accepts_platform_admin() {
+        let session = AuthSession::static_dry_run();
+        assert!(require_admin_permission(&session).is_ok());
+    }
+
+    #[test]
+    fn test_admin_permission_rejects_non_admin_role() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        let Err((status, Json(body))) = require_admin_permission(&session) else {
+            panic!("requester should not have admin permission");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.error, "FORBIDDEN");
     }
 
     #[test]
