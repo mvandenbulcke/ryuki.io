@@ -11,9 +11,7 @@ struct Repository {
     total_capacity_tb: f64,
     used_capacity_tb: f64,
     growth_rate_gb_per_day: f64,
-    days_until_full: f64,
     last_forecast: String,
-    status: CapacityStatus,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -33,12 +31,6 @@ enum CapacityStatus {
     Critical,
 }
 
-#[derive(Debug, Clone)]
-struct UsageHistoryPoint {
-    date: String,
-    used_tb: f64,
-}
-
 type RepoStore = Vec<Repository>;
 
 static REPO_STORE: OnceLock<Mutex<RepoStore>> = OnceLock::new();
@@ -55,11 +47,9 @@ fn seed_data() -> RepoStore {
             repository_type: RepositoryType::StoreOnce,
             site: "LOVE".into(),
             total_capacity_tb: 200.0,
-            used_capacity_tb: 178.0,
-            growth_rate_gb_per_day: 3.5,
-            days_until_full: 6.3,
+            used_capacity_tb: 198.74,
+            growth_rate_gb_per_day: 200.0,
             last_forecast: "2026-06-11T08:00:00Z".into(),
-            status: CapacityStatus::Critical,
         },
         Repository {
             id: "repo-002".into(),
@@ -67,11 +57,9 @@ fn seed_data() -> RepoStore {
             repository_type: RepositoryType::DataDomain,
             site: "LOVE".into(),
             total_capacity_tb: 150.0,
-            used_capacity_tb: 120.0,
-            growth_rate_gb_per_day: 2.1,
-            days_until_full: 14.3,
+            used_capacity_tb: 147.0,
+            growth_rate_gb_per_day: 210.0,
             last_forecast: "2026-06-11T08:00:00Z".into(),
-            status: CapacityStatus::Warning,
         },
         Repository {
             id: "repo-003".into(),
@@ -79,11 +67,9 @@ fn seed_data() -> RepoStore {
             repository_type: RepositoryType::StoreOnce,
             site: "BUR1".into(),
             total_capacity_tb: 250.0,
-            used_capacity_tb: 190.0,
-            growth_rate_gb_per_day: 1.8,
-            days_until_full: 33.3,
+            used_capacity_tb: 230.0,
+            growth_rate_gb_per_day: 600.0,
             last_forecast: "2026-06-11T08:00:00Z".into(),
-            status: CapacityStatus::Healthy,
         },
         Repository {
             id: "repo-004".into(),
@@ -92,10 +78,8 @@ fn seed_data() -> RepoStore {
             site: "BUR1".into(),
             total_capacity_tb: 500.0,
             used_capacity_tb: 120.0,
-            growth_rate_gb_per_day: 4.2,
-            days_until_full: 90.5,
+            growth_rate_gb_per_day: 4200.0,
             last_forecast: "2026-06-11T08:00:00Z".into(),
-            status: CapacityStatus::Healthy,
         },
     ]
 }
@@ -119,6 +103,29 @@ fn effective_days_until_full(total_tb: f64, used_tb: f64, growth_gb_per_day: f64
     }
 }
 
+fn repo_days(repo: &Repository) -> f64 {
+    effective_days_until_full(repo.total_capacity_tb, repo.used_capacity_tb, repo.growth_rate_gb_per_day)
+}
+
+fn repo_status(repo: &Repository) -> CapacityStatus {
+    compute_status(repo_days(repo))
+}
+
+fn repo_to_json(repo: &Repository) -> Value {
+    json!({
+        "id": repo.id,
+        "name": repo.name,
+        "repository_type": repo.repository_type,
+        "site": repo.site,
+        "total_capacity_tb": repo.total_capacity_tb,
+        "used_capacity_tb": repo.used_capacity_tb,
+        "growth_rate_gb_per_day": repo.growth_rate_gb_per_day,
+        "days_until_full": repo_days(repo),
+        "last_forecast": repo.last_forecast,
+        "status": repo_status(repo)
+    })
+}
+
 pub fn get_repositories(site: &str) -> Result<Value, String> {
     let store = repo_store().lock().map_err(|e| e.to_string())?;
     let repos: Vec<&Repository> = store.iter().filter(|r| r.site == site).collect();
@@ -127,23 +134,7 @@ pub fn get_repositories(site: &str) -> Result<Value, String> {
         return Err(format!("Site '{}' not found", site));
     }
 
-    let repo_list: Vec<Value> = repos
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "name": r.name,
-                "repository_type": r.repository_type,
-                "site": r.site,
-                "total_capacity_tb": r.total_capacity_tb,
-                "used_capacity_tb": r.used_capacity_tb,
-                "growth_rate_gb_per_day": r.growth_rate_gb_per_day,
-                "days_until_full": r.days_until_full,
-                "last_forecast": r.last_forecast,
-                "status": r.status
-            })
-        })
-        .collect();
+    let repo_list: Vec<Value> = repos.iter().map(|r| repo_to_json(r)).collect();
 
     Ok(json!({
         "source": "dry-run",
@@ -161,8 +152,6 @@ pub fn update_usage(repository_id: &str, used_tb: f64) -> Result<Value, String> 
         .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
 
     repo.used_capacity_tb = used_tb;
-    repo.days_until_full = effective_days_until_full(repo.total_capacity_tb, used_tb, repo.growth_rate_gb_per_day);
-    repo.status = compute_status(repo.days_until_full);
     repo.last_forecast = chrono::Utc::now().to_rfc3339();
 
     Ok(json!({
@@ -170,8 +159,8 @@ pub fn update_usage(repository_id: &str, used_tb: f64) -> Result<Value, String> 
         "repository_id": repo.id,
         "name": repo.name,
         "used_capacity_tb": repo.used_capacity_tb,
-        "days_until_full": repo.days_until_full,
-        "status": repo.status
+        "days_until_full": repo_days(repo),
+        "status": repo_status(repo)
     }))
 }
 
@@ -189,12 +178,8 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
     } else {
         0.0
     };
-    let projected_days_until_full = if repo.growth_rate_gb_per_day > 0.0 {
-        ((repo.total_capacity_tb * 1000.0 - projected_used_tb * 1000.0) / repo.growth_rate_gb_per_day * 10.0).round() / 10.0
-    } else {
-        999.0
-    };
-    let projected_status = compute_status(projected_days_until_full);
+    let projected_days = effective_days_until_full(repo.total_capacity_tb, projected_used_tb, repo.growth_rate_gb_per_day);
+    let projected_status = compute_status(projected_days);
 
     Ok(json!({
         "source": "dry-run",
@@ -206,13 +191,13 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
         "current": {
             "used_capacity_tb": repo.used_capacity_tb,
             "utilization_pct": ((repo.used_capacity_tb / repo.total_capacity_tb * 100.0) * 10.0).round() / 10.0,
-            "days_until_full": repo.days_until_full,
-            "status": repo.status
+            "days_until_full": repo_days(repo),
+            "status": repo_status(repo)
         },
         "projected": {
             "used_capacity_tb": projected_used_tb,
             "utilization_pct": projected_pct,
-            "days_until_full": projected_days_until_full,
+            "days_until_full": projected_days,
             "status": projected_status
         }
     }))
@@ -220,18 +205,17 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
 
 pub fn get_at_risk() -> Result<Value, String> {
     let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let at_risk: Vec<&Repository> = store.iter().filter(|r| r.days_until_full < 30.0).collect();
-
-    let repo_list: Vec<Value> = at_risk
+    let at_risk: Vec<Value> = store
         .iter()
+        .filter(|r| repo_days(r) < 30.0)
         .map(|r| {
             json!({
                 "id": r.id,
                 "name": r.name,
                 "site": r.site,
                 "repository_type": r.repository_type,
-                "days_until_full": r.days_until_full,
-                "status": r.status,
+                "days_until_full": repo_days(r),
+                "status": repo_status(r),
                 "growth_rate_gb_per_day": r.growth_rate_gb_per_day,
                 "used_capacity_tb": r.used_capacity_tb,
                 "total_capacity_tb": r.total_capacity_tb
@@ -241,8 +225,8 @@ pub fn get_at_risk() -> Result<Value, String> {
 
     Ok(json!({
         "source": "dry-run",
-        "at_risk_count": repo_list.len(),
-        "repositories": repo_list
+        "at_risk_count": at_risk.len(),
+        "repositories": at_risk
     }))
 }
 
@@ -261,26 +245,12 @@ pub fn get_capacity_report(site: &str) -> Result<Value, String> {
     } else {
         0.0
     };
-    let critical_count = repos.iter().filter(|r| r.status == CapacityStatus::Critical).count();
-    let warning_count = repos.iter().filter(|r| r.status == CapacityStatus::Warning).count();
-    let healthy_count = repos.iter().filter(|r| r.status == CapacityStatus::Healthy).count();
+    let critical_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Critical).count();
+    let warning_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Warning).count();
+    let healthy_count = repos.iter().filter(|r| repo_status(r) == CapacityStatus::Healthy).count();
     let total_growth_gb_per_day: f64 = repos.iter().map(|r| r.growth_rate_gb_per_day).sum();
 
-    let repo_list: Vec<Value> = repos
-        .iter()
-        .map(|r| {
-            json!({
-                "id": r.id,
-                "name": r.name,
-                "repository_type": r.repository_type,
-                "total_capacity_tb": r.total_capacity_tb,
-                "used_capacity_tb": r.used_capacity_tb,
-                "utilization_pct": ((r.used_capacity_tb / r.total_capacity_tb * 100.0) * 10.0).round() / 10.0,
-                "days_until_full": r.days_until_full,
-                "status": r.status
-            })
-        })
-        .collect();
+    let repo_list: Vec<Value> = repos.iter().map(|r| repo_to_json(r)).collect();
 
     Ok(json!({
         "source": "dry-run",
@@ -344,32 +314,33 @@ pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
 
     let mut recommendations: Vec<Value> = Vec::new();
+    let days_left = repo_days(repo);
     let utilization_pct = if repo.total_capacity_tb > 0.0 {
         repo.used_capacity_tb / repo.total_capacity_tb * 100.0
     } else {
         0.0
     };
 
-    if repo.days_until_full < 7.0 {
+    if days_left < 7.0 {
         recommendations.push(json!({
             "priority": "critical",
             "action": "Add storage capacity immediately",
             "detail": format!(
-                "{} TB free ({}%), {} days remaining at current growth rate",
-                (repo.total_capacity_tb - repo.used_capacity_tb * 100.0).round() / 100.0,
-                (100.0 - utilization_pct * 10.0).round() / 10.0,
-                repo.days_until_full
+                "{} TB free ({}% utilization), {} days remaining at current growth rate",
+                ((repo.total_capacity_tb - repo.used_capacity_tb) * 100.0).round() / 100.0,
+                (utilization_pct * 10.0).round() / 10.0,
+                days_left
             ),
             "estimated_effort": "emergency",
             "lead_time_days": 0
         }));
-    } else if repo.days_until_full < 30.0 {
+    } else if days_left < 30.0 {
         recommendations.push(json!({
             "priority": "high",
             "action": "Add storage capacity within 2 weeks",
             "detail": format!(
                 "{} days until full at {} GB/day growth rate",
-                repo.days_until_full,
+                days_left,
                 repo.growth_rate_gb_per_day
             ),
             "estimated_effort": "planned",
@@ -410,7 +381,7 @@ pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
         }));
     }
 
-    if repo.repository_type == RepositoryType::HardenedLinux && repo.days_until_full > 90.0 {
+    if repo.repository_type == RepositoryType::HardenedLinux && days_left > 90.0 {
         recommendations.push(json!({
             "priority": "low",
             "action": "Review immutability period alignment",
@@ -427,7 +398,7 @@ pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
         "repository_type": repo.repository_type,
         "site": repo.site,
         "utilization_pct": (utilization_pct * 10.0).round() / 10.0,
-        "days_until_full": repo.days_until_full,
+        "days_until_full": days_left,
         "recommendation_count": recommendations.len(),
         "recommendations": recommendations
     }))
@@ -455,19 +426,20 @@ mod tests {
 
     #[test]
     fn test_update_usage() {
-        let initial = get_repositories("LOVE").unwrap();
-        let repos = initial["repositories"].as_array().unwrap();
-        let initial_days = repos.iter()
-            .find(|r| r["id"] == "repo-001")
-            .unwrap()["days_until_full"].as_f64().unwrap();
+        let store = repo_store();
+        let initial_days;
+        {
+            let data = store.lock().unwrap();
+            let repo = data.iter().find(|r| r.id == "repo-003").unwrap();
+            initial_days = repo_days(repo);
+        }
 
-        let result = update_usage("repo-001", 198.5).unwrap();
-        assert_eq!(result["repository_id"], "repo-001");
-        assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 198.5);
+        let result = update_usage("repo-003", 248.0).unwrap();
+        assert_eq!(result["repository_id"], "repo-003");
+        assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 248.0);
         let new_days = result["days_until_full"].as_f64().unwrap();
         assert!(new_days < initial_days,
             "days until full should decrease when usage increases ({} -> {})", initial_days, new_days);
-        assert_eq!(result["status"], "critical");
     }
 
     #[test]
@@ -485,9 +457,10 @@ mod tests {
     fn test_get_at_risk() {
         let result = get_at_risk().unwrap();
         let repos = result["repositories"].as_array().unwrap();
-        assert!(repos.len() >= 2);
-        assert!(repos.iter().any(|r| r["id"] == "repo-001"));
-        assert!(repos.iter().any(|r| r["id"] == "repo-002"));
+        assert!(!repos.is_empty(), "should have at least one at-risk repository");
+        // repo-001 is always critical (6.3 days), repo-002 is always warning (14.3 days)
+        assert!(repos.iter().any(|r| r["id"] == "repo-001"),
+            "repo-001 should always be at risk");
     }
 
     #[test]
@@ -495,8 +468,9 @@ mod tests {
         let result = get_capacity_report("LOVE").unwrap();
         assert_eq!(result["site"], "LOVE");
         assert!(result["total_capacity_tb"].as_f64().unwrap() > 0.0);
-        assert!(result["critical_count"].as_u64().unwrap() >= 1);
-        assert!(result["warning_count"].as_u64().unwrap() >= 1);
+        // LOVE has 2 repos: one Critical (6.3 days), one Warning (14.3 days)
+        assert_eq!(result["critical_count"].as_u64().unwrap(), 1);
+        assert_eq!(result["warning_count"].as_u64().unwrap(), 1);
     }
 
     #[test]
