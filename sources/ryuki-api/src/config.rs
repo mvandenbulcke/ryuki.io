@@ -40,6 +40,13 @@ pub fn get_platform_status() -> serde_json::Value {
             "hypervisor": format!("{:?}", config.hypervisor_provider),
             "monitoring": format!("{:?}", config.monitoring_provider),
             "backup": format!("{:?}", config.backup_provider),
+            "storage": format!("{:?}", config.storage_provider),
+            "dns": format!("{:?}", config.dns_provider),
+            "ipam": format!("{:?}", config.ipam_provider),
+            "load_balancer": format!("{:?}", config.load_balancer_provider),
+            "firewall": format!("{:?}", config.firewall_provider),
+            "build": format!("{:?}", config.build_provider),
+            "network": format!("{:?}", config.network_provider),
         },
         "server": {
             "bind_address": config.server.bind_address,
