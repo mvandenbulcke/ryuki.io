@@ -163,6 +163,7 @@ fn join_domain_plan(distro: &LinuxDistro) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn plan_linux_deployment(
     distro: LinuxDistro,
     version: &str,

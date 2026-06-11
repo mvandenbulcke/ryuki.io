@@ -174,6 +174,7 @@ fn parse_direction(direction: &str) -> Result<RuleDirection, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_rule(
     id: &str,
     name: &str,
@@ -434,6 +435,7 @@ pub fn get_rule(id: &str) -> Result<Value, String> {
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_rule(
     name: &str,
     source_ip: &str,

@@ -374,7 +374,7 @@ pub fn get_emergency_stats(site: &str) -> Result<Value, String> {
     }
 
     let mut top_initiators: Vec<(String, usize)> = initiator_counts.into_iter().collect();
-    top_initiators.sort_by(|a, b| b.1.cmp(&a.1));
+    top_initiators.sort_by_key(|b| std::cmp::Reverse(b.1));
     let top_initiators: Vec<Value> = top_initiators
         .into_iter()
         .map(|(name, count)| json!({ "initiator": name, "count": count }))

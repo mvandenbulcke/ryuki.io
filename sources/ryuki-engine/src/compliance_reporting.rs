@@ -187,6 +187,7 @@ fn summarize_controls(controls: &[ComplianceControl]) -> (usize, usize, OverallS
     (compliant, total, status)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn control(
     id: &str,
     framework_id: &str,

@@ -445,7 +445,7 @@ pub fn get_volume_report(site: &str) -> Result<VolumeReport, String> {
     }
 
     let mut hosts: Vec<HostVolume> = host_map.into_values().collect();
-    hosts.sort_by(|a, b| b.volume_mb_per_day.cmp(&a.volume_mb_per_day));
+    hosts.sort_by_key(|b| std::cmp::Reverse(b.volume_mb_per_day));
 
     let total_volume_mb_per_day: u32 = hosts.iter().map(|h| h.volume_mb_per_day).sum();
     let top_talkers: Vec<HostVolume> = hosts.iter().take(3).cloned().collect();
@@ -503,8 +503,8 @@ pub fn get_retention_status(site: &str) -> Result<RetentionStatus, String> {
         }
     }
 
-    hosts_at_risk.sort_by(|a, b| b.configured_days.cmp(&a.configured_days));
-    hosts_approaching_limit.sort_by(|a, b| b.configured_days.cmp(&a.configured_days));
+    hosts_at_risk.sort_by_key(|b| std::cmp::Reverse(b.configured_days));
+    hosts_approaching_limit.sort_by_key(|b| std::cmp::Reverse(b.configured_days));
 
     Ok(RetentionStatus {
         site: site.into(),

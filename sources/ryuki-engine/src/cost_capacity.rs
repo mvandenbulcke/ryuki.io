@@ -44,6 +44,7 @@ fn seed_data() -> CostCapacityStore {
 
     let mut vms = Vec::new();
 
+    #[allow(clippy::type_complexity)]
     let sites: [(&str, &[(&str, u32, u32, u32, f64, f64, bool, bool, u32)]); 2] = [
         (
             "DEFRA",

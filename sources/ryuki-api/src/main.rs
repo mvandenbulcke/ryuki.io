@@ -91,6 +91,7 @@ async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware:
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct RequestId(String);
 
 type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;

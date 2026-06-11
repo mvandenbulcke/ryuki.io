@@ -257,11 +257,7 @@ pub fn get_dashboard(site: &str) -> DashboardSummary {
         // checks without results yet are not counted in pass/fail
     }
 
-    let avg_latency = if result_count > 0 {
-        total_latency / result_count
-    } else {
-        0
-    };
+    let avg_latency = total_latency.checked_div(result_count).unwrap_or(0);
 
     DashboardSummary {
         site: site.to_string(),
