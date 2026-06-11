@@ -978,6 +978,8 @@ pub fn routes() -> Router {
         )
         // ─── Site Registry (UN/LOCODE) ───
         .route("/api/admin/sites", get(site_registry_list))
+        .route("/api/admin/sites/countries", get(site_registry_countries))
+        .route("/api/admin/sites/countries/{code}/cities", get(site_registry_cities_by_country))
         .route("/api/admin/sites/{unlocode}", get(site_registry_get))
         .route("/api/admin/sites/{unlocode}/activate", post(site_registry_activate))
         .route("/api/admin/sites/{unlocode}/deactivate", post(site_registry_deactivate))
@@ -8765,6 +8767,20 @@ async fn site_registry_search(
     site_registry::search_sites(&params.q)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn site_registry_countries() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::list_countries()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn site_registry_cities_by_country(
+    Path(code): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    site_registry::list_cities_by_country(&code)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
 async fn site_registry_contract() -> Json<Value> {
