@@ -6499,6 +6499,135 @@ fn require_admin_permission(session: &AuthSession) -> Result<(), (StatusCode, Js
     }
 }
 
+fn apply_platform_config_entry(config: &mut PlatformConfig, key: &str, value: &str) {
+    match key {
+        "entra_tenant_id" => config.entra_tenant_id = value.to_string(),
+        "entra_client_id" => config.entra_client_id = value.to_string(),
+        "entra_authority" => config.entra_authority = value.to_string(),
+        "auth_mode" => config.auth_mode = value.to_string(),
+        "database_provider" => config.database_provider = value.to_string(),
+        "platform_name" => config.platform_name = value.to_string(),
+        "platform_url" => config.platform_url = value.to_string(),
+        "secret_provider" => config.secret_provider = value.to_string(),
+        "kubernetes_runtime" => config.kubernetes_runtime = value.to_string(),
+        "monitoring_provider" => config.monitoring_provider = value.to_string(),
+        "backup_provider" => config.backup_provider = value.to_string(),
+        "hypervisor_provider" => config.hypervisor_provider = value.to_string(),
+        "storage_provider" => config.storage_provider = value.to_string(),
+        "dns_provider" => config.dns_provider = value.to_string(),
+        "ipam_provider" => config.ipam_provider = value.to_string(),
+        "load_balancer_provider" => config.load_balancer_provider = value.to_string(),
+        "firewall_provider" => config.firewall_provider = value.to_string(),
+        "build_provider" => config.build_provider = value.to_string(),
+        "network_provider" => config.network_provider = value.to_string(),
+        "retention_daily_backups" => {
+            if let Ok(parsed) = value.parse() {
+                config.retention_daily_backups = parsed;
+            }
+        }
+        "retention_weekly_backups" => {
+            if let Ok(parsed) = value.parse() {
+                config.retention_weekly_backups = parsed;
+            }
+        }
+        "retention_monthly_backups" => {
+            if let Ok(parsed) = value.parse() {
+                config.retention_monthly_backups = parsed;
+            }
+        }
+        "retention_yearly_backups" => {
+            if let Ok(parsed) = value.parse() {
+                config.retention_yearly_backups = parsed;
+            }
+        }
+        "maintenance_window_day" => config.maintenance_window_day = value.to_string(),
+        "maintenance_window_start_hour" => {
+            if let Ok(parsed) = value.parse() {
+                config.maintenance_window_start_hour = parsed;
+            }
+        }
+        "maintenance_window_duration_hours" => {
+            if let Ok(parsed) = value.parse() {
+                config.maintenance_window_duration_hours = parsed;
+            }
+        }
+        "keep_alive_timeout_secs" => {
+            if let Ok(parsed) = value.parse() {
+                config.keep_alive_timeout_secs = parsed;
+            }
+        }
+        "max_concurrent_connections" => {
+            if let Ok(parsed) = value.parse() {
+                config.max_concurrent_connections = parsed;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn platform_config_entries(config: &PlatformConfig) -> Vec<(&'static str, String)> {
+    vec![
+        ("entra_tenant_id", config.entra_tenant_id.clone()),
+        ("entra_client_id", config.entra_client_id.clone()),
+        ("entra_authority", config.entra_authority.clone()),
+        ("auth_mode", config.auth_mode.clone()),
+        ("database_provider", config.database_provider.clone()),
+        ("platform_name", config.platform_name.clone()),
+        ("platform_url", config.platform_url.clone()),
+        ("secret_provider", config.secret_provider.clone()),
+        ("kubernetes_runtime", config.kubernetes_runtime.clone()),
+        ("monitoring_provider", config.monitoring_provider.clone()),
+        ("backup_provider", config.backup_provider.clone()),
+        ("hypervisor_provider", config.hypervisor_provider.clone()),
+        ("storage_provider", config.storage_provider.clone()),
+        ("dns_provider", config.dns_provider.clone()),
+        ("ipam_provider", config.ipam_provider.clone()),
+        (
+            "load_balancer_provider",
+            config.load_balancer_provider.clone(),
+        ),
+        ("firewall_provider", config.firewall_provider.clone()),
+        ("build_provider", config.build_provider.clone()),
+        ("network_provider", config.network_provider.clone()),
+        (
+            "retention_daily_backups",
+            config.retention_daily_backups.to_string(),
+        ),
+        (
+            "retention_weekly_backups",
+            config.retention_weekly_backups.to_string(),
+        ),
+        (
+            "retention_monthly_backups",
+            config.retention_monthly_backups.to_string(),
+        ),
+        (
+            "retention_yearly_backups",
+            config.retention_yearly_backups.to_string(),
+        ),
+        (
+            "maintenance_window_day",
+            config.maintenance_window_day.clone(),
+        ),
+        (
+            "maintenance_window_start_hour",
+            config.maintenance_window_start_hour.to_string(),
+        ),
+        (
+            "maintenance_window_duration_hours",
+            config.maintenance_window_duration_hours.to_string(),
+        ),
+        (
+            "keep_alive_timeout_secs",
+            config.keep_alive_timeout_secs.to_string(),
+        ),
+        (
+            "max_concurrent_connections",
+            config.max_concurrent_connections.to_string(),
+        ),
+    ]
+}
+
 async fn admin_platform_settings(
     AuthExtractor(session): AuthExtractor,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
@@ -6511,20 +6640,7 @@ async fn admin_platform_settings(
             .unwrap_or_default();
         let mut config = PlatformConfig::default();
         for (key, value) in &rows {
-            match key.as_str() {
-                "entra_tenant_id" => config.entra_tenant_id = value.clone(),
-                "entra_client_id" => config.entra_client_id = value.clone(),
-                "entra_authority" => config.entra_authority = value.clone(),
-                "auth_mode" => config.auth_mode = value.clone(),
-                "database_provider" => config.database_provider = value.clone(),
-                "secret_provider" => config.secret_provider = value.clone(),
-                "kubernetes_runtime" => config.kubernetes_runtime = value.clone(),
-                "monitoring_provider" => config.monitoring_provider = value.clone(),
-                "backup_provider" => config.backup_provider = value.clone(),
-                "platform_name" => config.platform_name = value.clone(),
-                "platform_url" => config.platform_url = value.clone(),
-                _ => {}
-            }
+            apply_platform_config_entry(&mut config, key, value);
         }
         return Ok(Json(serde_json::to_value(config).unwrap_or_default()));
     }
@@ -6551,19 +6667,7 @@ async fn admin_platform_settings_update(
     }
 
     if let Some(pool) = get_db() {
-        let entries = [
-            ("entra_tenant_id", &body.entra_tenant_id),
-            ("entra_client_id", &body.entra_client_id),
-            ("entra_authority", &body.entra_authority),
-            ("auth_mode", &body.auth_mode),
-            ("database_provider", &body.database_provider),
-            ("secret_provider", &body.secret_provider),
-            ("kubernetes_runtime", &body.kubernetes_runtime),
-            ("monitoring_provider", &body.monitoring_provider),
-            ("backup_provider", &body.backup_provider),
-            ("platform_name", &body.platform_name),
-            ("platform_url", &body.platform_url),
-        ];
+        let entries = platform_config_entries(&body);
         for (key, value) in &entries {
             let _ = sqlx::query(
                 "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
@@ -6591,19 +6695,7 @@ async fn admin_platform_settings_reset(
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
-        let entries = [
-            ("entra_tenant_id", &defaults.entra_tenant_id),
-            ("entra_client_id", &defaults.entra_client_id),
-            ("entra_authority", &defaults.entra_authority),
-            ("auth_mode", &defaults.auth_mode),
-            ("database_provider", &defaults.database_provider),
-            ("secret_provider", &defaults.secret_provider),
-            ("kubernetes_runtime", &defaults.kubernetes_runtime),
-            ("monitoring_provider", &defaults.monitoring_provider),
-            ("backup_provider", &defaults.backup_provider),
-            ("platform_name", &defaults.platform_name),
-            ("platform_url", &defaults.platform_url),
-        ];
+        let entries = platform_config_entries(&defaults);
         for (key, value) in &entries {
             let _ = sqlx::query(
                 "INSERT INTO platform_config (key, value, updated_at) VALUES ($1, $2, NOW()) \
@@ -11265,6 +11357,44 @@ mod unit_tests {
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.error, "FORBIDDEN");
+    }
+
+    #[test]
+    fn test_platform_config_entries_include_all_admin_fields() {
+        let config = PlatformConfig::default();
+        let entries = platform_config_entries(&config);
+        let keys: Vec<&str> = entries.iter().map(|(key, _)| *key).collect();
+        assert_eq!(entries.len(), 28);
+        assert!(keys.contains(&"hypervisor_provider"));
+        assert!(keys.contains(&"storage_provider"));
+        assert!(keys.contains(&"dns_provider"));
+        assert!(keys.contains(&"ipam_provider"));
+        assert!(keys.contains(&"load_balancer_provider"));
+        assert!(keys.contains(&"firewall_provider"));
+        assert!(keys.contains(&"build_provider"));
+        assert!(keys.contains(&"network_provider"));
+        assert!(keys.contains(&"retention_daily_backups"));
+        assert!(keys.contains(&"maintenance_window_start_hour"));
+        assert!(keys.contains(&"keep_alive_timeout_secs"));
+        assert!(keys.contains(&"max_concurrent_connections"));
+    }
+
+    #[test]
+    fn test_apply_platform_config_entry_handles_new_admin_fields() {
+        let mut config = PlatformConfig::default();
+        apply_platform_config_entry(&mut config, "storage_provider", "netapp");
+        apply_platform_config_entry(&mut config, "dns_provider", "bluecat");
+        apply_platform_config_entry(&mut config, "retention_daily_backups", "45");
+        apply_platform_config_entry(&mut config, "maintenance_window_start_hour", "3");
+        apply_platform_config_entry(&mut config, "keep_alive_timeout_secs", "90");
+        apply_platform_config_entry(&mut config, "max_concurrent_connections", "1024");
+
+        assert_eq!(config.storage_provider, "netapp");
+        assert_eq!(config.dns_provider, "bluecat");
+        assert_eq!(config.retention_daily_backups, 45);
+        assert_eq!(config.maintenance_window_start_hour, 3);
+        assert_eq!(config.keep_alive_timeout_secs, 90);
+        assert_eq!(config.max_concurrent_connections, 1024);
     }
 
     #[test]
