@@ -1,4 +1,10 @@
-# Ryuki
+<p align="center">
+  <img src="assets/logo.svg" width="96" alt="Ryuki logo — a dragon's eye in a hexagon">
+</p>
+
+<h1 align="center">Ryuki</h1>
+
+<p align="center"><em>竜騎 &mdash; the Dragon Knight. A governed control plane that watches over your infrastructure.</em></p>
 
 System engineer platform engineering portal for multi-site datacenter infrastructure management — **47+ engines, 89 UN/LOCODE locations, 33 countries, 690+ tests**.
 
