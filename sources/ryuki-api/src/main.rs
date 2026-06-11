@@ -247,9 +247,23 @@ async fn health(
             Some("Simulated error for testing ProblemDetails contract"),
         ));
     }
-    Ok(Json(
-        serde_json::json!({"status": "healthy", "source": "simulated"}),
-    ))
+    let db_connected = crate::database::get_db().is_some();
+    let app_config = crate::config_store::get_app_config();
+    let validation_errors = app_config.validate();
+
+    Ok(Json(serde_json::json!({
+        "status": if db_connected && validation_errors.is_empty() { "healthy" } else { "degraded" },
+        "database": {
+            "connected": db_connected,
+            "provider": format!("{:?}", app_config.database_provider),
+        },
+        "config": {
+            "valid": validation_errors.is_empty(),
+            "errors": validation_errors,
+        },
+        "auth_mode": app_config.auth_mode.as_str(),
+        "rate_limit_enabled": app_config.rate_limit.enabled,
+    })))
 }
 
 async fn ready(
@@ -263,9 +277,11 @@ async fn ready(
             Some("Simulated error for testing ProblemDetails contract"),
         ));
     }
-    Ok(Json(
-        serde_json::json!({"status": "ready", "source": "simulated"}),
-    ))
+    let db_connected = crate::database::get_db().is_some();
+    Ok(Json(serde_json::json!({
+        "status": if db_connected { "ready" } else { "degraded" },
+        "database": { "connected": db_connected },
+    })))
 }
 
 async fn validation_run(
