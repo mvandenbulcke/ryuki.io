@@ -9,7 +9,7 @@ use axum::{
 use ryuki_core::config::AuthMode;
 use ryuki_core::types::{ApiError, PlatformConfig};
 use ryuki_engine::auth::{check_permission, get_rbac_roles, AuthSession};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -64,6 +64,7 @@ use ryuki_engine::os_baseline;
 use ryuki_engine::outage_comms;
 use ryuki_engine::patch_engine;
 use ryuki_engine::repository_capacity;
+use ryuki_engine::request_lifecycle;
 use ryuki_engine::runbook_execution;
 use ryuki_engine::secrets_rotation;
 use ryuki_engine::server_decommission;
@@ -2362,19 +2363,6 @@ struct CreateRequest {
     justification: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct RequestRecord {
-    request_id: String,
-    request_type: String,
-    status: String,
-    stage: String,
-    site: String,
-    environment: String,
-    name: String,
-    created_at: String,
-    updated_at: String,
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct DbRequestRow {
     id: Uuid,
@@ -2394,9 +2382,9 @@ struct DbRequestRow {
 
 // ─── Request store (in-memory fallback) ───
 
-static REQUEST_STORE: OnceLock<Mutex<Vec<RequestRecord>>> = OnceLock::new();
+static REQUEST_STORE: OnceLock<Mutex<Vec<ryuki_engine::models::Request>>> = OnceLock::new();
 
-fn request_store() -> &'static Mutex<Vec<RequestRecord>> {
+fn request_store() -> &'static Mutex<Vec<ryuki_engine::models::Request>> {
     REQUEST_STORE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
@@ -6491,7 +6479,101 @@ fn status_409(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::CONFLICT, Json(json!({"error": msg})))
 }
 
+fn map_engine_error(e: String) -> (StatusCode, Json<Value>) {
+    status_400(&e)
+}
+
+fn parse_request_type(
+    s: &str,
+) -> Result<ryuki_engine::models::RequestType, (StatusCode, Json<Value>)> {
+    use ryuki_engine::models::RequestType;
+    match s {
+        "server-deployment" => Ok(RequestType::ServerDeployment),
+        "patch-maintenance" => Ok(RequestType::PatchMaintenance),
+        "reboot-orchestration" => Ok(RequestType::RebootOrchestration),
+        "controlled-restore" => Ok(RequestType::ControlledRestore),
+        "zabbix-onboarding" => Ok(RequestType::ZabbixOnboarding),
+        "cmdb-import" => Ok(RequestType::CmdbImport),
+        "cmdb-update-export" => Ok(RequestType::CmdbUpdateExport),
+        "operator-runbook-launch" => Ok(RequestType::OperatorRunbookLaunch),
+        "application-environment-retirement" => Ok(RequestType::ApplicationEnvironmentRetirement),
+        "vm-decommission-quarantine" => Ok(RequestType::VmDecommissionQuarantine),
+        "request-preflight" => Ok(RequestType::RequestPreflight),
+        "vm-day2-change" => Ok(RequestType::VmDay2Change),
+        "snapshot-governance" => Ok(RequestType::SnapshotGovernance),
+        "backup-coverage-report" => Ok(RequestType::BackupCoverageReport),
+        _ => Err(status_400(&format!("Unknown request type: {}", s))),
+    }
+}
+
+fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
+    use ryuki_engine::models::RequestStatus;
+    match s {
+        "intake" => RequestStatus::Intake,
+        "validated" => RequestStatus::Validated,
+        "planned" => RequestStatus::Planned,
+        "approved" => RequestStatus::Approved,
+        "locked" => RequestStatus::Locked,
+        "executing" | "executed" => RequestStatus::Executing,
+        "verifying" | "verified" => RequestStatus::Verifying,
+        "completed" => RequestStatus::Completed,
+        "failed" => RequestStatus::Failed,
+        _ => RequestStatus::Draft,
+    }
+}
+
+fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str {
+    use ryuki_engine::models::RequestStatus;
+    match s {
+        RequestStatus::Draft => "draft",
+        RequestStatus::Intake => "intake",
+        RequestStatus::Validated => "validated",
+        RequestStatus::Planned => "planned",
+        RequestStatus::Approved => "approved",
+        RequestStatus::Locked => "locked",
+        RequestStatus::Executing => "executing",
+        RequestStatus::Verifying => "verifying",
+        RequestStatus::Completed => "completed",
+        RequestStatus::Failed => "failed",
+    }
+}
+
+fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::models::Request {
+    use ryuki_engine::models::Request;
+    Request {
+        id: request_id.to_string(),
+        offering_id: row.request_type.clone(),
+        request_type: parse_request_type(&row.request_type)
+            .unwrap_or(ryuki_engine::models::RequestType::RequestPreflight),
+        status: db_status_to_request_status(&row.status),
+        requester: row.name.clone(),
+        owner: row.name.clone(),
+        site: row.site.clone(),
+        environment: row.environment.clone(),
+        criticality: "standard".into(),
+        stages: Vec::new(),
+        created_at: row.created_at.to_rfc3339(),
+        updated_at: row.updated_at.to_rfc3339(),
+        dry_run_required: true,
+        approval_route: Vec::new(),
+        evidence_manifest_id: None,
+        metadata: std::collections::HashMap::new(),
+    }
+}
+
 async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
+    let request_type = parse_request_type(&body.request_type)?;
+    let request = request_lifecycle::create_request(
+        &body.request_type,
+        request_type,
+        &body.name,
+        &body.name,
+        &body.site,
+        &body.environment,
+        "standard",
+    )
+    .map_err(map_engine_error)?;
+
     if let Some(pool) = get_db() {
         let row = sqlx::query_as::<_, DbRequestRow>(
             "INSERT INTO requests (request_type, site, environment, name, cpu, memory_gb, justification) \
@@ -6507,32 +6589,15 @@ async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
         .fetch_one(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "intake",
-            "created_at": row.created_at.to_rfc3339()
-        })));
+        let mut response = request;
+        response.id = row.id.to_string();
+        response.created_at = row.created_at.to_rfc3339();
+        response.updated_at = row.updated_at.to_rfc3339();
+        return Ok(Json(serde_json::to_value(&response).unwrap_or_default()));
     }
 
-    let request_id = Uuid::new_v4().to_string();
-    let now = now_iso();
-    let record = RequestRecord {
-        request_id: request_id.clone(),
-        request_type: body.request_type,
-        status: "intake".into(),
-        stage: "intake".into(),
-        site: body.site,
-        environment: body.environment,
-        name: body.name,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    request_store().lock().await.push(record);
-    Ok(Json(json!({
-        "request_id": request_id,
-        "status": "intake",
-        "created_at": request_store().lock().await.iter().find(|r| r.request_id == request_id).unwrap().created_at
-    })))
+    request_store().lock().await.push(request.clone());
+    Ok(Json(serde_json::to_value(&request).unwrap_or_default()))
 }
 
 async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
@@ -6571,10 +6636,10 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
         .take(limit)
         .map(|r| {
             json!({
-                "request_id": r.request_id,
-                "request_type": r.request_type,
-                "status": r.status,
-                "name": r.name,
+                "request_id": r.id,
+                "request_type": r.request_type.to_string(),
+                "status": format!("{:?}", r.status).to_lowercase(),
+                "name": r.requester,
                 "site": r.site,
                 "created_at": r.created_at
             })
@@ -6612,7 +6677,7 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     }
 
     let store = request_store().lock().await;
-    let record = store.iter().find(|r| r.request_id == request_id);
+    let record = store.iter().find(|r| r.id == request_id);
     match record {
         Some(r) => Ok(Json(serde_json::to_value(r).unwrap_or_default())),
         None => Err(status_404(&request_id)),
@@ -6622,92 +6687,86 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
 async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'validated', stage = 'validate', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
         )
         .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "validated",
-            "passed": true,
-            "checks": [
-                {"name": "site-validation", "passed": true},
-                {"name": "capacity-check", "passed": true},
-                {"name": "policy-gate", "passed": true}
-            ]
-        })));
+
+        let request = db_row_to_request(&current, &request_id);
+        let result = request_lifecycle::validate_request(&request).map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Validated);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'validate', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(db_status)
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+        return Ok(Json(serde_json::to_value(&result).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            r.status = "validated".into();
-            r.stage = "validate".into();
-            r.updated_at = now_iso();
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "validated",
-                "passed": true,
-                "checks": [
-                    {"name": "site-validation", "passed": true},
-                    {"name": "capacity-check", "passed": true},
-                    {"name": "policy-gate", "passed": true}
-                ]
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let result = request_lifecycle::validate_request(&store[idx]).map_err(map_engine_error)?;
+
+    store[idx].status = ryuki_engine::models::RequestStatus::Validated;
+    store[idx].updated_at = now_iso();
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
 async fn requests_plan(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'planned', stage = 'plan', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
         )
         .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "planned",
-            "plan": {
-                "actions": ["reserve-capacity", "validate-network", "assign-ip", "provision-vm"],
-                "risk": "low"
-            }
-        })));
+
+        let request = db_row_to_request(&current, &request_id);
+        let stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Planned);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'plan', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(db_status)
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+        return Ok(Json(serde_json::to_value(&stages).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            r.status = "planned".into();
-            r.stage = "plan".into();
-            r.updated_at = now_iso();
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "planned",
-                "plan": {
-                    "actions": [
-                        "reserve-capacity",
-                        "validate-network",
-                        "assign-ip",
-                        "provision-vm"
-                    ],
-                    "risk": "low"
-                }
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let stages = request_lifecycle::plan_request(&store[idx]).map_err(map_engine_error)?;
+
+    store[idx].status = ryuki_engine::models::RequestStatus::Planned;
+    store[idx].stages = stages.clone();
+    store[idx].updated_at = now_iso();
+
+    Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
 
 async fn requests_approve(
@@ -6719,73 +6778,85 @@ async fn requests_approve(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'approved', stage = 'approve', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
         )
         .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "approved",
-            "approved_by": "admin"
-        })));
+
+        let request = db_row_to_request(&current, &request_id);
+        let approved =
+            request_lifecycle::approve_request(&request, "admin").map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Approved);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'approve', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(db_status)
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+        return Ok(Json(serde_json::to_value(&approved).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            r.status = "approved".into();
-            r.stage = "approve".into();
-            r.updated_at = now_iso();
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "approved",
-                "approved_by": "admin"
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let approved =
+        request_lifecycle::approve_request(&store[idx], "admin").map_err(map_engine_error)?;
+
+    store[idx] = approved.clone();
+
+    Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
 async fn requests_lock(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'locked', stage = 'lock', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
         )
         .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        let lock_id = format!("lock-{}", Uuid::new_v4());
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "locked",
-            "lock_id": lock_id
-        })));
+
+        let request = db_row_to_request(&current, &request_id);
+        let locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Locked);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'lock', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(db_status)
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+        return Ok(Json(serde_json::to_value(&locked).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            r.status = "locked".into();
-            r.stage = "lock".into();
-            r.updated_at = now_iso();
-            let lock_id = format!("lock-{}", Uuid::new_v4());
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "locked",
-                "lock_id": lock_id
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
+
+    store[idx] = locked.clone();
+
+    Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
 
 async fn requests_execute(Path(request_id): Path<String>) -> ApiResult {
@@ -6799,84 +6870,86 @@ async fn requests_execute(Path(request_id): Path<String>) -> ApiResult {
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        if current.status != "locked" {
-            return Err(status_409("Request must be locked before execution"));
-        }
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'executed', stage = 'execute', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+
+        let request = db_row_to_request(&current, &request_id);
+        let executed = request_lifecycle::execute_request(&request).map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&executed.status);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'execute', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
         )
+        .bind(db_status)
         .bind(uid)
         .fetch_one(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "executed",
-            "result": "dry-run-success"
-        })));
+
+        return Ok(Json(serde_json::to_value(&executed).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            if r.status != "locked" {
-                return Err(status_409("Request must be locked before execution"));
-            }
-            r.status = "executed".into();
-            r.stage = "execute".into();
-            r.updated_at = now_iso();
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "executed",
-                "result": "dry-run-success"
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
+
+    store[idx] = executed.clone();
+
+    Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
 
 async fn requests_verify(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = 'verified', stage = 'verify', updated_at = NOW() WHERE id = $1 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
         )
         .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
         .ok_or_else(|| status_404(&request_id))?;
-        return Ok(Json(json!({
-            "request_id": row.id.to_string(),
-            "status": "verified",
-            "checks": [
-                {"name": "inventory-snapshot", "passed": true},
-                {"name": "service-health", "passed": true},
-                {"name": "config-drift", "passed": true}
-            ]
-        })));
+
+        let request = db_row_to_request(&current, &request_id);
+        let evidence = request_lifecycle::verify_request(&request).map_err(map_engine_error)?;
+        let completed = request_lifecycle::transition_status(
+            &request,
+            ryuki_engine::models::RequestStatus::Completed,
+        )
+        .map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&completed.status);
+        let _row: DbRequestRow = sqlx::query_as(
+            "UPDATE requests SET status = $1, stage = 'verify', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        )
+        .bind(db_status)
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+
+        return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
     }
 
     let mut store = request_store().lock().await;
-    let record = store.iter_mut().find(|r| r.request_id == request_id);
-    match record {
-        Some(r) => {
-            r.status = "verified".into();
-            r.stage = "verify".into();
-            r.updated_at = now_iso();
-            Ok(Json(json!({
-                "request_id": r.request_id,
-                "status": "verified",
-                "checks": [
-                    {"name": "inventory-snapshot", "passed": true},
-                    {"name": "service-health", "passed": true},
-                    {"name": "config-drift", "passed": true}
-                ]
-            })))
-        }
-        None => Err(status_404(&request_id)),
-    }
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let evidence = request_lifecycle::verify_request(&store[idx]).map_err(map_engine_error)?;
+
+    let completed = request_lifecycle::transition_status(
+        &store[idx],
+        ryuki_engine::models::RequestStatus::Completed,
+    )
+    .map_err(map_engine_error)?;
+
+    store[idx] = completed;
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
 // ─── VM Day-2 Operations handlers ───
