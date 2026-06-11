@@ -365,9 +365,13 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .feature-card:hover{transform:translateY(-4px);box-shadow:var(--card-shadow-hover);border-color:var(--border-strong)}
 .feature-card:hover::before{opacity:1}
-/* fine pointers get a 3D tilt driven by --rx/--ry from the script */
-.js.fine .feature-card{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
-.js.fine .feature-card:hover{--lift:-4px}
+/* fine pointers get a 3D tilt driven by --rx/--ry from the script
+   (scoped to .revealed so the data-reveal entrance offset still plays) */
+.js.fine .feature-card.revealed{transform:perspective(850px) rotateX(var(--rx,0deg)) rotateY(var(--ry,0deg)) translateY(var(--lift,0px))}
+.js.fine .feature-card.revealed:hover{
+  --lift:-4px;
+  transition:transform .12s ease,box-shadow var(--transition),border-color var(--transition),background var(--transition);
+}
 /* spotlight ring that follows the cursor along the card border */
 .js .feature-card::after{
   content:"";position:absolute;inset:-1px;border-radius:var(--radius);

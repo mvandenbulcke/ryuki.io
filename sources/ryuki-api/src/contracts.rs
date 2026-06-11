@@ -1783,13 +1783,6 @@ struct VmDay2PlanRequest {
     maintenance_window: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct VmDay2ActionRequest {
-    #[serde(rename = "changeId")]
-    change_id: String,
-}
-
 // ─── Snapshot request types ───
 
 #[derive(Debug, Deserialize)]
@@ -1806,13 +1799,6 @@ struct SnapshotPlanRequest {
     support_group: String,
     #[serde(rename = "changeContext")]
     change_context: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct SnapshotActionRequest {
-    #[serde(rename = "snapshotId")]
-    snapshot_id: String,
 }
 
 // ─── Backup request types ───
@@ -2629,12 +2615,6 @@ struct LogsOnboardRequest {
 #[allow(dead_code)]
 struct LogsSiteQuery {
     site: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LogsHostnamePath {
-    hostname: String,
 }
 
 // ─── Endpoint handlers ───
@@ -10719,11 +10699,7 @@ struct LbMemberRequest {
     ip: String,
     port: u16,
 }
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LbMemberRemoveRequest {
-    hostname: String,
-}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LbValidateVipRequest {

@@ -136,6 +136,8 @@ static START_TIME: OnceLock<Instant> = OnceLock::new();
 static DRAINING: AtomicBool = AtomicBool::new(false);
 
 /// Per-endpoint request counts keyed by "METHOD /path".
+/// Uses std::sync::Mutex with HashMap — acceptable for dev/light production.
+/// For high-throughput deployments, replace with dashmap or sharded approach.
 struct PerEndpointCounter {
     counts: Mutex<HashMap<String, u64>>,
 }
