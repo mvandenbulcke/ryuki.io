@@ -26,6 +26,7 @@ use ryuki_engine::cmdb_impact;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
+use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
@@ -1286,6 +1287,42 @@ pub fn routes() -> Router {
         .route(
             "/api/datacenter/hardware-contract",
             get(hardware_contract),
+        )
+        .route(
+            "/api/datacenter/image-factory/initiate-build",
+            post(image_factory_initiate_build),
+        )
+        .route(
+            "/api/datacenter/image-factory/run-tests/{id}",
+            post(image_factory_run_tests),
+        )
+        .route(
+            "/api/datacenter/image-factory/promote/{id}",
+            post(image_factory_promote),
+        )
+        .route(
+            "/api/datacenter/image-factory/reject/{id}",
+            post(image_factory_reject),
+        )
+        .route(
+            "/api/datacenter/image-factory/active/{site}",
+            get(image_factory_active),
+        )
+        .route(
+            "/api/datacenter/image-factory/history/{site}",
+            get(image_factory_history),
+        )
+        .route(
+            "/api/datacenter/image-factory/superseded",
+            get(image_factory_superseded),
+        )
+        .route(
+            "/api/datacenter/image-factory/schedule-monthly",
+            post(image_factory_schedule_monthly),
+        )
+        .route(
+            "/api/datacenter/image-factory-contract",
+            get(image_factory_contract),
         )
 }
 
@@ -8024,6 +8061,438 @@ async fn hardware_contract() -> Json<Value> {
                 "decision": "block",
                 "requirement": "Hardware with support or capacity risk needs refresh plan review before continued operation.",
                 "evidence": "Refresh plan"
+            }
+        ]
+    }))
+}
+
+// ─── Image factory handlers ───
+
+#[derive(Deserialize)]
+struct ImageFactoryBuildBody {
+    image_name: String,
+    os_family: String,
+    distro: String,
+    version: String,
+    site: String,
+}
+
+#[derive(Deserialize)]
+struct ImageFactoryRejectBody {
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct ImageFactoryScheduleBody {
+    site: String,
+    os_family: String,
+    distro: String,
+}
+
+async fn image_factory_initiate_build(
+    Json(body): Json<ImageFactoryBuildBody>,
+) -> ApiResult {
+    image_factory::initiate_build(
+        &body.image_name,
+        &body.os_family,
+        &body.distro,
+        &body.version,
+        &body.site,
+    )
+    .map(Json)
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn image_factory_run_tests(
+    Path(id): Path<String>,
+) -> ApiResult {
+    image_factory::run_tests(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn image_factory_promote(
+    Path(id): Path<String>,
+) -> ApiResult {
+    image_factory::promote_image(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn image_factory_reject(
+    Path(id): Path<String>,
+    Json(body): Json<ImageFactoryRejectBody>,
+) -> ApiResult {
+    image_factory::reject_image(&id, &body.reason)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn image_factory_active(
+    Path(site): Path<String>,
+) -> ApiResult {
+    image_factory::get_active_images(&site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn image_factory_history(
+    Path(site): Path<String>,
+) -> ApiResult {
+    image_factory::get_build_history(&site)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn image_factory_superseded() -> ApiResult {
+    image_factory::get_superseded()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn image_factory_schedule_monthly(
+    Json(body): Json<ImageFactoryScheduleBody>,
+) -> ApiResult {
+    image_factory::schedule_monthly_build(&body.site, &body.os_family, &body.distro)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn image_factory_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionAllowed": false,
+        "supportedWorkflows": [
+            "initiate-build",
+            "run-tests",
+            "promote-image",
+            "reject-image",
+            "active-images",
+            "build-history",
+            "superseded-images",
+            "schedule-monthly-build"
+        ],
+        "imageStatuses": ["building", "testing", "promoted", "superseded", "failed"],
+        "testPhases": ["security-scan", "agent-checks", "baseline-compliance"],
+        "validOsFamilies": ["Windows", "Linux"],
+        "requiredInputs": [
+            "image_name",
+            "os_family",
+            "os_version",
+            "distro",
+            "site_scope"
+        ],
+        "requiredGuards": [
+            "os-family-known",
+            "site-scope-known",
+            "test-phases-completed",
+            "compliance-baseline-met",
+            "superseded-images-marked"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "live-execution-disabled",
+            "os-family-unknown",
+            "site-scope-unknown",
+            "tests-not-completed",
+            "baseline-not-compliant"
+        ],
+        "requiredEvidence": [
+            "Golden image build log",
+            "Security scan results",
+            "Agent check results",
+            "Baseline compliance report",
+            "Promotion record",
+            "Supersedence chain"
+        ],
+        "rules": [
+            {
+                "id": "no-live-image-mutation",
+                "decision": "block",
+                "requirement": "Image factory returns dry-run decisions only and never mutates live images or calls provider APIs.",
+                "evidence": "Golden image build log"
+            },
+            {
+                "id": "tests-required-before-promotion",
+                "decision": "block",
+                "requirement": "An image must pass security scan, agent checks, and baseline compliance before it can be promoted.",
+                "evidence": "Security scan results"
+            },
+            {
+                "id": "supersedence-chain-required",
+                "decision": "block",
+                "requirement": "Promoting a new image for a site+os pair must supersede the previous active image.",
+                "evidence": "Promotion record"
+            },
+            {
+                "id": "monthly-cadence-enforced",
+                "decision": "block",
+                "requirement": "Scheduled builds follow a monthly cadence to ensure fresh security baselines.",
+                "evidence": "Golden image build log"
+            }
+        ]
+    }))
+}
+
+// ─── SQL Server Deployment request types ───
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SqlDeployPlanRequest {
+    #[serde(rename = "instanceName")]
+    instance_name: String,
+    #[serde(rename = "sqlVersion")]
+    sql_version: Option<String>,
+    edition: Option<String>,
+    cpu: Option<u32>,
+    #[serde(rename = "memoryGb")]
+    memory_gb: Option<u32>,
+    #[serde(rename = "dataDiskGb")]
+    data_disk_gb: Option<u32>,
+    #[serde(rename = "logDiskGb")]
+    log_disk_gb: Option<u32>,
+    #[serde(rename = "tempdbDiskGb")]
+    tempdb_disk_gb: Option<u32>,
+    collation: Option<String>,
+    #[serde(rename = "serviceAccount")]
+    service_account: String,
+    site: String,
+    #[serde(rename = "clusterMode")]
+    cluster_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SqlDeployValidateRequest {
+    #[serde(rename = "instanceName")]
+    instance_name: Option<String>,
+    #[serde(rename = "sqlVersion")]
+    sql_version: Option<String>,
+    edition: Option<String>,
+    cpu: Option<u32>,
+    #[serde(rename = "memoryGb")]
+    memory_gb: Option<u32>,
+    site: Option<String>,
+    #[serde(rename = "clusterMode")]
+    cluster_mode: Option<String>,
+    #[serde(rename = "serviceAccount")]
+    service_account: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct SqlDeployInventoryQuery {
+    site: Option<String>,
+}
+
+// ─── SQL Server Deployment handlers ───
+
+async fn sql_deploy_plan(
+    Json(body): Json<SqlDeployPlanRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let req = json!({
+        "instance_name": body.instance_name,
+        "sql_version": body.sql_version,
+        "edition": body.edition,
+        "cpu": body.cpu,
+        "memory_gb": body.memory_gb,
+        "data_disk_gb": body.data_disk_gb,
+        "log_disk_gb": body.log_disk_gb,
+        "tempdb_disk_gb": body.tempdb_disk_gb,
+        "collation": body.collation,
+        "service_account": body.service_account,
+        "site": body.site,
+        "cluster_mode": body.cluster_mode
+    });
+    sql_deployment::plan_deployment(req)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_validate(
+    Json(body): Json<SqlDeployValidateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let req = json!({
+        "instance_name": body.instance_name,
+        "sql_version": body.sql_version,
+        "edition": body.edition,
+        "cpu": body.cpu,
+        "memory_gb": body.memory_gb,
+        "site": body.site,
+        "cluster_mode": body.cluster_mode,
+        "service_account": body.service_account
+    });
+    sql_deployment::validate_deployment(req)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_install(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    sql_deployment::install_sql(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_configure(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    sql_deployment::configure_sql(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_verify(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    sql_deployment::verify_sql(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_backup(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    sql_deployment::add_to_backup(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_monitoring(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    sql_deployment::add_to_monitoring(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+async fn sql_deploy_inventory(
+    Query(params): Query<SqlDeployInventoryQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let site = params.site.as_deref().unwrap_or("");
+    sql_deployment::get_inventory(site)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+}
+
+async fn sql_deployment_contract() -> Json<Value> {
+    Json(json!({
+        "source": "static-seed",
+        "providerCallsEnabled": false,
+        "liveExecutionEnabled": false,
+        "deploymentPlans": [
+            "standalone-instance-plan",
+            "failover-cluster-plan",
+            "availability-group-plan",
+            "disk-layout-plan",
+            "runtime-identity-plan",
+            "backup-policy-plan",
+            "monitoring-plan",
+            "cmdb-publication-plan"
+        ],
+        "topologies": ["standalone", "failover-cluster", "availability-group"],
+        "supportedVersions": ["2019", "2022"],
+        "supportedEditions": ["Standard", "Enterprise", "Developer"],
+        "supportedSites": ["LOVE", "BUR1"],
+        "maxCpu": 256,
+        "maxMemoryGb": 24576,
+        "endpoints": [
+            {"method": "POST", "path": "/api/build/sql/plan", "description": "Plan SQL Server deployment with instance config, disk layout, and service accounts"},
+            {"method": "POST", "path": "/api/build/sql/validate", "description": "Validate deployment request — capacity, naming, version support"},
+            {"method": "POST", "path": "/api/build/sql/install/{id}", "description": "Mock SQL Server installation"},
+            {"method": "POST", "path": "/api/build/sql/configure/{id}", "description": "Mock post-install configuration — maxdop, memory, tempdb, backup defaults"},
+            {"method": "POST", "path": "/api/build/sql/verify/{id}", "description": "Mock connectivity, version, and configuration verification"},
+            {"method": "POST", "path": "/api/build/sql/backup/{id}", "description": "Mock Veeam application-aware backup registration"},
+            {"method": "POST", "path": "/api/build/sql/monitoring/{id}", "description": "Mock Zabbix SQL template onboarding"},
+            {"method": "GET", "path": "/api/build/sql/inventory?site={site}", "description": "List all SQL instances, optionally filtered by site"}
+        ],
+        "requiredGuards": [
+            "request-preflight-ready",
+            "topology-reviewed",
+            "capacity-admission-ready",
+            "disk-layout-reviewed",
+            "runtime-identity-reviewed",
+            "backup-plan-reviewed",
+            "monitoring-plan-reviewed",
+            "cmdb-publication-reviewed",
+            "approval-route-assigned",
+            "rollback-plan-ready",
+            "evidence-redacted"
+        ],
+        "planSections": [
+            "deploymentSummary",
+            "topologyReview",
+            "placementPlan",
+            "diskLayoutPlan",
+            "runtimeIdentityPlan",
+            "backupPlan",
+            "monitoringPlan",
+            "cmdbPublicationPlan",
+            "rollbackPlan",
+            "evidenceReferences"
+        ],
+        "blockedReasons": [
+            "provider-calls-disabled",
+            "worker-execution-disabled",
+            "live-deployment-disabled",
+            "live-sql-change-disabled",
+            "live-directory-change-disabled",
+            "live-backup-change-disabled",
+            "live-monitoring-change-disabled",
+            "live-cmdb-change-disabled",
+            "raw-sql-instance-data-disabled",
+            "raw-database-data-disabled",
+            "raw-path-data-disabled",
+            "raw-provider-payloads-disabled",
+            "sql-host-identifiers-disabled",
+            "credential-values-disabled",
+            "topology-missing",
+            "disk-layout-missing",
+            "runtime-identity-missing",
+            "backup-plan-missing",
+            "monitoring-plan-missing",
+            "cmdb-context-missing",
+            "approval-missing",
+            "rollback-plan-missing",
+            "evidence-not-redacted"
+        ],
+        "requiredEvidence": [
+            "Deployment summary",
+            "Topology review",
+            "Placement and disk layout plan",
+            "Runtime identity plan",
+            "Backup policy assignment",
+            "Monitoring template assignment",
+            "CMDB publication plan",
+            "Rollback plan",
+            "Evidence references"
+        ],
+        "rules": [
+            {
+                "id": "no-live-sql-deployment",
+                "decision": "block",
+                "requirement": "SQL Server deployments return dry-run decisions only and never execute live installations, configuration changes, backup registrations, or monitoring onboarding.",
+                "evidence": "Deployment summary"
+            },
+            {
+                "id": "capacity-admission-required",
+                "decision": "block",
+                "requirement": "CPU, memory, and disk capacity must be validated against site resources before installation readiness.",
+                "evidence": "Placement and disk layout plan"
+            },
+            {
+                "id": "runtime-identity-reviewed",
+                "decision": "block",
+                "requirement": "Service account and cluster identity must be reviewed before SQL Server execution readiness.",
+                "evidence": "Runtime identity plan"
+            },
+            {
+                "id": "backup-monitoring-onboarded",
+                "decision": "block",
+                "requirement": "Veeam application-aware backup and Zabbix monitoring must be assigned before a deployment can be marked complete.",
+                "evidence": "Backup policy assignment"
             }
         ]
     }))
