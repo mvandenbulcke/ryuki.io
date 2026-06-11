@@ -44,6 +44,15 @@ const SECRET_REFERENCES_PATH: &str = "/api/catalog/secret-references";
 const POLICY_OUTCOMES_PATH: &str = "/api/catalog/policy-guardrails-contract";
 const EVIDENCE_SUMMARY_PATH: &str = "/api/catalog/evidence-redaction-contract";
 const OPERATION_RUNS_PATH: &str = "/api/operations/run-state-contract";
+const DATACENTER_READINESS_SCORE_PATH: &str = "/api/datacenter/readiness-score-contract";
+const DATACENTER_SITE_REPORT_PATH: &str = "/api/datacenter/site-report-contract";
+const DATACENTER_FAILING_CHECKS_PATH: &str = "/api/datacenter/failing-checks-contract";
+const DATACENTER_CHECK_POWER_PATH: &str = "/api/datacenter/check-power-contract";
+const DATACENTER_CHECK_COOLING_PATH: &str = "/api/datacenter/check-cooling-contract";
+const DATACENTER_CHECK_RACK_SPACE_PATH: &str = "/api/datacenter/check-rack-space-contract";
+const DATACENTER_CHECK_SWITCHPORTS_PATH: &str = "/api/datacenter/check-switchports-contract";
+const DATACENTER_FULL_READINESS_PATH: &str = "/api/datacenter/full-readiness-contract";
+const DATACENTER_SITES_PATH: &str = "/api/datacenter/sites-contract";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiPathError {
@@ -191,6 +200,42 @@ pub fn evidence_summary_path() -> &'static str {
 
 pub fn operation_runs_path() -> &'static str {
     OPERATION_RUNS_PATH
+}
+
+pub fn datacenter_readiness_score_path() -> &'static str {
+    DATACENTER_READINESS_SCORE_PATH
+}
+
+pub fn datacenter_site_report_path() -> &'static str {
+    DATACENTER_SITE_REPORT_PATH
+}
+
+pub fn datacenter_failing_checks_path() -> &'static str {
+    DATACENTER_FAILING_CHECKS_PATH
+}
+
+pub fn datacenter_check_power_path() -> &'static str {
+    DATACENTER_CHECK_POWER_PATH
+}
+
+pub fn datacenter_check_cooling_path() -> &'static str {
+    DATACENTER_CHECK_COOLING_PATH
+}
+
+pub fn datacenter_check_rack_space_path() -> &'static str {
+    DATACENTER_CHECK_RACK_SPACE_PATH
+}
+
+pub fn datacenter_check_switchports_path() -> &'static str {
+    DATACENTER_CHECK_SWITCHPORTS_PATH
+}
+
+pub fn datacenter_full_readiness_path() -> &'static str {
+    DATACENTER_FULL_READINESS_PATH
+}
+
+pub fn datacenter_sites_path() -> &'static str {
+    DATACENTER_SITES_PATH
 }
 
 pub fn boundary_status_path() -> &'static str {

@@ -1152,6 +1152,272 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterReadinessScore {
+    pub site: String,
+    pub readiness_score_pct: u32,
+    pub total_checks: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub warnings: u32,
+    pub not_checked: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterSiteReport {
+    pub site: String,
+    pub overall_status: String,
+    pub readiness_score_pct: u32,
+    pub checks: Vec<DatacenterCheckDetail>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterCheckDetail {
+    pub check_type: String,
+    pub status: String,
+    pub details: String,
+    pub last_checked: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterFailingCheck {
+    pub site: String,
+    pub check_type: String,
+    pub details: String,
+    pub last_checked: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterFailingChecksSummary {
+    pub failing_count: u32,
+    pub failing_checks: Vec<DatacenterFailingCheck>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterSingleCheck {
+    pub site: String,
+    pub check_type: String,
+    pub status: String,
+    pub details: String,
+    pub last_checked: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterFullReadiness {
+    pub site: String,
+    pub checks_run: u32,
+    pub results: Vec<DatacenterCheckDetail>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterSiteSummary {
+    pub site: String,
+    pub total_checks: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub not_checked: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DatacenterSitesCatalog {
+    pub sites: Vec<DatacenterSiteSummary>,
+}
+
+pub fn datacenter_readiness_score_fallback(site: &str) -> DatacenterReadinessScore {
+    match site {
+        "LOVE" => DatacenterReadinessScore {
+            site: "LOVE".into(),
+            readiness_score_pct: 83,
+            total_checks: 6,
+            passed: 4,
+            failed: 0,
+            warnings: 2,
+            not_checked: 0,
+        },
+        "BUR1" => DatacenterReadinessScore {
+            site: "BUR1".into(),
+            readiness_score_pct: 25,
+            total_checks: 6,
+            passed: 1,
+            failed: 3,
+            warnings: 2,
+            not_checked: 0,
+        },
+        _ => DatacenterReadinessScore {
+            site: site.into(),
+            readiness_score_pct: 50,
+            total_checks: 6,
+            passed: 3,
+            failed: 0,
+            warnings: 2,
+            not_checked: 2,
+        },
+    }
+}
+
+pub fn datacenter_site_report_fallback(site: &str) -> DatacenterSiteReport {
+    let check_type_details: Vec<(&str, &str, &str, &str)> = match site {
+        "LOVE" => vec![
+            ("power", "passed", "PDU A+B redundant, UPS load 62% with 28 min runtime", "2026-06-11T10:00:00Z"),
+            ("cooling", "passed", "CRAC units nominal, return air 22 C, supply 16 C", "2026-06-11T10:00:00Z"),
+            ("rack-space", "warning", "12 rack units free across 3 racks (limited headroom)", "2026-06-11T10:00:00Z"),
+            ("switchport", "passed", "18 switchports available across prod/dmz/mgmt VLANs", "2026-06-11T10:00:00Z"),
+            ("firmware", "warning", "2 PDUs on firmware v2.8 (current v3.1), SFP modules current", "2026-06-11T10:00:00Z"),
+            ("capacity", "passed", "Compute 78% allocated, storage 64%, network fabric 42%", "2026-06-11T10:00:00Z"),
+        ],
+        "BUR1" => vec![
+            ("power", "failed", "UPS-B in bypass mode, PDU-3 overload alarm at 91%", "2026-06-11T09:30:00Z"),
+            ("cooling", "warning", "CRAC-2 compressor cycling, return air 26 C (threshold 24 C)", "2026-06-11T09:30:00Z"),
+            ("rack-space", "failed", "Zero rack units free, 2 racks over-populated (48U in 42U)", "2026-06-11T09:30:00Z"),
+            ("switchport", "passed", "22 switchports available, fabric links healthy", "2026-06-11T09:30:00Z"),
+            ("firmware", "failed", "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs", "2026-06-11T09:30:00Z"),
+            ("capacity", "warning", "Compute 94% allocated (critical), storage 88%, network 71%", "2026-06-11T09:30:00Z"),
+        ],
+        _ => vec![
+            ("power", "passed", "PDU A+B nominal, UPS load 45%", "2026-06-11T08:00:00Z"),
+            ("cooling", "passed", "All CRAC units healthy, supply temp 15 C per ASHRAE A1", "2026-06-11T08:00:00Z"),
+            ("rack-space", "passed", "42 rack units free across 7 empty racks (new buildout)", "2026-06-11T08:00:00Z"),
+            ("switchport", "not-checked", "Switch fabric not yet provisioned, awaiting L2 install", "2026-06-11T08:00:00Z"),
+            ("firmware", "not-checked", "Hardware not yet racked, firmware baseline pending", "2026-06-11T08:00:00Z"),
+            ("capacity", "passed", "Greenfield site, 100% free across compute/storage/network", "2026-06-11T08:00:00Z"),
+        ],
+    };
+
+    let checks: Vec<DatacenterCheckDetail> = check_type_details
+        .into_iter()
+        .map(|(ct, s, d, l)| DatacenterCheckDetail {
+            check_type: ct.into(),
+            status: s.into(),
+            details: d.into(),
+            last_checked: l.into(),
+        })
+        .collect();
+
+    let passed_count = checks.iter().filter(|c| c.status == "passed").count();
+    let warnings_count = checks.iter().filter(|c| c.status == "warning").count();
+    let score = ((passed_count as f64 * 1.0 + warnings_count as f64 * 0.5) / checks.len() as f64
+        * 100.0)
+        .round() as u32;
+    let overall = if score >= 90 {
+        "healthy"
+    } else if score >= 60 {
+        "degraded"
+    } else {
+        "critical"
+    };
+
+    DatacenterSiteReport {
+        site: site.into(),
+        overall_status: overall.into(),
+        readiness_score_pct: score,
+        checks,
+    }
+}
+
+pub fn datacenter_failing_checks_fallback() -> DatacenterFailingChecksSummary {
+    DatacenterFailingChecksSummary {
+        failing_count: 3,
+        failing_checks: vec![
+            DatacenterFailingCheck {
+                site: "BUR1".into(),
+                check_type: "power".into(),
+                details: "UPS-B in bypass mode, PDU-3 overload alarm at 91%".into(),
+                last_checked: "2026-06-11T09:30:00Z".into(),
+            },
+            DatacenterFailingCheck {
+                site: "BUR1".into(),
+                check_type: "rack-space".into(),
+                details: "Zero rack units free, 2 racks over-populated (48U in 42U)".into(),
+                last_checked: "2026-06-11T09:30:00Z".into(),
+            },
+            DatacenterFailingCheck {
+                site: "BUR1".into(),
+                check_type: "firmware".into(),
+                details: "Core switch firmware EOL 2025-Q3, CRAC controller behind 3 revs"
+                    .into(),
+                last_checked: "2026-06-11T09:30:00Z".into(),
+            },
+        ],
+    }
+}
+
+pub fn datacenter_single_check_fallback(site: &str, check_type: &str) -> DatacenterSingleCheck {
+    match (site, check_type) {
+        ("LOVE", "power") => DatacenterSingleCheck {
+            site: "LOVE".into(),
+            check_type: "power".into(),
+            status: "passed".into(),
+            details: "PDU A+B redundant, UPS load 62% with 28 min runtime".into(),
+            last_checked: "2026-06-11T10:00:00Z".into(),
+        },
+        ("LOVE", "cooling") => DatacenterSingleCheck {
+            site: "LOVE".into(),
+            check_type: "cooling".into(),
+            status: "passed".into(),
+            details: "CRAC units nominal, return air 22 C, supply 16 C".into(),
+            last_checked: "2026-06-11T10:00:00Z".into(),
+        },
+        ("LOVE", "rack-space") => DatacenterSingleCheck {
+            site: "LOVE".into(),
+            check_type: "rack-space".into(),
+            status: "warning".into(),
+            details: "12 rack units free across 3 racks (limited headroom)".into(),
+            last_checked: "2026-06-11T10:00:00Z".into(),
+        },
+        ("BUR1", "power") => DatacenterSingleCheck {
+            site: "BUR1".into(),
+            check_type: "power".into(),
+            status: "failed".into(),
+            details: "UPS-B in bypass mode, PDU-3 overload alarm at 91%".into(),
+            last_checked: "2026-06-11T09:30:00Z".into(),
+        },
+        _ => DatacenterSingleCheck {
+            site: site.into(),
+            check_type: check_type.into(),
+            status: "not-checked".into(),
+            details: "Check not yet executed for this site".into(),
+            last_checked: "2026-06-11T00:00:00Z".into(),
+        },
+    }
+}
+
+pub fn datacenter_full_readiness_fallback(site: &str) -> DatacenterFullReadiness {
+    let report = datacenter_site_report_fallback(site);
+    DatacenterFullReadiness {
+        site: report.site,
+        checks_run: report.checks.len() as u32,
+        results: report.checks,
+    }
+}
+
+pub fn datacenter_sites_catalog_fallback() -> DatacenterSitesCatalog {
+    DatacenterSitesCatalog {
+        sites: vec![
+            DatacenterSiteSummary {
+                site: "LOVE".into(),
+                total_checks: 6,
+                passed: 4,
+                failed: 0,
+                not_checked: 0,
+            },
+            DatacenterSiteSummary {
+                site: "BUR1".into(),
+                total_checks: 6,
+                passed: 1,
+                failed: 3,
+                not_checked: 0,
+            },
+            DatacenterSiteSummary {
+                site: "CCSS".into(),
+                total_checks: 6,
+                passed: 4,
+                failed: 0,
+                not_checked: 2,
+            },
+        ],
+    }
+}
+
 pub const DASHBOARD_SUMMARIES: &[SafeSummary] = &[
     SafeSummary {
         label: "Platform health",

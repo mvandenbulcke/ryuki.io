@@ -4,16 +4,20 @@ use crate::api::{
     approval_decision_readiness_path, auth_login_path, auth_logout_path, auth_session_path,
     auth_status_path, boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
     catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
-    cmdb_reconciliation_path, cmdb_relationship_graph_path, dry_run_plan_path,
-    emergency_change_path, evidence_compliance_dashboard_path, evidence_export_retention_path,
-    evidence_summary_path, inventory_ownership_risk_path, inventory_resource_overview_path,
-    operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
-    platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
-    request_approve_path, request_create_path, request_detail_path, request_execute_path,
-    request_intake_form_preview_path, request_intake_path, request_list_path, request_lock_path,
-    request_plan_path, request_preflight_path, request_validate_path, request_verify_path,
-    same_origin_api_path, secret_references_path, shift_queue_path, site_catalog_path,
-    ApiPathError,
+    cmdb_reconciliation_path, cmdb_relationship_graph_path,
+    datacenter_check_cooling_path, datacenter_check_power_path,
+    datacenter_check_rack_space_path, datacenter_check_switchports_path,
+    datacenter_failing_checks_path, datacenter_full_readiness_path,
+    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
+    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
+    evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
+    inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
+    operations_runbook_launch_path, platform_health_path, platform_status_path,
+    platform_summary_path, policy_outcomes_path, request_approve_path, request_create_path,
+    request_detail_path, request_execute_path, request_intake_form_preview_path,
+    request_intake_path, request_list_path, request_lock_path, request_plan_path,
+    request_preflight_path, request_validate_path, request_verify_path, same_origin_api_path,
+    secret_references_path, shift_queue_path, site_catalog_path, ApiPathError,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -25,12 +29,18 @@ use crate::api_client::{
 use crate::models::request_intake_form_fallback;
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
-    cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks, dry_run_plan_fallbacks,
-    evidence_summary_fallbacks, inventory_resource_fallbacks, operation_run_fallbacks,
-    policy_guardrail_fallbacks, policy_outcome_fallbacks, request_intake_fallbacks,
-    secret_reference_catalog_fallback, secret_reference_fallbacks, ActivityQueueSummary,
-    AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary, CmdbReconciliationSummary,
-    CmdbRelationshipSummary, CreateRequestPayload, DryRunPlanSummary, EvidenceSummary,
+    cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks,
+    datacenter_check_power_fallback, datacenter_failing_checks_fallback,
+    datacenter_full_readiness_fallback, datacenter_readiness_score_fallback,
+    datacenter_single_check_fallback, datacenter_site_report_fallback,
+    datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
+    inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
+    policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
+    secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
+    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
+    CreateRequestPayload, DatacenterCheckDetail, DatacenterFailingChecksSummary,
+    DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck,
+    DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary, EvidenceSummary,
     InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,
     PlatformSettingsSummary, PlatformStatus, PolicyGuardrailSummary, PolicyOutcome,
     RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary,
@@ -99,6 +109,15 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     policy_outcomes_path,
     evidence_summary_path,
     operation_runs_path,
+    datacenter_readiness_score_path,
+    datacenter_site_report_path,
+    datacenter_failing_checks_path,
+    datacenter_check_power_path,
+    datacenter_check_cooling_path,
+    datacenter_check_rack_space_path,
+    datacenter_check_switchports_path,
+    datacenter_full_readiness_path,
+    datacenter_sites_path,
     boundary_status_path,
     platform_status_path,
     platform_health_path,
@@ -543,6 +562,87 @@ impl PortalActivityRunStateSnapshot {
             customer_identifiers_allowed: false,
             activity_queue,
             operation_runs,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortalDatacenterReadinessSnapshot {
+    pub api_boundary: String,
+    pub execution_mode: String,
+    pub readiness_score_path: String,
+    pub site_report_path: String,
+    pub failing_checks_path: String,
+    pub check_power_path: String,
+    pub check_cooling_path: String,
+    pub check_rack_space_path: String,
+    pub check_switchports_path: String,
+    pub full_readiness_path: String,
+    pub sites_path: String,
+    pub readiness_score: DatacenterReadinessScore,
+    pub site_report: DatacenterSiteReport,
+    pub failing_checks: DatacenterFailingChecksSummary,
+    pub check_power: DatacenterSingleCheck,
+    pub check_cooling: DatacenterSingleCheck,
+    pub check_rack_space: DatacenterSingleCheck,
+    pub check_switchports: DatacenterSingleCheck,
+    pub full_readiness: DatacenterFullReadiness,
+    pub sites_catalog: DatacenterSitesCatalog,
+    pub live_execution_allowed: bool,
+    pub provider_calls_allowed: bool,
+    pub raw_payload_allowed: bool,
+    pub secret_values_allowed: bool,
+    pub customer_identifiers_allowed: bool,
+}
+
+impl PortalDatacenterReadinessSnapshot {
+    pub fn static_dry_run(site: &str) -> Result<Self, PortalBoundaryError> {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let readiness_score_path =
+            boundary.validate_platform_api_path(datacenter_readiness_score_path())?;
+        let site_report_path =
+            boundary.validate_platform_api_path(datacenter_site_report_path())?;
+        let failing_checks_path =
+            boundary.validate_platform_api_path(datacenter_failing_checks_path())?;
+        let check_power_path =
+            boundary.validate_platform_api_path(datacenter_check_power_path())?;
+        let check_cooling_path =
+            boundary.validate_platform_api_path(datacenter_check_cooling_path())?;
+        let check_rack_space_path =
+            boundary.validate_platform_api_path(datacenter_check_rack_space_path())?;
+        let check_switchports_path =
+            boundary.validate_platform_api_path(datacenter_check_switchports_path())?;
+        let full_readiness_path =
+            boundary.validate_platform_api_path(datacenter_full_readiness_path())?;
+        let sites_path = boundary.validate_platform_api_path(datacenter_sites_path())?;
+
+        Ok(Self {
+            api_boundary: boundary.api_boundary.to_string(),
+            execution_mode: execution_mode_label(&boundary.boundary_status.execution_mode)
+                .to_string(),
+            readiness_score_path: readiness_score_path.to_string(),
+            site_report_path: site_report_path.to_string(),
+            failing_checks_path: failing_checks_path.to_string(),
+            check_power_path: check_power_path.to_string(),
+            check_cooling_path: check_cooling_path.to_string(),
+            check_rack_space_path: check_rack_space_path.to_string(),
+            check_switchports_path: check_switchports_path.to_string(),
+            full_readiness_path: full_readiness_path.to_string(),
+            sites_path: sites_path.to_string(),
+            readiness_score: datacenter_readiness_score_fallback(site),
+            site_report: datacenter_site_report_fallback(site),
+            failing_checks: datacenter_failing_checks_fallback(),
+            check_power: datacenter_single_check_fallback(site, "power"),
+            check_cooling: datacenter_single_check_fallback(site, "cooling"),
+            check_rack_space: datacenter_single_check_fallback(site, "rack-space"),
+            check_switchports: datacenter_single_check_fallback(site, "switchport"),
+            full_readiness: datacenter_full_readiness_fallback(site),
+            sites_catalog: datacenter_sites_catalog_fallback(),
+            live_execution_allowed: false,
+            provider_calls_allowed: false,
+            raw_payload_allowed: false,
+            secret_values_allowed: false,
+            customer_identifiers_allowed: false,
         })
     }
 }
