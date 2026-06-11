@@ -122,6 +122,7 @@ pub enum KubernetesRuntime {
     Aks,
     Eks,
     Gke,
+    #[serde(alias = "openshift")]
     OpenShift,
     Rancher,
     None,
@@ -161,6 +162,7 @@ impl KubernetesRuntime {
 pub enum HypervisorProvider {
     #[default]
     Vmware,
+    #[serde(alias = "hyperv")]
     HyperV,
     Proxmox,
     NutanixAhv,
@@ -204,6 +206,7 @@ pub enum MonitoringProvider {
     Prometheus,
     Datadog,
     Grafana,
+    #[serde(alias = "solarwinds")]
     SolarWinds,
     None,
 }
@@ -241,6 +244,7 @@ pub enum BackupProvider {
     Commvault,
     Rubrik,
     Cohesity,
+    #[serde(alias = "netbackup")]
     NetBackup,
     None,
 }
@@ -275,8 +279,10 @@ impl BackupProvider {
 pub enum StorageProvider {
     #[default]
     None,
+    #[serde(alias = "netapp")]
     NetApp,
     PureStorage,
+    #[serde(alias = "dell-powerstore")]
     DellPowerStore,
     HpeAlletra,
     AzureBlob,
@@ -313,6 +319,7 @@ pub enum DnsProvider {
     #[default]
     None,
     Infoblox,
+    #[serde(alias = "bluecat")]
     BlueCat,
     WindowsDns,
     Route53,
@@ -347,7 +354,9 @@ pub enum IpamProvider {
     #[default]
     None,
     Infoblox,
+    #[serde(alias = "phpipam")]
     PhpIpam,
+    #[serde(alias = "netbox")]
     NetBox,
 }
 
@@ -377,8 +386,10 @@ impl IpamProvider {
 pub enum LoadBalancerProvider {
     #[default]
     None,
+    #[serde(alias = "f5-bigip")]
     F5BigIp,
     CitrixAdc,
+    #[serde(alias = "haproxy")]
     HAProxy,
     Nginx,
 }
@@ -412,6 +423,7 @@ pub enum FirewallProvider {
     #[default]
     None,
     PaloAlto,
+    #[serde(alias = "checkpoint")]
     CheckPoint,
     Fortinet,
     CiscoAsa,
@@ -446,8 +458,11 @@ pub enum BuildProvider {
     #[default]
     None,
     Jenkins,
+    #[serde(alias = "github-actions")]
     GitHubActions,
+    #[serde(alias = "azure-devops")]
     AzureDevOps,
+    #[serde(alias = "argocd")]
     ArgoCD,
 }
 
@@ -1395,6 +1410,116 @@ mod tests {
         assert!(json.contains("cloud-native-pg"));
         let restored: DatabaseProvider = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, DatabaseProvider::CloudNativePg);
+    }
+
+    fn documented_provider_value<T: serde::de::DeserializeOwned>(value: &str) -> T {
+        serde_json::from_str(&format!(r#""{value}""#)).unwrap()
+    }
+
+    #[test]
+    fn test_documented_provider_values_deserialize() {
+        assert_eq!(
+            documented_provider_value::<DatabaseProvider>("cloudnativepg"),
+            DatabaseProvider::CloudNativePg
+        );
+        assert_eq!(
+            documented_provider_value::<DatabaseProvider>("postgres-local"),
+            DatabaseProvider::PostgresLocal
+        );
+        assert_eq!(
+            documented_provider_value::<DatabaseProvider>("aws-rds"),
+            DatabaseProvider::AwsRds
+        );
+        assert_eq!(
+            documented_provider_value::<DatabaseProvider>("azure-postgresql"),
+            DatabaseProvider::AzurePostgresql
+        );
+        assert_eq!(
+            documented_provider_value::<DatabaseProvider>("gcp-cloud-sql"),
+            DatabaseProvider::GcpCloudSql
+        );
+
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("hashicorp-vault"),
+            SecretProvider::HashicorpVault
+        );
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("aws-secrets-manager"),
+            SecretProvider::AwsSecretsManager
+        );
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("azure-key-vault"),
+            SecretProvider::AzureKeyVault
+        );
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("gcp-secret-manager"),
+            SecretProvider::GcpSecretManager
+        );
+        assert_eq!(
+            documented_provider_value::<SecretProvider>("bitwarden-secrets-manager"),
+            SecretProvider::BitwardenSecretsManager
+        );
+
+        assert_eq!(
+            documented_provider_value::<KubernetesRuntime>("openshift"),
+            KubernetesRuntime::OpenShift
+        );
+        assert_eq!(
+            documented_provider_value::<HypervisorProvider>("hyperv"),
+            HypervisorProvider::HyperV
+        );
+        assert_eq!(
+            documented_provider_value::<MonitoringProvider>("solarwinds"),
+            MonitoringProvider::SolarWinds
+        );
+        assert_eq!(
+            documented_provider_value::<BackupProvider>("netbackup"),
+            BackupProvider::NetBackup
+        );
+        assert_eq!(
+            documented_provider_value::<StorageProvider>("netapp"),
+            StorageProvider::NetApp
+        );
+        assert_eq!(
+            documented_provider_value::<StorageProvider>("dell-powerstore"),
+            StorageProvider::DellPowerStore
+        );
+        assert_eq!(
+            documented_provider_value::<DnsProvider>("bluecat"),
+            DnsProvider::BlueCat
+        );
+        assert_eq!(
+            documented_provider_value::<IpamProvider>("phpipam"),
+            IpamProvider::PhpIpam
+        );
+        assert_eq!(
+            documented_provider_value::<IpamProvider>("netbox"),
+            IpamProvider::NetBox
+        );
+        assert_eq!(
+            documented_provider_value::<LoadBalancerProvider>("f5-bigip"),
+            LoadBalancerProvider::F5BigIp
+        );
+        assert_eq!(
+            documented_provider_value::<LoadBalancerProvider>("haproxy"),
+            LoadBalancerProvider::HAProxy
+        );
+        assert_eq!(
+            documented_provider_value::<FirewallProvider>("checkpoint"),
+            FirewallProvider::CheckPoint
+        );
+        assert_eq!(
+            documented_provider_value::<BuildProvider>("github-actions"),
+            BuildProvider::GitHubActions
+        );
+        assert_eq!(
+            documented_provider_value::<BuildProvider>("azure-devops"),
+            BuildProvider::AzureDevOps
+        );
+        assert_eq!(
+            documented_provider_value::<BuildProvider>("argocd"),
+            BuildProvider::ArgoCD
+        );
     }
 
     #[test]
