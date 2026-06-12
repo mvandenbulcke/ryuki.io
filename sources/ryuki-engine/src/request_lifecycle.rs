@@ -14,6 +14,20 @@ fn has_completed_stage(request: &Request, name: &str) -> bool {
         .any(|stage| stage.name == name && stage.status == StageStatus::Completed)
 }
 
+fn require_completed_stage_for_transition(
+    request: &Request,
+    stage: &str,
+    new_status: &RequestStatus,
+) -> Result<(), String> {
+    if !has_completed_stage(request, stage) {
+        return Err(format!(
+            "Cannot transition request to {:?} without a completed {} stage.",
+            new_status, stage
+        ));
+    }
+    Ok(())
+}
+
 pub fn create_request(
     offering_id: &str,
     request_type: RequestType,
@@ -484,6 +498,38 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
         ));
     }
 
+    match (&request.status, &new_status) {
+        (RequestStatus::Intake, RequestStatus::Validated) => {
+            let result = validate_request(request)?;
+            if !result.passed {
+                return Err(format!(
+                    "Cannot transition request to Validated until validation passes: {}",
+                    result.errors.join("; ")
+                ));
+            }
+        }
+        (RequestStatus::Validated, RequestStatus::Planned) => {
+            require_completed_stage_for_transition(request, "plan", &new_status)?;
+        }
+        (RequestStatus::Planned, RequestStatus::Approved) => {
+            require_completed_stage_for_transition(request, "plan", &new_status)?;
+            require_completed_stage_for_transition(request, "approve", &new_status)?;
+        }
+        (RequestStatus::Approved, RequestStatus::Locked) => {
+            require_completed_stage_for_transition(request, "approve", &new_status)?;
+        }
+        (RequestStatus::Locked, RequestStatus::Executing) => {
+            require_completed_stage_for_transition(request, "lock", &new_status)?;
+        }
+        (RequestStatus::Executing, RequestStatus::Verifying) => {
+            require_completed_stage_for_transition(request, "execute", &new_status)?;
+        }
+        (RequestStatus::Verifying, RequestStatus::Completed) => {
+            require_completed_stage_for_transition(request, "verify", &new_status)?;
+        }
+        _ => {}
+    }
+
     let mut updated = request.clone();
     updated.status = new_status;
     updated.updated_at = Utc::now().to_rfc3339();
@@ -591,6 +637,17 @@ mod tests {
         transition_status(&req, RequestStatus::Validated).unwrap()
     }
 
+    fn completed_test_stage(name: &str) -> Stage {
+        Stage {
+            name: name.into(),
+            status: StageStatus::Completed,
+            started_at: Some(Utc::now().to_rfc3339()),
+            completed_at: Some(Utc::now().to_rfc3339()),
+            evidence: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
     fn make_planned_request() -> Request {
         let mut validated = make_validated_request();
         validated.stages = plan_request(&validated).unwrap();
@@ -613,7 +670,8 @@ mod tests {
 
     #[test]
     fn test_approve_request_from_planned_without_completed_plan_fails() {
-        let req = transition_status(&make_validated_request(), RequestStatus::Planned).unwrap();
+        let mut req = make_validated_request();
+        req.status = RequestStatus::Planned;
         let error = approve_request(&req, "Datacenter Approver").unwrap_err();
         assert!(error.contains("completed dry-run plan"));
     }
@@ -692,7 +750,9 @@ mod tests {
         let req = make_test_request();
         let validated = transition_status(&req, RequestStatus::Validated).unwrap();
         assert_eq!(validated.status, RequestStatus::Validated);
-        let planned = transition_status(&validated, RequestStatus::Planned).unwrap();
+        let mut planned_ready = validated.clone();
+        planned_ready.stages = plan_request(&validated).unwrap();
+        let planned = transition_status(&planned_ready, RequestStatus::Planned).unwrap();
         assert_eq!(planned.status, RequestStatus::Planned);
     }
 
@@ -700,6 +760,37 @@ mod tests {
     fn test_transition_status_invalid_path_fails() {
         let req = make_test_request();
         assert!(transition_status(&req, RequestStatus::Completed).is_err());
+    }
+
+    #[test]
+    fn test_transition_to_validated_requires_validation_success() {
+        let mut req = make_test_request();
+        req.site = "UNKNOWN".into();
+
+        let error = transition_status(&req, RequestStatus::Validated).unwrap_err();
+        assert!(error.contains("validation passes"));
+        assert!(error.contains("Unknown site"));
+    }
+
+    #[test]
+    fn test_transition_to_planned_requires_plan_stage() {
+        let validated = make_validated_request();
+
+        let error = transition_status(&validated, RequestStatus::Planned).unwrap_err();
+        assert!(error.contains("completed plan stage"));
+    }
+
+    #[test]
+    fn test_transition_to_completed_requires_verify_stage() {
+        let mut req = make_test_request();
+        req.status = RequestStatus::Verifying;
+
+        let error = transition_status(&req, RequestStatus::Completed).unwrap_err();
+        assert!(error.contains("completed verify stage"));
+
+        req.stages.push(completed_test_stage("verify"));
+        let completed = transition_status(&req, RequestStatus::Completed).unwrap();
+        assert_eq!(completed.status, RequestStatus::Completed);
     }
 
     #[test]
@@ -726,8 +817,9 @@ mod tests {
         assert_eq!(req.status, RequestStatus::Intake);
 
         let validated = transition_status(&req, RequestStatus::Validated).unwrap();
-        let mut planned = transition_status(&validated, RequestStatus::Planned).unwrap();
-        planned.stages = plan_request(&validated).unwrap();
+        let mut planned_ready = validated.clone();
+        planned_ready.stages = plan_request(&validated).unwrap();
+        let planned = transition_status(&planned_ready, RequestStatus::Planned).unwrap();
         let approved = approve_request(&planned, "Datacenter Approver").unwrap();
         let locked = lock_request(&approved).unwrap();
         let executed = execute_request(&locked).unwrap();

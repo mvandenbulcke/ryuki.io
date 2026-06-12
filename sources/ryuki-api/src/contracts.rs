@@ -7406,8 +7406,12 @@ async fn requests_verify(
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::verify_request(&request).map_err(map_engine_error)?;
+        let mut verified_request = request.clone();
+        verified_request
+            .stages
+            .push(completed_request_stage("verify", evidence.clone()));
         let completed = request_lifecycle::transition_status(
-            &request,
+            &verified_request,
             ryuki_engine::models::RequestStatus::Completed,
         )
         .map_err(map_engine_error)?;
@@ -7433,8 +7437,12 @@ async fn requests_verify(
 
     let evidence = request_lifecycle::verify_request(&store[idx]).map_err(map_engine_error)?;
 
+    let mut verified_request = store[idx].clone();
+    verified_request
+        .stages
+        .push(completed_request_stage("verify", evidence.clone()));
     let completed = request_lifecycle::transition_status(
-        &store[idx],
+        &verified_request,
         ryuki_engine::models::RequestStatus::Completed,
     )
     .map_err(map_engine_error)?;
@@ -11568,6 +11576,14 @@ mod unit_tests {
         request
     }
 
+    fn static_admin_operator_session() -> AuthSession {
+        let mut session = AuthSession::static_dry_run();
+        session
+            .roles
+            .push(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string());
+        session
+    }
+
     #[tokio::test]
     async fn requests_validate_failure_does_not_mark_request_validated() {
         let id = format!("req-test-{}", Uuid::new_v4());
@@ -11631,11 +11647,51 @@ mod unit_tests {
             .iter()
             .any(|stage| { stage["name"] == "plan" && stage["status"] == "Completed" }));
 
-        let Json(approved) =
-            requests_approve(Path(id), AuthExtractor(AuthSession::static_dry_run()))
-                .await
-                .expect("approval should pass after planning");
+        let Json(approved) = requests_approve(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("approval should pass after planning");
         assert_eq!(approved["status"], "Approved");
+
+        let Json(locked) = requests_lock(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("locking should pass after approval");
+        assert_eq!(locked["status"], "Locked");
+
+        let Json(executed) = requests_execute(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("execution should pass after locking");
+        assert_eq!(executed["status"], "Verifying");
+
+        let Json(verification) = requests_verify(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("verification should complete after execution");
+        assert!(verification
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| { item["key"] == "verification-service-health" }));
+
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|request| request.id == id).unwrap();
+        assert_eq!(
+            stored.status,
+            ryuki_engine::models::RequestStatus::Completed
+        );
+        assert!(stored.stages.iter().any(|stage| {
+            stage.name == "verify" && stage.status == ryuki_engine::models::StageStatus::Completed
+        }));
     }
 
     #[tokio::test]
