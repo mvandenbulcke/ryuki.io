@@ -1,3 +1,7 @@
+// Deeply nested Leptos view types overflow rustc's default query depth
+// when computing layout in release builds.
+#![recursion_limit = "256"]
+
 pub mod api;
 pub mod api_client;
 pub mod app;

@@ -57,6 +57,7 @@ mod degradation_mode;
 mod dependency_maintenance_calendar;
 mod deployment_input_template;
 mod design_system;
+mod docker_image;
 mod emergency_change;
 mod entra_rbac_approval_readiness;
 mod evidence_compliance_dashboard;
@@ -281,6 +282,7 @@ slice	Adapter readiness contracts	adapter-readiness-catalog.yaml	adapter-readine
 slice	Adapter contract coverage	adapter-contract-contract.yaml	adapter-contract.md	/api/status/adapter-contract
 slice	Build sheet backlog coverage	backlog-coverage-catalog.yaml	backlog-coverage.md	/api/status/backlog
 slice	Deployment input template	deployment-input-template-contract.yaml	deployment-input-template.md	/api/status/deployment-template
+slice	Docker image build contexts	docker-image-contract.yaml	docker-image.md	/api/status/docker-image
 slice	Evidence manifest	evidence-manifest-catalog.yaml	evidence-manifest.md	/api/status/evidence-manifest
 slice	Image factory	image-factory-contract.yaml	image-factory.md	/api/status/image-factory
 slice	Registry readiness	registry-readiness-contract.yaml	registry-readiness.md	/api/status/registry
@@ -1141,6 +1143,12 @@ fn run() -> Result<(), String> {
                         "release-image-builds validation requires --context-json".to_string()
                     })?;
                     release_image_builds::validate_context_file(&path)?
+                }
+                "docker-image" => {
+                    let path = context_json.ok_or_else(|| {
+                        "docker-image validation requires --context-json".to_string()
+                    })?;
+                    docker_image::validate_context_file(&path)?
                 }
                 "ryuki-engine" => {
                     let path = context_json.ok_or_else(|| {
@@ -2360,6 +2368,7 @@ fn require_slice(args: &[String]) -> Result<&str, String> {
             | "datacenter-readiness"
             | "reboot-orchestration"
             | "release-image-builds"
+            | "docker-image"
             | "restore-testing"
             | "controlled-restore"
             | "vcenter-object-placement"
@@ -3045,6 +3054,10 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
     m.insert(
         "design-system",
         design_system::validate_context_file as ValidateFn,
+    );
+    m.insert(
+        "docker-image",
+        docker_image::validate_context_file as ValidateFn,
     );
     m.insert(
         "emergency-change",
@@ -3816,6 +3829,29 @@ fn build_slice_context(
             {
                 map.insert(
                     "cnpg_cluster_text".to_string(),
+                    serde_json::Value::String(raw),
+                );
+            }
+        }
+        "docker-image" => {
+            if let Ok(raw) = fs::read_to_string(root.join("Cargo.toml")) {
+                map.insert(
+                    "workspace_manifest".to_string(),
+                    serde_json::Value::String(raw),
+                );
+            }
+            if let Ok(raw) = fs::read_to_string(root.join("sources/ryuki-api/Dockerfile")) {
+                map.insert("api_dockerfile".to_string(), serde_json::Value::String(raw));
+            }
+            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/Dockerfile")) {
+                map.insert(
+                    "portal_dockerfile".to_string(),
+                    serde_json::Value::String(raw),
+                );
+            }
+            if let Ok(raw) = fs::read_to_string(root.join("deploy/ci/Dockerfile.validator")) {
+                map.insert(
+                    "validator_dockerfile".to_string(),
                     serde_json::Value::String(raw),
                 );
             }

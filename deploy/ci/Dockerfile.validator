@@ -1,11 +1,23 @@
-FROM rust:1.88-bookworm AS build
+# Build from the repository root:
+#   docker build -f deploy/ci/Dockerfile.validator .
+#
+# ryuki-validator is a workspace member with workspace = true dependencies and
+# a path dependency on ryuki-core, so the build needs the full workspace
+# manifest graph from the repo root (the root package's [[test]] targets make
+# tests/ load-bearing for cargo metadata).
+
+FROM rust:1.96-bookworm AS build
 
 WORKDIR /app
 
+# Full workspace COPY set so `cargo metadata` resolves every member
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY sources/ sources/
+COPY portal/ portal/
+COPY scripts/validator-rs/ scripts/validator-rs/
+COPY tests/ tests/
 
-RUN cargo build --release
+RUN cargo build --release -p ryuki-validator
 
 FROM debian:bookworm-slim AS runtime
 

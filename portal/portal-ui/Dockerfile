@@ -1,12 +1,25 @@
-FROM rust:1.88-bookworm AS build
+# Build from the repository root:
+#   docker build -f portal/portal-ui/Dockerfile .
+#
+# The root Cargo.toml declares five workspace members plus a root package with
+# [[test]] targets under tests/, so cargo metadata needs the full workspace
+# manifest graph (sources/, portal/, scripts/validator-rs/, tests/) to resolve.
+# cargo-leptos drives the build here, so this stage favours a plain
+# full-workspace COPY (ordered least- to most-frequently changing) over
+# cargo-chef layer tricks.
+
+FROM rust:1.96-bookworm AS build
 
 WORKDIR /app
 
+# Toolchain layer: cached independently of the workspace sources
 RUN rustup target add wasm32-unknown-unknown \
     && cargo install cargo-leptos --locked
 
-# Copy workspace manifests and lockfile for dependency resolution
+# Full workspace COPY set so `cargo metadata` resolves every member
 COPY Cargo.toml Cargo.lock ./
+COPY scripts/validator-rs/ scripts/validator-rs/
+COPY tests/ tests/
 COPY sources/ sources/
 COPY portal/ portal/
 

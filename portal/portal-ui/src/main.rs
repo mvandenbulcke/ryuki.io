@@ -1,3 +1,7 @@
+// The bin is its own crate root: it needs the same query-depth headroom as
+// the lib for the deeply nested Leptos view types in release builds.
+#![recursion_limit = "256"]
+
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
