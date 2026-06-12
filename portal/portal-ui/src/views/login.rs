@@ -1,9 +1,10 @@
 use crate::api::admin_platform_settings_path;
+use crate::server_boundary::{get_admin_platform_settings, perform_login};
 use leptos::prelude::*;
 
 #[component]
 pub fn LoginView() -> impl IntoView {
-    let platform_settings = Resource::new(|| (), |_| get_platform_settings());
+    let platform_settings = Resource::new(|| (), |_| get_admin_platform_settings());
 
     view! {
         <div class="login-page">
@@ -32,7 +33,7 @@ pub fn LoginView() -> impl IntoView {
                                 .unwrap_or(false);
 
                             let login_action = Action::new(|_input: &()| async move {
-                                perform_mock_login().await.ok()
+                                perform_login().await.ok()
                             });
                             let login_pending = login_action.pending();
                             let login_result = login_action.value();
@@ -91,25 +92,4 @@ pub fn LoginView() -> impl IntoView {
             </div>
         </div>
     }
-}
-
-#[server(prefix = "/portal/api", endpoint = "platform-settings-login")]
-async fn get_platform_settings() -> Result<crate::models::PlatformSettingsSummary, ServerFnError> {
-    Ok(crate::models::platform_settings_summary_fallback())
-}
-
-#[server(prefix = "/portal/api", endpoint = "mock-login")]
-async fn perform_mock_login() -> Result<crate::models::LoginResponse, ServerFnError> {
-    Ok(crate::models::LoginResponse {
-        session_id: "mock-session".to_string(),
-        user_id: "platform-engineer".to_string(),
-        display_name: "Platform Engineer".to_string(),
-        email: "platform-engineer@ryuki.local".to_string(),
-        roles: vec![
-            "platform-engineer".to_string(),
-            "operator".to_string(),
-            "viewer".to_string(),
-        ],
-        success: true,
-    })
 }
