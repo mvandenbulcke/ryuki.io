@@ -4,7 +4,7 @@
 
 - Rust 1.85+ (edition 2024)
 - Docker and Docker Compose
-- PostgreSQL 16+
+- PostgreSQL 18+
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ Edit `.env` — set `RYUKI_DATABASE_URL` to match your local PostgreSQL.
 ### 2. Start the database
 
 ```bash
-docker compose up -d
+docker compose -f deploy/compose/compose.yaml up -d platform-db
 ```
 
 ### 3. Build the workspace
@@ -36,7 +36,7 @@ cargo build --workspace
 cargo run -p ryuki-api
 ```
 
-The API starts at `http://localhost:18080`.
+The API listens on `http://localhost:8080` by default. The compose API service publishes container port `8080` as host port `18080`.
 
 ### 5. Run tests
 
