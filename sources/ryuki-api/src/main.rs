@@ -185,6 +185,7 @@ static DRAINING: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessStatus {
     Ready,
+    ConfigInvalid,
     DatabaseUnavailable,
     MigrationsNotApplied,
     MigrationsFailed,
@@ -732,6 +733,16 @@ async fn ready(
 }
 
 async fn readiness_check() -> ReadinessStatus {
+    let app_config = crate::config_store::get_app_config();
+    let validation_errors = app_config.validate();
+    if !validation_errors.is_empty() {
+        tracing::warn!(
+            config_errors = validation_errors.len(),
+            "readiness failed because hard config validation failed"
+        );
+        return ReadinessStatus::ConfigInvalid;
+    }
+
     let Some(pool) = crate::database::get_db() else {
         return ReadinessStatus::DatabaseUnavailable;
     };
@@ -778,6 +789,12 @@ fn readiness_response(status: ReadinessStatus) -> Result<Json<serde_json::Value>
                 "migrations": "applied",
             },
         }))),
+        ReadinessStatus::ConfigInvalid => Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CONFIG_INVALID",
+            "Configuration is invalid",
+            Some("Readiness requires hard config validation to pass"),
+        )),
         ReadinessStatus::DatabaseUnavailable => Err(problem_details(
             StatusCode::SERVICE_UNAVAILABLE,
             "DATABASE_UNAVAILABLE",
@@ -1099,6 +1116,20 @@ mod tests {
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.error, "DATABASE_UNAVAILABLE");
+    }
+
+    #[test]
+    fn test_readiness_response_for_invalid_config_is_safe_503() {
+        let Err((status, Json(body))) = readiness_response(ReadinessStatus::ConfigInvalid) else {
+            panic!("readiness should fail when config is invalid");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "CONFIG_INVALID");
+        assert_eq!(body.message, "Configuration is invalid");
+        assert_eq!(
+            body.detail,
+            Some("Readiness requires hard config validation to pass".into())
+        );
     }
 
     #[test]
