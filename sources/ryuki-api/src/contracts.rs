@@ -6545,6 +6545,22 @@ fn require_admin_permission(session: &AuthSession) -> Result<(), (StatusCode, Js
     }
 }
 
+fn require_verified_external_admin_permission(
+    session: &AuthSession,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    require_admin_permission(session)?;
+    if session.token_valid && session.provider_mode != "persisted-session" {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        Json(ApiError::new(
+            "VERIFIED_ADMIN_REQUIRED",
+            "Verified external admin authentication is required for platform settings writes",
+        )),
+    ))
+}
+
 fn apply_platform_config_entry(config: &mut PlatformConfig, key: &str, value: &str) {
     match key {
         "entra_tenant_id" => config.entra_tenant_id = value.to_string(),
@@ -6782,7 +6798,7 @@ async fn admin_platform_settings_update(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PlatformConfig>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    require_admin_permission(&session)?;
+    require_verified_external_admin_permission(&session)?;
 
     let validation_errors = ryuki_core::types::validate_platform_config(&body);
     if !validation_errors.is_empty() {
@@ -6811,7 +6827,7 @@ async fn admin_platform_settings_update(
 async fn admin_platform_settings_reset(
     AuthExtractor(session): AuthExtractor,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    require_admin_permission(&session)?;
+    require_verified_external_admin_permission(&session)?;
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
@@ -11734,6 +11750,39 @@ mod unit_tests {
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.error, "FORBIDDEN");
+    }
+
+    #[test]
+    fn test_verified_external_admin_permission_rejects_static_admin() {
+        let session = AuthSession::static_dry_run();
+        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+            panic!("static admin should not be allowed to write platform settings");
+        };
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error, "VERIFIED_ADMIN_REQUIRED");
+    }
+
+    #[test]
+    fn test_verified_external_admin_permission_rejects_persisted_session() {
+        let mut session = AuthSession::static_dry_run();
+        session.token_valid = true;
+        session.provider_mode = "persisted-session".into();
+        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+            panic!("persisted mock session should not be allowed to write platform settings");
+        };
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error, "VERIFIED_ADMIN_REQUIRED");
+    }
+
+    #[test]
+    fn test_verified_external_admin_permission_accepts_verified_admin() {
+        let mut session = AuthSession::static_dry_run();
+        session.token_valid = true;
+        session.provider_mode = "entra-id".into();
+
+        assert!(require_verified_external_admin_permission(&session).is_ok());
     }
 
     #[test]
