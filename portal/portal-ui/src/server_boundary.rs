@@ -13,11 +13,15 @@ use crate::api::{
     evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
     inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
     operations_runbook_launch_path, platform_health_path, platform_status_path,
-    platform_summary_path, policy_outcomes_path, request_approve_path, request_create_path,
-    request_detail_path, request_execute_path, request_intake_form_preview_path,
-    request_intake_path, request_list_path, request_lock_path, request_plan_path,
-    request_preflight_path, request_validate_path, request_verify_path, same_origin_api_path,
-    secret_references_path, shift_queue_path, site_catalog_path, ApiPathError,
+    platform_summary_path, policy_outcomes_path, request_create_path,
+    request_intake_form_preview_path, request_intake_path, request_list_path,
+    request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
+    site_catalog_path, ApiPathError,
+};
+#[cfg(any(feature = "ssr", test))]
+use crate::api::{
+    request_approve_path, request_detail_path, request_execute_path, request_lock_path,
+    request_plan_path, request_validate_path, request_verify_path,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -25,6 +29,8 @@ use crate::api_client::{
     inventory_resource_overview_resource, operation_runs_resource, policy_outcomes_resource,
     request_intake_resource, secret_references_resource, ApiResource,
 };
+#[cfg(any(feature = "ssr", test))]
+use crate::models::platform_settings_summary_fallback;
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
 use crate::models::{
@@ -34,22 +40,23 @@ use crate::models::{
     datacenter_single_check_fallback, datacenter_site_report_fallback,
     datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
-    policy_outcome_fallbacks, request_detail_fallback, request_intake_fallbacks,
-    request_summary_fallbacks, secret_reference_catalog_fallback, secret_reference_fallbacks,
-    ActivityQueueSummary, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
-    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload,
-    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
-    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
-    EvidenceSummary, InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,
-    PlatformSettingsSummary, PlatformStatus, PolicyGuardrailSummary, PolicyOutcome,
-    RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary,
-    SecretReferenceSummary, StageActionResponse,
+    policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
+    secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
+    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
+    CreateRequestPayload, DatacenterFailingChecksSummary, DatacenterFullReadiness,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
+    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, LoginResponse,
+    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
+    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
+    RequestIntakeSummary, RequestSummary, SecretReferenceSummary, StageActionResponse,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{
-    auth_session_fallback, platform_health_fallback, platform_settings_summary_fallback,
-    platform_status_fallback, rbac_role_summary_fallbacks,
+    auth_session_fallback, platform_health_fallback, platform_status_fallback,
+    rbac_role_summary_fallbacks,
 };
+#[cfg(feature = "ssr")]
+use crate::models::{request_detail_fallback, request_summary_fallbacks};
 use leptos::prelude::{server, ServerFnError};
 use ryuki_core::types::{BoundaryStatus, ExecutionMode};
 use serde::{Deserialize, Serialize};
@@ -1027,6 +1034,24 @@ pub async fn get_admin_platform_settings() -> Result<PlatformSettingsSummary, Se
     Ok(platform_settings_summary_fallback())
 }
 
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_platform_settings_save(
+    settings: PlatformSettingsSummary,
+) -> Result<PlatformSettingsSummary, ServerFnError> {
+    let _ = settings;
+    Err(ServerFnError::new(
+        "Portal settings save is preview-only in static dry-run mode; no changes were persisted",
+    ))
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_platform_settings_reset() -> Result<PlatformSettingsSummary, ServerFnError>
+{
+    Err(ServerFnError::new(
+        "Portal settings reset is preview-only in static dry-run mode; no changes were persisted",
+    ))
+}
+
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings-save")]
 pub async fn save_platform_settings(
     settings: PlatformSettingsSummary,
@@ -1037,10 +1062,7 @@ pub async fn save_platform_settings(
         .map_err(|_| {
             ServerFnError::new("admin platform settings API path failed same-origin guard")
         })?;
-    let _ = settings;
-    Err(ServerFnError::new(
-        "Portal settings save is preview-only in static dry-run mode; no changes were persisted",
-    ))
+    reject_static_preview_platform_settings_save(settings)
 }
 
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings-reset")]
@@ -1051,9 +1073,7 @@ pub async fn reset_platform_settings() -> Result<PlatformSettingsSummary, Server
         .map_err(|_| {
             ServerFnError::new("admin platform settings reset API path failed same-origin guard")
         })?;
-    Err(ServerFnError::new(
-        "Portal settings reset is preview-only in static dry-run mode; no changes were persisted",
-    ))
+    reject_static_preview_platform_settings_reset()
 }
 
 #[server(prefix = "/portal/api", endpoint = "platform-status")]
@@ -1297,17 +1317,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn save_platform_settings_refuses_static_preview_persistence() {
-        let result = save_platform_settings(platform_settings_summary_fallback()).await;
+    #[test]
+    fn save_platform_settings_refuses_static_preview_persistence() {
+        let result =
+            reject_static_preview_platform_settings_save(platform_settings_summary_fallback());
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("preview-only"));
     }
 
-    #[tokio::test]
-    async fn reset_platform_settings_refuses_static_preview_persistence() {
-        let result = reset_platform_settings().await;
+    #[test]
+    fn reset_platform_settings_refuses_static_preview_persistence() {
+        let result = reject_static_preview_platform_settings_reset();
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("preview-only"));
