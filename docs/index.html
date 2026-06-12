@@ -188,7 +188,9 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   -webkit-mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
   mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
 }
-.dragon-art.play-ink::before{animation:ryu-arrive 1.4s var(--ease-out) both,ryu-breathe 6.5s ease-in-out 1.6s infinite alternate}
+.dragon-art.play-ink::before{animation:ryu-arrive 1.4s var(--ease-out) both,ryu-breathe 5.5s ease-in-out 2s infinite alternate}
+.js .hero-bg{animation:ryu-swell 5.5s ease-in-out 2s infinite alternate;transform-origin:50% 58%;will-change:transform}
+@keyframes ryu-swell{from{transform:scale(1)}to{transform:scale(1.022)}}
 @keyframes ryu-breathe{from{opacity:var(--ryu-base-opacity)}to{opacity:calc(var(--ryu-base-opacity)*2.3)}}
 @keyframes ryu-arrive{from{opacity:0;transform:translateY(18px) scale(.99)}to{opacity:var(--ryu-base-opacity);transform:none}}
 @media (prefers-reduced-motion:reduce){
