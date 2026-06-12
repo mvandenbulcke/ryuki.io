@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,19 +8,6 @@
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-<script>
-(function(){
-  var k='ryuki-theme',s=null;
-  try{s=localStorage.getItem(k)}catch(e){}
-  var mode=s||'system';
-  var theme=mode==='system'
-    ?(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')
-    :mode;
-  var h=document.documentElement;
-  h.setAttribute('data-theme',theme);
-  h.setAttribute('data-theme-mode',mode);
-})();
-</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
@@ -31,14 +18,7 @@
   --mono:'JetBrains Mono',ui-monospace,monospace;
   --radius:10px;--transition:220ms ease;
 }
-:root,[data-theme="light"]{
-  --bg:#ffffff;--bg-secondary:#f6f8fb;--text:#14181f;--text-secondary:#525a6b;
-  --border:#e2e6ee;--border-strong:#cdd4e0;
-  --accent:#8B0000;--accent-bg:#fdeeee;--logo-red:#8B0000;--logo-gold:#d4a017;
-  --code-bg:#0f1420;--code-text:#d6deeb;--inline-code:#f3eaea;
-  --header-bg:rgba(255,255,255,.86);
-}
-[data-theme="dark"]{
+:root{
   --bg:#0b0d12;--bg-secondary:#11141b;--text:#e7eaf1;--text-secondary:#9aa2b2;
   --border:#222734;--border-strong:#313848;
   --accent:#e25d5d;--accent-bg:#3a1313;--logo-red:#c0392b;--logo-gold:#FFD700;
@@ -60,14 +40,6 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);
 .header-nav{display:flex;align-items:center;gap:.9rem;font-size:.85rem}
 .header-nav a{color:var(--text-secondary);text-decoration:none;font-weight:500}
 .header-nav a:hover{color:var(--accent)}
-.theme-btn{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;
-  border:1px solid var(--border-strong);border-radius:8px;background:transparent;
-  color:var(--text-secondary);cursor:pointer;padding:0}
-.theme-btn:hover{color:var(--accent);border-color:var(--accent)}
-.theme-btn svg{width:16px;height:16px}
-.theme-btn .icon-sun{display:none}
-[data-theme="dark"] .theme-btn .icon-sun{display:block}
-[data-theme="dark"] .theme-btn .icon-moon{display:none}
 /* ── Docs shell: sticky left nav + content column ── */
 .docs-shell{max-width:1140px;margin:0 auto;padding:0 1.5rem;
   display:grid;grid-template-columns:240px minmax(0,1fr);gap:2.8rem;align-items:start}
@@ -161,10 +133,6 @@ td code{white-space:nowrap}
     <nav class="header-nav">
       <a href="/documentation.html">Docs</a>
       <a href="https://github.com/mvandenbulcke/ryuki.io" target="_blank" rel="noopener">GitHub</a>
-      <button class="theme-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
-        <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-        <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-      </button>
     </nav>
   </div>
 </header>
@@ -178,27 +146,27 @@ td code{white-space:nowrap}
 <p>Copy <code>.env.example</code> to <code>.env</code> and configure:</p>
 <h3 id="postgresql">PostgreSQL</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>DATABASE_URL</code></td><td>PostgreSQL connection string</td><td><code>postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform</code></td></tr>
+<tr><td><code>RYUKI_DATABASE_URL</code></td><td>PostgreSQL connection string</td><td><code>postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform</code></td></tr>
 </tbody></table>
 <h3 id="entra-id">Entra ID</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>ENTRA_TENANT_ID</code></td><td>Azure AD tenant ID</td><td>(required for live auth)</td></tr>
-<tr><td><code>ENTRA_CLIENT_ID</code></td><td>App registration client ID</td><td>(required for live auth)</td></tr>
-<tr><td><code>ENTRA_AUTHORITY</code></td><td>OIDC authority URL</td><td><code>https://login.microsoftonline.com</code></td></tr>
+<tr><td><code>RYUKI_ENTRA_TENANT_ID</code></td><td>Azure AD tenant ID</td><td>(required for Entra auth)</td></tr>
+<tr><td><code>RYUKI_ENTRA_CLIENT_ID</code></td><td>App registration client ID</td><td>(required for Entra auth)</td></tr>
+<tr><td><code>RYUKI_ENTRA_AUTHORITY</code></td><td>OIDC authority URL</td><td><code>https://login.microsoftonline.com</code></td></tr>
 </tbody></table>
 <h3 id="platform">Platform</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>PLATFORM_NAME</code></td><td>Display name for the platform</td><td><code>Ryuki Infrastructure Platform</code></td></tr>
-<tr><td><code>PLATFORM_URL</code></td><td>Base URL where the API is served</td><td><code>http://localhost:18080</code></td></tr>
-<tr><td><code>AUTH_MODE</code></td><td><code>mock-dry-run</code> or <code>entra-id-live</code></td><td><code>mock-dry-run</code></td></tr>
+<tr><td><code>RYUKI_PLATFORM_NAME</code></td><td>Display name for the platform</td><td><code>Ryuki Infrastructure Platform</code></td></tr>
+<tr><td><code>RYUKI_PLATFORM_URL</code></td><td>Base URL where the API is served</td><td><code>http://localhost:18080</code></td></tr>
+<tr><td><code>RYUKI_AUTH_MODE</code></td><td><code>mock-dry-run</code>, <code>static-dry-run</code>, <code>entra-id</code>, or <code>local</code></td><td><code>mock-dry-run</code></td></tr>
 </tbody></table>
 <h3 id="infrastructure-providers-informational">Infrastructure Providers (informational)</h3>
 <table><thead><tr><th>Variable</th><th>Provider type</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>DATABASE_PROVIDER</code></td><td>CNPG operator</td><td><code>cloudnativepg</code></td></tr>
-<tr><td><code>SECRET_PROVIDER</code></td><td>Secrets management</td><td><code>hashicorp-vault</code></td></tr>
-<tr><td><code>KUBERNETES_RUNTIME</code></td><td>Kubernetes runtime</td><td><code>vsphere-vks</code></td></tr>
-<tr><td><code>MONITORING_PROVIDER</code></td><td>Monitoring system</td><td><code>zabbix</code></td></tr>
-<tr><td><code>BACKUP_PROVIDER</code></td><td>Backup system</td><td><code>veeam</code></td></tr>
+<tr><td><code>RYUKI_DATABASE_PROVIDER</code></td><td>CNPG operator</td><td><code>cloudnativepg</code></td></tr>
+<tr><td><code>RYUKI_SECRET_PROVIDER</code></td><td>Secrets management</td><td><code>hashicorp-vault</code></td></tr>
+<tr><td><code>RYUKI_KUBERNETES_RUNTIME</code></td><td>Kubernetes runtime</td><td><code>vsphere-vks</code></td></tr>
+<tr><td><code>RYUKI_MONITORING_PROVIDER</code></td><td>Monitoring system</td><td><code>zabbix</code></td></tr>
+<tr><td><code>RYUKI_BACKUP_PROVIDER</code></td><td>Backup system</td><td><code>veeam</code></td></tr>
 </tbody></table>
 <h2 id="entra-id-app-registration">Entra ID App Registration</h2>
 <p>See <code>docs/entra-app-registration.md</code> for the full app roles manifest and setup instructions.</p>
@@ -208,7 +176,7 @@ td code{white-space:nowrap}
 <li>2. Define app roles in the manifest (PlatformAdmin, DatacenterApprover, etc.)</li>
 <li>3. Expose the API with a scope for the portal</li>
 <li>4. Assign users/groups to roles in the Enterprise application blade</li>
-<li>5. Set <code>ENTRA_TENANT_ID</code>, <code>ENTRA_CLIENT_ID</code>, and <code>AUTH_MODE=entra-id-live</code></li>
+<li>5. Set <code>RYUKI_ENTRA_TENANT_ID</code>, <code>RYUKI_ENTRA_CLIENT_ID</code>, and <code>RYUKI_AUTH_MODE=entra-id</code></li>
 </ol>
 <h3 id="required-entra-configuration">Required Entra Configuration</h3>
 <ul>
@@ -223,10 +191,10 @@ td code{white-space:nowrap}
 <li>- PostgreSQL 16 with user <code>ryuki</code> and database <code>ryuki_platform</code></li>
 <li>- Port <code>5432</code> exposed locally</li>
 </ul>
-<p>For production, use a managed PostgreSQL service and set <code>DATABASE_URL</code> accordingly.</p>
+<p>For production, use a managed PostgreSQL service and set <code>RYUKI_DATABASE_URL</code> accordingly.</p>
 <h2 id="admin-portal">Admin Portal</h2>
 <h3 id="logo-and-branding">Logo and Branding</h3>
-<p>The platform name is configured via <code>PLATFORM_NAME</code>. Logo and branding assets are uploaded through the admin portal UI after deployment — no branding files are stored in the repository.</p>
+<p>The platform name is configured via <code>RYUKI_PLATFORM_NAME</code>. Logo and branding assets are uploaded through the admin portal UI after deployment — no branding files are stored in the repository.</p>
 <h3 id="access-control">Access Control</h3>
 <p>Access is controlled by Entra ID app roles. The <code>PlatformAdmin</code> role grants full administrative access to the portal.</p>
 <nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/entra-app-registration.html">Entra App Registration &rarr;</a></nav>
@@ -234,27 +202,6 @@ td code{white-space:nowrap}
 </div>
 <script>
 (function(){
-  var html=document.documentElement;
-  var btn=document.getElementById('theme-toggle');
-  function prefers(){return window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}
-  function resolve(mode){return mode==='system'||!mode?prefers():mode}
-  function apply(mode){
-    html.setAttribute('data-theme-mode',mode);
-    html.setAttribute('data-theme',resolve(mode));
-    btn.title='Theme: '+mode;
-  }
-  btn.addEventListener('click',function(){
-    var cur=html.getAttribute('data-theme-mode');
-    var next=cur==='system'
-      ?(resolve('system')==='dark'?'light':'dark')
-      :cur==='light'?'dark':'system';
-    try{localStorage.setItem('ryuki-theme',next)}catch(e){}
-    apply(next);
-  });
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){
-    if(html.getAttribute('data-theme-mode')==='system') apply('system');
-  });
-
   /* docs sidebar: mobile accordion toggle */
   var tg=document.getElementById('sb-toggle'),sb=document.getElementById('docs-sidebar');
   if(tg&&sb){

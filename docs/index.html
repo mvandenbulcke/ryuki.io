@@ -1,13 +1,12 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ryuki — Governed Infrastructure Control Plane</title>
 <meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable workflows across VMware, Hyper-V, Proxmox, Windows, Linux, SQL Server, Veeam, Zabbix, and ServiceNow.">
 <link rel="canonical" href="https://ryuki.io/">
-<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0b0d12" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#0b0d12">
 
 <!-- Open Graph / Twitter -->
 <meta property="og:type" content="website">
@@ -25,21 +24,8 @@
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 
-<!-- Theme bootstrap: runs before paint to avoid flash -->
-<script>
-(function(){
-  var k='ryuki-theme',s=null;
-  try{s=localStorage.getItem(k)}catch(e){}
-  var mode=s||'system';
-  var theme=mode==='system'
-    ?(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')
-    :mode;
-  var h=document.documentElement;
-  h.setAttribute('data-theme',theme);
-  h.setAttribute('data-theme-mode',mode);
-  h.classList.add('js');
-})();
-</script>
+<!-- JS flag: enables script-driven effects -->
+<script>document.documentElement.classList.add('js');</script>
 
 <!-- Typography -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -66,42 +52,8 @@ section[id]{scroll-margin-top:76px}
   --grad-accent:linear-gradient(135deg,#c0392b 0%,#8B0000 100%);
 }
 
-/* light (default) */
-:root,[data-theme="light"]{
-  --bg:            #ffffff;
-  --bg-secondary:  #f6f8fb;
-  --bg-tertiary:   #edf1f7;
-  --text:          #14181f;
-  --text-secondary:#525a6b;
-  --text-muted:    #8a92a3;
-  --border:        #e2e6ee;
-  --border-strong: #cdd4e0;
-  --accent:        #8B0000;
-  --accent-strong: #6f0000;
-  --accent-hover:  #a31515;
-  --accent-bg:     #fdeeee;
-  --accent-glow:   rgba(139,0,0,.20);
-  --code-bg:       #0f1420;
-  --code-text:     #d6deeb;
-  --card-bg:       #ffffff;
-  --card-border:   #e4e8ef;
-  --card-shadow:   0 1px 2px rgba(15,23,42,.05),0 1px 3px rgba(15,23,42,.06);
-  --card-shadow-hover:0 12px 28px -8px rgba(120,31,31,.16),0 4px 12px -4px rgba(120,31,31,.09);
-  --header-bg:     rgba(255,255,255,.86);
-  --logo-red:      #8B0000;
-  --logo-gold:     #d4a017;
-  --dragon-line:   rgba(20,24,31,.11);
-  --dragon-line-strong:rgba(20,24,31,.18);
-  --dragon-reveal: #7a1010;
-  --tag-bg:        #f8efee;
-  --tag-text:      #8c3a3a;
-  --section-alt:   #f6f8fb;
-  --gradient-text: linear-gradient(110deg,#8B0000 0%,#c0392b 50%,#b8860b 100%);
-  --pill-border:   #efd9d9;
-}
-
-/* dark */
-[data-theme="dark"]{
+/* palette (dark only) */
+:root{
   --bg:            #0b0d12;
   --bg-secondary:  #11141b;
   --bg-tertiary:   #181c25;
@@ -159,8 +111,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   border-bottom:1px solid transparent;
   transition:background var(--transition),border-color var(--transition),box-shadow var(--transition);
 }
-.site-header.scrolled{border-bottom-color:var(--border);box-shadow:0 1px 12px rgba(10,20,40,.06)}
-[data-theme="dark"] .site-header.scrolled{box-shadow:0 1px 12px rgba(0,0,0,.35)}
+.site-header.scrolled{border-bottom-color:var(--border);box-shadow:0 1px 12px rgba(0,0,0,.35)}
 .header-inner{
   max-width:1140px;margin:0 auto;padding:0 1.5rem;
   display:flex;align-items:center;justify-content:space-between;height:60px;gap:1rem;
@@ -190,18 +141,6 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .gh-btn:hover{border-color:var(--accent);background:var(--accent-bg)}
 .gh-btn svg{width:15px;height:15px}
-.theme-btn{
-  display:inline-flex;align-items:center;justify-content:center;
-  width:36px;height:36px;flex:none;
-  border:1px solid var(--border-strong);border-radius:var(--radius-sm);
-  background:transparent;color:var(--text-secondary);cursor:pointer;padding:0;
-  transition:background var(--transition),border-color var(--transition),color var(--transition);
-}
-.theme-btn:hover{color:var(--accent);border-color:var(--accent)}
-.theme-btn svg{width:17px;height:17px}
-.theme-btn .icon-sun{display:none}
-[data-theme="dark"] .theme-btn .icon-sun{display:block}
-[data-theme="dark"] .theme-btn .icon-moon{display:none}
 
 /* ── Scroll progress ────────────────────────────────────── */
 #scroll-progress{
@@ -223,13 +162,14 @@ section.alt{background:var(--section-alt);transition:background var(--transition
    through a soft-edged radial mask — the spotlight. On load
    the light travels the body head→tail (script below), then
    follows the cursor; on touch it keeps sweeping on its own.
-   Light theme inverts the layers to dark maroon strokes. */
+   The PNG is inverted so its dark outlines render as light
+   strokes on the dark page; the lit copy is tinted gold. */
 .hero-bg{position:absolute;inset:0;pointer-events:none;overflow:hidden}
 .dragon-art{
   position:absolute;inset:-8% 0 -4%;
   --ryu-spot-x:50%;--ryu-spot-y:50%;--ryu-spot-r:0px;
-  --ryu-base-opacity:.17;
-  --ryu-reveal-opacity:.6;
+  --ryu-base-opacity:.22;
+  --ryu-reveal-opacity:.9;
   will-change:transform;
 }
 .dragon-art::before,
@@ -237,10 +177,10 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   content:"";position:absolute;inset:0;
   background:url("/assets/ryu.png") center/contain no-repeat;
 }
-.dragon-art::before{opacity:var(--ryu-base-opacity)}
+.dragon-art::before{opacity:var(--ryu-base-opacity);filter:invert(1)}
 .dragon-art::after{
   opacity:var(--ryu-reveal-opacity);
-  filter:sepia(.55) saturate(1.9) brightness(1.12) drop-shadow(0 0 18px rgba(255,205,100,.35));
+  filter:invert(1) sepia(1) saturate(2.6) hue-rotate(-12deg) brightness(1.18) drop-shadow(0 0 16px rgba(255,210,90,.45));
   -webkit-mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
   mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
 }
@@ -250,9 +190,6 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   .dragon-art::after{display:none}
   .dragon-art{--ryu-base-opacity:.26}
 }
-[data-theme="light"] .dragon-art{--ryu-base-opacity:.14;--ryu-reveal-opacity:.55}
-[data-theme="light"] .dragon-art::before{filter:invert(1) sepia(.4) saturate(2) hue-rotate(-25deg)}
-[data-theme="light"] .dragon-art::after{filter:invert(1) sepia(.5) saturate(2.4) hue-rotate(-25deg) brightness(.85) drop-shadow(0 0 14px rgba(140,20,20,.3))}
 
 .hero-inner{position:relative}
 .hero .mark{width:74px;height:74px;margin:0 auto 1.6rem;filter:drop-shadow(0 10px 26px var(--accent-glow))}
@@ -713,10 +650,6 @@ section.alt .stage{background:var(--section-alt)}
         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
         <span>GitHub</span>
       </a>
-      <button class="theme-btn" id="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
-        <svg class="icon-sun" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
-        <svg class="icon-moon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-      </button>
     </div>
   </div>
 </header>
@@ -1095,29 +1028,6 @@ section.alt .stage{background:var(--section-alt)}
 <script>
 (function(){
   'use strict';
-
-  /* ── Theme toggle (light → dark → system) ── */
-  var STORAGE_KEY='ryuki-theme';
-  var html=document.documentElement;
-  var btn=document.getElementById('theme-toggle');
-  function prefers(){return window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}
-  function resolve(mode){return mode==='system'||!mode?prefers():mode}
-  function apply(mode){
-    html.setAttribute('data-theme-mode',mode);
-    html.setAttribute('data-theme',resolve(mode));
-    btn.title='Theme: '+mode;
-  }
-  btn.addEventListener('click',function(){
-    var cur=html.getAttribute('data-theme-mode');
-    var next=cur==='system'
-      ?(resolve('system')==='dark'?'light':'dark')
-      :cur==='light'?'dark':'system';
-    try{localStorage.setItem(STORAGE_KEY,next)}catch(e){}
-    apply(next);
-  });
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change',function(){
-    if(html.getAttribute('data-theme-mode')==='system') apply('system');
-  });
 
   /* ── Header shadow + scroll progress ── */
   var header=document.getElementById('site-header');
