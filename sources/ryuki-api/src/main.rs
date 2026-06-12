@@ -77,6 +77,80 @@ fn auth_session_for_request(auth_mode: AuthMode, auth_header: Option<&str>) -> A
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct DbAuthSessionRow {
+    user_id: String,
+    display_name: String,
+    roles: Vec<String>,
+}
+
+fn unverified_session(provider_mode: &str) -> AuthSession {
+    AuthSession {
+        user_id: "unauthenticated".into(),
+        display_name: "Unauthenticated".into(),
+        roles: Vec::new(),
+        token_valid: false,
+        provider_mode: provider_mode.into(),
+    }
+}
+
+fn session_from_db_row(row: DbAuthSessionRow) -> AuthSession {
+    AuthSession {
+        user_id: row.user_id,
+        display_name: row.display_name,
+        roles: row.roles,
+        token_valid: true,
+        provider_mode: "persisted-session".into(),
+    }
+}
+
+fn bearer_value(auth_header: Option<&str>) -> Option<&str> {
+    auth_header?.trim().strip_prefix("Bearer ").map(str::trim)
+}
+
+fn session_id_from_headers(
+    headers: &HeaderMap,
+    auth_header: Option<&str>,
+) -> Option<Result<Uuid, ()>> {
+    if let Some(raw_session_id) = headers
+        .get("X-Ryuki-Session-Id")
+        .and_then(|value| value.to_str().ok())
+    {
+        return Some(Uuid::parse_str(raw_session_id.trim()).map_err(|_| ()));
+    }
+
+    let auth_value = bearer_value(auth_header)?;
+    if auth_value.is_empty() {
+        return None;
+    }
+    Uuid::parse_str(auth_value).ok().map(Ok)
+}
+
+async fn auth_session_from_persisted_session(
+    headers: &HeaderMap,
+    auth_header: Option<&str>,
+) -> Option<AuthSession> {
+    let session_id = match session_id_from_headers(headers, auth_header)? {
+        Ok(session_id) => session_id,
+        Err(()) => return Some(unverified_session("invalid-session-id")),
+    };
+    let pool = crate::database::get_db()?;
+    match sqlx::query_as::<_, DbAuthSessionRow>(
+        "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => Some(session_from_db_row(row)),
+        Ok(None) => Some(unverified_session("session-not-found")),
+        Err(error) => {
+            tracing::error!(error = %error, "auth session lookup failed");
+            Some(unverified_session("session-lookup-failed"))
+        }
+    }
+}
+
 fn is_unsafe_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -107,7 +181,9 @@ async fn auth_middleware(
         provider_mode = log.provider_mode,
         "auth middleware"
     );
-    let session = auth_session_for_request(auth_mode, auth_header);
+    let session = auth_session_from_persisted_session(&headers, auth_header)
+        .await
+        .unwrap_or_else(|| auth_session_for_request(auth_mode, auth_header));
 
     if is_unsafe_method(&method)
         && !is_auth_exempt_path(&path)
@@ -990,6 +1066,53 @@ mod tests {
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
+    }
+
+    #[test]
+    fn test_session_id_from_header() {
+        let session_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            HeaderValue::from_str(&session_id.to_string()).unwrap(),
+        );
+
+        let parsed = session_id_from_headers(&headers, None)
+            .expect("session header should be recognized")
+            .expect("session header should parse");
+        assert_eq!(parsed, session_id);
+    }
+
+    #[test]
+    fn test_session_id_from_bearer_uuid() {
+        let session_id = Uuid::new_v4();
+        let headers = HeaderMap::new();
+
+        let parsed = session_id_from_headers(&headers, Some(&format!("Bearer {}", session_id)))
+            .expect("bearer uuid should be recognized")
+            .expect("bearer uuid should parse");
+        assert_eq!(parsed, session_id);
+    }
+
+    #[test]
+    fn test_non_uuid_bearer_is_not_session_id() {
+        let headers = HeaderMap::new();
+        assert!(session_id_from_headers(&headers, Some("Bearer jwt-token")).is_none());
+    }
+
+    #[test]
+    fn test_db_session_row_maps_to_verified_session() {
+        let session = session_from_db_row(DbAuthSessionRow {
+            user_id: "platform-engineer".into(),
+            display_name: "Platform Engineer".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
+        });
+
+        assert_eq!(session.provider_mode, "persisted-session");
+        assert!(session.token_valid);
+        assert!(session
+            .roles
+            .contains(&ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()));
     }
 
     #[test]

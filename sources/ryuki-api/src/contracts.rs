@@ -6090,16 +6090,24 @@ fn map_auth_session_persistence_result<T, E: std::fmt::Display>(
     })
 }
 
+fn static_login_roles() -> [&'static str; 2] {
+    [
+        ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN,
+        ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR,
+    ]
+}
+
 async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let app_cfg = crate::config_store::get_app_config();
     if app_cfg.auth_mode == AuthMode::MockDryRun || app_cfg.entra_tenant_id.is_empty() {
         let session_id = Uuid::new_v4();
+        let roles = static_login_roles();
         let session_data = json!({
             "session_id": session_id.to_string(),
             "user_id": "platform-engineer",
             "display_name": "Platform Engineer",
             "email": "platform-engineer@ryuki.local",
-            "roles": ["platform-engineer", "operator", "viewer"],
+            "roles": roles,
             "token_valid": false,
             "provider_mode": "static-dry-run"
         });
@@ -6113,7 +6121,7 @@ async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
                 .bind("platform-engineer")
                 .bind("Platform Engineer")
                 .bind("platform-engineer@ryuki.local")
-                .bind(&["platform-engineer", "operator", "viewer"] as &[&str])
+                .bind(&roles as &[&str])
                 .execute(pool)
                 .await,
                 "create",
@@ -11534,6 +11542,14 @@ mod unit_tests {
         assert!(!serde_json::to_string(&body)
             .unwrap()
             .contains("internal session persistence marker"));
+    }
+
+    #[test]
+    fn test_static_login_uses_rbac_roles() {
+        let roles = static_login_roles();
+
+        assert!(roles.contains(&ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN));
+        assert!(roles.contains(&ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR));
     }
 
     #[tokio::test]
