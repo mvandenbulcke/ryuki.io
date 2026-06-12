@@ -158,10 +158,10 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 /* ── Hero backdrop: the hidden ryū ────────────────────────
    The dragon (ivory line art on alpha, /assets/ryu.png) is
-   layered twice: a faint base and a bright "lit" copy seen
-   through a soft-edged radial mask — the spotlight. On load
-   the light travels the body head→tail (script below), then
-   follows the cursor; on touch it keeps sweeping on its own.
+   layered twice: a faint base and a gold-recolored copy seen
+   through a soft-edged radial mask. On load the gold lights up
+   from the center and expands to the sides, then fades; after
+   that it follows the cursor (or sweeps on its own on touch).
    The PNG is inverted so its dark outlines render as light
    strokes on the dark page; the lit copy is tinted gold. */
 .hero-bg{position:absolute;inset:0;pointer-events:none;overflow:hidden}
@@ -179,8 +179,8 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .dragon-art::before{opacity:var(--ryu-base-opacity);filter:invert(1)}
 .dragon-art::after{
-  opacity:var(--ryu-reveal-opacity);
-  filter:invert(1) sepia(1) saturate(2.6) hue-rotate(-12deg) brightness(1.18) drop-shadow(0 0 16px rgba(255,210,90,.45));
+  opacity:calc(var(--ryu-reveal-opacity)*var(--ryu-fade,1));
+  filter:invert(1) sepia(1) saturate(3) hue-rotate(-10deg) brightness(1.08);
   -webkit-mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
   mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
 }
@@ -1111,11 +1111,12 @@ section.alt .stage{background:var(--section-alt)}
   }
 
   /* ── The ryū engine: load light-up + cursor spotlight ─────
-     On load the soft light travels along the dragon's body,
-     head to tail, lighting it up. Afterwards the spotlight
-     follows the cursor (or keeps sweeping on touch screens).
-     Clicking the hero mark makes the whole dragon flare;
-     typing "ryu" replays the head-to-tail light-up. */
+     On load the line work turns gold from the center outward —
+     an expanding circle — until the whole dragon is lit, holds
+     a beat, then fades back to the faint base. Afterwards the
+     spotlight follows the cursor (or keeps sweeping on touch
+     screens). Clicking the hero mark makes the whole dragon
+     flare; typing "ryu" replays the center-out light-up. */
   var fine=window.matchMedia('(pointer: fine)').matches;
   var art=document.querySelector('.dragon-art');
   var heroEl=document.querySelector('.hero');
@@ -1124,29 +1125,16 @@ section.alt .stage{background:var(--section-alt)}
   if(art&&!reduced)art.classList.add('play-ink');
 
   if(art&&!reduced){
-    /* waypoints along the dragon's body, in ryu.png pixel coords */
-    var IMG_W=1672,IMG_H=941;
-    var BODY=[[265,240],[380,420],[600,620],[840,660],[1040,400],[1230,550],[1430,260],[1560,210]];
-    var sx=0,sy=0,sr=0,tx=0,ty=0,tr=0,spotRaf=null;
-    var introStart=null,introDone=false,INTRO_MS=2600;
+    var sx=0,sy=0,sr=0,tx=0,ty=0,tr=0,fade=1,spotRaf=null;
+    var introStart=null,introDone=false;
+    var GROW=1700,HOLD=400,FADE=900;
     var sweeping=!fine,heroVisible=true,roaring=false;
 
-    var toElem=function(rect,x,y){
-      var s=Math.min(rect.width/IMG_W,rect.height/IMG_H);
-      return [(rect.width-IMG_W*s)/2+x*s,(rect.height-IMG_H*s)/2+y*s];
-    };
-    var bodyAt=function(rect,t){
-      var n=BODY.length-1,f=Math.max(0,Math.min(.9999,t))*n,i=Math.floor(f),u=f-i;
-      var p0=BODY[i>0?i-1:0],p1=BODY[i],p2=BODY[i<n?i+1:n],p3=BODY[i+2<n?i+2:n];
-      var u2=u*u,u3=u2*u;
-      var x=.5*(2*p1[0]+(-p0[0]+p2[0])*u+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*u2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*u3);
-      var y=.5*(2*p1[1]+(-p0[1]+p2[1])*u+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*u2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*u3);
-      return toElem(rect,x,y);
-    };
     var setSpot=function(){
       art.style.setProperty('--ryu-spot-x',sx.toFixed(1)+'px');
       art.style.setProperty('--ryu-spot-y',sy.toFixed(1)+'px');
       art.style.setProperty('--ryu-spot-r',Math.max(0,sr).toFixed(1)+'px');
+      art.style.setProperty('--ryu-fade',Math.max(0,Math.min(1,fade)).toFixed(3));
     };
     var spotFrame=function(ts){
       var rect=art.getBoundingClientRect();
@@ -1154,19 +1142,25 @@ section.alt .stage{background:var(--section-alt)}
       if(!introDone&&!roaring){
         if(introStart===null){
           introStart=ts;
-          var p0=bodyAt(rect,0);
-          sx=tx=p0[0];sy=ty=p0[1];sr=0;
+          sx=tx=rect.width*.5;sy=ty=rect.height*.5;sr=tr=0;fade=1;
         }
-        var it=(ts-introStart)/INTRO_MS;
-        if(it>=1){
-          introDone=true;
-          if(fine)tr=0;
+        var el=ts-introStart;
+        var Rcover=Math.sqrt(rect.width*rect.width+rect.height*rect.height)*.5+60;
+        tx=rect.width*.5;ty=rect.height*.5;
+        if(el<GROW){
+          var p=el/GROW;
+          sr=tr=Rcover*(1-Math.pow(1-p,3));
+          fade=1;
+        }else if(el<GROW+HOLD){
+          sr=tr=Rcover;
+          fade=1;
+        }else if(el<GROW+HOLD+FADE){
+          sr=tr=Rcover;
+          fade=1-(el-GROW-HOLD)/FADE;
         }else{
-          var e=it<.5?2*it*it:1-Math.pow(-2*it+2,2)/2;
-          var p=bodyAt(rect,e);
-          tx=p[0];ty=p[1];
-          var ramp=it<.12?it/.12:(fine&&it>.86?(1-it)/.14:1);
-          tr=R*ramp;
+          introDone=true;
+          fade=1;
+          sr=tr=fine?0:R*1.15;
         }
       }else if(sweeping&&!roaring){
         tx=rect.width*.5+rect.width*.34*Math.sin(ts*.00031);
@@ -1207,7 +1201,7 @@ section.alt .stage{background:var(--section-alt)}
     /* roar: the whole dragon flares for a moment */
     var roar=function(){
       var rect=art.getBoundingClientRect();
-      roaring=true;
+      roaring=true;fade=1;
       tx=rect.width*.5;ty=rect.height*.45;tr=rect.width*.8;
       wakeSpot();
       setTimeout(function(){
@@ -1225,7 +1219,7 @@ section.alt .stage{background:var(--section-alt)}
         roar();
       });
     }
-    /* type "ryu": the dragon lights up again, head to tail */
+    /* type "ryu": the dragon lights up again, center outward */
     var buf='';
     document.addEventListener('keydown',function(e){
       if(e.key.length!==1)return;
