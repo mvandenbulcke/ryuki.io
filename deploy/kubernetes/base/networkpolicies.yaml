@@ -132,3 +132,152 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-platform-api-egress-to-db
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ryuki-infrastructure-platform
+      app.kubernetes.io/name: platform-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: ryuki-platform-db
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-db-from-platform-api
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-db
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: ryuki-platform-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: ryuki-infrastructure-platform
+              app.kubernetes.io/name: platform-api
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# CNPG intra-cluster traffic: replication on 5432 and the instance-manager
+# status port on 8000. Necessary but not sufficient under default-deny: the
+# instance manager also needs egress to the kube-apiserver (cluster-specific
+# ipBlock — supply via overlay), and Barman backups will need egress to the
+# object-store endpoint once F6 lands. Both are tracked as deployment-time
+# TODOs in the base README.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-db-intra-cluster
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-db
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: ryuki-platform-db
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: ryuki-platform-db
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: ryuki-platform-db
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+---
+# CloudNativePG operator access: status probes and failover orchestration hit
+# the instance-manager (8000) and postgres (5432) ports from the operator
+# namespace. Selector assumes the default `cnpg-system` install namespace —
+# verify on the target cluster before relying on this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-db-from-cnpg-operator
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-db
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: ryuki-platform-db
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+
+# Vault egress stub — enabled with the Vault Secrets Operator slice
+# (deploy/kubernetes/vault/vso-secrets.yaml). VSO syncs Vault material into
+# Kubernetes Secrets itself; uncomment only if platform-api pods need to call
+# Vault directly.
+#
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-platform-api-egress-to-vault
+#   namespace: ryuki-platform
+#   labels:
+#     app.kubernetes.io/part-of: ryuki-infrastructure-platform
+#     app.kubernetes.io/name: platform-api
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app.kubernetes.io/part-of: ryuki-infrastructure-platform
+#       app.kubernetes.io/name: platform-api
+#   policyTypes:
+#     - Egress
+#   egress:
+#     - to:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: vault
+#       ports:
+#         - protocol: TCP
+#           port: 8200

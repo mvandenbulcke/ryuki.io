@@ -70,6 +70,22 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     sqlx::migrate!("../../migrations").run(pool).await
 }
 
+/// Whether a failed database connection is fatal instead of falling back to
+/// in-memory stores (RYUKI_DATABASE__REQUIRED / database.required). Loaded
+/// directly from configuration on the failure path so this module does not
+/// depend on process startup order; only consulted when connecting fails.
+fn database_required() -> bool {
+    match ryuki_core::config::RyukiConfig::load() {
+        Ok(config) => config.database.required,
+        // A malformed unrelated env var must not fail this flag open into the
+        // silent in-memory fallback it exists to prevent: read the raw env
+        // value directly when full config parsing is unavailable.
+        Err(_) => std::env::var("RYUKI_DATABASE__REQUIRED")
+            .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+            .unwrap_or(false),
+    }
+}
+
 pub async fn try_connect_with_url(
     url: &str,
     max_connections: u32,
@@ -92,6 +108,12 @@ pub async fn try_connect_with_url(
             Some(pool)
         }
         Err(e) => {
+            if database_required() {
+                tracing::error!(
+                    "database unavailable and database.required is true; refusing in-memory fallback: {e}"
+                );
+                std::process::exit(1);
+            }
             tracing::warn!("database unavailable, falling back to in-memory stores: {e}");
             None
         }

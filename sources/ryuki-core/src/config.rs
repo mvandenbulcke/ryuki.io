@@ -892,6 +892,15 @@ impl Default for MaintenanceWindowConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DatabaseConfig {
+    /// When true, a failed database connection at startup is fatal (the
+    /// process exits non-zero) instead of falling back to in-memory stores.
+    /// Set via RYUKI_DATABASE__REQUIRED. Defaults to false for local dev.
+    #[serde(default)]
+    pub required: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RateLimitConfig {
     #[serde(default = "default_rate_limit_enabled")]
@@ -940,6 +949,8 @@ pub struct RyukiConfig {
     pub server: ServerConfig,
     #[serde(default = "default_database_url")]
     pub database_url: String,
+    #[serde(default)]
+    pub database: DatabaseConfig,
     #[serde(default)]
     pub auth_mode: AuthMode,
     #[serde(default)]
@@ -1019,6 +1030,7 @@ impl Default for RyukiConfig {
         Self {
             server: ServerConfig::default(),
             database_url: default_database_url(),
+            database: DatabaseConfig::default(),
             auth_mode: AuthMode::default(),
             entra_tenant_id: String::new(),
             entra_client_id: String::new(),
@@ -1370,6 +1382,22 @@ mod tests {
         assert_eq!(config.server.pool_idle_timeout_secs, 300);
         assert_eq!(config.server.pool_acquire_timeout_secs, 30);
         assert_eq!(config.server.pool_max_lifetime_secs, 1800);
+        assert!(!config.database.required);
+    }
+
+    #[test]
+    fn test_database_required_parses_from_nested_key() {
+        // Mirrors the nested key that RYUKI_DATABASE__REQUIRED produces via
+        // Env::prefixed("RYUKI_").split("__").
+        let config: RyukiConfig = Figment::new()
+            .merge(figment::providers::Serialized::defaults(
+                RyukiConfig::default(),
+            ))
+            .merge(Toml::string("[database]\nrequired = true"))
+            .extract()
+            .expect("config with database.required should parse");
+        assert!(config.database.required);
+        assert!(config.validate().is_empty());
     }
 
     #[test]

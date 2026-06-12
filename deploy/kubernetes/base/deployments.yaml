@@ -19,6 +19,9 @@ spec:
         - name: portal-ui
           image: ryuki/portal-ui:rust-dev
           imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: portal-ui-config
           ports:
             - containerPort: 8080
           readinessProbe:
@@ -70,6 +73,14 @@ spec:
         - name: platform-api
           image: ryuki/platform-api:rust-dev
           imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: platform-api-config
+            # RYUKI_DATABASE_URL — materialized from Vault by the Vault Secrets
+            # Operator (deploy/kubernetes/vault/vso-secrets.yaml). For clusters
+            # without VSO, create this Secret out-of-band (see base README).
+            - secretRef:
+                name: ryuki-platform-api-db
           ports:
             - containerPort: 8080
           readinessProbe:
