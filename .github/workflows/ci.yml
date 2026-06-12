@@ -1,0 +1,94 @@
+name: CI
+
+# Gates main: build, test, lint, secret scan, validator, and (on push) image builds.
+# The Pages deploy (.github/workflows/static.yml) triggers via workflow_run on this
+# workflow's success, so broken code never redeploys the live site.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # rust-toolchain.toml pins the stable channel with rustfmt + clippy components.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Test workspace
+        run: cargo test --workspace
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check --all
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  security:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Run secret scan
+        run: ./scripts/no-secret-scan.sh
+
+  validate:
+    name: Validator
+    runs-on: ubuntu-latest
+    # TODO(catalog-contract-documentation-integrity): most validator slices still
+    # assert the retired C# repository layout and fail against the current tree
+    # (116/121 failing at the time of writing; run-all currently reports them as
+    # JSON and exits 0). Run the validator for visibility, but do not block CI on
+    # it until the "Catalog, contract & documentation integrity" theme
+    # (docs/design/missing-features.md) makes the slices green; then make run-all
+    # exit non-zero on failures and remove continue-on-error to turn this into a
+    # hard gate.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Run validator
+        run: cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
+
+  images:
+    name: Build Images
+    runs-on: ubuntu-latest
+    # Image builds are heavy; run them on pushes to main only (not PRs) for latency.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build platform-api image
+        run: docker build -t ryuki/platform-api:ci -f sources/ryuki-api/Dockerfile .
+      - name: Build portal-ui image
+        run: docker build -t ryuki/portal-ui:ci -f portal/portal-ui/Dockerfile .

@@ -1,7 +1,12 @@
 name: Deploy static content to Pages
 
+# Gated on CI: this deploy only runs after the "CI" workflow (.github/workflows/ci.yml)
+# completes successfully on main. Direct pushes to main still land in git as before;
+# the live Pages site only redeploys on a green CI run.
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: ["main"]
   workflow_dispatch:
 
@@ -16,6 +21,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
