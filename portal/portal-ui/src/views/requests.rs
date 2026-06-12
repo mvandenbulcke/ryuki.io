@@ -70,6 +70,7 @@ pub fn RequestList(
                                 .into_any()
                         } else {
                             view! {
+                                <div class="table-wrap">
                                 <table
                                     class="request-table dense-table"
                                     aria-label="Request list"
@@ -91,7 +92,9 @@ pub fn RequestList(
                                         {requests
                                             .into_iter()
                                             .map(|req| {
-                                                let id = req.id.clone();
+                                                let row_id = req.id.clone();
+                                                let button_id = req.id.clone();
+                                                let open_label = format!("Open request {}", req.id);
                                                 let display_id = if req.id.len() > 8 {
                                                     req.id[..8].to_string()
                                                 } else {
@@ -100,10 +103,24 @@ pub fn RequestList(
                                                 let badge_class = status_badge_class(&req.status);
                                                 let status_text = status_label(&req.status);
                                                 let stage_text = req.stage.clone();
-                                                let on_click = move |_| on_select.run(id.clone());
+                                                let on_row_click = move |_| on_select.run(row_id.clone());
+                                                // Real button so the row is reachable and
+                                                // activatable by keyboard, not mouse-only.
+                                                let on_id_click = move |ev: leptos::ev::MouseEvent| {
+                                                    ev.stop_propagation();
+                                                    on_select.run(button_id.clone());
+                                                };
                                                 view! {
-                                                    <tr class="request-row clickable" on:click=on_click>
-                                                        <td class="cell-id">{display_id}</td>
+                                                    <tr class="request-row clickable" on:click=on_row_click>
+                                                        <td class="cell-id">
+                                                            <button
+                                                                class="row-link"
+                                                                aria-label=open_label
+                                                                on:click=on_id_click
+                                                            >
+                                                                {display_id}
+                                                            </button>
+                                                        </td>
                                                         <td>{req.request_type}</td>
                                                         <td>{req.name}</td>
                                                         <td>{req.site}</td>
@@ -117,6 +134,7 @@ pub fn RequestList(
                                             .collect_view()}
                                     </tbody>
                                 </table>
+                                </div>
                             }
                                 .into_any()
                         }

@@ -1,5 +1,6 @@
 use crate::api::admin_platform_settings_path;
 use crate::server_boundary::{get_admin_platform_settings, perform_login};
+use crate::shell::BrandMark;
 use leptos::prelude::*;
 
 #[component]
@@ -10,7 +11,7 @@ pub fn LoginView() -> impl IntoView {
         <div class="login-page">
             <div class="login-card">
                 <div class="login-brand">
-                    <span class="brand-mark" aria-hidden="true">"R"</span>
+                    <BrandMark/>
                     <span>
                         <span class="brand-kicker">"Ryuki"</span>
                         <strong>"Infrastructure Platform"</strong>

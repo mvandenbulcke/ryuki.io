@@ -9,6 +9,47 @@ pub fn is_authenticated() -> bool {
     true
 }
 
+/// The ryū logo mark shared with the ryuki.io landing page. Colors come from
+/// the shared `--logo-red`/`--logo-gold` tokens, which do not vary by theme;
+/// they ride on `style` because SVG presentation attributes do not reliably
+/// resolve `var()` in every browser.
+#[component]
+pub fn BrandMark() -> impl IntoView {
+    view! {
+        <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+                <path
+                    d="M 35.5 15.3 A 20 20 0 1 0 50.0 26.2"
+                    fill="none"
+                    style="stroke: var(--logo-red)"
+                    stroke-width="7.5"
+                    stroke-linecap="round"
+                />
+                <path
+                    d="M 15.5 18.5 L 6.8 19.7 M 8.6 35.0 L 3.3 42.0 M 15.5 51.5 L 16.7 60.2"
+                    fill="none"
+                    style="stroke: var(--logo-red)"
+                    stroke-width="2.7"
+                    stroke-linecap="round"
+                />
+                <path
+                    d="M 35.5 15.3 C 31.5 10.8 27.0 9.3 22.5 10.3"
+                    fill="none"
+                    style="stroke: var(--logo-red)"
+                    stroke-width="3"
+                    stroke-linecap="round"
+                />
+                <path
+                    d="M 46.5 24.5 L 43 18.5 L 44.5 14 L 40 9 L 46 10.5 L 50.5 4.5 L 51.5 11.5 L 57 13 L 53.5 17.5 L 53.8 22.5 Z"
+                    style="fill: var(--logo-red)"
+                />
+                <circle cx="48.4" cy="13.2" r="1.6" style="fill: var(--logo-gold)" />
+                <circle cx="32" cy="35" r="5.8" style="fill: var(--logo-gold)" />
+            </svg>
+        </span>
+    }
+}
+
 #[component]
 pub fn Shell() -> impl IntoView {
     let route_snapshot = PortalRouteStateSnapshot::static_dry_run()
@@ -120,7 +161,7 @@ pub fn Shell() -> impl IntoView {
         <div class="shell">
             <header class="topbar" aria-label="Product shell">
                 <a class="brand" href=home_href aria-label="Ryuki Infrastructure Platform home">
-                    <span class="brand-mark" aria-hidden="true">"R"</span>
+                    <BrandMark/>
                     <span>
                         <span class="brand-kicker">"Ryuki"</span>
                         <strong>"Infrastructure Platform"</strong>
