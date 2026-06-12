@@ -50,6 +50,16 @@ pub fn run() {
             println!();
 
             let validation_errors = config.validate();
+            let validation_warnings = config.validation_warnings();
+
+            if !validation_warnings.is_empty() {
+                println!("[WARN] Config validation warnings:");
+                for warning in &validation_warnings {
+                    println!("  - {warning}");
+                }
+                println!();
+            }
+
             if validation_errors.is_empty() {
                 println!("[OK] Config validation passed");
                 println!("\nStatus: VALID");
