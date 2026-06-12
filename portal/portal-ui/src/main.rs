@@ -7,7 +7,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use ryuki_portal_ui::app::{shell, App};
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
 
-    let configuration = get_configuration(Some("Cargo.toml"))?;
+    // Read Leptos config from the environment: cargo-leptos injects LEPTOS_*
+    // vars when serving, and the container image sets them explicitly. The
+    // binary runs where no Cargo.toml exists, so file-based config can't work.
+    let configuration = get_configuration(None)?;
     let leptos_options = configuration.leptos_options;
     let address = leptos_options.site_addr;
     let routes = generate_route_list(App);
