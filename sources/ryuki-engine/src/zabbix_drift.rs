@@ -291,11 +291,12 @@ pub fn plan_remediation(drift_id: &str) -> Result<DriftReport, String> {
 }
 
 pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> {
-    let store = drift_store().lock().unwrap();
-    let drift = store
+    let mut store = drift_store().lock().unwrap();
+    let idx = store
         .iter()
-        .find(|d| d.id == drift_id)
+        .position(|d| d.id == drift_id)
         .ok_or_else(|| format!("Drift report not found: {}", drift_id))?;
+    let drift = &mut store[idx];
 
     if drift.status != DriftStatus::Planned {
         return Err(format!(
@@ -319,6 +320,13 @@ pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> 
         "DRY-RUN: Maintenance window overlap checked (simulated)".into(),
     ];
 
+    drift.status = DriftStatus::Validated;
+    drift.updated_at = chrono::Utc::now().to_rfc3339();
+    drift.metadata.insert(
+        "remediation_validated_at".into(),
+        chrono::Utc::now().to_rfc3339(),
+    );
+
     Ok(ValidationResult {
         passed: true,
         errors: Vec::new(),
@@ -337,9 +345,9 @@ pub fn execute_remediation(drift_id: &str) -> Result<Vec<EvidenceItem>, String> 
 
     let mut drift = store[idx].clone();
 
-    if drift.status != DriftStatus::Planned {
+    if drift.status != DriftStatus::Validated {
         return Err(format!(
-            "Cannot execute remediation for drift in status {:?}. Must be Planned first.",
+            "Cannot execute remediation for drift in status {:?}. Must be Validated first.",
             drift.status
         ));
     }
@@ -536,10 +544,21 @@ mod tests {
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();
+        validate_remediation(&first_id).unwrap();
         let evidence = execute_remediation(&first_id).unwrap();
         assert!(evidence.len() >= 3);
         assert!(evidence.iter().any(|e| e.key == "pre-remediation-snapshot"));
         assert!(evidence.iter().any(|e| e.key == "post-remediation-verify"));
+    }
+
+    #[test]
+    fn test_execute_remediation_requires_validation() {
+        let reports = detect_drift("DEFRA").unwrap();
+        let first_id = reports[0].id.clone();
+
+        plan_remediation(&first_id).unwrap();
+        let error = execute_remediation(&first_id).unwrap_err();
+        assert!(error.contains("Must be Validated first"));
     }
 
     #[test]
@@ -548,6 +567,7 @@ mod tests {
         let first_id = reports[0].id.clone();
 
         plan_remediation(&first_id).unwrap();
+        validate_remediation(&first_id).unwrap();
         execute_remediation(&first_id).unwrap();
         let result = verify_remediation(&first_id).unwrap();
         assert!(result.passed);
