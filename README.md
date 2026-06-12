@@ -6,7 +6,9 @@
 
 <p align="center"><em>竜騎 &mdash; the Dragon Knight. A governed control plane that watches over your infrastructure.</em></p>
 
-System engineer platform engineering portal for multi-site datacenter infrastructure management — **47+ engines, 89 UN/LOCODE locations, 33 countries, 690+ tests**.
+System-engineer platform for multi-site datacenter infrastructure management — **58 domain engines, 17 provider adapters, 116 catalog contracts, 230 static validation checks, 1,380+ tests, 100% Rust**.
+
+**Website & documentation:** [ryuki.io](https://ryuki.io) · [Getting Started](https://ryuki.io/getting-started.html) · [Architecture](https://ryuki.io/architecture.html) · [Configuration](https://ryuki.io/configuration.html)
 
 ## What It Does
 
@@ -28,19 +30,20 @@ Ryuki is an operational control plane that gives system engineers, datacenter te
 | **Firmware Lifecycle** | EOL tracking, compliance exceptions, vendor summaries, firmware governance |
 | **Incident Context** | Context assembly, affected services, on-call escalation, dependency graph |
 | **Access Recertification** | AD groups, service accounts, local admin, sudo — recertification campaigns |
-| **Site Registry** | UN/LOCODE reference (89 locations, 33 countries), activate/deactivate via admin |
+| **Site Registry** | UN/LOCODE reference (89 locations, 49 countries), activate/deactivate via admin |
+| **Adapter Framework** | 17 provider adapters: VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, ServiceNow |
 | **Evidence & Audit** | Redacted evidence packs, approval chains, shift handover, compliance dashboards |
 | **Break-Glass** | Emergency change with full audit trail, no bypass on evidence |
 
 ### Request Lifecycle
 
-Every infrastructure request flows through governed stages:
+Every infrastructure request flows through governed statuses:
 
 ```
-Intake → Validate → Plan → Approve → Lock → Execute → Verify → Protect → Publish → Maintain → Retire
+Draft → Intake → Validated → Planned → Approved → Locked → Executing → Verifying → Completed
 ```
 
-Each stage produces redacted evidence suitable for audit, CAB, incident review, and handover.
+A request that fails at any stage lands in a terminal `Failed` status and keeps its full evidence trail. Each stage produces redacted evidence suitable for audit, CAB, incident review, and handover.
 
 ## Architecture
 
@@ -54,9 +57,9 @@ Browser → Portal UI (Leptos/Axum SSR) → Platform API (Axum) → Engine + Dat
 |---|---|---|
 | `portal-ui` | Rust / Leptos / Axum | Full-stack SSR portal, same-origin API boundary, role-filtered navigation |
 | `ryuki-api` | Rust / Axum / sqlx | Control plane API, Entra ID auth, request lifecycle, admin settings |
-| `ryuki-engine` | Rust | 47+ domain engines: models, evidence pipeline, health monitoring, adapters, workflows |
+| `ryuki-engine` | Rust | 58 domain engines: models, evidence pipeline, health monitoring, adapters, workflows |
 | `ryuki-core` | Rust | Shared types, secret scanning, YAML utilities |
-| `ryuki-validator` | Rust | Self-contained static validation engine |
+| `ryuki-validator` | Rust | Self-contained static validation engine — 121 validator modules, 230 coverage checks |
 | PostgreSQL | CloudNativePG / Docker | Control plane database, migrations via sqlx |
 | Vault | HashiCorp Vault | Runtime secrets, adapter credentials, PKI |
 
@@ -92,7 +95,8 @@ docker compose -f deploy/compose/compose.yaml up -d platform-db
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your Entra ID tenant/client IDs
+# Edit .env — set RYUKI_DATABASE_URL; for live SSO set RYUKI_AUTH_MODE,
+# RYUKI_ENTRA_TENANT_ID, and RYUKI_ENTRA_CLIENT_ID
 
 # Build
 cargo build --workspace
@@ -148,16 +152,19 @@ See `docs/entra-app-registration.md` for the app manifest template.
 
 ## Configuration
 
-All configuration via environment variables. See `.env.example` for the full reference.
+All configuration via environment variables with the `RYUKI_` prefix (nested fields use `__`, e.g. `RYUKI_SERVER__BIND_ADDRESS`). See `.env.example` for the full reference.
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `ENTRA_TENANT_ID` | Azure AD directory ID |
-| `ENTRA_CLIENT_ID` | App registration client ID |
-| `ENTRA_AUTHORITY` | OIDC authority URL |
-| `PLATFORM_NAME` | Display name in portal |
-| `PLATFORM_URL` | Platform URL for redirects |
+| `RYUKI_DATABASE_URL` | PostgreSQL connection string |
+| `RYUKI_AUTH_MODE` | `mock-dry-run` (default) or `entra-id-live` |
+| `RYUKI_ENTRA_TENANT_ID` | Azure AD directory ID |
+| `RYUKI_ENTRA_CLIENT_ID` | App registration client ID |
+| `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL |
+| `RYUKI_PLATFORM_NAME` | Display name in portal |
+| `RYUKI_PLATFORM_URL` | Platform URL for redirects |
+
+Provider backends are selected per category — `RYUKI_HYPERVISOR_PROVIDER` (vmware / hyperv / proxmox / nutanix-ahv / xen / kvm), `RYUKI_BACKUP_PROVIDER`, `RYUKI_MONITORING_PROVIDER`, `RYUKI_SECRET_PROVIDER`, `RYUKI_DATABASE_PROVIDER`, `RYUKI_KUBERNETES_RUNTIME`, plus storage, DNS, IPAM, load-balancer, firewall, CI/CD, and SDN categories — all documented in `.env.example`.
 
 ### Site Management
 
@@ -181,4 +188,4 @@ See `docs/site-management.md` for details.
 
 ## License
 
-MIT
+[MIT](LICENSE)
