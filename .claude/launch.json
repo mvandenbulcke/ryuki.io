@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "docs-site",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "4173", "--directory", "docs"],
+      "port": 4173
+    },
+    {
+      "name": "portal",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": ["-c", "cd portal/portal-ui && PATH=\"$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH\" exec cargo leptos serve"],
+      "port": 8080
+    }
+  ]
+}

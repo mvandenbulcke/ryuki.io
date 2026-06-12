@@ -30,3 +30,9 @@ pgdata/
 # Tooling artifacts
 .graphify_python
 .atl/
+
+# Python
+__pycache__/
+
+# Local agent settings
+.claude/settings.local.json
