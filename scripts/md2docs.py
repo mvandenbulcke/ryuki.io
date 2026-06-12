@@ -147,6 +147,13 @@ TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} — Ryuki</title>
 <meta name="description" content="{description}">
+<link rel="canonical" href="https://ryuki.io/{name}.html">
+<meta property="og:type" content="article">
+<meta property="og:url" content="https://ryuki.io/{name}.html">
+<meta property="og:title" content="{title} — Ryuki">
+<meta property="og:description" content="{description}">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
@@ -171,6 +178,9 @@ TEMPLATE = """<!doctype html>
 body{{font-family:var(--font);background:var(--bg);color:var(--text);
   transition:background var(--transition),color var(--transition);line-height:1.65}}
 ::selection{{background:var(--accent);color:#fff}}
+.skip-link{{position:absolute;left:-9999px;top:0;z-index:30;background:#fff;
+  color:#0b0d12;padding:.6rem 1.1rem;border-radius:0 0 8px 0;font-weight:700;text-decoration:none;font-size:.9rem}}
+.skip-link:focus{{left:0}}
 .site-header{{position:sticky;top:0;z-index:10;background:var(--header-bg);
   -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border-bottom:1px solid var(--border)}}
 .header-inner{{max-width:1140px;margin:0 auto;padding:0 1.5rem;height:58px;
@@ -192,6 +202,11 @@ main{{min-width:0;max-width:820px;padding:2.6rem 0 5rem}}
   letter-spacing:.09em;color:var(--text-secondary);text-decoration:none;margin-bottom:.75rem}}
 .sb-label:hover{{color:var(--accent)}}
 .sb-label.active{{color:var(--accent)}}
+.sb-filter{{width:100%;margin:.1rem 0 .8rem;padding:.42rem .65rem;
+  font-family:var(--font);font-size:.8rem;color:var(--text);
+  background:var(--bg-secondary);border:1px solid var(--border);border-radius:7px;outline:none}}
+.sb-filter:focus{{border-color:var(--accent)}}
+.sb-empty{{display:none;font-size:.78rem;color:var(--text-secondary);padding:.2rem .65rem}}
 .sb-list{{list-style:none;margin:0;padding:0}}
 .sb-list>li{{margin:0}}
 .sb-link{{display:block;font-size:.85rem;font-weight:500;color:var(--text-secondary);
@@ -272,6 +287,7 @@ td code{{white-space:nowrap}}
 </style>
 </head>
 <body>
+<a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
   <div class="header-inner">
     <a href="/" class="brand"><svg class="mark" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -290,7 +306,7 @@ td code{{white-space:nowrap}}
 </header>
 <div class="docs-shell">
 {sidebar}
-<main>
+<main id="main">
 {crumb}
 {content}
 {footnav}
@@ -328,6 +344,32 @@ td code{{white-space:nowrap}}
       }},{{rootMargin:'-72px 0px -68% 0px',threshold:0}});
       targets.forEach(function(t){{spy.observe(t)}});
     }}
+  }}
+
+  /* sidebar filter */
+  var sbFilter=document.getElementById('sb-filter');
+  if(sbFilter){{
+    var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
+    var sbEmpty=document.getElementById('sb-empty');
+    sbFilter.addEventListener('input',function(){{
+      var q=sbFilter.value.trim().toLowerCase();
+      var shown=0;
+      sbItems.forEach(function(li){{
+        var link=li.querySelector('.sb-link');
+        var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
+        var secEls=li.querySelectorAll('.sb-sections li');
+        var any=titleMatch;
+        Array.prototype.forEach.call(secEls,function(s){{
+          var m=titleMatch||s.textContent.toLowerCase().indexOf(q)>-1;
+          s.style.display=m?'':'none';
+          if(m)any=true;
+        }});
+        if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
+        li.style.display=any?'':'none';
+        if(any)shown++;
+      }});
+      if(sbEmpty)sbEmpty.style.display=shown?'none':'block';
+    }});
   }}
 
   /* copy buttons on code blocks */
@@ -386,6 +428,8 @@ def build_sidebar(current: str, sections_map: dict) -> str:
     """Left nav pane: every article, the current one expanded with its h2s."""
     items = []
     for name, title, _ in PAGES:
+        secs_attr = html_mod.escape(
+            "\n".join(s[1].lower() for s in sections_map.get(name, [])), quote=True)
         if name == current:
             sub = ""
             secs = sections_map.get(name, [])
@@ -395,19 +439,23 @@ def build_sidebar(current: str, sections_map: dict) -> str:
                                  for sid, stitle in secs)
                        + "</ul>")
             items.append(f'<li><a class="sb-link active" aria-current="page" '
-                         f'href="/{name}.html">{title}</a>{sub}</li>')
+                         f'data-sections="{secs_attr}" href="/{name}.html">{title}</a>{sub}</li>')
         else:
-            items.append(f'<li><a class="sb-link" href="/{name}.html">{title}</a></li>')
+            items.append(f'<li><a class="sb-link" data-sections="{secs_attr}" '
+                         f'href="/{name}.html">{title}</a></li>')
     overview_cls = " active" if current == "documentation" else ""
     return ('<button class="sb-toggle" id="sb-toggle" aria-expanded="false" '
             f'aria-controls="docs-sidebar">Docs navigation {CHEVRON}</button>\n'
             '<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation">'
             f'<a class="sb-label{overview_cls}" href="/documentation.html">Documentation</a>'
-            '<ul class="sb-list">' + "".join(items) + "</ul></nav></aside>")
+            '<input type="search" id="sb-filter" class="sb-filter" placeholder="Filter docs" '
+            'aria-label="Filter documentation navigation" autocomplete="off">'
+            '<ul class="sb-list">' + "".join(items) + "</ul>"
+            '<p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>')
 
 
 def render(name, title, description, content, crumb, footnav, sidebar):
-    return TEMPLATE.format(title=title, description=description,
+    return TEMPLATE.format(name=name, title=title, description=description,
                            content=content, crumb=crumb, footnav=footnav,
                            sidebar=sidebar)
 
@@ -444,6 +492,34 @@ def main():
         render("documentation", "Documentation", "Ryuki platform documentation.",
                index_content, "", "", build_sidebar("documentation", sections_map)))
     print("docs/documentation.html")
+
+    nf_content = (
+        "<h1>404 \u2014 page not found</h1>"
+        "<p>The ry\u016b guards many treasures, but this page is not among them.</p>"
+        '<p><a href="/">Back to ryuki.io</a> \u00b7 '
+        '<a href="/documentation.html">Browse the documentation</a></p>')
+    nf_html = render("404", "Page not found", "This page does not exist.",
+                     nf_content, "", "", build_sidebar("404", sections_map))
+    nf_html = nf_html.replace(
+        '<link rel="canonical" href="https://ryuki.io/404.html">',
+        '<meta name="robots" content="noindex">')
+    nf_html = nf_html.replace('<meta property="og:type" content="article">\n', '')
+    nf_html = nf_html.replace('<meta property="og:url" content="https://ryuki.io/404.html">\n', '')
+    assert 'noindex' in nf_html and 'canonical' not in nf_html
+    (DOCS / "404.html").write_text(nf_html)
+    print("docs/404.html")
+
+    urls = ["https://ryuki.io/", "https://ryuki.io/documentation.html"] + [
+        f"https://ryuki.io/{name}.html" for name, _, _ in PAGES]
+    sitemap = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+               '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+               + "".join(f"  <url><loc>{u}</loc></url>\n" for u in urls)
+               + "</urlset>\n")
+    (DOCS / "sitemap.xml").write_text(sitemap)
+    print("docs/sitemap.xml")
+    (DOCS / "robots.txt").write_text(
+        "User-agent: *\nAllow: /\n\nSitemap: https://ryuki.io/sitemap.xml\n")
+    print("docs/robots.txt")
 
 
 if __name__ == "__main__":

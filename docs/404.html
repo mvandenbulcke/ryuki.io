@@ -3,13 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Entra App Registration — Ryuki</title>
-<meta name="description" content="OIDC / OAuth2 app registration and role setup for Entra ID.">
-<link rel="canonical" href="https://ryuki.io/entra-app-registration.html">
-<meta property="og:type" content="article">
-<meta property="og:url" content="https://ryuki.io/entra-app-registration.html">
-<meta property="og:title" content="Entra App Registration — Ryuki">
-<meta property="og:description" content="OIDC / OAuth2 app registration and role setup for Entra ID.">
+<title>Page not found — Ryuki</title>
+<meta name="description" content="This page does not exist.">
+<meta name="robots" content="noindex">
+<meta property="og:title" content="Page not found — Ryuki">
+<meta property="og:description" content="This page does not exist.">
 <meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
@@ -173,146 +171,19 @@ key decisions
 network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="environment variables
 entra id app registration
 postgresql
-admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link active" aria-current="page" data-sections="overview
+admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
 app roles definition
 how it works
 environment configuration
-important security notes" href="/entra-app-registration.html">Entra App Registration</a><ul class="sb-sections"><li><a href="#overview">Overview</a></li><li><a href="#app-roles-definition">App Roles Definition</a></li><li><a href="#how-it-works">How It Works</a></li><li><a href="#environment-configuration">Environment Configuration</a></li><li><a href="#important-security-notes">Important Security Notes</a></li></ul></li><li><a class="sb-link" data-sections="un/locode
+important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
 site selection flow
 managing sites
 current active sites
 important notes" href="/site-management.html">Site Management</a></li></ul><p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>
 <main id="main">
-<nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Entra App Registration</span></nav>
-<h1 id="entra-id-app-registration-app-roles">Entra ID App Registration — App Roles</h1>
-<h2 id="overview">Overview</h2>
-<p>The Ryuki Infrastructure Platform uses Entra ID <strong>app roles</strong> for RBAC instead of group-name-to-role mapping. Roles are defined in the Entra app registration manifest and assigned to users/groups in the enterprise application. The access token issued by Entra ID contains a <code>roles</code> claim which the platform reads directly — no group name mapping needed.</p>
-<h2 id="app-roles-definition">App Roles Definition</h2>
-<p>Define these roles in the app registration manifest (Entra admin center → App registrations → [Your App] → App roles). Replace <code>{APP_CLIENT_ID}</code> below with your actual client ID.</p>
-<h3 id="manifest-snippet">Manifest Snippet</h3>
-<pre><code class="lang-json">{
-  "id": "{APP_CLIENT_ID}",
-  "appRoles": [
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Full platform administration, approval, and audit access",
-      "displayName": "Platform Admin",
-      "id": "00000000-0000-0000-0000-000000000001",
-      "isEnabled": true,
-      "value": "PlatformAdmin"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Datacenter-level approval and audit",
-      "displayName": "Datacenter Approver",
-      "id": "00000000-0000-0000-0000-000000000002",
-      "isEnabled": true,
-      "value": "DatacenterApprover"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "VMware virtualization execution and audit",
-      "displayName": "VMware Operator",
-      "id": "00000000-0000-0000-0000-000000000003",
-      "isEnabled": true,
-      "value": "VMwareOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Hyper-V virtualization execution and audit",
-      "displayName": "Hyper-V Operator",
-      "id": "00000000-0000-0000-0000-000000000004",
-      "isEnabled": true,
-      "value": "HyperVOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Proxmox virtualization execution and audit",
-      "displayName": "Proxmox Operator",
-      "id": "00000000-0000-0000-0000-000000000005",
-      "isEnabled": true,
-      "value": "ProxmoxOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Operating system execution and audit",
-      "displayName": "Wintel/Linux Operator",
-      "id": "00000000-0000-0000-0000-000000000006",
-      "isEnabled": true,
-      "value": "WintelLinuxOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Backup execution and audit",
-      "displayName": "Backup Operator",
-      "id": "00000000-0000-0000-0000-000000000007",
-      "isEnabled": true,
-      "value": "BackupOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Monitoring execution and audit",
-      "displayName": "Monitoring Operator",
-      "id": "00000000-0000-0000-0000-000000000008",
-      "isEnabled": true,
-      "value": "MonitoringOperator"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Service Desk triage, request, and audit access",
-      "displayName": "Service Desk",
-      "id": "00000000-0000-0000-0000-000000000009",
-      "isEnabled": true,
-      "value": "ServiceDesk"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Read-only audit access",
-      "displayName": "Auditor",
-      "id": "00000000-0000-0000-0000-000000000010",
-      "isEnabled": true,
-      "value": "Auditor"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Request-only access",
-      "displayName": "Requester",
-      "id": "00000000-0000-0000-0000-000000000011",
-      "isEnabled": true,
-      "value": "Requester"
-    },
-    {
-      "allowedMemberTypes": ["User", "Group"],
-      "description": "Emergency administration and audit",
-      "displayName": "Break-Glass Admin",
-      "id": "00000000-0000-0000-0000-000000000012",
-      "isEnabled": true,
-      "value": "BreakGlassAdmin"
-    }
-  ]
-}</code></pre>
-<h2 id="how-it-works">How It Works</h2>
-<ol>
-<li>1. Roles are defined once in the app registration manifest (above).</li>
-<li>2. Users and/or groups are assigned roles in the <strong>Enterprise application</strong> blade (not the app registration).</li>
-<li>3. When a user authenticates, the access token issued by Entra ID includes a <code>roles</code> claim containing the assigned role values (e.g., <code>["PlatformAdmin", "Auditor"]</code>).</li>
-<li>4. Verified Entra role values are mapped to platform permissions.</li>
-<li>5. <code>check_permission()</code> maps verified role names to permissions for authorization decisions.</li>
-</ol>
-<h2 id="environment-configuration">Environment Configuration</h2>
-<p>Only the Entra tenant and client IDs are needed:</p>
-<pre><code class="lang-env">RYUKI_ENTRA_TENANT_ID=&lt;your-tenant-id&gt;
-RYUKI_ENTRA_CLIENT_ID=&lt;your-app-client-id&gt;
-RYUKI_ENTRA_AUTHORITY=https://login.microsoftonline.com
-RYUKI_AUTH_MODE=entra-id</code></pre>
-<h2 id="important-security-notes">Important Security Notes</h2>
-<ul>
-<li>- <strong>Do NOT commit</strong> the app registration manifest with real GUIDs, tenant IDs, or client IDs.</li>
-<li>- The manifest snippet above uses placeholder GUIDs (<code>00000000-...</code>) for documentation only.</li>
-<li>- Real role assignments are managed in the Entra admin center, not in code or Git.</li>
-<li>- Role <strong>values</strong> (like <code>"PlatformAdmin"</code>) are safe to keep in source code as string constants — they are not secrets.</li>
-</ul>
-<nav class="foot-nav"><a href="/configuration.html">&larr; Configuration</a><a href="/site-management.html">Site Management &rarr;</a></nav>
+
+<h1>404 — page not found</h1><p>The ryū guards many treasures, but this page is not among them.</p><p><a href="/">Back to ryuki.io</a> · <a href="/documentation.html">Browse the documentation</a></p>
+
 </main>
 </div>
 <script>

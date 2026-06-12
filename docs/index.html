@@ -13,16 +13,20 @@
 <meta property="og:url" content="https://ryuki.io/">
 <meta property="og:title" content="Ryuki — Governed Infrastructure Control Plane">
 <meta property="og:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure. Request, operate, evidence, and retire — with audit-ready evidence at every stage.">
-<meta property="og:image" content="https://ryuki.io/assets/og.png">
+<meta property="og:image" content="https://ryuki.io/assets/og.jpg">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Ryuki — Governed Infrastructure Control Plane">
 <meta name="twitter:description" content="Open-source, Rust-powered control plane for multi-site datacenter infrastructure.">
-<meta name="twitter:image" content="https://ryuki.io/assets/og.png">
+<meta name="twitter:image" content="https://ryuki.io/assets/og.jpg">
 
 <!-- Icons -->
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg">
 <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<link rel="preload" as="image" href="/assets/ryu.png">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Ryuki","url":"https://ryuki.io/","applicationCategory":"DeveloperApplication","operatingSystem":"Linux, Kubernetes","description":"Open-source, Rust-powered governed control plane for multi-site datacenter infrastructure.","license":"https://github.com/mvandenbulcke/ryuki.io/blob/main/LICENSE","sameAs":["https://github.com/mvandenbulcke/ryuki.io"],"offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}
+</script>
 
 <!-- JS flag: enables script-driven effects -->
 <script>document.documentElement.classList.add('js');</script>
@@ -95,6 +99,9 @@ body{
   overflow-x:hidden;
 }
 ::selection{background:var(--accent);color:#fff}
+.skip-link{position:absolute;left:-9999px;top:0;z-index:300;background:#fff;
+  color:#0b0d12;padding:.6rem 1.1rem;border-radius:0 0 8px 0;font-weight:700;text-decoration:none;font-size:.9rem}
+.skip-link:focus{left:0}
 
 .container{max-width:1140px;margin:0 auto;padding:0 1.5rem}
 section{padding:5.5rem 0;position:relative}
@@ -131,6 +138,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   transition:color var(--transition),background var(--transition);
 }
 .nav-link:hover{color:var(--text);background:var(--bg-tertiary)}
+.nav-link.active{color:var(--text);background:var(--bg-tertiary)}
 .header-right{display:flex;align-items:center;gap:.6rem}
 .gh-btn{
   display:inline-flex;align-items:center;gap:.45rem;
@@ -669,6 +677,8 @@ section.alt .stage{background:var(--section-alt)}
 </head>
 <body>
 
+<a class="skip-link" href="#main">Skip to content</a>
+
 <div id="scroll-progress" aria-hidden="true"></div>
 
 <header class="site-header" id="site-header">
@@ -700,7 +710,7 @@ section.alt .stage{background:var(--section-alt)}
   </div>
 </header>
 
-<main>
+<main id="main">
 
 <!-- ── Hero ─────────────────────────────────────────────── -->
 <section class="hero">
@@ -1559,7 +1569,7 @@ section.alt .stage{background:var(--section-alt)}
     var KEY='ryuki-stars',cached=null;
     try{cached=JSON.parse(sessionStorage.getItem(KEY)||'null')}catch(e){}
     var show=function(n){
-      if(typeof n!=='number')return;
+      if(typeof n!=='number'||n<1)return;
       var s=document.createElement('span');
       s.className='star-chip';
       s.textContent='\u2605 '+(n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':n);
@@ -1575,6 +1585,25 @@ section.alt .stage{background:var(--section-alt)}
       })
       .catch(function(){});
   })();
+
+  /* ── Header nav: highlight the section in view ── */
+  var navMap={};
+  ['features','lifecycle','architecture','quickstart'].forEach(function(id){
+    var a=document.querySelector('.site-nav a[href="#'+id+'"]');
+    var s=document.getElementById(id);
+    if(a&&s)navMap[id]={a:a,s:s};
+  });
+  var navIds=Object.keys(navMap);
+  if(navIds.length&&'IntersectionObserver' in window){
+    var inBand={};
+    var navIo=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){inBand[en.target.id]=en.isIntersecting});
+      var current=navIds.filter(function(k){return inBand[k]});
+      navIds.forEach(function(k){navMap[k].a.classList.remove('active')});
+      if(current.length)navMap[current[current.length-1]].a.classList.add('active');
+    },{rootMargin:'-40% 0px -55% 0px',threshold:0});
+    navIds.forEach(function(k){navIo.observe(navMap[k].s)});
+  }
 
   /* ── Feature cards: cursor ring + 3D tilt ── */
   Array.prototype.forEach.call(document.querySelectorAll('.feature-card'),function(card){
