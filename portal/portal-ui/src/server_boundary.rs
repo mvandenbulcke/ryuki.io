@@ -1150,21 +1150,34 @@ pub async fn get_request_detail(request_id: String) -> Result<RequestDetail, Ser
     Ok(request_detail_fallback(&request_id))
 }
 
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_request_create(
+    payload: CreateRequestPayload,
+) -> Result<RequestDetail, ServerFnError> {
+    let _ = payload;
+    Err(ServerFnError::new(
+        "Portal request creation is preview-only in static dry-run mode; no request was persisted",
+    ))
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_request_action(
+    request_id: String,
+    action: &str,
+) -> Result<StageActionResponse, ServerFnError> {
+    let _ = request_id;
+    Err(ServerFnError::new(format!(
+        "Portal request {action} is preview-only in static dry-run mode; no lifecycle state was changed"
+    )))
+}
+
 #[server(prefix = "/portal/api", endpoint = "request-create-save")]
 pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDetail, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     boundary
         .validate_platform_api_path(request_create_path())
         .map_err(|_| ServerFnError::new("request create API path failed same-origin guard"))?;
-    let mut detail = request_detail_fallback("REQ-NEW");
-    detail.request_type = payload.request_type;
-    detail.name = payload.name;
-    detail.site = payload.site;
-    detail.environment = payload.environment;
-    detail.cpu = payload.cpu;
-    detail.memory = payload.memory;
-    detail.justification = payload.justification;
-    Ok(detail)
+    reject_static_preview_request_create(payload)
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-validate")]
@@ -1175,12 +1188,7 @@ pub async fn validate_request(request_id: String) -> Result<StageActionResponse,
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request validate API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "validated".to_string(),
-        message: "Request validated successfully.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "validation")
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-plan")]
@@ -1191,12 +1199,7 @@ pub async fn plan_request(request_id: String) -> Result<StageActionResponse, Ser
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request plan API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "planned".to_string(),
-        message: "Dry-run plan generated successfully.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "planning")
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-approve")]
@@ -1207,12 +1210,7 @@ pub async fn approve_request(request_id: String) -> Result<StageActionResponse, 
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "approved".to_string(),
-        message: "Request approved by datacenter approver.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "approval")
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-lock")]
@@ -1223,12 +1221,7 @@ pub async fn lock_request(request_id: String) -> Result<StageActionResponse, Ser
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request lock API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "locked".to_string(),
-        message: "Request locked for execution.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "locking")
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-execute")]
@@ -1239,12 +1232,7 @@ pub async fn execute_request(request_id: String) -> Result<StageActionResponse, 
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "executed".to_string(),
-        message: "Request executed successfully.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "execution")
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
@@ -1255,12 +1243,7 @@ pub async fn verify_request(request_id: String) -> Result<StageActionResponse, S
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request verify API path failed same-origin guard"))?;
-    Ok(StageActionResponse {
-        request_id,
-        success: true,
-        new_stage: "verified".to_string(),
-        message: "Request verification passed.".to_string(),
-    })
+    reject_static_preview_request_action(request_id, "verification")
 }
 
 #[cfg(test)]
@@ -1332,6 +1315,40 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("preview-only"));
+    }
+
+    #[test]
+    fn create_request_refuses_static_preview_persistence() {
+        let payload = CreateRequestPayload {
+            request_type: "VM".to_string(),
+            name: "srv-app-01".to_string(),
+            site: "site-alpha".to_string(),
+            environment: "prod".to_string(),
+            cpu: 4,
+            memory: 16,
+            justification: "Need capacity".to_string(),
+        };
+        let result = reject_static_preview_request_create(payload);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("preview-only"));
+    }
+
+    #[test]
+    fn request_lifecycle_actions_refuse_static_preview_persistence() {
+        for action in [
+            "validation",
+            "planning",
+            "approval",
+            "locking",
+            "execution",
+            "verification",
+        ] {
+            let result = reject_static_preview_request_action("REQ-123".to_string(), action);
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("preview-only"));
+        }
     }
 
     #[test]
