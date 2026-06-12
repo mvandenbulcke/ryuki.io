@@ -77,39 +77,41 @@ pub struct CheckCoverage {
 static CHECK_STORE: OnceLock<Mutex<Vec<BaselineCheck>>> = OnceLock::new();
 static RESULT_STORE: OnceLock<Mutex<Vec<BaselineResult>>> = OnceLock::new();
 
+fn seeded_checks() -> Vec<BaselineCheck> {
+    vec![
+        BaselineCheck {
+            id: "bc-001".into(),
+            check_name: "CrowdStrike Falcon Agent".into(),
+            category: BaselineCategory::Security,
+            expected_value: "running".into(),
+            severity: BaselineSeverity::Critical,
+        },
+        BaselineCheck {
+            id: "bc-002".into(),
+            check_name: "VMware Tools".into(),
+            category: BaselineCategory::Tools,
+            expected_value: "running, current".into(),
+            severity: BaselineSeverity::High,
+        },
+        BaselineCheck {
+            id: "bc-003".into(),
+            check_name: "Zabbix Agent".into(),
+            category: BaselineCategory::Monitoring,
+            expected_value: "running, v6.4+".into(),
+            severity: BaselineSeverity::High,
+        },
+        BaselineCheck {
+            id: "bc-004".into(),
+            check_name: "Windows Firewall".into(),
+            category: BaselineCategory::Configuration,
+            expected_value: "enabled, domain profile".into(),
+            severity: BaselineSeverity::Critical,
+        },
+    ]
+}
+
 fn ensure_seeded() {
-    let _ = CHECK_STORE.get_or_init(|| {
-        Mutex::new(vec![
-            BaselineCheck {
-                id: "bc-001".into(),
-                check_name: "CrowdStrike Falcon Agent".into(),
-                category: BaselineCategory::Security,
-                expected_value: "running".into(),
-                severity: BaselineSeverity::Critical,
-            },
-            BaselineCheck {
-                id: "bc-002".into(),
-                check_name: "VMware Tools".into(),
-                category: BaselineCategory::Tools,
-                expected_value: "running, current".into(),
-                severity: BaselineSeverity::High,
-            },
-            BaselineCheck {
-                id: "bc-003".into(),
-                check_name: "Zabbix Agent".into(),
-                category: BaselineCategory::Monitoring,
-                expected_value: "running, v6.4+".into(),
-                severity: BaselineSeverity::High,
-            },
-            BaselineCheck {
-                id: "bc-004".into(),
-                check_name: "Windows Firewall".into(),
-                category: BaselineCategory::Configuration,
-                expected_value: "enabled, domain profile".into(),
-                severity: BaselineSeverity::Critical,
-            },
-        ])
-    });
+    let _ = CHECK_STORE.get_or_init(|| Mutex::new(seeded_checks()));
     let _ = RESULT_STORE.get_or_init(|| {
         let mut results = Vec::new();
         let servers = [
@@ -119,7 +121,7 @@ fn ensure_seeded() {
             ("srv-frpar-app01", "FRPAR"),
             ("srv-nlams-fs01", "NLAMS"),
         ];
-        let checks = CHECK_STORE.get().unwrap().lock().unwrap();
+        let checks = seeded_checks();
         let now = Utc::now().to_rfc3339();
         for (server_name, _site) in &servers {
             for check in checks.iter() {
@@ -219,15 +221,16 @@ pub fn get_noncompliant(site: &str) -> Result<Vec<NoncompliantServer>, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
+    let critical_check_ids: std::collections::HashSet<String> = {
+        let checks = check_store().lock().unwrap();
+        checks
+            .iter()
+            .filter(|c| c.severity == BaselineSeverity::Critical)
+            .map(|c| c.id.clone())
+            .collect()
+    };
+
     let results = result_store().lock().unwrap();
-    let checks = check_store().lock().unwrap();
-
-    let critical_check_ids: std::collections::HashSet<String> = checks
-        .iter()
-        .filter(|c| c.severity == BaselineSeverity::Critical)
-        .map(|c| c.id.clone())
-        .collect();
-
     let site_results: Vec<&BaselineResult> = results
         .iter()
         .filter(|r| server_site(&r.server_name) == site && !r.compliant)
@@ -294,7 +297,7 @@ pub fn get_compliance_trend(site: &str) -> Result<Vec<ComplianceTrendPoint>, Str
 }
 
 pub fn get_check_coverage() -> Vec<CheckCoverage> {
-    let checks = check_store().lock().unwrap();
+    let checks = check_store().lock().unwrap().clone();
     let results = result_store().lock().unwrap();
 
     checks
@@ -317,6 +320,14 @@ pub fn get_check_coverage() -> Vec<CheckCoverage> {
 }
 
 pub fn remediate_finding(server_name: &str, check_id: &str) -> Result<Value, String> {
+    let expected_value = {
+        let checks = check_store().lock().unwrap();
+        checks
+            .iter()
+            .find(|c| c.id == check_id)
+            .map(|c| c.expected_value.clone())
+    };
+
     let mut results = result_store().lock().unwrap();
 
     let idx = results
@@ -329,16 +340,9 @@ pub fn remediate_finding(server_name: &str, check_id: &str) -> Result<Value, Str
             )
         })?;
 
-    let check = {
-        let checks = check_store().lock().unwrap();
-        checks.iter().find(|c| c.id == check_id).cloned()
-    };
-
     let now = Utc::now().to_rfc3339();
     results[idx].compliant = true;
-    results[idx].actual_value = check
-        .map(|c| c.expected_value)
-        .unwrap_or_else(|| "remediated".into());
+    results[idx].actual_value = expected_value.unwrap_or_else(|| "remediated".into());
     results[idx].last_checked = now.clone();
 
     Ok(json!({
