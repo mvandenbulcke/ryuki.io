@@ -102,5 +102,5 @@ fn compose_services_have_healthchecks() {
     assert_eq!(portal_test[0], "CMD");
     assert_eq!(portal_test[1], "curl");
     assert_eq!(portal_test[2], "-f");
-    assert_eq!(portal_test[3], "http://localhost:8080/health");
+    assert_eq!(portal_test[3], "http://localhost:8080/healthz");
 }

@@ -1214,11 +1214,11 @@ mod tests {
 mod db_tests {
     #[tokio::test]
     async fn test_migrations_run_against_pg18() {
-        if std::env::var("DATABASE_URL").is_err() {
-            eprintln!("SKIP: DATABASE_URL not set");
+        if std::env::var("RYUKI_DATABASE_URL").is_err() {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         }
-        let url = std::env::var("DATABASE_URL").unwrap();
+        let url = std::env::var("RYUKI_DATABASE_URL").unwrap();
         crate::database::try_connect_with_url(&url, 5, 2, 300, 30, 1800).await;
         let db = crate::database::get_db().expect("database should be available");
         crate::database::run_migrations(db)

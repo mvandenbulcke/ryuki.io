@@ -1484,7 +1484,7 @@ fn AdminSettingsDetail() -> impl IntoView {
                                             }
                                         >
                                             <option value="mock-dry-run">"Mock dry-run"</option>
-                                            <option value="entra-id-live">"Entra ID (Live)"</option>
+                                            <option value="entra-id">"Entra ID"</option>
                                         </select>
                                         <span class="table-note">"Authentication provider mode"</span>
                                     </div>

@@ -159,7 +159,7 @@ All configuration via environment variables with the `RYUKI_` prefix (nested fie
 | Variable | Purpose |
 |---|---|
 | `RYUKI_DATABASE_URL` | PostgreSQL connection string |
-| `RYUKI_AUTH_MODE` | `mock-dry-run` (default) or `entra-id-live` |
+| `RYUKI_AUTH_MODE` | `mock-dry-run` (default), `static-dry-run`, `entra-id`, or `local` |
 | `RYUKI_ENTRA_TENANT_ID` | Azure AD directory ID |
 | `RYUKI_ENTRA_CLIENT_ID` | App registration client ID |
 | `RYUKI_ENTRA_AUTHORITY` | OIDC authority URL |

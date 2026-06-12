@@ -12,9 +12,11 @@ Configuration is merged in this order:
 
 Nested fields use `__` in environment variables. For example, `server.bind_address` becomes `RYUKI_SERVER__BIND_ADDRESS`.
 
+`RyukiConfig::load()` does not parse `.env` files by itself. Use `.env` with Docker Compose, export variables into the host process environment, or use one of the supported config files for direct `cargo run` workflows.
+
 ## Core Environment Variables
 
-Copy `.env.example` to `.env` and configure:
+Copy `.env.example` to `.env` for Compose workflows, or export the same variables before running the API directly:
 
 ### PostgreSQL
 

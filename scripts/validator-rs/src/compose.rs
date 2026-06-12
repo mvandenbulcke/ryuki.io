@@ -55,15 +55,18 @@ const SAFE_TEXT_VALUES: &[&str] = &[
     "platform-db",
     "ryuki/platform-api:rust-dev",
     "ryuki/portal-ui:rust-dev",
-    "postgres:16-alpine",
+    "postgres:18-alpine",
     "sources/ryuki-api/Dockerfile",
     "portal/portal-ui/Dockerfile",
     "../..",
     "18080:8080",
     "18000:8080",
     "5432:5432",
+    "0.0.0.0:8080",
+    "postgres://ryuki:ryuki_dev@platform-db:5432/ryuki_platform",
+    "http://localhost:18080",
     "http://localhost:8080/health",
-    "http://localhost:3000/health",
+    "http://localhost:8080/healthz",
 ];
 const SECRET_ASSIGNMENT_KEYS: &[&str] = &[
     "password",
@@ -76,14 +79,9 @@ const HOST_ASSIGNMENT_KEYS: &[&str] = &["host", "hostname", "fqdn", "serial"];
 
 const PLATFORM_DB_ENV_WHITELIST: &[&str] = &["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"];
 const PLATFORM_API_ENV_WHITELIST: &[&str] = &[
-    "DATABASE_URL",
-    "ENTRA_TENANT_ID",
-    "ENTRA_CLIENT_ID",
-    "ENTRA_AUTHORITY",
-    "PLATFORM_NAME",
-    "PLATFORM_URL",
-    "AUTH_MODE",
-    "API_BIND_ADDR",
+    "RYUKI_DATABASE_URL",
+    "RYUKI_SERVER__BIND_ADDRESS",
+    "RYUKI_PLATFORM_URL",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -371,7 +369,7 @@ fn allowed_image(service_name: &str) -> &'static str {
     match service_name {
         "platform-api" => "ryuki/platform-api:rust-dev",
         "portal-ui" => "ryuki/portal-ui:rust-dev",
-        "platform-db" => "postgres:16-alpine",
+        "platform-db" => "postgres:18-alpine",
         _ => "",
     }
 }
@@ -664,7 +662,7 @@ mod tests {
                 "name": "ryuki-infrastructure-platform",
                 "services": {
                     "platform-db": {
-                        "image": "postgres:16-alpine",
+                        "image": "postgres:18-alpine",
                         "environment": {
                             "POSTGRES_USER": "ryuki",
                             "POSTGRES_PASSWORD": "ryuki_dev",
@@ -716,7 +714,7 @@ mod tests {
                         },
                         "networks": ["ryuki-net"],
                         "healthcheck": {
-                            "test": ["CMD", "curl", "-f", "http://localhost:3000/health"],
+                            "test": ["CMD", "curl", "-f", "http://localhost:8080/healthz"],
                             "interval": "30s",
                             "timeout": "5s",
                             "retries": 3,
@@ -789,7 +787,7 @@ mod tests {
                         },
                         "networks": ["platform"],
                         "healthcheck": {
-                            "test": ["CMD", "curl", "-f", "http://localhost:3000/health"],
+                            "test": ["CMD", "curl", "-f", "http://localhost:8080/healthz"],
                             "interval": "30s",
                             "timeout": "5s",
                             "retries": 3,
@@ -857,7 +855,7 @@ mod tests {
                         },
                         "networks": ["platform"],
                         "healthcheck": {
-                            "test": ["CMD", "curl", "-f", "http://localhost:3000/health"],
+                            "test": ["CMD", "curl", "-f", "http://localhost:8080/healthz"],
                             "interval": "30s",
                             "timeout": "5s",
                             "retries": 3,
@@ -922,7 +920,7 @@ mod tests {
                         },
                         "networks": ["platform"],
                         "healthcheck": {
-                            "test": ["CMD", "curl", "-f", "http://localhost:3000/health"],
+                            "test": ["CMD", "curl", "-f", "http://localhost:8080/healthz"],
                             "interval": "30s",
                             "timeout": "5s",
                             "retries": 3,
@@ -982,7 +980,7 @@ mod tests {
                         },
                         "networks": ["platform"],
                         "healthcheck": {
-                            "test": ["CMD", "curl", "-f", "http://localhost:3000/health"],
+                            "test": ["CMD", "curl", "-f", "http://localhost:8080/healthz"],
                             "interval": "30s",
                             "timeout": "5s",
                             "retries": 3,

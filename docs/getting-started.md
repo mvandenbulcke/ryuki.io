@@ -16,7 +16,7 @@ cd ryuki-platform
 cp .env.example .env
 ```
 
-Edit `.env` — set `RYUKI_DATABASE_URL` to match your local PostgreSQL.
+For Docker Compose workflows, edit `.env` and set `RYUKI_DATABASE_URL` to match your local PostgreSQL. For direct `cargo run`, export the needed `RYUKI_` variables or create `ryuki.toml`, `ryuki.json`, or `platform-config.json`; `.env` is not loaded automatically by the Rust config loader.
 
 ### 2. Start the database
 
