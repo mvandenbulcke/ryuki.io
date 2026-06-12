@@ -157,9 +157,22 @@ fn deployment_to_json(d: &SQLDeployment) -> Value {
     })
 }
 
-fn make_id() -> String {
-    let store = deployment_store().lock().unwrap();
+fn make_id(store: &DeploymentStore) -> String {
     format!("sql-{:03}", store.len() + 1)
+}
+
+fn require_status(
+    deployment: &SQLDeployment,
+    expected: DeploymentStatus,
+    action: &str,
+) -> Result<(), String> {
+    if deployment.status != expected {
+        return Err(format!(
+            "Cannot {} SQL deployment in status {:?}. Must be {:?} first.",
+            action, deployment.status, expected
+        ));
+    }
+    Ok(())
 }
 
 pub fn plan_deployment(req: Value) -> Result<Value, String> {
@@ -245,9 +258,8 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         json!({ "file_count": cpu, "initial_size_mb": 512, "autogrowth_mb": 256 })
     };
 
-    let id = make_id();
-
     let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
+    let id = make_id(&store);
     store.push(SQLDeployment {
         id: id.clone(),
         instance_name: instance_name.to_string(),
@@ -426,6 +438,7 @@ pub fn install_sql(deployment_id: &str) -> Result<Value, String> {
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
 
+    require_status(deployment, DeploymentStatus::Planned, "install")?;
     deployment.status = DeploymentStatus::Installing;
 
     Ok(json!({
@@ -455,6 +468,8 @@ pub fn configure_sql(deployment_id: &str) -> Result<Value, String> {
         .iter_mut()
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
+
+    require_status(deployment, DeploymentStatus::Installing, "configure")?;
 
     let maxdop = if deployment.cpu >= 8 {
         8
@@ -510,6 +525,7 @@ pub fn verify_sql(deployment_id: &str) -> Result<Value, String> {
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
 
+    require_status(deployment, DeploymentStatus::Configuring, "verify")?;
     deployment.status = DeploymentStatus::Verified;
 
     Ok(json!({
@@ -559,6 +575,11 @@ pub fn add_to_backup(deployment_id: &str) -> Result<Value, String> {
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
 
+    require_status(
+        deployment,
+        DeploymentStatus::Verified,
+        "register backup for",
+    )?;
     deployment.status = DeploymentStatus::BackedUp;
 
     Ok(json!({
@@ -596,6 +617,11 @@ pub fn add_to_monitoring(deployment_id: &str) -> Result<Value, String> {
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
 
+    require_status(
+        deployment,
+        DeploymentStatus::BackedUp,
+        "register monitoring for",
+    )?;
     deployment.status = DeploymentStatus::Monitored;
 
     Ok(json!({
@@ -826,6 +852,92 @@ mod tests {
                 .len()
                 >= 5
         );
+    }
+
+    #[test]
+    fn test_sql_deployment_actions_require_lifecycle_order() {
+        let planned = plan_deployment(json!({
+            "instance_name": "NLAMS-SQL-01",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "collation": "SQL_Latin1_General_CP1_CI_AS",
+            "service_account": "svc-nlams@ryuki.local",
+            "site": "NLAMS",
+            "cluster_mode": "Standalone"
+        }))
+        .unwrap();
+        let deployment_id = planned["deployment_id"].as_str().unwrap();
+
+        assert!(
+            configure_sql(deployment_id)
+                .unwrap_err()
+                .contains("Must be Installing first")
+        );
+
+        install_sql(deployment_id).unwrap();
+        assert!(
+            verify_sql(deployment_id)
+                .unwrap_err()
+                .contains("Must be Configuring first")
+        );
+
+        configure_sql(deployment_id).unwrap();
+        assert!(
+            add_to_backup(deployment_id)
+                .unwrap_err()
+                .contains("Must be Verified first")
+        );
+
+        verify_sql(deployment_id).unwrap();
+        assert!(
+            add_to_monitoring(deployment_id)
+                .unwrap_err()
+                .contains("Must be BackedUp first")
+        );
+
+        add_to_backup(deployment_id).unwrap();
+        add_to_monitoring(deployment_id).unwrap();
+    }
+
+    #[test]
+    fn test_sql_deployment_ids_are_allocated_under_store_lock() {
+        let first = plan_deployment(json!({
+            "instance_name": "FRPAR-SQL-01",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "collation": "SQL_Latin1_General_CP1_CI_AS",
+            "service_account": "svc-frpar-01@ryuki.local",
+            "site": "FRPAR",
+            "cluster_mode": "Standalone"
+        }))
+        .unwrap();
+        let second = plan_deployment(json!({
+            "instance_name": "FRPAR-SQL-02",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "collation": "SQL_Latin1_General_CP1_CI_AS",
+            "service_account": "svc-frpar-02@ryuki.local",
+            "site": "FRPAR",
+            "cluster_mode": "Standalone"
+        }))
+        .unwrap();
+
+        assert_ne!(first["deployment_id"], second["deployment_id"]);
     }
 
     fn active_sites() -> Vec<String> {
