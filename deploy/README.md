@@ -14,4 +14,4 @@ Deployment artifacts define local and Kubernetes skeletons for the Ryuki Infrast
 - Use placeholder image names until Harbor registry and promotion policy are approved.
 - Browser traffic reaches only ingress, `portal-ui`, and `platform-api`.
 - External provider egress stays blocked until explicit adapter policies and credential references are approved.
-- Validate all deployment changes with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all`.
+- Validate all deployment changes with `make validate`.

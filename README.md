@@ -122,8 +122,8 @@ cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 # Format check
 cargo fmt --check --all
 
-# Clippy (correctness + suspicious only)
-cargo clippy --workspace -- -D clippy::correctness -D clippy::suspicious
+# Clippy (matches the CI lint gate)
+cargo clippy --workspace -- -D warnings
 
 # Secret scan
 ./scripts/no-secret-scan.sh

@@ -1,4 +1,4 @@
-.PHONY: build test lint clean run validate
+.PHONY: build test lint validate clean run-api run-portal compose-up compose-down docker-build release-check
 
 build:
 	cargo build --workspace
@@ -11,7 +11,7 @@ lint:
 	cargo clippy --workspace -- -D warnings
 
 validate:
-	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all
+	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
 	./scripts/no-secret-scan.sh
 
 clean:
@@ -29,3 +29,14 @@ compose-up:
 
 compose-down:
 	docker compose -f deploy/compose/compose.yaml down
+
+docker-build:
+	docker build -f sources/ryuki-api/Dockerfile -t ryuki/platform-api:rust-dev .
+	docker build -f portal/portal-ui/Dockerfile -t ryuki/portal-ui:rust-dev .
+
+release-check:
+	cargo fmt --check --all
+	cargo clippy --workspace -- -D warnings
+	cargo test --workspace
+	$(MAKE) validate
+	$(MAKE) docker-build
