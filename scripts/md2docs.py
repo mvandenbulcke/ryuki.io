@@ -12,6 +12,7 @@ index). The markdown files stay the source of truth and keep working on
 GitHub's web UI; links to docs/<name>.md are rewritten to <name>.html.
 """
 import html as html_mod
+import json
 import re
 import sys
 from pathlib import Path
@@ -51,6 +52,98 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+# ── build-time syntax highlighting (bash / json / env) ──────────
+def _esc(s: str) -> str:
+    return html_mod.escape(s, quote=False)
+
+
+_BASH_TOKEN = re.compile(r"""('[^']*'|"[^"]*"|\$\{[^}]*\}|\$\w+|#.*$|\s+|[^\s'"$#]+)""")
+_BASH_JOINERS = {"&&", "||", "|", ";"}
+
+
+def _hl_bash(code: str) -> str:
+    out = []
+    for ln in code.split("\n"):
+        if re.match(r"^\s*#", ln):
+            out.append(f'<span class="hl-c">{_esc(ln)}</span>')
+            continue
+        parts, new_cmd, pos = [], True, 0
+        for m in _BASH_TOKEN.finditer(ln):
+            if m.start() > pos:
+                parts.append(_esc(ln[pos:m.start()]))
+            pos = m.end()
+            tok = m.group(0)
+            if tok.startswith(("'", '"')):
+                parts.append(f'<span class="hl-s">{_esc(tok)}</span>')
+                new_cmd = False
+            elif tok.startswith("$"):
+                parts.append(f'<span class="hl-v">{_esc(tok)}</span>')
+                new_cmd = False
+            elif tok.startswith("#"):
+                parts.append(f'<span class="hl-c">{_esc(tok)}</span>')
+            elif tok.isspace():
+                parts.append(tok)
+            else:
+                if new_cmd:
+                    parts.append(f'<span class="hl-cmd">{_esc(tok)}</span>')
+                    new_cmd = False
+                elif tok.startswith("-"):
+                    parts.append(f'<span class="hl-f">{_esc(tok)}</span>')
+                else:
+                    parts.append(_esc(tok))
+                if tok in _BASH_JOINERS:
+                    new_cmd = True
+        if pos < len(ln):
+            parts.append(_esc(ln[pos:]))
+        out.append("".join(parts))
+    return "\n".join(out)
+
+
+_JSON_TOKEN = re.compile(r'("(?:\\.|[^"\\])*")(\s*:)?|(\b(?:true|false|null)\b|-?\d+(?:\.\d+)?)')
+
+
+def _hl_json(code: str) -> str:
+    out, pos = [], 0
+    for m in _JSON_TOKEN.finditer(code):
+        out.append(_esc(code[pos:m.start()]))
+        if m.group(1) and m.group(2):
+            out.append(f'<span class="hl-k">{_esc(m.group(1))}</span>{_esc(m.group(2))}')
+        elif m.group(1):
+            out.append(f'<span class="hl-s">{_esc(m.group(1))}</span>')
+        else:
+            out.append(f'<span class="hl-n">{_esc(m.group(3))}</span>')
+        pos = m.end()
+    out.append(_esc(code[pos:]))
+    return "".join(out)
+
+
+def _hl_env(code: str) -> str:
+    out = []
+    for ln in code.split("\n"):
+        if re.match(r"^\s*#", ln):
+            out.append(f'<span class="hl-c">{_esc(ln)}</span>')
+            continue
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(=)(.*)$", ln)
+        if m:
+            val = m.group(3)
+            val_html = (f'<span class="hl-s">{_esc(val)}</span>'
+                        if val.startswith(("'", '"')) else _esc(val))
+            out.append(f'<span class="hl-v">{_esc(m.group(1))}</span>={val_html}')
+        else:
+            out.append(_esc(ln))
+    return "\n".join(out)
+
+
+def highlight(code: str, lang: str) -> str:
+    if lang == "bash":
+        return _hl_bash(code)
+    if lang == "json":
+        return _hl_json(code)
+    if lang == "env":
+        return _hl_env(code)
+    return _esc(code)
+
+
 def convert(md: str) -> str:
     lines = md.splitlines()
     out, i = [], 0
@@ -78,7 +171,7 @@ def convert(md: str) -> str:
                 i += 1
             i += 1
             cls = f' class="lang-{lang}"' if lang else ""
-            out.append(f"<pre><code{cls}>{html_mod.escape(chr(10).join(block), quote=False)}</code></pre>")
+            out.append(f"<pre><code{cls}>{highlight(chr(10).join(block), lang)}</code></pre>")
             continue
 
         if line.startswith("|") and i + 1 < len(lines) and re.match(r"^\|[\s:|-]+\|$", lines[i + 1]):
@@ -109,7 +202,7 @@ def convert(md: str) -> str:
                 close_lists()
                 out.append("<ul>")
                 in_ul = True
-            out.append(f"<li>{inline(re.sub(r'^\\s*-\\s+', '', line))}</li>")
+            out.append(f"<li>{inline(re.sub(r'^\s*-\s+', '', line, count=1))}</li>")
             i += 1
             continue
 
@@ -118,7 +211,7 @@ def convert(md: str) -> str:
                 close_lists()
                 out.append("<ol>")
                 in_ol = True
-            out.append(f"<li>{inline(re.sub(r'^\\s*\\d+\\.\\s+', '', line))}</li>")
+            out.append(f"<li>{inline(re.sub(r'^\s*\d+\.\s+', '', line, count=1))}</li>")
             i += 1
             continue
 
@@ -207,6 +300,16 @@ main{{min-width:0;max-width:820px;padding:2.6rem 0 5rem}}
   background:var(--bg-secondary);border:1px solid var(--border);border-radius:7px;outline:none}}
 .sb-filter:focus{{border-color:var(--accent)}}
 .sb-empty{{display:none;font-size:.78rem;color:var(--text-secondary);padding:.2rem .65rem}}
+.sb-results{{margin:0 0 .6rem}}
+.sb-results a{{display:block;padding:.45rem .6rem;border:1px solid var(--border);
+  border-radius:7px;margin:.35rem 0;text-decoration:none;
+  transition:border-color var(--transition),background var(--transition)}}
+.sb-results a:hover{{border-color:var(--accent);background:var(--bg-secondary)}}
+.sb-results .r-t{{font-size:.78rem;font-weight:600;color:var(--text)}}
+.sb-results .r-t .r-sec{{color:var(--accent)}}
+.sb-results .r-x{{font-size:.72rem;line-height:1.45;color:var(--text-secondary);margin-top:.15rem;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
+.sb-results .r-x mark{{background:transparent;color:var(--accent);font-weight:700}}
 .sb-list{{list-style:none;margin:0;padding:0}}
 .sb-list>li{{margin:0}}
 .sb-link{{display:block;font-size:.85rem;font-weight:500;color:var(--text-secondary);
@@ -269,6 +372,13 @@ pre{{background:var(--code-bg);color:var(--code-text);border-radius:var(--radius
 .copy-code:hover{{background:rgba(255,255,255,.14);color:#fff}}
 .copy-code.done{{color:#34c98e;border-color:rgba(52,201,142,.4)}}
 pre code{{background:none;padding:0;font-size:1em;color:inherit}}
+pre .hl-c{{color:#637292}}
+pre .hl-s{{color:#e0b46a}}
+pre .hl-v{{color:#ffd966}}
+pre .hl-cmd{{color:#82d9b6}}
+pre .hl-f{{color:#9fb1cd}}
+pre .hl-k{{color:#7da6d9}}
+pre .hl-n{{color:#f78c6c}}
 table{{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.9rem}}
 th,td{{text-align:left;padding:.55rem .8rem;border:1px solid var(--border)}}
 th{{background:var(--bg-secondary)}}
@@ -346,14 +456,75 @@ td code{{white-space:nowrap}}
     }}
   }}
 
-  /* sidebar filter */
+  /* sidebar: heading filter + lazy full-text search */
   var sbFilter=document.getElementById('sb-filter');
   if(sbFilter){{
     var sbItems=Array.prototype.slice.call(document.querySelectorAll('.sb-list>li'));
     var sbEmpty=document.getElementById('sb-empty');
+    var sbResults=document.getElementById('sb-results');
+    var listShown=sbItems.length,hitCount=0;
+    var sbIndex=null,sbLoading=false,pendingQ=null;
+    var updateEmpty=function(q){{
+      if(sbEmpty)sbEmpty.style.display=(q&&!listShown&&!hitCount)?'block':'none';
+    }};
+    var renderHits=function(q){{
+      hitCount=0;
+      if(!sbResults)return;
+      sbResults.textContent='';
+      if(!sbIndex||q.length<2)return;
+      var scored=[];
+      for(var i=0;i<sbIndex.length;i++){{
+        var e=sbIndex[i];
+        var sc=0;
+        if(e.t.toLowerCase().indexOf(q)>-1||(e.s&&e.s.toLowerCase().indexOf(q)>-1))sc=2;
+        else if(e.x.indexOf(q)>-1)sc=1;
+        if(sc)scored.push([sc,e]);
+      }}
+      scored.sort(function(a,b){{return b[0]-a[0]}});
+      scored.slice(0,8).forEach(function(pair){{
+        var e=pair[1];
+        var a=document.createElement('a');
+        a.href='/'+e.p+(e.a?'#'+e.a:'');
+        var tt=document.createElement('div');
+        tt.className='r-t';
+        tt.textContent=e.t+(e.s?' \u203a ':'');
+        if(e.s){{
+          var sec=document.createElement('span');
+          sec.className='r-sec';
+          sec.textContent=e.s;
+          tt.appendChild(sec);
+        }}
+        a.appendChild(tt);
+        var ix=e.x.indexOf(q);
+        if(ix>-1){{
+          var from=Math.max(0,ix-45);
+          var pre=(from>0?'\u2026':'')+e.x.slice(from,ix);
+          var post=e.x.slice(ix+q.length,ix+q.length+70)+'\u2026';
+          var xx=document.createElement('div');
+          xx.className='r-x';
+          xx.appendChild(document.createTextNode(pre));
+          var mk=document.createElement('mark');
+          mk.textContent=e.x.slice(ix,ix+q.length);
+          xx.appendChild(mk);
+          xx.appendChild(document.createTextNode(post));
+          a.appendChild(xx);
+        }}
+        sbResults.appendChild(a);
+        hitCount++;
+      }});
+    }};
+    var runSearch=function(q){{
+      if(q.length>=2&&!sbIndex&&!sbLoading&&window.fetch){{
+        sbLoading=true;pendingQ=q;
+        fetch('/search-index.json').then(function(r){{return r.ok?r.json():null}}).then(function(j){{
+          if(j){{sbIndex=j;renderHits(pendingQ);updateEmpty(pendingQ)}}
+        }}).catch(function(){{}});
+      }}
+      renderHits(q);
+    }};
     sbFilter.addEventListener('input',function(){{
       var q=sbFilter.value.trim().toLowerCase();
-      var shown=0;
+      listShown=0;
       sbItems.forEach(function(li){{
         var link=li.querySelector('.sb-link');
         var titleMatch=!q||link.textContent.toLowerCase().indexOf(q)>-1;
@@ -366,9 +537,31 @@ td code{{white-space:nowrap}}
         }});
         if(!any&&!secEls.length&&(link.getAttribute('data-sections')||'').indexOf(q)>-1)any=true;
         li.style.display=any?'':'none';
-        if(any)shown++;
+        if(any)listShown++;
       }});
-      if(sbEmpty)sbEmpty.style.display=shown?'none':'block';
+      pendingQ=q;
+      runSearch(q);
+      updateEmpty(q);
+    }});
+    sbFilter.addEventListener('keydown',function(e){{
+      if(e.key==='Escape'){{
+        sbFilter.value='';
+        sbFilter.dispatchEvent(new Event('input'));
+        sbFilter.blur();
+      }}
+    }});
+    document.addEventListener('keydown',function(e){{
+      if(e.key!=='/'||e.metaKey||e.ctrlKey||e.altKey)return;
+      var el=document.activeElement;
+      if(el&&/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))return;
+      e.preventDefault();
+      var sb2=document.getElementById('docs-sidebar');
+      var tg2=document.getElementById('sb-toggle');
+      if(sb2&&tg2&&getComputedStyle(tg2).display!=='none'&&!sb2.classList.contains('open')){{
+        sb2.classList.add('open');
+        tg2.setAttribute('aria-expanded','true');
+      }}
+      sbFilter.focus();
     }});
   }}
 
@@ -419,6 +612,39 @@ def sections(md: str):
     return out
 
 
+def _plain(md_text: str) -> str:
+    """Markdown -> lowercase plain text for the search index."""
+    s = re.sub(r"^\s*```.*$", "", md_text, flags=re.M)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = s.replace("`", "").replace("**", "").replace("|", " ")
+    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def search_entries(name: str, title: str, md: str):
+    """One index entry per h2 section, plus the intro before the first h2."""
+    entries, fence = [], False
+    cur_title, cur_anchor, buf = "", "", []
+    for line in md.splitlines():
+        if line.startswith("```"):
+            fence = not fence
+            buf.append(line)
+            continue
+        m = None if fence else re.match(r"^##\s+(.*)$", line)
+        if m:
+            if buf:
+                entries.append((cur_title, cur_anchor, _plain("\n".join(buf))))
+            cur_title = m.group(1).strip()
+            cur_anchor = slug(cur_title)
+            buf = []
+        else:
+            buf.append(line)
+    if buf:
+        entries.append((cur_title, cur_anchor, _plain("\n".join(buf))))
+    return [{"p": f"{name}.html", "t": title, "s": s, "a": a, "x": x}
+            for s, a, x in entries if x]
+
+
 CHEVRON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
            '<polyline points="6 9 12 15 18 9"/></svg>')
@@ -448,8 +674,9 @@ def build_sidebar(current: str, sections_map: dict) -> str:
             f'aria-controls="docs-sidebar">Docs navigation {CHEVRON}</button>\n'
             '<aside class="docs-sidebar" id="docs-sidebar"><nav aria-label="Documentation">'
             f'<a class="sb-label{overview_cls}" href="/documentation.html">Documentation</a>'
-            '<input type="search" id="sb-filter" class="sb-filter" placeholder="Filter docs" '
-            'aria-label="Filter documentation navigation" autocomplete="off">'
+            '<input type="search" id="sb-filter" class="sb-filter" placeholder="Search docs ( / )" '
+            'aria-label="Search documentation" autocomplete="off">'
+            '<div class="sb-results" id="sb-results" role="region" aria-label="Search results"></div>'
             '<ul class="sb-list">' + "".join(items) + "</ul>"
             '<p class="sb-empty" id="sb-empty">No matches.</p></nav></aside>')
 
@@ -520,6 +747,13 @@ def main():
     (DOCS / "robots.txt").write_text(
         "User-agent: *\nAllow: /\n\nSitemap: https://ryuki.io/sitemap.xml\n")
     print("docs/robots.txt")
+
+    index_entries = []
+    for name, title, _ in PAGES:
+        index_entries.extend(search_entries(name, title, (DOCS / f"{name}.md").read_text()))
+    (DOCS / "search-index.json").write_text(
+        json.dumps(index_entries, separators=(",", ":"), ensure_ascii=False))
+    print(f"docs/search-index.json ({len(index_entries)} sections)")
 
 
 if __name__ == "__main__":
