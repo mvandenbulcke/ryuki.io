@@ -6064,6 +6064,32 @@ async fn auth_roles() -> Json<Value> {
     Json(serde_json::to_value(roles).unwrap_or_default())
 }
 
+const AUTH_SESSION_PERSISTENCE_FAILED: &str = "AUTH_SESSION_PERSISTENCE_FAILED";
+
+fn auth_session_persistence_problem() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError::new(
+            AUTH_SESSION_PERSISTENCE_FAILED,
+            "Auth session could not be persisted",
+        )),
+    )
+}
+
+fn map_auth_session_persistence_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    operation: &str,
+) -> Result<T, (StatusCode, Json<ApiError>)> {
+    result.map_err(|error| {
+        tracing::error!(
+            operation,
+            error = %error,
+            "auth session persistence failed"
+        );
+        auth_session_persistence_problem()
+    })
+}
+
 async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let app_cfg = crate::config_store::get_app_config();
     if app_cfg.auth_mode == AuthMode::MockDryRun || app_cfg.entra_tenant_id.is_empty() {
@@ -6079,16 +6105,19 @@ async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
         });
 
         if let Some(pool) = get_db() {
-            let _ = sqlx::query(
+            map_auth_session_persistence_result(
+                sqlx::query(
                 "INSERT INTO sessions (id, user_id, display_name, email, roles) VALUES ($1, $2, $3, $4, $5)"
             )
-            .bind(session_id)
-            .bind("platform-engineer")
-            .bind("Platform Engineer")
-            .bind("platform-engineer@ryuki.local")
-            .bind(&["platform-engineer", "operator", "viewer"] as &[&str])
-            .execute(pool)
-            .await;
+                .bind(session_id)
+                .bind("platform-engineer")
+                .bind("Platform Engineer")
+                .bind("platform-engineer@ryuki.local")
+                .bind(&["platform-engineer", "operator", "viewer"] as &[&str])
+                .execute(pool)
+                .await,
+                "create",
+            )?;
         }
 
         return Ok(Json(session_data));
@@ -6118,13 +6147,23 @@ async fn auth_logout(
             )),
         ));
     }
+    let uid = Uuid::parse_str(session_id).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new(
+                "INVALID_SESSION_ID",
+                "Session ID must be a UUID",
+            )),
+        )
+    })?;
     if let Some(pool) = get_db() {
-        if let Ok(uid) = Uuid::parse_str(session_id) {
-            let _ = sqlx::query("DELETE FROM sessions WHERE id = $1")
+        map_auth_session_persistence_result(
+            sqlx::query("DELETE FROM sessions WHERE id = $1")
                 .bind(uid)
                 .execute(pool)
-                .await;
-        }
+                .await,
+            "delete",
+        )?;
     }
     Ok(Json(json!({"status": "logged_out"})))
 }
@@ -11469,6 +11508,37 @@ mod unit_tests {
         assert_eq!(part["source"], "static-seed");
         assert_eq!(part["mode"], "static-dry-run");
         assert_eq!(part["providerCallsAllowed"], false);
+    }
+
+    #[test]
+    fn test_auth_session_persistence_result_returns_safe_500() {
+        let raw_error = "internal session persistence marker should stay out of response";
+        let Err((status, Json(body))) =
+            map_auth_session_persistence_result::<(), _>(Err(raw_error), "create")
+        else {
+            panic!("session persistence failure should map to ApiError");
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, AUTH_SESSION_PERSISTENCE_FAILED);
+        assert_eq!(body.message, "Auth session could not be persisted");
+        assert_eq!(body.detail, None);
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("internal session persistence marker"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_logout_rejects_invalid_session_id() {
+        let Err((status, Json(body))) =
+            auth_logout(Json(json!({"session_id": "not-a-uuid"}))).await
+        else {
+            panic!("invalid session id should fail");
+        };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "INVALID_SESSION_ID");
+        assert_eq!(body.message, "Session ID must be a UUID");
     }
 
     #[test]
