@@ -10,6 +10,10 @@ Compose file for local container bootstrap of the Ryuki Infrastructure Platform.
 | `platform-api` | `ryuki/platform-api:rust-dev` | `18080` | Rust platform API with health, readiness, and catalog endpoints. |
 | `portal-ui` | `ryuki/portal-ui:rust-dev` | `18000` | Full-stack Rust/Leptos portal server. |
 
+## Configuration
+
+`platform-api` reads the optional root `.env` file through the current `RYUKI_` configuration contract. The compose file overrides the database URL to use the internal `platform-db` service hostname instead of the host-local `localhost` default.
+
 ## Boundaries
 
 - No Vault, provider adapters, worker execution, or external provider egress included.
