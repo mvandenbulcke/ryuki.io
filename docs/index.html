@@ -364,7 +364,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .pipeline{
   position:relative;list-style:none;
   display:flex;align-items:center;justify-content:space-between;
-  gap:.5rem;min-width:1230px;
+  gap:.5rem;min-width:860px;
 }
 .pipeline::before{
   content:"";position:absolute;left:1.5%;right:1.5%;top:50%;height:2px;margin-top:-1px;
@@ -396,6 +396,17 @@ section.alt .stage{background:var(--section-alt)}
 .js .stage{cursor:pointer}
 .js .stage:hover{animation-play-state:paused;border-color:var(--accent);color:var(--accent)}
 .stage:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.pipeline.roadmap-row{min-width:0;justify-content:center;flex-wrap:wrap;margin-top:.9rem}
+.pipeline.roadmap-row::before{display:none}
+.roadmap-label{
+  display:flex;align-items:center;gap:.8rem;margin-top:1.6rem;
+  font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--text-muted);
+}
+.roadmap-label::before,.roadmap-label::after{
+  content:"";height:1px;flex:1;
+  background-image:repeating-linear-gradient(90deg,var(--border-strong) 0 6px,transparent 6px 12px);
+}
 .stage.planned{border-style:dashed;opacity:.65}
 .stage.planned:hover{opacity:1}
 .js .stage.planned{animation:none}
@@ -871,6 +882,9 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage" style="--i:6"><span class="stage-num">07</span>Execute</li>
         <li class="stage" style="--i:7"><span class="stage-num">08</span>Verify</li>
         <li class="stage" style="--i:8"><span class="stage-num">09</span>Complete</li>
+      </ol>
+      <div class="roadmap-label" aria-hidden="true">Roadmap</div>
+      <ol class="pipeline roadmap-row" aria-label="Planned lifecycle stages">
         <li class="stage planned"><span class="stage-num">10</span>Protect<span class="sr-only"> (planned)</span></li>
         <li class="stage planned"><span class="stage-num">11</span>Publish<span class="sr-only"> (planned)</span></li>
         <li class="stage planned"><span class="stage-num">12</span>Maintain<span class="sr-only"> (planned)</span></li>
