@@ -45,6 +45,8 @@ Draft → Intake → Validated → Planned → Approved → Locked → Executing
 
 A request that fails at any stage lands in a terminal `Failed` status and keeps its full evidence trail. Each stage produces redacted evidence suitable for audit, CAB, incident review, and handover.
 
+On the roadmap, four stages extend the pipeline beyond completion: `Protect` (backup coverage and monitoring enrollment), `Publish` (CMDB and service-catalog visibility), `Maintain` (patching, compliance, and ownership through the service life), and `Retire` (governed decommission with final evidence).
+
 ## Architecture
 
 ```

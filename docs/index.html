@@ -354,7 +354,7 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 .pipeline{
   position:relative;list-style:none;
   display:flex;align-items:center;justify-content:space-between;
-  gap:.5rem;min-width:860px;
+  gap:.5rem;min-width:1230px;
 }
 .pipeline::before{
   content:"";position:absolute;left:1.5%;right:1.5%;top:50%;height:2px;margin-top:-1px;
@@ -386,6 +386,9 @@ section.alt .stage{background:var(--section-alt)}
 .js .stage{cursor:pointer}
 .js .stage:hover{animation-play-state:paused;border-color:var(--accent);color:var(--accent)}
 .stage:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.stage.planned{border-style:dashed;opacity:.65}
+.stage.planned:hover{opacity:1}
+.js .stage.planned{animation:none}
 .js .pipeline.quiet .stage{animation:none}
 .js .pipeline.quiet::before{animation:none;background-position:-30% 0}
 .js .stage.active{
@@ -843,7 +846,7 @@ section.alt .stage{background:var(--section-alt)}
     <div data-reveal>
       <div class="section-label">Request Lifecycle</div>
       <h2 class="section-title">Nine governed stages. Zero blind spots.</h2>
-      <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
+      <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover. Dashed stages are next on the roadmap.</p>
     </div>
     <div class="pipeline-wrap" data-reveal>
       <ol class="pipeline">
@@ -856,6 +859,10 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage" style="--i:6"><span class="stage-num">07</span>Execute</li>
         <li class="stage" style="--i:7"><span class="stage-num">08</span>Verify</li>
         <li class="stage" style="--i:8"><span class="stage-num">09</span>Complete</li>
+        <li class="stage planned"><span class="stage-num">10</span>Protect<span class="sr-only"> (planned)</span></li>
+        <li class="stage planned"><span class="stage-num">11</span>Publish<span class="sr-only"> (planned)</span></li>
+        <li class="stage planned"><span class="stage-num">12</span>Maintain<span class="sr-only"> (planned)</span></li>
+        <li class="stage planned"><span class="stage-num">13</span>Retire<span class="sr-only"> (planned)</span></li>
       </ol>
     </div>
     <div class="tour-wrap" data-reveal>
@@ -1311,7 +1318,11 @@ section.alt .stage{background:var(--section-alt)}
     'Change window locked, resources reserved, conflicts blocked.',
     'Adapters execute against approved provider endpoints only.',
     'Post-change health probes and configuration drift checks.',
-    'Evidence pack sealed, CMDB reconciled, request closed.'
+    'Evidence pack sealed, CMDB reconciled, request closed.',
+    'Roadmap &mdash; backup coverage confirmed and monitoring enrolled after completion.',
+    'Roadmap &mdash; CMDB publication and service-catalog visibility for the delivered request.',
+    'Roadmap &mdash; patching, compliance, and ownership through the service life.',
+    'Roadmap &mdash; governed decommission: quarantine, final evidence, teardown.'
   ];
   var stages=document.querySelectorAll('.pipeline .stage');
   var detail=document.getElementById('pipeline-detail');
@@ -1367,12 +1378,13 @@ section.alt .stage{background:var(--section-alt)}
       tourBtn.addEventListener('click',function(){
         if(tourTimer!==null){stopTour();showStage(null);return}
         var i=0;
+        var tourLen=document.querySelectorAll('.pipeline .stage:not(.planned)').length;
         detail.setAttribute('aria-live','off');
         showStage(0);
         tourLabel.textContent='Stop the tour';
         tourTimer=setInterval(function(){
           i++;
-          if(i>=stages.length){stopTour();showStage(null)}
+          if(i>=tourLen){stopTour();showStage(null)}
           else{showStage(i)}
         },1600);
       });
