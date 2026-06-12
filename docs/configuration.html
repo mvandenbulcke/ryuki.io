@@ -101,6 +101,16 @@ code{font-family:var(--mono);font-size:.86em;background:var(--inline-code);
   padding:.12em .38em;border-radius:5px}
 pre{background:var(--code-bg);color:var(--code-text);border-radius:var(--radius);
   padding:1.1rem 1.2rem;overflow-x:auto;margin:1rem 0;font-size:.84rem;line-height:1.55}
+.pre-wrap{position:relative}
+.copy-code{position:absolute;top:.5rem;right:.5rem;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);
+  color:#aeb7c7;font-family:var(--font);font-size:.68rem;font-weight:600;
+  border-radius:6px;padding:.25rem .6rem;cursor:pointer;opacity:0;
+  transition:opacity var(--transition),background var(--transition)}
+.pre-wrap:hover .copy-code,.copy-code:focus-visible{opacity:1}
+@media (hover:none){.copy-code{opacity:1}}
+.copy-code:hover{background:rgba(255,255,255,.14);color:#fff}
+.copy-code.done{color:#34c98e;border-color:rgba(52,201,142,.4)}
 pre code{background:none;padding:0;font-size:1em;color:inherit}
 table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.9rem}
 th,td{text-align:left;padding:.55rem .8rem;border:1px solid var(--border)}
@@ -232,6 +242,31 @@ td code{white-space:nowrap}
       },{rootMargin:'-72px 0px -68% 0px',threshold:0});
       targets.forEach(function(t){spy.observe(t)});
     }
+  }
+
+  /* copy buttons on code blocks */
+  if(navigator.clipboard){
+    Array.prototype.forEach.call(document.querySelectorAll('main pre'),function(pre){
+      var code=pre.textContent;
+      var wrap=document.createElement('div');
+      wrap.className='pre-wrap';
+      pre.parentNode.insertBefore(wrap,pre);
+      wrap.appendChild(pre);
+      var b=document.createElement('button');
+      b.type='button';b.className='copy-code';b.textContent='Copy';
+      b.setAttribute('aria-label','Copy code');
+      b.addEventListener('click',function(){
+        navigator.clipboard.writeText(code).then(function(){
+          b.textContent='Copied';b.classList.add('done');
+          b.setAttribute('aria-label','Copied');
+          setTimeout(function(){
+            b.textContent='Copy';b.classList.remove('done');
+            b.setAttribute('aria-label','Copy code');
+          },1600);
+        }).catch(function(){});
+      });
+      wrap.appendChild(b);
+    });
   }
 })();
 </script>

@@ -141,6 +141,10 @@ section.alt{background:var(--section-alt);transition:background var(--transition
 }
 .gh-btn:hover{border-color:var(--accent);background:var(--accent-bg)}
 .gh-btn svg{width:15px;height:15px}
+.star-chip{font-size:.7rem;font-weight:700;color:var(--logo-gold);
+  border-left:1px solid var(--border-strong);padding-left:.5rem}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+  clip:rect(0,0,0,0);white-space:pre;border:0}
 
 /* ── Scroll progress ────────────────────────────────────── */
 #scroll-progress{
@@ -184,7 +188,8 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   -webkit-mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
   mask-image:radial-gradient(circle var(--ryu-spot-r) at var(--ryu-spot-x) var(--ryu-spot-y),#000 38%,rgba(0,0,0,.55) 68%,transparent 100%);
 }
-.dragon-art.play-ink::before{animation:ryu-arrive 1.4s var(--ease-out) both}
+.dragon-art.play-ink::before{animation:ryu-arrive 1.4s var(--ease-out) both,ryu-breathe 8s ease-in-out 1.6s infinite alternate}
+@keyframes ryu-breathe{from{opacity:var(--ryu-base-opacity)}to{opacity:calc(var(--ryu-base-opacity)*1.5)}}
 @keyframes ryu-arrive{from{opacity:0;transform:translateY(18px) scale(.99)}to{opacity:var(--ryu-base-opacity);transform:none}}
 @media (prefers-reduced-motion:reduce){
   .dragon-art::after{display:none}
@@ -393,6 +398,18 @@ section.alt .stage{background:var(--section-alt)}
 }
 .pipeline-detail strong{color:var(--accent);font-weight:700}
 .pipeline-detail.swap{opacity:0}
+.tour-wrap{text-align:center}
+.tour-btn{
+  display:none;align-items:center;gap:.45rem;margin:1.4rem auto 0;
+  background:transparent;border:1px solid var(--border-strong);border-radius:100px;
+  color:var(--text-secondary);font-family:var(--font);font-size:.8rem;font-weight:600;
+  padding:.4rem 1.1rem;cursor:pointer;
+  transition:color var(--transition),border-color var(--transition);
+}
+.js .tour-btn{display:inline-flex}
+.tour-btn:hover{color:var(--accent);border-color:var(--accent)}
+.tour-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.tour-btn svg{width:11px;height:11px}
 .pipeline-note{
   margin-top:.8rem;text-align:center;font-size:.84rem;color:var(--text-muted);
 }
@@ -464,6 +481,13 @@ section.alt .stage{background:var(--section-alt)}
   transition:border-color var(--transition),background var(--transition);
 }
 .arch-mini:hover{border-color:var(--accent)}
+.js .arch-node{cursor:pointer}
+.arch-node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.arch-node.lit{border-color:var(--logo-gold);box-shadow:0 0 18px -4px rgba(255,215,0,.35)}
+.arch-mini.lit{border-color:var(--logo-gold)}
+.arch-table tbody tr.hl{background:var(--accent-bg)}
+.arch-link.firing::before,.arch-vlink.firing::before,
+.arch-link.firing::after,.arch-vlink.firing::after{opacity:1;filter:brightness(1.7)}
 .arch-mini svg{width:15px;height:15px;color:var(--accent)}
 .arch-caption{text-align:center;font-size:.78rem;color:var(--text-muted);margin-top:1.4rem}
 
@@ -512,6 +536,21 @@ section.alt .stage{background:var(--section-alt)}
 .copy-btn:hover{background:rgba(255,255,255,.12);color:#fff}
 .copy-btn svg{width:12px;height:12px}
 .copy-btn.copied{color:#34c98e;border-color:rgba(52,201,142,.4)}
+.code-block pre .out{color:#7d8699}
+.code-block pre .prompt{color:#e0a050}
+.term-cursor{display:inline-block;width:7px;height:1em;vertical-align:-.15em;background:#82d9b6}
+.js .term-cursor{animation:term-blink 1.1s steps(1) infinite}
+@keyframes term-blink{50%{opacity:0}}
+.replay-btn{
+  display:none;align-items:center;gap:.4rem;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);
+  color:#aeb7c7;font-size:.7rem;font-weight:600;font-family:var(--font);
+  border-radius:6px;padding:.3rem .65rem;cursor:pointer;
+  transition:background var(--transition),color var(--transition);
+}
+.js .replay-btn{display:inline-flex}
+.replay-btn:hover{background:rgba(255,255,255,.12);color:#fff}
+.replay-btn svg{width:12px;height:12px}
 .code-block pre{
   padding:1.3rem 1.2rem;overflow-x:auto;
   font-size:.8125rem;line-height:1.75;color:var(--code-text);
@@ -610,7 +649,7 @@ section.alt .stage{background:var(--section-alt)}
   .stat:nth-child(n+3){border-top:1px solid var(--border)}
   .stat-value{font-size:1.8rem}
   .features-grid{grid-template-columns:1fr 1fr}
-  .gh-btn span{display:none}
+  .gh-btn .gh-label{display:none}
   .gh-btn{padding:.42rem .6rem}
 }
 @media(max-width:560px){
@@ -648,7 +687,7 @@ section.alt .stage{background:var(--section-alt)}
     <div class="header-right">
       <a href="https://github.com/mvandenbulcke/ryuki.io" class="gh-btn" target="_blank" rel="noopener">
         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-        <span>GitHub</span>
+        <span class="gh-label">GitHub</span>
       </a>
     </div>
   </div>
@@ -819,6 +858,12 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage" style="--i:10"><span class="stage-num">11</span>Retire</li>
       </ol>
     </div>
+    <div class="tour-wrap" data-reveal>
+      <button class="tour-btn" id="tour-btn" type="button">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6 4 20 12 6 20"/></svg>
+        <span id="tour-label">Play the lifecycle</span>
+      </button>
+    </div>
     <p class="pipeline-detail" id="pipeline-detail" data-reveal aria-live="polite">Select a stage to see what it governs.</p>
     <p class="pipeline-note" data-reveal>Break-glass emergency changes follow the same pipeline &mdash; full audit trail, <code>no bypass on evidence</code>.</p>
   </div>
@@ -939,6 +984,10 @@ section.alt .stage{background:var(--section-alt)}
         <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy commands">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
           <span>Copy</span>
+        </button>
+        <button class="replay-btn" id="replay-btn" type="button" aria-label="Replay the demo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          <span>Replay</span>
         </button>
       </div>
       <pre id="quickstart-code"><code><span class="c"># Start PostgreSQL via Docker Compose</span>
@@ -1095,7 +1144,7 @@ section.alt .stage{background:var(--section-alt)}
   if(copyBtn){
     copyBtn.addEventListener('click',function(){
       var code=document.getElementById('quickstart-code');
-      var text=code.innerText.split('\n').filter(function(l){return l&&l.charAt(0)!=='#'}).join('\n');
+      var text=(code.getAttribute('data-src')||code.innerText).split('\n').filter(function(l){return l&&l.charAt(0)!=='#'}).join('\n');
       function done(){
         copyBtn.classList.add('copied');
         copyBtn.querySelector('span').textContent='Copied';
@@ -1268,37 +1317,250 @@ section.alt .stage{background:var(--section-alt)}
   ];
   var stages=document.querySelectorAll('.pipeline .stage');
   var detail=document.getElementById('pipeline-detail');
+  var tourBtn=document.getElementById('tour-btn');
+  var tourLabel=document.getElementById('tour-label');
+  var tourTimer=null;
   if(stages.length&&detail){
     var defaultMsg=detail.innerHTML;
+    var swapSeq=0;
+    var showStage=function(idx){
+      Array.prototype.forEach.call(stages,function(s){
+        s.classList.remove('active');
+        s.setAttribute('aria-pressed','false');
+      });
+      detail.classList.add('swap');
+      var my=++swapSeq;
+      setTimeout(function(){
+        if(my!==swapSeq)return;
+        if(idx===null){
+          detail.innerHTML=defaultMsg;
+        }else{
+          var li=stages[idx];
+          li.classList.add('active');
+          li.setAttribute('aria-pressed','true');
+          var name=li.textContent.replace(/^\s*\d+\s*/,'').trim();
+          detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> &mdash; '+stageInfo[idx];
+        }
+        detail.classList.remove('swap');
+      },150);
+    };
+    var stopTour=function(){
+      if(tourTimer!==null){clearInterval(tourTimer);tourTimer=null}
+      detail.setAttribute('aria-live','polite');
+      if(tourBtn)tourLabel.textContent='Play the lifecycle';
+    };
     Array.prototype.forEach.call(stages,function(li,idx){
       li.setAttribute('tabindex','0');
       li.setAttribute('role','button');
       li.setAttribute('aria-pressed','false');
       var activate=function(){
-        var wasOn=li.classList.contains('active');
-        Array.prototype.forEach.call(stages,function(s){
-          s.classList.remove('active');
-          s.setAttribute('aria-pressed','false');
-        });
-        detail.classList.add('swap');
-        setTimeout(function(){
-          if(wasOn){
-            detail.innerHTML=defaultMsg;
-          }else{
-            li.classList.add('active');
-            li.setAttribute('aria-pressed','true');
-            var name=li.textContent.replace(/^\s*\d+\s*/,'').trim();
-            detail.innerHTML='<strong>'+('0'+(idx+1)).slice(-2)+' '+name+'</strong> &mdash; '+stageInfo[idx];
-          }
-          detail.classList.remove('swap');
-        },150);
+        stopTour();
+        showStage(li.classList.contains('active')?null:idx);
       };
       li.addEventListener('click',activate);
       li.addEventListener('keydown',function(e){
         if(e.key==='Enter'||e.key===' '){e.preventDefault();activate()}
       });
     });
+    /* the tour: walk all eleven stages */
+    if(tourBtn){
+      tourBtn.addEventListener('click',function(){
+        if(tourTimer!==null){stopTour();showStage(null);return}
+        var i=0;
+        detail.setAttribute('aria-live','off');
+        showStage(0);
+        tourLabel.textContent='Stop the tour';
+        tourTimer=setInterval(function(){
+          i++;
+          if(i>=stages.length){stopTour();showStage(null)}
+          else{showStage(i)}
+        },1600);
+      });
+    }
   }
+
+  /* ── Quick Start: the terminal types itself ──────────────
+     When the code block scrolls into view it replays as a
+     live session: comments appear, commands type themselves,
+     plausible output follows. Replay re-runs it; Copy always
+     copies the pristine commands (kept in data-src). */
+  var term=document.getElementById('quickstart-code');
+  var replayBtn=document.getElementById('replay-btn');
+  if(term){
+    var TERM_SRC=term.innerHTML;
+    term.setAttribute('data-src',term.innerText);
+    var outputFor=function(cmd){
+      if(cmd.indexOf('docker compose')===0)return [' \u2714 Container platform-db  Started                0.4s'];
+      if(cmd.indexOf('cargo build')===0)return ['   Compiling ryuki-core, ryuki-engine, ryuki-api \u2026','    Finished `dev` profile target(s) in 42.3s'];
+      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 352 passed; 0 failed; 0 ignored'];
+      if(cmd.indexOf('cargo run')===0)return ['352/352 validation slices passed \u00b7 evidence pack written'];
+      return [];
+    };
+    var termTimers=[];
+    var later=function(fn,ms){termTimers.push(setTimeout(fn,ms))};
+    var playTerm=function(){
+      termTimers.forEach(clearTimeout);termTimers=[];
+      term.style.minHeight=Math.max(parseFloat(term.style.minHeight)||0,term.offsetHeight)+'px';
+      if(!term.hasAttribute('aria-hidden')){
+        term.setAttribute('aria-hidden','true');
+        var sr=document.createElement('span');
+        sr.className='sr-only';
+        sr.textContent=term.getAttribute('data-src');
+        term.parentNode.insertBefore(sr,term);
+      }
+      var probe=document.createElement('div');
+      probe.innerHTML=TERM_SRC;
+      var lines=[];
+      Array.prototype.forEach.call(probe.querySelectorAll('span'),function(sp){
+        if(sp.className==='c'||sp.className==='cmd')lines.push({t:sp.className,text:sp.textContent});
+      });
+      term.innerHTML='';
+      var cursor=document.createElement('span');
+      cursor.className='term-cursor';
+      term.appendChild(cursor);
+      var txt=function(s){term.insertBefore(document.createTextNode(s),cursor)};
+      var span=function(cls,s){
+        var el=document.createElement('span');
+        el.className=cls;el.textContent=s;
+        term.insertBefore(el,cursor);
+        return el;
+      };
+      var t=80,STEP=14;
+      lines.forEach(function(ln){
+        if(ln.t==='c'){
+          later(function(){span('c',ln.text);txt('\n')},t);
+          t+=300;
+        }else{
+          later(function(){span('prompt','$ ')},t);
+          t+=140;
+          var el=null;
+          later(function(){el=span('cmd','')},t);
+          ln.text.split('').forEach(function(_,ci){
+            later(function(){if(el)el.textContent=ln.text.slice(0,ci+1)},t+ci*STEP);
+          });
+          t+=ln.text.length*STEP+160;
+          later(function(){txt('\n')},t);
+          outputFor(ln.text).forEach(function(o){
+            t+=120;
+            later(function(){span('out',o);txt('\n')},t);
+          });
+          t+=220;
+        }
+      });
+      later(function(){span('prompt','$ ')},t);
+    };
+    if(!reduced&&'IntersectionObserver' in window){
+      var termIo=new IntersectionObserver(function(entries){
+        if(entries[0].isIntersecting){
+          termIo.disconnect();
+          playTerm();
+        }
+      },{threshold:.45});
+      termIo.observe(term);
+      if(replayBtn)replayBtn.addEventListener('click',playTerm);
+    }else if(replayBtn){
+      replayBtn.style.display='none';
+    }
+  }
+
+  /* ── Architecture: nodes light their table row; click runs
+     a governed request across the plane ── */
+  var archNodes=[].slice.call(document.querySelectorAll('.arch-node'));
+  var archMinis=[].slice.call(document.querySelectorAll('.arch-mini'));
+  var archRows=[].slice.call(document.querySelectorAll('.arch-table tbody tr'));
+  var archCaption=document.querySelector('.arch-caption');
+  if(archNodes.length&&archRows.length){
+    if(archCaption)archCaption.setAttribute('aria-live','polite');
+    var rowFor=function(name){
+      for(var ri=0;ri<archRows.length;ri++){
+        var td=archRows[ri].querySelector('td');
+        if(td&&td.textContent.trim()===name)return archRows[ri];
+      }
+      return null;
+    };
+    var nodeRow={'Portal UI':'portal-ui','Platform API':'ryuki-api','Engine':'ryuki-engine','PostgreSQL':'PostgreSQL','Vault':'Vault'};
+    var bindHl=function(el,title){
+      var row=nodeRow[title]?rowFor(nodeRow[title]):null;
+      if(!row)return;
+      var on=function(){row.classList.add('hl')};
+      var off=function(){row.classList.remove('hl')};
+      el.addEventListener('mouseenter',on);
+      el.addEventListener('mouseleave',off);
+      if(el.hasAttribute('tabindex')){
+        el.addEventListener('focus',on);
+        el.addEventListener('blur',off);
+      }
+    };
+    archNodes.forEach(function(n){
+      var h=n.querySelector('h4');
+      n.setAttribute('tabindex','0');
+      n.setAttribute('role','button');
+      n.setAttribute('aria-label',(h?h.textContent.trim()+' \u2014 ':'')+'run a governed request across the plane');
+      bindHl(n,h?h.textContent.trim():'');
+    });
+    archMinis.forEach(function(m){bindHl(m,m.textContent.trim())});
+    var archLinks=[].slice.call(document.querySelectorAll('.arch-diagram .arch-link'));
+    var archVlinks=[].slice.call(document.querySelectorAll('.arch-vlink'));
+    var archFiring=false;
+    var archTimers=[];
+    var fire=function(){
+      if(archFiring)return;
+      archFiring=true;
+      var capDefault=archCaption?archCaption.textContent:'';
+      var step=360;
+      archNodes.forEach(function(n,i){
+        archTimers.push(setTimeout(function(){n.classList.add('lit')},i*step));
+        if(archLinks[i])archTimers.push(setTimeout(function(){archLinks[i].classList.add('firing')},i*step+step/2));
+      });
+      var tEnd=archNodes.length*step;
+      archVlinks.forEach(function(v){archTimers.push(setTimeout(function(){v.classList.add('firing')},tEnd))});
+      archMinis.forEach(function(m){archTimers.push(setTimeout(function(){m.classList.add('lit')},tEnd+step/2))});
+      if(archCaption){
+        archTimers.push(setTimeout(function(){
+          archCaption.textContent='Request executed under governance \u2014 evidence pack written \u2713';
+        },tEnd+step));
+      }
+      archTimers.push(setTimeout(function(){
+        archNodes.forEach(function(n){n.classList.remove('lit')});
+        archMinis.forEach(function(m){m.classList.remove('lit')});
+        archLinks.forEach(function(l){l.classList.remove('firing')});
+        archVlinks.forEach(function(v){v.classList.remove('firing')});
+        if(archCaption)archCaption.textContent=capDefault;
+        archTimers=[];
+        archFiring=false;
+      },tEnd+2800));
+    };
+    archNodes.forEach(function(n){
+      n.addEventListener('click',fire);
+      n.addEventListener('keydown',function(e){
+        if(e.key==='Enter'||e.key===' '){e.preventDefault();fire()}
+      });
+    });
+  }
+
+  /* ── GitHub stars in the header button (cached, silent) ── */
+  (function(){
+    var gh=document.querySelector('.gh-btn');
+    if(!gh||!window.fetch)return;
+    var KEY='ryuki-stars',cached=null;
+    try{cached=JSON.parse(sessionStorage.getItem(KEY)||'null')}catch(e){}
+    var show=function(n){
+      if(typeof n!=='number')return;
+      var s=document.createElement('span');
+      s.className='star-chip';
+      s.textContent='\u2605 '+(n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':n);
+      gh.appendChild(s);
+    };
+    if(cached&&Date.now()-cached.t<36e5){show(cached.n);return}
+    fetch('https://api.github.com/repos/mvandenbulcke/ryuki.io')
+      .then(function(r){return r.ok?r.json():null})
+      .then(function(j){
+        if(!j||typeof j.stargazers_count!=='number')return;
+        try{sessionStorage.setItem(KEY,JSON.stringify({n:j.stargazers_count,t:Date.now()}))}catch(e){}
+        show(j.stargazers_count);
+      })
+      .catch(function(){});
+  })();
 
   /* ── Feature cards: cursor ring + 3D tilt ── */
   Array.prototype.forEach.call(document.querySelectorAll('.feature-card'),function(card){
