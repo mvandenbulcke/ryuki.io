@@ -19,7 +19,7 @@ impl ConfigStore {
         }
     }
 
-    pub fn load_config(&self) -> PlatformConfig {
+    pub fn load_config(&self) -> Result<PlatformConfig, String> {
         let mut config = PlatformConfig::default();
 
         if let Some(app_cfg) = APP_CONFIG.get() {
@@ -32,14 +32,14 @@ impl ConfigStore {
         }
 
         if Path::new(&self.path).exists() {
-            if let Ok(contents) = std::fs::read_to_string(&self.path) {
-                if let Ok(file_config) = serde_json::from_str::<PlatformConfig>(&contents) {
-                    return file_config;
-                }
-            }
+            let contents = std::fs::read_to_string(&self.path)
+                .map_err(|e| format!("failed to read config file: {e}"))?;
+            let file_config = serde_json::from_str::<PlatformConfig>(&contents)
+                .map_err(|e| format!("failed to parse config file: {e}"))?;
+            return Ok(file_config);
         }
 
-        config
+        Ok(config)
     }
 
     pub fn save_config(&self, config: &PlatformConfig) -> Result<(), String> {
@@ -76,12 +76,25 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&expected).unwrap()).unwrap();
 
         let store = ConfigStore::new(&path);
-        let loaded = store.load_config();
+        let loaded = store.load_config().expect("config file should load");
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.storage_provider, "netapp");
         assert_eq!(loaded.retention_daily_backups, 45);
         assert_eq!(loaded.max_concurrent_connections, 1024);
+    }
+
+    #[test]
+    fn test_load_config_returns_error_for_invalid_file_config() {
+        let path = temp_config_path();
+        std::fs::write(&path, "{not-json").unwrap();
+
+        let store = ConfigStore::new(&path);
+        let result = store.load_config();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("failed to parse config file"));
     }
 }
 
@@ -97,7 +110,7 @@ pub fn get_app_config() -> &'static RyukiConfig {
     APP_CONFIG.get().expect("app config not initialized")
 }
 
-pub async fn load_config() -> PlatformConfig {
+pub async fn load_config() -> Result<PlatformConfig, String> {
     let store = STORE.get().expect("config store not initialized");
     store.lock().await.load_config()
 }

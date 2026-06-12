@@ -6628,6 +6628,7 @@ fn platform_config_entries(config: &PlatformConfig) -> Vec<(&'static str, String
 }
 
 const PLATFORM_SETTINGS_PERSISTENCE_FAILED: &str = "PLATFORM_SETTINGS_PERSISTENCE_FAILED";
+const PLATFORM_SETTINGS_READ_FAILED: &str = "PLATFORM_SETTINGS_READ_FAILED";
 
 fn platform_settings_persistence_problem() -> ProblemDetails {
     problem_details(
@@ -6651,6 +6652,29 @@ fn map_platform_settings_persistence_result<T, E: std::fmt::Display>(
             "platform settings persistence failed"
         );
         platform_settings_persistence_problem()
+    })
+}
+
+fn platform_settings_read_problem() -> ProblemDetails {
+    problem_details(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        PLATFORM_SETTINGS_READ_FAILED,
+        "Platform settings could not be loaded",
+        None::<&str>,
+    )
+}
+
+fn map_platform_settings_read_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    backend: &str,
+) -> Result<T, ProblemDetails> {
+    result.map_err(|error| {
+        tracing::error!(
+            backend,
+            error = %error,
+            "platform settings read failed"
+        );
+        platform_settings_read_problem()
     })
 }
 
@@ -6690,17 +6714,20 @@ async fn admin_platform_settings(
     require_admin_permission(&session)?;
 
     if let Some(pool) = get_db() {
-        let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM platform_config")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+        let rows: Vec<(String, String)> = map_platform_settings_read_result(
+            sqlx::query_as("SELECT key, value FROM platform_config")
+                .fetch_all(pool)
+                .await,
+            "database",
+        )?;
         let mut config = PlatformConfig::default();
         for (key, value) in &rows {
             apply_platform_config_entry(&mut config, key, value);
         }
         return Ok(Json(serde_json::to_value(config).unwrap_or_default()));
     }
-    let config = crate::config_store::load_config().await;
+    let config =
+        map_platform_settings_read_result(crate::config_store::load_config().await, "file")?;
     Ok(Json(serde_json::to_value(config).unwrap_or_default()))
 }
 
@@ -6729,7 +6756,7 @@ async fn admin_platform_settings_update(
     let config = if get_db().is_some() {
         body
     } else {
-        crate::config_store::load_config().await
+        map_platform_settings_read_result(crate::config_store::load_config().await, "file")?
     };
     Ok(Json(serde_json::to_value(config).unwrap_or_default()))
 }
@@ -11613,6 +11640,24 @@ mod unit_tests {
         assert!(!serde_json::to_string(&body)
             .unwrap()
             .contains("internal persistence marker"));
+    }
+
+    #[test]
+    fn test_platform_settings_read_result_returns_safe_500() {
+        let raw_error = "internal read marker should stay out of response";
+        let Err((status, Json(body))) =
+            map_platform_settings_read_result::<(), _>(Err(raw_error), "database")
+        else {
+            panic!("read failure should map to ProblemDetails");
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, PLATFORM_SETTINGS_READ_FAILED);
+        assert_eq!(body.message, "Platform settings could not be loaded");
+        assert_eq!(body.detail, None);
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("internal read marker"));
     }
 
     #[test]
