@@ -1353,8 +1353,8 @@ fn AdminSettingsDetail() -> impl IntoView {
                     set_feedback_class.set("badge good");
                 }
                 Err(_) => {
-                    set_feedback.set("Save failed".to_string());
-                    set_feedback_class.set("badge bad");
+                    set_feedback.set("Preview only: settings were not persisted".to_string());
+                    set_feedback_class.set("badge neutral");
                 }
             }
         }
@@ -1375,8 +1375,8 @@ fn AdminSettingsDetail() -> impl IntoView {
                     set_feedback_class.set("badge good");
                 }
                 Err(_) => {
-                    set_feedback.set("Reset failed".to_string());
-                    set_feedback_class.set("badge bad");
+                    set_feedback.set("Preview only: settings were not reset".to_string());
+                    set_feedback_class.set("badge neutral");
                 }
             }
         }

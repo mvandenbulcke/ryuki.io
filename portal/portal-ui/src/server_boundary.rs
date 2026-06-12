@@ -1,5 +1,5 @@
 use crate::api::{
-    ApiPathError, activity_operation_queue_path, admin_feature_flag_governance_path,
+    activity_operation_queue_path, admin_feature_flag_governance_path,
     admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
     admin_worker_capability_path, approval_decision_readiness_path, auth_login_path,
     auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
@@ -17,17 +17,25 @@ use crate::api::{
     request_detail_path, request_execute_path, request_intake_form_preview_path,
     request_intake_path, request_list_path, request_lock_path, request_plan_path,
     request_preflight_path, request_validate_path, request_verify_path, same_origin_api_path,
-    secret_references_path, shift_queue_path, site_catalog_path,
+    secret_references_path, shift_queue_path, site_catalog_path, ApiPathError,
 };
 use crate::api_client::{
-    ApiResource, capacity_admission_resource, cmdb_file_exchange_resource,
-    cmdb_reconciliation_resource, cmdb_relationship_graph_resource, dry_run_plan_resource,
-    evidence_summary_resource, inventory_resource_overview_resource, operation_runs_resource,
-    policy_outcomes_resource, request_intake_resource, secret_references_resource,
+    capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
+    cmdb_relationship_graph_resource, dry_run_plan_resource, evidence_summary_resource,
+    inventory_resource_overview_resource, operation_runs_resource, policy_outcomes_resource,
+    request_intake_resource, secret_references_resource, ApiResource,
 };
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
 use crate::models::{
+    activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
+    cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks, datacenter_failing_checks_fallback,
+    datacenter_full_readiness_fallback, datacenter_readiness_score_fallback,
+    datacenter_single_check_fallback, datacenter_site_report_fallback,
+    datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
+    inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
+    policy_outcome_fallbacks, request_detail_fallback, request_intake_fallbacks,
+    request_summary_fallbacks, secret_reference_catalog_fallback, secret_reference_fallbacks,
     ActivityQueueSummary, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
     CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload,
     DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
@@ -35,22 +43,14 @@ use crate::models::{
     EvidenceSummary, InventoryResourceSummary, LoginResponse, OperationRunSummary, PlatformHealth,
     PlatformSettingsSummary, PlatformStatus, PolicyGuardrailSummary, PolicyOutcome,
     RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary, RequestSummary,
-    SecretReferenceSummary, StageActionResponse, activity_queue_fallbacks,
-    capacity_admission_fallbacks, cmdb_file_exchange_fallbacks, cmdb_reconciliation_fallbacks,
-    cmdb_relationship_fallbacks, datacenter_failing_checks_fallback,
-    datacenter_full_readiness_fallback, datacenter_readiness_score_fallback,
-    datacenter_single_check_fallback, datacenter_site_report_fallback,
-    datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
-    inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
-    policy_outcome_fallbacks, request_detail_fallback, request_intake_fallbacks,
-    request_summary_fallbacks, secret_reference_catalog_fallback, secret_reference_fallbacks,
+    SecretReferenceSummary, StageActionResponse,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{
     auth_session_fallback, platform_health_fallback, platform_settings_summary_fallback,
     platform_status_fallback, rbac_role_summary_fallbacks,
 };
-use leptos::prelude::{ServerFnError, server};
+use leptos::prelude::{server, ServerFnError};
 use ryuki_core::types::{BoundaryStatus, ExecutionMode};
 use serde::{Deserialize, Serialize};
 
@@ -932,50 +932,50 @@ pub async fn load_portal_route_state() -> Result<PortalRouteStateSnapshot, Serve
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-preflight-status")]
-pub async fn load_portal_request_preflight_status()
--> Result<PortalRequestPreflightSnapshot, ServerFnError> {
+pub async fn load_portal_request_preflight_status(
+) -> Result<PortalRequestPreflightSnapshot, ServerFnError> {
     PortalRequestPreflightSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal request preflight status is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "inventory-capacity-status")]
-pub async fn load_portal_inventory_capacity_status()
--> Result<PortalInventoryCapacitySnapshot, ServerFnError> {
+pub async fn load_portal_inventory_capacity_status(
+) -> Result<PortalInventoryCapacitySnapshot, ServerFnError> {
     PortalInventoryCapacitySnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal inventory capacity status is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "activity-run-state")]
-pub async fn load_portal_activity_run_state()
--> Result<PortalActivityRunStateSnapshot, ServerFnError> {
+pub async fn load_portal_activity_run_state(
+) -> Result<PortalActivityRunStateSnapshot, ServerFnError> {
     PortalActivityRunStateSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal activity run state is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "evidence-summary-status")]
-pub async fn load_portal_evidence_summary_status()
--> Result<PortalEvidenceSummarySnapshot, ServerFnError> {
+pub async fn load_portal_evidence_summary_status(
+) -> Result<PortalEvidenceSummarySnapshot, ServerFnError> {
     PortalEvidenceSummarySnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal evidence summary status is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "secret-reference-status")]
-pub async fn load_portal_secret_reference_status()
--> Result<PortalSecretReferenceSnapshot, ServerFnError> {
+pub async fn load_portal_secret_reference_status(
+) -> Result<PortalSecretReferenceSnapshot, ServerFnError> {
     PortalSecretReferenceSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal secret reference status is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "cmdb-workspace-status")]
-pub async fn load_portal_cmdb_workspace_status()
--> Result<PortalCmdbWorkspaceSnapshot, ServerFnError> {
+pub async fn load_portal_cmdb_workspace_status(
+) -> Result<PortalCmdbWorkspaceSnapshot, ServerFnError> {
     PortalCmdbWorkspaceSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal CMDB workspace status is unavailable"))
 }
 
 #[server(prefix = "/portal/api", endpoint = "policy-guardrails-status")]
-pub async fn load_portal_policy_guardrails_status()
--> Result<PortalPolicyGuardrailsSnapshot, ServerFnError> {
+pub async fn load_portal_policy_guardrails_status(
+) -> Result<PortalPolicyGuardrailsSnapshot, ServerFnError> {
     PortalPolicyGuardrailsSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal policy guardrails status is unavailable"))
 }
@@ -1037,18 +1037,23 @@ pub async fn save_platform_settings(
         .map_err(|_| {
             ServerFnError::new("admin platform settings API path failed same-origin guard")
         })?;
-    Ok(settings)
+    let _ = settings;
+    Err(ServerFnError::new(
+        "Portal settings save is preview-only in static dry-run mode; no changes were persisted",
+    ))
 }
 
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings-reset")]
 pub async fn reset_platform_settings() -> Result<PlatformSettingsSummary, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
     boundary
-        .validate_platform_api_path(admin_platform_settings_path())
+        .validate_platform_api_path(admin_platform_settings_reset_path())
         .map_err(|_| {
-            ServerFnError::new("admin platform settings API path failed same-origin guard")
+            ServerFnError::new("admin platform settings reset API path failed same-origin guard")
         })?;
-    Ok(platform_settings_summary_fallback())
+    Err(ServerFnError::new(
+        "Portal settings reset is preview-only in static dry-run mode; no changes were persisted",
+    ))
 }
 
 #[server(prefix = "/portal/api", endpoint = "platform-status")]
@@ -1292,6 +1297,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn save_platform_settings_refuses_static_preview_persistence() {
+        let result = save_platform_settings(platform_settings_summary_fallback()).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("preview-only"));
+    }
+
+    #[tokio::test]
+    async fn reset_platform_settings_refuses_static_preview_persistence() {
+        let result = reset_platform_settings().await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("preview-only"));
+    }
+
     #[test]
     fn boundary_validates_generated_request_lifecycle_paths() {
         let boundary = PortalServerBoundary::static_dry_run();
@@ -1455,12 +1476,10 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
-        assert!(
-            snapshot
-                .dry_run_plans
-                .iter()
-                .all(|plan| plan.dry_run && !plan.execution_allowed)
-        );
+        assert!(snapshot
+            .dry_run_plans
+            .iter()
+            .all(|plan| plan.dry_run && !plan.execution_allowed));
 
         serde_json::to_string(&snapshot)
             .expect("portal request preflight snapshot must serialize for Leptos server function");
@@ -1496,12 +1515,10 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
-        assert!(
-            snapshot
-                .capacity_admissions
-                .iter()
-                .all(|admission| !admission.execution_allowed)
-        );
+        assert!(snapshot
+            .capacity_admissions
+            .iter()
+            .all(|admission| !admission.execution_allowed));
 
         serde_json::to_string(&snapshot)
             .expect("portal inventory capacity snapshot must serialize for Leptos server function");
@@ -1532,18 +1549,14 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
-        assert!(
-            snapshot
-                .activity_queue
-                .iter()
-                .all(|item| !item.worker_execution_allowed)
-        );
-        assert!(
-            snapshot
-                .operation_runs
-                .iter()
-                .all(|run| run.dry_run && run.blocked_reason.is_some())
-        );
+        assert!(snapshot
+            .activity_queue
+            .iter()
+            .all(|item| !item.worker_execution_allowed));
+        assert!(snapshot
+            .operation_runs
+            .iter()
+            .all(|run| run.dry_run && run.blocked_reason.is_some()));
 
         serde_json::to_string(&snapshot)
             .expect("portal activity run state snapshot must serialize for Leptos server function");
@@ -1568,12 +1581,10 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
-        assert!(
-            snapshot
-                .evidence_summaries
-                .iter()
-                .all(|summary| summary.redaction_required && !summary.export_allowed)
-        );
+        assert!(snapshot
+            .evidence_summaries
+            .iter()
+            .all(|summary| summary.redaction_required && !summary.export_allowed));
 
         serde_json::to_string(&snapshot)
             .expect("portal evidence summary snapshot must serialize for Leptos server function");
@@ -1643,12 +1654,10 @@ mod tests {
                 && !exchange.live_api_allowed
                 && !exchange.raw_cmdb_rows_allowed
         }));
-        assert!(
-            snapshot
-                .reconciliation
-                .iter()
-                .all(|item| { !item.cmdb_mutation_allowed && !item.raw_cmdb_rows_allowed })
-        );
+        assert!(snapshot
+            .reconciliation
+            .iter()
+            .all(|item| { !item.cmdb_mutation_allowed && !item.raw_cmdb_rows_allowed }));
         assert!(snapshot.relationships.iter().all(|item| {
             !item.relationship_mutation_allowed && !item.raw_relationship_rows_allowed
         }));
@@ -1681,18 +1690,14 @@ mod tests {
         assert!(!snapshot.raw_payload_allowed);
         assert!(!snapshot.secret_values_allowed);
         assert!(!snapshot.customer_identifiers_allowed);
-        assert!(
-            snapshot
-                .policy_outcomes
-                .iter()
-                .all(|outcome| outcome.decision == "block" && !outcome.safe_summary.is_empty())
-        );
-        assert!(
-            snapshot
-                .guardrails
-                .iter()
-                .all(|guardrail| !guardrail.execution_allowed)
-        );
+        assert!(snapshot
+            .policy_outcomes
+            .iter()
+            .all(|outcome| outcome.decision == "block" && !outcome.safe_summary.is_empty()));
+        assert!(snapshot
+            .guardrails
+            .iter()
+            .all(|guardrail| !guardrail.execution_allowed));
 
         serde_json::to_string(&snapshot)
             .expect("portal policy guardrails snapshot must serialize for Leptos server function");
