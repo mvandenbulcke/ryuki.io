@@ -39,9 +39,9 @@ VALUES
 
 INSERT INTO build_test_results (id, image_id, test_phase, passed, details, run_at)
 VALUES
-    ('t0000400-4000-4000-4000-000000000001', 'e0000400-4000-4000-4000-000000000001', 'security-scan', true, 'No critical or high CVEs found', '2026-05-01 04:00:00+00'),
-    ('t0000400-4000-4000-4000-000000000002', 'e0000400-4000-4000-4000-000000000001', 'agent-checks', true, 'All monitoring agents operational', '2026-05-01 04:30:00+00'),
-    ('t0000400-4000-4000-4000-000000000003', 'e0000400-4000-4000-4000-000000000001', 'baseline-compliance', true, 'CIS baseline compliant', '2026-05-01 05:00:00+00'),
-    ('t0000400-4000-4000-4000-000000000004', 'e0000400-4000-4000-4000-000000000002', 'security-scan', true, 'No critical or high CVEs found', '2026-05-02 04:00:00+00'),
-    ('t0000400-4000-4000-4000-000000000005', 'e0000400-4000-4000-4000-000000000002', 'agent-checks', true, 'All monitoring agents operational', '2026-05-02 04:30:00+00'),
-    ('t0000400-4000-4000-4000-000000000006', 'e0000400-4000-4000-4000-000000000002', 'baseline-compliance', true, 'CIS baseline compliant', '2026-05-02 05:00:00+00');
+    ('a0000400-4000-4000-4000-000000000001', 'e0000400-4000-4000-4000-000000000001', 'security-scan', true, 'No critical or high CVEs found', '2026-05-01 04:00:00+00'),
+    ('a0000400-4000-4000-4000-000000000002', 'e0000400-4000-4000-4000-000000000001', 'agent-checks', true, 'All monitoring agents operational', '2026-05-01 04:30:00+00'),
+    ('a0000400-4000-4000-4000-000000000003', 'e0000400-4000-4000-4000-000000000001', 'baseline-compliance', true, 'CIS baseline compliant', '2026-05-01 05:00:00+00'),
+    ('a0000400-4000-4000-4000-000000000004', 'e0000400-4000-4000-4000-000000000002', 'security-scan', true, 'No critical or high CVEs found', '2026-05-02 04:00:00+00'),
+    ('a0000400-4000-4000-4000-000000000005', 'e0000400-4000-4000-4000-000000000002', 'agent-checks', true, 'All monitoring agents operational', '2026-05-02 04:30:00+00'),
+    ('a0000400-4000-4000-4000-000000000006', 'e0000400-4000-4000-4000-000000000002', 'baseline-compliance', true, 'CIS baseline compliant', '2026-05-02 05:00:00+00');

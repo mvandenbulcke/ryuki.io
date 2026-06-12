@@ -8,7 +8,7 @@ CREATE TABLE sql_deployments (
     data_disk_gb INTEGER NOT NULL CHECK (data_disk_gb >= 10),
     log_disk_gb INTEGER NOT NULL CHECK (log_disk_gb >= 10),
     tempdb_disk_gb INTEGER NOT NULL CHECK (tempdb_disk_gb >= 10),
-    collation TEXT NOT NULL DEFAULT 'SQL_Latin1_General_CP1_CI_AS',
+    collation_name TEXT NOT NULL DEFAULT 'SQL_Latin1_General_CP1_CI_AS',
     service_account TEXT NOT NULL,
     site TEXT NOT NULL,
     cluster_mode TEXT NOT NULL CHECK (cluster_mode IN ('Standalone', 'FCI', 'AG')),
@@ -41,7 +41,7 @@ CREATE INDEX idx_sql_deployments_cluster_mode ON sql_deployments(site, cluster_m
 CREATE INDEX idx_sql_deployment_operations_deployment ON sql_deployment_operations(deployment_id);
 CREATE INDEX idx_sql_deployment_operations_type ON sql_deployment_operations(deployment_id, operation_type);
 
-INSERT INTO sql_deployments (id, instance_name, sql_version, edition, cpu, memory_gb, data_disk_gb, log_disk_gb, tempdb_disk_gb, collation, service_account, site, cluster_mode, status)
+INSERT INTO sql_deployments (id, instance_name, sql_version, edition, cpu, memory_gb, data_disk_gb, log_disk_gb, tempdb_disk_gb, collation_name, service_account, site, cluster_mode, status)
 VALUES
     ('e0000400-4000-4000-4000-000000000001', 'DEFRA-SQL-PROD-01', '2022', 'Enterprise', 8, 64, 500, 200, 100, 'Latin1_General_CI_AS', 'service-account@example.local', 'DEFRA', 'AG', 'draft'),
     ('e0000400-4000-4000-4000-000000000002', 'GBLON-SQL-PROD-01', '2019', 'Standard', 4, 32, 250, 100, 50, 'SQL_Latin1_General_CP1_CI_AS', 'service-account@example.local', 'GBLON', 'Standalone', 'draft');
