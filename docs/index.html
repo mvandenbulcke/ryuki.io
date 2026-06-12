@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ryuki — Governed Infrastructure Control Plane</title>
-<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable workflows across VMware, Hyper-V, Proxmox, Windows, Linux, SQL Server, Veeam, Zabbix, and ServiceNow.">
+<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable workflows through 17 provider adapters — VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
 <link rel="canonical" href="https://ryuki.io/">
 <meta name="theme-color" content="#0b0d12">
 
@@ -206,7 +206,23 @@ section.alt{background:var(--section-alt);transition:background var(--transition
   .dragon-art{--ryu-base-opacity:.26}
 }
 
-.hero-inner{position:relative}
+.hero-inner{position:relative;z-index:1}
+/* Text scrim: when the gold reveal sweeps behind the headline the
+   line art competes with the copy. This radial wash darkens the
+   dragon directly under the text and fades out, so the reveal
+   stays vivid at the edges while the words stay readable. */
+.hero-inner::before{
+  content:"";position:absolute;z-index:-1;pointer-events:none;
+  left:50%;top:47%;transform:translate(-50%,-50%);
+  width:min(1020px,116%);height:138%;
+  background:radial-gradient(ellipse closest-side,
+    rgba(11,13,18,.94) 0%,rgba(11,13,18,.78) 50%,rgba(11,13,18,.42) 76%,transparent 100%);
+}
+.hero h1{text-shadow:0 1px 3px rgba(11,13,18,.85),0 4px 22px rgba(11,13,18,.55)}
+/* no text-shadow on clipped-gradient text — it bleeds through the
+   transparent fill; a drop-shadow filter separates it instead */
+.hero h1 .grad{text-shadow:none;filter:drop-shadow(0 2px 12px rgba(11,13,18,.6))}
+.hero .tagline{text-shadow:0 1px 2px rgba(11,13,18,.95),0 2px 18px rgba(11,13,18,.75)}
 .hero .mark{width:74px;height:74px;margin:0 auto 1.6rem;filter:drop-shadow(0 10px 26px var(--accent-glow))}
 .js .hero .mark{cursor:pointer}
 @keyframes markPop{0%{transform:scale(1)}35%{transform:scale(1.16) rotate(-5deg)}70%{transform:scale(.97)}100%{transform:scale(1)}}
@@ -741,7 +757,7 @@ section.alt .stage{background:var(--section-alt)}
       <span class="hero-pill fx" style="--d:.15s"><span class="dot"></span>Open source &middot; Rust-powered &middot; MIT licensed</span>
     </div>
     <h1 class="fx" style="--d:.25s">The <span class="grad">governed control plane</span> for multi&#8209;site infrastructure</h1>
-    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, operate, evidence, and retire infrastructure services &mdash; across VMware, Hyper&#8209;V, Proxmox, Windows, Linux, SQL Server, Veeam, Zabbix, and ServiceNow.</p>
+    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, operate, evidence, and retire infrastructure services &mdash; through a growing adapter framework: 17 providers spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow.</p>
     <div class="hero-links fx" style="--d:.55s">
       <a href="/getting-started.html" class="btn btn-primary">
         Get Started
@@ -792,8 +808,8 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
         </div>
         <h3>VM Lifecycle</h3>
-        <p>Provision, resize, migrate, and retire VMs across VMware, Hyper&#8209;V, and Proxmox. Capacity governance and placement policies per cluster.</p>
-        <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span></div>
+        <p>Provision, resize, migrate, and retire VMs across six hypervisors &mdash; with capacity governance and placement policies per cluster.</p>
+        <div class="feature-tags"><span class="tag">VMware</span><span class="tag">Hyper-V</span><span class="tag">Proxmox</span><span class="tag">Nutanix AHV</span><span class="tag">Xen</span><span class="tag">KVM</span></div>
       </div>
 
       <div class="feature-card" data-reveal style="--d:.07s">
@@ -801,8 +817,8 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
         </div>
         <h3>Monitoring &amp; Alerting</h3>
-        <p>Zabbix host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts.</p>
-        <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">SNMP</span><span class="tag">Drift</span></div>
+        <p>Host onboarding, alert routing, maintenance windows, and configuration drift detection across thousands of hosts &mdash; on the monitoring stack you already run.</p>
+        <div class="feature-tags"><span class="tag">Zabbix</span><span class="tag">Prometheus</span><span class="tag">Datadog</span><span class="tag">Grafana</span><span class="tag">SolarWinds</span></div>
       </div>
 
       <div class="feature-card" data-reveal style="--d:.14s">
@@ -810,8 +826,8 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         </div>
         <h3>Backup &amp; Recovery</h3>
-        <p>Veeam Backup &amp; Replication coverage tracking, restore testing, DR orchestration, and repository health across sites.</p>
-        <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">DR</span><span class="tag">SQL</span></div>
+        <p>Backup coverage tracking, restore testing, DR orchestration, and repository health across sites &mdash; whichever backup platform protects them.</p>
+        <div class="feature-tags"><span class="tag">Veeam</span><span class="tag">Commvault</span><span class="tag">Rubrik</span><span class="tag">Cohesity</span><span class="tag">NetBackup</span></div>
       </div>
 
       <div class="feature-card" data-reveal style="--d:.21s">
