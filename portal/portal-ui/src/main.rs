@@ -1,7 +1,7 @@
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use axum::{routing::get, Router};
+    use axum::{middleware, routing::get, Router};
     use leptos::prelude::*;
     use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
     use ryuki_portal_ui::app::{shell, App};
@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             move || shell(leptos_options.clone())
         })
         .fallback(file_and_error_handler(shell))
+        .layer(middleware::from_fn(security_headers_middleware))
         .with_state(leptos_options);
 
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -32,3 +33,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(not(feature = "ssr"))]
 fn main() {}
+
+#[cfg(feature = "ssr")]
+async fn security_headers_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    apply_security_headers(response.headers_mut());
+    response
+}
+
+#[cfg(feature = "ssr")]
+fn apply_security_headers(headers: &mut axum::http::HeaderMap) {
+    use axum::http::{HeaderName, HeaderValue};
+
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "default-src 'self'; \
+             script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+             style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; \
+             font-src 'self'; \
+             connect-src 'self' ws: wss:; \
+             frame-ancestors 'none'; \
+             base-uri 'self'; \
+             form-action 'self'",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName};
+
+    #[test]
+    fn security_headers_are_applied() {
+        let mut headers = HeaderMap::new();
+
+        apply_security_headers(&mut headers);
+
+        assert_eq!(
+            headers
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY")
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
+        assert_eq!(
+            headers
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("strict-origin-when-cross-origin")
+        );
+
+        let csp = headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .expect("content-security-policy header is set");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn security_headers_do_not_apply_hsts_without_https_runtime_signal() {
+        let mut headers = HeaderMap::new();
+
+        apply_security_headers(&mut headers);
+
+        assert!(!headers.contains_key(HeaderName::from_static("strict-transport-security")));
+    }
+}
