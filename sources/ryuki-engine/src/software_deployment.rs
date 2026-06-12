@@ -293,6 +293,14 @@ pub fn validate_deployment(request: &DeploymentRequest) -> Result<ValidationResu
 }
 
 pub fn plan_deployment(request: &DeploymentRequest) -> Result<DeploymentRecord, String> {
+    let validation = validate_deployment(request)?;
+    if !validation.passed {
+        return Err(format!(
+            "Cannot plan software deployment until validation passes: {}",
+            validation.errors.join("; ")
+        ));
+    }
+
     let packages = package_store().lock().unwrap();
     let package = packages
         .iter()
@@ -677,6 +685,21 @@ mod tests {
             requester: "ops-team".into(),
         };
         assert!(plan_deployment(&request).is_err());
+    }
+
+    #[test]
+    fn test_plan_deployment_requires_validation_success() {
+        let request = DeploymentRequest {
+            server_name: "".into(),
+            package_id: "pkg-zabbix-agent".into(),
+            target_version: "7.0.4".into(),
+            scheduled_time: "2026-06-15T22:00:00Z".into(),
+            requester: "ops-team".into(),
+        };
+
+        let error = plan_deployment(&request).unwrap_err();
+        assert!(error.contains("Cannot plan software deployment until validation passes"));
+        assert!(error.contains("Server name is required"));
     }
 
     #[test]
