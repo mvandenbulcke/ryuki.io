@@ -3,6 +3,7 @@ const BOUNDARY_STATUS_PATH: &str = "/api/boundary/status";
 const PLATFORM_STATUS_PATH: &str = "/api/platform/status";
 const PLATFORM_HEALTH_PATH: &str = "/api/platform/health";
 const AUTH_STATUS_PATH: &str = "/api/auth/status";
+const AUTH_SESSION_PATH: &str = "/api/auth/session";
 const PLATFORM_SUMMARY_PATH: &str = "/api/platform/summary";
 const REQUEST_INTAKE_PATH: &str = "/api/requests/intake-support-contract";
 const REQUEST_PREFLIGHT_PATH: &str = "/api/requests/preflight-contract";
@@ -30,6 +31,7 @@ const ADMIN_WORKER_CAPABILITY_PATH: &str = "/api/admin/worker-capability-contrac
 const ADMIN_FEATURE_FLAG_GOVERNANCE_PATH: &str = "/api/admin/feature-flag-governance-contract";
 const ADMIN_RBAC_ROLES_PATH: &str = "/api/admin/rbac-roles";
 const ADMIN_PLATFORM_SETTINGS_PATH: &str = "/api/admin/platform-settings";
+const ADMIN_PLATFORM_SETTINGS_RESET_PATH: &str = "/api/admin/platform-settings/reset";
 const REQUEST_INTAKE_FORM_PREVIEW_PATH: &str = "/api/requests/intake-form";
 const REQUEST_LIST_PATH: &str = "/api/requests";
 const REQUEST_CREATE_PATH: &str = "/api/requests";
@@ -209,6 +211,10 @@ pub fn admin_platform_settings_path() -> &'static str {
     ADMIN_PLATFORM_SETTINGS_PATH
 }
 
+pub fn admin_platform_settings_reset_path() -> &'static str {
+    ADMIN_PLATFORM_SETTINGS_RESET_PATH
+}
+
 pub fn request_intake_form_preview_path() -> &'static str {
     REQUEST_INTAKE_FORM_PREVIEW_PATH
 }
@@ -293,7 +299,7 @@ pub fn auth_logout_path() -> &'static str {
 }
 
 pub fn auth_session_path() -> &'static str {
-    AUTH_STATUS_PATH
+    AUTH_SESSION_PATH
 }
 
 pub fn request_list_path() -> &'static str {
@@ -367,6 +373,29 @@ mod tests {
         assert_eq!(
             request_verify_path(request_id),
             Ok("/api/requests/REQ-123/verify".to_string())
+        );
+    }
+
+    #[test]
+    fn auth_paths_match_api_contract() {
+        assert_eq!(auth_status_path(), "/api/auth/status");
+        assert_eq!(auth_session_path(), "/api/auth/session");
+        assert_ne!(auth_status_path(), auth_session_path());
+    }
+
+    #[test]
+    fn admin_platform_settings_paths_match_api_contract() {
+        assert_eq!(
+            admin_platform_settings_path(),
+            "/api/admin/platform-settings"
+        );
+        assert_eq!(
+            admin_platform_settings_reset_path(),
+            "/api/admin/platform-settings/reset"
+        );
+        assert_ne!(
+            admin_platform_settings_path(),
+            admin_platform_settings_reset_path()
         );
     }
 
