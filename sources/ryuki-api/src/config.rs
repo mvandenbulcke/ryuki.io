@@ -4,10 +4,17 @@ pub fn load_config() -> RyukiConfig {
     match RyukiConfig::load() {
         Ok(config) => {
             let validation_errors = config.validate();
+            let validation_warnings = config.validation_warnings();
             if !validation_errors.is_empty() {
-                eprintln!("Configuration validation warnings:");
+                eprintln!("Configuration validation errors:");
                 for error in &validation_errors {
                     eprintln!("  - {error}");
+                }
+            }
+            if !validation_warnings.is_empty() {
+                eprintln!("Configuration validation warnings:");
+                for warning in &validation_warnings {
+                    eprintln!("  - {warning}");
                 }
             }
             config
@@ -31,6 +38,7 @@ fn is_tls_configured(cert_path: &Option<String>, key_path: &Option<String>) -> b
 pub fn get_platform_status() -> serde_json::Value {
     let config = crate::config_store::get_app_config();
     let validation_errors = config.validate();
+    let validation_warnings = config.validation_warnings();
     let entra_tenant_configured = !config.entra_tenant_id.is_empty();
     let entra_client_configured = !config.entra_client_id.is_empty();
     let tls_configured =
@@ -134,6 +142,7 @@ pub fn get_platform_status() -> serde_json::Value {
             "duration_hours": config.maintenance_window.duration_hours,
         },
         "validation_errors": validation_errors,
+        "validation_warnings": validation_warnings,
     })
 }
 

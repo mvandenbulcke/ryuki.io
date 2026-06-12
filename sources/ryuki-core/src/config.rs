@@ -1079,6 +1079,35 @@ impl RyukiConfig {
         figment.merge(Env::prefixed("RYUKI_").split("__")).extract()
     }
 
+    pub fn validation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.kubernetes_runtime == KubernetesRuntime::None
+            && self.database_provider == DatabaseProvider::CloudNativePg
+        {
+            warnings.push(
+                "database_provider cloudnativepg typically requires a kubernetes_runtime — consider setting one"
+                    .into(),
+            );
+        }
+
+        if self.secret_provider == SecretProvider::HashicorpVault {
+            warnings.push(
+                "secret_provider is hashicorp-vault; ensure VAULT_ADDR and vault token are configured externally"
+                    .into(),
+            );
+        }
+
+        if self.server.pool_acquire_timeout_secs > self.server.request_timeout_secs {
+            warnings.push(
+                "server.pool_acquire_timeout_secs should not exceed server.request_timeout_secs"
+                    .into(),
+            );
+        }
+
+        warnings
+    }
+
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
@@ -1213,22 +1242,6 @@ impl RyukiConfig {
             errors.push("security.content_security_policy must not be empty".into());
         }
 
-        if self.kubernetes_runtime == KubernetesRuntime::None
-            && self.database_provider == DatabaseProvider::CloudNativePg
-        {
-            errors.push(
-                "database_provider cloudnativepg typically requires a kubernetes_runtime — consider setting one"
-                    .into(),
-            );
-        }
-
-        if self.secret_provider == SecretProvider::HashicorpVault {
-            errors.push(
-                "secret_provider is hashicorp-vault; ensure VAULT_ADDR and vault token are configured externally"
-                    .into(),
-            );
-        }
-
         // Future: if monitoring_provider is Zabbix, validate a zabbix_url field once added
         if self.monitoring_provider == MonitoringProvider::Zabbix {
             // Zabbix currently requires no additional in-process config
@@ -1253,13 +1266,6 @@ impl RyukiConfig {
                 "server.bind_address '{}' must include a port (e.g. 0.0.0.0:8080)",
                 self.server.bind_address
             ));
-        }
-
-        if self.server.pool_acquire_timeout_secs > self.server.request_timeout_secs {
-            errors.push(
-                "server.pool_acquire_timeout_secs should not exceed server.request_timeout_secs"
-                    .into(),
-            );
         }
 
         if self.smtp.enabled {
@@ -1370,13 +1376,31 @@ mod tests {
     fn test_validate_ryuki_config_valid() {
         let config = RyukiConfig::default();
         let errors = config.validate();
-        assert_eq!(
-            errors.len(),
-            1,
-            "default config should produce exactly one warning (hashicorp-vault), got: {:?}",
+        assert!(
+            errors.is_empty(),
+            "default config should produce no hard validation errors, got: {:?}",
             errors
         );
-        assert!(errors.iter().any(|e| e.contains("hashicorp-vault")));
+    }
+
+    #[test]
+    fn test_validation_warnings_are_advisory() {
+        let config = RyukiConfig::default();
+        let warnings = config.validation_warnings();
+        assert!(warnings.iter().any(|e| e.contains("hashicorp-vault")));
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validation_warnings_include_operational_guidance() {
+        let mut config = RyukiConfig::default();
+        config.kubernetes_runtime = KubernetesRuntime::None;
+        config.server.pool_acquire_timeout_secs = config.server.request_timeout_secs + 1;
+        let warnings = config.validation_warnings();
+
+        assert!(warnings.iter().any(|e| e.contains("cloudnativepg")));
+        assert!(warnings.iter().any(|e| e.contains("pool_acquire_timeout")));
+        assert!(config.validate().is_empty());
     }
 
     #[test]

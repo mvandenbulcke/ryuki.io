@@ -664,6 +664,7 @@ async fn health(
     let db_connected = crate::database::get_db().is_some();
     let app_config = crate::config_store::get_app_config();
     let validation_errors = app_config.validate();
+    let validation_warnings = app_config.validation_warnings();
 
     let status = if db_connected && validation_errors.is_empty() {
         "healthy"
@@ -675,6 +676,7 @@ async fn health(
         db_connected,
         config_valid = validation_errors.is_empty(),
         config_errors = validation_errors.len(),
+        config_warnings = validation_warnings.len(),
         auth_mode = %app_config.auth_mode.as_str(),
         rate_limit_enabled = app_config.rate_limit.enabled,
         "health check result"
@@ -689,6 +691,7 @@ async fn health(
         "config": {
             "valid": validation_errors.is_empty(),
             "errors": validation_errors,
+            "warnings": validation_warnings,
         },
         "auth_mode": app_config.auth_mode.as_str(),
         "rate_limit_enabled": app_config.rate_limit.enabled,
