@@ -13509,19 +13509,190 @@ struct SecretsSiteQuery {
     site: Option<String>,
 }
 
+/// Deserializes a stored enum string back into its engine type via serde — the
+/// inverse of `serde_enum_str`. Using serde (not a hand parser) guarantees the
+/// stored string round-trips exactly, including rename_all="kebab-case" quirks
+/// like SecretType::APIKey ↔ "a-p-i-key".
+fn de_enum<T: serde::de::DeserializeOwned>(s: &str) -> Option<T> {
+    serde_json::from_value(Value::String(s.to_string())).ok()
+}
+
+/// One persisted `managed_secrets` row (migration 051). `to_engine` rebuilds the
+/// engine `ManagedSecret` (enum columns hold serde strings) so serialization is
+/// byte-for-byte identical to the static path.
+#[derive(sqlx::FromRow)]
+struct ManagedSecretRow {
+    id: String,
+    name: String,
+    secret_type: String,
+    vault_path: String,
+    rotation_interval_days: i64,
+    last_rotated: String,
+    next_rotation_due: String,
+    status: String,
+    owner: String,
+    site: String,
+}
+
+impl ManagedSecretRow {
+    fn to_engine(&self) -> secrets_rotation::ManagedSecret {
+        secrets_rotation::ManagedSecret {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            secret_type: de_enum(&self.secret_type).unwrap_or(secrets_rotation::SecretType::Token),
+            vault_path: self.vault_path.clone(),
+            rotation_interval_days: self.rotation_interval_days.max(0) as u64,
+            last_rotated: self.last_rotated.clone(),
+            next_rotation_due: self.next_rotation_due.clone(),
+            status: de_enum(&self.status).unwrap_or(secrets_rotation::SecretStatus::Active),
+            owner: self.owner.clone(),
+            site: self.site.clone(),
+        }
+    }
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self.to_engine()).unwrap_or_default()
+    }
+}
+
+/// One persisted `rotation_runs` row (migration 051).
+#[derive(sqlx::FromRow)]
+struct RotationRunRow {
+    id: String,
+    secret_id: String,
+    started_at: String,
+    completed_at: Option<String>,
+    status: String,
+    rotated_by: String,
+    new_version: Option<String>,
+    error_message: Option<String>,
+}
+
+impl RotationRunRow {
+    fn to_engine(&self) -> secrets_rotation::RotationRun {
+        secrets_rotation::RotationRun {
+            id: self.id.clone(),
+            secret_id: self.secret_id.clone(),
+            started_at: self.started_at.clone(),
+            completed_at: self.completed_at.clone(),
+            status: de_enum(&self.status).unwrap_or(secrets_rotation::RotationStatus::Completed),
+            rotated_by: self.rotated_by.clone(),
+            new_version: self.new_version.clone(),
+            error_message: self.error_message.clone(),
+        }
+    }
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self.to_engine()).unwrap_or_default()
+    }
+}
+
+const MANAGED_SECRET_COLUMNS: &str = "id, name, secret_type, vault_path, \
+     rotation_interval_days, last_rotated, next_rotation_due, status, owner, site";
+const ROTATION_RUN_COLUMNS: &str = "id, secret_id, started_at, completed_at, status, \
+     rotated_by, new_version, error_message";
+
+/// 404 for a missing secret/rotation, mirroring the engine's message.
+fn secrets_not_found(msg: String) -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
+}
+
+/// Inserts one rotation run inside an open transaction (shared by rotate and
+/// rotate-all). Enum status is stored as its serde string.
+async fn insert_rotation_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run: &secrets_rotation::RotationRun,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    sqlx::query(&format!(
+        "INSERT INTO rotation_runs ({ROTATION_RUN_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+    ))
+    .bind(&run.id)
+    .bind(&run.secret_id)
+    .bind(&run.started_at)
+    .bind(&run.completed_at)
+    .bind(serde_enum_str(&run.status))
+    .bind(&run.rotated_by)
+    .bind(&run.new_version)
+    .bind(&run.error_message)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_error)?;
+    Ok(())
+}
+
 async fn secrets_list(
     Query(q): Query<SecretsListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    secrets_rotation::list_secrets(
-        q.site.as_deref().unwrap_or(""),
-        q.secret_type.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let secret_type = q.secret_type.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        // Normalize the optional type filter through the engine parser, then
+        // compare against the stored serde string.
+        let type_col = if secret_type.is_empty() {
+            String::new()
+        } else {
+            let parsed =
+                secrets_rotation::parse_secret_type(secret_type).map_err(|e| status_400(&e))?;
+            serde_enum_str(&parsed)
+        };
+        let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR secret_type = $2) \
+             ORDER BY site, id"
+        ))
+        .bind(site)
+        .bind(&type_col)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "count": secrets.len(),
+            "secrets": secrets,
+        })));
+    }
+    secrets_rotation::list_secrets(site, secret_type)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn secrets_register(
     Json(b): Json<SecretsRegisterRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let secret = secrets_rotation::build_secret(
+            &b.name,
+            &b.secret_type,
+            &b.vault_path,
+            b.interval_days,
+            &b.owner,
+            &b.site,
+        )
+        .map_err(|e| status_400(&e))?;
+        sqlx::query(&format!(
+            "INSERT INTO managed_secrets ({MANAGED_SECRET_COLUMNS}) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+        ))
+        .bind(&secret.id)
+        .bind(&secret.name)
+        .bind(serde_enum_str(&secret.secret_type))
+        .bind(&secret.vault_path)
+        .bind(secret.rotation_interval_days as i64)
+        .bind(&secret.last_rotated)
+        .bind(&secret.next_rotation_due)
+        .bind(serde_enum_str(&secret.status))
+        .bind(&secret.owner)
+        .bind(&secret.site)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "provider_calls_enabled": false,
+            "secret": serde_json::to_value(&secret).unwrap_or_default(),
+        })));
+    }
     secrets_rotation::register_secret(
         &b.name,
         &b.secret_type,
@@ -13534,6 +13705,34 @@ async fn secrets_register(
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let secret = match row {
+            Some(r) => r,
+            None => return Err(secrets_not_found(format!("Secret '{id}' not found"))),
+        };
+        let run_rows: Vec<RotationRunRow> = sqlx::query_as(&format!(
+            "SELECT {ROTATION_RUN_COLUMNS} FROM rotation_runs \
+             WHERE secret_id = $1 ORDER BY started_at, id"
+        ))
+        .bind(&id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let history: Vec<Value> = run_rows.iter().map(RotationRunRow::to_value).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "secret": secret.to_value(),
+            "rotation_history": history,
+        })));
+    }
     secrets_rotation::get_secret(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -13542,6 +13741,56 @@ async fn secrets_rotate(
     Path(id): Path<String>,
     Json(b): Json<SecretsRotateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        if b.rotated_by.trim().is_empty() {
+            return Err(status_400("rotated_by cannot be empty"));
+        }
+        let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let secret = match row {
+            Some(r) => r.to_engine(),
+            None => return Err(secrets_not_found(format!("Secret '{id}' not found"))),
+        };
+        // Version label is the next sequential run number across all runs.
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rotation_runs")
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
+        let (updated, run) = secrets_rotation::rotate_secret_record(
+            &secret,
+            &b.rotated_by,
+            run_count.max(0) as usize,
+        );
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        sqlx::query(
+            "UPDATE managed_secrets SET status = $1, last_rotated = $2, next_rotation_due = $3 \
+             WHERE id = $4",
+        )
+        .bind(serde_enum_str(&updated.status))
+        .bind(&updated.last_rotated)
+        .bind(&updated.next_rotation_due)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        insert_rotation_run(&mut tx, &run).await?;
+        tx.commit().await.map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "provider": "vault-mock",
+            "provider_calls_enabled": false,
+            "secret_id": id,
+            "rotation": serde_json::to_value(&run).unwrap_or_default(),
+        })));
+    }
     secrets_rotation::rotate_secret(&id, &b.rotated_by)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -13554,6 +13803,22 @@ async fn secrets_rotation_history(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
+             WHERE next_rotation_due::timestamptz <= now() ORDER BY site, id"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "count": secrets.len(),
+            "secrets": secrets,
+        })));
+    }
     secrets_rotation::list_due_rotations()
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
@@ -13561,14 +13826,88 @@ async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>
 async fn secrets_expiring(
     Query(q): Query<SecretsExpiringQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    secrets_rotation::list_expiring(q.days.unwrap_or(30))
+    let days = q.days.unwrap_or(30);
+    if let Some(pool) = get_db() {
+        let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
+             WHERE next_rotation_due::timestamptz >= now() \
+               AND next_rotation_due::timestamptz <= now() + make_interval(days => $1) \
+             ORDER BY next_rotation_due, id"
+        ))
+        .bind(days as i32)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "days": days,
+            "count": secrets.len(),
+            "secrets": secrets,
+        })));
+    }
+    secrets_rotation::list_expiring(days)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 async fn secrets_rotate_all(
     Query(q): Query<SecretsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    secrets_rotation::force_rotate_all(q.site.as_deref().unwrap_or(""))
+    let site = q.site.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        if site.trim().is_empty() {
+            return Err(status_400("site cannot be empty"));
+        }
+        // Rotate every due secret for the site in ONE transaction; version
+        // labels continue sequentially from the current run count.
+        let due: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
+             WHERE site = $1 AND next_rotation_due::timestamptz <= now() ORDER BY id"
+        ))
+        .bind(site)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let base_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rotation_runs")
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
+        let base = base_count.max(0) as usize;
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let mut rotations = Vec::new();
+        for (offset, row) in due.iter().enumerate() {
+            let secret = row.to_engine();
+            let (updated, run) =
+                secrets_rotation::rotate_secret_record(&secret, "force-rotate-all", base + offset);
+            sqlx::query(
+                "UPDATE managed_secrets SET status = $1, last_rotated = $2, \
+                 next_rotation_due = $3 WHERE id = $4",
+            )
+            .bind(serde_enum_str(&updated.status))
+            .bind(&updated.last_rotated)
+            .bind(&updated.next_rotation_due)
+            .bind(&secret.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            insert_rotation_run(&mut tx, &run).await?;
+            rotations.push(serde_json::to_value(&run).unwrap_or_default());
+        }
+        tx.commit().await.map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "provider": "vault-mock",
+            "provider_calls_enabled": false,
+            "site": site,
+            "rotated_count": rotations.len(),
+            "rotations": rotations,
+        })));
+    }
+    secrets_rotation::force_rotate_all(site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -13582,6 +13921,54 @@ async fn secrets_rotation_summary(
 async fn secrets_rotation_fail(
     Json(b): Json<SecretsFailRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        if b.error.trim().is_empty() {
+            return Err(status_400("error cannot be empty"));
+        }
+        let row: Option<RotationRunRow> = sqlx::query_as(&format!(
+            "SELECT {ROTATION_RUN_COLUMNS} FROM rotation_runs WHERE id = $1"
+        ))
+        .bind(&b.rotation_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let run = match row {
+            Some(r) => r.to_engine(),
+            None => {
+                return Err(secrets_not_found(format!(
+                    "Rotation '{}' not found",
+                    b.rotation_id
+                )))
+            }
+        };
+        let failed = secrets_rotation::fail_rotation_record(&run, &b.error);
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        sqlx::query(
+            "UPDATE rotation_runs SET status = $1, completed_at = $2, error_message = $3 \
+             WHERE id = $4",
+        )
+        .bind(serde_enum_str(&failed.status))
+        .bind(&failed.completed_at)
+        .bind(&failed.error_message)
+        .bind(&b.rotation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        sqlx::query("UPDATE managed_secrets SET status = $1 WHERE id = $2")
+            .bind(serde_enum_str(&secrets_rotation::SecretStatus::Failed))
+            .bind(&failed.secret_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "dry_run": true,
+            "rotation": serde_json::to_value(&failed).unwrap_or_default(),
+        })));
+    }
     secrets_rotation::mark_rotation_failed(&b.rotation_id, &b.error)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))

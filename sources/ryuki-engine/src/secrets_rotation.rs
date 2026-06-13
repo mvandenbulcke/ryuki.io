@@ -110,7 +110,7 @@ fn parse_iso_time(time: &str) -> Option<chrono::DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn parse_secret_type(secret_type: &str) -> Result<SecretType, String> {
+pub fn parse_secret_type(secret_type: &str) -> Result<SecretType, String> {
     match secret_type {
         "ServiceAccount" | "service-account" | "service_account" => Ok(SecretType::ServiceAccount),
         "DatabaseCredential" | "database-credential" | "database_credential" => {
@@ -324,14 +324,19 @@ pub fn get_secret(id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn register_secret(
+/// PURE: validate inputs, parse the type, and construct a freshly-registered
+/// secret — WITHOUT touching the static store. ryuki-api calls this to persist
+/// durably; the static `register_secret` below calls it then pushes to the
+/// in-process fallback. Keeping id/timestamp minting here means DB mode and the
+/// no-DB demo register identical secrets.
+pub fn build_secret(
     name: &str,
     secret_type: &str,
     vault_path: &str,
     interval_days: u64,
     owner: &str,
     site: &str,
-) -> Result<Value, String> {
+) -> Result<ManagedSecret, String> {
     if name.trim().is_empty() {
         return Err("name cannot be empty".into());
     }
@@ -347,17 +352,16 @@ pub fn register_secret(
 
     let parsed_type = parse_secret_type(secret_type)?;
     let now = Utc::now();
-    let id = format!(
-        "sr-{}-{}",
-        site.to_lowercase(),
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
-    let secret = ManagedSecret {
-        id: id.clone(),
+    Ok(ManagedSecret {
+        id: format!(
+            "sr-{}-{}",
+            site.to_lowercase(),
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        ),
         name: name.to_string(),
         secret_type: parsed_type,
         vault_path: vault_path.to_string(),
@@ -367,8 +371,64 @@ pub fn register_secret(
         status: SecretStatus::Active,
         owner: owner.to_string(),
         site: site.to_string(),
-    };
+    })
+}
 
+/// PURE: produce the rotated secret state AND its completed rotation run, given
+/// the existing run count (for the `v{n}` version label) — no store access.
+pub fn rotate_secret_record(
+    secret: &ManagedSecret,
+    rotated_by: &str,
+    existing_run_count: usize,
+) -> (ManagedSecret, RotationRun) {
+    let now = Utc::now();
+    let completed_at = now + chrono::Duration::seconds(2);
+    let updated = ManagedSecret {
+        status: SecretStatus::Active,
+        last_rotated: completed_at.to_rfc3339(),
+        next_rotation_due: (completed_at + Days::new(secret.rotation_interval_days)).to_rfc3339(),
+        ..secret.clone()
+    };
+    let run = RotationRun {
+        id: format!(
+            "rr-{}",
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        ),
+        secret_id: secret.id.clone(),
+        started_at: now.to_rfc3339(),
+        completed_at: Some(completed_at.to_rfc3339()),
+        status: RotationStatus::Completed,
+        rotated_by: rotated_by.to_string(),
+        new_version: Some(format!("v{}", existing_run_count + 1)),
+        error_message: None,
+    };
+    (updated, run)
+}
+
+/// PURE: produce the failed-rotation run state — no store access. The caller
+/// also flips the owning secret to Failed.
+pub fn fail_rotation_record(run: &RotationRun, error: &str) -> RotationRun {
+    RotationRun {
+        status: RotationStatus::Failed,
+        completed_at: Some(now_iso()),
+        error_message: Some(error.to_string()),
+        ..run.clone()
+    }
+}
+
+pub fn register_secret(
+    name: &str,
+    secret_type: &str,
+    vault_path: &str,
+    interval_days: u64,
+    owner: &str,
+    site: &str,
+) -> Result<Value, String> {
+    let secret = build_secret(name, secret_type, vault_path, interval_days, owner, site)?;
     secret_store().lock().unwrap().0.push(secret.clone());
 
     Ok(json!({
@@ -385,36 +445,15 @@ pub fn rotate_secret(id: &str, rotated_by: &str) -> Result<Value, String> {
     }
 
     let mut store = secret_store().lock().unwrap();
-    let secret = store
+    let run_count = store.1.len();
+    let index = store
         .0
-        .iter_mut()
-        .find(|secret| secret.id == id)
+        .iter()
+        .position(|secret| secret.id == id)
         .ok_or_else(|| format!("Secret '{}' not found", id))?;
 
-    let now = Utc::now();
-    let completed_at = now + chrono::Duration::seconds(2);
-    secret.status = SecretStatus::Active;
-    secret.last_rotated = completed_at.to_rfc3339();
-    secret.next_rotation_due =
-        (completed_at + Days::new(secret.rotation_interval_days)).to_rfc3339();
-
-    let run = RotationRun {
-        id: format!(
-            "rr-{}",
-            Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("unknown")
-        ),
-        secret_id: id.to_string(),
-        started_at: now.to_rfc3339(),
-        completed_at: Some(completed_at.to_rfc3339()),
-        status: RotationStatus::Completed,
-        rotated_by: rotated_by.to_string(),
-        new_version: Some(format!("v{}", store.1.len() + 1)),
-        error_message: None,
-    };
+    let (updated, run) = rotate_secret_record(&store.0[index], rotated_by, run_count);
+    store.0[index] = updated;
     store.1.push(run.clone());
 
     Ok(json!({
@@ -619,6 +658,40 @@ pub fn mark_rotation_failed(rotation_id: &str, error: &str) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_secret_and_transition_helpers_are_pure() {
+        // No store access: ryuki-api drives these against DB-loaded rows.
+        let secret =
+            build_secret("db-token", "api-key", "kv/db/token", 30, "owner.x", "DEFRA").unwrap();
+        assert_eq!(secret.secret_type, SecretType::APIKey);
+        assert_eq!(secret.status, SecretStatus::Active);
+        assert!(secret.id.starts_with("sr-defra-"));
+        // serde rename_all="kebab-case" hyphenates EACH consecutive capital, so
+        // APIKey serializes "a-p-i-key" (NOT "api-key"). Persistence must store
+        // and round-trip this exact serde form.
+        assert_eq!(
+            serde_json::to_value(&secret).unwrap()["secret_type"],
+            "a-p-i-key"
+        );
+
+        // rotation transition: secret goes Active, a completed run is minted
+        // with the next sequential version.
+        let (rotated, run) = rotate_secret_record(&secret, "rotator", 11);
+        assert_eq!(rotated.status, SecretStatus::Active);
+        assert_eq!(run.status, RotationStatus::Completed);
+        assert_eq!(run.new_version.as_deref(), Some("v12"));
+        assert_eq!(run.rotated_by, "rotator");
+
+        // fail transition flips the run to Failed with the error recorded.
+        let failed = fail_rotation_record(&run, "policy denied");
+        assert_eq!(failed.status, RotationStatus::Failed);
+        assert_eq!(failed.error_message.as_deref(), Some("policy denied"));
+        assert!(failed.completed_at.is_some());
+
+        // validation rejects empties.
+        assert!(build_secret("", "token", "p", 30, "o", "S").is_err());
+    }
 
     #[test]
     fn test_register_and_list_secrets() {
