@@ -842,7 +842,12 @@ p {
 
 .workspace-detail-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* auto-fit so a SINGLE panel (requests, activity feed, inventory, cmdb,
+     evidence, request detail/create) fills the full width instead of being
+     pinned to a half-width column with the other half empty (and wide content
+     like the requests table clipped). Two-panel views (catalog, operations)
+     still lay out side-by-side, and it collapses to one column when narrow. */
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
   gap: 12px;
 }
 
