@@ -335,21 +335,32 @@ textarea:focus-visible {
   color: var(--text);
 }
 
+/* The session controls (sign out, theme toggle) share the scope/session pills'
+   shape and height so the whole toolbar reads as one cohesive row of controls
+   — pill radius (100px), 31px tall, matching .pill exactly. */
 .theme-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 31px;
+  height: 31px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: 100px;
   background: var(--surface-2);
   color: var(--text);
-  font-size: 16px;
+  font-size: 15px;
   cursor: pointer;
   padding: 0;
   line-height: 1;
   transition: background var(--transition), border-color var(--transition);
+}
+
+.theme-toggle:hover {
+  border-color: var(--line-strong);
+}
+
+.theme-toggle:active {
+  background: var(--surface);
 }
 
 .theme-toggle:hover {
@@ -2129,16 +2140,25 @@ tbody tr:hover {
 }
 
 .signout-button {
-  padding: 4px 12px;
+  padding: 6px 14px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: 100px;
   background: var(--surface-2);
   color: var(--muted);
   font: inherit;
   font-size: 12px;
   font-weight: 700;
   cursor: pointer;
-  transition: color var(--transition), border-color var(--transition);
+  transition: color var(--transition), border-color var(--transition), background var(--transition);
+}
+
+.signout-button:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.signout-button:active {
+  background: var(--surface);
 }
 
 .signout-button:hover {
