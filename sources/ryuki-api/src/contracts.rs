@@ -12188,6 +12188,100 @@ struct IpamSiteQuery {
     site: Option<String>,
 }
 
+/// Parses a persisted subnet `status` string back into the engine enum. The
+/// column stores the canonical CAPITALIZED serde strings, so this round-trips.
+fn parse_subnet_status(s: &str) -> dns_ipam::IpamSubnetStatus {
+    match s {
+        "Exhausted" => dns_ipam::IpamSubnetStatus::Exhausted,
+        "Reserved" => dns_ipam::IpamSubnetStatus::Reserved,
+        _ => dns_ipam::IpamSubnetStatus::Available,
+    }
+}
+
+/// One persisted `ipam_subnets` row (migration 050). `to_engine` rebuilds the
+/// engine `IpamSubnet` so serialization is byte-for-byte identical to the
+/// static path (single serde shape, no hand-mirrored JSON).
+#[derive(sqlx::FromRow)]
+struct IpamSubnetRow {
+    id: String,
+    cidr: String,
+    gateway: String,
+    vlan_id: i32,
+    site: String,
+    total_ips: i32,
+    used_ips: i32,
+    available_ips: i32,
+    status: String,
+}
+
+impl IpamSubnetRow {
+    fn to_engine(&self) -> dns_ipam::IpamSubnet {
+        dns_ipam::IpamSubnet {
+            id: self.id.clone(),
+            cidr: self.cidr.clone(),
+            gateway: self.gateway.clone(),
+            vlan_id: self.vlan_id as u16,
+            site: self.site.clone(),
+            total_ips: self.total_ips as u32,
+            used_ips: self.used_ips as u32,
+            available_ips: self.available_ips as u32,
+            status: parse_subnet_status(&self.status),
+        }
+    }
+}
+
+/// One persisted `ip_reservations` row (migration 050).
+#[derive(sqlx::FromRow)]
+struct IpReservationRow {
+    id: String,
+    ip_address: String,
+    subnet_id: String,
+    hostname: String,
+    purpose: String,
+    reserved_by: String,
+    reserved_at: String,
+    expiry: String,
+}
+
+impl IpReservationRow {
+    fn to_engine(&self) -> dns_ipam::IpReservation {
+        dns_ipam::IpReservation {
+            id: self.id.clone(),
+            ip_address: self.ip_address.clone(),
+            subnet_id: self.subnet_id.clone(),
+            hostname: self.hostname.clone(),
+            purpose: self.purpose.clone(),
+            reserved_by: self.reserved_by.clone(),
+            reserved_at: self.reserved_at.clone(),
+            expiry: self.expiry.clone(),
+        }
+    }
+}
+
+const IPAM_SUBNET_COLUMNS: &str =
+    "id, cidr, gateway, vlan_id, site, total_ips, used_ips, available_ips, status";
+const IP_RESERVATION_COLUMNS: &str =
+    "id, ip_address, subnet_id, hostname, purpose, reserved_by, reserved_at, expiry";
+
+/// 404 for a missing subnet/reservation, mirroring the engine's message.
+fn ipam_not_found(msg: String) -> (StatusCode, Json<Value>) {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": msg })))
+}
+
+/// One subnet rendered for a list response: the serialized subnet plus its
+/// utilization percent (matches the engine's `list_subnets` element shape).
+fn subnet_list_entry(subnet: &dns_ipam::IpamSubnet) -> Value {
+    let utilization = if subnet.total_ips == 0 {
+        0.0
+    } else {
+        (subnet.used_ips as f64 / subnet.total_ips as f64) * 100.0
+    };
+    json!({
+        "subnet": serde_json::to_value(subnet).unwrap_or_default(),
+        "utilization_percent": utilization,
+    })
+}
+
 /// One persisted `dns_records` row. `record_type` / `status` are stored as the
 /// canonical serde strings, so `to_json` reproduces the engine `DnsRecord`
 /// serialization byte-for-byte (no enum round-trip needed on read).
@@ -12360,11 +12454,62 @@ async fn dns_record_delete(
 async fn ipam_subnets_list(
     Query(q): Query<IpamSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dns_ipam::list_subnets(q.site.as_deref().unwrap_or(""))
+    let site = q.site.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        let rows: Vec<IpamSubnetRow> = sqlx::query_as(&format!(
+            "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets \
+             WHERE ($1 = '' OR site = $1) ORDER BY site, id"
+        ))
+        .bind(site)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let subnets: Vec<Value> = rows
+            .iter()
+            .map(|row| subnet_list_entry(&row.to_engine()))
+            .collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "subnets": subnets,
+            "count": subnets.len(),
+        })));
+    }
+    dns_ipam::list_subnets(site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let subnet_row: Option<IpamSubnetRow> = sqlx::query_as(&format!(
+            "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let subnet = match subnet_row {
+            Some(row) => row.to_engine(),
+            None => return Err(ipam_not_found(format!("Subnet '{id}' not found"))),
+        };
+        let reservation_rows: Vec<IpReservationRow> = sqlx::query_as(&format!(
+            "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations \
+             WHERE subnet_id = $1 ORDER BY id"
+        ))
+        .bind(&id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let reservations: Vec<Value> = reservation_rows
+            .iter()
+            .map(|row| serde_json::to_value(row.to_engine()).unwrap_or_default())
+            .collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "subnet": serde_json::to_value(&subnet).unwrap_or_default(),
+            "available_ips": subnet.available_ips,
+            "reservations": reservations,
+        })));
+    }
     dns_ipam::get_subnet(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -12372,6 +12517,93 @@ async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
 async fn ipam_reserve_ip(
     Json(b): Json<IpamReserveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Load the target subnet and its existing reservations, then let the
+        // pure engine builder validate + allocate the next free IP. Persisting
+        // the new reservation and the subnet counter change happen in ONE
+        // transaction so used/available never drift from the reservation rows.
+        let subnet_row: Option<IpamSubnetRow> = sqlx::query_as(&format!(
+            "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+        ))
+        .bind(&b.subnet_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let subnet = match subnet_row {
+            Some(row) => row.to_engine(),
+            None => return Err(status_400(&format!("Subnet '{}' not found", b.subnet_id))),
+        };
+        let existing_rows: Vec<IpReservationRow> = sqlx::query_as(&format!(
+            "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations WHERE subnet_id = $1"
+        ))
+        .bind(&b.subnet_id)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let existing: Vec<dns_ipam::IpReservation> = existing_rows
+            .iter()
+            .map(IpReservationRow::to_engine)
+            .collect();
+        let reservation = dns_ipam::build_reservation(
+            &subnet,
+            &existing,
+            &b.hostname,
+            &b.purpose,
+            &b.reserved_by,
+            b.ttl_days,
+        )
+        .map_err(|e| status_400(&e))?;
+
+        // Mirror the engine's counter mutation: one IP consumed; mark Exhausted
+        // when the last one goes (existing status is otherwise preserved).
+        let new_used = subnet.used_ips + 1;
+        let new_available = subnet.available_ips - 1;
+        let new_status = if new_available == 0 {
+            dns_ipam::IpamSubnetStatus::Exhausted
+        } else {
+            subnet.status.clone()
+        };
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        sqlx::query(&format!(
+            "INSERT INTO ip_reservations ({IP_RESERVATION_COLUMNS}) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        ))
+        .bind(&reservation.id)
+        .bind(&reservation.ip_address)
+        .bind(&reservation.subnet_id)
+        .bind(&reservation.hostname)
+        .bind(&reservation.purpose)
+        .bind(&reservation.reserved_by)
+        .bind(&reservation.reserved_at)
+        .bind(&reservation.expiry)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        sqlx::query(
+            "UPDATE ipam_subnets SET used_ips = $1, available_ips = $2, status = $3 WHERE id = $4",
+        )
+        .bind(new_used as i32)
+        .bind(new_available as i32)
+        .bind(serde_enum_str(&new_status))
+        .bind(&b.subnet_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+
+        let updated_subnet = dns_ipam::IpamSubnet {
+            used_ips: new_used,
+            available_ips: new_available,
+            status: new_status,
+            ..subnet
+        };
+        return Ok(Json(json!({
+            "source": "database",
+            "reservation": serde_json::to_value(&reservation).unwrap_or_default(),
+            "subnet": serde_json::to_value(&updated_subnet).unwrap_or_default(),
+        })));
+    }
     dns_ipam::reserve_ip(
         &b.subnet_id,
         &b.hostname,
@@ -12383,6 +12615,46 @@ async fn ipam_reserve_ip(
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn ipam_release_ip(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Free the reservation and credit its subnet back, atomically. A subnet
+        // that was Exhausted reverts to Available (mirrors the engine).
+        let reservation_row: Option<IpReservationRow> = sqlx::query_as(&format!(
+            "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let reservation = match reservation_row {
+            Some(row) => row.to_engine(),
+            None => return Err(ipam_not_found(format!("Reservation '{id}' not found"))),
+        };
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        sqlx::query("DELETE FROM ip_reservations WHERE id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        sqlx::query(
+            "UPDATE ipam_subnets \
+             SET used_ips = GREATEST(used_ips - 1, 0), \
+                 available_ips = available_ips + 1, \
+                 status = CASE WHEN status = 'Exhausted' THEN 'Available' ELSE status END \
+             WHERE id = $1",
+        )
+        .bind(&reservation.subnet_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "released": true,
+            "reservation": serde_json::to_value(&reservation).unwrap_or_default(),
+        })));
+    }
     dns_ipam::release_ip(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -12390,7 +12662,27 @@ async fn ipam_release_ip(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
 async fn ipam_summary(
     Query(q): Query<IpamSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dns_ipam::get_ipam_summary(q.site.as_deref().unwrap_or(""))
+    let site = q.site.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(total_ips), 0), COALESCE(SUM(used_ips), 0), \
+                    COALESCE(SUM(available_ips), 0), COUNT(*) \
+             FROM ipam_subnets WHERE ($1 = '' OR site = $1)",
+        )
+        .bind(site)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "source": "database",
+            "site": if site.is_empty() { "ALL" } else { site },
+            "total_ips": row.0,
+            "used_ips": row.1,
+            "available_ips": row.2,
+            "subnet_count": row.3,
+        })));
+    }
+    dns_ipam::get_ipam_summary(site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }

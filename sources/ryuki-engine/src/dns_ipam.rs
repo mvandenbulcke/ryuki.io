@@ -493,13 +493,21 @@ pub fn get_subnet(id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn reserve_ip(
-    subnet_id: &str,
+/// PURE: validate the inputs, pick the next free IP within `subnet` (skipping
+/// the gateway and any address already in `existing`), and construct the
+/// reservation — WITHOUT touching the static store. ryuki-api calls this to
+/// persist a reservation durably (then UPDATEs the subnet counters in SQL); the
+/// static `reserve_ip` below calls it then mutates the in-process fallback
+/// store. Keeping the id/IP/timestamp construction here means DB mode and the
+/// no-DB demo mint identical reservations.
+pub fn build_reservation(
+    subnet: &IpamSubnet,
+    existing: &[IpReservation],
     hostname: &str,
     purpose: &str,
     reserved_by: &str,
     ttl_days: u64,
-) -> Result<Value, String> {
+) -> Result<IpReservation, String> {
     if hostname.trim().is_empty() {
         return Err("hostname cannot be empty".into());
     }
@@ -509,23 +517,15 @@ pub fn reserve_ip(
     if reserved_by.trim().is_empty() {
         return Err("reserved_by cannot be empty".into());
     }
-
-    let mut store = store().lock().unwrap();
-    let subnet_index = store
-        .1
-        .iter()
-        .position(|subnet| subnet.id == subnet_id)
-        .ok_or_else(|| format!("Subnet '{}' not found", subnet_id))?;
-
-    if store.1[subnet_index].available_ips == 0 {
-        return Err(format!("Subnet '{}' has no available IPs", subnet_id));
+    if subnet.available_ips == 0 {
+        return Err(format!("Subnet '{}' has no available IPs", subnet.id));
     }
 
-    let ip_address = next_ip(&store.1[subnet_index], &store.2)?;
-    let reservation = IpReservation {
+    let ip_address = next_ip(subnet, existing)?;
+    Ok(IpReservation {
         id: format!(
             "res-{}-{}",
-            store.1[subnet_index].site.to_lowercase(),
+            subnet.site.to_lowercase(),
             Uuid::new_v4()
                 .to_string()
                 .split('-')
@@ -533,13 +533,37 @@ pub fn reserve_ip(
                 .unwrap_or("unknown")
         ),
         ip_address,
-        subnet_id: subnet_id.to_string(),
+        subnet_id: subnet.id.clone(),
         hostname: hostname.to_string(),
         purpose: purpose.to_string(),
         reserved_by: reserved_by.to_string(),
         reserved_at: now_iso(),
         expiry: (Utc::now() + Days::new(ttl_days)).to_rfc3339(),
-    };
+    })
+}
+
+pub fn reserve_ip(
+    subnet_id: &str,
+    hostname: &str,
+    purpose: &str,
+    reserved_by: &str,
+    ttl_days: u64,
+) -> Result<Value, String> {
+    let mut store = store().lock().unwrap();
+    let subnet_index = store
+        .1
+        .iter()
+        .position(|subnet| subnet.id == subnet_id)
+        .ok_or_else(|| format!("Subnet '{}' not found", subnet_id))?;
+
+    let reservation = build_reservation(
+        &store.1[subnet_index],
+        &store.2,
+        hostname,
+        purpose,
+        reserved_by,
+        ttl_days,
+    )?;
 
     store.1[subnet_index].used_ips += 1;
     store.1[subnet_index].available_ips -= 1;
@@ -713,6 +737,39 @@ mod tests {
         let released = release_ip(reservation_id).unwrap();
         assert_eq!(released["released"], true);
         assert_eq!(released["reservation"]["id"], reservation_id);
+    }
+
+    #[test]
+    fn build_reservation_is_pure_and_allocates_free_ip() {
+        // No store access: build_reservation works purely off its arguments, so
+        // ryuki-api can drive it against DB-loaded subnets/reservations.
+        let subnet = IpamSubnet {
+            id: "subnet-x-001".into(),
+            cidr: "10.0.0.0/24".into(),
+            gateway: "10.0.0.1".into(),
+            vlan_id: 10,
+            site: "X".into(),
+            total_ips: 254,
+            used_ips: 5,
+            available_ips: 249,
+            status: IpamSubnetStatus::Available,
+        };
+        let existing = vec![];
+        let reservation =
+            build_reservation(&subnet, &existing, "host-a", "purpose", "tester", 7).unwrap();
+        assert_eq!(reservation.subnet_id, "subnet-x-001");
+        // First host candidate is .10 (loop starts at 10), skipping the gateway.
+        assert_eq!(reservation.ip_address, "10.0.0.10");
+        assert!(reservation.id.starts_with("res-x-"));
+
+        // Empty required fields are rejected.
+        assert!(build_reservation(&subnet, &existing, "", "p", "t", 7).is_err());
+        // An exhausted subnet cannot allocate.
+        let exhausted = IpamSubnet {
+            available_ips: 0,
+            ..subnet.clone()
+        };
+        assert!(build_reservation(&exhausted, &existing, "h", "p", "t", 7).is_err());
     }
 
     #[test]
