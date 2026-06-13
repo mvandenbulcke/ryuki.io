@@ -898,7 +898,8 @@ p {
 .contract-item {
   display: grid;
   gap: 7px;
-  min-height: 112px;
+  /* Matches .workspace-detail-item so the two card types align row-to-row. */
+  min-height: 126px;
   align-content: start;
   padding: 12px;
   border: 1px solid var(--line);
@@ -1189,7 +1190,7 @@ tbody tr:hover {
 .request-detail-head {
   display: flex;
   justify-content: space-between;
-  gap: 14px;
+  gap: 16px;
   align-items: flex-start;
 }
 
@@ -1625,7 +1626,7 @@ tbody tr:hover {
 .request-create-head {
   display: flex;
   justify-content: space-between;
-  gap: 14px;
+  gap: 16px;
   align-items: flex-start;
 }
 
@@ -1667,6 +1668,16 @@ tbody tr:hover {
   box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
+/* Disabled fields read as unavailable: dimmed, muted, not-allowed cursor. */
+.form-field select:disabled,
+.form-field input:disabled,
+.form-field textarea:disabled {
+  background: var(--surface-2);
+  color: var(--muted);
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .form-field textarea {
   min-height: 90px;
   resize: vertical;
@@ -1697,13 +1708,29 @@ tbody tr:hover {
   gap: 8px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-sm);
-  padding: 10px 16px;
+  /* Shared with .primary-action / .login-button so every action button is the
+     same size across the portal. */
+  padding: 11px 18px;
   background: var(--surface);
   color: var(--text);
   font: inherit;
   font-weight: 700;
   cursor: pointer;
   transition: transform var(--transition), box-shadow var(--transition), background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+/* Disabled buttons read as inert: dimmed, no pointer, no hover lift. */
+.btn:disabled,
+.btn[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+.btn:disabled:hover,
+.btn[aria-disabled="true"]:hover {
+  transform: none;
+  box-shadow: none;
 }
 
 .btn:hover {
@@ -1729,6 +1756,15 @@ tbody tr:hover {
 .btn-secondary {
   background: var(--surface-2);
   color: var(--muted);
+}
+
+.btn-secondary:hover {
+  color: var(--text);
+  border-color: var(--line-strong);
+}
+
+.btn-secondary:active {
+  background: var(--surface);
 }
 
 .btn-danger {
@@ -1996,7 +2032,7 @@ tbody tr:hover {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 12px 20px;
+  padding: 11px 18px;
   border: none;
   border-radius: var(--radius-sm);
   background: var(--grad-accent);
