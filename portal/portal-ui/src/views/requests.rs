@@ -30,6 +30,7 @@ fn status_badge_class(status: &str) -> &'static str {
         "approved" => "badge good",
         "executed" => "badge good",
         "failed" => "badge bad",
+        "rejected" | "cancelled" => "badge bad",
         _ => "badge neutral",
     }
 }
@@ -41,6 +42,8 @@ fn status_label(status: &str) -> &'static str {
         "approved" => "Approved",
         "executed" => "Executed",
         "failed" => "Failed",
+        "rejected" => "Rejected",
+        "cancelled" => "Cancelled",
         &_ => "Unknown",
     }
 }

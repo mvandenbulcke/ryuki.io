@@ -365,6 +365,14 @@ pub fn request_approve_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("approve"))
 }
 
+pub fn request_reject_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("reject"))
+}
+
+pub fn request_cancel_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("cancel"))
+}
+
 pub fn request_lock_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("lock"))
 }
@@ -375,6 +383,13 @@ pub fn request_execute_path(request_id: &str) -> Result<String, ApiPathError> {
 
 pub fn request_verify_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("verify"))
+}
+
+/// Read path for the persisted audit trail of a single request
+/// (`GET /api/requests/{id}/audit`). Gated server-side on the `audit`
+/// permission; carries no mutation.
+pub fn request_audit_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("audit"))
 }
 
 #[cfg(test)]
@@ -402,6 +417,14 @@ mod tests {
             Ok("/api/requests/REQ-123/approve".to_string())
         );
         assert_eq!(
+            request_reject_path(request_id),
+            Ok("/api/requests/REQ-123/reject".to_string())
+        );
+        assert_eq!(
+            request_cancel_path(request_id),
+            Ok("/api/requests/REQ-123/cancel".to_string())
+        );
+        assert_eq!(
             request_lock_path(request_id),
             Ok("/api/requests/REQ-123/lock".to_string())
         );
@@ -412,6 +435,10 @@ mod tests {
         assert_eq!(
             request_verify_path(request_id),
             Ok("/api/requests/REQ-123/verify".to_string())
+        );
+        assert_eq!(
+            request_audit_path(request_id),
+            Ok("/api/requests/REQ-123/audit".to_string())
         );
     }
 

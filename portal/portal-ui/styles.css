@@ -1216,6 +1216,21 @@ tbody tr:hover {
   transform: translateY(-2px);
 }
 
+/* terminal reject/cancel: a distinct "stopped" step appended after the
+   forward row, none of which is active for a terminal request */
+.stage-step.terminal {
+  border-color: color-mix(in srgb, var(--bad) 55%, var(--line-strong));
+  background: var(--bad-bg);
+}
+
+.stage-step.terminal .stage-dot {
+  background: var(--bad);
+}
+
+.stage-step.terminal .stage-label {
+  color: var(--bad);
+}
+
 .stage-dot {
   width: 12px;
   height: 12px;
@@ -1315,6 +1330,18 @@ tbody tr:hover {
 
 .timeline-item strong {
   font-size: 14px;
+}
+
+/* reject/cancel rows in the audit trail read as a negative outcome */
+.timeline-item.terminal {
+  border-left-color: var(--bad);
+  background: var(--bad-bg);
+}
+
+.timeline-reason {
+  font-size: 13px;
+  font-style: italic;
+  color: var(--text);
 }
 
 /* ── Request create & forms ─────────────────────────────────── */
@@ -1435,6 +1462,34 @@ tbody tr:hover {
 .btn-secondary {
   background: var(--surface-2);
   color: var(--muted);
+}
+
+.btn-danger {
+  background: var(--bad-bg);
+  border-color: color-mix(in srgb, var(--bad) 45%, var(--line-strong));
+  color: var(--bad);
+}
+
+.btn-danger:hover {
+  border-color: var(--bad);
+  box-shadow: 0 6px 18px -6px color-mix(in srgb, var(--bad) 55%, transparent);
+}
+
+/* ── Reject / cancel reason confirm panel ───────────────────── */
+.reason-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--bad) 35%, var(--line));
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.reason-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 @media (max-width: 720px) {

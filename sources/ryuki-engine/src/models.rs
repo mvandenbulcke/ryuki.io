@@ -109,6 +109,8 @@ pub enum RequestStatus {
     Verifying,
     Completed,
     Failed,
+    Rejected,
+    Cancelled,
 }
 
 impl RequestStatus {
@@ -124,6 +126,8 @@ impl RequestStatus {
             Self::Verifying => "verifying",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
         }
     }
 }

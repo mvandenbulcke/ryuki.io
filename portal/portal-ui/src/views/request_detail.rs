@@ -1,8 +1,8 @@
 use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::AuthSession;
 use crate::server_boundary::{
-    approve_request, execute_request, get_request_detail, lock_request, plan_request,
-    validate_request, verify_request,
+    approve_request, cancel_request, execute_request, get_request_audit, get_request_detail,
+    lock_request, plan_request, reject_request, validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -27,10 +27,19 @@ fn no_capability_session() -> AuthSession {
 /// approve requires `approve`.
 fn action_capability(action: &str) -> &'static str {
     match action {
-        "approve" => "approve",
+        // approve and its inverse (reject) are the approver's decision.
+        "approve" | "reject" => "approve",
+        // cancel is a requester/admin act (withdraw the request).
+        "cancel" => "request",
         // validate, plan, lock, execute, verify are operator-tier mechanics.
         _ => "execute",
     }
+}
+
+/// Reason-bearing decisions (reject/cancel) require a free-text reason and a
+/// confirm step, unlike the bodyless forward-stage actions.
+fn action_requires_reason(action: &str) -> bool {
+    matches!(action, "reject" | "cancel")
 }
 
 fn status_badge_class(status: &str) -> &'static str {
@@ -40,6 +49,7 @@ fn status_badge_class(status: &str) -> &'static str {
         "approved" => "badge good",
         "executed" => "badge good",
         "failed" => "badge bad",
+        "rejected" | "cancelled" => "badge bad",
         _ => "badge neutral",
     }
 }
@@ -54,8 +64,17 @@ fn stage_label(stage: &str) -> &'static str {
         "executed" => "Executed",
         "verified" => "Verified",
         "failed" => "Failed",
+        "rejected" => "Rejected",
+        "cancelled" => "Cancelled",
         &_ => "Unknown",
     }
+}
+
+/// Whether a (portal-vocabulary) stage is a terminal "negative" outcome that
+/// the stepper renders with a distinct terminal styling rather than the
+/// normal forward progression.
+fn is_terminal_stage(stage: &str) -> bool {
+    matches!(stage, "rejected" | "cancelled")
 }
 
 /// Strips the server-function transport prefix so action feedback badges
@@ -72,10 +91,38 @@ fn action_label(action: &str) -> &'static str {
         "validate" => "Validate",
         "plan" => "Plan",
         "approve" => "Approve",
+        "reject" => "Reject",
+        "cancel" => "Cancel",
         "lock" => "Lock",
         "execute" => "Execute",
         "verify" => "Verify",
         &_ => "Unknown",
+    }
+}
+
+/// Button class for a lifecycle action: approve is the primary affirmative,
+/// reject is destructive (danger), everything else is secondary.
+fn action_button_class(action: &str) -> &'static str {
+    match action {
+        "approve" => "btn btn-primary",
+        "reject" => "btn btn-danger",
+        _ => "btn btn-secondary",
+    }
+}
+
+/// Human-readable label for an audit action key (`request.reject`, etc.).
+fn audit_action_label(action: &str) -> &'static str {
+    match action {
+        "request.create" => "Created",
+        "request.validate" => "Validated",
+        "request.plan" => "Planned",
+        "request.approve" => "Approved",
+        "request.reject" => "Rejected",
+        "request.cancel" => "Cancelled",
+        "request.lock" => "Locked",
+        "request.execute" => "Executed",
+        "request.verify" => "Verified",
+        _ => "Updated",
     }
 }
 
@@ -96,11 +143,22 @@ pub fn RequestDetail() -> impl IntoView {
     let loading_detail_path = move || detail_path.get();
     let content_detail_path = move || detail_path.get();
     let detail_resource = Resource::new(move || request_id.get(), get_request_detail);
+    // The real, persisted audit trail is fetched separately and refetched
+    // after every successful transition so the timeline stays live.
+    let audit_resource = Resource::new(move || request_id.get(), get_request_audit);
 
     #[allow(deprecated)]
     let (action_feedback, set_action_feedback) = create_signal(String::new());
     #[allow(deprecated)]
     let (action_class, set_action_class) = create_signal("badge neutral");
+    // The reason-bearing decision (reject/cancel) the user is confirming, plus
+    // its free-text reason. `None` means no confirm panel is open.
+    #[allow(deprecated)]
+    let (pending_reason_action, set_pending_reason_action) = create_signal::<Option<String>>(None);
+    #[allow(deprecated)]
+    let (reason_text, set_reason_text) = create_signal(String::new());
+    #[allow(deprecated)]
+    let (reason_error, set_reason_error) = create_signal(String::new());
 
     let validate_action = Action::new(move |id: &String| {
         let id = id.clone();
@@ -114,6 +172,7 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -136,6 +195,7 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -158,6 +218,7 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -180,6 +241,7 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -202,6 +264,7 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -224,6 +287,62 @@ pub fn RequestDetail() -> impl IntoView {
                     set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
                     if succeeded {
                         detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    // Reject and cancel carry a mandatory reason; the action input is the
+    // (id, reason) pair captured from the confirm panel. On success they close
+    // the panel and refetch both the detail and the persisted audit trail.
+    let reject_action = Action::new(move |args: &(String, String)| {
+        let (id, reason) = args.clone();
+        set_action_feedback.set("Rejecting...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match reject_request(id, reason).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        set_pending_reason_action.set(None);
+                        set_reason_text.set(String::new());
+                        set_reason_error.set(String::new());
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    let cancel_action = Action::new(move |args: &(String, String)| {
+        let (id, reason) = args.clone();
+        set_action_feedback.set("Cancelling...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match cancel_request(id, reason).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        set_pending_reason_action.set(None);
+                        set_reason_text.set(String::new());
+                        set_reason_error.set(String::new());
+                        detail_resource.refetch();
+                        audit_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -270,9 +389,18 @@ pub fn RequestDetail() -> impl IntoView {
                             }
                         };
 
+                        // The real, persisted audit trail. On a fetch failure
+                        // (live API unreachable, or audit permission denied)
+                        // fall back to the clearly-labeled synthetic single
+                        // entry carried on the detail so the panel still renders.
+                        let audit_rows = audit_resource.await.unwrap_or_default();
+                        let synthetic_timeline = detail.timeline.clone();
+
                         let status_class = status_badge_class(&detail.status);
                         let stage_text = stage_label(&detail.stage);
                         let current_stage = detail.stage.clone();
+                        let terminal_stage = is_terminal_stage(&current_stage);
+                        let terminal_label = stage_label(&current_stage);
                         // Gate each stage-available action on its capability,
                         // using the same action->permission map as the engine.
                         let actions: Vec<String> = detail
@@ -321,7 +449,10 @@ pub fn RequestDetail() -> impl IntoView {
                                                     "failed" => false,
                                                     _ => false,
                                                 };
-                                                let step_class = if *stage == current_stage {
+                                                // A terminal reject/cancel leaves the forward steps
+                                                // un-highlighted (none is the active step); the
+                                                // distinct terminal step is appended after the row.
+                                                let step_class = if !terminal_stage && *stage == current_stage {
                                                     "stage-step active"
                                                 } else if is_done {
                                                     "stage-step done"
@@ -337,6 +468,12 @@ pub fn RequestDetail() -> impl IntoView {
                                                 }
                                             })
                                             .collect_view()}
+                                        <Show when=move || terminal_stage>
+                                            <li class="stage-step terminal">
+                                                <span class="stage-dot" aria-hidden="true"></span>
+                                                <span class="stage-label">{terminal_label}</span>
+                                            </li>
+                                        </Show>
                                     </ol>
                                 </div>
 
@@ -381,14 +518,23 @@ pub fn RequestDetail() -> impl IntoView {
                                             .iter()
                                             .map(|action| {
                                                 let label = action_label(action);
-                                                let is_approve = action == "approve";
-                                                let btn_class = if is_approve { "btn btn-primary" } else { "btn btn-secondary" };
+                                                let btn_class = action_button_class(action);
+                                                let needs_reason = action_requires_reason(action);
                                                 let action = action.clone();
                                                 let id = request_id_for_action.clone();
                                                 view! {
                                                     <button
                                                         class=btn_class
                                                         on:click=move |_| {
+                                                            // Reason-bearing decisions open the confirm
+                                                            // panel instead of dispatching immediately;
+                                                            // the bodyless forward actions dispatch now.
+                                                            if needs_reason {
+                                                                set_reason_text.set(String::new());
+                                                                set_reason_error.set(String::new());
+                                                                set_pending_reason_action.set(Some(action.clone()));
+                                                                return;
+                                                            }
                                                             match action.as_str() {
                                                                 "validate" => { validate_action.dispatch(id.clone()); }
                                                                 "plan" => { plan_action.dispatch(id.clone()); }
@@ -406,26 +552,168 @@ pub fn RequestDetail() -> impl IntoView {
                                             })
                                             .collect_view()}
                                     </div>
+                                    <Show when=move || pending_reason_action.get().is_some()>
+                                        {
+                                            let id = request_id_for_action.clone();
+                                            // The action being confirmed drives the heading, the
+                                            // submit dispatch, and which engine fn runs.
+                                            let pending = pending_reason_action.get().unwrap_or_default();
+                                            let pending_label = action_label(&pending);
+                                            let submit_pending = pending.clone();
+                                            let submit_id = id.clone();
+                                            view! {
+                                                <div class="reason-panel" role="group" aria-label="Decision reason">
+                                                    <label class="form-field">
+                                                        <span>{pending_label} " reason (required)"</span>
+                                                        <textarea
+                                                            prop:value=move || reason_text.get()
+                                                            on:input=move |ev| {
+                                                                set_reason_text.set(event_target_value(&ev));
+                                                            }
+                                                            placeholder="Explain why this request is being rejected or cancelled"
+                                                        ></textarea>
+                                                    </label>
+                                                    <Show when=move || !reason_error.get().is_empty()>
+                                                        <span class="form-error" role="alert">{reason_error}</span>
+                                                    </Show>
+                                                    <div class="reason-actions">
+                                                        <button
+                                                            class="btn btn-danger"
+                                                            on:click=move |_| {
+                                                                let reason = reason_text.get();
+                                                                if reason.trim().is_empty() {
+                                                                    set_reason_error.set(
+                                                                        "A reason is required.".to_string(),
+                                                                    );
+                                                                    return;
+                                                                }
+                                                                set_reason_error.set(String::new());
+                                                                let args = (submit_id.clone(), reason);
+                                                                match submit_pending.as_str() {
+                                                                    "reject" => { reject_action.dispatch(args); }
+                                                                    "cancel" => { cancel_action.dispatch(args); }
+                                                                    _ => {}
+                                                                }
+                                                            }
+                                                        >
+                                                            "Confirm " {pending_label}
+                                                        </button>
+                                                        <button
+                                                            class="btn btn-secondary"
+                                                            on:click=move |_| {
+                                                                set_pending_reason_action.set(None);
+                                                                set_reason_text.set(String::new());
+                                                                set_reason_error.set(String::new());
+                                                            }
+                                                        >
+                                                            "Cancel"
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            }
+                                        }
+                                    </Show>
                                 </div>
 
                                 <div class="request-timeline">
-                                    <h3>"Stage Timeline"</h3>
-                                    <div class="timeline-list" aria-label="Request stage progression">
-                                        {detail.timeline
-                                            .into_iter()
-                                            .map(|event| {
-                                                let stage_text = stage_label(&event.stage);
-                                                view! {
-                                                    <div class="timeline-item">
-                                                        <span class="badge neutral">{stage_text}</span>
-                                                        <strong>{event.stage.clone()}</strong>
-                                                        <p>{event.description.clone()}</p>
-                                                        <span class="table-note">{event.timestamp.clone()}</span>
-                                                    </div>
-                                                }
-                                            })
-                                            .collect_view()}
-                                    </div>
+                                    <h3>"Audit Trail"</h3>
+                                    {if audit_rows.is_empty() {
+                                        // SSR / unreachable / empty-trail fallback: the
+                                        // clearly-labeled synthetic single entry.
+                                        view! {
+                                            <div class="timeline-list" aria-label="Request audit trail">
+                                                <p class="table-note">
+                                                    "Persisted audit trail unavailable — showing current lifecycle stage only."
+                                                </p>
+                                                {synthetic_timeline
+                                                    .into_iter()
+                                                    .map(|event| {
+                                                        let stage_text = stage_label(&event.stage);
+                                                        view! {
+                                                            <div class="timeline-item">
+                                                                <span class="badge neutral">{stage_text}</span>
+                                                                <strong>{event.stage.clone()}</strong>
+                                                                <p>{event.description.clone()}</p>
+                                                                <span class="table-note">{event.timestamp.clone()}</span>
+                                                            </div>
+                                                        }
+                                                    })
+                                                    .collect_view()}
+                                            </div>
+                                        }
+                                            .into_any()
+                                    } else {
+                                        let any_non_durable = audit_rows.iter().any(|row| !row.durable);
+                                        view! {
+                                            <div class="timeline-list" aria-label="Request audit trail">
+                                                <Show when=move || any_non_durable>
+                                                    <p class="table-note">
+                                                        "Preview trail — entries are not durably persisted in this mode."
+                                                    </p>
+                                                </Show>
+                                                {audit_rows
+                                                    .into_iter()
+                                                    .map(|row| {
+                                                        let action_text = audit_action_label(&row.action);
+                                                        let is_negative = matches!(
+                                                            row.action.as_str(),
+                                                            "request.reject" | "request.cancel",
+                                                        );
+                                                        let badge_class = if is_negative {
+                                                            "badge bad"
+                                                        } else {
+                                                            "badge neutral"
+                                                        };
+                                                        let item_class = if is_negative {
+                                                            "timeline-item terminal"
+                                                        } else {
+                                                            "timeline-item"
+                                                        };
+                                                        // Actor: prefer the display name, falling back
+                                                        // to the verified principal.
+                                                        let actor = if row.actor_display.is_empty() {
+                                                            row.actor_principal.clone()
+                                                        } else {
+                                                            row.actor_display.clone()
+                                                        };
+                                                        let from_stage = row
+                                                            .from_stage
+                                                            .clone()
+                                                            .filter(|stage| !stage.is_empty());
+                                                        let transition = match from_stage {
+                                                            Some(from) => format!(
+                                                                "{} → {}",
+                                                                stage_label(&crate::models::normalize_api_stage(&from)),
+                                                                stage_label(&crate::models::normalize_api_stage(&row.to_stage)),
+                                                            ),
+                                                            None => stage_label(
+                                                                &crate::models::normalize_api_stage(&row.to_stage),
+                                                            )
+                                                                .to_string(),
+                                                        };
+                                                        let reason = row.reason.clone();
+                                                        view! {
+                                                            <div class=item_class>
+                                                                <span class=badge_class>{action_text}</span>
+                                                                <strong>{actor}</strong>
+                                                                <p>{transition}</p>
+                                                                {reason
+                                                                    .map(|reason| {
+                                                                        view! {
+                                                                            <p class="timeline-reason">
+                                                                                "Reason: " {reason}
+                                                                            </p>
+                                                                        }
+                                                                    })}
+                                                                <span class="table-note">{row.occurred_at.clone()}</span>
+                                                            </div>
+                                                        }
+                                                    })
+                                                    .collect_view()}
+                                            </div>
+                                        }
+                                            .into_any()
+                                    }}
                                 </div>
                             </article>
                         }

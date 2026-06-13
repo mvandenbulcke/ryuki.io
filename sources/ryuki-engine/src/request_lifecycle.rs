@@ -5,7 +5,15 @@ use uuid::Uuid;
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 const VALID_ENVIRONMENTS: &[&str] = &["development", "test", "acceptance", "production"];
-const BLOCKED_STATUSES: &[RequestStatus] = &[RequestStatus::Failed, RequestStatus::Completed];
+// Terminal/blocked statuses refuse further forward transitions (validate, plan,
+// approve, lock, execute, verify). Rejected and Cancelled are the new terminal
+// "say no" states alongside Failed and Completed.
+const BLOCKED_STATUSES: &[RequestStatus] = &[
+    RequestStatus::Failed,
+    RequestStatus::Completed,
+    RequestStatus::Rejected,
+    RequestStatus::Cancelled,
+];
 
 fn has_completed_stage(request: &Request, name: &str) -> bool {
     request
@@ -337,6 +345,112 @@ pub fn approve_request(request: &Request, approver: &str) -> Result<Request, Str
     }
 
     Ok(approved)
+}
+
+/// Reject a request at the approval decision point. Valid ONLY from `Planned`
+/// (the same state `approve_request` accepts) — it is the inverse approver act.
+/// Returns a clone with status=Rejected (TERMINAL); records the rejection as a
+/// failed `approve` stage carrying an ApprovalDecision evidence item, and stores
+/// the mandatory reason in metadata. Pure: no I/O — ryuki-api persists.
+pub fn reject_request(request: &Request, approver: &str, reason: &str) -> Result<Request, String> {
+    if reason.trim().is_empty() {
+        return Err("Rejection reason cannot be empty".into());
+    }
+
+    if request.status != RequestStatus::Planned {
+        return Err(format!(
+            "Cannot reject request in status {:?}. A request can only be rejected at the approval decision point (Planned).",
+            request.status
+        ));
+    }
+
+    let mut rejected = request.clone();
+    rejected.status = RequestStatus::Rejected;
+    rejected.updated_at = Utc::now().to_rfc3339();
+
+    let decision = EvidenceItem {
+        key: "approval-decision".into(),
+        value: format!("Rejected by {approver}: {reason}"),
+        redacted_value: None,
+        redacted: false,
+        evidence_type: EvidenceType::ApprovalDecision,
+    };
+    let metadata = HashMap::from([
+        ("approver".into(), approver.to_string()),
+        ("reason".into(), reason.to_string()),
+        ("decision".into(), "rejected".into()),
+    ]);
+
+    if let Some(stage) = rejected.stages.iter_mut().find(|s| s.name == "approve") {
+        stage.status = StageStatus::Failed;
+        stage.started_at = Some(Utc::now().to_rfc3339());
+        stage.completed_at = Some(Utc::now().to_rfc3339());
+        stage.evidence.push(decision);
+        stage.metadata.extend(metadata);
+    } else {
+        rejected.stages.push(Stage {
+            name: "approve".into(),
+            status: StageStatus::Failed,
+            started_at: Some(Utc::now().to_rfc3339()),
+            completed_at: Some(Utc::now().to_rfc3339()),
+            evidence: vec![decision],
+            metadata,
+        });
+    }
+
+    Ok(rejected)
+}
+
+/// Cancel a request before it begins executing. Valid from
+/// Draft|Intake|Validated|Planned|Approved|Locked — NOT once Executing/Verifying
+/// or already terminal (Completed/Failed/Rejected/Cancelled). Returns a clone
+/// with status=Cancelled (TERMINAL); appends a completed `cancel` stage with a
+/// Summary evidence item and stores the mandatory reason in metadata. Pure: no
+/// I/O — ryuki-api persists.
+pub fn cancel_request(request: &Request, actor: &str, reason: &str) -> Result<Request, String> {
+    if reason.trim().is_empty() {
+        return Err("Cancellation reason cannot be empty".into());
+    }
+
+    let cancellable = matches!(
+        request.status,
+        RequestStatus::Draft
+            | RequestStatus::Intake
+            | RequestStatus::Validated
+            | RequestStatus::Planned
+            | RequestStatus::Approved
+            | RequestStatus::Locked
+    );
+    if !cancellable {
+        return Err(format!(
+            "Cannot cancel request in status {:?}. Cancellation is only allowed before execution begins.",
+            request.status
+        ));
+    }
+
+    let mut cancelled = request.clone();
+    cancelled.status = RequestStatus::Cancelled;
+    cancelled.updated_at = Utc::now().to_rfc3339();
+
+    cancelled.stages.push(Stage {
+        name: "cancel".into(),
+        status: StageStatus::Completed,
+        started_at: Some(Utc::now().to_rfc3339()),
+        completed_at: Some(Utc::now().to_rfc3339()),
+        evidence: vec![EvidenceItem {
+            key: "cancellation-summary".into(),
+            value: format!("Cancelled by {actor}: {reason}"),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        }],
+        metadata: HashMap::from([
+            ("actor".into(), actor.to_string()),
+            ("reason".into(), reason.to_string()),
+        ]),
+    });
+
+    Ok(cancelled)
 }
 
 pub fn lock_request(request: &Request) -> Result<Request, String> {
@@ -825,5 +939,136 @@ mod tests {
         let executed = execute_request(&locked).unwrap();
 
         assert_eq!(executed.status, RequestStatus::Verifying);
+    }
+
+    #[test]
+    fn test_reject_request_from_planned_succeeds_and_is_terminal() {
+        let req = make_planned_request();
+        let rejected = reject_request(&req, "Datacenter Approver", "budget not approved").unwrap();
+        assert_eq!(rejected.status, RequestStatus::Rejected);
+        let approve_stage = rejected
+            .stages
+            .iter()
+            .find(|s| s.name == "approve")
+            .unwrap();
+        assert_eq!(approve_stage.status, StageStatus::Failed);
+        let decision = approve_stage
+            .evidence
+            .iter()
+            .find(|e| e.key == "approval-decision")
+            .unwrap();
+        assert!(decision.value.contains("Rejected by Datacenter Approver"));
+        assert!(decision.value.contains("budget not approved"));
+        assert_eq!(decision.evidence_type, EvidenceType::ApprovalDecision);
+        // Terminal: cannot validate/plan/approve a rejected request.
+        let validation = validate_request(&rejected).unwrap();
+        assert!(!validation.passed);
+        assert!(reject_request(&rejected, "x", "again").is_err());
+    }
+
+    #[test]
+    fn test_reject_request_from_intake_fails() {
+        let req = make_test_request();
+        assert_eq!(req.status, RequestStatus::Intake);
+        let error = reject_request(&req, "Datacenter Approver", "no").unwrap_err();
+        assert!(error.contains("approval decision point"));
+    }
+
+    #[test]
+    fn test_reject_request_from_approved_fails() {
+        let planned = make_planned_request();
+        let approved = approve_request(&planned, "Datacenter Approver").unwrap();
+        assert_eq!(approved.status, RequestStatus::Approved);
+        assert!(reject_request(&approved, "Datacenter Approver", "too late").is_err());
+    }
+
+    #[test]
+    fn test_reject_request_empty_reason_rejected() {
+        let req = make_planned_request();
+        assert!(reject_request(&req, "Datacenter Approver", "").is_err());
+        assert!(reject_request(&req, "Datacenter Approver", "   ").is_err());
+    }
+
+    #[test]
+    fn test_cancel_request_from_each_allowed_status_succeeds() {
+        // Intake
+        let intake = make_test_request();
+        assert_eq!(
+            cancel_request(&intake, "alice", "no longer needed")
+                .unwrap()
+                .status,
+            RequestStatus::Cancelled
+        );
+
+        // Validated
+        let validated = make_validated_request();
+        assert_eq!(
+            cancel_request(&validated, "alice", "scope changed")
+                .unwrap()
+                .status,
+            RequestStatus::Cancelled
+        );
+
+        // Planned
+        let planned = make_planned_request();
+        let cancelled = cancel_request(&planned, "alice", "duplicate").unwrap();
+        assert_eq!(cancelled.status, RequestStatus::Cancelled);
+        let cancel_stage = cancelled
+            .stages
+            .iter()
+            .find(|s| s.name == "cancel")
+            .unwrap();
+        assert_eq!(cancel_stage.status, StageStatus::Completed);
+        assert!(
+            cancel_stage
+                .evidence
+                .iter()
+                .any(|e| e.value.contains("Cancelled by alice") && e.value.contains("duplicate"))
+        );
+
+        // Approved
+        let approved = approve_request(&make_planned_request(), "Datacenter Approver").unwrap();
+        assert_eq!(
+            cancel_request(&approved, "alice", "withdrawn")
+                .unwrap()
+                .status,
+            RequestStatus::Cancelled
+        );
+
+        // Locked
+        let locked = lock_request(&approved).unwrap();
+        assert_eq!(
+            cancel_request(&locked, "alice", "withdrawn")
+                .unwrap()
+                .status,
+            RequestStatus::Cancelled
+        );
+
+        // Draft
+        let mut draft = make_test_request();
+        draft.status = RequestStatus::Draft;
+        assert_eq!(
+            cancel_request(&draft, "alice", "abandoned").unwrap().status,
+            RequestStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_cancel_request_from_executing_fails() {
+        let approved = approve_request(&make_planned_request(), "Datacenter Approver").unwrap();
+        let locked = lock_request(&approved).unwrap();
+        let executing = execute_request(&locked).unwrap();
+        // execute_request leaves the request in Verifying; force Executing too.
+        let mut executing_state = executing.clone();
+        executing_state.status = RequestStatus::Executing;
+        assert!(cancel_request(&executing_state, "alice", "stop").is_err());
+        assert!(cancel_request(&executing, "alice", "stop").is_err());
+    }
+
+    #[test]
+    fn test_cancel_request_empty_reason_rejected() {
+        let req = make_test_request();
+        assert!(cancel_request(&req, "alice", "").is_err());
+        assert!(cancel_request(&req, "alice", "   ").is_err());
     }
 }

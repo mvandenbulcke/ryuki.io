@@ -1125,11 +1125,21 @@ pub struct ApiRequestDetail {
 
 impl From<ApiRequestDetail> for RequestDetail {
     fn from(detail: ApiRequestDetail) -> Self {
-        let stage = normalize_api_stage(&detail.stage);
+        // A terminal status overrides the stage column for display so a
+        // rejected request (which keeps `stage='approve'`) renders as a
+        // terminal "rejected" step rather than a still-open approval stage.
+        let stage = match detail.status.as_str() {
+            "rejected" => "rejected".to_string(),
+            "cancelled" => "cancelled".to_string(),
+            _ => normalize_api_stage(&detail.stage),
+        };
+        // The real trail is fetched separately via `get_request_audit`; this
+        // single synthetic entry is a clearly-labeled SSR/unreachable
+        // fallback only and is replaced by the persisted timeline in the view.
         let timeline = vec![StageEvent {
             stage: stage.clone(),
             timestamp: detail.updated_at.clone(),
-            description: "Current lifecycle stage (stage history not yet persisted)".to_string(),
+            description: "Current lifecycle stage (audit trail loads separately)".to_string(),
         }];
         let actions_available = actions_for_stage(&stage);
         Self {
@@ -1162,6 +1172,11 @@ pub fn normalize_api_stage(stage: &str) -> String {
         "lock" => "locked",
         "execute" => "executed",
         "verify" => "verified",
+        // The cancel transition stamps `stage='cancel'`; the rejected
+        // transition reuses `stage='approve'` (the decision point), so the
+        // terminal "rejected" display is driven by the request status rather
+        // than the stage column (see `RequestDetail::from`).
+        "cancel" => "cancelled",
         other => other,
     }
     .to_string()
@@ -1172,13 +1187,23 @@ pub fn normalize_api_stage(stage: &str) -> String {
 /// detail mapping.
 pub fn actions_for_stage(stage: &str) -> Vec<String> {
     match stage {
-        "intake" => vec!["validate".to_string()],
-        "validated" => vec!["plan".to_string()],
-        "planned" => vec!["approve".to_string(), "validate".to_string()],
-        "approved" => vec!["lock".to_string()],
-        "locked" => vec!["execute".to_string()],
+        // `cancel` is offered on every non-terminal pre-execution stage so a
+        // requester (or admin) can withdraw a request before it runs. `reject`
+        // is the approver's "say no" at the approval decision point (planned).
+        "draft" | "intake" => vec!["validate".to_string(), "cancel".to_string()],
+        "validated" => vec!["plan".to_string(), "cancel".to_string()],
+        "planned" => vec![
+            "approve".to_string(),
+            "validate".to_string(),
+            "reject".to_string(),
+            "cancel".to_string(),
+        ],
+        "approved" => vec!["lock".to_string(), "cancel".to_string()],
+        "locked" => vec!["execute".to_string(), "cancel".to_string()],
         "executed" => vec!["verify".to_string()],
         "failed" => vec!["validate".to_string(), "plan".to_string()],
+        // Terminal states offer no further lifecycle actions.
+        "rejected" | "cancelled" => vec![],
         _ => vec!["validate".to_string()],
     }
 }
@@ -1206,6 +1231,116 @@ pub struct StageEvent {
     pub stage: String,
     pub timestamp: String,
     pub description: String,
+}
+
+/// One row of the durable who-did-what-when trail, mirroring an `audit_log`
+/// row as served by `GET /api/requests/{id}/audit`. The portal renders the
+/// verified actor identity, the action, the resulting status, the
+/// transition's stage, the timestamp, and a reason (for reject/cancel rows).
+/// `durable` distinguishes a persisted DB row (`true`) from a process-local
+/// dry-run entry (`false`), so the timeline can label non-durable trails.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditEventRow {
+    pub action: String,
+    #[serde(default)]
+    pub actor_display: String,
+    #[serde(default)]
+    pub actor_principal: String,
+    #[serde(default)]
+    pub from_stage: Option<String>,
+    #[serde(default)]
+    pub to_stage: String,
+    #[serde(default)]
+    pub to_status: String,
+    pub occurred_at: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default = "default_durable")]
+    pub durable: bool,
+}
+
+/// Audit rows are durable (DB-backed) unless the read endpoint explicitly
+/// tags them `false` (dry-run / process-local trail). Defaulting to `true`
+/// keeps the common DB path terse.
+fn default_durable() -> bool {
+    true
+}
+
+/// Mirrors the `GET /api/requests/{id}/audit` envelope. The API may either
+/// return a bare array of rows or an object with `{durable, source, events}`;
+/// both decode through this enum so the portal tolerates either shape.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApiAuditTrail {
+    Enveloped {
+        #[serde(default = "default_durable")]
+        durable: bool,
+        #[serde(default)]
+        events: Vec<ApiAuditEventRow>,
+    },
+    Bare(Vec<ApiAuditEventRow>),
+}
+
+impl ApiAuditTrail {
+    /// Flattens the wire shape into portal `AuditEventRow`s, stamping the
+    /// envelope-level `durable` flag onto each row when present.
+    pub fn into_rows(self) -> Vec<AuditEventRow> {
+        match self {
+            ApiAuditTrail::Enveloped { durable, events } => events
+                .into_iter()
+                .map(|row| row.into_audit_event(durable))
+                .collect(),
+            ApiAuditTrail::Bare(events) => events
+                .into_iter()
+                .map(|row| row.into_audit_event(true))
+                .collect(),
+        }
+    }
+}
+
+/// Mirrors one `audit_log` row as serialized by the API. `detail` carries the
+/// reason text for reject/cancel rows; the portal extracts `detail.reason`
+/// into the rendered `AuditEventRow`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiAuditEventRow {
+    pub action: String,
+    #[serde(default)]
+    pub actor_display: Option<String>,
+    #[serde(default)]
+    pub actor_principal: String,
+    #[serde(default)]
+    pub from_stage: Option<String>,
+    #[serde(default)]
+    pub to_stage: String,
+    #[serde(default)]
+    pub to_status: String,
+    pub occurred_at: String,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
+impl ApiAuditEventRow {
+    fn into_audit_event(self, durable: bool) -> AuditEventRow {
+        // The reason lives in the JSONB `detail.reason` for reject/cancel
+        // rows; absent for the forward-only stage transitions.
+        let reason = self
+            .detail
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .filter(|reason| !reason.is_empty());
+        AuditEventRow {
+            action: self.action,
+            actor_display: self.actor_display.unwrap_or_default(),
+            actor_principal: self.actor_principal,
+            from_stage: self.from_stage,
+            to_stage: self.to_stage,
+            to_status: self.to_status,
+            occurred_at: self.occurred_at,
+            reason,
+            durable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -2037,14 +2172,84 @@ mod tests {
 
         assert_eq!(mapped.memory, 16);
         assert_eq!(mapped.stage, "validated");
-        assert_eq!(mapped.actions_available, vec!["plan".to_string()]);
+        assert_eq!(
+            mapped.actions_available,
+            vec!["plan".to_string(), "cancel".to_string()]
+        );
         assert_eq!(mapped.timeline.len(), 1);
         assert_eq!(mapped.timeline[0].stage, "validated");
         assert_eq!(mapped.timeline[0].timestamp, "2026-06-12T11:00:00+00:00");
         assert_eq!(
             mapped.timeline[0].description,
-            "Current lifecycle stage (stage history not yet persisted)"
+            "Current lifecycle stage (audit trail loads separately)"
         );
+    }
+
+    #[test]
+    fn api_request_detail_renders_terminal_states_from_status() {
+        // A rejected request keeps stage='approve' but status='rejected'; the
+        // portal must display the terminal stage and offer no further actions.
+        let rejected = r#"{"request_id":"r1","request_type":"VM","status":"rejected","stage":"approve","site":"s","environment":"prod","name":"n","cpu":2,"memory_gb":8,"justification":null,"created_by":"req","created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(rejected).expect("decode");
+        let mapped = RequestDetail::from(detail);
+        assert_eq!(mapped.stage, "rejected");
+        assert!(mapped.actions_available.is_empty());
+
+        let cancelled = r#"{"request_id":"r2","request_type":"VM","status":"cancelled","stage":"cancel","site":"s","environment":"prod","name":"n","cpu":2,"memory_gb":8,"justification":null,"created_by":"req","created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(cancelled).expect("decode");
+        let mapped = RequestDetail::from(detail);
+        assert_eq!(mapped.stage, "cancelled");
+        assert!(mapped.actions_available.is_empty());
+    }
+
+    #[test]
+    fn actions_for_stage_offers_reject_at_decision_point_and_cancel_pre_execution() {
+        // reject is only offered at the approval decision point.
+        assert!(actions_for_stage("planned").contains(&"reject".to_string()));
+        assert!(!actions_for_stage("intake").contains(&"reject".to_string()));
+        assert!(!actions_for_stage("approved").contains(&"reject".to_string()));
+
+        // cancel is offered on every non-terminal pre-execution stage.
+        for stage in [
+            "draft",
+            "intake",
+            "validated",
+            "planned",
+            "approved",
+            "locked",
+        ] {
+            assert!(
+                actions_for_stage(stage).contains(&"cancel".to_string()),
+                "{stage} should offer cancel"
+            );
+        }
+        // ...but not once executing/verifying or in a terminal state.
+        assert!(!actions_for_stage("executed").contains(&"cancel".to_string()));
+        assert!(actions_for_stage("rejected").is_empty());
+        assert!(actions_for_stage("cancelled").is_empty());
+    }
+
+    #[test]
+    fn api_audit_trail_flattens_enveloped_and_bare_shapes() {
+        // Enveloped dry-run trail: durable=false propagates to every row, and
+        // the reject reason is lifted out of detail.reason.
+        let enveloped = r#"{"durable":false,"source":"dry-run","events":[{"action":"request.reject","actor_display":"Approver","actor_principal":"approver","from_stage":"plan","to_stage":"approve","to_status":"rejected","occurred_at":"t","detail":{"reason":"insufficient capacity"}}]}"#;
+        let trail: ApiAuditTrail = serde_json::from_str(enveloped).expect("decode envelope");
+        let rows = trail.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].durable);
+        assert_eq!(rows[0].action, "request.reject");
+        assert_eq!(rows[0].actor_display, "Approver");
+        assert_eq!(rows[0].reason.as_deref(), Some("insufficient capacity"));
+
+        // Bare array shape defaults durable=true and tolerates absent reason.
+        let bare = r#"[{"action":"request.approve","actor_principal":"approver","to_stage":"approve","to_status":"approved","occurred_at":"t","detail":{}}]"#;
+        let trail: ApiAuditTrail = serde_json::from_str(bare).expect("decode bare");
+        let rows = trail.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].durable);
+        assert_eq!(rows[0].reason, None);
+        assert_eq!(rows[0].actor_display, "");
     }
 
     #[test]
@@ -2054,7 +2259,10 @@ mod tests {
         let mapped = RequestDetail::from(detail);
 
         assert_eq!(mapped.justification, "");
-        assert_eq!(mapped.actions_available, vec!["validate".to_string()]);
+        assert_eq!(
+            mapped.actions_available,
+            vec!["validate".to_string(), "cancel".to_string()]
+        );
     }
 
     #[test]

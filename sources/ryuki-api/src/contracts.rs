@@ -16,6 +16,7 @@ use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::audit::{self, AuditRecord};
 use crate::database::get_db;
 use crate::problem_details;
 use crate::ProblemDetails;
@@ -116,6 +117,9 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/lock", post(requests_lock))
         .route("/api/requests/{id}/execute", post(requests_execute))
         .route("/api/requests/{id}/verify", post(requests_verify))
+        .route("/api/requests/{id}/reject", post(requests_reject))
+        .route("/api/requests/{id}/cancel", post(requests_cancel))
+        .route("/api/requests/{id}/audit", get(requests_audit))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -7618,6 +7622,114 @@ fn status_409(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::CONFLICT, Json(json!({"error": msg})))
 }
 
+/// Maps any database/transaction error to a 500. Used by the transactional
+/// lifecycle handlers where the request UPDATE and the audit INSERT commit
+/// together.
+fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": e.to_string()})),
+    )
+}
+
+/// Applies a lifecycle transition to a request row AND records its audit entry
+/// in ONE transaction, so a row can never transition without its audit trail
+/// (and vice versa). `current` is the pre-transition row (supplies the
+/// from_status/from_stage attribution); `to_status`/`to_stage` are the
+/// post-transition DB values; actor identity is taken from `session`.
+#[allow(clippy::too_many_arguments)]
+async fn apply_transition_audited(
+    pool: &sqlx::PgPool,
+    session: &AuthSession,
+    uid: Uuid,
+    current: &DbRequestRow,
+    action: &str,
+    to_status: &str,
+    to_stage: &str,
+    detail: Value,
+) -> Result<DbRequestRow, (StatusCode, Json<Value>)> {
+    let mut tx = pool.begin().await.map_err(db_error)?;
+
+    let row: DbRequestRow = sqlx::query_as(
+        "UPDATE requests SET status = $1, stage = $2, updated_at = NOW() WHERE id = $3 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+    )
+    .bind(to_status)
+    .bind(to_stage)
+    .bind(uid)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    let request_id = uid.to_string();
+    audit::record_audit_tx(
+        &mut tx,
+        session,
+        &AuditRecord {
+            action,
+            request_id: Some(&request_id),
+            from_status: Some(&current.status),
+            to_status: &row.status,
+            from_stage: Some(&current.stage),
+            to_stage: &row.stage,
+            detail,
+            outcome: "applied",
+        },
+    )
+    .await
+    .map_err(db_error)?;
+
+    tx.commit().await.map_err(db_error)?;
+    Ok(row)
+}
+
+/// Best-effort audit of a DENIED transition attempt (a 403 before any state
+/// change). Records to the DB when available, otherwise the process-local
+/// store. The from/to stages are unknown without reading the row, so they are
+/// recorded as "unknown"; a failure here never changes the 403 outcome.
+async fn record_transition_denied(session: &AuthSession, request_id: &str, action: &str) {
+    audit::record_denied(
+        get_db(),
+        session,
+        &AuditRecord {
+            action,
+            request_id: Some(request_id),
+            from_status: None,
+            to_status: "unknown",
+            from_stage: None,
+            to_stage: "unknown",
+            detail: json!({"note": "permission denied"}),
+            outcome: "denied",
+        },
+    )
+    .await;
+}
+
+/// Records an APPLIED transition to the process-local store (no-DB / dry-run
+/// mode). The pre-transition status/stage are not tracked in-memory, so they
+/// are left null; the post-transition values come from the caller.
+async fn record_local_transition(
+    session: &AuthSession,
+    request_id: &str,
+    action: &str,
+    to_status: &str,
+    to_stage: &str,
+) {
+    audit::record_audit_local(
+        session,
+        &AuditRecord {
+            action,
+            request_id: Some(request_id),
+            from_status: None,
+            to_status,
+            from_stage: None,
+            to_stage,
+            detail: json!({}),
+            outcome: "applied",
+        },
+    )
+    .await;
+}
+
 fn map_engine_error(e: String) -> (StatusCode, Json<Value>) {
     status_400(&e)
 }
@@ -7657,6 +7769,8 @@ fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
         "verifying" | "verified" => RequestStatus::Verifying,
         "completed" => RequestStatus::Completed,
         "failed" => RequestStatus::Failed,
+        "rejected" => RequestStatus::Rejected,
+        "cancelled" => RequestStatus::Cancelled,
         _ => RequestStatus::Draft,
     }
 }
@@ -7674,6 +7788,8 @@ fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str
         RequestStatus::Verifying => "verifying",
         RequestStatus::Completed => "completed",
         RequestStatus::Failed => "failed",
+        RequestStatus::Rejected => "rejected",
+        RequestStatus::Cancelled => "cancelled",
     }
 }
 
@@ -7758,10 +7874,26 @@ async fn requests_create(
     // POST /api/requests. Keeping the handler check makes the requirement
     // explicit and survives any future routing refactor.
     if !check_permission(&session, "request") {
+        // Audit the refused create (best-effort) before the 403.
+        audit::record_denied(
+            get_db(),
+            &session,
+            &AuditRecord {
+                action: "request.create",
+                request_id: None,
+                from_status: None,
+                to_status: "intake",
+                from_stage: None,
+                to_stage: "intake",
+                detail: json!({}),
+                outcome: "denied",
+            },
+        )
+        .await;
         return Err(status_403());
     }
     let request_type = parse_request_type(&body.request_type)?;
-    let request = request_lifecycle::create_request(
+    let mut request = request_lifecycle::create_request(
         &body.request_type,
         request_type,
         &body.name,
@@ -7771,11 +7903,20 @@ async fn requests_create(
         "standard",
     )
     .map_err(map_engine_error)?;
+    // Anchor the requester to the VERIFIED session principal, not the
+    // client-supplied name. The DB path uses created_by=session.user_id; the
+    // in-memory (no-DB) path must match so the cancel SoD check ("requester ==
+    // caller") cannot be forged by setting the request name.
+    request.requester = session.user_id.clone();
 
     if let Some(pool) = get_db() {
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        // created_by is the VERIFIED requester principal from the session — it
+        // is the requester anchor the cancel SoD check matches against. Never a
+        // client-supplied value.
         let row = sqlx::query_as::<_, DbRequestRow>(
-            "INSERT INTO requests (request_type, site, environment, name, cpu, memory_gb, justification) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+            "INSERT INTO requests (request_type, site, environment, name, cpu, memory_gb, justification, created_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
         )
         .bind(&body.request_type)
         .bind(&body.site)
@@ -7784,16 +7925,51 @@ async fn requests_create(
         .bind(body.cpu as i32)
         .bind(body.memory_gb as i32)
         .bind(&body.justification)
-        .fetch_one(pool)
+        .bind(&session.user_id)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .map_err(db_error)?;
+
+        let request_id = row.id.to_string();
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &AuditRecord {
+                action: "request.create",
+                request_id: Some(&request_id),
+                from_status: None,
+                to_status: &row.status,
+                from_stage: None,
+                to_stage: &row.stage,
+                detail: json!({}),
+                outcome: "applied",
+            },
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+
         let mut response = request;
-        response.id = row.id.to_string();
+        response.id = request_id;
         response.created_at = row.created_at.to_rfc3339();
         response.updated_at = row.updated_at.to_rfc3339();
         return Ok(Json(serde_json::to_value(&response).unwrap_or_default()));
     }
 
+    audit::record_audit_local(
+        &session,
+        &AuditRecord {
+            action: "request.create",
+            request_id: Some(&request.id),
+            from_status: None,
+            to_status: request.status.as_str(),
+            from_stage: None,
+            to_stage: "intake",
+            detail: json!({}),
+            outcome: "applied",
+        },
+    )
+    .await;
     request_store().lock().await.push(request.clone());
     Ok(Json(serde_json::to_value(&request).unwrap_or_default()))
 }
@@ -7906,6 +8082,7 @@ async fn requests_validate(
     // Defense-in-depth: validate is operator-tier ("execute"). The central
     // route gate enforces the same requirement.
     if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.validate").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -7916,7 +8093,7 @@ async fn requests_validate(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
@@ -7927,14 +8104,17 @@ async fn requests_validate(
         }
 
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Validated);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'validate', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.validate",
+            db_status,
+            "validate",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&result).unwrap_or_default()));
     }
@@ -7973,6 +8153,14 @@ async fn requests_validate(
         metadata: std::collections::HashMap::new(),
     });
     store[idx].updated_at = now_iso();
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.validate",
+        "validated",
+        "validate",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
@@ -7984,6 +8172,7 @@ async fn requests_plan(
     // Defense-in-depth: plan is operator-tier ("execute"). The central route
     // gate enforces the same requirement.
     if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.plan").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -7994,21 +8183,24 @@ async fn requests_plan(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
         let stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
 
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Planned);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'plan', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.plan",
+            db_status,
+            "plan",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&stages).unwrap_or_default()));
     }
@@ -8024,6 +8216,7 @@ async fn requests_plan(
     store[idx].status = ryuki_engine::models::RequestStatus::Planned;
     store[idx].stages = stages.clone();
     store[idx].updated_at = now_iso();
+    record_local_transition(&session, &request_id, "request.plan", "planned", "plan").await;
 
     Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
@@ -8033,6 +8226,7 @@ async fn requests_approve(
     AuthExtractor(session): AuthExtractor,
 ) -> ApiResult {
     if !check_permission(&session, "approve") {
+        record_transition_denied(&session, &request_id, "request.approve").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -8043,22 +8237,28 @@ async fn requests_approve(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
-        let approved =
-            request_lifecycle::approve_request(&request, "admin").map_err(map_engine_error)?;
+        // Attribution: the REAL verified approver from the session, never a
+        // literal. The engine threads this into the approval-decision evidence
+        // and approval_route.
+        let approved = request_lifecycle::approve_request(&request, &session.user_id)
+            .map_err(map_engine_error)?;
 
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Approved);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'approve', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.approve",
+            db_status,
+            "approve",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&approved).unwrap_or_default()));
     }
@@ -8069,10 +8269,18 @@ async fn requests_approve(
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
 
-    let approved =
-        request_lifecycle::approve_request(&store[idx], "admin").map_err(map_engine_error)?;
+    let approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
+        .map_err(map_engine_error)?;
 
     store[idx] = approved.clone();
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.approve",
+        "approved",
+        "approve",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
@@ -8082,6 +8290,7 @@ async fn requests_lock(
     AuthExtractor(session): AuthExtractor,
 ) -> ApiResult {
     if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.lock").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -8092,21 +8301,24 @@ async fn requests_lock(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
         let locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
 
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Locked);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'lock', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.lock",
+            db_status,
+            "lock",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&locked).unwrap_or_default()));
     }
@@ -8120,6 +8332,7 @@ async fn requests_lock(
     let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
 
     store[idx] = locked.clone();
+    record_local_transition(&session, &request_id, "request.lock", "locked", "lock").await;
 
     Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
@@ -8129,6 +8342,7 @@ async fn requests_execute(
     AuthExtractor(session): AuthExtractor,
 ) -> ApiResult {
     if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.execute").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -8139,21 +8353,24 @@ async fn requests_execute(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
         let executed = request_lifecycle::execute_request(&request).map_err(map_engine_error)?;
 
         let db_status = request_status_to_db(&executed.status);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'execute', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.execute",
+            db_status,
+            "execute",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&executed).unwrap_or_default()));
     }
@@ -8166,7 +8383,16 @@ async fn requests_execute(
 
     let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
 
+    let to_status = executed.status.as_str();
     store[idx] = executed.clone();
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.execute",
+        to_status,
+        "execute",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
@@ -8176,6 +8402,7 @@ async fn requests_verify(
     AuthExtractor(session): AuthExtractor,
 ) -> ApiResult {
     if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.verify").await;
         return Err(status_403());
     }
     if let Some(pool) = get_db() {
@@ -8186,7 +8413,7 @@ async fn requests_verify(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
@@ -8202,14 +8429,17 @@ async fn requests_verify(
         .map_err(map_engine_error)?;
 
         let db_status = request_status_to_db(&completed.status);
-        let _row: DbRequestRow = sqlx::query_as(
-            "UPDATE requests SET status = $1, stage = 'verify', updated_at = NOW() WHERE id = $2 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.verify",
+            db_status,
+            "verify",
+            json!({}),
         )
-        .bind(db_status)
-        .bind(uid)
-        .fetch_one(pool)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .await?;
 
         return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
     }
@@ -8232,9 +8462,211 @@ async fn requests_verify(
     )
     .map_err(map_engine_error)?;
 
+    let to_status = completed.status.as_str();
     store[idx] = completed;
+    record_local_transition(&session, &request_id, "request.verify", to_status, "verify").await;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
+}
+
+/// Body for reject/cancel: the human reason text only. There is deliberately no
+/// actor field — actor identity is taken exclusively from the verified session,
+/// so a forged actor is impossible.
+#[derive(Debug, Deserialize)]
+struct ReasonBody {
+    reason: String,
+}
+
+/// POST /api/requests/{id}/reject — the approver "say no" act. Valid only from
+/// Planned (the approval decision point); guarded by the `approve` permission
+/// (the inverse of approve). The mandatory reason is recorded in the audit
+/// trail and the rejection evidence. Terminal.
+async fn requests_reject(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ReasonBody>,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        record_transition_denied(&session, &request_id, "request.reject").await;
+        return Err(status_403());
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Rejection reason is required"));
+    }
+
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
+            .map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Rejected);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.reject",
+            db_status,
+            "approve",
+            json!({ "reason": reason }),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()));
+    }
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    let rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
+        .map_err(map_engine_error)?;
+    store[idx] = rejected.clone();
+    audit::record_audit_local(
+        &session,
+        &AuditRecord {
+            action: "request.reject",
+            request_id: Some(&request_id),
+            from_status: None,
+            to_status: "rejected",
+            from_stage: None,
+            to_stage: "approve",
+            detail: json!({ "reason": reason }),
+            outcome: "applied",
+        },
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/cancel — withdraw a request before execution begins.
+/// SoD: an admin may cancel any request; a requester may cancel only their OWN
+/// request (matched against `requests.created_by`). The central route gate
+/// applies a coarse `request` floor; this handler enforces the finer
+/// requester-or-admin rule because the route table cannot see `created_by`.
+async fn requests_cancel(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ReasonBody>,
+) -> ApiResult {
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Cancellation reason is required"));
+    }
+
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        // SoD: admin OR (requester AND owns the row).
+        if !cancel_permitted(&session, current.created_by.as_deref()) {
+            record_transition_denied(&session, &request_id, "request.cancel").await;
+            return Err(status_403());
+        }
+
+        let request = db_row_to_request(&current, &request_id);
+        let cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
+            .map_err(map_engine_error)?;
+
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Cancelled);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.cancel",
+            db_status,
+            "cancel",
+            json!({ "reason": reason }),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::to_value(&cancelled).unwrap_or_default()));
+    }
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    // In-memory records carry the requester in `requester`; honor the same SoD.
+    if !cancel_permitted(&session, Some(store[idx].requester.as_str())) {
+        drop(store);
+        record_transition_denied(&session, &request_id, "request.cancel").await;
+        return Err(status_403());
+    }
+
+    let cancelled = request_lifecycle::cancel_request(&store[idx], &session.user_id, reason)
+        .map_err(map_engine_error)?;
+    store[idx] = cancelled.clone();
+    audit::record_audit_local(
+        &session,
+        &AuditRecord {
+            action: "request.cancel",
+            request_id: Some(&request_id),
+            from_status: None,
+            to_status: "cancelled",
+            from_stage: None,
+            to_stage: "cancel",
+            detail: json!({ "reason": reason }),
+            outcome: "applied",
+        },
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&cancelled).unwrap_or_default()))
+}
+
+/// SoD gate for cancel: an admin may cancel any request; a requester may cancel
+/// only their own (session principal == the request's creator).
+fn cancel_permitted(session: &AuthSession, created_by: Option<&str>) -> bool {
+    check_permission(session, "admin")
+        || (check_permission(session, "request") && created_by == Some(session.user_id.as_str()))
+}
+
+/// GET /api/requests/{id}/audit — the ordered, actor-attributed audit trail for
+/// one request. DB-backed entries are tagged `durable: true`; the no-DB
+/// (dry-run) store is tagged `durable: false`. No secrets are ever written to
+/// the trail, so this read is safe to expose.
+async fn requests_audit(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
+    // The audit trail is sensitive identity data — who acted, when, and why,
+    // more sensitive than a request body. Gate it on audit-tier access ahead of
+    // the general read-authentication wave. Static/mock sessions carry
+    // PlatformAdmin (audit via the admin superuser), so the demo is unaffected.
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read the request audit trail"})),
+        ));
+    }
+    Ok(Json(
+        audit::audit_trail_for_request(get_db(), &request_id).await,
+    ))
 }
 
 // ─── VM Day-2 Operations handlers ───
@@ -13217,5 +13649,272 @@ mod unit_tests {
             panic!("non-admin must be forbidden from revoking sessions");
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    // ─── reject / cancel / audit (no-DB / in-memory path) ───
+
+    fn single_role_session(user_id: &str, role: &str) -> AuthSession {
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = user_id.to_string();
+        session.display_name = format!("{user_id} (test)");
+        session.provider_mode = "local".to_string();
+        session.roles = vec![role.to_string()];
+        session
+    }
+
+    /// Build an in-memory request advanced to Planned (the decision point).
+    async fn seed_planned_request(id: &str, requester: &str) {
+        let mut request = test_request(id);
+        request.requester = requester.to_string();
+        request.approval_route.push("Datacenter Approver".into());
+        request_store().lock().await.push(request);
+
+        let operator = static_admin_operator_session();
+        let _ = requests_validate(Path(id.to_string()), AuthExtractor(operator.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(Path(id.to_string()), AuthExtractor(operator))
+            .await
+            .expect("plan");
+    }
+
+    #[tokio::test]
+    async fn requests_reject_from_planned_marks_rejected_and_audits() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Json(body) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(approver),
+            Json(ReasonBody {
+                reason: "insufficient capacity".into(),
+            }),
+        )
+        .await
+        .expect("approver may reject a planned request");
+        assert_eq!(body["status"], "Rejected");
+
+        // The request is terminal in the store.
+        {
+            let store = request_store().lock().await;
+            let stored = store.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Rejected);
+        }
+
+        // The audit trail records the real approver identity and the action.
+        let Json(trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        assert_eq!(trail["durable"], false);
+        let entries = trail["entries"].as_array().unwrap();
+        let reject = entries
+            .iter()
+            .find(|e| e["action"] == "request.reject")
+            .expect("reject audit entry present");
+        assert_eq!(reject["actor_principal"], "approver-1");
+        assert_eq!(reject["to_status"], "rejected");
+        assert_eq!(reject["detail"]["reason"], "insufficient capacity");
+        assert_eq!(reject["outcome"], "applied");
+    }
+
+    #[tokio::test]
+    async fn requests_reject_requires_reason() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Err((status, _)) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(approver),
+            Json(ReasonBody {
+                reason: "   ".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("empty reason must be a 400");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn requests_reject_rejected_for_auditor() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+
+        let auditor = single_role_session("auditor-1", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let Err((status, _)) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(auditor),
+            Json(ReasonBody {
+                reason: "no".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("auditor (no approve) must be forbidden from rejecting");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The denied attempt is itself audited best-effort.
+        let Json(trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        let entries = trail["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|e| {
+            e["action"] == "request.reject"
+                && e["outcome"] == "denied"
+                && e["actor_principal"] == "auditor-1"
+        }));
+    }
+
+    #[tokio::test]
+    async fn requests_cancel_by_owning_requester_succeeds_and_audits() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        // A fresh intake request owned by requester-2.
+        let mut request = test_request(&id);
+        request.requester = "requester-2".to_string();
+        request_store().lock().await.push(request);
+
+        let requester = single_role_session("requester-2", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        let Json(body) = requests_cancel(
+            Path(id.clone()),
+            AuthExtractor(requester),
+            Json(ReasonBody {
+                reason: "no longer needed".into(),
+            }),
+        )
+        .await
+        .expect("a requester may cancel their own request");
+        assert_eq!(body["status"], "Cancelled");
+
+        let Json(trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        let entries = trail["entries"].as_array().unwrap();
+        let cancel = entries
+            .iter()
+            .find(|e| e["action"] == "request.cancel")
+            .expect("cancel audit entry present");
+        assert_eq!(cancel["actor_principal"], "requester-2");
+        assert_eq!(cancel["to_status"], "cancelled");
+        assert_eq!(cancel["detail"]["reason"], "no longer needed");
+    }
+
+    #[tokio::test]
+    async fn requests_cancel_rejected_for_non_owning_requester() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        let mut request = test_request(&id);
+        request.requester = "requester-owner".to_string();
+        request_store().lock().await.push(request);
+
+        // A different requester does not own this request.
+        let other = single_role_session("requester-other", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        let Err((status, _)) = requests_cancel(
+            Path(id.clone()),
+            AuthExtractor(other),
+            Json(ReasonBody {
+                reason: "not mine".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("a requester may not cancel someone else's request");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn requests_cancel_requires_reason() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+        let admin = AuthSession::static_dry_run();
+        let Err((status, _)) = requests_cancel(
+            Path(id.clone()),
+            AuthExtractor(admin),
+            Json(ReasonBody {
+                reason: String::new(),
+            }),
+        )
+        .await
+        else {
+            panic!("empty reason must be a 400");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn cancel_permitted_enforces_admin_or_owning_requester() {
+        let admin = AuthSession::static_dry_run(); // PlatformAdmin -> superuser
+        assert!(cancel_permitted(&admin, Some("anyone")));
+        assert!(cancel_permitted(&admin, None));
+
+        let owner = single_role_session("u-owner", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        assert!(cancel_permitted(&owner, Some("u-owner")));
+        assert!(!cancel_permitted(&owner, Some("someone-else")));
+        assert!(!cancel_permitted(&owner, None));
+
+        // An auditor holds neither admin nor request — never permitted.
+        let auditor = single_role_session("u-aud", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        assert!(!cancel_permitted(&auditor, Some("u-aud")));
+    }
+
+    #[tokio::test]
+    async fn requests_audit_unknown_request_returns_empty_trail() {
+        let Json(trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("nope-not-real".to_string()),
+        )
+        .await
+        .expect("audit read");
+        assert_eq!(trail["durable"], false);
+        assert!(trail["entries"].as_array().unwrap().is_empty());
+    }
+
+    /// The audit trail is sensitive identity data and must be gated on
+    /// audit-tier access. A session with no roles (no audit permission) is
+    /// refused; an Auditor (audit permission) is allowed.
+    #[tokio::test]
+    async fn requests_audit_requires_audit_permission() {
+        let no_roles = AuthSession {
+            user_id: "anon".to_string(),
+            display_name: "No roles".to_string(),
+            roles: vec![],
+            token_valid: false,
+            provider_mode: "local-unauthenticated".to_string(),
+        };
+        let Err((status, Json(body))) =
+            requests_audit(AuthExtractor(no_roles), Path("any".to_string())).await
+        else {
+            panic!("a session without audit access must be refused the audit trail");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("Audit"),
+            "denial body should name the audit-tier requirement"
+        );
+
+        let auditor = single_role_session("aud-1", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        assert!(
+            requests_audit(AuthExtractor(auditor), Path("any".to_string()))
+                .await
+                .is_ok(),
+            "an auditor must be allowed to read the audit trail"
+        );
     }
 }

@@ -21,9 +21,9 @@ use crate::api::{
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_detail_path,
-    request_execute_path, request_lock_path, request_plan_path, request_validate_path,
-    request_verify_path,
+    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
+    request_cancel_path, request_detail_path, request_execute_path, request_lock_path,
+    request_plan_path, request_reject_path, request_validate_path, request_verify_path,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -40,7 +40,7 @@ use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
     actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
-    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiLoginSession,
+    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiLoginSession,
     ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
 };
 use crate::models::{
@@ -52,14 +52,15 @@ use crate::models::{
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
-    AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary, CmdbReconciliationSummary,
-    CmdbRelationshipSummary, CreateRequestPayload, CreateTokenPayload, CreateTokenResult,
-    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
-    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
-    EvidenceSummary, InventoryResourceSummary, OperationRunSummary, PlatformHealth,
-    PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
-    PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
-    RequestSummary, RevokeResult, SecretReferenceSummary, StageActionResponse,
+    AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
+    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload, CreateTokenPayload,
+    CreateTokenResult, DatacenterFailingChecksSummary, DatacenterFullReadiness,
+    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
+    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, OperationRunSummary,
+    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
+    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
+    RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
+    StageActionResponse,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -223,7 +224,16 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
     }
     if matches!(
         request_id,
-        "detail" | "validate" | "plan" | "approve" | "lock" | "execute" | "verify"
+        "detail"
+            | "validate"
+            | "plan"
+            | "approve"
+            | "reject"
+            | "cancel"
+            | "lock"
+            | "execute"
+            | "verify"
+            | "audit"
     ) {
         return false;
     }
@@ -233,9 +243,12 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("validate"), None)
             | (Some("plan"), None)
             | (Some("approve"), None)
+            | (Some("reject"), None)
+            | (Some("cancel"), None)
             | (Some("lock"), None)
             | (Some("execute"), None)
             | (Some("verify"), None)
+            | (Some("audit"), None)
     )
 }
 
@@ -1934,6 +1947,152 @@ pub async fn verify_request(request_id: String) -> Result<StageActionResponse, S
     dispatch_stage_action_live(request_id, "verification", &path).await
 }
 
+/// Live POST of a reason-bearing lifecycle decision (reject/cancel). Unlike
+/// `dispatch_stage_action_live` (which posts no body), this sends a
+/// `{"reason": ...}` JSON body — these transitions are never bodyless. 2xx
+/// maps to a success badge with the freshly fetched terminal stage; 4xx (the
+/// 409 lifecycle guard, the 403 role/SoD denial, the 400 empty-reason guard)
+/// maps to a failure badge carrying the API safe message; transport failures
+/// and 5xx surface as errors so mutations never silently degrade.
+#[cfg(feature = "ssr")]
+async fn dispatch_reason_action_live(
+    request_id: String,
+    action: &str,
+    reason: String,
+    path: &str,
+) -> Result<StageActionResponse, ServerFnError> {
+    let upstream = upstream_context();
+    let session_id = session_id_from_request().await;
+    let body = serde_json::json!({ "reason": reason });
+    let response = upstream
+        .post(path, Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if response.is_success() {
+        let new_stage = fetch_request_detail_live(&upstream, &request_id)
+            .await
+            .map(|detail| detail.stage)
+            .unwrap_or_default();
+        Ok(StageActionResponse {
+            request_id,
+            success: true,
+            new_stage,
+            message: format!("{action} completed"),
+        })
+    } else {
+        Ok(StageActionResponse {
+            request_id,
+            success: false,
+            new_stage: String::new(),
+            message: api_error_text(&response, &format!("{action} was rejected by the API")),
+        })
+    }
+}
+
+/// Rejects an empty/whitespace reason before any upstream call, mirroring the
+/// API's 400 guard so the user gets immediate, safe feedback.
+#[cfg(any(feature = "ssr", test))]
+fn require_reason(action: &str, reason: &str) -> Result<String, ServerFnError> {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return Err(ServerFnError::new(format!(
+            "A reason is required to {action} this request"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[server(prefix = "/portal/api", endpoint = "request-reject")]
+pub async fn reject_request(
+    request_id: String,
+    reason: String,
+) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_reject_path(&request_id)
+        .map_err(|_| ServerFnError::new("request reject API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request reject API path failed same-origin guard"))?;
+    let reason = require_reason("reject", &reason)?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "rejection");
+    }
+    dispatch_reason_action_live(request_id, "rejection", reason, &path).await
+}
+
+#[server(prefix = "/portal/api", endpoint = "request-cancel")]
+pub async fn cancel_request(
+    request_id: String,
+    reason: String,
+) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_cancel_path(&request_id)
+        .map_err(|_| ServerFnError::new("request cancel API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request cancel API path failed same-origin guard"))?;
+    let reason = require_reason("cancel", &reason)?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "cancellation");
+    }
+    dispatch_reason_action_live(request_id, "cancellation", reason, &path).await
+}
+
+/// Reads the durable who-did-what-when trail for a single request through the
+/// allowlisted `GET /api/requests/{id}/audit` read endpoint (gated server-side
+/// on the `audit` permission). Static mode serves a labeled, clearly
+/// non-durable preview trail; a live API that is unreachable surfaces an
+/// error so the timeline can fall back rather than show stale data.
+#[server(prefix = "/portal/api", endpoint = "request-audit-trail")]
+pub async fn get_request_audit(request_id: String) -> Result<Vec<AuditEventRow>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_audit_path(&request_id)
+        .map_err(|_| ServerFnError::new("request audit API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request audit API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(static_preview_audit_trail(&request_id));
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(&path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let trail: ApiAuditTrail = response
+                .json()
+                .map_err(|_| ServerFnError::new("request audit response was malformed"))?;
+            Ok(trail.into_rows())
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "request audit fetch failed",
+        ))),
+        // Live mode never substitutes the preview trail for an unreachable
+        // API; the timeline renders the synthetic detail fallback instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Labeled, clearly non-durable preview trail for static-dry-run mode. Marks
+/// `durable=false` so the timeline can flag that no row was persisted.
+#[cfg(any(feature = "ssr", test))]
+fn static_preview_audit_trail(request_id: &str) -> Vec<AuditEventRow> {
+    let _ = request_id;
+    vec![AuditEventRow {
+        action: "request.create".to_string(),
+        actor_display: "Platform Engineer (preview)".to_string(),
+        actor_principal: "platform-engineer".to_string(),
+        from_stage: None,
+        to_stage: "intake".to_string(),
+        to_status: "intake".to_string(),
+        occurred_at: "2026-06-13T08:00:00Z".to_string(),
+        reason: None,
+        durable: false,
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,6 +2318,8 @@ mod tests {
             "validation",
             "planning",
             "approval",
+            "rejection",
+            "cancellation",
             "locking",
             "execution",
             "verification",
@@ -2171,6 +2332,31 @@ mod tests {
     }
 
     #[test]
+    fn reason_actions_reject_empty_or_whitespace_reason_before_upstream() {
+        for action in ["reject", "cancel"] {
+            assert!(require_reason(action, "").is_err());
+            assert!(require_reason(action, "   ").is_err());
+            assert!(require_reason(action, "\t\n").is_err());
+            // A real reason is trimmed and accepted.
+            assert_eq!(
+                require_reason(action, "  insufficient capacity  ").unwrap(),
+                "insufficient capacity"
+            );
+        }
+    }
+
+    #[test]
+    fn static_preview_audit_trail_is_labeled_non_durable() {
+        let trail = static_preview_audit_trail("REQ-123");
+        assert!(!trail.is_empty());
+        assert!(
+            trail.iter().all(|row| !row.durable),
+            "preview trail must be flagged non-durable"
+        );
+        assert_eq!(trail[0].action, "request.create");
+    }
+
+    #[test]
     fn boundary_validates_generated_request_lifecycle_paths() {
         let boundary = PortalServerBoundary::static_dry_run();
         let request_id = "REQ-123";
@@ -2180,9 +2366,12 @@ mod tests {
             request_validate_path(request_id),
             request_plan_path(request_id),
             request_approve_path(request_id),
+            request_reject_path(request_id),
+            request_cancel_path(request_id),
             request_lock_path(request_id),
             request_execute_path(request_id),
             request_verify_path(request_id),
+            request_audit_path(request_id),
         ] {
             let path = path.expect("request lifecycle path must build");
             assert_eq!(
@@ -2193,7 +2382,11 @@ mod tests {
 
         for path in [
             "/api/requests/detail",
+            "/api/requests/reject",
+            "/api/requests/cancel",
+            "/api/requests/audit",
             "/api/requests/REQ-123/validate/extra",
+            "/api/requests/REQ-123/reject/extra",
             "/api/requests/REQ 123/validate",
             "/api/requests/REQ%2F123/validate",
             "/api/requests/REQ-123?stage=validate",

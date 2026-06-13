@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod audit;
 mod boundary;
 mod config;
 mod config_store;
@@ -496,6 +497,15 @@ const DEFAULT_ROUTE_PERMISSION: &str = "admin";
 ///
 /// - `/api/requests` exactly (POST create)                -> "request"
 /// - `/api/requests/{id}/approve`                          -> "approve"
+/// - `/api/requests/{id}/reject`                           -> "approve"
+///   (reject is an approver act — the inverse of approve — so the central
+///   route gate matches the handler guard)
+/// - `/api/requests/{id}/cancel`                           -> "request"
+///   (coarse requester-tier floor: a cancel can be initiated by the requester
+///   who raised the request, so the central gate must admit `request`-holders;
+///   the finer requester-OWNS-it-or-admin SoD check is enforced in the handler
+///   against `created_by`, which the central table cannot see. An admin passes
+///   via the superuser model.)
 /// - `/api/requests/{id}/{validate|plan|lock|execute|verify}` -> "execute"
 /// - any other `/api/requests/...` mutation                -> "execute"
 ///   (fail-toward-operator; a request-family mutation never falls back to the
@@ -511,6 +521,13 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
     // rest looks like "{id}", "{id}/approve", "{id}/validate", ...
     match rest.rsplit('/').next() {
         Some("approve") => Some("approve"),
+        // reject is an approver decision (the inverse of approve)
+        Some("reject") => Some("approve"),
+        // cancel: requester-tier floor so the requester who raised the request
+        // reaches the handler, where the finer requester-OWNS-it-or-admin SoD
+        // check runs against the row's created_by (the route table cannot
+        // evaluate it). Admin passes via the superuser model.
+        Some("cancel") => Some("request"),
         // every other request-family mutation is operator-tier
         _ => Some("execute"),
     }
@@ -2350,6 +2367,8 @@ mod tests {
         "/api/requests/00000000-0000-0000-0000-000000000000/lock",
         "/api/requests/00000000-0000-0000-0000-000000000000/execute",
         "/api/requests/00000000-0000-0000-0000-000000000000/verify",
+        "/api/requests/00000000-0000-0000-0000-000000000000/reject",
+        "/api/requests/00000000-0000-0000-0000-000000000000/cancel",
         "/api/identity/access-review/r1/start",
         "/api/identity/access-review/r1/approve",
         "/api/identity/access-review/r1/revoke",
@@ -2642,6 +2661,22 @@ mod tests {
             ),
             "execute"
         );
+        // reject routes to the approver gate; cancel to the requester floor
+        // (the handler enforces requester-owns-it-or-admin SoD against the row)
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/requests/00000000-0000-0000-0000-000000000000/reject"
+            ),
+            "approve"
+        );
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/requests/00000000-0000-0000-0000-000000000000/cancel"
+            ),
+            "request"
+        );
         // /api/admin family is admin-only
         assert_eq!(
             route_permission_for(&Method::PUT, "/api/admin/platform-settings"),
@@ -2680,6 +2715,17 @@ mod tests {
         assert_eq!(
             requests_route_permission("/api/requests/abc/approve"),
             Some("approve")
+        );
+        // reject is an approver act — same gate as approve
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/reject"),
+            Some("approve")
+        );
+        // cancel is a requester-tier floor (handler enforces requester-owns-it
+        // -or-admin SoD against the row)
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/cancel"),
+            Some("request")
         );
         // GET /api/requests/{id} would also resolve here, but the gate only runs
         // for unsafe methods; a request-family mutation never falls back to the
