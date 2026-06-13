@@ -43,7 +43,7 @@ fn action_requires_reason(action: &str) -> bool {
     matches!(action, "reject" | "cancel")
 }
 
-fn status_badge_class(status: &str) -> &'static str {
+pub(crate) fn status_badge_class(status: &str) -> &'static str {
     match status {
         "intake" => "badge neutral",
         "validated" => "badge good",
@@ -51,6 +51,7 @@ fn status_badge_class(status: &str) -> &'static str {
         "executed" => "badge good",
         "failed" => "badge bad",
         "rejected" | "cancelled" => "badge bad",
+        "executing" | "verifying" => "badge warn",
         _ => "badge neutral",
     }
 }

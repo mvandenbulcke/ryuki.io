@@ -2831,6 +2831,32 @@ mod tests {
         }
     }
 
+    /// Covers the "cancel" → "cancelled" mapping and the pass-through cases for
+    /// already-normalized and terminal vocabulary values.  The function must be
+    /// idempotent for any value that is already in portal vocabulary.
+    #[test]
+    fn normalize_api_stage_covers_cancel_and_pass_through_inputs() {
+        // cancel is an action-name that must map to the portal vocabulary.
+        assert_eq!(normalize_api_stage("cancel"), "cancelled");
+
+        // Already-normalized portal vocabulary must pass through unchanged.
+        for stage in [
+            "intake",
+            "completed",
+            "rejected",
+            "cancelled",
+            "planned",
+            "approved",
+            "locked",
+        ] {
+            assert_eq!(
+                normalize_api_stage(stage),
+                stage,
+                "normalize_api_stage({stage:?}) must pass through as-is"
+            );
+        }
+    }
+
     #[test]
     fn platform_summary_context_decodes_nested_camel_case_payload() {
         // GET /api/platform/summary shape (nested localAuthorization block).

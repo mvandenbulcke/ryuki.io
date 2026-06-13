@@ -23,7 +23,7 @@ fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
 }
 
-fn status_badge_class(status: &str) -> &'static str {
+pub(crate) fn status_badge_class(status: &str) -> &'static str {
     match status {
         "intake" => "badge neutral",
         "validated" => "badge good",
@@ -31,6 +31,7 @@ fn status_badge_class(status: &str) -> &'static str {
         "executed" => "badge good",
         "failed" => "badge bad",
         "rejected" | "cancelled" => "badge bad",
+        "executing" | "verifying" => "badge warn",
         _ => "badge neutral",
     }
 }
