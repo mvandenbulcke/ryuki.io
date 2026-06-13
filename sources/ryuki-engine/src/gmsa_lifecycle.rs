@@ -328,6 +328,18 @@ pub fn seed_examples() -> Vec<GMSAAccount> {
 mod tests {
     use super::*;
 
+    /// Tests below mutate the shared `svc-webappool-gblon` account in the
+    /// process-global GMSA_STORE; without serialization their interleaving
+    /// is racy under the parallel test runner (observed as a CI-only flake).
+    /// Poisoning is tolerated so one failing test cannot cascade.
+    static SHARED_ACCOUNT_GUARD: Mutex<()> = Mutex::new(());
+
+    fn lock_shared_account() -> std::sync::MutexGuard<'static, ()> {
+        SHARED_ACCOUNT_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn test_create_gmsa_succeeds() {
         let account = create_gmsa(
@@ -383,6 +395,7 @@ mod tests {
 
     #[test]
     fn test_assign_to_host_succeeds() {
+        let _guard = lock_shared_account();
         let result = assign_to_host("svc-webappool-gblon", "new-host.corp.local");
         assert!(result.is_ok());
         let account = result.unwrap();
@@ -395,6 +408,7 @@ mod tests {
 
     #[test]
     fn test_assign_to_host_revoked_fails() {
+        let _guard = lock_shared_account();
         let mut store = GMSA_STORE.lock().unwrap();
         if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-gblon") {
             account.status = GMSAStatus::Revoked;
@@ -412,6 +426,7 @@ mod tests {
 
     #[test]
     fn test_remove_from_host_succeeds() {
+        let _guard = lock_shared_account();
         let result = remove_from_host("svc-webappool-gblon", "webapp01.corp.local");
         assert!(result.is_ok());
         let account = result.unwrap();
@@ -426,6 +441,7 @@ mod tests {
 
     #[test]
     fn test_rotate_password_succeeds() {
+        let _guard = lock_shared_account();
         let result = rotate_password("svc-webappool-gblon");
         assert!(result.is_ok());
         let account = result.unwrap();
