@@ -97,7 +97,10 @@ pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
     Ok(())
 }
 
-fn should_redact(key: &str, value: &str) -> bool {
+/// Whether an evidence/audit field should be redacted, by key name or by a
+/// secret-bearing value pattern. Pure and pattern-only (no I/O); shared with the
+/// API's audit-read redaction so the two stay consistent.
+pub fn should_redact(key: &str, value: &str) -> bool {
     let key_lower = key.to_lowercase();
     let value_lower = value.to_lowercase();
 

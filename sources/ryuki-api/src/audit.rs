@@ -58,9 +58,39 @@ impl AuditEntry {
             "to_stage": self.to_stage,
             "from_status": self.from_status,
             "to_status": self.to_status,
-            "detail": self.detail,
+            "detail": redact_detail(&self.detail),
             "outcome": self.outcome,
         })
+    }
+}
+
+/// Redacts secret-bearing values in an audit `detail` JSON before it is served.
+/// The stored trail is append-only and keeps the real verbatim attribution, but
+/// every READ path (`/api/requests/{id}/audit`, `/api/activity/audit`, and the
+/// evidence pack that embeds the trail) must never surface a secret a user typed
+/// into free-text — e.g. a credential pasted into a reject/cancel reason. Reuses
+/// the engine's pure pattern logic so this stays consistent with the evidence
+/// pipeline's redaction.
+fn redact_detail(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                match child {
+                    Value::String(text)
+                        if ryuki_engine::evidence_pipeline::should_redact(key, text) =>
+                    {
+                        redacted.insert(key.clone(), Value::String("***REDACTED***".to_string()));
+                    }
+                    other => {
+                        redacted.insert(key.clone(), redact_detail(other));
+                    }
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_detail).collect()),
+        other => other.clone(),
     }
 }
 
@@ -323,8 +353,54 @@ impl AuditLogRow {
             "to_stage": self.to_stage,
             "from_status": self.from_status,
             "to_status": self.to_status,
-            "detail": detail,
+            "detail": redact_detail(&detail),
             "outcome": self.outcome,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_detail_scrubs_secret_bearing_values() {
+        let detail = json!({
+            "reason": "rotate password: hunter2 before lock",
+            "note": "ordinary handover text",
+            "nested": {"api_key": "abc123", "ok": "fine"},
+        });
+        let redacted = redact_detail(&detail);
+        // Value pattern (`password:`) redacts a free-text reason.
+        assert_eq!(redacted["reason"], "***REDACTED***");
+        // Ordinary text is preserved verbatim.
+        assert_eq!(redacted["note"], "ordinary handover text");
+        // Key-name match (`api_key` contains `key`) redacts regardless of value,
+        // recursing into nested objects; sibling non-secret values are kept.
+        assert_eq!(redacted["nested"]["api_key"], "***REDACTED***");
+        assert_eq!(redacted["nested"]["ok"], "fine");
+    }
+
+    #[test]
+    fn audit_entry_to_json_redacts_detail_reason() {
+        let entry = AuditEntry {
+            occurred_at: "t".into(),
+            request_id: Some("r".into()),
+            actor_principal: "approver".into(),
+            actor_display: "Approver".into(),
+            actor_roles: vec!["DatacenterApprover".into()],
+            provider_mode: "local".into(),
+            action: "request.reject".into(),
+            from_stage: Some("plan".into()),
+            to_stage: "approve".into(),
+            from_status: Some("planned".into()),
+            to_status: "rejected".into(),
+            detail: json!({"reason": "blocked — secret: topsecret leaked"}),
+            outcome: "applied".into(),
+        };
+        let value = entry.to_json();
+        assert_eq!(value["detail"]["reason"], "***REDACTED***");
+        // Non-detail attribution is untouched.
+        assert_eq!(value["actor_display"], "Approver");
     }
 }
