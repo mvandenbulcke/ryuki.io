@@ -1306,12 +1306,36 @@ pub async fn get_admin_rbac_roles() -> Result<Vec<RbacRoleSummary>, ServerFnErro
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings")]
 pub async fn get_admin_platform_settings() -> Result<PlatformSettingsSummary, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(admin_platform_settings_path())
         .map_err(|_| {
             ServerFnError::new("admin platform settings API path failed same-origin guard")
         })?;
-    Ok(platform_settings_summary_fallback())
+    let upstream = upstream_context();
+    // Static-dry-run mode serves the labeled fallback; live mode reads the REAL
+    // durable platform_config so the admin sees the actual auth mode, database,
+    // and Entra wiring — never the static "mock-dry-run" placeholder.
+    if !upstream.live() {
+        return Ok(platform_settings_summary_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            // The API returns the full PlatformConfig; the summary is a subset
+            // of its fields (extra fields are ignored by serde).
+            let summary: PlatformSettingsSummary = response.json().map_err(|_| {
+                ServerFnError::new("admin platform settings response was malformed")
+            })?;
+            Ok(summary)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "admin platform settings fetch failed",
+        ))),
+        // Live mode surfaces an unreachable API as an error; the view renders a
+        // labeled fallback rather than masking it as real durable config.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 #[cfg(any(feature = "ssr", test))]
