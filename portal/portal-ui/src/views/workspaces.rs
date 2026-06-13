@@ -15,10 +15,11 @@ use crate::api_client::{
 };
 use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, auth_session_fallback,
-    catalog_contract_fallbacks, catalog_readiness_fallbacks, normalize_api_stage,
-    operation_run_fallbacks, platform_settings_summary_fallback, rbac_role_summary_fallbacks,
-    request_intake_form_fallback, AdminSessionSummary, AdminTokenSummary, AuditEventRow,
-    AuthSession, CreateTokenPayload, PlatformSettingsSummary, ALL_APP_ROLES,
+    catalog_contract_fallbacks, catalog_readiness_fallbacks, condense_timestamp,
+    normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
+    rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
+    AdminTokenSummary, AuditEventRow, AuthSession, CreateTokenPayload, PlatformSettingsSummary,
+    ALL_APP_ROLES,
 };
 use crate::server_boundary::{
     create_admin_token, get_activity_audit_feed, get_admin_platform_settings, get_auth_session,
@@ -500,19 +501,6 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
     }
 }
 
-/// Condenses an RFC3339 timestamp (`2026-06-13T12:05:12.6+00:00`) to a compact
-/// `YYYY-MM-DD HH:MM` for the timeline. Honest: it only trims, never reformats
-/// into a different timezone.
-fn format_audit_timestamp(raw: &str) -> String {
-    match raw.split_once('T') {
-        Some((date, time)) => {
-            let hm: String = time.chars().take(5).collect();
-            format!("{date} {hm}")
-        }
-        None => raw.to_string(),
-    }
-}
-
 /// Renders one row of the governance audit feed: action, actor, roles,
 /// stage transition, outcome, reason, and a deep link to the request.
 fn activity_feed_row(row: AuditEventRow) -> impl IntoView {
@@ -543,7 +531,7 @@ fn activity_feed_row(row: AuditEventRow) -> impl IntoView {
         ),
         None => stage_label(&normalize_api_stage(&row.to_stage)).to_string(),
     };
-    let timestamp = format_audit_timestamp(&row.occurred_at);
+    let timestamp = condense_timestamp(&row.occurred_at);
     let reason = row.reason.clone();
     let roles = row.actor_roles.clone();
     // Only surface a non-default outcome (a denial is the one that matters).

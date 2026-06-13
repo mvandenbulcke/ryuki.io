@@ -1,5 +1,5 @@
 use crate::api::{platform_summary_path, request_detail_path};
-use crate::models::{AuthSession, EvidencePackExport};
+use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
     approve_request, cancel_request, execute_request, get_request_audit, get_request_detail,
     get_request_evidence, lock_request, plan_request, reject_request, validate_request,
@@ -731,7 +731,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 <span class="badge neutral">{stage_text}</span>
                                                                 <strong>{event.stage.clone()}</strong>
                                                                 <p>{event.description.clone()}</p>
-                                                                <span class="table-note">{event.timestamp.clone()}</span>
+                                                                <span class="table-note">{condense_timestamp(&event.timestamp)}</span>
                                                             </div>
                                                         }
                                                     })
@@ -802,7 +802,7 @@ pub fn RequestDetail() -> impl IntoView {
                                                                             </p>
                                                                         }
                                                                     })}
-                                                                <span class="table-note">{row.occurred_at.clone()}</span>
+                                                                <span class="table-note">{condense_timestamp(&row.occurred_at)}</span>
                                                             </div>
                                                         }
                                                     })

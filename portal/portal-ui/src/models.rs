@@ -1288,6 +1288,20 @@ pub fn flatten_payload_fields(payload: &serde_json::Value) -> Vec<KeyValue> {
 
 /// Humanizes a payload key for display: `requested_offering` -> "Requested
 /// offering", `dryRunPlan` -> "Dry run plan".
+/// Condenses an RFC3339 timestamp (`2026-06-13T14:57:20.6+00:00`) to a compact
+/// `YYYY-MM-DD HH:MM` for display. Shared across the dashboard, request list,
+/// activity feed, and audit trail so every timestamp reads the same and a raw
+/// fractional-second value never overruns its cell. Honest: it only trims.
+pub fn condense_timestamp(raw: &str) -> String {
+    match raw.split_once('T') {
+        Some((date, time)) => {
+            let hm: String = time.chars().take(5).collect();
+            format!("{date} {hm}")
+        }
+        None => raw.to_string(),
+    }
+}
+
 fn humanize_field_key(key: &str) -> String {
     let spaced = key
         .chars()

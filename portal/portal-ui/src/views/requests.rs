@@ -1,23 +1,10 @@
 use crate::api::{platform_summary_path, request_list_path, same_origin_api_path};
-use crate::models::{AuthSession, RequestSummary};
+use crate::models::{condense_timestamp, AuthSession, RequestSummary};
 use crate::server_boundary::get_request_list;
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
-
-/// Condenses an RFC3339 timestamp (`2026-06-13T14:57:20.6+00:00`) to a compact
-/// `YYYY-MM-DD HH:MM` for the table cell — matching the Activity feed's format,
-/// so the raw fractional-second timestamp no longer overruns the column.
-fn format_created(raw: &str) -> String {
-    match raw.split_once('T') {
-        Some((date, time)) => {
-            let hm: String = time.chars().take(5).collect();
-            format!("{date} {hm}")
-        }
-        None => raw.to_string(),
-    }
-}
 
 /// Zero-capability session used when no `AuthSession` is in context. An absent
 /// context must HIDE capability-gated controls, never reveal them — so this is
@@ -191,7 +178,7 @@ pub fn RequestList() -> impl IntoView {
                                                         <td>{req.environment}</td>
                                                         <td><span class=badge_class>{status_text}</span></td>
                                                         <td><span class="badge neutral">{stage_text}</span></td>
-                                                        <td class="cell-date">{format_created(&req.created)}</td>
+                                                        <td class="cell-date">{condense_timestamp(&req.created)}</td>
                                                     </tr>
                                                 }
                                             })

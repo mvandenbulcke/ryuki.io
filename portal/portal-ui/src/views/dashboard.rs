@@ -10,7 +10,7 @@ use crate::api_client::{
 };
 use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, catalog_contract_fallbacks,
-    catalog_readiness_fallbacks, policy_outcome_fallbacks,
+    catalog_readiness_fallbacks, condense_timestamp, policy_outcome_fallbacks,
 };
 use crate::server_boundary::{
     get_auth_session, get_boundary_status, get_platform_health, get_platform_status,
@@ -675,7 +675,7 @@ fn PlatformStatusSection() -> impl IntoView {
                         .unwrap_or_else(|_| vec![]);
                     let timestamp = health_result
                         .as_ref()
-                        .map(|h| h.timestamp.clone())
+                        .map(|h| condense_timestamp(&h.timestamp))
                         .unwrap_or_else(|_| "unknown".to_string());
 
                     view! {
@@ -741,7 +741,7 @@ fn PlatformStatusSection() -> impl IntoView {
                                                     <span class=check_badge_class>{check.status}</span>
                                                     <strong>{check.name}</strong>
                                                     <p>{check.message}</p>
-                                                    <span class="table-note">{check.component} " / " {check.last_check}</span>
+                                                    <span class="table-note">{check.component} " / " {condense_timestamp(&check.last_check)}</span>
                                                 </div>
                                             }
                                         })
