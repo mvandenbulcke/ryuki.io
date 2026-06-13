@@ -607,12 +607,28 @@ fn read_permission_for(path: &str) -> &'static str {
     }
 }
 
-/// Whether `session` may read `path`. Sensitive prefixes require `admin`;
-/// ordinary reads accept any standard read permission — `audit`
+/// Audit-trail reads carry identity-grade who-did-what-when data and require
+/// the `audit` tier SPECIFICALLY — never the ordinary `request` tier. Matching
+/// the central gate to the handler's own `check_permission(audit)` closes the
+/// defense-in-depth gap where a `request`-only Requester passed the route gate
+/// (and was only stopped by the handler). Covers the global activity feed and
+/// every per-request `/api/requests/{id}/audit` trail; the plain request detail
+/// (`/api/requests/{id}`, no `/audit` suffix) stays `request`-readable.
+fn is_audit_read_path(path: &str) -> bool {
+    path == "/api/activity/audit"
+        || (path.starts_with("/api/requests/") && path.ends_with("/audit"))
+}
+
+/// Whether `session` may read `path`. Sensitive prefixes require `admin`; audit
+/// trails require the `audit` tier specifically; all other ordinary reads
+/// accept any standard read permission — `audit`
 /// (Auditor/operators/approver/service-desk) OR `request`
 /// (Requester/service-desk) — so a Requester can view their own requests.
 /// `admin` satisfies everything via the check_permission superuser rule.
 fn read_authorized(session: &AuthSession, path: &str) -> bool {
+    if is_audit_read_path(path) {
+        return ryuki_engine::auth::check_permission(session, "audit");
+    }
     match read_permission_for(path) {
         "admin" => ryuki_engine::auth::check_permission(session, "admin"),
         _ => {
@@ -2934,6 +2950,7 @@ mod tests {
         "/api/requests",
         "/api/requests/00000000-0000-0000-0000-000000000000",
         "/api/requests/00000000-0000-0000-0000-000000000000/audit",
+        "/api/activity/audit",
         "/api/catalog/categories",
         "/api/identity/shares",
         "/api/audit/compliance/summary",
@@ -3052,8 +3069,8 @@ mod tests {
             );
 
             // A logged-in Auditor is admitted (token_valid) and passes ordinary
-            // reads but is refused sensitive ones — asserted via the same
-            // read_authorized helper the gate uses.
+            // AND audit-trail reads (holds `audit`) but is refused sensitive
+            // ones — asserted via the same read_authorized helper the gate uses.
             assert!(read_admitted(&auditor));
             if required == "admin" {
                 assert!(
@@ -3063,12 +3080,13 @@ mod tests {
             } else {
                 assert!(
                     read_authorized(&auditor, path),
-                    "auditor must pass ordinary GET {path}"
+                    "auditor must pass ordinary/audit GET {path}"
                 );
             }
 
-            // A Requester (holds only `request`) must be able to read ordinary
-            // GETs (e.g. view their own requests) but never sensitive ones.
+            // A Requester (holds only `request`) reads ordinary GETs (e.g. view
+            // their own requests) but never sensitive ones — and never the
+            // identity-grade audit trails, which require the `audit` tier.
             let requester = AuthSession {
                 user_id: "req-1".into(),
                 display_name: "Requester One".into(),
@@ -3076,10 +3094,10 @@ mod tests {
                 token_valid: true,
                 provider_mode: "persisted-session".into(),
             };
-            if required == "admin" {
+            if required == "admin" || is_audit_read_path(path) {
                 assert!(
                     !read_authorized(&requester, path),
-                    "requester must be refused sensitive GET {path}"
+                    "requester must be refused sensitive/audit GET {path}"
                 );
             } else {
                 assert!(
@@ -3088,6 +3106,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The audit trails (global activity feed + per-request `/audit`) require the
+    /// `audit` tier at the CENTRAL gate, matching the handler's own check — a
+    /// `request`-only Requester is refused at the gate, not merely the handler.
+    /// The plain request detail (no `/audit` suffix) stays `request`-readable.
+    #[test]
+    fn test_audit_read_paths_require_audit_tier() {
+        assert!(is_audit_read_path("/api/activity/audit"));
+        assert!(is_audit_read_path(
+            "/api/requests/00000000-0000-0000-0000-000000000000/audit"
+        ));
+        assert!(!is_audit_read_path(
+            "/api/requests/00000000-0000-0000-0000-000000000000"
+        ));
+        assert!(!is_audit_read_path("/api/requests"));
+        assert!(!is_audit_read_path("/api/activity"));
+
+        let auditor = auditor_session();
+        let requester = AuthSession {
+            user_id: "req-1".into(),
+            display_name: "Requester One".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+        };
+        for path in [
+            "/api/activity/audit",
+            "/api/requests/00000000-0000-0000-0000-000000000000/audit",
+        ] {
+            assert!(read_authorized(&auditor, path), "auditor reads {path}");
+            assert!(
+                !read_authorized(&requester, path),
+                "requester (no audit tier) refused {path} at the central gate"
+            );
+        }
+        // Plain detail stays request-readable so requesters see their own work.
+        assert!(read_authorized(
+            &requester,
+            "/api/requests/00000000-0000-0000-0000-000000000000"
+        ));
     }
 
     /// B3 (a): a credential-less GET to each sensitive path is refused — 401 at

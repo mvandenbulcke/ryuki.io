@@ -18,6 +18,8 @@ const CATALOG_REQUEST_FORM_PATH: &str = "/api/catalog/request-form-contract";
 const SITE_CATALOG_PATH: &str = "/api/catalog/site-catalog-contract";
 const APPROVAL_DECISION_READINESS_PATH: &str = "/api/approvals/decision-readiness-contract";
 const ACTIVITY_OPERATION_QUEUE_PATH: &str = "/api/operations/activity-queue-contract";
+/// Global, newest-first governance audit feed across all requests.
+const ACTIVITY_AUDIT_FEED_PATH: &str = "/api/activity/audit";
 const SHIFT_QUEUE_PATH: &str = "/api/operations/shift-queue-contract";
 const EMERGENCY_CHANGE_PATH: &str = "/api/operations/emergency-change-contract";
 const CMDB_FILE_EXCHANGE_PATH: &str = "/api/integrations/servicenow/cmdb-file-contract";
@@ -159,6 +161,10 @@ pub fn approval_decision_readiness_path() -> &'static str {
 
 pub fn activity_operation_queue_path() -> &'static str {
     ACTIVITY_OPERATION_QUEUE_PATH
+}
+
+pub fn activity_audit_feed_path() -> &'static str {
+    ACTIVITY_AUDIT_FEED_PATH
 }
 
 pub fn shift_queue_path() -> &'static str {

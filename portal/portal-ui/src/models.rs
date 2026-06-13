@@ -1453,6 +1453,17 @@ pub struct AuditEventRow {
     pub reason: Option<String>,
     #[serde(default = "default_durable")]
     pub durable: bool,
+    /// Which request this row belongs to. Empty for the per-request trail
+    /// (the request is already in context); carried by the global activity
+    /// feed so each row can deep-link to `/requests/:id`.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// The verified roles the actor held at the time of the action.
+    #[serde(default)]
+    pub actor_roles: Vec<String>,
+    /// The recorded outcome (`applied`, `denied`, …); shown by the global feed.
+    #[serde(default)]
+    pub outcome: Option<String>,
 }
 
 /// Audit rows are durable (DB-backed) unless the read endpoint explicitly
@@ -1462,17 +1473,18 @@ fn default_durable() -> bool {
     true
 }
 
-/// Mirrors the `GET /api/requests/{id}/audit` envelope. The API may either
-/// return a bare array of rows or an object with `{durable, source, events}`;
-/// both decode through this enum so the portal tolerates either shape.
+/// Mirrors the audit envelope served by both `GET /api/requests/{id}/audit`
+/// and `GET /api/activity/audit`. The API serializes the rows under the
+/// `entries` key; the `events` alias keeps older fixtures and any bare-array
+/// shape decoding too, so the portal tolerates either shape.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ApiAuditTrail {
     Enveloped {
         #[serde(default = "default_durable")]
         durable: bool,
-        #[serde(default)]
-        events: Vec<ApiAuditEventRow>,
+        #[serde(default, alias = "events")]
+        entries: Vec<ApiAuditEventRow>,
     },
     Bare(Vec<ApiAuditEventRow>),
 }
@@ -1482,11 +1494,11 @@ impl ApiAuditTrail {
     /// envelope-level `durable` flag onto each row when present.
     pub fn into_rows(self) -> Vec<AuditEventRow> {
         match self {
-            ApiAuditTrail::Enveloped { durable, events } => events
+            ApiAuditTrail::Enveloped { durable, entries } => entries
                 .into_iter()
                 .map(|row| row.into_audit_event(durable))
                 .collect(),
-            ApiAuditTrail::Bare(events) => events
+            ApiAuditTrail::Bare(entries) => entries
                 .into_iter()
                 .map(|row| row.into_audit_event(true))
                 .collect(),
@@ -1505,12 +1517,18 @@ pub struct ApiAuditEventRow {
     #[serde(default)]
     pub actor_principal: String,
     #[serde(default)]
+    pub actor_roles: Vec<String>,
+    #[serde(default)]
     pub from_stage: Option<String>,
     #[serde(default)]
     pub to_stage: String,
     #[serde(default)]
     pub to_status: String,
     pub occurred_at: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
     #[serde(default)]
     pub detail: serde_json::Value,
 }
@@ -1535,6 +1553,9 @@ impl ApiAuditEventRow {
             occurred_at: self.occurred_at,
             reason,
             durable,
+            request_id: self.request_id.filter(|id| !id.is_empty()),
+            actor_roles: self.actor_roles,
+            outcome: self.outcome.filter(|outcome| !outcome.is_empty()),
         }
     }
 }
@@ -2455,6 +2476,25 @@ mod tests {
         assert!(rows[0].durable);
         assert_eq!(rows[0].reason, None);
         assert_eq!(rows[0].actor_display, "");
+    }
+
+    #[test]
+    fn api_audit_trail_decodes_real_entries_key_and_global_fields() {
+        // REGRESSION: the API serializes the rows under `entries` (not the
+        // legacy `events`); decoding the real envelope used to silently yield
+        // an empty trail. It must now flatten the rows AND carry the global
+        // activity-feed fields (request_id, actor_roles, outcome) so each row
+        // can deep-link and show who acted under which roles.
+        let real = r#"{"durable":true,"source":"database","limit":50,"offset":0,"total":1,"entries":[{"action":"request.lock","actor_display":"Approver DB","actor_principal":"approver-db","actor_roles":["DatacenterApprover"],"from_stage":"approve","to_stage":"lock","to_status":"locked","occurred_at":"t","request_id":"req-7","outcome":"applied","detail":{}}]}"#;
+        let trail: ApiAuditTrail =
+            serde_json::from_str(real).expect("decode real entries envelope");
+        let rows = trail.into_rows();
+        assert_eq!(rows.len(), 1, "entries key must flatten, not yield empty");
+        assert!(rows[0].durable);
+        assert_eq!(rows[0].action, "request.lock");
+        assert_eq!(rows[0].request_id.as_deref(), Some("req-7"));
+        assert_eq!(rows[0].actor_roles, vec!["DatacenterApprover".to_string()]);
+        assert_eq!(rows[0].outcome.as_deref(), Some("applied"));
     }
 
     #[test]

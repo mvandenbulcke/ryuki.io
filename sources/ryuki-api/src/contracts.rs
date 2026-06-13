@@ -120,6 +120,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route("/api/requests/{id}/audit", get(requests_audit))
+        .route("/api/activity/audit", get(activity_audit_feed))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -9095,6 +9096,25 @@ async fn requests_audit(
     ))
 }
 
+/// GET /api/activity/audit — the global, newest-first, actor-attributed audit
+/// feed across all requests. Same audit-tier gate as the per-request trail:
+/// who-acted-when is sensitive identity data. Static/mock sessions carry
+/// PlatformAdmin (audit via the admin superuser), so the demo is unaffected.
+async fn activity_audit_feed(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<PaginationParams>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read the activity audit feed"})),
+        ));
+    }
+    let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
+    let offset = params.offset.unwrap_or(0) as i64;
+    Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 async fn vm_day2_plan(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
@@ -14381,6 +14401,71 @@ mod unit_tests {
                 .is_ok(),
             "an auditor must be allowed to read the audit trail"
         );
+    }
+
+    /// The global activity feed is the same sensitive identity data as the
+    /// per-request trail and carries the same audit-tier gate. A no-roles
+    /// session is refused; an Auditor (audit permission) is allowed.
+    #[tokio::test]
+    async fn activity_audit_feed_requires_audit_permission() {
+        let no_roles = AuthSession {
+            user_id: "anon".to_string(),
+            display_name: "No roles".to_string(),
+            roles: vec![],
+            token_valid: false,
+            provider_mode: "local-unauthenticated".to_string(),
+        };
+        let Err((status, Json(body))) = activity_audit_feed(
+            AuthExtractor(no_roles),
+            Query(PaginationParams {
+                limit: None,
+                offset: None,
+            }),
+        )
+        .await
+        else {
+            panic!("a session without audit access must be refused the activity feed");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body["error"].as_str().unwrap_or_default().contains("Audit"),
+            "denial body should name the audit-tier requirement"
+        );
+
+        let auditor = single_role_session("aud-2", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        assert!(
+            activity_audit_feed(
+                AuthExtractor(auditor),
+                Query(PaginationParams {
+                    limit: None,
+                    offset: None,
+                }),
+            )
+            .await
+            .is_ok(),
+            "an auditor must be allowed to read the activity audit feed"
+        );
+    }
+
+    /// Pagination limits are clamped by the handler before reaching the store:
+    /// an over-large requested limit is capped at 200, and the envelope shape
+    /// (durable flag + entries array) is always returned even when the no-DB
+    /// store is empty in test mode.
+    #[tokio::test]
+    async fn activity_audit_feed_clamps_pagination() {
+        let auditor = single_role_session("aud-3", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let Json(trail) = activity_audit_feed(
+            AuthExtractor(auditor),
+            Query(PaginationParams {
+                limit: Some(9999),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .expect("activity feed read");
+        assert!(trail.get("durable").is_some());
+        assert!(trail["entries"].is_array());
+        assert_eq!(trail["limit"], 200);
     }
 
     /// B5: a structural assertion of the precedence rule without a live DB.

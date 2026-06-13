@@ -233,6 +233,58 @@ pub async fn audit_trail_for_request(pool: Option<&PgPool>, request_id: &str) ->
     })
 }
 
+/// Read the global, newest-first audit feed across all requests. DB-backed
+/// when available (durable: true); otherwise serves the process-local store
+/// (durable: false). `limit` is clamped by the caller. Returns the same entry
+/// shape as `audit_trail_for_request` plus pagination + total metadata.
+pub async fn audit_feed(pool: Option<&PgPool>, limit: i64, offset: i64) -> Value {
+    if let Some(pool) = pool {
+        let rows = sqlx::query_as::<_, AuditLogRow>(
+            "SELECT id, occurred_at, request_id, actor_principal, actor_display, actor_roles, \
+                    provider_mode, action, from_stage, to_stage, from_status, to_status, \
+                    detail::text AS detail, outcome \
+             FROM audit_log ORDER BY occurred_at DESC, id DESC LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+        let entries: Vec<Value> = rows.iter().map(AuditLogRow::to_json).collect();
+        return json!({
+            "durable": true,
+            "source": "database",
+            "limit": limit,
+            "offset": offset,
+            "total": total,
+            "entries": entries,
+        });
+    }
+
+    // No-DB / dry-run mode: serve the process-local store newest-first.
+    let store = audit_store().lock().await;
+    let total = store.len();
+    let entries: Vec<Value> = store
+        .iter()
+        .rev()
+        .skip(offset.max(0) as usize)
+        .take(limit.max(0) as usize)
+        .map(AuditEntry::to_json)
+        .collect();
+    json!({
+        "durable": false,
+        "source": "dry-run",
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "entries": entries,
+    })
+}
+
 #[derive(sqlx::FromRow)]
 struct AuditLogRow {
     id: i64,

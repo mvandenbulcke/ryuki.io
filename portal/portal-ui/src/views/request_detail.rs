@@ -54,7 +54,7 @@ fn status_badge_class(status: &str) -> &'static str {
     }
 }
 
-fn stage_label(stage: &str) -> &'static str {
+pub(crate) fn stage_label(stage: &str) -> &'static str {
     match stage {
         "intake" => "Intake",
         "validated" => "Validated",
@@ -111,7 +111,7 @@ fn action_button_class(action: &str) -> &'static str {
 }
 
 /// Human-readable label for an audit action key (`request.reject`, etc.).
-fn audit_action_label(action: &str) -> &'static str {
+pub(crate) fn audit_action_label(action: &str) -> &'static str {
     match action {
         "request.create" => "Created",
         "request.validate" => "Validated",

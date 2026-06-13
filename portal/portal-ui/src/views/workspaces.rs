@@ -15,15 +15,15 @@ use crate::api_client::{
 };
 use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, auth_session_fallback,
-    catalog_contract_fallbacks, catalog_readiness_fallbacks, operation_run_fallbacks,
-    platform_settings_summary_fallback, rbac_role_summary_fallbacks, request_intake_form_fallback,
-    AdminSessionSummary, AdminTokenSummary, AuthSession, CreateTokenPayload,
-    PlatformSettingsSummary, ALL_APP_ROLES,
+    catalog_contract_fallbacks, catalog_readiness_fallbacks, normalize_api_stage,
+    operation_run_fallbacks, platform_settings_summary_fallback, rbac_role_summary_fallbacks,
+    request_intake_form_fallback, AdminSessionSummary, AdminTokenSummary, AuditEventRow,
+    AuthSession, CreateTokenPayload, PlatformSettingsSummary, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
-    create_admin_token, get_admin_platform_settings, get_auth_session, get_boundary_status,
-    get_platform_health, get_platform_status, load_admin_sessions, load_admin_tokens,
-    load_portal_activity_run_state, load_portal_evidence_summary_status,
+    create_admin_token, get_activity_audit_feed, get_admin_platform_settings, get_auth_session,
+    get_boundary_status, get_platform_health, get_platform_status, load_admin_sessions,
+    load_admin_tokens, load_portal_activity_run_state, load_portal_evidence_summary_status,
     load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
     revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
     PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
@@ -33,6 +33,7 @@ use crate::server_boundary::{
 use crate::views::dashboard::DashboardView;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
+use crate::views::request_detail::{audit_action_label, stage_label};
 use crate::views::requests::RequestList;
 use crate::workspace_catalog::{role_satisfies, session_can, PRIMARY_WORKSPACES};
 use leptos::prelude::*;
@@ -192,12 +193,16 @@ pub fn RequestDetailWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/activity` — queue, run-state, and handover summaries.
+/// `/activity` — the durable governance audit feed (who-did-what-when across
+/// every request), plus queue, run-state, and handover summaries.
 #[component]
 pub fn ActivityWorkspaceView() -> impl IntoView {
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="activity"/>
+            <section class="workspace-detail-grid" aria-label="Governance activity feed">
+                <GovernanceActivityFeed/>
+            </section>
             <section class="workspace-detail-grid" aria-label="Activity workspace details">
                 <ActivityWorkspaceDetail/>
             </section>
@@ -482,6 +487,218 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
                 </div>
             </div>
         </article>
+    }
+}
+
+/// Condenses an RFC3339 timestamp (`2026-06-13T12:05:12.6+00:00`) to a compact
+/// `YYYY-MM-DD HH:MM` for the timeline. Honest: it only trims, never reformats
+/// into a different timezone.
+fn format_audit_timestamp(raw: &str) -> String {
+    match raw.split_once('T') {
+        Some((date, time)) => {
+            let hm: String = time.chars().take(5).collect();
+            format!("{date} {hm}")
+        }
+        None => raw.to_string(),
+    }
+}
+
+/// Renders one row of the governance audit feed: action, actor, roles,
+/// stage transition, outcome, reason, and a deep link to the request.
+fn activity_feed_row(row: AuditEventRow) -> impl IntoView {
+    let action_text = audit_action_label(&row.action);
+    let is_negative = matches!(row.action.as_str(), "request.reject" | "request.cancel");
+    let badge_class = if is_negative {
+        "badge bad"
+    } else {
+        "badge neutral"
+    };
+    let item_class = if is_negative {
+        "timeline-item terminal"
+    } else {
+        "timeline-item"
+    };
+    // Prefer the verified display name, falling back to the principal.
+    let actor = if row.actor_display.is_empty() {
+        row.actor_principal.clone()
+    } else {
+        row.actor_display.clone()
+    };
+    let from_stage = row.from_stage.clone().filter(|stage| !stage.is_empty());
+    let transition = match from_stage {
+        Some(from) => format!(
+            "{} → {}",
+            stage_label(&normalize_api_stage(&from)),
+            stage_label(&normalize_api_stage(&row.to_stage)),
+        ),
+        None => stage_label(&normalize_api_stage(&row.to_stage)).to_string(),
+    };
+    let timestamp = format_audit_timestamp(&row.occurred_at);
+    let reason = row.reason.clone();
+    let roles = row.actor_roles.clone();
+    // Only surface a non-default outcome (a denial is the one that matters).
+    let outcome_badge = match row.outcome.as_deref() {
+        Some("applied") | Some("") | None => None,
+        Some(other) => {
+            let class = if other == "denied" {
+                "badge bad"
+            } else {
+                "badge warn"
+            };
+            let label = other.to_string();
+            Some(view! { <span class=class>{label}</span> })
+        }
+    };
+    let request_link = row.request_id.clone().map(|id| {
+        let href = format!("/requests/{id}");
+        view! {
+            <a class="timeline-link" href=href>
+                "View request →"
+            </a>
+        }
+    });
+    let roles_view = (!roles.is_empty()).then(|| {
+        view! {
+            <div class="role-chips" aria-label="Actor roles">
+                {roles
+                    .into_iter()
+                    .map(|role| view! { <span class="role-chip">{role}</span> })
+                    .collect_view()}
+            </div>
+        }
+    });
+
+    view! {
+        <li class=item_class>
+            <div class="timeline-row-head">
+                <span class=badge_class>{action_text}</span>
+                {outcome_badge}
+                <time class="timeline-time">{timestamp}</time>
+            </div>
+            <strong>{actor}</strong>
+            {roles_view}
+            <p>{transition}</p>
+            {reason
+                .map(|reason| {
+                    view! { <p class="timeline-reason">"Reason: " {reason}</p> }
+                })}
+            {request_link}
+        </li>
+    }
+}
+
+/// The durable governance audit feed panel for a successfully-loaded feed.
+fn activity_feed_panel(rows: Vec<AuditEventRow>) -> impl IntoView {
+    let total = rows.len();
+    let any_non_durable = rows.iter().any(|row| !row.durable);
+    let count_label = if total == 1 {
+        "1 recorded action".to_string()
+    } else {
+        format!("{total} recorded actions")
+    };
+    let durable_badge = if any_non_durable {
+        view! { <span class="badge warn">"Preview — not persisted"</span> }.into_any()
+    } else {
+        view! { <span class="badge good">"Durable"</span> }.into_any()
+    };
+    let body = if rows.is_empty() {
+        view! {
+            <div class="empty-state" role="status">
+                <p class="empty-state-title">"No governance activity yet"</p>
+                <p class="table-note">
+                    "Lifecycle actions — create, validate, plan, approve, lock, execute, verify — appear here with their verified actor as requests move through the control plane."
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <ol class="timeline-list activity-feed" aria-label="Governance activity timeline">
+                {rows.into_iter().map(activity_feed_row).collect_view()}
+            </ol>
+        }
+        .into_any()
+    };
+
+    view! {
+        <article class="workspace-detail-panel" aria-labelledby="governance-activity-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Activity"</span>
+                    <h2 id="governance-activity-title">"Governance activity"</h2>
+                </div>
+                {durable_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "The durable, append-only audit trail — every lifecycle action across all requests with its verified actor, roles, and outcome. " {count_label} "."
+            </p>
+            {body}
+        </article>
+    }
+}
+
+/// `/activity` flagship surface — the real `audit_log` feed served by
+/// `GET /api/activity/audit`, newest first. The star of the "governed control
+/// plane": every action with its verified actor. Never shows stale or
+/// fabricated data — an unreachable API renders an explicit degraded state.
+#[component]
+fn GovernanceActivityFeed() -> impl IntoView {
+    let feed = Resource::new(|| (), |_| get_activity_audit_feed());
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="governance-activity-title"
+                    aria-busy="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Activity"</span>
+                            <h2 id="governance-activity-title">"Governance activity"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading…"</span>
+                    </div>
+                    <div class="timeline-list activity-feed" aria-hidden="true">
+                        <div class="timeline-item skeleton"></div>
+                        <div class="timeline-item skeleton"></div>
+                        <div class="timeline-item skeleton"></div>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    match feed.await {
+                        Ok(rows) => activity_feed_panel(rows).into_any(),
+                        Err(_) => {
+                            view! {
+                                <article
+                                    class="workspace-detail-panel"
+                                    aria-labelledby="governance-activity-title"
+                                >
+                                    <div class="workspace-detail-head">
+                                        <div>
+                                            <span class="eyebrow">"Activity"</span>
+                                            <h2 id="governance-activity-title">"Governance activity"</h2>
+                                        </div>
+                                        <span class="badge bad">"Feed unavailable"</span>
+                                    </div>
+                                    <div class="empty-state" role="status">
+                                        <p class="empty-state-title">"Audit feed unavailable"</p>
+                                        <p class="table-note">
+                                            "The platform API is unreachable, so the durable governance trail cannot be shown. No stale or fabricated data is displayed."
+                                        </p>
+                                    </div>
+                                </article>
+                            }
+                                .into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
     }
 }
 

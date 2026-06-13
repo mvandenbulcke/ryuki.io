@@ -1380,6 +1380,120 @@ tbody tr:hover {
   color: var(--text);
 }
 
+/* ── Governance activity feed (/activity) ───────────────────── */
+/* The feed reuses .timeline-list / .timeline-item; the modifier strips the
+   <ol> list affordances and adds the per-row header (action + outcome + time)
+   and the actor role chips. Everything is token-driven so both themes work. */
+.activity-feed {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-detail-lede {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  margin: 0 0 4px;
+}
+
+.timeline-row-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.timeline-time {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.role-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.role-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--pill-border);
+  border-radius: 100px;
+  background: var(--tag-bg);
+  color: var(--tag-text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.timeline-link {
+  justify-self: start;
+  margin-top: 2px;
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+  transition: color var(--transition);
+}
+
+.timeline-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.empty-state {
+  display: grid;
+  gap: 6px;
+  padding: 24px 16px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  text-align: center;
+}
+
+.empty-state-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 0;
+}
+
+/* Loading skeleton rows: token-driven shimmer, honors reduced-motion. */
+.timeline-item.skeleton {
+  min-height: 52px;
+  border-left-color: var(--line);
+  background:
+    linear-gradient(
+      100deg,
+      var(--surface-2) 30%,
+      var(--line) 50%,
+      var(--surface-2) 70%
+    );
+  background-size: 200% 100%;
+  animation: activity-shimmer 1.3s ease-in-out infinite;
+}
+
+@keyframes activity-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .timeline-item.skeleton {
+    animation: none;
+  }
+}
+
 /* ── Request create & forms ─────────────────────────────────── */
 .request-create-panel {
   display: grid;

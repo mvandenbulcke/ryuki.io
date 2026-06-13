@@ -1,5 +1,5 @@
 use crate::api::{
-    activity_operation_queue_path, admin_feature_flag_governance_path,
+    activity_audit_feed_path, activity_operation_queue_path, admin_feature_flag_governance_path,
     admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
     admin_sessions_path, admin_tokens_path, admin_worker_capability_path,
     approval_decision_readiness_path, auth_local_login_path, auth_local_logout_path,
@@ -105,6 +105,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     site_catalog_path,
     approval_decision_readiness_path,
     activity_operation_queue_path,
+    activity_audit_feed_path,
     shift_queue_path,
     emergency_change_path,
     cmdb_file_exchange_path,
@@ -2084,6 +2085,112 @@ pub async fn get_request_audit(request_id: String) -> Result<Vec<AuditEventRow>,
     }
 }
 
+/// Reads the global, newest-first governance audit feed across all requests
+/// through the allowlisted `GET /api/activity/audit` read endpoint (gated
+/// server-side on the `audit` permission). Static mode serves a labeled,
+/// clearly non-durable preview feed; a live API that is unreachable surfaces an
+/// error so the Activity view renders an explicit degraded state rather than
+/// stale data.
+#[server(prefix = "/portal/api", endpoint = "activity-audit-feed")]
+pub async fn get_activity_audit_feed() -> Result<Vec<AuditEventRow>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(activity_audit_feed_path())
+        .map_err(|_| ServerFnError::new("activity audit feed API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(static_preview_activity_feed());
+    }
+    // The feed shows the most recent governance actions; a generous page keeps
+    // the timeline useful without unbounded payloads (the API caps at 200).
+    let fetch_path = format!("{path}?limit=100");
+    let session_id = session_id_from_request().await;
+    match upstream.get(&fetch_path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let feed: ApiAuditTrail = response
+                .json()
+                .map_err(|_| ServerFnError::new("activity audit feed response was malformed"))?;
+            Ok(feed.into_rows())
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "activity audit feed fetch failed",
+        ))),
+        // Live mode never substitutes preview rows for an unreachable API; the
+        // Activity view renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Labeled, clearly non-durable preview feed for static-dry-run mode. Each row
+/// is marked `durable=false` so the Activity timeline can flag that nothing was
+/// persisted, and carries a `request_id` so the deep-links still resolve.
+#[cfg(any(feature = "ssr", test))]
+fn static_preview_activity_feed() -> Vec<AuditEventRow> {
+    #[allow(clippy::too_many_arguments)]
+    fn preview_row(
+        action: &str,
+        actor_display: &str,
+        actor_principal: &str,
+        roles: &[&str],
+        from_stage: Option<&str>,
+        to_stage: &str,
+        to_status: &str,
+        occurred_at: &str,
+        request_id: &str,
+    ) -> AuditEventRow {
+        AuditEventRow {
+            action: action.to_string(),
+            actor_display: actor_display.to_string(),
+            actor_principal: actor_principal.to_string(),
+            from_stage: from_stage.map(str::to_string),
+            to_stage: to_stage.to_string(),
+            to_status: to_status.to_string(),
+            occurred_at: occurred_at.to_string(),
+            reason: None,
+            durable: false,
+            request_id: Some(request_id.to_string()),
+            actor_roles: roles.iter().map(|role| role.to_string()).collect(),
+            outcome: Some("applied".to_string()),
+        }
+    }
+    vec![
+        preview_row(
+            "request.approve",
+            "Datacenter Approver (preview)",
+            "approver",
+            &["DatacenterApprover"],
+            Some("plan"),
+            "approve",
+            "approved",
+            "2026-06-13T08:12:00Z",
+            "PREVIEW-2",
+        ),
+        preview_row(
+            "request.plan",
+            "Platform Engineer (preview)",
+            "platform-engineer",
+            &["VMwareOperator"],
+            Some("validate"),
+            "plan",
+            "planned",
+            "2026-06-13T08:06:00Z",
+            "PREVIEW-2",
+        ),
+        preview_row(
+            "request.create",
+            "Requester (preview)",
+            "requester",
+            &["Requester"],
+            None,
+            "intake",
+            "intake",
+            "2026-06-13T08:00:00Z",
+            "PREVIEW-1",
+        ),
+    ]
+}
+
 /// Labeled, clearly non-durable preview trail for static-dry-run mode. Marks
 /// `durable=false` so the timeline can flag that no row was persisted.
 #[cfg(any(feature = "ssr", test))]
@@ -2099,6 +2206,9 @@ fn static_preview_audit_trail(request_id: &str) -> Vec<AuditEventRow> {
         occurred_at: "2026-06-13T08:00:00Z".to_string(),
         reason: None,
         durable: false,
+        request_id: None,
+        actor_roles: vec![],
+        outcome: None,
     }]
 }
 
