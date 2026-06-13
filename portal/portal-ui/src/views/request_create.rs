@@ -66,6 +66,364 @@ const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
     ("production", "Production"),
 ];
 
+/// The kind of input a per-type field renders as.
+#[derive(Clone, Copy)]
+enum FieldKind {
+    Text,
+    Number,
+    Select,
+    Textarea,
+}
+
+/// One per-type intake field. `key` is the snake_case payload key (the API
+/// merges it into the request payload JSONB; the detail view humanizes it).
+#[derive(Clone, Copy)]
+struct FieldDef {
+    key: &'static str,
+    label: &'static str,
+    kind: FieldKind,
+    placeholder: &'static str,
+    options: &'static [&'static str],
+}
+
+const fn text(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        kind: FieldKind::Text,
+        placeholder,
+        options: &[],
+    }
+}
+const fn number(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        kind: FieldKind::Number,
+        placeholder,
+        options: &[],
+    }
+}
+const fn textarea(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        kind: FieldKind::Textarea,
+        placeholder,
+        options: &[],
+    }
+}
+const fn select(
+    key: &'static str,
+    label: &'static str,
+    placeholder: &'static str,
+    options: &'static [&'static str],
+) -> FieldDef {
+    FieldDef {
+        key,
+        label,
+        kind: FieldKind::Select,
+        placeholder,
+        options,
+    }
+}
+
+// Per-type intake fields. `server-deployment` keeps the typed CPU/Memory inputs
+// (rendered separately) and adds OS/disk here; every other type defines the
+// fields meaningful to it. Keys are snake_case so the detail view humanizes them
+// ("patch_wave" -> "Patch wave"). The API persists them into the payload JSONB.
+const SERVER_DEPLOYMENT_FIELDS: &[FieldDef] = &[
+    select(
+        "operating_system",
+        "Operating System",
+        "Select OS",
+        &["Windows Server 2022", "RHEL 9", "Ubuntu 22.04 LTS"],
+    ),
+    number("data_disk_gb", "Data Disk GB", "e.g. 100"),
+];
+const PATCH_FIELDS: &[FieldDef] = &[
+    text(
+        "target_host_group",
+        "Target Host Group",
+        "e.g. wintel-prod-web",
+    ),
+    select(
+        "patch_wave",
+        "Patch Wave",
+        "Select wave",
+        &["Wave 1", "Wave 2", "Wave 3"],
+    ),
+    text(
+        "maintenance_window",
+        "Maintenance Window",
+        "e.g. 2026-07-01 02:00 UTC",
+    ),
+    select(
+        "reboot_required",
+        "Reboot Required",
+        "Select",
+        &["Yes", "No"],
+    ),
+];
+const REBOOT_FIELDS: &[FieldDef] = &[
+    text(
+        "target_host_group",
+        "Target Host Group",
+        "e.g. linux-prod-db",
+    ),
+    select(
+        "reboot_strategy",
+        "Reboot Strategy",
+        "Select strategy",
+        &["Rolling", "Sequential", "Parallel"],
+    ),
+    number(
+        "drain_timeout_minutes",
+        "Drain Timeout (minutes)",
+        "e.g. 15",
+    ),
+];
+const RESTORE_FIELDS: &[FieldDef] = &[
+    text(
+        "source_backup_id",
+        "Source Backup ID",
+        "e.g. bk-2026-06-30-0231",
+    ),
+    text(
+        "restore_point",
+        "Restore Point",
+        "e.g. 2026-06-30 23:00 UTC",
+    ),
+    text("target_host", "Target Host", "e.g. srv-app-01"),
+];
+const ZABBIX_FIELDS: &[FieldDef] = &[
+    text(
+        "target_host_group",
+        "Target Host Group",
+        "e.g. monitored-prod",
+    ),
+    select(
+        "monitoring_template",
+        "Monitoring Template",
+        "Select template",
+        &["Linux", "Windows", "Network", "Database"],
+    ),
+    select(
+        "alert_severity",
+        "Alert Severity",
+        "Select severity",
+        &["Info", "Warning", "High", "Disaster"],
+    ),
+];
+const CMDB_IMPORT_FIELDS: &[FieldDef] = &[
+    select(
+        "source_system",
+        "Source System",
+        "Select source",
+        &["ServiceNow", "NetBox", "Spreadsheet"],
+    ),
+    text("record_type", "Record Type", "e.g. cmdb_ci_server"),
+    select("dry_run", "Dry Run", "Select", &["Yes", "No"]),
+];
+const CMDB_EXPORT_FIELDS: &[FieldDef] = &[
+    text("export_scope", "Export Scope", "e.g. site:DEFRA"),
+    select("format", "Format", "Select format", &["CSV", "JSON", "XML"]),
+    text("target_system", "Target System", "e.g. ServiceNow"),
+];
+const RUNBOOK_FIELDS: &[FieldDef] = &[
+    text("runbook_id", "Runbook ID", "e.g. rb-failover-db"),
+    textarea("parameters", "Parameters", "key=value per line"),
+    select(
+        "approval_required",
+        "Approval Required",
+        "Select",
+        &["Yes", "No"],
+    ),
+];
+const APP_RETIRE_FIELDS: &[FieldDef] = &[
+    text("application", "Application", "e.g. app-team-web"),
+    select(
+        "retention_policy",
+        "Retention Policy",
+        "Select retention",
+        &["30 days", "90 days", "365 days"],
+    ),
+    select(
+        "confirm_data_deletion",
+        "Confirm Data Deletion",
+        "Select",
+        &["No", "Yes"],
+    ),
+];
+const VM_DECOMMISSION_FIELDS: &[FieldDef] = &[
+    text("vm_identifier", "VM Identifier", "e.g. vm-app-0142"),
+    select(
+        "action",
+        "Action",
+        "Select action",
+        &["Quarantine", "Decommission"],
+    ),
+    select(
+        "snapshot_before",
+        "Snapshot Before",
+        "Select",
+        &["Yes", "No"],
+    ),
+];
+const PREFLIGHT_FIELDS: &[FieldDef] = &[
+    text(
+        "target_request_type",
+        "Target Request Type",
+        "e.g. server-deployment",
+    ),
+    text("scope", "Scope", "e.g. site:DEFRA env:production"),
+];
+const VM_DAY2_FIELDS: &[FieldDef] = &[
+    text("vm_identifier", "VM Identifier", "e.g. vm-app-0142"),
+    select(
+        "change_type",
+        "Change Type",
+        "Select change",
+        &["Resize", "Add disk", "Network change", "Reconfigure"],
+    ),
+    textarea("details", "Details", "Describe the change"),
+];
+const SNAPSHOT_FIELDS: &[FieldDef] = &[
+    text("target_scope", "Target Scope", "e.g. cluster:prod-vmw-01"),
+    select(
+        "snapshot_policy",
+        "Snapshot Policy",
+        "Select policy",
+        &["Daily", "Weekly", "Monthly"],
+    ),
+    number("retention_days", "Retention Days", "e.g. 30"),
+];
+const BACKUP_REPORT_FIELDS: &[FieldDef] = &[
+    select(
+        "report_scope",
+        "Report Scope",
+        "Select scope",
+        &["Site", "Cluster", "Application"],
+    ),
+    select(
+        "period",
+        "Period",
+        "Select period",
+        &["Last 7 days", "Last 30 days", "Last 90 days"],
+    ),
+];
+
+/// Resolves the per-type intake fields for a request type. Unknown types (none
+/// expected — the select is fixed) render no extra fields.
+fn type_fields(request_type: &str) -> &'static [FieldDef] {
+    match request_type {
+        "server-deployment" => SERVER_DEPLOYMENT_FIELDS,
+        "patch-maintenance" => PATCH_FIELDS,
+        "reboot-orchestration" => REBOOT_FIELDS,
+        "controlled-restore" => RESTORE_FIELDS,
+        "zabbix-onboarding" => ZABBIX_FIELDS,
+        "cmdb-import" => CMDB_IMPORT_FIELDS,
+        "cmdb-update-export" => CMDB_EXPORT_FIELDS,
+        "operator-runbook-launch" => RUNBOOK_FIELDS,
+        "application-environment-retirement" => APP_RETIRE_FIELDS,
+        "vm-decommission-quarantine" => VM_DECOMMISSION_FIELDS,
+        "request-preflight" => PREFLIGHT_FIELDS,
+        "vm-day2-change" => VM_DAY2_FIELDS,
+        "snapshot-governance" => SNAPSHOT_FIELDS,
+        "backup-coverage-report" => BACKUP_REPORT_FIELDS,
+        _ => &[],
+    }
+}
+
+/// Renders one per-type field bound to the shared `values` map signal. Editing a
+/// field upserts its `key` into the map; the value reads back from it.
+fn dynamic_field(
+    def: FieldDef,
+    values: RwSignal<std::collections::HashMap<String, String>>,
+) -> AnyView {
+    let key = def.key.to_string();
+    let id = format!("rtf-{}", def.key);
+    let label_for = id.clone();
+    match def.kind {
+        FieldKind::Text | FieldKind::Number => {
+            let read_key = key.clone();
+            let write_key = key.clone();
+            let input_type = match def.kind {
+                FieldKind::Number => "number",
+                _ => "text",
+            };
+            view! {
+                <div class="form-field">
+                    <label for=label_for>{def.label}</label>
+                    <input
+                        id=id
+                        type=input_type
+                        class="settings-input"
+                        placeholder=def.placeholder
+                        prop:value=move || values.get().get(&read_key).cloned().unwrap_or_default()
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            values.update(|m| {
+                                m.insert(write_key.clone(), v);
+                            });
+                        }
+                    />
+                </div>
+            }
+            .into_any()
+        }
+        FieldKind::Textarea => {
+            let read_key = key.clone();
+            let write_key = key.clone();
+            view! {
+                <div class="form-field">
+                    <label for=label_for>{def.label}</label>
+                    <textarea
+                        id=id
+                        class="settings-input"
+                        placeholder=def.placeholder
+                        prop:value=move || values.get().get(&read_key).cloned().unwrap_or_default()
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            values.update(|m| {
+                                m.insert(write_key.clone(), v);
+                            });
+                        }
+                    ></textarea>
+                </div>
+            }
+            .into_any()
+        }
+        FieldKind::Select => {
+            let read_key = key.clone();
+            let write_key = key.clone();
+            view! {
+                <div class="form-field">
+                    <label for=label_for>{def.label}</label>
+                    <select
+                        id=id
+                        class="settings-input"
+                        prop:value=move || values.get().get(&read_key).cloned().unwrap_or_default()
+                        on:change=move |ev| {
+                            let v = event_target_value(&ev);
+                            values.update(|m| {
+                                m.insert(write_key.clone(), v);
+                            });
+                        }
+                    >
+                        <option value="">{def.placeholder}</option>
+                        {def.options
+                            .iter()
+                            .map(|opt| view! { <option value=*opt>{*opt}</option> })
+                            .collect_view()}
+                    </select>
+                </div>
+            }
+            .into_any()
+        }
+    }
+}
+
 #[component]
 pub fn RequestCreate() -> impl IntoView {
     let create_path_guard = api_path(request_create_path());
@@ -123,6 +481,9 @@ pub fn RequestCreate() -> impl IntoView {
     let (feedback_class, set_feedback_class) = create_signal("badge neutral");
     #[allow(deprecated)]
     let (show_errors, set_show_errors) = create_signal(false);
+    // Per-type intake field values, keyed by snake_case field key. Cleared when
+    // the request type changes so stale values from the previous type never leak.
+    let field_values = RwSignal::new(std::collections::HashMap::<String, String>::new());
 
     let is_valid = move || !name.get().trim().is_empty() && !justification.get().trim().is_empty();
 
@@ -182,6 +543,9 @@ pub fn RequestCreate() -> impl IntoView {
                         prop:value=request_type
                         on:change=move |ev| {
                             set_request_type.set(event_target_value(&ev));
+                            // Drop the previous type's field values so they never
+                            // bleed into a different request type's payload.
+                            field_values.set(std::collections::HashMap::new());
                         }
                     >
                         {REQUEST_TYPE_OPTIONS
@@ -290,6 +654,15 @@ pub fn RequestCreate() -> impl IntoView {
                     </div>
                 </Show>
 
+                // Per-type intake fields — reactively rendered for the selected
+                // request type, so changing the type swaps in that type's fields.
+                {move || {
+                    type_fields(&request_type.get())
+                        .iter()
+                        .map(|def| dynamic_field(*def, field_values))
+                        .collect_view()
+                }}
+
                 <div class="form-field">
                     <label for="request-justification">"Business Justification"</label>
                     <textarea
@@ -315,15 +688,29 @@ pub fn RequestCreate() -> impl IntoView {
                                 // VM sizing is only sent for server-deployment; other
                                 // types store 0 (not applicable) rather than the
                                 // form defaults, matching the API's typed payload.
-                                let is_vm = request_type.get() == "server-deployment";
+                                let selected_type = request_type.get();
+                                let is_vm = selected_type == "server-deployment";
+                                // Collect only the CURRENT type's non-empty fields,
+                                // trimmed — so a stale key can never reach the payload.
+                                let allowed: std::collections::HashSet<&str> =
+                                    type_fields(&selected_type).iter().map(|d| d.key).collect();
+                                let fields: std::collections::BTreeMap<String, String> = field_values
+                                    .get()
+                                    .into_iter()
+                                    .filter(|(k, v)| {
+                                        allowed.contains(k.as_str()) && !v.trim().is_empty()
+                                    })
+                                    .map(|(k, v)| (k, v.trim().to_string()))
+                                    .collect();
                                 let payload = CreateRequestPayload {
-                                    request_type: request_type.get(),
+                                    request_type: selected_type,
                                     name: name.get().trim().to_string(),
                                     site: site.get(),
                                     environment: environment.get(),
                                     cpu: if is_vm { cpu.get() } else { 0 },
                                     memory: if is_vm { memory.get() } else { 0 },
                                     justification: justification.get().trim().to_string(),
+                                    fields,
                                 };
                                 submit_action.dispatch(payload);
                             }
@@ -391,6 +778,42 @@ mod tests {
             values,
             vec!["development", "test", "acceptance", "production"]
         );
+    }
+
+    #[test]
+    fn every_request_type_defines_intake_fields_with_snake_case_keys() {
+        for (value, _) in REQUEST_TYPE_OPTIONS {
+            let fields = type_fields(value);
+            assert!(
+                !fields.is_empty(),
+                "request type {value} must define at least one intake field"
+            );
+            for field in fields {
+                assert!(!field.key.is_empty() && !field.label.is_empty());
+                assert!(
+                    field
+                        .key
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "field key {} must be snake_case so the detail view humanizes it",
+                    field.key
+                );
+                match field.kind {
+                    FieldKind::Select => assert!(
+                        !field.options.is_empty(),
+                        "select field {} must offer options",
+                        field.key
+                    ),
+                    _ => assert!(
+                        field.options.is_empty(),
+                        "non-select field {} must not carry options",
+                        field.key
+                    ),
+                }
+            }
+        }
+        // An unknown type yields no extra fields rather than panicking.
+        assert!(type_fields("not-a-real-type").is_empty());
     }
 
     #[test]

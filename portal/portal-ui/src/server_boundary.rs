@@ -1855,7 +1855,8 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
     if !upstream.live() {
         return reject_static_preview_request_create(payload);
     }
-    // The portal `memory` field maps to the API `memory_gb` field.
+    // The portal `memory` field maps to the API `memory_gb` field; `fields`
+    // carries the per-type intake inputs the API merges into the request payload.
     let body = serde_json::json!({
         "request_type": payload.request_type,
         "name": payload.name,
@@ -1864,6 +1865,7 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
         "cpu": payload.cpu,
         "memory_gb": payload.memory,
         "justification": payload.justification,
+        "fields": payload.fields,
     });
     let session_id = session_id_from_request().await;
     let response = upstream
@@ -2590,6 +2592,7 @@ mod tests {
             cpu: 4,
             memory: 16,
             justification: "Need capacity".to_string(),
+            fields: std::collections::BTreeMap::new(),
         };
         let result = reject_static_preview_request_create(payload);
 

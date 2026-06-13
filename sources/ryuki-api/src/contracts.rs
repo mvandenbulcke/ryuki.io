@@ -2413,6 +2413,11 @@ struct CreateRequest {
     #[serde(default)]
     memory_gb: u32,
     justification: String,
+    // Per-type intake fields (snake_case keys -> string values), merged into the
+    // persisted payload JSONB by build_request_payload. Absent for legacy/VM
+    // bodies; canonical payload keys (name/site/etc.) are never overwritten.
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -8110,7 +8115,7 @@ fn build_request_payload(
     criticality: &str,
 ) -> Value {
     use ryuki_engine::models::RequestType;
-    match request_type {
+    let mut payload = match request_type {
         RequestType::ServerDeployment => json!({
             "name": body.name,
             "cpu": body.cpu,
@@ -8129,7 +8134,17 @@ fn build_request_payload(
             "criticality": criticality,
             "request_type": body.request_type,
         }),
+    };
+    // Merge the per-type intake fields. `or_insert` ensures a client-supplied
+    // field can NEVER overwrite a canonical key (name/site/environment/etc.).
+    if let Some(object) = payload.as_object_mut() {
+        for (key, value) in &body.fields {
+            object
+                .entry(key.clone())
+                .or_insert_with(|| Value::String(value.clone()));
+        }
     }
+    payload
 }
 
 fn validation_failed_response(
@@ -14644,6 +14659,42 @@ mod unit_tests {
         assert_eq!(trail["limit"], 200);
     }
 
+    /// Per-type intake fields are merged into the persisted payload, but a
+    /// client-supplied field can NEVER overwrite a canonical key (name, site,
+    /// request_type, …) — the merge uses `entry().or_insert`.
+    #[test]
+    fn build_request_payload_merges_fields_without_clobbering_canonical_keys() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("patch_wave".to_string(), "Wave 2".to_string());
+        fields.insert(
+            "maintenance_window".to_string(),
+            "2026-07-01 02:00 UTC".to_string(),
+        );
+        // A field that collides with a canonical key must be ignored.
+        fields.insert("name".to_string(), "evil-override".to_string());
+        fields.insert("request_type".to_string(), "server-deployment".to_string());
+        let body = CreateRequest {
+            request_type: "patch-maintenance".to_string(),
+            site: "DEFRA".to_string(),
+            environment: "production".to_string(),
+            name: "real-name".to_string(),
+            cpu: 0,
+            memory_gb: 0,
+            justification: "monthly wave".to_string(),
+            fields,
+        };
+        let request_type = parse_request_type("patch-maintenance").expect("valid request type");
+        let payload = build_request_payload(&request_type, &body, "standard");
+
+        // Per-type fields are merged in.
+        assert_eq!(payload["patch_wave"], "Wave 2");
+        assert_eq!(payload["maintenance_window"], "2026-07-01 02:00 UTC");
+        // Canonical keys are never clobbered by a colliding field.
+        assert_eq!(payload["name"], "real-name");
+        assert_eq!(payload["request_type"], "patch-maintenance");
+        assert_eq!(payload["site"], "DEFRA");
+    }
+
     /// The evidence pack is identity-grade compliance data and must be gated on
     /// audit-tier access: a no-roles session is refused; an Auditor is admitted
     /// (and gets a 404 for a non-existent request — proving it cleared the gate
@@ -15194,6 +15245,7 @@ mod db_lifecycle_tests {
             cpu: 4,
             memory_gb: 8,
             justification: "p2 durable-state test".into(),
+            fields: std::collections::BTreeMap::new(),
         }
     }
 

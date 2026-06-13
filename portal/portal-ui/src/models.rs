@@ -1687,6 +1687,12 @@ pub struct CreateRequestPayload {
     pub cpu: u32,
     pub memory: u32,
     pub justification: String,
+    /// Per-type intake fields (e.g. patch wave, restore point, runbook id). Keys
+    /// are snake_case; they are merged into the persisted request payload JSONB
+    /// by the API and surface on the request detail. Empty for types with no
+    /// extra fields.
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
