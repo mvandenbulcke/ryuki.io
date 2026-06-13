@@ -1,4 +1,5 @@
-/// Portal SSR integration tests for request-form hardening.
+/// Portal SSR integration tests for request-form hardening and badge/label
+/// coverage.
 ///
 /// These tests only compile and run under `--features ssr`; the portal default
 /// feature set is empty, so `cargo test --workspace` skips this module.  The
@@ -9,6 +10,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::request_create::{missing_required_fields, type_fields};
+    use super::super::request_detail::{
+        stage_label, status_badge_class as detail_status_badge_class,
+    };
+    use super::super::requests::status_badge_class as list_status_badge_class;
 
     // --- Task 1.2 ---------------------------------------------------------
 
@@ -89,6 +94,88 @@ mod tests {
         assert!(
             missing.is_empty(),
             "all required fields filled — missing must be empty; got: {missing:?}"
+        );
+    }
+
+    // --- Badge and label coverage -----------------------------------------
+
+    /// `stage_label` must cover all portal-vocabulary stage strings, including
+    /// the Unknown fallback for unrecognized input.
+    #[test]
+    fn stage_label_covers_all_stages_and_unknown_fallback() {
+        for (stage, expected) in [
+            ("intake", "Intake"),
+            ("validated", "Validated"),
+            ("planned", "Planned"),
+            ("approved", "Approved"),
+            ("locked", "Locked"),
+            ("executed", "Executed"),
+            ("verified", "Verified"),
+            ("failed", "Failed"),
+            ("rejected", "Rejected"),
+            ("cancelled", "Cancelled"),
+            ("totally-unknown", "Unknown"),
+            ("", "Unknown"),
+        ] {
+            assert_eq!(
+                stage_label(stage),
+                expected,
+                "stage_label({stage:?}) must be {expected:?}"
+            );
+        }
+    }
+
+    /// Both `status_badge_class` copies must return identical output for every
+    /// status string — including the newly-added in-progress states.  This test
+    /// guards against the two copies diverging.
+    #[test]
+    fn status_badge_class_both_copies_agree_on_all_statuses() {
+        for status in [
+            "intake",
+            "validated",
+            "approved",
+            "executed",
+            "failed",
+            "rejected",
+            "cancelled",
+            "executing",
+            "verifying",
+            "draft",
+            "planned",
+            "locked",
+            "completed",
+            "unknown-status",
+        ] {
+            let detail = detail_status_badge_class(status);
+            let list = list_status_badge_class(status);
+            assert_eq!(
+                detail,
+                list,
+                "status_badge_class copies diverge for {status:?}: detail={detail:?}, list={list:?}"
+            );
+        }
+    }
+
+    /// The new in-progress arms must return a class that is distinct from the
+    /// neutral fallback so executing/verifying states render with visual weight.
+    #[test]
+    fn status_badge_class_executing_and_verifying_are_not_neutral() {
+        let neutral = detail_status_badge_class("intake");
+        let executing = detail_status_badge_class("executing");
+        let verifying = detail_status_badge_class("verifying");
+
+        assert_ne!(
+            executing, neutral,
+            "executing must not fall back to the neutral badge"
+        );
+        assert_ne!(
+            verifying, neutral,
+            "verifying must not fall back to the neutral badge"
+        );
+        // Both in-progress states must return the same class as each other.
+        assert_eq!(
+            executing, verifying,
+            "executing and verifying must use the same badge class"
         );
     }
 }
