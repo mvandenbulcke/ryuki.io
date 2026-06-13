@@ -1,3 +1,4 @@
+pub mod approvals;
 pub mod dashboard;
 pub mod login;
 pub mod request_create;

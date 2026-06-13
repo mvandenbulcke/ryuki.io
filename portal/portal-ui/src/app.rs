@@ -3,9 +3,10 @@ use crate::server_boundary::{get_auth_session, load_portal_route_state, PortalRo
 use crate::shell::Shell;
 use crate::views::login::LoginView;
 use crate::views::workspaces::{
-    ActivityWorkspaceView, AdminWorkspaceView, CatalogWorkspaceView, CmdbWorkspaceView,
-    DashboardWorkspaceView, EvidenceWorkspaceView, InventoryWorkspaceView, OperationsWorkspaceView,
-    RequestDetailWorkspaceView, RequestNewWorkspaceView, RequestsWorkspaceView,
+    ActivityWorkspaceView, AdminWorkspaceView, ApprovalsWorkspaceView, CatalogWorkspaceView,
+    CmdbWorkspaceView, DashboardWorkspaceView, EvidenceWorkspaceView, InventoryWorkspaceView,
+    OperationsWorkspaceView, RequestDetailWorkspaceView, RequestNewWorkspaceView,
+    RequestsWorkspaceView,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, MetaTags, Stylesheet, Title};
@@ -61,6 +62,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("requests") view=RequestsWorkspaceView/>
                     <Route path=path!("requests/new") view=RequestNewWorkspaceView/>
                     <Route path=path!("requests/:id") view=RequestDetailWorkspaceView/>
+                    <Route path=path!("approvals") view=ApprovalsWorkspaceView/>
                     <Route path=path!("activity") view=ActivityWorkspaceView/>
                     <Route path=path!("inventory") view=InventoryWorkspaceView/>
                     <Route path=path!("cmdb") view=CmdbWorkspaceView/>

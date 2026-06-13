@@ -17,6 +17,7 @@ const CATALOG_RECOMMENDATIONS_PATH: &str = "/api/catalog/recommendations-contrac
 const CATALOG_REQUEST_FORM_PATH: &str = "/api/catalog/request-form-contract";
 const SITE_CATALOG_PATH: &str = "/api/catalog/site-catalog-contract";
 const APPROVAL_DECISION_READINESS_PATH: &str = "/api/approvals/decision-readiness-contract";
+const APPROVALS_PENDING_PATH: &str = "/api/approvals/pending";
 const ACTIVITY_OPERATION_QUEUE_PATH: &str = "/api/operations/activity-queue-contract";
 /// Global, newest-first governance audit feed across all requests.
 const ACTIVITY_AUDIT_FEED_PATH: &str = "/api/activity/audit";
@@ -157,6 +158,10 @@ pub fn site_catalog_path() -> &'static str {
 
 pub fn approval_decision_readiness_path() -> &'static str {
     APPROVAL_DECISION_READINESS_PATH
+}
+
+pub fn approvals_pending_path() -> &'static str {
+    APPROVALS_PENDING_PATH
 }
 
 pub fn activity_operation_queue_path() -> &'static str {
@@ -405,6 +410,11 @@ pub fn request_evidence_path(request_id: &str) -> Result<String, ApiPathError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approvals_pending_path_matches_api_contract() {
+        assert_eq!(approvals_pending_path(), "/api/approvals/pending");
+    }
 
     #[test]
     fn request_lifecycle_paths_match_api_contract() {
