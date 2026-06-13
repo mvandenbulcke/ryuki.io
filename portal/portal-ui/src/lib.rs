@@ -8,6 +8,7 @@ pub mod app;
 pub mod models;
 pub mod server_boundary;
 pub mod shell;
+pub mod upstream;
 pub mod views;
 pub mod workspace_catalog;
 

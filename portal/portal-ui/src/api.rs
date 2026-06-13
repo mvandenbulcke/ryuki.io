@@ -289,6 +289,8 @@ pub fn auth_status_path() -> &'static str {
 
 const AUTH_LOGIN_PATH: &str = "/api/auth/login";
 const AUTH_LOGOUT_PATH: &str = "/api/auth/logout";
+const AUTH_LOCAL_LOGIN_PATH: &str = "/api/auth/local/login";
+const AUTH_LOCAL_LOGOUT_PATH: &str = "/api/auth/local/logout";
 
 pub fn auth_login_path() -> &'static str {
     AUTH_LOGIN_PATH
@@ -296,6 +298,14 @@ pub fn auth_login_path() -> &'static str {
 
 pub fn auth_logout_path() -> &'static str {
     AUTH_LOGOUT_PATH
+}
+
+pub fn auth_local_login_path() -> &'static str {
+    AUTH_LOCAL_LOGIN_PATH
+}
+
+pub fn auth_local_logout_path() -> &'static str {
+    AUTH_LOCAL_LOGOUT_PATH
 }
 
 pub fn auth_session_path() -> &'static str {
@@ -381,6 +391,15 @@ mod tests {
         assert_eq!(auth_status_path(), "/api/auth/status");
         assert_eq!(auth_session_path(), "/api/auth/session");
         assert_ne!(auth_status_path(), auth_session_path());
+    }
+
+    #[test]
+    fn local_auth_paths_match_api_contract() {
+        assert_eq!(auth_local_login_path(), "/api/auth/local/login");
+        assert_eq!(auth_local_logout_path(), "/api/auth/local/logout");
+        assert_ne!(auth_local_login_path(), auth_local_logout_path());
+        assert_ne!(auth_local_login_path(), auth_login_path());
+        assert_ne!(auth_local_logout_path(), auth_logout_path());
     }
 
     #[test]

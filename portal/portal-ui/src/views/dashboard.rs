@@ -798,18 +798,14 @@ fn AuthStatusSection() -> impl IntoView {
                     let session_result = auth_session.await;
                     let boundary_result = boundary_status.await;
 
-                    let user_id = session_result
-                        .as_ref()
+                    let session = session_result.as_ref().ok().and_then(|s| s.as_ref());
+                    let user_id = session
                         .map(|s| s.user_id.clone())
-                        .unwrap_or_else(|_| "unavailable".to_string());
-                    let display_name = session_result
-                        .as_ref()
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    let display_name = session
                         .map(|s| s.display_name.clone())
-                        .unwrap_or_else(|_| "unavailable".to_string());
-                    let roles: Vec<_> = session_result
-                        .as_ref()
-                        .map(|s| s.roles.clone())
-                        .unwrap_or_else(|_| vec![]);
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    let roles: Vec<_> = session.map(|s| s.roles.clone()).unwrap_or_default();
 
                     let execution_mode = boundary_result
                         .as_ref()

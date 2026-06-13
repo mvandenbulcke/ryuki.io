@@ -1,5 +1,4 @@
 use crate::api::{platform_summary_path, request_detail_path};
-use crate::models::request_detail_fallback;
 use crate::server_boundary::{
     approve_request, execute_request, get_request_detail, lock_request, plan_request,
     validate_request, verify_request,
@@ -29,6 +28,15 @@ fn stage_label(stage: &str) -> &'static str {
         "failed" => "Failed",
         &_ => "Unknown",
     }
+}
+
+/// Strips the server-function transport prefix so action feedback badges
+/// show the API/boundary message rather than the wire-format wrapper.
+fn server_error_message(error: &leptos::prelude::ServerFnError) -> String {
+    let text = error.to_string();
+    text.strip_prefix("error running server function: ")
+        .map(str::to_string)
+        .unwrap_or(text)
 }
 
 fn action_label(action: &str) -> &'static str {
@@ -63,15 +71,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match validate_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -85,15 +93,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match plan_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -107,15 +115,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match approve_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -129,15 +137,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match lock_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -151,15 +159,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match execute_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -173,15 +181,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         async move {
             match verify_request(id).await {
                 Ok(resp) => {
+                    let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
-                    set_action_class.set(if resp.success {
-                        "badge good"
-                    } else {
-                        "badge bad"
-                    });
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                    }
                 }
                 Err(e) => {
-                    set_action_feedback.set(e.to_string());
+                    set_action_feedback.set(server_error_message(&e));
                     set_action_class.set("badge bad");
                 }
             }
@@ -202,7 +210,29 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
                     Suspend::new(async move {
                         let detail = match detail_resource.await {
                             Ok(d) => d,
-                            Err(_) => request_detail_fallback("error"),
+                            // Live mode with the API unreachable: an explicit
+                            // error state, never the demo detail.
+                            Err(_) => {
+                                return view! {
+                                    <div
+                                        class="request-detail-error"
+                                        role="alert"
+                                        data-api-path=content_detail_path.clone()
+                                    >
+                                        <p>"Platform API unreachable"</p>
+                                        <p class="table-note">
+                                            "Request detail cannot be loaded. Check the platform API and try again."
+                                        </p>
+                                        <button
+                                            class="btn btn-secondary"
+                                            on:click=move |_| on_back.run(())
+                                        >
+                                            "Back to list"
+                                        </button>
+                                    </div>
+                                }
+                                    .into_any();
+                            }
                         };
 
                         let status_class = status_badge_class(&detail.status);

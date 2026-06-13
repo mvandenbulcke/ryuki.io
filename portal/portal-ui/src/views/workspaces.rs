@@ -16,7 +16,7 @@ use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, auth_session_fallback,
     catalog_contract_fallbacks, catalog_readiness_fallbacks, operation_run_fallbacks,
     platform_settings_summary_fallback, rbac_role_summary_fallbacks, request_intake_form_fallback,
-    PlatformSettingsSummary,
+    AuthSession, PlatformSettingsSummary,
 };
 use crate::server_boundary::{
     get_admin_platform_settings, get_auth_session, get_boundary_status, get_platform_health,
@@ -44,7 +44,9 @@ fn resource_api_path<T>(resource: ApiResource<T>) -> &'static str {
 
 #[component]
 pub fn WorkspaceSections() -> impl IntoView {
-    let auth_session = auth_session_fallback();
+    // Real session roles arrive through context from the auth gate; the
+    // labeled synthetic fallback only covers out-of-gate renders.
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
 
     view! {
         <div class="workspace-area">
@@ -1189,18 +1191,14 @@ fn SecurityWorkspaceDetail() -> impl IntoView {
                     let boundary_result = boundary_status.await;
                     let platform_status_result = platform_status.await;
 
-                    let user_id = session_result
-                        .as_ref()
+                    let session = session_result.as_ref().ok().and_then(|s| s.as_ref());
+                    let user_id = session
                         .map(|s| s.user_id.clone())
-                        .unwrap_or_else(|_| "unavailable".to_string());
-                    let display_name = session_result
-                        .as_ref()
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    let display_name = session
                         .map(|s| s.display_name.clone())
-                        .unwrap_or_else(|_| "unavailable".to_string());
-                    let roles: Vec<_> = session_result
-                        .as_ref()
-                        .map(|s| s.roles.clone())
-                        .unwrap_or_else(|_| vec![]);
+                        .unwrap_or_else(|| "unavailable".to_string());
+                    let roles: Vec<_> = session.map(|s| s.roles.clone()).unwrap_or_default();
 
                     let execution_mode = boundary_result
                         .as_ref()

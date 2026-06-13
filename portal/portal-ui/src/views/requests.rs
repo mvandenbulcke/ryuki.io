@@ -1,5 +1,5 @@
 use crate::api::{platform_summary_path, request_list_path, same_origin_api_path};
-use crate::models::{request_summary_fallbacks, RequestSummary};
+use crate::models::RequestSummary;
 use crate::server_boundary::get_request_list;
 use leptos::prelude::*;
 
@@ -57,7 +57,23 @@ pub fn RequestList(
                     Suspend::new(async move {
                         let requests: Vec<RequestSummary> = match list_resource.await {
                             Ok(list) => list,
-                            Err(_) => request_summary_fallbacks(),
+                            // Live mode with the API unreachable: an explicit
+                            // error state, never demo rows.
+                            Err(_) => {
+                                return view! {
+                                    <div
+                                        class="request-list-error"
+                                        role="alert"
+                                        data-api-path=request_list_path_guard
+                                    >
+                                        <p>"Platform API unreachable"</p>
+                                        <p class="table-note">
+                                            "Live request data cannot be loaded. Check the platform API and reload this page."
+                                        </p>
+                                    </div>
+                                }
+                                    .into_any();
+                            }
                         };
 
                         if requests.is_empty() {

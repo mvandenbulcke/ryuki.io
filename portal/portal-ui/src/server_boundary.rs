@@ -1,19 +1,19 @@
 use crate::api::{
     activity_operation_queue_path, admin_feature_flag_governance_path,
     admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
-    admin_worker_capability_path, approval_decision_readiness_path, auth_login_path,
-    auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
-    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
-    cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
-    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
-    datacenter_check_rack_space_path, datacenter_check_switchports_path,
-    datacenter_failing_checks_path, datacenter_full_readiness_path,
-    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
-    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
-    evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
-    inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
-    operations_runbook_launch_path, platform_health_path, platform_status_path,
-    platform_summary_path, policy_outcomes_path, request_create_path,
+    admin_worker_capability_path, approval_decision_readiness_path, auth_local_login_path,
+    auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
+    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
+    catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
+    cmdb_reconciliation_path, cmdb_relationship_graph_path, datacenter_check_cooling_path,
+    datacenter_check_power_path, datacenter_check_rack_space_path,
+    datacenter_check_switchports_path, datacenter_failing_checks_path,
+    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
+    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
+    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
+    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
+    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
+    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
     request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
@@ -33,6 +33,12 @@ use crate::api_client::{
 use crate::models::platform_settings_summary_fallback;
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
+#[cfg(feature = "ssr")]
+use crate::models::{
+    actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
+    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiLoginSession,
+    ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
+};
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
     cmdb_reconciliation_fallbacks, cmdb_relationship_fallbacks, datacenter_failing_checks_fallback,
@@ -45,18 +51,18 @@ use crate::models::{
     CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
     CreateRequestPayload, DatacenterFailingChecksSummary, DatacenterFullReadiness,
     DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
-    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, LoginResponse,
-    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
+    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, OperationRunSummary,
+    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
     PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
     RequestIntakeSummary, RequestSummary, SecretReferenceSummary, StageActionResponse,
 };
 #[cfg(feature = "ssr")]
-use crate::models::{
-    auth_session_fallback, platform_health_fallback, platform_status_fallback,
-    rbac_role_summary_fallbacks,
-};
-#[cfg(feature = "ssr")]
 use crate::models::{request_detail_fallback, request_summary_fallbacks};
+#[cfg(feature = "ssr")]
+use crate::upstream::{
+    clear_portal_session_cookie, cookie_max_age_from_expires_at, session_id_from_request,
+    set_portal_session_cookie, UpstreamClient, UpstreamResponse,
+};
 use leptos::prelude::{server, ServerFnError};
 use ryuki_core::types::{BoundaryStatus, ExecutionMode};
 use serde::{Deserialize, Serialize};
@@ -124,8 +130,56 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     auth_status_path,
     auth_login_path,
     auth_logout_path,
+    auth_local_login_path,
+    auth_local_logout_path,
     auth_session_path,
 ];
+
+/// Generic mutation failure when the upstream API is unreachable in live
+/// mode. Mutations never degrade to static fallbacks.
+#[cfg(feature = "ssr")]
+const MUTATION_UNREACHABLE_MESSAGE: &str =
+    "API unreachable; portal is in degraded static preview — no changes were made";
+
+/// Recovers the process-wide upstream client provided through Leptos context
+/// by `main.rs`. Falls back to building one from the environment so SSR
+/// renders outside the context-providing routes (for example the file/error
+/// fallback handler) stay functional.
+#[cfg(feature = "ssr")]
+fn upstream_context() -> UpstreamClient {
+    use leptos::prelude::use_context;
+
+    use_context::<UpstreamClient>().unwrap_or_else(UpstreamClient::from_env)
+}
+
+/// Extracts the canonical `{"error","message"}` text from an upstream 4xx
+/// body, falling back to the bare `error` field and then to a generic label.
+/// Raw upstream payloads never pass through unparsed.
+#[cfg(feature = "ssr")]
+fn api_error_text(response: &UpstreamResponse, fallback: &str) -> String {
+    response.api_error_message().unwrap_or_else(|| {
+        serde_json::from_str::<serde_json::Value>(&response.body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|error| error.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| fallback.to_string())
+    })
+}
+
+/// Lowercases the engine PascalCase health status enums so the portal badge
+/// classes (which compare against lowercase labels) stay consistent.
+#[cfg(feature = "ssr")]
+fn normalize_platform_health(mut health: PlatformHealth) -> PlatformHealth {
+    health.overall_status = health.overall_status.to_ascii_lowercase();
+    for check in &mut health.checks {
+        check.status = check.status.to_ascii_lowercase();
+    }
+    health
+}
 
 fn execution_mode_label(mode: &ExecutionMode) -> &'static str {
     match mode {
@@ -402,6 +456,9 @@ impl PortalBoundaryStatusSnapshot {
 pub struct PortalRouteStateSnapshot {
     pub api_boundary: String,
     pub execution_mode: String,
+    /// "live" | "degraded-static" | "static-dry-run" — whether the data on
+    /// screen reflects the live API, a degraded fallback, or the static demo.
+    pub upstream_state: String,
     pub route_state_path: String,
     pub run_state_path: String,
     pub active_route: String,
@@ -436,6 +493,7 @@ impl PortalRouteStateSnapshot {
             api_boundary: boundary.api_boundary.to_string(),
             execution_mode: execution_mode_label(&boundary.boundary_status.execution_mode)
                 .to_string(),
+            upstream_state: "static-dry-run".to_string(),
             route_state_path: PORTAL_ROUTE_STATE_SERVER_FUNCTION_PATH.to_string(),
             run_state_path: run_state_plan.path.to_string(),
             active_route: "#dashboard".to_string(),
@@ -460,6 +518,34 @@ impl PortalRouteStateSnapshot {
             secret_values_allowed: false,
             customer_identifiers_allowed: false,
         })
+    }
+
+    /// Route state when the portal runs in live-provider mode and the
+    /// upstream API answered the reachability probe.
+    pub fn live_provider() -> Result<Self, PortalBoundaryError> {
+        let mut snapshot = Self::static_dry_run()?;
+        snapshot.execution_mode = "live-provider".to_string();
+        snapshot.upstream_state = "live".to_string();
+        snapshot.execution_authority_label = "Execution: live provider (gated)".to_string();
+        snapshot.route_state = "live-shell-route".to_string();
+        snapshot.safe_summary = "Portal route state backed by the live platform API".to_string();
+        Ok(snapshot)
+    }
+
+    /// Route state when live-provider mode is configured but the upstream API
+    /// is unreachable: reads degrade to labeled static fallbacks and the
+    /// shell repoints its context-strip labels.
+    pub fn degraded_static_fallback() -> Result<Self, PortalBoundaryError> {
+        let mut snapshot = Self::static_dry_run()?;
+        snapshot.execution_mode = "degraded-static-fallback".to_string();
+        snapshot.upstream_state = "degraded-static".to_string();
+        snapshot.execution_authority_label = "Execution: blocked (API unreachable)".to_string();
+        snapshot.inventory_freshness_label = "API unreachable — static preview".to_string();
+        snapshot.backup_freshness_label = "API unreachable — static preview".to_string();
+        snapshot.monitoring_freshness_label = "API unreachable — static preview".to_string();
+        snapshot.safe_summary =
+            "Upstream API unreachable; static preview shown read-only".to_string();
+        Ok(snapshot)
     }
 }
 
@@ -934,8 +1020,21 @@ pub async fn load_portal_boundary_status() -> Result<PortalBoundaryStatusSnapsho
 
 #[server(prefix = "/portal/api", endpoint = "route-state")]
 pub async fn load_portal_route_state() -> Result<PortalRouteStateSnapshot, ServerFnError> {
-    PortalRouteStateSnapshot::static_dry_run()
-        .map_err(|_| ServerFnError::new("portal route state is unavailable"))
+    let unavailable = |_| ServerFnError::new("portal route state is unavailable");
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return PortalRouteStateSnapshot::static_dry_run().map_err(unavailable);
+    }
+    let boundary = PortalServerBoundary::static_dry_run();
+    let probe_path = boundary
+        .validate_platform_api_path(platform_summary_path())
+        .map_err(unavailable)?;
+    let session_id = session_id_from_request().await;
+    match upstream.get(probe_path, session_id.as_deref()).await {
+        Ok(_) => PortalRouteStateSnapshot::live_provider(),
+        Err(_) => PortalRouteStateSnapshot::degraded_static_fallback(),
+    }
+    .map_err(unavailable)
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-preflight-status")]
@@ -990,10 +1089,58 @@ pub async fn load_portal_policy_guardrails_status(
 #[server(prefix = "/portal/api", endpoint = "platform-health")]
 pub async fn get_platform_health() -> Result<PlatformHealth, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(platform_health_path())
         .map_err(|_| ServerFnError::new("platform health API path failed same-origin guard"))?;
-    Ok(platform_health_fallback())
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(platform_health_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let health: PlatformHealth = response
+                .json()
+                .map_err(|_| ServerFnError::new("platform health response was malformed"))?;
+            Ok(normalize_platform_health(health))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "platform health fetch failed",
+        ))),
+        // Live mode never masks an unreachable API behind the static
+        // fallback; the caller renders an explicit degraded state.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+#[server(prefix = "/portal/api", endpoint = "platform-summary")]
+pub async fn get_platform_summary() -> Result<PlatformSummaryContext, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(platform_summary_path())
+        .map_err(|_| ServerFnError::new("platform summary API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(platform_summary_context_fallback());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let summary: ApiPlatformSummary = response
+                .json()
+                .map_err(|_| ServerFnError::new("platform summary response was malformed"))?;
+            Ok(PlatformSummaryContext::from(summary))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "platform summary fetch failed",
+        ))),
+        // Live mode surfaces the unreachable API as an error; the login
+        // view maps it to the distinct "degraded" authentication mode
+        // instead of the static-preview message.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 #[server(prefix = "/portal/api", endpoint = "boundary-status-check")]
@@ -1005,13 +1152,52 @@ pub async fn get_boundary_status() -> Result<BoundaryStatus, ServerFnError> {
     Ok(boundary.boundary_status.clone())
 }
 
+/// Resolves the caller's session. `Ok(None)` means "not signed in" (no
+/// cookie, or the upstream session is expired/invalid); `Err` means the
+/// upstream API was unreachable in live mode (degraded shell). The synthetic
+/// `auth_session_fallback()` PlatformAdmin grant survives ONLY behind the
+/// static-mode branch.
 #[server(prefix = "/portal/api", endpoint = "auth-session")]
-pub async fn get_auth_session() -> Result<AuthSession, ServerFnError> {
+pub async fn get_auth_session() -> Result<Option<AuthSession>, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(auth_session_path())
         .map_err(|_| ServerFnError::new("auth session API path failed same-origin guard"))?;
-    Ok(auth_session_fallback())
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(Some(auth_session_fallback()));
+    }
+    let Some(session_id) = session_id_from_request().await else {
+        return Ok(None);
+    };
+    let response = upstream
+        .get(path, Some(&session_id))
+        .await
+        .map_err(|_| ServerFnError::new("API unreachable"))?;
+    // Only a definitive upstream rejection of the session (401/403)
+    // invalidates the portal cookie. Any other non-2xx is a degraded gate:
+    // surface the error and keep the cookie so a transient API problem
+    // cannot sign the user out.
+    if matches!(response.status, 401 | 403) {
+        clear_portal_session_cookie();
+        return Ok(None);
+    }
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "auth session fetch failed",
+        )));
+    }
+    let session: AuthSession = response
+        .json()
+        .map_err(|_| ServerFnError::new("auth session response was malformed"))?;
+    if session.token_valid {
+        Ok(Some(session))
+    } else {
+        // Expired or unknown upstream session: clear the stale portal cookie.
+        clear_portal_session_cookie();
+        Ok(None)
+    }
 }
 
 #[server(prefix = "/portal/api", endpoint = "admin-rbac-roles")]
@@ -1094,49 +1280,127 @@ pub async fn get_request_intake_form() -> Result<RequestIntakeForm, ServerFnErro
     Ok(request_intake_form_fallback())
 }
 
+/// Signs in against the upstream local-auth endpoint. The upstream
+/// `session_id` is stored in the portal-origin `ryuki_session` cookie and
+/// never reaches WASM; the browser only receives the [`AuthSession`]
+/// identity fields.
 #[server(prefix = "/portal/api", endpoint = "auth-login")]
-pub async fn perform_login() -> Result<LoginResponse, ServerFnError> {
+pub async fn perform_login(
+    username: String,
+    password: String,
+) -> Result<AuthSession, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
-        .validate_platform_api_path(auth_login_path())
+    let path = boundary
+        .validate_platform_api_path(auth_local_login_path())
         .map_err(|_| ServerFnError::new("auth login API path failed same-origin guard"))?;
-    Ok(LoginResponse {
-        session_id: "mock-session-id".to_string(),
-        user_id: "platform-engineer".to_string(),
-        display_name: "Platform Engineer".to_string(),
-        email: "platform-engineer@ryuki.local".to_string(),
-        roles: vec![
-            "platform-engineer".to_string(),
-            "operator".to_string(),
-            "viewer".to_string(),
-        ],
-        success: true,
-    })
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // Static demo: the auth gate is bypassed with the labeled synthetic
+        // session; the credentials are intentionally ignored.
+        let _ = (username, password);
+        return Ok(auth_session_fallback());
+    }
+    let body = serde_json::json!({ "username": username, "password": password });
+    let response = upstream
+        .post(path, Some(&body), None)
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if response.status == 401 {
+        // Deliberately generic: unknown user and wrong password are
+        // indistinguishable (no account enumeration).
+        return Err(ServerFnError::new("Invalid username or password"));
+    }
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "Sign-in failed",
+        )));
+    }
+    let login: ApiLoginSession = response
+        .json()
+        .map_err(|_| ServerFnError::new("Sign-in response was malformed"))?;
+    // The cookie lifetime tracks the upstream session expiry, falling back
+    // to one day when `expires_at` is absent or unparseable.
+    set_portal_session_cookie(
+        &login.session_id,
+        cookie_max_age_from_expires_at(&login.expires_at),
+    );
+    Ok(AuthSession::from(login))
 }
 
+/// Signs out: best-effort upstream logout with the forwarded session header,
+/// then clears the portal cookie regardless of the upstream outcome.
 #[server(prefix = "/portal/api", endpoint = "auth-logout")]
-pub async fn perform_logout() -> Result<LoginResponse, ServerFnError> {
+pub async fn perform_logout() -> Result<(), ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
-        .validate_platform_api_path(auth_logout_path())
+    let path = boundary
+        .validate_platform_api_path(auth_local_logout_path())
         .map_err(|_| ServerFnError::new("auth logout API path failed same-origin guard"))?;
-    Ok(LoginResponse {
-        session_id: String::new(),
-        user_id: String::new(),
-        display_name: String::new(),
-        email: String::new(),
-        roles: vec![],
-        success: true,
-    })
+    let upstream = upstream_context();
+    if upstream.live() {
+        let session_id = session_id_from_request().await;
+        let _ = upstream.post(path, None, session_id.as_deref()).await;
+    }
+    clear_portal_session_cookie();
+    Ok(())
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-list-data")]
 pub async fn get_request_list() -> Result<Vec<RequestSummary>, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(request_list_path())
         .map_err(|_| ServerFnError::new("request list API path failed same-origin guard"))?;
-    Ok(request_summary_fallbacks())
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(request_summary_fallbacks());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let list: Vec<ApiRequestSummary> = response
+                .json()
+                .map_err(|_| ServerFnError::new("request list response was malformed"))?;
+            Ok(list.into_iter().map(RequestSummary::from).collect())
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "request list fetch failed",
+        ))),
+        // Live mode never substitutes demo rows for an unreachable API;
+        // the list view renders an explicit unreachable state.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Live GET of a single request detail through the allowlisted lifecycle
+/// path; shared by detail reads, create follow-ups, and stage transitions.
+#[cfg(feature = "ssr")]
+async fn fetch_request_detail_live(
+    upstream: &UpstreamClient,
+    request_id: &str,
+) -> Result<RequestDetail, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_detail_path(request_id)
+        .map_err(|_| ServerFnError::new("request detail API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request detail API path failed same-origin guard"))?;
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .get(&path, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new("API unreachable"))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "request detail fetch failed",
+        )));
+    }
+    let detail: ApiRequestDetail = response
+        .json()
+        .map_err(|_| ServerFnError::new("request detail response was malformed"))?;
+    Ok(RequestDetail::from(detail))
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-detail-data")]
@@ -1147,7 +1411,26 @@ pub async fn get_request_detail(request_id: String) -> Result<RequestDetail, Ser
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request detail API path failed same-origin guard"))?;
-    Ok(request_detail_fallback(&request_id))
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(request_detail_fallback(&request_id));
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(&path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let detail: ApiRequestDetail = response
+                .json()
+                .map_err(|_| ServerFnError::new("request detail response was malformed"))?;
+            Ok(RequestDetail::from(detail))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "request detail fetch failed",
+        ))),
+        // Live mode never substitutes the demo detail for an unreachable
+        // API; the detail view renders an explicit unreachable state.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
 }
 
 #[cfg(any(feature = "ssr", test))]
@@ -1174,10 +1457,100 @@ fn reject_static_preview_request_action(
 #[server(prefix = "/portal/api", endpoint = "request-create-save")]
 pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDetail, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(request_create_path())
         .map_err(|_| ServerFnError::new("request create API path failed same-origin guard"))?;
-    reject_static_preview_request_create(payload)
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_create(payload);
+    }
+    // The portal `memory` field maps to the API `memory_gb` field.
+    let body = serde_json::json!({
+        "request_type": payload.request_type,
+        "name": payload.name,
+        "site": payload.site,
+        "environment": payload.environment,
+        "cpu": payload.cpu,
+        "memory_gb": payload.memory,
+        "justification": payload.justification,
+    });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(path, Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "request creation was rejected by the API",
+        )));
+    }
+    let created: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("request create response was malformed"))?;
+    let request_id = created
+        .get("id")
+        .and_then(|id| id.as_str())
+        .ok_or_else(|| ServerFnError::new("request create response did not include an id"))?
+        .to_string();
+    match fetch_request_detail_live(&upstream, &request_id).await {
+        Ok(detail) => Ok(detail),
+        // The request was created; if the follow-up read fails, return a
+        // minimal detail so the UI can still navigate to the new request.
+        Err(_) => Ok(RequestDetail {
+            id: request_id,
+            request_type: payload.request_type,
+            name: payload.name,
+            site: payload.site,
+            environment: payload.environment,
+            cpu: payload.cpu,
+            memory: payload.memory,
+            justification: payload.justification,
+            status: "intake".to_string(),
+            stage: "intake".to_string(),
+            created: String::new(),
+            updated: String::new(),
+            timeline: Vec::new(),
+            actions_available: actions_for_stage("intake"),
+        }),
+    }
+}
+
+/// Live POST of a lifecycle stage action. 2xx maps to an in-flow success
+/// badge with the freshly fetched stage; 4xx (lifecycle guards, role
+/// denials) maps to an in-flow failure badge carrying the API message;
+/// transport failures and 5xx surface as errors — mutations never degrade.
+#[cfg(feature = "ssr")]
+async fn dispatch_stage_action_live(
+    request_id: String,
+    action: &str,
+    path: &str,
+) -> Result<StageActionResponse, ServerFnError> {
+    let upstream = upstream_context();
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(path, None, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if response.is_success() {
+        let new_stage = fetch_request_detail_live(&upstream, &request_id)
+            .await
+            .map(|detail| detail.stage)
+            .unwrap_or_default();
+        Ok(StageActionResponse {
+            request_id,
+            success: true,
+            new_stage,
+            message: format!("{action} completed"),
+        })
+    } else {
+        Ok(StageActionResponse {
+            request_id,
+            success: false,
+            new_stage: String::new(),
+            message: api_error_text(&response, &format!("{action} was rejected by the API")),
+        })
+    }
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-validate")]
@@ -1188,7 +1561,11 @@ pub async fn validate_request(request_id: String) -> Result<StageActionResponse,
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request validate API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "validation")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "validation");
+    }
+    dispatch_stage_action_live(request_id, "validation", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-plan")]
@@ -1199,7 +1576,11 @@ pub async fn plan_request(request_id: String) -> Result<StageActionResponse, Ser
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request plan API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "planning")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "planning");
+    }
+    dispatch_stage_action_live(request_id, "planning", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-approve")]
@@ -1210,7 +1591,11 @@ pub async fn approve_request(request_id: String) -> Result<StageActionResponse, 
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request approve API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "approval")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "approval");
+    }
+    dispatch_stage_action_live(request_id, "approval", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-lock")]
@@ -1221,7 +1606,11 @@ pub async fn lock_request(request_id: String) -> Result<StageActionResponse, Ser
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request lock API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "locking")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "locking");
+    }
+    dispatch_stage_action_live(request_id, "locking", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-execute")]
@@ -1232,7 +1621,11 @@ pub async fn execute_request(request_id: String) -> Result<StageActionResponse, 
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "execution")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "execution");
+    }
+    dispatch_stage_action_live(request_id, "execution", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
@@ -1243,7 +1636,11 @@ pub async fn verify_request(request_id: String) -> Result<StageActionResponse, S
     boundary
         .validate_request_lifecycle_api_path(&path)
         .map_err(|_| ServerFnError::new("request verify API path failed same-origin guard"))?;
-    reject_static_preview_request_action(request_id, "verification")
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "verification");
+    }
+    dispatch_stage_action_live(request_id, "verification", &path).await
 }
 
 #[cfg(test)]
@@ -1280,6 +1677,55 @@ mod tests {
             Ok("/api/auth/session")
         );
         assert_ne!(auth_status_path(), auth_session_path());
+    }
+
+    #[test]
+    fn boundary_allows_local_auth_login_and_logout_routes() {
+        let boundary = PortalServerBoundary::static_dry_run();
+
+        assert_eq!(
+            boundary.validate_platform_api_path(auth_local_login_path()),
+            Ok("/api/auth/local/login")
+        );
+        assert_eq!(
+            boundary.validate_platform_api_path(auth_local_logout_path()),
+            Ok("/api/auth/local/logout")
+        );
+    }
+
+    #[test]
+    fn degraded_route_state_repoints_context_strip_labels() {
+        let snapshot = PortalRouteStateSnapshot::degraded_static_fallback()
+            .expect("degraded route state snapshot must build");
+
+        assert_eq!(snapshot.upstream_state, "degraded-static");
+        assert_eq!(snapshot.execution_mode, "degraded-static-fallback");
+        assert_eq!(
+            snapshot.execution_authority_label,
+            "Execution: blocked (API unreachable)"
+        );
+        for label in [
+            &snapshot.inventory_freshness_label,
+            &snapshot.backup_freshness_label,
+            &snapshot.monitoring_freshness_label,
+        ] {
+            assert_eq!(label, "API unreachable — static preview");
+        }
+        // Degradation never loosens the boundary flags.
+        assert!(!snapshot.http_request_allowed);
+        assert!(!snapshot.live_execution_allowed);
+    }
+
+    #[test]
+    fn live_route_state_is_labeled_live_without_loosening_boundary_flags() {
+        let snapshot = PortalRouteStateSnapshot::live_provider()
+            .expect("live route state snapshot must build");
+
+        assert_eq!(snapshot.upstream_state, "live");
+        assert_eq!(snapshot.execution_mode, "live-provider");
+        assert!(!snapshot.raw_payload_allowed);
+        assert!(!snapshot.secret_values_allowed);
+        assert!(!snapshot.customer_identifiers_allowed);
     }
 
     #[test]
@@ -1320,10 +1766,10 @@ mod tests {
     #[test]
     fn create_request_refuses_static_preview_persistence() {
         let payload = CreateRequestPayload {
-            request_type: "VM".to_string(),
+            request_type: "server-deployment".to_string(),
             name: "srv-app-01".to_string(),
-            site: "site-alpha".to_string(),
-            environment: "prod".to_string(),
+            site: "DEBER".to_string(),
+            environment: "production".to_string(),
             cpu: 4,
             memory: 16,
             justification: "Need capacity".to_string(),
@@ -1470,6 +1916,7 @@ mod tests {
 
         assert_eq!(snapshot.api_boundary, "same-origin-platform-api");
         assert_eq!(snapshot.execution_mode, "static-dry-run");
+        assert_eq!(snapshot.upstream_state, "static-dry-run");
         assert_eq!(
             snapshot.route_state_path,
             PORTAL_ROUTE_STATE_SERVER_FUNCTION_PATH

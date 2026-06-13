@@ -1,13 +1,10 @@
-use crate::models::auth_session_fallback;
-use crate::server_boundary::PortalRouteStateSnapshot;
+use crate::app::SessionResource;
+use crate::models::{auth_session_fallback, AuthSession};
+use crate::server_boundary::{perform_logout, PortalRouteStateSnapshot};
 use crate::views::dashboard::DashboardView;
 use crate::views::workspaces::WorkspaceSections;
 use crate::workspace_catalog::{role_satisfies, PRIMARY_NAV_ITEMS};
 use leptos::prelude::*;
-
-pub fn is_authenticated() -> bool {
-    true
-}
 
 /// The ryū logo mark shared with the ryuki.io landing page. Colors come from
 /// the shared `--logo-red`/`--logo-gold` tokens, which do not vary by theme;
@@ -51,23 +48,35 @@ pub fn BrandMark() -> impl IntoView {
 }
 
 #[component]
-pub fn Shell() -> impl IntoView {
-    let route_snapshot = PortalRouteStateSnapshot::static_dry_run()
-        .expect("portal route state snapshot must be static and allowlisted");
-    let auth_session = auth_session_fallback();
+pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
+    // The route snapshot arrives from the `load_portal_route_state` server
+    // function via app.rs, so the context strip and data-* attributes report
+    // the real upstream state (live / degraded-static / static-dry-run)
+    // instead of always claiming the static skeleton.
+    let degraded = route_snapshot.upstream_state == "degraded-static";
+    // The real session arrives through context from the auth gate in app.rs;
+    // the labeled synthetic fallback only covers out-of-gate renders.
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
     let home_href = route_snapshot.active_route.clone();
     let main_id = route_snapshot.active_workspace.clone();
     let activity_href = route_snapshot.activity_route.clone();
     let activity_action_label = route_snapshot.activity_action_label.clone();
     let site_scope_label = route_snapshot.site_scope_label.clone();
     let environment_scope_label = route_snapshot.environment_scope_label.clone();
-    let role_scope_label = route_snapshot.role_scope_label.clone();
+    // The role pill carries real role information — the single role name or
+    // the granted-role count — never the username dressed up as a role.
+    let role_scope_label = match auth_session.roles.as_slice() {
+        [] => "Role: none".to_string(),
+        [role] => format!("Role: {role}"),
+        roles => format!("Roles: {}", roles.len()),
+    };
     let inventory_freshness_label = route_snapshot.inventory_freshness_label.clone();
     let backup_freshness_label = route_snapshot.backup_freshness_label.clone();
     let monitoring_freshness_label = route_snapshot.monitoring_freshness_label.clone();
     let execution_authority_label = route_snapshot.execution_authority_label.clone();
     let api_boundary = route_snapshot.api_boundary.clone();
     let execution_mode = route_snapshot.execution_mode.clone();
+    let upstream_state = route_snapshot.upstream_state.clone();
     let route_state_path = route_snapshot.route_state_path.clone();
     let run_state_path = route_snapshot.run_state_path.clone();
     let route_state = route_snapshot.route_state.clone();
@@ -77,8 +86,24 @@ pub fn Shell() -> impl IntoView {
     let route_provider_calls_allowed = route_snapshot.provider_calls_allowed.to_string();
     let route_live_execution_allowed = route_snapshot.live_execution_allowed.to_string();
     let route_raw_state_allowed = route_snapshot.raw_route_state_allowed.to_string();
-    let user_name = auth_session.display_name.clone();
-    let user_roles = auth_session.roles.join(", ");
+    let user_scope_label = format!("User: {}", auth_session.display_name);
+    let user_roles = if auth_session.roles.is_empty() {
+        "none".to_string()
+    } else {
+        auth_session.roles.join(", ")
+    };
+
+    let session_resource = use_context::<SessionResource>();
+    let logout_action = Action::new(move |_: &()| async move {
+        let _ = perform_logout().await;
+        if let Some(resource) = session_resource {
+            resource.refetch();
+        }
+    });
+    let logout_pending = logout_action.pending();
+    let on_signout_click = move |_| {
+        logout_action.dispatch(());
+    };
 
     let (theme_icon, set_theme_icon) = signal(String::from("\u{263C}\u{FE0F}"));
 
@@ -183,8 +208,15 @@ pub fn Shell() -> impl IntoView {
                         <span class="pill role">{role_scope_label.clone()}</span>
                     </div>
                     <div class="session-info" aria-label="Session info">
-                        <span class="pill user">{user_name}</span>
+                        <span class="pill user">{user_scope_label}</span>
                         <span class="table-note">"Roles: " {user_roles}</span>
+                        <button
+                            class="signout-button"
+                            on:click=on_signout_click
+                            disabled=move || logout_pending.get()
+                        >
+                            "Sign out"
+                        </button>
                     </div>
                     <button
                         class="theme-toggle"
@@ -195,6 +227,15 @@ pub fn Shell() -> impl IntoView {
                     </button>
                 </div>
             </header>
+
+            <Show when=move || degraded>
+                <div class="boundary-degraded" role="status">
+                    <strong>"API unreachable"</strong>
+                    <span>
+                        " — the portal is showing a read-only static preview; sign-in and changes are unavailable until the platform API is reachable again."
+                    </span>
+                </div>
+            </Show>
 
             <nav class="nav" aria-label="Primary navigation">
                 {PRIMARY_NAV_ITEMS
@@ -214,6 +255,7 @@ pub fn Shell() -> impl IntoView {
                 id=main_id
                 data-api-boundary=api_boundary
                 data-execution-mode=execution_mode
+                data-upstream-state=upstream_state
                 data-route-state-path=route_state_path
                 data-run-state-path=run_state_path
                 data-route-state=route_state

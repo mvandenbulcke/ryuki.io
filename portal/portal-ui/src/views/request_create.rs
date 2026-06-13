@@ -7,6 +7,49 @@ fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
 }
 
+/// `(API value, display label)` pairs for the request-type select. The
+/// values must stay in lockstep with the API's `parse_request_type`
+/// vocabulary (sources/ryuki-api/src/contracts.rs) — anything else is
+/// rejected at intake.
+const REQUEST_TYPE_OPTIONS: &[(&str, &str)] = &[
+    ("server-deployment", "Server Deployment"),
+    ("patch-maintenance", "Patch Maintenance"),
+    ("reboot-orchestration", "Reboot Orchestration"),
+    ("controlled-restore", "Controlled Restore"),
+    ("zabbix-onboarding", "Zabbix Onboarding"),
+    ("cmdb-import", "CMDB Import"),
+    ("cmdb-update-export", "CMDB Update / Export"),
+    ("operator-runbook-launch", "Operator Runbook Launch"),
+    (
+        "application-environment-retirement",
+        "Application Environment Retirement",
+    ),
+    ("vm-decommission-quarantine", "VM Decommission / Quarantine"),
+    ("request-preflight", "Request Preflight"),
+    ("vm-day2-change", "VM Day-2 Change"),
+    ("snapshot-governance", "Snapshot Governance"),
+    ("backup-coverage-report", "Backup Coverage Report"),
+];
+
+/// `(API value, display label)` pairs for the site select; values mirror the
+/// engine's valid site codes (ryuki-engine request lifecycle).
+const SITE_OPTIONS: &[(&str, &str)] = &[
+    ("DEBER", "DEBER — Berlin"),
+    ("DEFRA", "DEFRA — Frankfurt"),
+    ("FRPAR", "FRPAR — Paris"),
+    ("GBLON", "GBLON — London"),
+    ("NLAMS", "NLAMS — Amsterdam"),
+];
+
+/// `(API value, display label)` pairs for the environment select; values
+/// mirror the engine's valid environments (ryuki-engine request lifecycle).
+const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
+    ("development", "Development"),
+    ("test", "Test"),
+    ("acceptance", "Acceptance"),
+    ("production", "Production"),
+];
+
 #[component]
 pub fn RequestCreate(
     #[prop(into)] on_created: Callback<String>,
@@ -15,11 +58,11 @@ pub fn RequestCreate(
     let create_path_guard = api_path(request_create_path());
 
     #[allow(deprecated)]
-    let (request_type, set_request_type) = create_signal("VM".to_string());
+    let (request_type, set_request_type) = create_signal("server-deployment".to_string());
     #[allow(deprecated)]
-    let (site, set_site) = create_signal("site-alpha".to_string());
+    let (site, set_site) = create_signal("DEBER".to_string());
     #[allow(deprecated)]
-    let (environment, set_environment) = create_signal("prod".to_string());
+    let (environment, set_environment) = create_signal("production".to_string());
     #[allow(deprecated)]
     let (name, set_name) = create_signal(String::new());
     #[allow(deprecated)]
@@ -49,7 +92,12 @@ pub fn RequestCreate(
                     on_created.run(detail.id);
                 }
                 Err(e) => {
-                    set_feedback.set(e.to_string());
+                    let text = e.to_string();
+                    let message = text
+                        .strip_prefix("error running server function: ")
+                        .map(str::to_string)
+                        .unwrap_or(text);
+                    set_feedback.set(message);
                     set_feedback_class.set("badge bad");
                 }
             }
@@ -89,11 +137,10 @@ pub fn RequestCreate(
                             set_request_type.set(event_target_value(&ev));
                         }
                     >
-                        <option value="VM">"VM"</option>
-                        <option value="Application">"Application"</option>
-                        <option value="SQL">"SQL"</option>
-                        <option value="Network">"Network"</option>
-                        <option value="Storage">"Storage"</option>
+                        {REQUEST_TYPE_OPTIONS
+                            .iter()
+                            .map(|(value, label)| view! { <option value=*value>{*label}</option> })
+                            .collect_view()}
                     </select>
                 </div>
 
@@ -107,8 +154,10 @@ pub fn RequestCreate(
                             set_site.set(event_target_value(&ev));
                         }
                     >
-                        <option value="site-alpha">"site-alpha"</option>
-                        <option value="site-bravo">"site-bravo"</option>
+                        {SITE_OPTIONS
+                            .iter()
+                            .map(|(value, label)| view! { <option value=*value>{*label}</option> })
+                            .collect_view()}
                     </select>
                 </div>
 
@@ -122,10 +171,10 @@ pub fn RequestCreate(
                             set_environment.set(event_target_value(&ev));
                         }
                     >
-                        <option value="dev">"dev"</option>
-                        <option value="test">"test"</option>
-                        <option value="staging">"staging"</option>
-                        <option value="prod">"prod"</option>
+                        {ENVIRONMENT_OPTIONS
+                            .iter()
+                            .map(|(value, label)| view! { <option value=*value>{*label}</option> })
+                            .collect_view()}
                     </select>
                 </div>
 
@@ -221,5 +270,73 @@ pub fn RequestCreate(
                 </div>
             </div>
         </article>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_type_options_match_api_intake_vocabulary() {
+        let values: Vec<&str> = REQUEST_TYPE_OPTIONS
+            .iter()
+            .map(|(value, _)| *value)
+            .collect();
+        // Pinned to parse_request_type in sources/ryuki-api/src/contracts.rs.
+        assert_eq!(
+            values,
+            vec![
+                "server-deployment",
+                "patch-maintenance",
+                "reboot-orchestration",
+                "controlled-restore",
+                "zabbix-onboarding",
+                "cmdb-import",
+                "cmdb-update-export",
+                "operator-runbook-launch",
+                "application-environment-retirement",
+                "vm-decommission-quarantine",
+                "request-preflight",
+                "vm-day2-change",
+                "snapshot-governance",
+                "backup-coverage-report",
+            ]
+        );
+    }
+
+    #[test]
+    fn site_options_match_engine_site_codes() {
+        let values: Vec<&str> = SITE_OPTIONS.iter().map(|(value, _)| *value).collect();
+        // Pinned to VALID_SITES in sources/ryuki-engine/src/request_lifecycle.rs.
+        assert_eq!(values, vec!["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"]);
+    }
+
+    #[test]
+    fn environment_options_match_engine_environments() {
+        let values: Vec<&str> = ENVIRONMENT_OPTIONS
+            .iter()
+            .map(|(value, _)| *value)
+            .collect();
+        // Pinned to VALID_ENVIRONMENTS in sources/ryuki-engine/src/request_lifecycle.rs.
+        assert_eq!(
+            values,
+            vec!["development", "test", "acceptance", "production"]
+        );
+    }
+
+    #[test]
+    fn every_option_has_a_humane_label_distinct_from_machine_values() {
+        for (value, label) in REQUEST_TYPE_OPTIONS
+            .iter()
+            .chain(SITE_OPTIONS)
+            .chain(ENVIRONMENT_OPTIONS)
+        {
+            assert!(!value.is_empty() && !label.is_empty());
+            assert!(
+                !label.contains("site-") && *label != "prod" && *label != "dev",
+                "label {label} must be display text, not legacy demo vocabulary"
+            );
+        }
     }
 }

@@ -608,14 +608,20 @@ pub fn operation_run_fallbacks() -> Vec<OperationRunSummary> {
     ]
 }
 
+/// Mirrors the engine `health_monitor::PlatformHealth` JSON. Unknown fields
+/// (such as the engine `source`) are tolerated; `components` is defaulted so
+/// trimmed payloads still decode.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PlatformHealth {
     pub overall_status: String,
+    #[serde(default)]
     pub components: Vec<String>,
     pub checks: Vec<HealthCheck>,
     pub timestamp: String,
 }
 
+/// Mirrors the engine `health_monitor::HealthCheck` JSON; the extra engine
+/// `source` field is ignored on decode.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct HealthCheck {
     pub name: String,
@@ -637,21 +643,91 @@ pub struct BoundaryStatusSnapshot {
     pub customer_identifiers_allowed: bool,
 }
 
+/// Mirrors `ryuki_engine::auth::AuthSession` field-for-field. The portal
+/// must not depend on ryuki-engine, so the shape is pinned by fixture tests
+/// instead of a shared type.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthSession {
     pub user_id: String,
     pub display_name: String,
     pub roles: Vec<String>,
+    pub token_valid: bool,
+    pub provider_mode: String,
 }
 
+/// Canonical POST /api/auth/local/login response. The `session_id` stays on
+/// the SSR side (portal cookie) and never reaches WASM.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub struct LoginResponse {
+pub struct ApiLoginSession {
     pub session_id: String,
     pub user_id: String,
     pub display_name: String,
-    pub email: String,
     pub roles: Vec<String>,
-    pub success: bool,
+    pub token_valid: bool,
+    pub provider_mode: String,
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+impl From<ApiLoginSession> for AuthSession {
+    fn from(login: ApiLoginSession) -> Self {
+        Self {
+            user_id: login.user_id,
+            display_name: login.display_name,
+            roles: login.roles,
+            token_valid: login.token_valid,
+            provider_mode: login.provider_mode,
+        }
+    }
+}
+
+/// Portal-facing platform summary for the dashboard/login context line.
+/// Mapped from the nested camelCase `/api/platform/summary` payload via
+/// [`ApiPlatformSummary`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PlatformSummaryContext {
+    pub product_name: String,
+    pub authentication_mode: String,
+    pub entra_groups_configured: bool,
+}
+
+/// Mirrors the `/api/platform/summary` JSON (camelCase, nested
+/// `localAuthorization` object). Unknown fields are tolerated.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPlatformSummary {
+    pub product_name: String,
+    #[serde(default)]
+    pub local_authorization: ApiLocalAuthorization,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiLocalAuthorization {
+    #[serde(default)]
+    pub authentication_mode: String,
+    #[serde(default)]
+    pub entra_groups_configured: bool,
+}
+
+impl From<ApiPlatformSummary> for PlatformSummaryContext {
+    fn from(summary: ApiPlatformSummary) -> Self {
+        Self {
+            product_name: summary.product_name,
+            authentication_mode: summary.local_authorization.authentication_mode,
+            entra_groups_configured: summary.local_authorization.entra_groups_configured,
+        }
+    }
+}
+
+/// Static fallback for the platform summary context. Served verbatim in
+/// static-dry-run mode and when the upstream API is unreachable in live mode.
+pub fn platform_summary_context_fallback() -> PlatformSummaryContext {
+    PlatformSummaryContext {
+        product_name: "Ryuki Infrastructure Platform".to_string(),
+        authentication_mode: "static-dry-run".to_string(),
+        entra_groups_configured: false,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -755,11 +831,27 @@ pub fn boundary_status_snapshot_fallback() -> BoundaryStatusSnapshot {
     }
 }
 
+/// Labeled synthetic session for the static-dry-run demo. The PlatformAdmin
+/// grant survives only behind the static-mode branch in the server boundary.
 pub fn auth_session_fallback() -> AuthSession {
     AuthSession {
         user_id: "platform-engineer".to_string(),
         display_name: "Platform Engineer".to_string(),
         roles: vec!["PlatformAdmin".to_string()],
+        token_valid: false,
+        provider_mode: "static-dry-run".to_string(),
+    }
+}
+
+/// Zero-role placeholder session rendered while the upstream API is
+/// unreachable in live mode; the shell shows it read-only with a banner.
+pub fn degraded_auth_session() -> AuthSession {
+    AuthSession {
+        user_id: "degraded".to_string(),
+        display_name: "Degraded read-only".to_string(),
+        roles: vec![],
+        token_valid: false,
+        provider_mode: "degraded-static-fallback".to_string(),
     }
 }
 
@@ -971,6 +1063,126 @@ pub struct RequestSummary {
     pub created: String,
 }
 
+/// Mirrors one element of the `GET /api/requests` list JSON. The list DTO
+/// omits `stage` and `environment`, so both are defaulted.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiRequestSummary {
+    pub request_id: String,
+    pub request_type: String,
+    pub status: String,
+    #[serde(default)]
+    pub stage: String,
+    pub name: String,
+    pub site: String,
+    #[serde(default)]
+    pub environment: String,
+    pub created_at: String,
+}
+
+impl From<ApiRequestSummary> for RequestSummary {
+    fn from(summary: ApiRequestSummary) -> Self {
+        let stage = if summary.stage.is_empty() {
+            // The list endpoint does not return the stage column; the status
+            // is the closest honest signal for the stage badge.
+            summary.status.clone()
+        } else {
+            normalize_api_stage(&summary.stage)
+        };
+        Self {
+            id: summary.request_id,
+            request_type: summary.request_type,
+            name: summary.name,
+            site: summary.site,
+            environment: summary.environment,
+            status: summary.status,
+            stage,
+            created: summary.created_at,
+        }
+    }
+}
+
+/// Mirrors the `GET /api/requests/{id}` detail JSON.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiRequestDetail {
+    pub request_id: String,
+    pub request_type: String,
+    pub status: String,
+    #[serde(default)]
+    pub stage: String,
+    pub site: String,
+    #[serde(default)]
+    pub environment: String,
+    pub name: String,
+    pub cpu: u32,
+    pub memory_gb: u32,
+    #[serde(default)]
+    pub justification: Option<String>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<ApiRequestDetail> for RequestDetail {
+    fn from(detail: ApiRequestDetail) -> Self {
+        let stage = normalize_api_stage(&detail.stage);
+        let timeline = vec![StageEvent {
+            stage: stage.clone(),
+            timestamp: detail.updated_at.clone(),
+            description: "Current lifecycle stage (stage history not yet persisted)".to_string(),
+        }];
+        let actions_available = actions_for_stage(&stage);
+        Self {
+            id: detail.request_id,
+            request_type: detail.request_type,
+            name: detail.name,
+            site: detail.site,
+            environment: detail.environment,
+            cpu: detail.cpu,
+            memory: detail.memory_gb,
+            justification: detail.justification.unwrap_or_default(),
+            status: detail.status,
+            stage,
+            created: detail.created_at,
+            updated: detail.updated_at,
+            timeline,
+            actions_available,
+        }
+    }
+}
+
+/// Maps the API `requests.stage` column vocabulary (action names such as
+/// `validate`) onto the portal display vocabulary (state names such as
+/// `validated`). Values already in the portal vocabulary pass through.
+pub fn normalize_api_stage(stage: &str) -> String {
+    match stage {
+        "validate" => "validated",
+        "plan" => "planned",
+        "approve" => "approved",
+        "lock" => "locked",
+        "execute" => "executed",
+        "verify" => "verified",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Lifecycle actions the portal offers for a request in the given (portal
+/// vocabulary) stage. Shared by the static fallback detail and the live
+/// detail mapping.
+pub fn actions_for_stage(stage: &str) -> Vec<String> {
+    match stage {
+        "intake" => vec!["validate".to_string()],
+        "validated" => vec!["plan".to_string()],
+        "planned" => vec!["approve".to_string(), "validate".to_string()],
+        "approved" => vec!["lock".to_string()],
+        "locked" => vec!["execute".to_string()],
+        "executed" => vec!["verify".to_string()],
+        "failed" => vec!["validate".to_string(), "plan".to_string()],
+        _ => vec!["validate".to_string()],
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RequestDetail {
     pub id: String,
@@ -1123,16 +1335,7 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
         },
     ];
 
-    let actions_available = match summary.stage.as_str() {
-        "intake" => vec!["validate".to_string()],
-        "validated" => vec!["plan".to_string()],
-        "planned" => vec!["approve".to_string(), "validate".to_string()],
-        "approved" => vec!["lock".to_string()],
-        "locked" => vec!["execute".to_string()],
-        "executed" => vec!["verify".to_string()],
-        "failed" => vec!["validate".to_string(), "plan".to_string()],
-        _ => vec!["validate".to_string()],
-    };
+    let actions_available = actions_for_stage(&summary.stage);
 
     RequestDetail {
         id: summary.id,
@@ -1558,3 +1761,157 @@ pub const DASHBOARD_SUMMARIES: &[SafeSummary] = &[
         redaction_state: "Safe summary",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_login_session_decodes_canonical_local_login_response() {
+        // Canonical POST /api/auth/local/login 200 body — the seam both the
+        // API and the portal test against.
+        let body = r#"{"session_id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"2026-06-13T12:00:00+00:00"}"#;
+        let login: ApiLoginSession = serde_json::from_str(body).expect("login body must decode");
+
+        assert_eq!(login.session_id, "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b");
+        assert_eq!(login.user_id, "admin");
+        assert_eq!(login.display_name, "admin");
+        assert_eq!(login.roles, vec!["PlatformAdmin".to_string()]);
+        assert!(login.token_valid);
+        assert_eq!(login.provider_mode, "local");
+
+        let session = AuthSession::from(login);
+        assert_eq!(session.user_id, "admin");
+        assert!(session.token_valid);
+        assert_eq!(session.provider_mode, "local");
+        // The session id must never cross into the AuthSession that reaches
+        // WASM: AuthSession has no session_id field by construction.
+        let serialized = serde_json::to_value(&session).expect("session must serialize");
+        assert!(serialized.get("session_id").is_none());
+    }
+
+    #[test]
+    fn auth_session_mirrors_engine_serialization_field_for_field() {
+        // Engine ryuki_engine::auth::AuthSession JSON shape (GET /api/auth/session).
+        let body = r#"{"user_id":"operator","display_name":"operator","roles":["VMwareOperator","WintelLinuxOperator"],"token_valid":true,"provider_mode":"persisted-session"}"#;
+        let session: AuthSession = serde_json::from_str(body).expect("session must decode");
+
+        assert_eq!(session.user_id, "operator");
+        assert_eq!(session.roles.len(), 2);
+        assert!(session.token_valid);
+        assert_eq!(session.provider_mode, "persisted-session");
+    }
+
+    #[test]
+    fn api_request_summary_decodes_list_dto_without_stage_or_environment() {
+        // GET /api/requests element shape: no stage, no environment.
+        let body = r#"{"request_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","request_type":"VM","status":"intake","name":"srv-app-01","site":"site-alpha","created_at":"2026-06-12T10:00:00+00:00"}"#;
+        let summary: ApiRequestSummary =
+            serde_json::from_str(body).expect("list DTO must decode with defaults");
+
+        assert_eq!(summary.stage, "");
+        assert_eq!(summary.environment, "");
+
+        let mapped = RequestSummary::from(summary);
+        assert_eq!(mapped.id, "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        // Missing stage falls back to the status signal.
+        assert_eq!(mapped.stage, "intake");
+        assert_eq!(mapped.created, "2026-06-12T10:00:00+00:00");
+    }
+
+    #[test]
+    fn api_request_detail_maps_to_portal_detail_with_honest_timeline() {
+        // GET /api/requests/{id} shape, including memory_gb and the API
+        // stage vocabulary ("validate" rather than "validated").
+        let body = r#"{"request_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","request_type":"VM","status":"validated","stage":"validate","site":"site-alpha","environment":"prod","name":"srv-app-01","cpu":4,"memory_gb":16,"justification":"Need capacity","created_by":"admin","created_at":"2026-06-12T10:00:00+00:00","updated_at":"2026-06-12T11:00:00+00:00"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+
+        assert_eq!(mapped.memory, 16);
+        assert_eq!(mapped.stage, "validated");
+        assert_eq!(mapped.actions_available, vec!["plan".to_string()]);
+        assert_eq!(mapped.timeline.len(), 1);
+        assert_eq!(mapped.timeline[0].stage, "validated");
+        assert_eq!(mapped.timeline[0].timestamp, "2026-06-12T11:00:00+00:00");
+        assert_eq!(
+            mapped.timeline[0].description,
+            "Current lifecycle stage (stage history not yet persisted)"
+        );
+    }
+
+    #[test]
+    fn api_request_detail_tolerates_null_justification() {
+        let body = r#"{"request_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","request_type":"VM","status":"intake","stage":"intake","site":"site-alpha","environment":"dev","name":"srv-app-02","cpu":2,"memory_gb":8,"justification":null,"created_by":null,"created_at":"2026-06-12T10:00:00+00:00","updated_at":"2026-06-12T10:00:00+00:00"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+
+        assert_eq!(mapped.justification, "");
+        assert_eq!(mapped.actions_available, vec!["validate".to_string()]);
+    }
+
+    #[test]
+    fn normalize_api_stage_maps_action_names_to_display_states() {
+        for (api, portal) in [
+            ("intake", "intake"),
+            ("validate", "validated"),
+            ("plan", "planned"),
+            ("approve", "approved"),
+            ("lock", "locked"),
+            ("execute", "executed"),
+            ("verify", "verified"),
+            ("validated", "validated"),
+            ("failed", "failed"),
+        ] {
+            assert_eq!(normalize_api_stage(api), portal);
+        }
+    }
+
+    #[test]
+    fn platform_summary_context_decodes_nested_camel_case_payload() {
+        // GET /api/platform/summary shape (nested localAuthorization block).
+        let body = r#"{"productName":"Ryuki Infrastructure Platform","lifecycleStages":["intake"],"components":["portal-ui"],"browserIsolation":true,"localAuthorization":{"authenticationMode":"local","configuredForProduction":false,"entraGroupsConfigured":false,"roleHeader":"X-Ryuki-Local-Role","requiredProductionProvider":"Microsoft Entra ID"}}"#;
+        let summary: ApiPlatformSummary =
+            serde_json::from_str(body).expect("platform summary must decode");
+        let context = PlatformSummaryContext::from(summary);
+
+        assert_eq!(context.product_name, "Ryuki Infrastructure Platform");
+        assert_eq!(context.authentication_mode, "local");
+        assert!(!context.entra_groups_configured);
+    }
+
+    #[test]
+    fn platform_summary_context_fallback_is_labeled_static() {
+        let fallback = platform_summary_context_fallback();
+        assert_eq!(fallback.authentication_mode, "static-dry-run");
+        assert!(!fallback.entra_groups_configured);
+    }
+
+    #[test]
+    fn platform_health_tolerates_engine_payload_shape() {
+        // Engine health_monitor JSON: PascalCase status enums, extra `source`
+        // fields, and (defensively) a missing `components` array.
+        let body = r#"{"overall_status":"Healthy","checks":[{"name":"database","component":"platform-db","status":"Healthy","source":"dependency-backed","last_check":"2026-06-12T10:00:00+00:00","message":"Database reachable"}],"timestamp":"2026-06-12T10:00:00+00:00","source":"dependency-backed"}"#;
+        let health: PlatformHealth =
+            serde_json::from_str(body).expect("engine health payload must decode");
+
+        assert_eq!(health.overall_status, "Healthy");
+        assert!(health.components.is_empty());
+        assert_eq!(health.checks.len(), 1);
+        assert_eq!(health.checks[0].component, "platform-db");
+    }
+
+    #[test]
+    fn request_detail_fallback_reuses_stage_action_mapping() {
+        let detail = request_detail_fallback("REQ-001");
+        assert_eq!(detail.stage, "intake");
+        assert_eq!(detail.actions_available, actions_for_stage("intake"));
+    }
+
+    #[test]
+    fn degraded_auth_session_grants_no_roles() {
+        let session = degraded_auth_session();
+        assert!(session.roles.is_empty());
+        assert!(!session.token_valid);
+        assert_eq!(session.provider_mode, "degraded-static-fallback");
+    }
+}

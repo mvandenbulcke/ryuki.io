@@ -5,11 +5,13 @@
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use axum::routing::any;
     use axum::{middleware, routing::get, Router};
     use leptos::prelude::*;
     use leptos_axum::{file_and_error_handler, generate_route_list, LeptosRoutes};
     use ryuki_portal_ui::app::{shell, App};
     use ryuki_portal_ui::server_boundary::PortalServerBoundary;
+    use ryuki_portal_ui::upstream::UpstreamClient;
 
     // Read Leptos config from the environment: cargo-leptos injects LEPTOS_*
     // vars when serving, and the container image sets them explicitly. The
@@ -22,13 +24,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     boundary.validate_platform_api_path("/api/platform/summary")?;
     let _core_read_plans = boundary.plan_core_platform_reads()?;
 
+    // One upstream HTTP client for the whole process, handed to server
+    // functions through Leptos context on both the SSR-render path and the
+    // explicit server-function route below.
+    let upstream = UpstreamClient::from_env();
+    let upstream_for_server_fns = upstream.clone();
+    let upstream_for_routes = upstream.clone();
+
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ready" }))
-        .leptos_routes(&leptos_options, routes, {
-            let leptos_options = leptos_options.clone();
-            move || shell(leptos_options.clone())
-        })
+        .route(
+            "/portal/api/{*fn_name}",
+            any(move |request: axum::extract::Request| {
+                let upstream = upstream_for_server_fns.clone();
+                async move {
+                    leptos_axum::handle_server_fns_with_context(
+                        move || provide_context(upstream.clone()),
+                        request,
+                    )
+                    .await
+                }
+            }),
+        )
+        .leptos_routes_with_context(
+            &leptos_options,
+            routes,
+            move || provide_context(upstream_for_routes.clone()),
+            {
+                let leptos_options = leptos_options.clone();
+                move || shell(leptos_options.clone())
+            },
+        )
         .fallback(file_and_error_handler(shell))
         .layer(middleware::from_fn(security_headers_middleware))
         .with_state(leptos_options);
