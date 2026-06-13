@@ -31,6 +31,7 @@ use crate::server_boundary::{
     PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
     PortalServerBoundary,
 };
+use crate::views::approvals::ApprovalsList;
 use crate::views::dashboard::DashboardView;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
@@ -175,6 +176,37 @@ pub fn RequestsWorkspaceView() -> impl IntoView {
             <WorkspaceSummaryCards only="requests"/>
             <section class="workspace-detail-grid" aria-label="Request workspace details">
                 <RequestList/>
+            </section>
+        </div>
+    }
+}
+
+/// `/approvals` — the approver's pending-decision queue.
+///
+/// The primary nav is already role-gated to DatacenterApprover/PlatformAdmin
+/// via `required_role`; this view re-gates on the `approve` capability so even
+/// a directly-navigated route hides the list from non-approvers.
+#[component]
+pub fn ApprovalsWorkspaceView() -> impl IntoView {
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let can_approve = session_can(&auth_session, "approve");
+
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="approvals"/>
+            <section class="workspace-detail-grid" aria-label="Approvals workspace details">
+                <Show
+                    when=move || can_approve
+                    fallback=|| {
+                        view! {
+                            <div class="request-list-empty" aria-label="No approver access">
+                                <p>"You do not have approver permissions."</p>
+                            </div>
+                        }
+                    }
+                >
+                    <ApprovalsList/>
+                </Show>
             </section>
         </div>
     }

@@ -2,19 +2,19 @@ use crate::api::{
     activity_audit_feed_path, activity_operation_queue_path, admin_feature_flag_governance_path,
     admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
     admin_sessions_path, admin_tokens_path, admin_worker_capability_path,
-    approval_decision_readiness_path, auth_local_login_path, auth_local_logout_path,
-    auth_login_path, auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
-    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
-    cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
-    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
-    datacenter_check_rack_space_path, datacenter_check_switchports_path,
-    datacenter_failing_checks_path, datacenter_full_readiness_path,
-    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
-    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
-    evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
-    inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
-    operations_runbook_launch_path, platform_health_path, platform_status_path,
-    platform_summary_path, policy_outcomes_path, request_create_path,
+    approval_decision_readiness_path, approvals_pending_path, auth_local_login_path,
+    auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
+    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
+    catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
+    cmdb_reconciliation_path, cmdb_relationship_graph_path, datacenter_check_cooling_path,
+    datacenter_check_power_path, datacenter_check_rack_space_path,
+    datacenter_check_switchports_path, datacenter_failing_checks_path,
+    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
+    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
+    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
+    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
+    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
+    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
     request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
@@ -105,6 +105,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     catalog_request_form_path,
     site_catalog_path,
     approval_decision_readiness_path,
+    approvals_pending_path,
     activity_operation_queue_path,
     activity_audit_feed_path,
     shift_queue_path,
@@ -1771,6 +1772,35 @@ pub async fn get_request_list() -> Result<Vec<RequestSummary>, ServerFnError> {
         ))),
         // Live mode never substitutes demo rows for an unreachable API;
         // the list view renders an explicit unreachable state.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+#[server(prefix = "/portal/api", endpoint = "approvals-pending-data")]
+pub async fn get_approvals_pending() -> Result<Vec<RequestSummary>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(approvals_pending_path())
+        .map_err(|_| ServerFnError::new("approvals pending API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // There is no honest synthetic per-approver demo set. Return an empty
+        // queue in static/degraded mode — consistent with Slice 1's no-DB []
+        // behavior and the Approvals inbox design (Risk #2).
+        return Ok(Vec::new());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let list: Vec<ApiRequestSummary> = response
+                .json()
+                .map_err(|_| ServerFnError::new("approvals pending response was malformed"))?;
+            Ok(list.into_iter().map(RequestSummary::from).collect())
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "approvals pending fetch failed",
+        ))),
         Err(_) => Err(ServerFnError::new("API unreachable")),
     }
 }

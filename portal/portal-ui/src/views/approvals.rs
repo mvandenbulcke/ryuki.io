@@ -1,14 +1,12 @@
-use crate::api::{platform_summary_path, request_list_path, same_origin_api_path};
+use crate::api::{approvals_pending_path, platform_summary_path, same_origin_api_path};
 use crate::models::{condense_timestamp, AuthSession, RequestSummary};
-use crate::server_boundary::get_request_list;
-use crate::workspace_catalog::session_can;
+use crate::server_boundary::get_approvals_pending;
+use crate::views::requests::{status_badge_class, status_label};
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
-/// Zero-capability session used when no `AuthSession` is in context. An absent
-/// context must HIDE capability-gated controls, never reveal them — so this is
-/// deliberately not `auth_session_fallback` (which carries PlatformAdmin).
+/// Zero-capability session: an absent context HIDES approvals, never reveals them.
 fn no_capability_session() -> AuthSession {
     AuthSession {
         user_id: String::new(),
@@ -23,78 +21,51 @@ fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
 }
 
-pub(crate) fn status_badge_class(status: &str) -> &'static str {
-    match status {
-        "intake" => "badge neutral",
-        "validated" => "badge good",
-        "approved" => "badge good",
-        "executed" => "badge good",
-        "failed" => "badge bad",
-        "rejected" | "cancelled" => "badge bad",
-        "executing" | "verifying" => "badge warn",
-        _ => "badge neutral",
-    }
-}
-
-pub(crate) fn status_label(status: &str) -> &'static str {
-    match status {
-        "intake" => "Intake",
-        "validated" => "Validated",
-        "approved" => "Approved",
-        "executed" => "Executed",
-        "failed" => "Failed",
-        "rejected" => "Rejected",
-        "cancelled" => "Cancelled",
-        &_ => "Unknown",
-    }
-}
-
+/// Approvals inbox — oldest-first queue of requests pending the current
+/// approver's decision. Rows deep-link to `/requests/{id}` where the
+/// existing approve/reject controls live.
 #[component]
-pub fn RequestList() -> impl IntoView {
-    let request_list_path_guard = api_path(request_list_path());
-    let list_resource = Resource::new(|| (), |_| get_request_list());
+pub fn ApprovalsList() -> impl IntoView {
+    let approvals_api_path_guard = api_path(approvals_pending_path());
+    let list_resource = Resource::new(|| (), |_| get_approvals_pending());
     let navigate = use_navigate();
     // The verified session is provided by AuthenticatedShell (app.rs). An
-    // absent context falls back to a zero-capability session so the control
+    // absent context falls back to a zero-capability session so the list
     // is hidden rather than shown.
-    let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
-    let can_request = session_can(&session, "request");
+    let _session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
 
     view! {
         <div class="request-list-view">
             <div class="request-list-toolbar">
-                <h2 id="request-list-title">"Requests"</h2>
-                <Show when=move || can_request>
-                    <a class="btn btn-primary" href="/requests/new">
-                        "New Request"
-                    </a>
-                </Show>
+                <h2 id="approvals-list-title">"Approvals — pending my decision"</h2>
             </div>
 
             <Suspense fallback=move || {
                 view! {
-                    <div class="request-list-loading" aria-busy="true" data-api-path=request_list_path_guard>
-                        <p>"Loading requests..."</p>
+                    <div
+                        class="request-list-loading"
+                        aria-busy="true"
+                        data-api-path=approvals_api_path_guard
+                    >
+                        <p>"Loading approvals..."</p>
                     </div>
                 }
             }>
                 {move || {
                     let navigate = navigate.clone();
                     Suspend::new(async move {
-                        let requests: Vec<RequestSummary> = match list_resource.await {
+                        let approvals: Vec<RequestSummary> = match list_resource.await {
                             Ok(list) => list,
-                            // Live mode with the API unreachable: an explicit
-                            // error state, never demo rows.
                             Err(_) => {
                                 return view! {
                                     <div
                                         class="request-list-error"
                                         role="alert"
-                                        data-api-path=request_list_path_guard
+                                        data-api-path=approvals_api_path_guard
                                     >
                                         <p>"Platform API unreachable"</p>
                                         <p class="table-note">
-                                            "Live request data cannot be loaded. Check the platform API and reload this page."
+                                            "Live approvals data cannot be loaded. Check the platform API and reload this page."
                                         </p>
                                     </div>
                                 }
@@ -102,11 +73,13 @@ pub fn RequestList() -> impl IntoView {
                             }
                         };
 
-                        if requests.is_empty() {
+                        if approvals.is_empty() {
                             view! {
-                                <div class="request-list-empty" aria-label="No requests">
-                                    <p>"No requests yet."</p>
-                                    <p class="table-note">"Create a new request to get started."</p>
+                                <div
+                                    class="request-list-empty"
+                                    aria-label="No pending approvals"
+                                >
+                                    <p>"No requests awaiting your approval."</p>
                                 </div>
                             }
                                 .into_any()
@@ -115,8 +88,8 @@ pub fn RequestList() -> impl IntoView {
                                 <div class="table-wrap">
                                 <table
                                     class="request-table dense-table"
-                                    aria-label="Request list"
-                                    data-api-path=request_list_path_guard
+                                    aria-label="Approvals list"
+                                    data-api-path=approvals_api_path_guard
                                 >
                                     <thead>
                                         <tr>
@@ -131,7 +104,7 @@ pub fn RequestList() -> impl IntoView {
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {requests
+                                        {approvals
                                             .into_iter()
                                             .map(|req| {
                                                 let row_id = req.id.clone();
@@ -153,17 +126,19 @@ pub fn RequestList() -> impl IntoView {
                                                         NavigateOptions::default(),
                                                     );
                                                 };
-                                                // Real button so the row is reachable and
-                                                // activatable by keyboard, not mouse-only.
-                                                let on_id_click = move |ev: leptos::ev::MouseEvent| {
-                                                    ev.stop_propagation();
-                                                    button_navigate(
-                                                        &format!("/requests/{button_id}"),
-                                                        NavigateOptions::default(),
-                                                    );
-                                                };
+                                                let on_id_click =
+                                                    move |ev: leptos::ev::MouseEvent| {
+                                                        ev.stop_propagation();
+                                                        button_navigate(
+                                                            &format!("/requests/{button_id}"),
+                                                            NavigateOptions::default(),
+                                                        );
+                                                    };
                                                 view! {
-                                                    <tr class="request-row clickable" on:click=on_row_click>
+                                                    <tr
+                                                        class="request-row clickable"
+                                                        on:click=on_row_click
+                                                    >
                                                         <td class="cell-id">
                                                             <button
                                                                 class="row-link"
@@ -177,9 +152,19 @@ pub fn RequestList() -> impl IntoView {
                                                         <td>{req.name}</td>
                                                         <td>{req.site}</td>
                                                         <td>{req.environment}</td>
-                                                        <td><span class=badge_class>{status_text}</span></td>
-                                                        <td><span class="badge neutral">{stage_text}</span></td>
-                                                        <td class="cell-date">{condense_timestamp(&req.created)}</td>
+                                                        <td>
+                                                            <span class=badge_class>
+                                                                {status_text}
+                                                            </span>
+                                                        </td>
+                                                        <td>
+                                                            <span class="badge neutral">
+                                                                {stage_text}
+                                                            </span>
+                                                        </td>
+                                                        <td class="cell-date">
+                                                            {condense_timestamp(&req.created)}
+                                                        </td>
                                                     </tr>
                                                 }
                                             })

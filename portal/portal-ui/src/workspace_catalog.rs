@@ -1,11 +1,11 @@
 use crate::api::{
     activity_operation_queue_path, admin_feature_flag_governance_path,
-    admin_worker_capability_path, catalog_offerings_path, catalog_request_form_path,
-    cmdb_reconciliation_path, cmdb_relationship_graph_path, dry_run_plan_path,
-    evidence_compliance_dashboard_path, evidence_export_retention_path,
-    inventory_ownership_risk_path, inventory_resource_overview_path,
-    operations_platform_health_path, operations_runbook_launch_path, request_intake_path,
-    shift_queue_path,
+    admin_worker_capability_path, approval_decision_readiness_path, approvals_pending_path,
+    catalog_offerings_path, catalog_request_form_path, cmdb_reconciliation_path,
+    cmdb_relationship_graph_path, dry_run_plan_path, evidence_compliance_dashboard_path,
+    evidence_export_retention_path, inventory_ownership_risk_path,
+    inventory_resource_overview_path, operations_platform_health_path,
+    operations_runbook_launch_path, request_intake_path, shift_queue_path,
 };
 use crate::models::AuthSession;
 
@@ -112,6 +112,11 @@ pub const PRIMARY_NAV_ITEMS: &[NavItem] = &[
         required_role: Some("Requester"),
     },
     NavItem {
+        label: "Approvals",
+        href: "/approvals",
+        required_role: Some("DatacenterApprover"),
+    },
+    NavItem {
         label: "Inventory",
         href: "/inventory",
         required_role: Some("ServiceDesk"),
@@ -180,6 +185,7 @@ pub fn match_portal_route(path: &str) -> Option<(String, &'static str)> {
         "/catalog" => "catalog",
         "/requests" | "/requests/new" => "requests",
         "/activity" => "activity",
+        "/approvals" => "approvals",
         "/inventory" => "inventory",
         "/cmdb" => "cmdb",
         "/evidence" => "evidence",
@@ -235,6 +241,25 @@ pub const PRIMARY_WORKSPACES: &[WorkspaceDefinition] = &[
         primary_api_path: request_intake_path,
         secondary_api_path: dry_run_plan_path,
         required_role: Some("Requester"),
+    },
+    WorkspaceDefinition {
+        id: "approvals",
+        href: "/approvals",
+        label: "Approvals",
+        title: "Approvals workspace",
+        badge: "Approver queue",
+        badge_class: "badge warn",
+        description: "Oldest-first queue of requests awaiting your approval decision, gated to DatacenterApprover and PlatformAdmin sessions.",
+        points: &[
+            "Pending decision queue",
+            "Oldest-first ordering",
+            "Deep-links to request detail",
+        ],
+        api_boundary: WORKSPACE_API_BOUNDARY,
+        execution_mode: WORKSPACE_EXECUTION_MODE,
+        primary_api_path: approvals_pending_path,
+        secondary_api_path: approval_decision_readiness_path,
+        required_role: Some("DatacenterApprover"),
     },
     WorkspaceDefinition {
         id: "activity",
@@ -431,6 +456,41 @@ mod tests {
         for capability in ["request", "execute", "approve", "audit"] {
             assert!(!session_can(&session, capability));
         }
+    }
+
+    #[test]
+    fn approvals_nav_item_is_gated_to_approver() {
+        let item = PRIMARY_NAV_ITEMS
+            .iter()
+            .find(|i| i.href == "/approvals")
+            .expect("approvals nav item must exist");
+        assert_eq!(item.required_role, Some("DatacenterApprover"));
+        // DatacenterApprover and PlatformAdmin can see the item.
+        assert!(role_satisfies(
+            &session_with_roles(&["DatacenterApprover"]),
+            item.required_role
+        ));
+        assert!(role_satisfies(
+            &session_with_roles(&["PlatformAdmin"]),
+            item.required_role
+        ));
+        // Requester and Auditor cannot.
+        assert!(!role_satisfies(
+            &session_with_roles(&["Requester"]),
+            item.required_role
+        ));
+        assert!(!role_satisfies(
+            &session_with_roles(&["Auditor"]),
+            item.required_role
+        ));
+    }
+
+    #[test]
+    fn route_matcher_resolves_approvals_route() {
+        assert_eq!(
+            match_portal_route("/approvals"),
+            Some(("/approvals".to_string(), "approvals"))
+        );
     }
 
     #[test]
