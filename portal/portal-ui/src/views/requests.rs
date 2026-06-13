@@ -2,6 +2,8 @@ use crate::api::{platform_summary_path, request_list_path, same_origin_api_path}
 use crate::models::RequestSummary;
 use crate::server_boundary::get_request_list;
 use leptos::prelude::*;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 
 fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
@@ -30,20 +32,18 @@ fn status_label(status: &str) -> &'static str {
 }
 
 #[component]
-pub fn RequestList(
-    #[prop(into)] on_select: Callback<String>,
-    #[prop(into)] on_create: Callback<()>,
-) -> impl IntoView {
+pub fn RequestList() -> impl IntoView {
     let request_list_path_guard = api_path(request_list_path());
     let list_resource = Resource::new(|| (), |_| get_request_list());
+    let navigate = use_navigate();
 
     view! {
         <div class="request-list-view">
             <div class="request-list-toolbar">
                 <h2 id="request-list-title">"Requests"</h2>
-                <button class="btn btn-primary" on:click=move |_| on_create.run(())>
+                <a class="btn btn-primary" href="/requests/new">
                     "New Request"
-                </button>
+                </a>
             </div>
 
             <Suspense fallback=move || {
@@ -54,6 +54,7 @@ pub fn RequestList(
                 }
             }>
                 {move || {
+                    let navigate = navigate.clone();
                     Suspend::new(async move {
                         let requests: Vec<RequestSummary> = match list_resource.await {
                             Ok(list) => list,
@@ -119,12 +120,22 @@ pub fn RequestList(
                                                 let badge_class = status_badge_class(&req.status);
                                                 let status_text = status_label(&req.status);
                                                 let stage_text = req.stage.clone();
-                                                let on_row_click = move |_| on_select.run(row_id.clone());
+                                                let row_navigate = navigate.clone();
+                                                let button_navigate = navigate.clone();
+                                                let on_row_click = move |_| {
+                                                    row_navigate(
+                                                        &format!("/requests/{row_id}"),
+                                                        NavigateOptions::default(),
+                                                    );
+                                                };
                                                 // Real button so the row is reachable and
                                                 // activatable by keyboard, not mouse-only.
                                                 let on_id_click = move |ev: leptos::ev::MouseEvent| {
                                                     ev.stop_propagation();
-                                                    on_select.run(button_id.clone());
+                                                    button_navigate(
+                                                        &format!("/requests/{button_id}"),
+                                                        NavigateOptions::default(),
+                                                    );
                                                 };
                                                 view! {
                                                     <tr class="request-row clickable" on:click=on_row_click>

@@ -23,9 +23,10 @@ use crate::server_boundary::{
     get_platform_status, load_portal_activity_run_state, load_portal_evidence_summary_status,
     load_portal_inventory_capacity_status, reset_platform_settings, save_platform_settings,
     PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
-    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalSecretReferenceSnapshot,
-    PortalServerBoundary,
+    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
+    PortalSecretReferenceSnapshot, PortalServerBoundary,
 };
+use crate::views::dashboard::DashboardView;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
 use crate::views::requests::RequestList;
@@ -42,62 +43,227 @@ fn resource_api_path<T>(resource: ApiResource<T>) -> &'static str {
         .unwrap_or(platform_summary_path())
 }
 
+/// Workspace summary cards from the typed registry. The dashboard renders
+/// the full role-filtered grid as the workspace overview; each routed
+/// workspace renders only its own card via `only`.
 #[component]
-pub fn WorkspaceSections() -> impl IntoView {
+fn WorkspaceSummaryCards(#[prop(optional)] only: Option<&'static str>) -> impl IntoView {
     // Real session roles arrive through context from the auth gate; the
     // labeled synthetic fallback only covers out-of-gate renders.
     let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
 
     view! {
+        <section class="workspace-sections" aria-label="Primary workspaces">
+            {PRIMARY_WORKSPACES
+                .iter()
+                .filter(move |workspace| {
+                    only.is_none_or(|id| workspace.id == id)
+                        && role_satisfies(&auth_session, workspace.required_role)
+                })
+                .map(|workspace| {
+                    let primary_api_path = api_path((workspace.primary_api_path)());
+                    let secondary_api_path = api_path((workspace.secondary_api_path)());
+                    let open_label = format!("Open {}", workspace.title);
+
+                    view! {
+                        <article
+                            class="workspace-panel"
+                            data-workspace-id=workspace.id
+                            data-api-path=primary_api_path
+                            data-secondary-path=secondary_api_path
+                            data-api-boundary=workspace.api_boundary
+                            data-execution-mode=workspace.execution_mode
+                        >
+                            <div class="workspace-panel-head">
+                                <span class="eyebrow">{workspace.label}</span>
+                                <h2>{workspace.title}</h2>
+                                <span class=workspace.badge_class>{workspace.badge}</span>
+                            </div>
+                            <p>{workspace.description}</p>
+                            <ul class="workspace-points">
+                                {workspace.points
+                                    .iter()
+                                    .map(|point| view! { <li>{*point}</li> })
+                                    .collect_view()}
+                            </ul>
+                            {(only.is_none())
+                                .then(|| {
+                                    view! {
+                                        <a
+                                            class="workspace-open-link"
+                                            href=workspace.href
+                                            aria-label=open_label
+                                        >
+                                            "Open workspace"
+                                        </a>
+                                    }
+                                })}
+                        </article>
+                    }
+                })
+                .collect_view()}
+        </section>
+    }
+}
+
+/// `/` — hero, dashboard summaries, and the workspace overview cards.
+#[component]
+pub fn DashboardWorkspaceView() -> impl IntoView {
+    // The route-state snapshot arrives through context from the shell
+    // layout; the static constructor only covers out-of-shell renders.
+    let route_snapshot = use_context::<PortalRouteStateSnapshot>().unwrap_or_else(|| {
+        PortalRouteStateSnapshot::static_dry_run()
+            .expect("static portal route state snapshot must build")
+    });
+    let activity_href = route_snapshot.activity_route.clone();
+    let activity_action_label = route_snapshot.activity_action_label.clone();
+
+    view! {
+        <section class="hero" aria-labelledby="dashboard-title">
+            <div>
+                <span class="eyebrow">"Dashboard"</span>
+                <h1 id="dashboard-title">"Operational control plane"</h1>
+                <p>
+                    "Safe summaries for platform health, readiness, protected workloads, monitoring coverage, and blocked execution."
+                </p>
+            </div>
+            <a class="primary-action" href=activity_href>{activity_action_label}</a>
+        </section>
+
+        <DashboardView/>
         <div class="workspace-area">
-            <section class="workspace-sections" aria-label="Primary workspaces">
-                {PRIMARY_WORKSPACES
-                    .iter()
-                    .filter(|workspace| role_satisfies(&auth_session, workspace.required_role))
-                    .map(|workspace| {
-                        let primary_api_path = api_path((workspace.primary_api_path)());
-                        let secondary_api_path = api_path((workspace.secondary_api_path)());
+            <WorkspaceSummaryCards/>
+        </div>
+    }
+}
 
-                        view! {
-                            <article
-                                class="workspace-panel"
-                                id=workspace.id
-                                data-api-path=primary_api_path
-                                data-secondary-path=secondary_api_path
-                                data-api-boundary=workspace.api_boundary
-                                data-execution-mode=workspace.execution_mode
-                            >
-                                <div class="workspace-panel-head">
-                                    <span class="eyebrow">{workspace.label}</span>
-                                    <h2>{workspace.title}</h2>
-                                    <span class=workspace.badge_class>{workspace.badge}</span>
-                                </div>
-                                <p>{workspace.description}</p>
-                                <ul class="workspace-points">
-                                    {workspace.points
-                                        .iter()
-                                        .map(|point| view! { <li>{*point}</li> })
-                                        .collect_view()}
-                                </ul>
-                            </article>
-                        }
-                    })
-                    .collect_view()}
-            </section>
-
-            <section class="workspace-detail-grid" aria-label="Request, catalog, secret reference, activity, inventory, CMDB, policy, evidence, operations, and security workspace details">
+/// `/catalog` — catalog readiness and the request-intake preview.
+#[component]
+pub fn CatalogWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="catalog"/>
+            <section class="workspace-detail-grid" aria-label="Catalog workspace details">
                 <CatalogWorkspaceDetail/>
                 <RequestIntakePreview/>
-                <SecretReferenceWorkspaceDetail/>
-                <RequestsWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/requests` — the request list; rows deep-link to `/requests/:id`.
+#[component]
+pub fn RequestsWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="requests"/>
+            <section class="workspace-detail-grid" aria-label="Request workspace details">
+                <RequestList/>
+            </section>
+        </div>
+    }
+}
+
+/// `/requests/new` — the request intake form.
+#[component]
+pub fn RequestNewWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <section class="workspace-detail-grid" aria-label="New request form">
+                <RequestCreate/>
+            </section>
+        </div>
+    }
+}
+
+/// `/requests/:id` — one request's detail and lifecycle actions.
+#[component]
+pub fn RequestDetailWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <section class="workspace-detail-grid" aria-label="Request detail">
+                <RequestDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/activity` — queue, run-state, and handover summaries.
+#[component]
+pub fn ActivityWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="activity"/>
+            <section class="workspace-detail-grid" aria-label="Activity workspace details">
                 <ActivityWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/inventory` — freshness, coverage, and capacity admission summaries.
+#[component]
+pub fn InventoryWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="inventory"/>
+            <section class="workspace-detail-grid" aria-label="Inventory workspace details">
                 <InventoryWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/cmdb` — file exchange, reconciliation, and relationship summaries.
+#[component]
+pub fn CmdbWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="cmdb"/>
+            <section class="workspace-detail-grid" aria-label="CMDB workspace details">
                 <CmdbWorkspaceDetail/>
-                <PolicyWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/evidence` — redaction, export, and retention readiness.
+#[component]
+pub fn EvidenceWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="evidence"/>
+            <section class="workspace-detail-grid" aria-label="Evidence workspace details">
                 <EvidenceWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/operations` — run state, platform health, and policy guardrails.
+#[component]
+pub fn OperationsWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="operations"/>
+            <section class="workspace-detail-grid" aria-label="Operations workspace details">
                 <OperationsWorkspaceDetail/>
-                <SecurityWorkspaceDetail/>
+                <PolicyWorkspaceDetail/>
+            </section>
+        </div>
+    }
+}
+
+/// `/admin` — platform settings, security posture, and secret references.
+#[component]
+pub fn AdminWorkspaceView() -> impl IntoView {
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="admin"/>
+            <section class="workspace-detail-grid" aria-label="Admin workspace details">
                 <AdminSettingsDetail/>
+                <SecurityWorkspaceDetail/>
+                <SecretReferenceWorkspaceDetail/>
             </section>
         </div>
     }
@@ -302,57 +468,6 @@ fn SecretReferenceWorkspaceDetail() -> impl IntoView {
             </div>
         </article>
     }
-}
-
-#[component]
-fn RequestsWorkspaceDetail() -> impl IntoView {
-    #[allow(deprecated)]
-    let (view, set_view) = create_signal(RequestsView::List);
-    #[allow(deprecated)]
-    let (selected_id, set_selected_id) = create_signal(String::new());
-
-    let on_select = Callback::new(move |id: String| {
-        set_selected_id.set(id);
-        set_view.set(RequestsView::Detail);
-    });
-
-    let on_create = Callback::new(move |_: ()| {
-        set_view.set(RequestsView::Create);
-    });
-
-    let on_back = Callback::new(move |_: ()| {
-        set_view.set(RequestsView::List);
-    });
-
-    let on_created = Callback::new(move |id: String| {
-        set_selected_id.set(id);
-        set_view.set(RequestsView::Detail);
-    });
-
-    view! {
-        {move || match view.get() {
-            RequestsView::List => {
-                view! { <RequestList on_select=on_select on_create=on_create/> }
-                    .into_any()
-            }
-            RequestsView::Detail => {
-                let id = selected_id.get();
-                view! { <RequestDetail request_id=id on_back=on_back/> }
-                    .into_any()
-            }
-            RequestsView::Create => {
-                view! { <RequestCreate on_created=on_created on_back=on_back/> }
-                    .into_any()
-            }
-        }}
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestsView {
-    List,
-    Detail,
-    Create,
 }
 
 #[component]
@@ -1335,7 +1450,7 @@ fn AdminSettingsDetail() -> impl IntoView {
     #[allow(deprecated)]
     let (feedback_class, set_feedback_class) = create_signal("badge neutral");
 
-    let save_action = Action::new_unsync(move |input: &PlatformSettingsSummary| {
+    let save_action = Action::new(move |input: &PlatformSettingsSummary| {
         let payload = input.clone();
         set_feedback.set("Saving...".to_string());
         set_feedback_class.set("badge neutral");
@@ -1358,7 +1473,7 @@ fn AdminSettingsDetail() -> impl IntoView {
         }
     });
 
-    let reset_action = Action::new_unsync(move |_: &()| {
+    let reset_action = Action::new(move |_: &()| {
         set_feedback.set("Resetting...".to_string());
         set_feedback_class.set("badge neutral");
         async move {

@@ -769,6 +769,21 @@ p {
   transition: background var(--transition), border-color var(--transition);
 }
 
+.workspace-open-link {
+  justify-self: start;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  transition: text-decoration-color var(--transition);
+}
+
+.workspace-open-link:hover,
+.workspace-open-link:focus-visible {
+  text-decoration-color: currentColor;
+}
+
 .workspace-detail-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -2610,6 +2610,7 @@ dependencies = [
  "leptos",
  "leptos_axum",
  "leptos_meta",
+ "leptos_router",
  "reqwest",
  "ryuki-core",
  "serde",

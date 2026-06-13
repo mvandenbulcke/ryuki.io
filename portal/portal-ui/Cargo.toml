@@ -13,6 +13,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 leptos = "0.8.9"
 leptos_axum = { version = "0.8.9", optional = true }
 leptos_meta = "0.8.6"
+leptos_router = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,6 +37,7 @@ ssr = [
     "dep:tokio",
     "leptos/ssr",
     "leptos_meta/ssr",
+    "leptos_router/ssr",
 ]
 
 [package.metadata.leptos]

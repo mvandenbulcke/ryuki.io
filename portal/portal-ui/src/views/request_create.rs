@@ -2,6 +2,8 @@ use crate::api::{platform_summary_path, request_create_path, same_origin_api_pat
 use crate::models::CreateRequestPayload;
 use crate::server_boundary::create_request;
 use leptos::prelude::*;
+use leptos_router::hooks::use_navigate;
+use leptos_router::NavigateOptions;
 
 fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
@@ -51,11 +53,9 @@ const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
 ];
 
 #[component]
-pub fn RequestCreate(
-    #[prop(into)] on_created: Callback<String>,
-    #[prop(into)] on_back: Callback<()>,
-) -> impl IntoView {
+pub fn RequestCreate() -> impl IntoView {
     let create_path_guard = api_path(request_create_path());
+    let navigate = use_navigate();
 
     #[allow(deprecated)]
     let (request_type, set_request_type) = create_signal("server-deployment".to_string());
@@ -80,16 +80,17 @@ pub fn RequestCreate(
 
     let is_valid = move || !name.get().trim().is_empty() && !justification.get().trim().is_empty();
 
-    let submit_action = Action::new_unsync(move |input: &CreateRequestPayload| {
+    let submit_action = Action::new(move |input: &CreateRequestPayload| {
         let payload = input.clone();
+        let navigate = navigate.clone();
         set_feedback.set("Submitting request...".to_string());
         set_feedback_class.set("badge neutral");
         async move {
             match create_request(payload).await {
-                Ok(detail) => {
+                Ok(_detail) => {
                     set_feedback.set("Request created".to_string());
                     set_feedback_class.set("badge good");
-                    on_created.run(detail.id);
+                    navigate("/requests", NavigateOptions::default());
                 }
                 Err(e) => {
                     let text = e.to_string();
@@ -115,9 +116,9 @@ pub fn RequestCreate(
                     <span class="eyebrow">"Requests"</span>
                     <h2 id="request-create-title">"New Request"</h2>
                 </div>
-                <button class="btn btn-secondary" on:click=move |_| on_back.run(())>
+                <a class="btn btn-secondary" href="/requests">
                     "Cancel"
-                </button>
+                </a>
             </div>
 
             <Show when=move || !feedback.get().is_empty()>
@@ -264,9 +265,9 @@ pub fn RequestCreate(
                     >
                         "Submit Request"
                     </button>
-                    <button class="btn btn-secondary" on:click=move |_| on_back.run(())>
+                    <a class="btn btn-secondary" href="/requests">
                         "Cancel"
-                    </button>
+                    </a>
                 </div>
             </div>
         </article>

@@ -1,10 +1,10 @@
 use crate::app::SessionResource;
 use crate::models::{auth_session_fallback, AuthSession};
 use crate::server_boundary::{perform_logout, PortalRouteStateSnapshot};
-use crate::views::dashboard::DashboardView;
-use crate::views::workspaces::WorkspaceSections;
-use crate::workspace_catalog::{role_satisfies, PRIMARY_NAV_ITEMS};
+use crate::workspace_catalog::{nav_item_is_active, role_satisfies, PRIMARY_NAV_ITEMS};
 use leptos::prelude::*;
+use leptos_router::components::Outlet;
+use leptos_router::hooks::use_location;
 
 /// The ryū logo mark shared with the ryuki.io landing page. Colors come from
 /// the shared `--logo-red`/`--logo-gold` tokens, which do not vary by theme;
@@ -57,10 +57,14 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
     // The real session arrives through context from the auth gate in app.rs;
     // the labeled synthetic fallback only covers out-of-gate renders.
     let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
-    let home_href = route_snapshot.active_route.clone();
+    // Routed views (the dashboard hero, for one) read the snapshot from
+    // context, so the layout shares it before destructuring its own labels.
+    provide_context(route_snapshot.clone());
+    // The current location drives the nav active state; the snapshot's
+    // active_route reports the matched route the server rendered.
+    let current_path = use_location().pathname;
+    let active_route = route_snapshot.active_route.clone();
     let main_id = route_snapshot.active_workspace.clone();
-    let activity_href = route_snapshot.activity_route.clone();
-    let activity_action_label = route_snapshot.activity_action_label.clone();
     let site_scope_label = route_snapshot.site_scope_label.clone();
     let environment_scope_label = route_snapshot.environment_scope_label.clone();
     // The role pill carries real role information — the single role name or
@@ -185,7 +189,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
     view! {
         <div class="shell">
             <header class="topbar" aria-label="Product shell">
-                <a class="brand" href=home_href aria-label="Ryuki Infrastructure Platform home">
+                <a class="brand" href="/" aria-label="Ryuki Infrastructure Platform home">
                     <BrandMark/>
                     <span>
                         <span class="brand-kicker">"Ryuki"</span>
@@ -242,9 +246,19 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                     .iter()
                     .filter(|item| role_satisfies(&auth_session, item.required_role))
                     .map(|item| {
-                        let class = if item.active { "active" } else { "" };
+                        let href = item.href;
+                        let class = move || {
+                            if nav_item_is_active(&current_path.get(), href) {
+                                "active"
+                            } else {
+                                ""
+                            }
+                        };
+                        let aria_current = move || {
+                            nav_item_is_active(&current_path.get(), href).then_some("page")
+                        };
                         view! {
-                            <a class=class href=item.href>{item.label}</a>
+                            <a class=class aria-current=aria_current href=href>{item.label}</a>
                         }
                     })
                     .collect_view()}
@@ -253,6 +267,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
             <main
                 class="workspace"
                 id=main_id
+                data-active-route=active_route
                 data-api-boundary=api_boundary
                 data-execution-mode=execution_mode
                 data-upstream-state=upstream_state
@@ -278,19 +293,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                     </div>
                 </section>
 
-                <section class="hero" aria-labelledby="dashboard-title">
-                    <div>
-                        <span class="eyebrow">"Dashboard"</span>
-                        <h1 id="dashboard-title">"Operational control plane"</h1>
-                        <p>
-                            "Safe summaries for platform health, readiness, protected workloads, monitoring coverage, and blocked execution."
-                        </p>
-                    </div>
-                    <a class="primary-action" href=activity_href>{activity_action_label}</a>
-                </section>
-
-                <DashboardView/>
-                <WorkspaceSections/>
+                <Outlet/>
             </main>
         </div>
     }

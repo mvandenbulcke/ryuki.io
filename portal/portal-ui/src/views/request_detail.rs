@@ -4,6 +4,7 @@ use crate::server_boundary::{
     validate_request, verify_request,
 };
 use leptos::prelude::*;
+use leptos_router::hooks::use_params_map;
 
 fn status_badge_class(status: &str) -> &'static str {
     match status {
@@ -52,19 +53,25 @@ fn action_label(action: &str) -> &'static str {
 }
 
 #[component]
-pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) -> impl IntoView {
-    let detail_path_guard =
-        request_detail_path(&request_id).unwrap_or_else(|_| platform_summary_path().to_string());
-    let loading_detail_path = detail_path_guard.clone();
-    let content_detail_path = detail_path_guard;
-    let detail_resource = Resource::new(move || request_id.clone(), get_request_detail);
+pub fn RequestDetail() -> impl IntoView {
+    // The request id arrives from the `/requests/:id` route, so request
+    // detail pages are directly addressable deep links.
+    let params = use_params_map();
+    let request_id = Memo::new(move |_| params.read().get("id").unwrap_or_default());
+    let detail_path = Memo::new(move |_| {
+        request_detail_path(&request_id.get())
+            .unwrap_or_else(|_| platform_summary_path().to_string())
+    });
+    let loading_detail_path = move || detail_path.get();
+    let content_detail_path = move || detail_path.get();
+    let detail_resource = Resource::new(move || request_id.get(), get_request_detail);
 
     #[allow(deprecated)]
     let (action_feedback, set_action_feedback) = create_signal(String::new());
     #[allow(deprecated)]
     let (action_class, set_action_class) = create_signal("badge neutral");
 
-    let validate_action = Action::new_unsync(move |id: &String| {
+    let validate_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Validating...".to_string());
         set_action_class.set("badge neutral");
@@ -86,7 +93,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         }
     });
 
-    let plan_action = Action::new_unsync(move |id: &String| {
+    let plan_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Planning...".to_string());
         set_action_class.set("badge neutral");
@@ -108,7 +115,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         }
     });
 
-    let approve_action = Action::new_unsync(move |id: &String| {
+    let approve_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Approving...".to_string());
         set_action_class.set("badge neutral");
@@ -130,7 +137,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         }
     });
 
-    let lock_action = Action::new_unsync(move |id: &String| {
+    let lock_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Locking...".to_string());
         set_action_class.set("badge neutral");
@@ -152,7 +159,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         }
     });
 
-    let execute_action = Action::new_unsync(move |id: &String| {
+    let execute_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Executing...".to_string());
         set_action_class.set("badge neutral");
@@ -174,7 +181,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         }
     });
 
-    let verify_action = Action::new_unsync(move |id: &String| {
+    let verify_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Verifying...".to_string());
         set_action_class.set("badge neutral");
@@ -200,13 +207,12 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
         <div class="request-detail-view">
             <Suspense fallback=move || {
                 view! {
-                    <div class="request-detail-loading" aria-busy="true" data-api-path=loading_detail_path.clone()>
+                    <div class="request-detail-loading" aria-busy="true" data-api-path=loading_detail_path>
                         <p>"Loading request detail..."</p>
                     </div>
                 }
             }>
                 {move || {
-                    let content_detail_path = content_detail_path.clone();
                     Suspend::new(async move {
                         let detail = match detail_resource.await {
                             Ok(d) => d,
@@ -217,18 +223,15 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
                                     <div
                                         class="request-detail-error"
                                         role="alert"
-                                        data-api-path=content_detail_path.clone()
+                                        data-api-path=content_detail_path
                                     >
                                         <p>"Platform API unreachable"</p>
                                         <p class="table-note">
                                             "Request detail cannot be loaded. Check the platform API and try again."
                                         </p>
-                                        <button
-                                            class="btn btn-secondary"
-                                            on:click=move |_| on_back.run(())
-                                        >
+                                        <a class="btn btn-secondary" href="/requests">
                                             "Back to list"
-                                        </button>
+                                        </a>
                                     </div>
                                 }
                                     .into_any();
@@ -245,7 +248,7 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
                             <article
                                 class="request-detail-panel"
                                 aria-label="Request detail"
-                                data-api-path=content_detail_path.clone()
+                                data-api-path=content_detail_path
                                 data-request-id=detail.id.clone()
                             >
                                 <div class="request-detail-head">
@@ -257,9 +260,9 @@ pub fn RequestDetail(request_id: String, #[prop(into)] on_back: Callback<()>) ->
                                         <span class=status_class>{detail.status.clone()}</span>
                                         <span class="badge neutral">"Stage: " {stage_text}</span>
                                     </div>
-                                    <button class="btn btn-secondary" on:click=move |_| on_back.run(())>
+                                    <a class="btn btn-secondary" href="/requests">
                                         "Back to list"
-                                    </button>
+                                    </a>
                                 </div>
 
                                 <div class="stage-progression" aria-label="Request stage progression">

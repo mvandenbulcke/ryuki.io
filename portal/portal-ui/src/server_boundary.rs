@@ -496,9 +496,9 @@ impl PortalRouteStateSnapshot {
             upstream_state: "static-dry-run".to_string(),
             route_state_path: PORTAL_ROUTE_STATE_SERVER_FUNCTION_PATH.to_string(),
             run_state_path: run_state_plan.path.to_string(),
-            active_route: "#dashboard".to_string(),
+            active_route: "/".to_string(),
             active_workspace: "dashboard".to_string(),
-            activity_route: "#activity".to_string(),
+            activity_route: "/activity".to_string(),
             activity_action_label: "Open shift queue".to_string(),
             site_scope_label: "Site: Global".to_string(),
             environment_scope_label: "Env: Production".to_string(),
@@ -546,6 +546,19 @@ impl PortalRouteStateSnapshot {
         snapshot.safe_summary =
             "Upstream API unreachable; static preview shown read-only".to_string();
         Ok(snapshot)
+    }
+
+    /// Reports the requested path as the matched route. The path is resolved
+    /// through the workspace catalog's route table, so unknown or unsafe
+    /// client-supplied paths fall back to the dashboard route instead of
+    /// being echoed into the snapshot.
+    pub fn with_active_path(mut self, requested_path: &str) -> Self {
+        let (active_route, active_workspace) =
+            crate::workspace_catalog::match_portal_route(requested_path)
+                .unwrap_or_else(|| ("/".to_string(), "dashboard"));
+        self.active_route = active_route;
+        self.active_workspace = active_workspace.to_string();
+        self
     }
 }
 
@@ -1019,22 +1032,27 @@ pub async fn load_portal_boundary_status() -> Result<PortalBoundaryStatusSnapsho
 }
 
 #[server(prefix = "/portal/api", endpoint = "route-state")]
-pub async fn load_portal_route_state() -> Result<PortalRouteStateSnapshot, ServerFnError> {
+pub async fn load_portal_route_state(
+    active_path: String,
+) -> Result<PortalRouteStateSnapshot, ServerFnError> {
     let unavailable = |_| ServerFnError::new("portal route state is unavailable");
     let upstream = upstream_context();
-    if !upstream.live() {
-        return PortalRouteStateSnapshot::static_dry_run().map_err(unavailable);
-    }
-    let boundary = PortalServerBoundary::static_dry_run();
-    let probe_path = boundary
-        .validate_platform_api_path(platform_summary_path())
-        .map_err(unavailable)?;
-    let session_id = session_id_from_request().await;
-    match upstream.get(probe_path, session_id.as_deref()).await {
-        Ok(_) => PortalRouteStateSnapshot::live_provider(),
-        Err(_) => PortalRouteStateSnapshot::degraded_static_fallback(),
-    }
-    .map_err(unavailable)
+    let snapshot = if !upstream.live() {
+        PortalRouteStateSnapshot::static_dry_run()
+    } else {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let probe_path = boundary
+            .validate_platform_api_path(platform_summary_path())
+            .map_err(unavailable)?;
+        let session_id = session_id_from_request().await;
+        match upstream.get(probe_path, session_id.as_deref()).await {
+            Ok(_) => PortalRouteStateSnapshot::live_provider(),
+            Err(_) => PortalRouteStateSnapshot::degraded_static_fallback(),
+        }
+    };
+    snapshot
+        .map(|snapshot| snapshot.with_active_path(&active_path))
+        .map_err(unavailable)
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-preflight-status")]
@@ -1922,9 +1940,9 @@ mod tests {
             PORTAL_ROUTE_STATE_SERVER_FUNCTION_PATH
         );
         assert_eq!(snapshot.run_state_path, operation_runs_path());
-        assert_eq!(snapshot.active_route, "#dashboard");
+        assert_eq!(snapshot.active_route, "/");
         assert_eq!(snapshot.active_workspace, "dashboard");
-        assert_eq!(snapshot.activity_route, "#activity");
+        assert_eq!(snapshot.activity_route, "/activity");
         assert_eq!(snapshot.site_scope_label, "Site: Global");
         assert_eq!(snapshot.environment_scope_label, "Env: Production");
         assert_eq!(snapshot.role_scope_label, "Role: Platform Engineer");
@@ -1940,6 +1958,45 @@ mod tests {
 
         serde_json::to_string(&snapshot)
             .expect("portal route state snapshot must serialize for Leptos server function");
+    }
+
+    #[test]
+    fn route_snapshot_reports_the_matched_route_path() {
+        let snapshot = PortalRouteStateSnapshot::static_dry_run()
+            .expect("portal route state snapshot must build")
+            .with_active_path("/requests/req-1234");
+
+        assert_eq!(snapshot.active_route, "/requests/req-1234");
+        assert_eq!(snapshot.active_workspace, "requests");
+
+        let snapshot = PortalRouteStateSnapshot::live_provider()
+            .expect("live route state snapshot must build")
+            .with_active_path("/admin");
+
+        assert_eq!(snapshot.active_route, "/admin");
+        assert_eq!(snapshot.active_workspace, "admin");
+        // Reporting the matched route never loosens the boundary flags.
+        assert!(!snapshot.http_request_allowed);
+        assert!(!snapshot.raw_route_state_allowed);
+    }
+
+    #[test]
+    fn route_snapshot_falls_back_to_dashboard_for_unknown_or_unsafe_paths() {
+        for path in [
+            "/not-a-workspace",
+            "//evil.example",
+            "https://evil.example/requests",
+            "/requests/../admin",
+            "/requests/<script>",
+            "javascript:alert(1)",
+        ] {
+            let snapshot = PortalRouteStateSnapshot::static_dry_run()
+                .expect("portal route state snapshot must build")
+                .with_active_path(path);
+
+            assert_eq!(snapshot.active_route, "/", "path {path} must fall back");
+            assert_eq!(snapshot.active_workspace, "dashboard");
+        }
     }
 
     #[test]
