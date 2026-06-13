@@ -937,7 +937,7 @@ async fn request_counter_middleware(
         normalize_metrics_path(request.uri().path())
     );
     {
-        let mut counts = per_endpoint().counts.lock().unwrap();
+        let mut counts = lock_or_recover(&per_endpoint().counts);
         *counts.entry(label).or_insert(0) += 1;
     }
     next.run(request).await
@@ -976,6 +976,14 @@ fn duration_tracker() -> &'static DurationTracker {
     })
 }
 
+/// Acquires a mutex guard, recovering from poisoning instead of panicking.
+/// These mutexes guard best-effort metrics state only; a poisoned lock
+/// (from a panic elsewhere) must never cascade into an API outage. A
+/// possibly-inconsistent metric read after a panic is acceptable.
+fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -> Response {
     let start = Instant::now();
     let method = request.method().clone();
@@ -1000,7 +1008,7 @@ async fn timing_middleware(request: HttpRequest<Body>, next: middleware::Next) -
     );
 
     let tracker = duration_tracker();
-    let mut durations = tracker.durations.lock().unwrap();
+    let mut durations = lock_or_recover(&tracker.durations);
     if durations.len() >= 10_000 {
         durations.remove(0);
     }
@@ -1687,7 +1695,7 @@ async fn metrics() -> Response {
     let mut body = ryuki_engine::health_monitor::metrics_text_with_api_requests(count);
 
     let tracker = duration_tracker();
-    let durations = tracker.durations.lock().unwrap();
+    let durations = lock_or_recover(&tracker.durations);
     if !durations.is_empty() {
         let dur_count = durations.len() as u64;
         let sum_ms: f64 = durations.iter().map(|&d| d as f64 / 1000.0).sum();
@@ -1709,7 +1717,7 @@ async fn metrics() -> Response {
 
     body.push_str("# HELP ryuki_api_requests_per_endpoint_total Requests per endpoint\n");
     body.push_str("# TYPE ryuki_api_requests_per_endpoint_total counter\n");
-    let counts = per_endpoint().counts.lock().unwrap();
+    let counts = lock_or_recover(&per_endpoint().counts);
     let mut sorted: Vec<_> = counts.iter().collect();
     sorted.sort_by_key(|(k, _)| *k);
     for (label, n) in &sorted {
@@ -1789,6 +1797,23 @@ async fn not_found() -> (StatusCode, Json<ApiError>) {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[test]
+    fn lock_or_recover_returns_usable_guard_after_poison() {
+        use std::sync::{Arc, Mutex};
+        let m = Arc::new(Mutex::new(0u64));
+        // Poison the mutex: lock it in a thread that panics while holding the guard.
+        let m2 = Arc::clone(&m);
+        let handle = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("intentional panic while holding the lock");
+        });
+        assert!(handle.join().is_err()); // thread panicked -> mutex now poisoned
+                                         // Helper must still return a usable guard without panicking.
+        let mut g = lock_or_recover(&m); // would panic with .lock().unwrap()
+        *g += 1;
+        assert_eq!(*g, 1);
+    }
 
     #[test]
     fn test_auth_log_metadata_header_present() {
