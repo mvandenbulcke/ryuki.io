@@ -281,7 +281,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                 data-raw-route-state-allowed=route_raw_state_allowed
             >
                 <section class="context" aria-label="Operational context" data-safe-summary=route_safe_summary>
-                    <div>
+                    <div class="context-scope">
                         <span class="eyebrow">"Context"</span>
                         <strong>{site_scope_label} " / " {environment_scope_label}</strong>
                     </div>
