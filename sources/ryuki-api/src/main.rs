@@ -86,8 +86,9 @@ async fn resolve_request_session(
     match auth_mode {
         AuthMode::MockDryRun | AuthMode::StaticDryRun => (AuthSession::static_dry_run(), None),
         // Local mode without a persisted session is unauthenticated: zero
-        // roles, token_valid=false. Unsafe methods 401 until login; GET stays
-        // anonymous this wave (read authentication is a later wave).
+        // roles, token_valid=false. Both unsafe methods AND non-exempt reads
+        // 401 until login (B3) — the portal sends X-Ryuki-Session-Id after the
+        // local login flow.
         AuthMode::Local => (unverified_session("local-unauthenticated"), None),
         // EntraId: a real bearer token is cryptographically validated by the
         // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
@@ -303,21 +304,27 @@ async fn auth_session_from_persisted_session(
 ) -> Option<(AuthSession, SessionIdSource)> {
     // API-token bearers (`ryk_...`) are resolved BEFORE the UUID/cookie path: a
     // `ryk_` string is not a valid UUID, so without this explicit branch it
-    // would silently fall through to the UUID parse and become unverified. The
-    // branch runs even when no DB pool is available so an API-token bearer can
-    // never leak into the session-id resolution path.
+    // would silently fall through to the UUID parse and become unverified.
+    //
+    // B5: only a SUCCESSFUL token resolution early-returns. A bogus or
+    // unresolvable `ryk_` bearer (including the no-DB case where it cannot be
+    // validated) must NOT shadow a valid `X-Ryuki-Session-Id` — it falls
+    // through to the session-id resolution below. `session_id_from_headers`
+    // already prefers the header over the bearer, so the fall-through correctly
+    // honors the valid session header.
     if let Some(token) = bearer_value(auth_header) {
         if token.strip_prefix(API_TOKEN_PREFIX).is_some() {
-            let Some(pool) = crate::database::get_db() else {
-                return Some((
-                    unverified_session("api-token-no-db"),
-                    SessionIdSource::Bearer,
-                ));
-            };
-            return Some((
-                resolve_api_token(token, pool).await,
-                SessionIdSource::Bearer,
-            ));
+            if let Some(pool) = crate::database::get_db() {
+                let candidate = resolve_api_token(token, pool).await;
+                if candidate.token_valid {
+                    return Some((candidate, SessionIdSource::Bearer));
+                }
+                // Token did not resolve to a valid credential: fall through so a
+                // valid X-Ryuki-Session-Id header is still honored.
+            }
+            // No pool (token cannot be validated) OR a failed resolution: do
+            // NOT early-return unverified — fall through to session-id
+            // resolution.
         }
     }
 
@@ -357,10 +364,37 @@ fn is_unsafe_method(method: &Method) -> bool {
 }
 
 fn is_auth_exempt_path(path: &str) -> bool {
-    // local logout stays exempt so an expired session can still clear cookies
+    // Exempt = reachable WITHOUT a resolved session. Two groups:
+    //   1. the 4 auth POSTs (login/logout x2) — login mints a session,
+    //      logout stays exempt so an expired session can still clear cookies;
+    //   2. the pre-login GET reads the portal hits before a session exists,
+    //      plus the infra probes (/health, /ready) which must never 401.
+    // B3: groups (2) are added so read-authentication does not break the
+    // portal's bootstrap or liveness/readiness probes.
+    //   /api/platform/summary is the bootstrap endpoint the LOGIN VIEW itself
+    //   fetches before any session exists, to choose its sign-in copy
+    //   (authenticationMode local|entra-id|static-dry-run). Without the
+    //   exemption an anonymous fetch 401s and the login page renders the
+    //   "Platform API unreachable" degraded arm instead of the correct
+    //   local-mode note, breaking the local-mode portal. The payload is
+    //   non-sensitive branding/mode metadata only (product name, lifecycle
+    //   stage labels, component/guardrail names, auth mode, an
+    //   entra-groups-configured boolean) — no request data, secrets, tenant
+    //   ids, or network values — so it is safe to read pre-login.
     matches!(
         path,
-        "/api/auth/login" | "/api/auth/logout" | "/api/auth/local/login" | "/api/auth/local/logout"
+        // auth POSTs
+        "/api/auth/login"
+            | "/api/auth/logout"
+            | "/api/auth/local/login"
+            | "/api/auth/local/logout"
+            // pre-login portal reads + infra probes (GET)
+            | "/health"
+            | "/ready"
+            | "/api/auth/status"
+            | "/api/auth/session"
+            | "/api/auth/roles"
+            | "/api/platform/summary"
     )
 }
 
@@ -548,6 +582,46 @@ fn route_permission_for(_method: &Method, path: &str) -> &'static str {
         .unwrap_or(DEFAULT_ROUTE_PERMISSION)
 }
 
+/// Read families that carry identity/secret-grade data and require `admin` to
+/// read, not the ordinary `audit` read tier. These are disjoint family roots
+/// (no longest-match needed): an `admin` is returned if ANY matches.
+static SENSITIVE_READ_PREFIXES: &[&str] =
+    &["/api/protect/secrets", "/api/ops/emergency", "/api/admin"];
+
+/// Resolves the permission required to READ (safe method) a path. Reuse of
+/// `route_permission_for` is wrong for reads because the mutating table maps
+/// families like `/api/protect`->execute and `/api/requests`->request, which
+/// would lock a plain auditor out of ordinary GETs. Instead: sensitive read
+/// prefixes require `admin`; everything else is an ordinary read requiring
+/// `audit`. A logged-in Auditor (holds `audit`) reads ordinary GETs but 403s on
+/// the sensitive prefixes; a static-dry-run/PlatformAdmin session satisfies
+/// both via the superuser model, so the demo and mock mode keep reading.
+fn read_permission_for(path: &str) -> &'static str {
+    let sensitive = SENSITIVE_READ_PREFIXES
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")));
+    if sensitive {
+        "admin"
+    } else {
+        "audit"
+    }
+}
+
+/// Whether `session` may read `path`. Sensitive prefixes require `admin`;
+/// ordinary reads accept any standard read permission — `audit`
+/// (Auditor/operators/approver/service-desk) OR `request`
+/// (Requester/service-desk) — so a Requester can view their own requests.
+/// `admin` satisfies everything via the check_permission superuser rule.
+fn read_authorized(session: &AuthSession, path: &str) -> bool {
+    match read_permission_for(path) {
+        "admin" => ryuki_engine::auth::check_permission(session, "admin"),
+        _ => {
+            ryuki_engine::auth::check_permission(session, "audit")
+                || ryuki_engine::auth::check_permission(session, "request")
+        }
+    }
+}
+
 /// Builds the 403 ProblemDetails response for a missing mutating permission.
 fn forbidden(required: &str) -> Response {
     let body = serde_json::to_string(&ApiError::with_detail(
@@ -588,17 +662,18 @@ fn bind_address_is_loopback(bind_address: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolves the session, enforces the 401 verified-auth gate, then the
-/// mutating-route RBAC gate, before handing off to the handler.
+/// Resolves the session, enforces the 401 verified-auth gates (unsafe + read),
+/// then the RBAC gate, before handing off to the handler.
 ///
-/// SCOPED DEFERRAL — GET reads are intentionally NOT authenticated this wave.
-/// The RBAC gate below is wrapped in `is_unsafe_method`, so GETs never hit it:
-/// mock/static-dry-run demos and the local-mode portal keep rendering reads
-/// anonymously. Read authentication (audit-tier GETs and dropping the
-/// `is_unsafe_method` precondition) is a known, SEQUENCED deferral to the Entra
-/// wave — it is gated on real Entra token validation so EntraId deployments are
-/// not locked out of reads, and on keeping the static/mock demos zero-friction.
-/// This is a deliberate boundary, not an oversight.
+/// READ AUTHENTICATION (B3): non-exempt GETs are now authenticated. A read
+/// requires a resolved session UNLESS the session is static-dry-run, which is
+/// admitted so the GitHub Pages demo and mock mode keep rendering reads
+/// anonymously. Ordinary reads require the `audit` tier; sensitive read
+/// prefixes (`/api/protect/secrets`, `/api/ops/emergency`, `/api/admin`)
+/// require `admin`. Mutations are unchanged. The exempt set
+/// (`is_auth_exempt_path`) covers the auth POSTs plus the pre-login portal
+/// reads and infra probes so the portal bootstrap and liveness/readiness checks
+/// are never gated.
 async fn auth_middleware(
     State(validator): State<Arc<EntraTokenValidator>>,
     headers: HeaderMap,
@@ -633,29 +708,49 @@ async fn auth_middleware(
         "auth middleware"
     );
 
+    // 401 gate for UNSAFE methods (POST/PUT/PATCH/DELETE): a verified or
+    // static-dry-run session is required; cookie-only sessions are refused
+    // (CSRF defense). Unchanged.
     if !session_authorizes_request(&method, &path, &session, session_source) {
-        let body = serde_json::to_string(&ApiError::new(
-            "AUTH_REQUIRED",
-            "Verified authentication is required for this operation",
-        ))
-        .unwrap_or_else(|_| {
-            r#"{"error":"AUTH_REQUIRED","message":"Verified authentication is required for this operation"}"#.into()
-        });
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
+        return auth_required_response();
     }
 
-    // Mutating-route RBAC gate. Runs only for unsafe, non-exempt methods (GET
-    // reads are deferred per the doc comment above) and AFTER the 401 gate, so
-    // an unauthenticated caller still 401s and only an authenticated-but-
-    // underprivileged caller 403s. Handler-level check_permission calls stay as
+    // B3: 401 gate for SAFE methods (reads). A non-exempt GET now requires a
+    // resolved session UNLESS it is static-dry-run — that admission keeps the
+    // GitHub Pages demo and mock mode reading anonymously (token_valid=false,
+    // provider_mode=="static-dry-run"). A Local-mode anonymous GET (an
+    // unverified, zero-role session that is NOT static-dry-run) 401s, which is
+    // correct: the portal sends X-Ryuki-Session-Id after login. The CSRF
+    // cookie-only restriction does NOT apply to reads (GETs are safe), so the
+    // Cookie==>false rule is intentionally not reused here.
+    let read_requires_session = !is_unsafe_method(&method) && !is_auth_exempt_path(&path);
+    if read_requires_session && !session.token_valid && session.provider_mode != "static-dry-run" {
+        return auth_required_response();
+    }
+
+    // RBAC gate. Runs for EVERY non-exempt method (B3 dropped the
+    // `is_unsafe_method` precondition so GETs are gated too) and AFTER the 401
+    // gates, so an unauthenticated caller still 401s and only an
+    // authenticated-but-underprivileged caller 403s. The only difference is
+    // WHICH permission the path maps to: mutations use the mutating route
+    // table; reads use the read-permission tier (audit, or admin for sensitive
+    // read prefixes). Handler-level check_permission calls stay as
     // defense-in-depth.
-    if is_unsafe_method(&method) && !is_auth_exempt_path(&path) {
-        let required = route_permission_for(&method, &path);
-        if !ryuki_engine::auth::check_permission(&session, required) {
+    if !is_auth_exempt_path(&path) {
+        let required = if is_unsafe_method(&method) {
+            route_permission_for(&method, &path)
+        } else {
+            read_permission_for(&path)
+        };
+        // Mutations require the exact route permission; reads use the shared
+        // read_authorized tier (sensitive -> admin; ordinary -> audit OR
+        // request) so a Requester can view their own requests.
+        let authorized = if is_unsafe_method(&method) {
+            ryuki_engine::auth::check_permission(&session, required)
+        } else {
+            read_authorized(&session, &path)
+        };
+        if !authorized {
             tracing::warn!(
                 user_id = %session.user_id,
                 method = %method,
@@ -663,12 +758,56 @@ async fn auth_middleware(
                 required,
                 "authorization denied: missing required permission"
             );
+            // B7: audit the denial for AUTHENTICATED callers only. The
+            // token_valid guard keeps anonymous callers (who already 401 at the
+            // gates above for unsafe/sensitive/Local reads) from flooding the
+            // trail; static-dry-run (token_valid=false) never fails a check
+            // anyway (superuser), so it is intentionally not recorded here. A
+            // failure to record never changes the 403.
+            if session.token_valid {
+                audit::record_denied(
+                    crate::database::get_db(),
+                    &session,
+                    &audit::AuditRecord {
+                        action: "authz.denied",
+                        request_id: None,
+                        from_status: None,
+                        to_status: "denied",
+                        from_stage: None,
+                        to_stage: "denied",
+                        detail: serde_json::json!({
+                            "method": method.as_str(),
+                            "path": path,
+                            "required": required,
+                        }),
+                        outcome: "denied",
+                    },
+                )
+                .await;
+            }
             return forbidden(required);
         }
     }
 
     request.extensions_mut().insert(session);
     next.run(request).await
+}
+
+/// The 401 AUTH_REQUIRED response, shared by the unsafe-method gate and the B3
+/// read-auth gate.
+fn auth_required_response() -> Response {
+    let body = serde_json::to_string(&ApiError::new(
+        "AUTH_REQUIRED",
+        "Verified authentication is required for this operation",
+    ))
+    .unwrap_or_else(|_| {
+        r#"{"error":"AUTH_REQUIRED","message":"Verified authentication is required for this operation"}"#.into()
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 async fn request_id_middleware(mut request: HttpRequest<Body>, next: middleware::Next) -> Response {
@@ -2766,12 +2905,250 @@ mod tests {
             );
         }
     }
+
+    // ---- B3: read authentication ----
+
+    /// A logged-in Auditor: holds exactly `audit`, fails `admin`. The read tier
+    /// (ordinary reads need `audit`, sensitive reads need `admin`) is built so
+    /// an Auditor reads ordinary GETs but is refused sensitive ones.
+    fn auditor_session() -> AuthSession {
+        AuthSession {
+            user_id: "auditor-1".into(),
+            display_name: "Auditor One".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+        }
+    }
+
+    /// Hardcoded representative list of non-exempt GET routes the API exposes,
+    /// kept in sync by hand with `contracts::routes()` (mirrors the
+    /// MUTATING_ROUTES pattern). Covers all three sensitive read prefixes plus a
+    /// spread of ordinary reads. The walk test below pins the read tier and the
+    /// gate invariants against every entry.
+    const GET_ROUTES: &[&str] = &[
+        // ordinary reads (audit tier).
+        // NOTE: /api/platform/summary is intentionally NOT here — it is
+        // auth-exempt (the pre-login portal bootstrap read), asserted
+        // separately in test_platform_summary_is_pre_login_exempt.
+        "/api/requests",
+        "/api/requests/00000000-0000-0000-0000-000000000000",
+        "/api/requests/00000000-0000-0000-0000-000000000000/audit",
+        "/api/catalog/categories",
+        "/api/identity/shares",
+        "/api/audit/compliance/summary",
+        "/api/ops/runbook/catalog",
+        "/api/ops/incident/active",
+        "/api/observe/logs/coverage",
+        "/api/cmdb/export",
+        "/api/analytics/capacity",
+        "/api/network/dns/records",
+        "/api/datacenter/storage/arrays",
+        "/api/maintain/patch/compliance",
+        // sensitive reads (admin tier)
+        "/api/protect/secrets",
+        "/api/protect/secrets/s1",
+        "/api/protect/secrets/due",
+        "/api/ops/emergency/active",
+        "/api/ops/emergency/history",
+        "/api/ops/emergency/stats",
+        "/api/admin/tokens",
+        "/api/admin/sessions",
+        "/api/admin/platform-settings",
+        "/api/admin/rbac-roles",
+    ];
+
+    /// `read_permission_for` returns `admin` for each sensitive prefix and
+    /// `audit` for a representative ordinary path.
+    #[test]
+    fn test_read_permission_tier() {
+        // ordinary read
+        assert_eq!(read_permission_for("/api/requests"), "audit");
+        // each sensitive prefix root + a sub-path under it
+        assert_eq!(read_permission_for("/api/protect/secrets"), "admin");
+        assert_eq!(read_permission_for("/api/protect/secrets/s1"), "admin");
+        assert_eq!(read_permission_for("/api/ops/emergency"), "admin");
+        assert_eq!(read_permission_for("/api/ops/emergency/history"), "admin");
+        assert_eq!(read_permission_for("/api/admin"), "admin");
+        assert_eq!(read_permission_for("/api/admin/tokens"), "admin");
+        // a near-miss that is NOT a sensitive prefix stays audit
+        assert_eq!(
+            read_permission_for("/api/protect/repository-capacity"),
+            "audit"
+        );
+        assert_eq!(read_permission_for("/api/ops/runbook/catalog"), "audit");
+    }
+
+    /// B3/B6 reconciliation: the login view fetches `/api/platform/summary`
+    /// BEFORE any session exists, to choose its sign-in copy. It must therefore
+    /// be auth-exempt (readable anonymously) so an anonymous fetch does not 401
+    /// and force the login page into the "Platform API unreachable" degraded
+    /// arm instead of the correct local-mode note. The other pre-login portal
+    /// reads stay exempt; an ordinary gated read (e.g. /api/requests) and every
+    /// sensitive read stay NON-exempt.
+    #[test]
+    fn test_platform_summary_is_pre_login_exempt() {
+        assert!(
+            is_auth_exempt_path("/api/platform/summary"),
+            "/api/platform/summary must be readable pre-login so the local-mode \
+             login copy renders instead of the degraded API-unreachable arm"
+        );
+        // The other pre-login bootstrap reads remain exempt.
+        assert!(is_auth_exempt_path("/api/auth/status"));
+        assert!(is_auth_exempt_path("/api/auth/session"));
+        assert!(is_auth_exempt_path("/api/auth/roles"));
+        // Ordinary and sensitive reads stay gated (NOT exempt).
+        assert!(!is_auth_exempt_path("/api/requests"));
+        assert!(!is_auth_exempt_path("/api/protect/secrets"));
+        assert!(!is_auth_exempt_path("/api/ops/emergency/history"));
+        assert!(!is_auth_exempt_path("/api/admin/tokens"));
+    }
+
+    /// The exact read-auth admission predicate used in `auth_middleware`: a
+    /// non-exempt read is admitted only when the session is verified
+    /// (token_valid) OR static-dry-run. Returns true == admitted (no 401).
+    fn read_admitted(session: &AuthSession) -> bool {
+        session.token_valid || session.provider_mode == "static-dry-run"
+    }
+
+    /// Router-walk: every non-exempt GET must resolve to a non-empty read
+    /// permission; an anonymous Local session (zero roles, NOT static) is
+    /// refused at the read-auth gate (would 401); static-dry-run passes every
+    /// GET (demo invariant); a logged-in Auditor passes every NON-sensitive GET
+    /// and is refused every sensitive one.
+    #[test]
+    fn test_get_routes_read_auth_walk() {
+        let anon = unverified_session("local-unauthenticated");
+        let static_session = AuthSession::static_dry_run();
+        let auditor = auditor_session();
+
+        for path in GET_ROUTES {
+            assert!(
+                !is_auth_exempt_path(path),
+                "GET_ROUTES must not contain an exempt path: {path}"
+            );
+            let required = read_permission_for(path);
+            assert!(
+                !required.is_empty(),
+                "read permission for {path} must be non-empty"
+            );
+            assert!(
+                ["audit", "admin"].contains(&required),
+                "read permission for {path} must be a read tier, got {required}"
+            );
+
+            // Anonymous Local read is refused at the 401 read-auth gate.
+            assert!(
+                !read_admitted(&anon),
+                "anonymous local session must be refused read of {path}"
+            );
+
+            // static-dry-run is admitted AND passes the RBAC check for every GET
+            // (demo invariant: PlatformAdmin superuser).
+            assert!(read_admitted(&static_session));
+            assert!(
+                ryuki_engine::auth::check_permission(&static_session, required),
+                "static-dry-run must pass GET {path} (requires {required})"
+            );
+
+            // A logged-in Auditor is admitted (token_valid) and passes ordinary
+            // reads but is refused sensitive ones — asserted via the same
+            // read_authorized helper the gate uses.
+            assert!(read_admitted(&auditor));
+            if required == "admin" {
+                assert!(
+                    !read_authorized(&auditor, path),
+                    "auditor must be refused sensitive GET {path}"
+                );
+            } else {
+                assert!(
+                    read_authorized(&auditor, path),
+                    "auditor must pass ordinary GET {path}"
+                );
+            }
+
+            // A Requester (holds only `request`) must be able to read ordinary
+            // GETs (e.g. view their own requests) but never sensitive ones.
+            let requester = AuthSession {
+                user_id: "req-1".into(),
+                display_name: "Requester One".into(),
+                roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+                token_valid: true,
+                provider_mode: "persisted-session".into(),
+            };
+            if required == "admin" {
+                assert!(
+                    !read_authorized(&requester, path),
+                    "requester must be refused sensitive GET {path}"
+                );
+            } else {
+                assert!(
+                    read_authorized(&requester, path),
+                    "requester must pass ordinary GET {path}"
+                );
+            }
+        }
+    }
+
+    /// B3 (a): a credential-less GET to each sensitive path is refused — 401 at
+    /// the read-auth gate (anonymous, non-static), and 403 for a logged-in
+    /// Auditor (admitted but lacks `admin`). Modeled at the predicate level
+    /// (the gate is private middleware): anonymous -> not admitted (401);
+    /// Auditor -> admitted but `check_permission(admin)` false (403).
+    #[test]
+    fn test_sensitive_get_without_credentials_401_or_403() {
+        let anon = unverified_session("local-unauthenticated");
+        let auditor = auditor_session();
+        for path in [
+            "/api/protect/secrets",
+            "/api/ops/emergency/history",
+            "/api/admin/tokens",
+        ] {
+            let required = read_permission_for(path);
+            assert_eq!(required, "admin", "{path} must be a sensitive read");
+            // anonymous, non-static -> 401 (not admitted)
+            assert!(!read_admitted(&anon), "{path} anon must 401");
+            // auditor -> admitted (no 401) but 403 (lacks admin)
+            assert!(read_admitted(&auditor), "{path} auditor admitted");
+            assert!(
+                !ryuki_engine::auth::check_permission(&auditor, required),
+                "{path} auditor must 403"
+            );
+        }
+    }
+
+    /// B7 drift: the central gate's resolved permission for each lifecycle path
+    /// must match the permission the handler's own `check_permission` arg uses,
+    /// so the gate and handler can never silently diverge.
+    #[test]
+    fn test_route_permission_matches_handler_guard() {
+        let id = "00000000-0000-0000-0000-000000000000";
+        let cases: &[(String, &str)] = &[
+            (format!("/api/requests/{id}/validate"), "execute"),
+            (format!("/api/requests/{id}/plan"), "execute"),
+            (format!("/api/requests/{id}/lock"), "execute"),
+            (format!("/api/requests/{id}/execute"), "execute"),
+            (format!("/api/requests/{id}/verify"), "execute"),
+            (format!("/api/requests/{id}/approve"), "approve"),
+            (format!("/api/requests/{id}/reject"), "approve"),
+            (format!("/api/requests/{id}/cancel"), "request"),
+            ("/api/requests".to_string(), "request"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                route_permission_for(&Method::POST, path),
+                *expected,
+                "gate permission for {path} must match handler guard {expected}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod db_tests {
     #[tokio::test]
     async fn test_migrations_run_against_pg18() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
         if std::env::var("RYUKI_DATABASE_URL").is_err() {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;

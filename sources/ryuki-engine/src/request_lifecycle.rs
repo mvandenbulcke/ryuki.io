@@ -5,15 +5,6 @@ use uuid::Uuid;
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 const VALID_ENVIRONMENTS: &[&str] = &["development", "test", "acceptance", "production"];
-// Terminal/blocked statuses refuse further forward transitions (validate, plan,
-// approve, lock, execute, verify). Rejected and Cancelled are the new terminal
-// "say no" states alongside Failed and Completed.
-const BLOCKED_STATUSES: &[RequestStatus] = &[
-    RequestStatus::Failed,
-    RequestStatus::Completed,
-    RequestStatus::Rejected,
-    RequestStatus::Cancelled,
-];
 
 fn has_completed_stage(request: &Request, name: &str) -> bool {
     request
@@ -105,16 +96,24 @@ pub fn create_request(
 }
 
 pub fn validate_request(request: &Request) -> Result<ValidationResult, String> {
-    if BLOCKED_STATUSES.contains(&request.status) {
+    // From-status precondition: validation is a Draft|Intake-only act. This
+    // mirrors the from-status guards on plan/approve/lock/etc. and prevents a
+    // later-stage request (Validated/Planned/Approved/Locked/Executing/
+    // Verifying, or any terminal status) from being rewound to "validated".
+    // A failed ValidationResult (passed:false) — not an Err — is returned so
+    // the API maps it to a 400 validation_failed_response, and
+    // transition_status's Intake->Validated arm turns !passed into an Err, so
+    // terminal-rewind protection holds on both call paths.
+    if !matches!(request.status, RequestStatus::Draft | RequestStatus::Intake) {
         return Ok(ValidationResult {
             passed: false,
             errors: vec![format!(
-                "Cannot validate request in status: {:?}",
+                "Cannot validate request in status {:?}. Validation is only allowed from Draft or Intake.",
                 request.status
             )],
             warnings: Vec::new(),
-            failed_rules: vec!["blocked-status".into()],
-            remediation: vec!["Move request back to Draft or Intake before validation.".into()],
+            failed_rules: vec!["invalid-from-status".into()],
+            remediation: vec!["Validation can only run on a Draft or Intake request.".into()],
         });
     }
 
@@ -727,6 +726,72 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("Datacenter Approver"))
         );
+    }
+
+    /// B1: validation may run only from Draft or Intake. A request already in a
+    /// later (or terminal) status must be REFUSED with a non-passing
+    /// ValidationResult tagged `invalid-from-status`, so it can never be rewound
+    /// to "validated" by re-running validate.
+    fn assert_validate_refused_from(status: RequestStatus) {
+        let mut req = make_test_request();
+        req.approval_route.push("Datacenter Approver".into());
+        req.status = status.clone();
+        let result = validate_request(&req).unwrap();
+        assert!(
+            !result.passed,
+            "validate must refuse rewind from {:?}",
+            status
+        );
+        assert!(
+            result
+                .failed_rules
+                .iter()
+                .any(|r| r == "invalid-from-status"),
+            "failed_rule must be invalid-from-status for {:?}, got {:?}",
+            status,
+            result.failed_rules
+        );
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_validated() {
+        assert_validate_refused_from(RequestStatus::Validated);
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_planned() {
+        assert_validate_refused_from(RequestStatus::Planned);
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_approved() {
+        assert_validate_refused_from(RequestStatus::Approved);
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_locked() {
+        assert_validate_refused_from(RequestStatus::Locked);
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_executing() {
+        assert_validate_refused_from(RequestStatus::Executing);
+    }
+
+    #[test]
+    fn test_validate_request_refuses_rewind_from_verifying() {
+        assert_validate_refused_from(RequestStatus::Verifying);
+    }
+
+    #[test]
+    fn test_validate_request_allowed_from_draft() {
+        let mut req = make_test_request();
+        req.approval_route.push("Datacenter Approver".into());
+        req.status = RequestStatus::Draft;
+        // Draft is an allowed from-status: it passes the precondition and
+        // reaches the field-level rules (which pass for a valid request).
+        let result = validate_request(&req).unwrap();
+        assert!(result.passed);
     }
 
     #[test]

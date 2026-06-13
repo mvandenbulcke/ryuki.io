@@ -173,6 +173,20 @@ pub fn LoginView() -> impl IntoView {
                                     </div>
                                 }
                                     .into_any()
+                            } else if mode == "local" {
+                                // Local-auth mode is the expected, fully working
+                                // path: the form above signs in against local
+                                // platform credentials. Keep the copy reassuring
+                                // and neutral rather than warning-styled.
+                                view! {
+                                    <div class="login-note">
+                                        <span class="eyebrow">"Local accounts"</span>
+                                        <p>
+                                            "Sign-in uses your local platform credentials. Enter the username and password issued for this platform above."
+                                        </p>
+                                    </div>
+                                }
+                                    .into_any()
                             } else if mode == "entra-id" {
                                 view! {
                                     <div class="login-warning">
@@ -184,10 +198,14 @@ pub fn LoginView() -> impl IntoView {
                                 }
                                     .into_any()
                             } else {
+                                // Generic fallback for any future/unknown mode.
+                                // Must NOT misreport as Entra-specific.
                                 view! {
                                     <div class="login-warning">
-                                        <span class="eyebrow">"Entra ID SSO"</span>
-                                        <p>"Entra ID SSO (not configured)"</p>
+                                        <span class="eyebrow">"Sign-in"</span>
+                                        <p>
+                                            "This platform is configured with an authentication mode this portal build does not recognize. Use a local platform account to sign in."
+                                        </p>
                                     </div>
                                 }
                                     .into_any()

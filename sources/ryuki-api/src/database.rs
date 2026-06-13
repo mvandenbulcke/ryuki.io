@@ -145,6 +145,15 @@ pub fn set_migration_status_for_test(status: MigrationStatus) {
     set_migration_status(status);
 }
 
+/// Process-wide serialization guard for DB-touching integration tests. All
+/// tests that connect to and query the live Postgres (the migrations check in
+/// `main::db_tests` and the lifecycle/logout/token tests in
+/// `contracts::db_lifecycle_tests`) acquire this so they run mutually
+/// exclusive — otherwise the shared, small connection pools are exhausted and
+/// queries `PoolTimedOut` under `cargo test`'s parallel scheduling.
+#[cfg(test)]
+pub static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::{migration_status, set_migration_status_for_test, MigrationStatus};

@@ -2406,7 +2406,7 @@ struct CreateRequest {
     justification: String,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct DbRequestRow {
     id: Uuid,
     request_type: String,
@@ -6325,23 +6325,93 @@ async fn auth_local_login(
     Ok(([(SET_COOKIE, cookie)], Json(response_body)).into_response())
 }
 
-async fn auth_local_logout(headers: HeaderMap) -> Result<Response, (StatusCode, Json<ApiError>)> {
+/// One persisted session row, used by the logout path to capture actor identity
+/// for the `session.logout` audit row before the row is deleted.
+#[derive(sqlx::FromRow)]
+struct LogoutSessionRow {
+    user_id: String,
+    display_name: String,
+    roles: Vec<String>,
+}
+
+/// Logs the caller out of their OWN session and ONLY their own session (B4).
+///
+/// The session id is resolved exclusively from the caller's own credential
+/// surface (`X-Ryuki-Session-Id`, `Authorization: Bearer <uuid>`, then the
+/// `ryuki_session` cookie) via `session_id_from_headers` — there is NO
+/// client-supplied body id, so no victim-id termination vector exists. The
+/// flow is: resolve id -> best-effort SELECT for actor attribution -> DELETE
+/// that one id -> best-effort `session.logout` audit row. It is idempotent: a
+/// missing/invalid/expired session simply records nothing and returns. Audit
+/// or DB failures never change the caller's logout outcome.
+async fn logout_caller_session(headers: &HeaderMap) {
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
-    // Same session resolution order as auth_middleware (X-Ryuki-Session-Id,
-    // Bearer UUID, ryuki_session cookie); local logout only ever deletes the
-    // caller's own session and is idempotent for missing/invalid sessions.
-    if let Some((Ok(session_id), _source)) = crate::session_id_from_headers(&headers, auth_header) {
-        if let Some(pool) = get_db() {
-            map_auth_session_persistence_result(
-                sqlx::query("DELETE FROM sessions WHERE id = $1")
-                    .bind(session_id)
-                    .execute(pool)
-                    .await,
-                "delete",
-            )?;
-            tracing::info!(session_id = %session_id, "local logout deleted session");
+    let Some((Ok(session_id), _source)) = crate::session_id_from_headers(headers, auth_header)
+    else {
+        // No resolvable session id on the caller's own surface: nothing to
+        // delete, idempotent no-op.
+        return;
+    };
+    let Some(pool) = get_db() else {
+        return;
+    };
+
+    // Best-effort: capture actor identity BEFORE deleting so the logout audit
+    // row carries the real principal/roles. A miss falls back to an
+    // unverified "local-logout" actor.
+    let row: Option<LogoutSessionRow> =
+        sqlx::query_as("SELECT user_id, display_name, roles FROM sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+
+    let delete_result = sqlx::query("DELETE FROM sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+
+    match delete_result {
+        Ok(_) => {
+            tracing::info!(session_id = %session_id, "logout deleted caller session");
+            let actor = match row {
+                Some(r) => AuthSession {
+                    user_id: r.user_id,
+                    display_name: r.display_name,
+                    roles: r.roles,
+                    token_valid: true,
+                    provider_mode: "persisted-session".into(),
+                },
+                None => crate::unverified_session("local-logout"),
+            };
+            audit::record_denied(
+                get_db(),
+                &actor,
+                &AuditRecord {
+                    action: "session.logout",
+                    request_id: None,
+                    from_status: None,
+                    to_status: "logged_out",
+                    from_stage: None,
+                    to_stage: "logout",
+                    detail: json!({}),
+                    outcome: "applied",
+                },
+            )
+            .await;
+        }
+        Err(error) => {
+            // A delete failure never changes the 200 — log and move on so an
+            // expired session can still clear cookies.
+            tracing::warn!(error = %error, "logout session delete failed (best-effort)");
         }
     }
+}
+
+async fn auth_local_logout(headers: HeaderMap) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    // B4: delete ONLY the caller's own resolved session; idempotent; writes a
+    // best-effort session.logout audit row. Always returns 200 + clear-cookie.
+    logout_caller_session(&headers).await;
     let app_cfg = crate::config_store::get_app_config();
     let cookie = session_cookie_clear_header(&app_cfg.session);
     Ok((
@@ -6464,40 +6534,14 @@ async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     Ok(Json(session_data))
 }
 
-async fn auth_logout(
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let session_id = body
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if session_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::new(
-                "MISSING_SESSION_ID",
-                "Session ID is required for logout",
-            )),
-        ));
-    }
-    let uid = Uuid::parse_str(session_id).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ApiError::new(
-                "INVALID_SESSION_ID",
-                "Session ID must be a UUID",
-            )),
-        )
-    })?;
-    if let Some(pool) = get_db() {
-        map_auth_session_persistence_result(
-            sqlx::query("DELETE FROM sessions WHERE id = $1")
-                .bind(uid)
-                .execute(pool)
-                .await,
-            "delete",
-        )?;
-    }
+/// POST /api/auth/logout — the Entra/mock logout path.
+///
+/// B4: takes ONLY the request headers (no `Json(body)`), so a client-supplied
+/// `session_id` can never terminate a victim's session. The caller's own id is
+/// resolved from their credential surface and only that session is deleted.
+/// Idempotent: an expired/missing session still returns 200.
+async fn auth_logout(headers: HeaderMap) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    logout_caller_session(&headers).await;
     Ok(Json(json!({"status": "logged_out"})))
 }
 
@@ -7622,6 +7666,21 @@ fn status_409(msg: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::CONFLICT, Json(json!({"error": msg})))
 }
 
+/// 409 for a LOST compare-and-set in `apply_transition_audited`: the request
+/// row's status changed between the unguarded pre-read (which the pure engine
+/// guard ran against) and the conditional UPDATE, so a concurrent identical
+/// transition already landed. This is a transient-conflict signal distinct from
+/// the engine's 400 invalid-transition: reload and retry.
+fn transition_conflict_409(request_id: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Request was modified concurrently; reload and retry",
+            "request_id": request_id,
+        })),
+    )
+}
+
 /// Maps any database/transaction error to a 500. Used by the transactional
 /// lifecycle handlers where the request UPDATE and the audit INSERT commit
 /// together.
@@ -7637,6 +7696,16 @@ fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
 /// (and vice versa). `current` is the pre-transition row (supplies the
 /// from_status/from_stage attribution); `to_status`/`to_stage` are the
 /// post-transition DB values; actor identity is taken from `session`.
+///
+/// CONCURRENCY (B2): the request UPDATE is a compare-and-set conditioned on
+/// `expected_from_status` (the row's CURRENT status that the pure engine guard
+/// just accepted, captured from each handler's unguarded pre-read). The CAS
+/// `WHERE id = $3 AND status = $4` guarantees the UPDATE only lands if the row
+/// is STILL in exactly that status, so N concurrent identical transitions
+/// produce exactly ONE row update + ONE audit row; the losers match zero rows
+/// and roll back to a 409. This makes the read-guard-write effectively
+/// serializable without a separate `SELECT ... FOR UPDATE` — the atomic
+/// conditional UPDATE is the lock.
 #[allow(clippy::too_many_arguments)]
 async fn apply_transition_audited(
     pool: &sqlx::PgPool,
@@ -7644,23 +7713,34 @@ async fn apply_transition_audited(
     uid: Uuid,
     current: &DbRequestRow,
     action: &str,
+    expected_from_status: &str,
     to_status: &str,
     to_stage: &str,
     detail: Value,
 ) -> Result<DbRequestRow, (StatusCode, Json<Value>)> {
     let mut tx = pool.begin().await.map_err(db_error)?;
 
-    let row: DbRequestRow = sqlx::query_as(
-        "UPDATE requests SET status = $1, stage = $2, updated_at = NOW() WHERE id = $3 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
+    let maybe_row: Option<DbRequestRow> = sqlx::query_as(
+        "UPDATE requests SET status = $1, stage = $2, updated_at = NOW() WHERE id = $3 AND status = $4 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
     )
     .bind(to_status)
     .bind(to_stage)
     .bind(uid)
-    .fetch_one(&mut *tx)
+    .bind(expected_from_status)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?;
 
     let request_id = uid.to_string();
+
+    let Some(row) = maybe_row else {
+        // Zero rows updated: the status changed under us (a concurrent
+        // identical transition already applied) or the row vanished. Roll back
+        // and signal a transient 409 — distinct from the engine's 400.
+        tx.rollback().await.ok();
+        return Err(transition_conflict_409(&request_id));
+    };
+
     audit::record_audit_tx(
         &mut tx,
         session,
@@ -7705,12 +7785,16 @@ async fn record_transition_denied(session: &AuthSession, request_id: &str, actio
 }
 
 /// Records an APPLIED transition to the process-local store (no-DB / dry-run
-/// mode). The pre-transition status/stage are not tracked in-memory, so they
-/// are left null; the post-transition values come from the caller.
+/// mode). The pre-transition status/stage are snapshotted by the caller BEFORE
+/// it mutates the in-memory store and threaded through here, so the no-DB audit
+/// trail carries the real from_status/from_stage (B8) instead of null.
+#[allow(clippy::too_many_arguments)]
 async fn record_local_transition(
     session: &AuthSession,
     request_id: &str,
     action: &str,
+    from_status: Option<&str>,
+    from_stage: Option<&str>,
     to_status: &str,
     to_stage: &str,
 ) {
@@ -7719,9 +7803,9 @@ async fn record_local_transition(
         &AuditRecord {
             action,
             request_id: Some(request_id),
-            from_status: None,
+            from_status,
             to_status,
-            from_stage: None,
+            from_stage,
             to_stage,
             detail: json!({}),
             outcome: "applied",
@@ -8110,6 +8194,7 @@ async fn requests_validate(
             uid,
             &current,
             "request.validate",
+            &current.status,
             db_status,
             "validate",
             json!({}),
@@ -8143,6 +8228,10 @@ async fn requests_validate(
         return Err(validation_failed_response(&result));
     }
 
+    // B8: snapshot the prior status/stage BEFORE mutating store[idx] so the
+    // no-DB audit row carries the real from_status/from_stage.
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx].status = ryuki_engine::models::RequestStatus::Validated;
     store[idx].stages.push(ryuki_engine::models::Stage {
         name: "validate".into(),
@@ -8157,6 +8246,8 @@ async fn requests_validate(
         &session,
         &request_id,
         "request.validate",
+        Some(&from_status),
+        Some(&from_stage),
         "validated",
         "validate",
     )
@@ -8196,6 +8287,7 @@ async fn requests_plan(
             uid,
             &current,
             "request.plan",
+            &current.status,
             db_status,
             "plan",
             json!({}),
@@ -8213,10 +8305,22 @@ async fn requests_plan(
 
     let stages = request_lifecycle::plan_request(&store[idx]).map_err(map_engine_error)?;
 
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx].status = ryuki_engine::models::RequestStatus::Planned;
     store[idx].stages = stages.clone();
     store[idx].updated_at = now_iso();
-    record_local_transition(&session, &request_id, "request.plan", "planned", "plan").await;
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.plan",
+        Some(&from_status),
+        Some(&from_stage),
+        "planned",
+        "plan",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
 }
@@ -8254,6 +8358,7 @@ async fn requests_approve(
             uid,
             &current,
             "request.approve",
+            &current.status,
             db_status,
             "approve",
             json!({}),
@@ -8272,11 +8377,16 @@ async fn requests_approve(
     let approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
         .map_err(map_engine_error)?;
 
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx] = approved.clone();
     record_local_transition(
         &session,
         &request_id,
         "request.approve",
+        Some(&from_status),
+        Some(&from_stage),
         "approved",
         "approve",
     )
@@ -8314,6 +8424,7 @@ async fn requests_lock(
             uid,
             &current,
             "request.lock",
+            &current.status,
             db_status,
             "lock",
             json!({}),
@@ -8331,8 +8442,20 @@ async fn requests_lock(
 
     let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
 
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx] = locked.clone();
-    record_local_transition(&session, &request_id, "request.lock", "locked", "lock").await;
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.lock",
+        Some(&from_status),
+        Some(&from_stage),
+        "locked",
+        "lock",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
@@ -8366,6 +8489,7 @@ async fn requests_execute(
             uid,
             &current,
             "request.execute",
+            &current.status,
             db_status,
             "execute",
             json!({}),
@@ -8383,12 +8507,17 @@ async fn requests_execute(
 
     let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
 
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     let to_status = executed.status.as_str();
     store[idx] = executed.clone();
     record_local_transition(
         &session,
         &request_id,
         "request.execute",
+        Some(&from_status),
+        Some(&from_stage),
         to_status,
         "execute",
     )
@@ -8435,6 +8564,7 @@ async fn requests_verify(
             uid,
             &current,
             "request.verify",
+            &current.status,
             db_status,
             "verify",
             json!({}),
@@ -8452,6 +8582,9 @@ async fn requests_verify(
 
     let evidence = request_lifecycle::verify_request(&store[idx]).map_err(map_engine_error)?;
 
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     let mut verified_request = store[idx].clone();
     verified_request
         .stages
@@ -8464,7 +8597,16 @@ async fn requests_verify(
 
     let to_status = completed.status.as_str();
     store[idx] = completed;
-    record_local_transition(&session, &request_id, "request.verify", to_status, "verify").await;
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.verify",
+        Some(&from_status),
+        Some(&from_stage),
+        to_status,
+        "verify",
+    )
+    .await;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -8517,6 +8659,7 @@ async fn requests_reject(
             uid,
             &current,
             "request.reject",
+            &current.status,
             db_status,
             "approve",
             json!({ "reason": reason }),
@@ -8534,15 +8677,18 @@ async fn requests_reject(
 
     let rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx] = rejected.clone();
     audit::record_audit_local(
         &session,
         &AuditRecord {
             action: "request.reject",
             request_id: Some(&request_id),
-            from_status: None,
+            from_status: Some(&from_status),
             to_status: "rejected",
-            from_stage: None,
+            from_stage: Some(&from_stage),
             to_stage: "approve",
             detail: json!({ "reason": reason }),
             outcome: "applied",
@@ -8596,6 +8742,7 @@ async fn requests_cancel(
             uid,
             &current,
             "request.cancel",
+            &current.status,
             db_status,
             "cancel",
             json!({ "reason": reason }),
@@ -8620,15 +8767,18 @@ async fn requests_cancel(
 
     let cancelled = request_lifecycle::cancel_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
     store[idx] = cancelled.clone();
     audit::record_audit_local(
         &session,
         &AuditRecord {
             action: "request.cancel",
             request_id: Some(&request_id),
-            from_status: None,
+            from_status: Some(&from_status),
             to_status: "cancelled",
-            from_stage: None,
+            from_stage: Some(&from_stage),
             to_stage: "cancel",
             detail: json!({ "reason": reason }),
             outcome: "applied",
@@ -12761,17 +12911,17 @@ mod unit_tests {
         assert!(roles.contains(&ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR));
     }
 
+    /// B4: auth_logout no longer accepts a client-supplied body session id, so
+    /// there is no INVALID_SESSION_ID/MISSING_SESSION_ID branch to validate. A
+    /// logout with no resolvable credentials is idempotent: 200 + logged_out,
+    /// no DB error, nothing deleted.
     #[tokio::test]
-    async fn test_auth_logout_rejects_invalid_session_id() {
-        let Err((status, Json(body))) =
-            auth_logout(Json(json!({"session_id": "not-a-uuid"}))).await
-        else {
-            panic!("invalid session id should fail");
+    async fn test_auth_logout_idempotent_no_session() {
+        let headers = HeaderMap::new();
+        let Ok(Json(body)) = auth_logout(headers).await else {
+            panic!("logout with no session must still return 200");
         };
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.error, "INVALID_SESSION_ID");
-        assert_eq!(body.message, "Session ID must be a UUID");
+        assert_eq!(body, json!({"status": "logged_out"}));
     }
 
     #[test]
@@ -13916,5 +14066,447 @@ mod unit_tests {
                 .is_ok(),
             "an auditor must be allowed to read the audit trail"
         );
+    }
+
+    /// B5: a structural assertion of the precedence rule without a live DB.
+    /// `session_id_from_headers` always prefers `X-Ryuki-Session-Id` over the
+    /// `Authorization: Bearer` value, and a `ryk_` bearer is never a valid
+    /// session UUID. So when the persisted-session resolver falls through on a
+    /// failed token (B5), the session-id resolution it falls into will pick the
+    /// header — never the bogus bearer. (Full DB-backed precedence is asserted
+    /// in `db_lifecycle_tests::test_invalid_api_token_falls_through_to_session_header`.)
+    #[test]
+    fn test_session_header_wins_over_api_token_bearer() {
+        let session_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            axum::http::HeaderValue::from_str(&session_id.to_string()).unwrap(),
+        );
+        let (parsed, source) =
+            crate::session_id_from_headers(&headers, Some("Bearer ryk_bogustoken"))
+                .expect("session header must be resolvable");
+        assert_eq!(parsed.expect("header parses"), session_id);
+        assert_eq!(source, crate::SessionIdSource::Header);
+    }
+
+    /// B8: the no-DB audit path must capture the prior status/stage instead of
+    /// recording NULL. Drive a fresh (Intake) request through validate and
+    /// assert the local audit entry carries from_status="intake" /
+    /// from_stage="intake".
+    #[tokio::test]
+    async fn test_local_audit_captures_from_status() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        let mut request = test_request(&id);
+        request.approval_route.push("Datacenter Approver".into());
+        request_store().lock().await.push(request);
+
+        let operator = static_admin_operator_session();
+        let _ = requests_validate(Path(id.clone()), AuthExtractor(operator))
+            .await
+            .expect("validate from intake");
+
+        let Json(trail) = requests_audit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        let entries = trail["entries"].as_array().unwrap();
+        let validate = entries
+            .iter()
+            .find(|e| e["action"] == "request.validate")
+            .expect("validate audit entry present");
+        // B8: prior status/stage are no longer null.
+        assert_eq!(validate["from_status"], "intake");
+        assert_eq!(validate["from_stage"], "intake");
+        assert_eq!(validate["to_status"], "validated");
+        assert_eq!(validate["to_stage"], "validate");
+    }
+}
+
+/// Live-DB integration tests for the transactional/CAS lifecycle (B2), logout
+/// scoping (B4), and the ryk_-token precedence fall-through (B5). Each test
+/// SKIPS (returns early, prints SKIP) when `RYUKI_DATABASE_URL` is unset so CI
+/// without Postgres stays green; run with the compose Postgres up.
+#[cfg(test)]
+mod db_lifecycle_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Connects a small fresh pool to the test database, or returns None to
+    /// SKIP. Capped at 2 connections so the suite (which also drives the global
+    /// pool and the pre-existing `db_tests`) does not exhaust Postgres
+    /// `max_connections` under parallel scheduling.
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .ok()?;
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations run");
+        Some(pool)
+    }
+
+    fn approver_session() -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = "approver-db".into();
+        s.display_name = "Approver DB".into();
+        s.provider_mode = "local".into();
+        s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
+        s
+    }
+
+    /// Seeds one request row directly in the given status/stage, returns its id.
+    async fn seed_request(pool: &PgPool, status: &str, stage: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', $2, $3, 'DEFRA', 'production', 'db-test', 2, 4, 'requester-db')",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(stage)
+        .execute(pool)
+        .await
+        .expect("seed request");
+        id
+    }
+
+    async fn read_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
+        sqlx::query_as(
+            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read row")
+    }
+
+    async fn count_audit(pool: &PgPool, id: Uuid, action: &str, outcome: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 AND action = $2 AND outcome = $3",
+        )
+        .bind(id)
+        .bind(action)
+        .bind(outcome)
+        .fetch_one(pool)
+        .await
+        .expect("count audit")
+    }
+
+    async fn cleanup_request(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM audit_log WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
+    /// same `expected_from_status` against a seeded row applies once and returns
+    /// 409 the second time (the CAS sees the row already moved).
+    #[tokio::test]
+    async fn test_apply_transition_cas_second_call_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_request(&pool, "approved", "approve").await;
+        let session = approver_session();
+        let current = read_row(&pool, id).await;
+
+        let ok = apply_transition_audited(
+            &pool,
+            &session,
+            id,
+            &current,
+            "request.lock",
+            &current.status,
+            "locked",
+            "lock",
+            json!({}),
+        )
+        .await;
+        assert!(ok.is_ok(), "first transition must apply");
+
+        // Second call with the SAME expected_from_status ("approved") — the row
+        // is now "locked", so the CAS matches zero rows -> 409.
+        let again = apply_transition_audited(
+            &pool,
+            &session,
+            id,
+            &current,
+            "request.lock",
+            &current.status,
+            "locked",
+            "lock",
+            json!({}),
+        )
+        .await;
+        let Err((status, _)) = again else {
+            panic!("second transition must be a 409 conflict");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        assert_eq!(count_audit(&pool, id, "request.lock", "applied").await, 1);
+        assert_eq!(read_row(&pool, id).await.status, "locked");
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
+    /// B2 (concurrency): N parallel `apply_transition_audited` calls on one
+    /// Approved request -> exactly ONE applies + ONE audit row; the rest 409.
+    #[tokio::test]
+    async fn test_concurrent_transitions_apply_exactly_once() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_request(&pool, "approved", "approve").await;
+        let session = approver_session();
+        // Capture the snapshot ONCE: all N callers carry the SAME
+        // expected_from_status ("approved"), exactly as N concurrent identical
+        // transitions racing off one read would. Re-reading per task would let a
+        // late task observe "locked" and CAS a no-op locked->locked, masking the
+        // race — so the snapshot is shared deliberately.
+        let current = read_row(&pool, id).await;
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let pool = pool.clone();
+            let session = session.clone();
+            let current = current.clone();
+            handles.push(tokio::spawn(async move {
+                apply_transition_audited(
+                    &pool,
+                    &session,
+                    id,
+                    &current,
+                    "request.lock",
+                    &current.status,
+                    "locked",
+                    "lock",
+                    json!({}),
+                )
+                .await
+                .is_ok()
+            }));
+        }
+
+        let mut applied = 0usize;
+        let mut conflicts = 0usize;
+        for h in handles {
+            if h.await.expect("join") {
+                applied += 1;
+            } else {
+                conflicts += 1;
+            }
+        }
+
+        assert_eq!(applied, 1, "exactly one concurrent transition must apply");
+        assert_eq!(conflicts, N - 1, "the rest must 409");
+        assert_eq!(read_row(&pool, id).await.status, "locked");
+        assert_eq!(
+            count_audit(&pool, id, "request.lock", "applied").await,
+            1,
+            "exactly one applied lock audit row"
+        );
+
+        cleanup_request(&pool, id).await;
+        pool.close().await;
+    }
+
+    async fn seed_session(pool: &PgPool, user_id: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, display_name, email, roles, provider) \
+             VALUES ($1, $2, $3, NULL, ARRAY['Auditor']::TEXT[], 'local')",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(format!("{user_id} display"))
+        .execute(pool)
+        .await
+        .expect("seed session");
+        id
+    }
+
+    async fn session_exists(pool: &PgPool, id: Uuid) -> bool {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count sessions");
+        count > 0
+    }
+
+    /// `logout_caller_session`/`auth_logout` resolve the PROCESS-GLOBAL
+    /// `get_db()` pool, so the logout tests must seed and assert through THAT
+    /// same pool (not a separate `test_pool()` connection). Connects the global
+    /// pool, runs migrations on it, and returns it — or None to SKIP.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// B4 (a)+(c): logout deletes ONLY the caller's own session and writes a
+    /// session.logout audit row. B must survive, A must be gone.
+    #[tokio::test]
+    async fn test_logout_only_deletes_caller_session() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let a = seed_session(pool, "user-a").await;
+        let b = seed_session(pool, "user-b").await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            axum::http::HeaderValue::from_str(&a.to_string()).unwrap(),
+        );
+        logout_caller_session(&headers).await;
+
+        assert!(!session_exists(pool, a).await, "caller session A deleted");
+        assert!(session_exists(pool, b).await, "victim session B survives");
+
+        let logout_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'session.logout' AND actor_principal = 'user-a'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count logout audit");
+        assert!(
+            logout_rows >= 1,
+            "a session.logout audit row must be written"
+        );
+
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(b)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "DELETE FROM audit_log WHERE action = 'session.logout' AND actor_principal = 'user-a'",
+        )
+        .execute(pool)
+        .await
+        .ok();
+    }
+
+    /// B4 (d): auth_logout takes only headers — a client-supplied id can't
+    /// terminate a victim. Caller id in the header; victim is never honored.
+    #[tokio::test]
+    async fn test_auth_logout_ignores_body_session_id() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let caller = seed_session(pool, "user-caller").await;
+        let victim = seed_session(pool, "user-victim").await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            axum::http::HeaderValue::from_str(&caller.to_string()).unwrap(),
+        );
+        let Ok(Json(body)) = auth_logout(headers).await else {
+            panic!("auth_logout must return 200");
+        };
+        assert_eq!(body, json!({"status": "logged_out"}));
+
+        assert!(!session_exists(pool, caller).await, "caller deleted");
+        assert!(
+            session_exists(pool, victim).await,
+            "victim id is ignored — victim survives"
+        );
+
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(victim)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM audit_log WHERE action = 'session.logout' AND actor_principal = 'user-caller'")
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// B4 (b): logout with no/invalid credentials is idempotent — no DB error,
+    /// nothing deleted, helper returns cleanly.
+    #[tokio::test]
+    async fn test_logout_idempotent_no_session() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        logout_caller_session(&HeaderMap::new()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            axum::http::HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
+        );
+        logout_caller_session(&headers).await;
+        // Reaching here without panic is the assertion.
+    }
+
+    /// B5 (a): a bogus `ryk_` bearer + a valid `X-Ryuki-Session-Id` must resolve
+    /// to the SESSION (token_valid true), not shadow it as unverified.
+    #[tokio::test]
+    async fn test_invalid_api_token_falls_through_to_session_header() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        // Uses the process-global get_db() pool via auth_session_from_persisted_session.
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let sid = seed_session(pool, "user-fallthrough").await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            axum::http::HeaderValue::from_str(&sid.to_string()).unwrap(),
+        );
+        let auth_header = Some("Bearer ryk_bogus_never_matches");
+
+        let (session, source) =
+            crate::auth_session_from_persisted_session(&headers, auth_header, &AuthMode::Local)
+                .await
+                .expect("resolution must yield a session");
+        assert!(
+            session.token_valid,
+            "valid session header must win over a bogus ryk_ bearer"
+        );
+        assert_eq!(session.user_id, "user-fallthrough");
+        assert_eq!(source, crate::SessionIdSource::Header);
+
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(sid)
+            .execute(pool)
+            .await
+            .ok();
     }
 }
