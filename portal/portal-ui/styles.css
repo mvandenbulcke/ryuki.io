@@ -4,7 +4,12 @@
    bars, pill badges, glowing lifecycle stages. Light and dark.
    ════════════════════════════════════════════════════════════ */
 
-/* ── Tokens: shared ─────────────────────────────────────────── */
+/* ── Tokens: default (light) palette ────────────────────────────
+   Single :root carrying structural tokens plus the default light
+   palette, so light and dark mode are both first-class. The dragon
+   brand drives the functional accent (--accent), with gold as the
+   secondary accent (--accent-secondary); --logo-red/--logo-gold are
+   the fixed mark colors. Explicit [data-theme] blocks pin one scheme. */
 :root {
   color-scheme: light dark;
   /* Fonts match the landing page but resolve locally — the portal
@@ -17,12 +22,8 @@
   --logo-red: #c0392b;
   --logo-gold: #ffd700;
   --grad-accent: linear-gradient(135deg, #c0392b 0%, #8b0000 100%);
-}
-
-/* ── Tokens: light palette ──────────────────────────────────── */
-:root {
-  color-scheme: light;
   --accent: #c0392b;
+  --accent-secondary: #f0a030;
   --accent-text: #a93226;
   --accent-bg: #fcebe9;
   --accent-glow: rgba(192, 57, 43, 0.2);
@@ -55,6 +56,7 @@
 [data-theme="dark"] {
   color-scheme: dark;
   --accent: #e25d5d;
+  --accent-secondary: #eab308;
   --accent-text: #ec7b7b;
   --accent-bg: #3a1313;
   --accent-glow: rgba(226, 93, 93, 0.22);
@@ -86,6 +88,7 @@
 [data-theme="light"] {
   color-scheme: light;
   --accent: #c0392b;
+  --accent-secondary: #f0a030;
   --accent-text: #a93226;
   --accent-bg: #fcebe9;
   --accent-glow: rgba(192, 57, 43, 0.2);
@@ -118,6 +121,7 @@
   :root:not([data-theme="light"]):not([data-theme="dark"]) {
     color-scheme: dark;
     --accent: #e25d5d;
+    --accent-secondary: #eab308;
     --accent-text: #ec7b7b;
     --accent-bg: #3a1313;
     --accent-glow: rgba(226, 93, 93, 0.22);
