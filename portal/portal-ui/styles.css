@@ -773,6 +773,24 @@ p {
   transition: background var(--transition), border-color var(--transition);
 }
 
+/* Solo workspace header — a single summary card on an individual tab. The base
+   grid is multi-column (right for the dashboard's card grid), which left one
+   card half-width with an empty cell beside it on every other tab. Solo mode is
+   a full-width header matching the full-width detail panel below, with the
+   points flowing horizontally instead of stacking narrow. The `.workspace-area`
+   prefix raises specificity so it wins over the responsive grid breakpoints. */
+.workspace-area .workspace-sections--solo {
+  grid-template-columns: 1fr;
+}
+
+.workspace-sections--solo .workspace-panel {
+  min-height: 0;
+}
+
+.workspace-sections--solo .workspace-points {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
 .workspace-open-link {
   justify-self: start;
   font-size: 12.5px;

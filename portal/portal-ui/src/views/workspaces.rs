@@ -57,8 +57,18 @@ fn WorkspaceSummaryCards(#[prop(optional)] only: Option<&'static str>) -> impl I
     // labeled synthetic fallback only covers out-of-gate renders.
     let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
 
+    // On an individual workspace tab a single summary card renders; the
+    // multi-column grid would leave it half-width with an empty cell beside it,
+    // so solo mode lays it out as a full-width header matching the detail panel
+    // below. The dashboard (no `only`) keeps the multi-column card grid.
+    let section_class = if only.is_some() {
+        "workspace-sections workspace-sections--solo"
+    } else {
+        "workspace-sections"
+    };
+
     view! {
-        <section class="workspace-sections" aria-label="Primary workspaces">
+        <section class=section_class aria-label="Primary workspaces">
             {PRIMARY_WORKSPACES
                 .iter()
                 .filter(move |workspace| {
