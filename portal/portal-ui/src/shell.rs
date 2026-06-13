@@ -201,7 +201,9 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                     <input
                         id="global-search"
                         type="search"
-                        placeholder="Search requests, CIs, evidence, servers, apps..."
+                        placeholder="Global search — coming soon"
+                        title="Global search is not yet available"
+                        aria-disabled="true"
                         disabled=true
                     />
                 </form>

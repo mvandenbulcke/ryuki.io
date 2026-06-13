@@ -271,6 +271,13 @@ textarea:focus-visible {
   color: var(--muted);
 }
 
+/* The global search is not yet wired; render it as clearly inert so it does not
+   present a working affordance that does nothing. */
+.search input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .search input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow);
