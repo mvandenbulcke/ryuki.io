@@ -17,5 +17,12 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uu
 figment = { workspace = true }
 governor = { workspace = true }
 tower = { workspace = true }
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 ryuki-core = { workspace = true }
 ryuki-engine = { workspace = true }
+
+[dev-dependencies]
+rsa = "0.9"
+rand = "0.8"
+base64 = "0.22"

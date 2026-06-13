@@ -5,13 +5,18 @@ mod config;
 mod config_store;
 mod contracts;
 pub mod database;
+mod entra_auth;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequest, StatusCode};
 use axum::middleware;
 use axum::response::Response;
-use axum::{extract::Query, routing::get, Extension, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Extension, Json, Router,
+};
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
@@ -32,6 +37,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::database::MigrationStatus;
+use crate::entra_auth::EntraTokenValidator;
 use ryuki_core::config::{AuthMode, TrustedProxyNetwork};
 use ryuki_core::types::{ApiError, ValidationResult};
 use ryuki_engine::auth::AuthSession;
@@ -68,17 +74,46 @@ fn resolve_auth_metadata(header: Option<&str>, provider_mode: &'static str) -> A
     }
 }
 
-fn auth_session_for_request(auth_mode: AuthMode, auth_header: Option<&str>) -> AuthSession {
+/// Resolves the request session AND a SAFE failure-reason string (EntraId
+/// failures only) for logging. Mock/static/local arms are byte-unchanged and
+/// never touch the validator.
+async fn resolve_request_session(
+    auth_mode: AuthMode,
+    auth_header: Option<&str>,
+    validator: &EntraTokenValidator,
+) -> (AuthSession, Option<&'static str>) {
     match auth_mode {
-        AuthMode::MockDryRun | AuthMode::StaticDryRun => AuthSession::static_dry_run(),
+        AuthMode::MockDryRun | AuthMode::StaticDryRun => (AuthSession::static_dry_run(), None),
         // Local mode without a persisted session is unauthenticated: zero
         // roles, token_valid=false. Unsafe methods 401 until login; GET stays
         // anonymous this wave (read authentication is a later wave).
-        AuthMode::Local => unverified_session("local-unauthenticated"),
-        AuthMode::EntraId => auth_header
-            .map(ryuki_engine::auth::validate_token)
-            .unwrap_or_else(AuthSession::unverified_entra),
+        AuthMode::Local => (unverified_session("local-unauthenticated"), None),
+        // EntraId: a real bearer token is cryptographically validated by the
+        // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
+        // or any failure path is unverified_entra(). The engine's validate_token
+        // stub is no longer called from the API.
+        AuthMode::EntraId => match auth_header {
+            Some(h) => {
+                let outcome = validator.validate_with_reason(h).await;
+                (outcome.session, outcome.failure_reason)
+            }
+            None => (AuthSession::unverified_entra(), Some("missing-bearer")),
+        },
     }
+}
+
+/// Resolves the request session for the given auth mode and optional bearer
+/// header. Validator-aware: EntraId tokens are cryptographically validated by
+/// the injected validator; all other modes are unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn auth_session_for_request(
+    auth_mode: AuthMode,
+    auth_header: Option<&str>,
+    validator: &EntraTokenValidator,
+) -> AuthSession {
+    resolve_request_session(auth_mode, auth_header, validator)
+        .await
+        .0
 }
 
 #[derive(sqlx::FromRow)]
@@ -442,6 +477,7 @@ fn bind_address_is_loopback(bind_address: &str) -> bool {
 /// not locked out of reads, and on keeping the static/mock demos zero-friction.
 /// This is a deliberate boundary, not an oversight.
 async fn auth_middleware(
+    State(validator): State<Arc<EntraTokenValidator>>,
     headers: HeaderMap,
     mut request: HttpRequest<Body>,
     next: middleware::Next,
@@ -451,16 +487,28 @@ async fn auth_middleware(
     let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
     let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
     let log = resolve_auth_metadata(auth_header, auth_mode.as_str());
+
+    // Persisted DB session wins for Local/persisted flows; only the None
+    // fallback runs validator-aware resolution.
+    let (session, session_source, failure_reason) =
+        match auth_session_from_persisted_session(&headers, auth_header, &auth_mode).await {
+            Some((session, source)) => (session, Some(source), None),
+            None => {
+                let (session, reason) =
+                    resolve_request_session(auth_mode, auth_header, &validator).await;
+                (session, None, reason)
+            }
+        };
+
+    // SAFE logging: presence + mode + token_valid + an optional low-cardinality
+    // failure-reason string. NEVER the token, claims, oid, or header bytes.
     tracing::info!(
         auth_header_present = log.auth_header_present,
         provider_mode = log.provider_mode,
+        token_valid = session.token_valid,
+        failure_reason = failure_reason.unwrap_or(""),
         "auth middleware"
     );
-    let (session, session_source) =
-        match auth_session_from_persisted_session(&headers, auth_header, &auth_mode).await {
-            Some((session, source)) => (session, Some(source)),
-            None => (auth_session_for_request(auth_mode, auth_header), None),
-        };
 
     if !session_authorizes_request(&method, &path, &session, session_source) {
         let body = serde_json::to_string(&ApiError::new(
@@ -1040,6 +1088,18 @@ async fn main() {
     // shared with the handler through an Extension (no global mutable state).
     let local_login_throttle = Arc::new(contracts::LocalLoginThrottle::default());
 
+    // Entra ID token validator, built ONCE at startup from the live config.
+    // issuer/audience are fixed for the process lifetime (a settings change
+    // takes effect on the next restart, like every other entra_* consumer);
+    // only the JWKS keyset refreshes live, behind its own lock inside the Arc.
+    let entra_validator = Arc::new(EntraTokenValidator::from_app_config(
+        &app_config.entra_tenant_id,
+        &app_config.entra_client_id,
+        &app_config.entra_authority,
+        app_config.entra_jwks_ttl_secs,
+        app_config.entra_leeway_secs,
+    ));
+
     let cors_origins: Vec<_> = app_config
         .cors
         .allowed_origins
@@ -1089,7 +1149,10 @@ async fn main() {
                 async move { rate_limit_middleware(limiter, req, next).await }
             },
         ))
-        .layer(middleware::from_fn(auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            entra_validator.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(
             move |req: HttpRequest<Body>, next: middleware::Next| async move {
                 let path = req.uri().path().to_string();
@@ -1468,23 +1531,42 @@ mod tests {
         assert_eq!(fields.provider_mode, "entra-id");
     }
 
-    #[test]
-    fn test_static_auth_mode_ignores_authorization_header() {
+    /// Builds an enabled, network-backed validator with no usable keyset. It is
+    /// used by middleware-arm tests that never expect a successful validation
+    /// (mock arm short-circuits; the unsigned-entra token fails to decode).
+    fn test_validator() -> EntraTokenValidator {
+        EntraTokenValidator::from_app_config(
+            "test-tenant",
+            "test-client",
+            "https://login.microsoftonline.com",
+            86_400,
+            60,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_static_auth_mode_ignores_authorization_header() {
+        let validator = test_validator();
         let session = auth_session_for_request(
             AuthMode::MockDryRun,
             Some("header.eyJyb2xlcyI6WyJQbGF0Zm9ybUFkbWluIl19.signature"),
-        );
+            &validator,
+        )
+        .await;
         assert_eq!(session.provider_mode, "static-dry-run");
         assert_eq!(session.roles, vec!["PlatformAdmin"]);
         assert!(!session.token_valid);
     }
 
-    #[test]
-    fn test_entra_auth_mode_rejects_unsigned_roles_claim() {
+    #[tokio::test]
+    async fn test_entra_auth_mode_rejects_unsigned_roles_claim() {
+        let validator = test_validator();
         let session = auth_session_for_request(
             AuthMode::EntraId,
-            Some("header.eyJyb2xlcyI6WyJQbGF0Zm9ybUFkbWluIl19.signature"),
-        );
+            Some("Bearer header.eyJyb2xlcyI6WyJQbGF0Zm9ybUFkbWluIl19.signature"),
+            &validator,
+        )
+        .await;
         assert_eq!(session.provider_mode, "entra-id-unverified");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
@@ -1633,9 +1715,10 @@ mod tests {
         assert!(!is_auth_exempt_path("/api/requests"));
     }
 
-    #[test]
-    fn test_local_auth_mode_yields_unauthenticated_session_without_login() {
-        let session = auth_session_for_request(AuthMode::Local, None);
+    #[tokio::test]
+    async fn test_local_auth_mode_yields_unauthenticated_session_without_login() {
+        let validator = test_validator();
+        let session = auth_session_for_request(AuthMode::Local, None, &validator).await;
         assert_eq!(session.provider_mode, "local-unauthenticated");
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);

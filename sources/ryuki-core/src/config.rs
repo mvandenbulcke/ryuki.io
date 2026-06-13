@@ -1290,6 +1290,14 @@ pub struct RyukiConfig {
     pub entra_client_id: String,
     #[serde(default = "default_entra_authority")]
     pub entra_authority: String,
+    /// JWKS keyset cache TTL in seconds for Entra token validation (default 24h).
+    /// Optional tuning knob; not required for EntraId mode validation.
+    #[serde(default = "default_entra_jwks_ttl_secs")]
+    pub entra_jwks_ttl_secs: u64,
+    /// Clock-skew leeway in seconds applied to exp/nbf during Entra token
+    /// validation (default 60s). Optional tuning knob; not required for EntraId mode.
+    #[serde(default = "default_entra_leeway_secs")]
+    pub entra_leeway_secs: u64,
     #[serde(default = "default_platform_name")]
     pub platform_name: String,
     #[serde(default = "default_platform_url")]
@@ -1348,6 +1356,14 @@ fn default_entra_authority() -> String {
     "https://login.microsoftonline.com".to_string()
 }
 
+fn default_entra_jwks_ttl_secs() -> u64 {
+    86_400
+}
+
+fn default_entra_leeway_secs() -> u64 {
+    60
+}
+
 fn default_platform_name() -> String {
     "Ryuki Infrastructure Platform".to_string()
 }
@@ -1367,6 +1383,8 @@ impl Default for RyukiConfig {
             entra_tenant_id: String::new(),
             entra_client_id: String::new(),
             entra_authority: default_entra_authority(),
+            entra_jwks_ttl_secs: default_entra_jwks_ttl_secs(),
+            entra_leeway_secs: default_entra_leeway_secs(),
             platform_name: default_platform_name(),
             platform_url: default_platform_url(),
             database_provider: DatabaseProvider::default(),
