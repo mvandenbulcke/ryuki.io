@@ -5444,10 +5444,93 @@ async fn legal_hold_place(
             ))
         }
     };
-    match legal_hold::place_hold(&req.target, hold_type, &req.reason, &req.by, &req.site) {
-        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    // Validate + construct via the engine (enforces VALID_SITES; also pushes to
+    // the static, which is the no-DB fallback).
+    let hold = match legal_hold::place_hold(&req.target, hold_type, &req.reason, &req.by, &req.site)
+    {
+        Ok(hold) => hold,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    };
+    if let Some(pool) = get_db() {
+        // Durable path: timestamps via ::timestamptz casts, JSONB via ::jsonb on
+        // text binds. hold_type/status serialize capitalized (serde variant
+        // names), matching the migration-026 CHECK constraints and seeds.
+        sqlx::query(
+            "INSERT INTO legal_holds \
+                (id, server_or_app_name, hold_type, reason, initiated_by, initiated_date, \
+                 expiry_date, status, affected_backups, site, audit_trail) \
+             VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8, $9::jsonb, $10, $11::jsonb)",
+        )
+        .bind(&hold.id)
+        .bind(&hold.server_or_app_name)
+        .bind(serde_enum_str(&hold.hold_type))
+        .bind(&hold.reason)
+        .bind(&hold.initiated_by)
+        .bind(&hold.initiated_date)
+        .bind(&hold.expiry_date)
+        .bind(serde_enum_str(&hold.status))
+        .bind(serde_json::to_string(&hold.affected_backups).unwrap_or_else(|_| "[]".into()))
+        .bind(&hold.site)
+        .bind(serde_json::to_string(&hold.audit_trail).unwrap_or_else(|_| "[]".into()))
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
     }
+    Ok(Json(serde_json::to_value(&hold).unwrap_or_default()))
+}
+
+/// One persisted `legal_holds` row (migration 026). JSONB columns are selected
+/// as ::text and parsed back so `to_json` reproduces the engine `LegalHold`
+/// serde shape (enums capitalized, dates rfc3339, JSONB arrays).
+#[derive(sqlx::FromRow)]
+struct LegalHoldRow {
+    id: String,
+    server_or_app_name: String,
+    hold_type: String,
+    reason: String,
+    initiated_by: String,
+    initiated_date: chrono::DateTime<chrono::Utc>,
+    expiry_date: chrono::DateTime<chrono::Utc>,
+    status: String,
+    affected_backups: String,
+    site: String,
+    released_by: Option<String>,
+    released_date: Option<chrono::DateTime<chrono::Utc>>,
+    audit_trail: String,
+}
+
+impl LegalHoldRow {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "server_or_app_name": self.server_or_app_name,
+            "hold_type": self.hold_type,
+            "reason": self.reason,
+            "initiated_by": self.initiated_by,
+            "initiated_date": self.initiated_date.to_rfc3339(),
+            "expiry_date": self.expiry_date.to_rfc3339(),
+            "status": self.status,
+            "affected_backups": serde_json::from_str::<Value>(&self.affected_backups)
+                .unwrap_or_else(|_| json!([])),
+            "site": self.site,
+            "released_by": self.released_by,
+            "released_date": self.released_date.as_ref().map(|d| d.to_rfc3339()),
+            "audit_trail": serde_json::from_str::<Value>(&self.audit_trail)
+                .unwrap_or_else(|_| json!([])),
+        })
+    }
+}
+
+const LEGAL_HOLD_COLUMNS: &str = "id, server_or_app_name, hold_type, reason, initiated_by, \
+     initiated_date, expiry_date, status, affected_backups::text AS affected_backups, site, \
+     released_by, released_date, audit_trail::text AS audit_trail";
+
+/// Canonical serde string for a serializable enum value ("Active", etc.).
+fn serde_enum_str<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 async fn legal_hold_validate(
@@ -5481,11 +5564,40 @@ async fn legal_hold_release(
 
 async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> Json<Value> {
     let site = q.site.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
+            "SELECT {LEGAL_HOLD_COLUMNS} FROM legal_holds \
+             WHERE status = 'Active' AND ($1 = '' OR site = $1) ORDER BY expiry_date, id"
+        ))
+        .bind(&site)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        return Json(json!(rows
+            .iter()
+            .map(LegalHoldRow::to_json)
+            .collect::<Vec<_>>()));
+    }
     let holds = legal_hold::get_active_holds(&site);
     Json(serde_json::to_value(holds).unwrap())
 }
 
 async fn legal_hold_expiring() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        // Same predicate as the engine: Active holds expiring within 30 days.
+        let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
+            "SELECT {LEGAL_HOLD_COLUMNS} FROM legal_holds \
+             WHERE status = 'Active' AND expiry_date <= NOW() + INTERVAL '30 days' \
+             ORDER BY expiry_date, id"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        return Json(json!(rows
+            .iter()
+            .map(LegalHoldRow::to_json)
+            .collect::<Vec<_>>()));
+    }
     let holds = legal_hold::get_expiring_holds();
     Json(serde_json::to_value(holds).unwrap())
 }
