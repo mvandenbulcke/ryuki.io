@@ -178,4 +178,73 @@ mod tests {
             "executing and verifying must use the same badge class"
         );
     }
+
+    // --- admin_settings_error_feedback ----------------------------------------
+
+    use super::super::workspaces::admin_settings_error_feedback;
+
+    /// The static dry-run sentinel message must map to the neutral preview badge
+    /// so the user sees an informational "Preview only" message, not an error.
+    #[test]
+    fn admin_settings_feedback_static_dry_run_save_sentinel_is_neutral() {
+        // Exact text produced by reject_static_preview_platform_settings_save.
+        let sentinel = "Portal settings save is preview-only in static dry-run mode; no changes were persisted";
+        let (class, msg) = admin_settings_error_feedback(sentinel);
+        assert_eq!(
+            class, "badge neutral",
+            "static dry-run sentinel must map to badge neutral, got: {class:?}"
+        );
+        assert!(
+            msg.contains("Preview only"),
+            "static dry-run message must contain 'Preview only', got: {msg:?}"
+        );
+    }
+
+    /// The static dry-run sentinel for reset must also map to neutral.
+    #[test]
+    fn admin_settings_feedback_static_dry_run_reset_sentinel_is_neutral() {
+        let sentinel = "Portal settings reset is preview-only in static dry-run mode; no changes were persisted";
+        let (class, _msg) = admin_settings_error_feedback(sentinel);
+        assert_eq!(
+            class, "badge neutral",
+            "static dry-run reset sentinel must map to badge neutral, got: {class:?}"
+        );
+    }
+
+    /// A real failure (auth rejection, validation error, network) must map to
+    /// `badge bad` so the user sees it as an error, not a neutral preview notice.
+    #[test]
+    fn admin_settings_feedback_real_error_is_badge_bad() {
+        let real_error = "VERIFIED_ADMIN_REQUIRED: interactive admin session required";
+        let (class, msg) = admin_settings_error_feedback(real_error);
+        assert_eq!(
+            class, "badge bad",
+            "real error must map to badge bad, got: {class:?}"
+        );
+        assert!(
+            msg.contains("VERIFIED_ADMIN_REQUIRED"),
+            "real error message must be preserved, got: {msg:?}"
+        );
+    }
+
+    /// The Leptos wire prefix must be stripped so the user sees the API message,
+    /// not the transport wrapper.
+    #[test]
+    fn admin_settings_feedback_strips_leptos_wire_prefix() {
+        let wire_wrapped =
+            "error running server function: CONFIG_VALIDATION_FAILED: auth_mode is invalid";
+        let (class, msg) = admin_settings_error_feedback(wire_wrapped);
+        assert_eq!(
+            class, "badge bad",
+            "wire-prefixed real error must map to badge bad, got: {class:?}"
+        );
+        assert!(
+            !msg.contains("error running server function:"),
+            "wire prefix must be stripped, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("CONFIG_VALIDATION_FAILED"),
+            "underlying error must be present after stripping, got: {msg:?}"
+        );
+    }
 }

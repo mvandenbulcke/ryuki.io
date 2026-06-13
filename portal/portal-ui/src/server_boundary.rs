@@ -153,6 +153,17 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
 const MUTATION_UNREACHABLE_MESSAGE: &str =
     "API unreachable; portal is in degraded static preview — no changes were made";
 
+/// Shared substring present in BOTH static dry-run rejection messages (save
+/// and reset).  Used by the UI helper to distinguish the expected preview
+/// boundary from real failures (auth, validation, network, DB).
+///
+/// Both `reject_static_preview_platform_settings_save` and
+/// `reject_static_preview_platform_settings_reset` embed this fragment, so a
+/// single `contains` check is sufficient and robust to minor wording changes
+/// in the non-sentinel parts of those messages.
+pub(crate) const STATIC_PREVIEW_PLATFORM_SETTINGS_SENTINEL: &str =
+    "preview-only in static dry-run mode";
+
 /// Recovers the process-wide upstream client provided through Leptos context
 /// by `main.rs`. Falls back to building one from the environment so SSR
 /// renders outside the context-providing routes (for example the file/error
