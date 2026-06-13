@@ -2401,7 +2401,13 @@ struct CreateRequest {
     site: String,
     environment: String,
     name: String,
+    // VM-shaped sizing is only meaningful for server-deployment; the other ~13
+    // request types omit it. Default to 0 when absent so a non-VM intake JSON
+    // body (which has no cpu/memory_gb) deserializes instead of 422-ing.
+    // build_request_payload only reads these for ServerDeployment.
+    #[serde(default)]
     cpu: u32,
+    #[serde(default)]
     memory_gb: u32,
     justification: String,
 }
@@ -2421,7 +2427,33 @@ struct DbRequestRow {
     created_by: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    // ── Durable lifecycle state (migration 047) ──
+    // payload is authoritative for all 14 request types; the cpu/memory_gb
+    // scalars above are a denormalized server-deployment convenience copy.
+    payload: serde_json::Value,
+    // serde of Vec<Stage>: the REAL persisted lifecycle history (no longer
+    // fabricated in db_row_to_request).
+    stages: serde_json::Value,
+    // serde of Vec<String> (the engine approval_route field).
+    approval_route: serde_json::Value,
+    // serde of the produced plan stages (Vec<Stage>) or null until planned.
+    plan: serde_json::Value,
+    // serde of the last ValidationResult or null.
+    validation_results: serde_json::Value,
+    criticality: String,
+    requester: Option<String>,
+    owner: Option<String>,
+    evidence_manifest_id: Option<String>,
 }
+
+/// The full `requests` column list shared by every `SELECT`/`RETURNING` that
+/// hydrates a [`DbRequestRow`]. Centralized so the 047 columns are added in one
+/// place and the column order stays in lockstep with the struct's `FromRow`
+/// (sqlx::query_as matches by position for the tuple-less struct case via name,
+/// but a single source of truth keeps all ~10 sites identical).
+const REQUEST_COLUMNS: &str = "id, request_type, status, stage, site, environment, name, cpu, \
+     memory_gb, justification, created_by, created_at, updated_at, payload, stages, \
+     approval_route, plan, validation_results, criticality, requester, owner, evidence_manifest_id";
 
 // ─── Request store (in-memory fallback) ───
 
@@ -7706,6 +7738,52 @@ fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
 /// and roll back to a 409. This makes the read-guard-write effectively
 /// serializable without a separate `SELECT ... FOR UPDATE` — the atomic
 /// conditional UPDATE is the lock.
+/// Artifacts a transition produces that must be persisted DURABLY alongside the
+/// status/stage flip, so a restart preserves the full lifecycle (P2) — not just
+/// status/stage. Each is threaded into the CAS UPDATE: `stages` is always
+/// overwritten with the latest cumulative Vec<Stage>; `plan`/`validation`/
+/// `approval_route` use COALESCE so a transition that does not produce one
+/// leaves the prior value intact.
+struct TransitionArtifacts {
+    /// serde of the engine-produced Vec<Stage> for this transition (always Some
+    /// in practice; the engine returns the cumulative stages each step).
+    stages_json: Value,
+    /// Some for plan, None otherwise.
+    plan_json: Option<Value>,
+    /// Some for validate, None otherwise.
+    validation_json: Option<Value>,
+    /// Some for approve, None otherwise.
+    approval_route_json: Option<Value>,
+    /// Approval-decision ledger row: the route role this decision satisfies and
+    /// 'approved'/'rejected'. Both Some only for approve/reject; the reject
+    /// reason rides in `approval_reason`.
+    approval_role: Option<String>,
+    approval_decision: Option<&'static str>,
+    approval_reason: Option<String>,
+}
+
+impl TransitionArtifacts {
+    /// A transition that produces only the cumulative stage history (lock,
+    /// execute, verify, cancel): stages persist, everything else is left intact.
+    fn stages_only(stages_json: Value) -> Self {
+        TransitionArtifacts {
+            stages_json,
+            plan_json: None,
+            validation_json: None,
+            approval_route_json: None,
+            approval_role: None,
+            approval_decision: None,
+            approval_reason: None,
+        }
+    }
+}
+
+/// Persists a lifecycle transition atomically: the CAS `UPDATE requests` (which
+/// now also writes the durable stages/plan/validation/approval_route blobs),
+/// the `audit_log` insert, and — for approve/reject — the
+/// `request_approval_decisions` row all commit in ONE transaction. A row can
+/// never transition without its audit entry, and can never be approved/rejected
+/// without its decision row.
 #[allow(clippy::too_many_arguments)]
 async fn apply_transition_audited(
     pool: &sqlx::PgPool,
@@ -7717,19 +7795,33 @@ async fn apply_transition_audited(
     to_status: &str,
     to_stage: &str,
     detail: Value,
+    artifacts: TransitionArtifacts,
 ) -> Result<DbRequestRow, (StatusCode, Json<Value>)> {
     let mut tx = pool.begin().await.map_err(db_error)?;
 
-    let maybe_row: Option<DbRequestRow> = sqlx::query_as(
-        "UPDATE requests SET status = $1, stage = $2, updated_at = NOW() WHERE id = $3 AND status = $4 RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
-    )
-    .bind(to_status)
-    .bind(to_stage)
-    .bind(uid)
-    .bind(expected_from_status)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(db_error)?;
+    // The CAS condition `AND status = $9` is unchanged so the concurrency/409
+    // invariant holds. `stages` is always overwritten with the latest full
+    // Vec<Stage>; plan/validation_results/approval_route use COALESCE so a
+    // transition that does not produce one leaves the prior value intact.
+    let update_sql = format!(
+        "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, \
+         plan = COALESCE($4::jsonb, plan), \
+         validation_results = COALESCE($5::jsonb, validation_results), \
+         approval_route = COALESCE($6::jsonb, approval_route), \
+         updated_at = NOW() WHERE id = $7 AND status = $8 RETURNING {REQUEST_COLUMNS}"
+    );
+    let maybe_row: Option<DbRequestRow> = sqlx::query_as(&update_sql)
+        .bind(to_status)
+        .bind(to_stage)
+        .bind(&artifacts.stages_json)
+        .bind(&artifacts.plan_json)
+        .bind(&artifacts.validation_json)
+        .bind(&artifacts.approval_route_json)
+        .bind(uid)
+        .bind(expected_from_status)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
 
     let request_id = uid.to_string();
 
@@ -7758,8 +7850,53 @@ async fn apply_transition_audited(
     .await
     .map_err(db_error)?;
 
+    // Approval ledger: when this transition is an approve/reject, persist the
+    // decision row in the SAME tx as the status flip. ON CONFLICT makes a
+    // re-approve after the CAS idempotent (it never aborts the tx on the
+    // UNIQUE). The no-DB path does NOT touch this table.
+    if let (Some(role), Some(decision)) = (
+        artifacts.approval_role.as_deref(),
+        artifacts.approval_decision,
+    ) {
+        sqlx::query(
+            "INSERT INTO request_approval_decisions (request_id, role, decision, actor, reason) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (request_id, role) \
+             DO UPDATE SET decision = EXCLUDED.decision, actor = EXCLUDED.actor, \
+                           decided_at = NOW(), reason = EXCLUDED.reason",
+        )
+        .bind(uid)
+        .bind(role)
+        .bind(decision)
+        .bind(&session.user_id)
+        .bind(&artifacts.approval_reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    }
+
     tx.commit().await.map_err(db_error)?;
     Ok(row)
+}
+
+/// The approval-route role a verified session satisfies, used as the
+/// `request_approval_decisions.role` key. Picks the highest-precedence
+/// approval-capable role the session carries; falls back to the verified
+/// `user_id` when none is present (so the decision is still attributable and
+/// the per-role UNIQUE still holds). Never client-supplied.
+fn approval_role_for(session: &AuthSession) -> String {
+    use ryuki_engine::auth::{APP_ROLE_DATACENTER_APPROVER, APP_ROLE_PLATFORM_ADMIN};
+    if session
+        .roles
+        .iter()
+        .any(|r| r == APP_ROLE_DATACENTER_APPROVER)
+    {
+        return APP_ROLE_DATACENTER_APPROVER.to_string();
+    }
+    if session.roles.iter().any(|r| r == APP_ROLE_PLATFORM_ADMIN) {
+        return APP_ROLE_PLATFORM_ADMIN.to_string();
+    }
+    session.user_id.clone()
 }
 
 /// Best-effort audit of a DENIED transition attempt (a 403 before any state
@@ -7891,51 +8028,82 @@ fn completed_request_stage(
     }
 }
 
+/// Hydrate the engine `Request` from the persisted row. As of migration 047 the
+/// stages/approval_route are the REAL durable history — no fabrication. This is
+/// the point of P2: the engine guards (approve_request's
+/// has_completed_stage("plan"), transition_status's
+/// require_completed_stage_for_transition, execute_request's "execute" lookup)
+/// now run against genuine persisted history, which is exactly why every
+/// transition MUST persist its engine-produced stages back (see
+/// apply_transition_audited / the per-handler artifacts).
 fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::models::Request {
-    use ryuki_engine::models::Request;
-    let mut request = Request {
+    use ryuki_engine::models::{Request, Stage};
+    Request {
         id: request_id.to_string(),
         offering_id: row.request_type.clone(),
         request_type: parse_request_type(&row.request_type)
             .unwrap_or(ryuki_engine::models::RequestType::RequestPreflight),
         status: db_status_to_request_status(&row.status),
-        requester: row.name.clone(),
-        owner: row.name.clone(),
+        // From created_by (the verified SoD anchor), NOT row.name — row.name is
+        // the request display name and was the source of the old
+        // mis-reconstruction.
+        requester: row
+            .requester
+            .clone()
+            .or_else(|| row.created_by.clone())
+            .unwrap_or_default(),
+        owner: row
+            .owner
+            .clone()
+            .or_else(|| row.created_by.clone())
+            .unwrap_or_default(),
         site: row.site.clone(),
         environment: row.environment.clone(),
-        criticality: "standard".into(),
-        stages: Vec::new(),
+        criticality: row.criticality.clone(),
+        // The REAL persisted lifecycle history.
+        stages: serde_json::from_value::<Vec<Stage>>(row.stages.clone()).unwrap_or_default(),
         created_at: row.created_at.to_rfc3339(),
         updated_at: row.updated_at.to_rfc3339(),
         dry_run_required: true,
-        approval_route: Vec::new(),
-        evidence_manifest_id: None,
+        approval_route: serde_json::from_value::<Vec<String>>(row.approval_route.clone())
+            .unwrap_or_default(),
+        evidence_manifest_id: row.evidence_manifest_id.clone(),
         metadata: std::collections::HashMap::new(),
-    };
-
-    if row.stage == "validate" || row.stage == "plan" {
-        request
-            .stages
-            .push(completed_request_stage("validate", Vec::new()));
     }
+}
 
-    if row.stage == "plan" {
-        request.stages.push(completed_request_stage(
-            "plan",
-            vec![ryuki_engine::models::EvidenceItem {
-                key: "dry-run-plan".into(),
-                value: format!(
-                    "DRY-RUN: Planned execution for {} in site {} environment {} (simulated, no provider calls)",
-                    request.request_type, request.site, request.environment
-                ),
-                redacted_value: None,
-                redacted: false,
-                evidence_type: ryuki_engine::models::EvidenceType::Plan,
-            }],
-        ));
+/// Build the per-type payload JSONB stored in `requests.payload`. For
+/// ServerDeployment the payload carries the VM-shaped fields incl cpu/memory_gb;
+/// the other ~13 types have intake-thin bodies today, so they map to the common
+/// envelope {name, site, environment, justification, criticality, request_type}.
+/// This is the schemaless extension point: a type that later grows a richer
+/// intake form extends its match arm WITHOUT a schema change.
+fn build_request_payload(
+    request_type: &ryuki_engine::models::RequestType,
+    body: &CreateRequest,
+    criticality: &str,
+) -> Value {
+    use ryuki_engine::models::RequestType;
+    match request_type {
+        RequestType::ServerDeployment => json!({
+            "name": body.name,
+            "cpu": body.cpu,
+            "memory_gb": body.memory_gb,
+            "site": body.site,
+            "environment": body.environment,
+            "justification": body.justification,
+            "criticality": criticality,
+            "request_type": body.request_type,
+        }),
+        _ => json!({
+            "name": body.name,
+            "site": body.site,
+            "environment": body.environment,
+            "justification": body.justification,
+            "criticality": criticality,
+            "request_type": body.request_type,
+        }),
     }
-
-    request
 }
 
 fn validation_failed_response(
@@ -7979,7 +8147,7 @@ async fn requests_create(
     let request_type = parse_request_type(&body.request_type)?;
     let mut request = request_lifecycle::create_request(
         &body.request_type,
-        request_type,
+        request_type.clone(),
         &body.name,
         &body.name,
         &body.site,
@@ -7990,18 +8158,34 @@ async fn requests_create(
     // Anchor the requester to the VERIFIED session principal, not the
     // client-supplied name. The DB path uses created_by=session.user_id; the
     // in-memory (no-DB) path must match so the cancel SoD check ("requester ==
-    // caller") cannot be forged by setting the request name.
+    // caller") cannot be forged by setting the request name. Owner mirrors the
+    // requester so the create response matches the persisted (created_by-backed)
+    // value rather than echoing the request name.
     request.requester = session.user_id.clone();
+    request.owner = session.user_id.clone();
 
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_error)?;
+        // CreateRequest has no criticality field; default "standard", matching
+        // the engine create_request call above.
+        let criticality = "standard";
+        // The full typed payload (authoritative for all 14 types) and the REAL
+        // intake stage(s) the engine just produced. approval_route is '[]' at
+        // intake; plan/validation_results stay NULL until those transitions.
+        let payload = build_request_payload(&request_type, &body, criticality);
+        let stages_json = serde_json::to_value(&request.stages).unwrap_or_else(|_| json!([]));
+        let approval_route_json =
+            serde_json::to_value(&request.approval_route).unwrap_or_else(|_| json!([]));
         // created_by is the VERIFIED requester principal from the session — it
         // is the requester anchor the cancel SoD check matches against. Never a
-        // client-supplied value.
-        let row = sqlx::query_as::<_, DbRequestRow>(
-            "INSERT INTO requests (request_type, site, environment, name, cpu, memory_gb, justification, created_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at"
-        )
+        // client-supplied value. requester/owner mirror it (the SoD anchor).
+        let row = sqlx::query_as::<_, DbRequestRow>(&format!(
+            "INSERT INTO requests \
+             (request_type, site, environment, name, cpu, memory_gb, justification, created_by, \
+              payload, stages, approval_route, criticality, requester, owner) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $8, $8) \
+             RETURNING {REQUEST_COLUMNS}"
+        ))
         .bind(&body.request_type)
         .bind(&body.site)
         .bind(&body.environment)
@@ -8010,6 +8194,10 @@ async fn requests_create(
         .bind(body.memory_gb as i32)
         .bind(&body.justification)
         .bind(&session.user_id)
+        .bind(&payload)
+        .bind(&stages_json)
+        .bind(&approval_route_json)
+        .bind(criticality)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -8076,9 +8264,9 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
     let offset = params.offset.unwrap_or(0);
 
     if let Some(pool) = get_db() {
-        let rows: Vec<DbRequestRow> = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests ORDER BY created_at DESC LIMIT $1 OFFSET $2"
-        )
+        let rows: Vec<DbRequestRow> = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT $1 OFFSET $2"
+        ))
         .bind(limit as i64)
         .bind(offset as i64)
         .fetch_all(pool)
@@ -8126,14 +8314,22 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
 async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let row: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let row: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .ok_or_else(|| status_404(&request_id))?;
+        // The durable lifecycle state (047): payload is authoritative for all
+        // 14 types; stages/approval_route/plan/validation_results are the REAL
+        // persisted history that survives a restart (no fabrication).
         return Ok(Json(json!({
             "request_id": row.id.to_string(),
             "request_type": row.request_type,
@@ -8147,7 +8343,16 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
             "justification": row.justification,
             "created_by": row.created_by,
             "created_at": row.created_at.to_rfc3339(),
-            "updated_at": row.updated_at.to_rfc3339()
+            "updated_at": row.updated_at.to_rfc3339(),
+            "payload": row.payload,
+            "stages": row.stages,
+            "approval_route": row.approval_route,
+            "plan": row.plan,
+            "validation_results": row.validation_results,
+            "criticality": row.criticality,
+            "requester": row.requester,
+            "owner": row.owner,
+            "evidence_manifest_id": row.evidence_manifest_id
         })));
     }
 
@@ -8171,9 +8376,9 @@ async fn requests_validate(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8187,6 +8392,16 @@ async fn requests_validate(
             return Err(validation_failed_response(&result));
         }
 
+        // Persist the cumulative stages with the completed "validate" stage
+        // appended (mirroring the no-DB arm) plus the validation result, so a
+        // restart preserves the validated lifecycle, not just the status flip.
+        let mut validated = request.clone();
+        validated
+            .stages
+            .push(completed_request_stage("validate", Vec::new()));
+        let stages_json = serde_json::to_value(&validated.stages).unwrap_or_else(|_| json!([]));
+        let validation_json = serde_json::to_value(&result).unwrap_or(Value::Null);
+
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Validated);
         apply_transition_audited(
             pool,
@@ -8198,6 +8413,15 @@ async fn requests_validate(
             db_status,
             "validate",
             json!({}),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: None,
+                validation_json: Some(validation_json),
+                approval_route_json: None,
+                approval_role: None,
+                approval_decision: None,
+                approval_reason: None,
+            },
         )
         .await?;
 
@@ -8268,9 +8492,9 @@ async fn requests_plan(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8279,6 +8503,13 @@ async fn requests_plan(
 
         let request = db_row_to_request(&current, &request_id);
         let stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
+
+        // plan_request returns the full cumulative Vec<Stage> (including the
+        // plan stage). The no-DB arm sets store[idx].stages = stages.clone();
+        // the DB arm now persists the same durably, and records the real plan
+        // (replacing the old fabricated DRY-RUN string).
+        let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| json!([]));
+        let plan_json = stages_json.clone();
 
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Planned);
         apply_transition_audited(
@@ -8291,6 +8522,15 @@ async fn requests_plan(
             db_status,
             "plan",
             json!({}),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: Some(plan_json),
+                validation_json: None,
+                approval_route_json: None,
+                approval_role: None,
+                approval_decision: None,
+                approval_reason: None,
+            },
         )
         .await?;
 
@@ -8335,9 +8575,9 @@ async fn requests_approve(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8351,6 +8591,12 @@ async fn requests_approve(
         let approved = request_lifecycle::approve_request(&request, &session.user_id)
             .map_err(map_engine_error)?;
 
+        // Persist the engine-produced stages + the updated approval_route, and
+        // write the durable approval-decision row in the SAME tx.
+        let stages_json = serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([]));
+        let approval_route_json =
+            serde_json::to_value(&approved.approval_route).unwrap_or_else(|_| json!([]));
+
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Approved);
         apply_transition_audited(
             pool,
@@ -8362,6 +8608,15 @@ async fn requests_approve(
             db_status,
             "approve",
             json!({}),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: None,
+                validation_json: None,
+                approval_route_json: Some(approval_route_json),
+                approval_role: Some(approval_role_for(&session)),
+                approval_decision: Some("approved"),
+                approval_reason: None,
+            },
         )
         .await?;
 
@@ -8405,9 +8660,9 @@ async fn requests_lock(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8417,6 +8672,7 @@ async fn requests_lock(
         let request = db_row_to_request(&current, &request_id);
         let locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
 
+        let stages_json = serde_json::to_value(&locked.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Locked);
         apply_transition_audited(
             pool,
@@ -8428,6 +8684,7 @@ async fn requests_lock(
             db_status,
             "lock",
             json!({}),
+            TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
 
@@ -8470,9 +8727,9 @@ async fn requests_execute(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8482,6 +8739,7 @@ async fn requests_execute(
         let request = db_row_to_request(&current, &request_id);
         let executed = request_lifecycle::execute_request(&request).map_err(map_engine_error)?;
 
+        let stages_json = serde_json::to_value(&executed.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&executed.status);
         apply_transition_audited(
             pool,
@@ -8493,6 +8751,7 @@ async fn requests_execute(
             db_status,
             "execute",
             json!({}),
+            TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
 
@@ -8536,9 +8795,9 @@ async fn requests_verify(
     }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8557,6 +8816,8 @@ async fn requests_verify(
         )
         .map_err(map_engine_error)?;
 
+        let stages_json =
+            serde_json::to_value(&verified_request.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&completed.status);
         apply_transition_audited(
             pool,
@@ -8568,6 +8829,7 @@ async fn requests_verify(
             db_status,
             "verify",
             json!({}),
+            TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
 
@@ -8639,9 +8901,9 @@ async fn requests_reject(
 
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8652,6 +8914,9 @@ async fn requests_reject(
         let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
+        // Persist the engine-produced stages (the failed approve stage) and the
+        // durable rejection decision row (with reason) in the SAME tx.
+        let stages_json = serde_json::to_value(&rejected.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Rejected);
         apply_transition_audited(
             pool,
@@ -8663,6 +8928,15 @@ async fn requests_reject(
             db_status,
             "approve",
             json!({ "reason": reason }),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: None,
+                validation_json: None,
+                approval_route_json: None,
+                approval_role: Some(approval_role_for(&session)),
+                approval_decision: Some("rejected"),
+                approval_reason: Some(reason.to_string()),
+            },
         )
         .await?;
 
@@ -8716,9 +8990,9 @@ async fn requests_cancel(
 
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
-        let current: DbRequestRow = sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1"
-        )
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(uid)
         .fetch_optional(pool)
         .await
@@ -8735,6 +9009,7 @@ async fn requests_cancel(
         let cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
+        let stages_json = serde_json::to_value(&cancelled.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Cancelled);
         apply_transition_audited(
             pool,
@@ -8746,6 +9021,7 @@ async fn requests_cancel(
             db_status,
             "cancel",
             json!({ "reason": reason }),
+            TransitionArtifacts::stages_only(stages_json),
         )
         .await?;
 
@@ -12852,6 +13128,45 @@ async fn sql_deployment_contract() -> Json<Value> {
 mod unit_tests {
     use super::*;
 
+    /// A non-VM request type's intake JSON omits cpu/memory_gb. It must
+    /// deserialize (not 422) now that those fields default to 0, and its
+    /// payload must be the common envelope — never a fabricated VM shape.
+    /// Guards the P2 goal of supporting all ~14 request types over HTTP.
+    #[test]
+    fn test_non_vm_create_body_deserializes_without_cpu_memory() {
+        let body: CreateRequest = serde_json::from_str(
+            r#"{"request_type":"zabbix-onboarding","site":"DEFRA","environment":"production","name":"zbx-1","justification":"non-vm intake"}"#,
+        )
+        .expect("non-VM intake body (no cpu/memory_gb) must deserialize");
+        assert_eq!(body.cpu, 0);
+        assert_eq!(body.memory_gb, 0);
+
+        let request_type = parse_request_type(&body.request_type).expect("known type");
+        let payload = build_request_payload(&request_type, &body, "standard");
+        // Common envelope: no cpu/memory keys for a non-VM type.
+        assert!(payload.get("cpu").is_none());
+        assert!(payload.get("memory_gb").is_none());
+        assert_eq!(payload["request_type"], "zabbix-onboarding");
+        assert_eq!(payload["name"], "zbx-1");
+    }
+
+    /// A server-deployment body still requires the VM sizing semantics and
+    /// carries cpu/memory into its payload.
+    #[test]
+    fn test_vm_create_body_carries_cpu_memory_into_payload() {
+        let body: CreateRequest = serde_json::from_str(
+            r#"{"request_type":"server-deployment","site":"DEFRA","environment":"production","name":"vm-1","cpu":4,"memory_gb":16,"justification":"vm intake"}"#,
+        )
+        .expect("VM intake body must deserialize");
+        assert_eq!(body.cpu, 4);
+        assert_eq!(body.memory_gb, 16);
+
+        let request_type = parse_request_type(&body.request_type).expect("known type");
+        let payload = build_request_payload(&request_type, &body, "standard");
+        assert_eq!(payload["cpu"], 4);
+        assert_eq!(payload["memory_gb"], 16);
+    }
+
     fn test_platform_summary_json() -> Value {
         json!({"productName":"Ryuki Infrastructure Platform","lifecycleStages":lifecycle_stages(),"components":components(),"guardrails":guardrails(),"browserIsolation":true,"localAuthorization":{"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"roleHeader":"X-Ryuki-Local-Role","requiredProductionProvider":"Microsoft Entra ID"}})
     }
@@ -14178,9 +14493,9 @@ mod db_lifecycle_tests {
     }
 
     async fn read_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
-        sqlx::query_as(
-            "SELECT id, request_type, status, stage, site, environment, name, cpu, memory_gb, justification, created_by, created_at, updated_at FROM requests WHERE id = $1",
-        )
+        sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
         .bind(id)
         .fetch_one(pool)
         .await
@@ -14201,6 +14516,13 @@ mod db_lifecycle_tests {
 
     async fn cleanup_request(pool: &PgPool, id: Uuid) {
         sqlx::query("DELETE FROM audit_log WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        // request_approval_decisions has a FK to requests(id); delete its rows
+        // before the request row or the request DELETE aborts on the FK.
+        sqlx::query("DELETE FROM request_approval_decisions WHERE request_id = $1")
             .bind(id)
             .execute(pool)
             .await
@@ -14236,6 +14558,7 @@ mod db_lifecycle_tests {
             "locked",
             "lock",
             json!({}),
+            TransitionArtifacts::stages_only(json!([])),
         )
         .await;
         assert!(ok.is_ok(), "first transition must apply");
@@ -14252,6 +14575,7 @@ mod db_lifecycle_tests {
             "locked",
             "lock",
             json!({}),
+            TransitionArtifacts::stages_only(json!([])),
         )
         .await;
         let Err((status, _)) = again else {
@@ -14301,6 +14625,7 @@ mod db_lifecycle_tests {
                     "locked",
                     "lock",
                     json!({}),
+                    TransitionArtifacts::stages_only(json!([])),
                 )
                 .await
                 .is_ok()
@@ -14508,5 +14833,349 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    // ── P2: durable request lifecycle state (migration 047) ──
+
+    /// A PlatformAdmin session (request+execute+approve+admin) used to drive the
+    /// full lifecycle through the handlers, which resolve the process-global
+    /// `get_db()` pool. provider_mode=local so the audit/DB path is exercised.
+    fn admin_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
+    /// Read the raw persisted row through the global pool (so it observes what
+    /// the handlers wrote), bypassing the in-memory store.
+    async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
+        sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read global row")
+    }
+
+    fn create_body(request_type: &str) -> CreateRequest {
+        CreateRequest {
+            request_type: request_type.into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            name: format!("p2-{request_type}"),
+            cpu: 4,
+            memory_gb: 8,
+            justification: "p2 durable-state test".into(),
+        }
+    }
+
+    /// Every one of the 14 request types round-trips create -> read with its
+    /// REAL persisted payload (not a fabricated VM shape). ServerDeployment
+    /// carries cpu/memory; the other 13 carry the common envelope.
+    #[tokio::test]
+    async fn test_all_request_types_persist_real_payload() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let session = admin_session("requester-p2");
+
+        let types = [
+            "server-deployment",
+            "patch-maintenance",
+            "reboot-orchestration",
+            "controlled-restore",
+            "zabbix-onboarding",
+            "cmdb-import",
+            "cmdb-update-export",
+            "operator-runbook-launch",
+            "application-environment-retirement",
+            "vm-decommission-quarantine",
+            "request-preflight",
+            "vm-day2-change",
+            "snapshot-governance",
+            "backup-coverage-report",
+        ];
+
+        for rt in types {
+            let body = create_body(rt);
+            let Ok(Json(created)) =
+                requests_create(AuthExtractor(session.clone()), Json(body)).await
+            else {
+                panic!("create must succeed for {rt}");
+            };
+            let id = Uuid::parse_str(created["id"].as_str().expect("id")).expect("uuid");
+
+            let row = read_global_row(pool, id).await;
+            // requester/owner anchored to the verified principal, not the name.
+            assert_eq!(row.requester.as_deref(), Some("requester-p2"), "{rt}");
+            assert_eq!(row.owner.as_deref(), Some("requester-p2"), "{rt}");
+            assert_eq!(row.criticality, "standard", "{rt}");
+            // The intake stage is REAL persisted history, not fabricated.
+            let stages: Vec<ryuki_engine::models::Stage> =
+                serde_json::from_value(row.stages.clone()).expect("stages");
+            assert!(
+                stages.iter().any(|s| s.name == "intake"
+                    && s.status == ryuki_engine::models::StageStatus::Completed),
+                "{rt}: intake stage must be persisted"
+            );
+            // Payload is authoritative and type-shaped.
+            assert_eq!(row.payload["request_type"], json!(rt), "{rt}");
+            assert_eq!(row.payload["site"], json!("DEFRA"), "{rt}");
+            if rt == "server-deployment" {
+                assert_eq!(row.payload["cpu"], json!(4), "{rt} carries cpu");
+                assert_eq!(row.payload["memory_gb"], json!(8), "{rt} carries memory");
+            } else {
+                // The other 13 are intake-thin: the common envelope, no VM keys.
+                assert!(
+                    row.payload.get("cpu").is_none(),
+                    "{rt} has no cpu in payload"
+                );
+            }
+            // plan/validation_results stay null at intake.
+            assert_eq!(row.plan, Value::Null, "{rt} plan null at intake");
+            assert_eq!(
+                row.validation_results,
+                Value::Null,
+                "{rt} validation null at intake"
+            );
+
+            cleanup_request(pool, id).await;
+        }
+    }
+
+    /// Drive a request create -> validate -> plan -> approve -> lock -> execute
+    /// -> verify and assert the durable stages/approval_route/plan PERSISTED and
+    /// rehydrate FAITHFULLY — no fabricated DRY-RUN string, real stage history —
+    /// across a fresh hydration (simulating a restart by re-reading the row).
+    #[tokio::test]
+    async fn test_full_lifecycle_persists_and_rehydrates_real_state() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let session = admin_session("approver-p2");
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(session.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        // Drive the lifecycle through the handlers (each commits durably).
+        let p = |s: &str| Path(s.to_string());
+        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("plan");
+        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("approve");
+        let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("lock");
+        let _ = requests_execute(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("execute");
+        let _ = requests_verify(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("verify");
+
+        // Simulate a RESTART: re-read the persisted row and hydrate fresh — this
+        // is exactly what a cold-started API does. No in-memory state.
+        let row = read_global_row(pool, id).await;
+        assert_eq!(row.status, "completed", "lifecycle reaches completed");
+
+        let rehydrated = db_row_to_request(&row, &id_str);
+        let stage_names: Vec<&str> = rehydrated.stages.iter().map(|s| s.name.as_str()).collect();
+        // REAL persisted history: the engine's plan_request rebuilds the full
+        // stage list (validate..publish) and each later transition appends its
+        // own completed stage, so the cumulative history rehydrates faithfully.
+        // The old code FABRICATED only a validate (+ plan) stage from row.stage;
+        // here every executed transition's stage is genuinely persisted.
+        for expected in ["validate", "plan", "approve", "lock", "execute", "verify"] {
+            assert!(
+                stage_names.contains(&expected),
+                "rehydrated stages must include {expected}; got {stage_names:?}"
+            );
+        }
+
+        // The plan column holds the REAL plan stages, NOT a fabricated string.
+        assert_ne!(row.plan, Value::Null, "plan persisted");
+        let plan_stages: Vec<ryuki_engine::models::Stage> =
+            serde_json::from_value(row.plan.clone()).expect("plan deserializes as Vec<Stage>");
+        assert!(
+            plan_stages.iter().any(|s| s.name == "plan"),
+            "persisted plan carries the plan stage"
+        );
+
+        // validation_results persisted (passed).
+        let validation: ryuki_engine::models::ValidationResult =
+            serde_json::from_value(row.validation_results.clone())
+                .expect("validation_results deserializes");
+        assert!(validation.passed, "validation result persisted as passed");
+
+        // approval_route persisted with the verified approver.
+        assert!(
+            rehydrated
+                .approval_route
+                .contains(&"approver-p2".to_string()),
+            "approval_route persisted; got {:?}",
+            rehydrated.approval_route
+        );
+
+        // requester is the verified principal, NOT the request name.
+        assert_eq!(rehydrated.requester, "approver-p2");
+        assert_ne!(rehydrated.requester, row.name);
+
+        // No fabricated DRY-RUN reconstruction string leaks into any plan stage
+        // metadata key the old fabrication used.
+        let fabricated = rehydrated.stages.iter().any(|s| {
+            s.metadata.get("dry_run").map(String::as_str) == Some("true")
+                && s.name == "validate"
+                && s.evidence.is_empty()
+                && s.started_at.is_none()
+        });
+        assert!(
+            !fabricated,
+            "no fabricated validate stage (None timestamps + empty evidence) may appear"
+        );
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// The normalized approval ledger gets exactly ONE row per approving role,
+    /// written atomically with the approve transition; a re-approve is
+    /// idempotent (ON CONFLICT), not a duplicate or a tx abort.
+    #[tokio::test]
+    async fn test_approval_decision_row_persisted_once_per_role() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // A DatacenterApprover so the decision role key is the route role, not a
+        // bare user id.
+        let mut session = admin_session("dc-approver-p2");
+        session.roles = vec![
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
+        ];
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(session.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let p = |s: &str| Path(s.to_string());
+        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("plan");
+        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("approve");
+
+        let role = ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
+        )
+        .bind(id)
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("count decisions");
+        assert_eq!(count, 1, "exactly one approval decision row for the role");
+
+        let (decision, actor): (String, String) = sqlx::query_as(
+            "SELECT decision, actor FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
+        )
+        .bind(id)
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("fetch decision");
+        assert_eq!(decision, "approved");
+        assert_eq!(actor, "dc-approver-p2", "actor is the verified principal");
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// A rejection writes a 'rejected' decision row carrying the mandatory
+    /// reason, atomically with the reject transition.
+    #[tokio::test]
+    async fn test_reject_decision_row_persists_reason() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let mut session = admin_session("dc-rejecter-p2");
+        session.roles = vec![
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
+        ];
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(session.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let p = |s: &str| Path(s.to_string());
+        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("plan");
+        let _ = requests_reject(
+            p(&id_str),
+            AuthExtractor(session.clone()),
+            Json(ReasonBody {
+                reason: "policy violation".into(),
+            }),
+        )
+        .await
+        .expect("reject");
+
+        let (decision, reason): (String, Option<String>) = sqlx::query_as(
+            "SELECT decision, reason FROM request_approval_decisions WHERE request_id = $1 AND role = $2",
+        )
+        .bind(id)
+        .bind(ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER)
+        .fetch_one(pool)
+        .await
+        .expect("fetch decision");
+        assert_eq!(decision, "rejected");
+        assert_eq!(reason.as_deref(), Some("policy violation"));
+        assert_eq!(read_global_row(pool, id).await.status, "rejected");
+
+        cleanup_request(pool, id).await;
     }
 }

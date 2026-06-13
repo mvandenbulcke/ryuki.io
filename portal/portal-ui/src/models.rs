@@ -1102,6 +1102,14 @@ impl From<ApiRequestSummary> for RequestSummary {
 }
 
 /// Mirrors the `GET /api/requests/{id}` detail JSON.
+///
+/// `cpu`/`memory_gb` are VM-shaped scalars; they default so non-VM request
+/// types (patch-maintenance, controlled-restore, cmdb-import, ...) that omit
+/// or zero them still decode. The persisted-state additions
+/// (`criticality`/`requester`/`owner`/`stages`/`plan`/`validation_results`/
+/// `payload`) are all `#[serde(default)]` and absent fields decode to their
+/// defaults, so the portal continues to decode the older scalar-only detail
+/// JSON unchanged (no `deny_unknown_fields`).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ApiRequestDetail {
     pub request_id: String,
@@ -1113,7 +1121,9 @@ pub struct ApiRequestDetail {
     #[serde(default)]
     pub environment: String,
     pub name: String,
+    #[serde(default)]
     pub cpu: u32,
+    #[serde(default)]
     pub memory_gb: u32,
     #[serde(default)]
     pub justification: Option<String>,
@@ -1121,6 +1131,55 @@ pub struct ApiRequestDetail {
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    // --- Persisted request-state additions (all optional / defaulted) ---
+    /// Service criticality (e.g. `critical`, `standard`); absent on the older
+    /// scalar-only detail JSON.
+    #[serde(default)]
+    pub criticality: Option<String>,
+    /// Verified requester principal (the durable `created_by`-derived owner of
+    /// the request), distinct from the display `name`.
+    #[serde(default)]
+    pub requester: Option<String>,
+    /// Accountable owner of the target resource.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// The real, persisted dry-run plan. The API serializes this as the
+    /// produced plan stages (a JSON array of Stage objects), or null until a
+    /// request is planned — NOT a string. Kept as a raw Value (like `payload`
+    /// /`validation_results`); the human-readable summary is extracted in the
+    /// `From` impl from the plan stage's `dry-run-plan` evidence.
+    #[serde(default)]
+    pub plan: serde_json::Value,
+    /// Persisted approval route (ordered approver roles/principals).
+    #[serde(default)]
+    pub approval_route: Vec<String>,
+    /// Persisted lifecycle stages (name/status/timestamps), the request's own
+    /// durable stage record rather than the satellite audit ledger.
+    #[serde(default)]
+    pub stages: Vec<ApiRequestStage>,
+    /// Free-form validation results (rule outcomes); rendered as labelled
+    /// key/value rows when present.
+    #[serde(default)]
+    pub validation_results: serde_json::Value,
+    /// Per-type request payload (the ~14 non-VM request shapes). Rendered as
+    /// generic key/value rows so non-VM types surface their real fields
+    /// instead of assuming cpu/memory.
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// Mirrors one persisted lifecycle stage as serialized by the API
+/// (`ryuki_engine::models::Stage`). All fields default so an absent or partial
+/// stage object still decodes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiRequestStage {
+    pub name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
 }
 
 impl From<ApiRequestDetail> for RequestDetail {
@@ -1142,6 +1201,23 @@ impl From<ApiRequestDetail> for RequestDetail {
             description: "Current lifecycle stage (audit trail loads separately)".to_string(),
         }];
         let actions_available = actions_for_stage(&stage);
+        // Persisted stages map directly to display stages (normalizing the
+        // action-name vocabulary onto the portal state vocabulary).
+        let stages = detail
+            .stages
+            .into_iter()
+            .map(|s| PersistedStage {
+                name: normalize_api_stage(&s.name),
+                status: s.status,
+                timestamp: s.completed_at.or(s.started_at).unwrap_or_default(),
+            })
+            .collect();
+        // Flatten the per-type payload into display rows so non-VM request
+        // types surface their real fields instead of assuming cpu/memory.
+        let payload_fields = flatten_payload_fields(&detail.payload);
+        // The API serializes `plan` as a Vec<Stage>; surface the human-readable
+        // dry-run-plan evidence text (empty until the request is planned).
+        let plan = plan_summary_text(&detail.plan);
         Self {
             id: detail.request_id,
             request_type: detail.request_type,
@@ -1157,7 +1233,90 @@ impl From<ApiRequestDetail> for RequestDetail {
             updated: detail.updated_at,
             timeline,
             actions_available,
+            criticality: detail.criticality.unwrap_or_default(),
+            requester: detail.requester.unwrap_or_default(),
+            owner: detail.owner.unwrap_or_default(),
+            plan,
+            approval_route: detail.approval_route,
+            stages,
+            payload_fields,
         }
+    }
+}
+
+/// Extracts the human-readable dry-run plan summary from the API's persisted
+/// `plan` value (a JSON array of Stage objects, or null until planned). Looks
+/// for the `plan` stage's `dry-run-plan` evidence value; returns "" when the
+/// request is not yet planned or the shape is absent. Never assumes `plan` is
+/// a string (the API serializes it as `Vec<Stage>`).
+pub fn plan_summary_text(plan: &serde_json::Value) -> String {
+    let Some(stages) = plan.as_array() else {
+        return String::new();
+    };
+    stages
+        .iter()
+        .find(|stage| {
+            stage.get("name").and_then(|n| n.as_str()) == Some("plan")
+                || stage.get("name").and_then(|n| n.as_str()) == Some("dry-run-plan")
+        })
+        .and_then(|stage| stage.get("evidence").and_then(|e| e.as_array()))
+        .and_then(|evidence| {
+            evidence
+                .iter()
+                .find(|item| item.get("key").and_then(|k| k.as_str()) == Some("dry-run-plan"))
+        })
+        .and_then(|item| item.get("value").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+/// Flattens a JSON request payload object into display rows. Object keys are
+/// humanized (`snake_case` -> "Snake case"); nested objects/arrays are
+/// rendered as compact JSON so no field is silently dropped. A non-object
+/// payload (null / scalar / the older absent payload) yields no rows.
+pub fn flatten_payload_fields(payload: &serde_json::Value) -> Vec<KeyValue> {
+    let Some(map) = payload.as_object() else {
+        return Vec::new();
+    };
+    map.iter()
+        .map(|(key, value)| KeyValue {
+            label: humanize_field_key(key),
+            value: json_value_to_display(value),
+        })
+        .collect()
+}
+
+/// Humanizes a payload key for display: `requested_offering` -> "Requested
+/// offering", `dryRunPlan` -> "Dry run plan".
+fn humanize_field_key(key: &str) -> String {
+    let spaced = key
+        .chars()
+        .flat_map(|c| {
+            if c == '_' || c == '-' {
+                vec![' ']
+            } else if c.is_ascii_uppercase() {
+                vec![' ', c.to_ascii_lowercase()]
+            } else {
+                vec![c]
+            }
+        })
+        .collect::<String>();
+    let trimmed = spaced.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Renders a JSON value as a compact display string. Strings drop their
+/// quotes; objects/arrays serialize compactly so nested payload data is still
+/// surfaced rather than dropped.
+fn json_value_to_display(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -1224,6 +1383,43 @@ pub struct RequestDetail {
     pub updated: String,
     pub timeline: Vec<StageEvent>,
     pub actions_available: Vec<String>,
+    // --- Persisted request-state additions ---
+    /// Service criticality; empty when the API did not supply it.
+    pub criticality: String,
+    /// Verified requester principal; empty when not supplied.
+    pub requester: String,
+    /// Accountable owner; empty when not supplied.
+    pub owner: String,
+    /// Real persisted dry-run plan text; empty when none has been generated
+    /// yet (the view shows a "no plan" note rather than a fabricated string).
+    pub plan: String,
+    /// Persisted approval route (ordered).
+    pub approval_route: Vec<String>,
+    /// Persisted lifecycle stages, surfaced as a real stage record.
+    pub stages: Vec<PersistedStage>,
+    /// Per-type request payload flattened into display rows. Empty for VM-type
+    /// requests whose fields are already covered by cpu/memory.
+    pub payload_fields: Vec<KeyValue>,
+}
+
+/// A persisted lifecycle stage, projected for display.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PersistedStage {
+    /// Portal-vocabulary stage name (already normalized).
+    pub name: String,
+    /// Stage status (`Completed`, `InProgress`, `Pending`, `Failed`,
+    /// `Blocked`), passed through from the engine `StageStatus`.
+    pub status: String,
+    /// Best-available timestamp (completed, else started).
+    pub timestamp: String,
+}
+
+/// A flattened key/value row used to render per-type request payloads and
+/// validation results generically.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KeyValue {
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1627,6 +1823,15 @@ pub fn request_detail_fallback(request_id: &str) -> RequestDetail {
         updated: "2026-06-05T12:00:00Z".to_string(),
         timeline,
         actions_available,
+        criticality: "standard".to_string(),
+        requester: "requester".to_string(),
+        owner: "platform-team".to_string(),
+        plan: "Provision VM with the requested CPU/memory, attach to the \
+               environment network, register in CMDB."
+            .to_string(),
+        approval_route: vec!["datacenter-approver".to_string()],
+        stages: Vec::new(),
+        payload_fields: Vec::new(),
     }
 }
 
@@ -2263,6 +2468,132 @@ mod tests {
             mapped.actions_available,
             vec!["validate".to_string(), "cancel".to_string()]
         );
+    }
+
+    #[test]
+    fn api_request_detail_decodes_legacy_scalar_only_json() {
+        // The older scalar-only detail JSON (no criticality/requester/owner/
+        // stages/plan/payload) must still decode: the additive fields default
+        // and cpu/memory remain present. This pins backward compatibility.
+        let body = r#"{"request_id":"r1","request_type":"VM","status":"intake","stage":"intake","site":"s","environment":"prod","name":"n","cpu":4,"memory_gb":16,"justification":"j","created_by":"admin","created_at":"t","updated_at":"t2"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("legacy detail decodes");
+        let mapped = RequestDetail::from(detail);
+
+        assert_eq!(mapped.cpu, 4);
+        assert_eq!(mapped.memory, 16);
+        // Absent persisted-state fields surface as empty, never fabricated.
+        assert_eq!(mapped.criticality, "");
+        assert_eq!(mapped.requester, "");
+        assert_eq!(mapped.owner, "");
+        assert_eq!(mapped.plan, "");
+        assert!(mapped.approval_route.is_empty());
+        assert!(mapped.stages.is_empty());
+        assert!(mapped.payload_fields.is_empty());
+    }
+
+    #[test]
+    fn api_request_detail_surfaces_persisted_state() {
+        // The now-real detail carries criticality/requester/owner, a real plan
+        // (not the old fabricated DRY-RUN string), an ordered approval route,
+        // and persisted stages with the API action-name vocabulary normalized.
+        // `plan` is the API's REAL shape: a JSON array of Stage objects (the
+        // produced plan), NOT a string. The portal extracts the human-readable
+        // summary from the plan stage's `dry-run-plan` evidence. (Feeding a
+        // string here previously masked a hard deserialization failure for any
+        // planned-or-later request.)
+        let body = r#"{"request_id":"r1","request_type":"server-deployment","status":"planned","stage":"plan","site":"s","environment":"prod","name":"srv-01","cpu":8,"memory_gb":32,"justification":"j","created_by":"requester","created_at":"t","updated_at":"t2","criticality":"critical","requester":"requester","owner":"platform-team","plan":[{"name":"plan","status":"Completed","started_at":"t1","completed_at":"t2","evidence":[{"key":"dry-run-plan","value":"Provision and register srv-01."}]}],"approval_route":["datacenter-approver","security"],"stages":[{"name":"validate","status":"Completed","started_at":"t0","completed_at":"t1"},{"name":"plan","status":"InProgress","started_at":"t2","completed_at":null}]}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail decodes");
+        let mapped = RequestDetail::from(detail);
+
+        assert_eq!(mapped.criticality, "critical");
+        assert_eq!(mapped.requester, "requester");
+        assert_eq!(mapped.owner, "platform-team");
+        assert_eq!(mapped.plan, "Provision and register srv-01.");
+        assert_eq!(
+            mapped.approval_route,
+            vec!["datacenter-approver".to_string(), "security".to_string()]
+        );
+        assert_eq!(mapped.stages.len(), 2);
+        // Action-name "validate" is normalized to the display state.
+        assert_eq!(mapped.stages[0].name, "validated");
+        assert_eq!(mapped.stages[0].status, "Completed");
+        // The completed timestamp is preferred over the started timestamp.
+        assert_eq!(mapped.stages[0].timestamp, "t1");
+        // An in-progress stage with no completed_at falls back to started_at.
+        assert_eq!(mapped.stages[1].name, "planned");
+        assert_eq!(mapped.stages[1].timestamp, "t2");
+    }
+
+    #[test]
+    fn api_request_detail_decodes_array_plan_and_null_plan() {
+        // Regression: the API serializes `plan` as Vec<Stage> (array) or null,
+        // never a string. Both must decode (a string-typed field would hard-
+        // fail the whole detail). An un-planned request yields an empty plan.
+        let unplanned = r#"{"request_id":"r2","request_type":"zabbix-onboarding","status":"intake","stage":"intake","site":"s","environment":"prod","name":"host-1","created_at":"t","updated_at":"t","plan":null}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(unplanned).expect("null plan decodes");
+        assert_eq!(RequestDetail::from(detail).plan, "");
+
+        // A planned request with the array shape extracts the evidence text.
+        let planned = r#"{"request_id":"r3","request_type":"server-deployment","status":"planned","stage":"plan","site":"s","environment":"prod","name":"srv-9","created_at":"t","updated_at":"t","plan":[{"name":"plan","status":"Completed","evidence":[{"key":"dry-run-plan","value":"Provision srv-9."}]}]}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(planned).expect("array plan decodes");
+        assert_eq!(RequestDetail::from(detail).plan, "Provision srv-9.");
+    }
+
+    #[test]
+    fn plan_summary_text_handles_shapes() {
+        assert_eq!(plan_summary_text(&serde_json::Value::Null), "");
+        assert_eq!(plan_summary_text(&serde_json::json!([])), "");
+        // No dry-run-plan evidence -> empty.
+        assert_eq!(
+            plan_summary_text(&serde_json::json!([{"name":"plan","evidence":[]}])),
+            ""
+        );
+    }
+
+    #[test]
+    fn api_request_detail_flattens_non_vm_payload_fields() {
+        // A non-VM request type (patch-maintenance) carries no cpu/memory but
+        // a per-type payload; the portal flattens it into display rows so the
+        // type surfaces its real fields instead of assuming the VM shape.
+        let body = r#"{"request_id":"r1","request_type":"patch-maintenance","status":"intake","stage":"intake","site":"s","environment":"prod","name":"wave-7","created_at":"t","updated_at":"t2","payload":{"patch_baseline":"2026-06","maintenance_window":"02:00-04:00","reboot_required":true,"target_hosts":["h1","h2"]}}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail decodes");
+        // cpu/memory default to 0 for non-VM types.
+        assert_eq!(detail.cpu, 0);
+        assert_eq!(detail.memory_gb, 0);
+        let mapped = RequestDetail::from(detail);
+
+        // Keys are humanized and present (order follows the JSON map ordering).
+        let labels: Vec<&str> = mapped
+            .payload_fields
+            .iter()
+            .map(|f| f.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Patch baseline"));
+        assert!(labels.contains(&"Maintenance window"));
+        assert!(labels.contains(&"Reboot required"));
+        assert!(labels.contains(&"Target hosts"));
+
+        let find = |label: &str| {
+            mapped
+                .payload_fields
+                .iter()
+                .find(|f| f.label == label)
+                .map(|f| f.value.clone())
+                .unwrap_or_default()
+        };
+        // String values drop their quotes; scalars/arrays render compactly.
+        assert_eq!(find("Patch baseline"), "2026-06");
+        assert_eq!(find("Reboot required"), "true");
+        assert_eq!(find("Target hosts"), r#"["h1","h2"]"#);
+    }
+
+    #[test]
+    fn flatten_payload_fields_ignores_non_object_payloads() {
+        // The older absent payload (Null) and any scalar payload yield no rows
+        // rather than panicking.
+        assert!(flatten_payload_fields(&serde_json::Value::Null).is_empty());
+        assert!(flatten_payload_fields(&serde_json::json!("scalar")).is_empty());
+        assert!(flatten_payload_fields(&serde_json::json!(42)).is_empty());
     }
 
     #[test]

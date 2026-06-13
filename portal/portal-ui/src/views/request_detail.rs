@@ -411,6 +411,28 @@ pub fn RequestDetail() -> impl IntoView {
                             .collect();
                         let request_id_for_action = detail.id.clone();
 
+                        // Persisted-state fields surfaced in the detail panel.
+                        // CPU/memory are only meaningful for VM-shaped types;
+                        // non-VM types report 0 and render their real fields
+                        // through the per-type payload section instead.
+                        let has_compute = detail.cpu > 0 || detail.memory > 0;
+                        let criticality = detail.criticality.clone();
+                        let requester = detail.requester.clone();
+                        let owner = detail.owner.clone();
+                        let plan = detail.plan.clone();
+                        let approval_route = detail.approval_route.clone();
+                        let payload_fields = detail.payload_fields.clone();
+                        // `Show when=` closures need Copy predicates, so the
+                        // emptiness checks are hoisted to bools the closures
+                        // capture by value (the data itself is cloned into the
+                        // bodies below).
+                        let has_criticality = !criticality.is_empty();
+                        let has_requester = !requester.is_empty();
+                        let has_owner = !owner.is_empty();
+                        let has_plan = !plan.is_empty();
+                        let has_approval_route = !approval_route.is_empty();
+                        let has_payload = !payload_fields.is_empty();
+
                         view! {
                             <article
                                 class="request-detail-panel"
@@ -486,14 +508,39 @@ pub fn RequestDetail() -> impl IntoView {
                                         <strong>"Environment"</strong>
                                         <span>{detail.environment.clone()}</span>
                                     </div>
-                                    <div class="request-info-item">
-                                        <strong>"CPU"</strong>
-                                        <span>{detail.cpu} " cores"</span>
-                                    </div>
-                                    <div class="request-info-item">
-                                        <strong>"Memory"</strong>
-                                        <span>{detail.memory} " GB"</span>
-                                    </div>
+                                    // CPU/Memory are VM-shaped scalars; render
+                                    // them only when present (non-zero). Non-VM
+                                    // request types surface their real fields
+                                    // through the per-type payload section
+                                    // below instead of showing "0 cores".
+                                    <Show when=move || has_compute>
+                                        <div class="request-info-item">
+                                            <strong>"CPU"</strong>
+                                            <span>{detail.cpu} " cores"</span>
+                                        </div>
+                                        <div class="request-info-item">
+                                            <strong>"Memory"</strong>
+                                            <span>{detail.memory} " GB"</span>
+                                        </div>
+                                    </Show>
+                                    <Show when=move || has_criticality>
+                                        <div class="request-info-item">
+                                            <strong>"Criticality"</strong>
+                                            <span>{criticality.clone()}</span>
+                                        </div>
+                                    </Show>
+                                    <Show when=move || has_requester>
+                                        <div class="request-info-item">
+                                            <strong>"Requester"</strong>
+                                            <span>{requester.clone()}</span>
+                                        </div>
+                                    </Show>
+                                    <Show when=move || has_owner>
+                                        <div class="request-info-item">
+                                            <strong>"Owner"</strong>
+                                            <span>{owner.clone()}</span>
+                                        </div>
+                                    </Show>
                                     <div class="request-info-item">
                                         <strong>"Justification"</strong>
                                         <span>{detail.justification.clone()}</span>
@@ -507,6 +554,55 @@ pub fn RequestDetail() -> impl IntoView {
                                         <span>{detail.updated.clone()}</span>
                                     </div>
                                 </div>
+
+                                // Per-type request payload (the ~14 non-VM
+                                // request shapes). Rendered generically so each
+                                // type surfaces its real fields rather than
+                                // assuming the VM cpu/memory shape.
+                                <Show when=move || has_payload>
+                                    <div class="request-payload" aria-label="Request details">
+                                        <h3>"Request Details"</h3>
+                                        <div class="request-info-grid">
+                                            {payload_fields
+                                                .clone()
+                                                .into_iter()
+                                                .map(|field| {
+                                                    view! {
+                                                        <div class="request-info-item">
+                                                            <strong>{field.label}</strong>
+                                                            <span>{field.value}</span>
+                                                        </div>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </div>
+                                    </div>
+                                </Show>
+
+                                // The real, persisted dry-run plan (replaces
+                                // the old fabricated "DRY-RUN: Planned
+                                // execution..." string). Hidden until a plan
+                                // has actually been generated.
+                                <Show when=move || has_plan>
+                                    <div class="request-plan" aria-label="Dry-run plan">
+                                        <h3>"Dry-Run Plan"</h3>
+                                        <pre class="plan-text">{plan.clone()}</pre>
+                                    </div>
+                                </Show>
+
+                                // The persisted approval route (ordered).
+                                <Show when=move || has_approval_route>
+                                    <div class="request-approval-route" aria-label="Approval route">
+                                        <h3>"Approval Route"</h3>
+                                        <ol class="approval-route-list">
+                                            {approval_route
+                                                .clone()
+                                                .into_iter()
+                                                .map(|step| view! { <li>{step}</li> })
+                                                .collect_view()}
+                                        </ol>
+                                    </div>
+                                </Show>
 
                                 <div class="request-actions">
                                     <h3>"Actions"</h3>

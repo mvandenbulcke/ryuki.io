@@ -1816,6 +1816,15 @@ pub async fn create_request(payload: CreateRequestPayload) -> Result<RequestDeta
             updated: String::new(),
             timeline: Vec::new(),
             actions_available: actions_for_stage("intake"),
+            // The follow-up read failed, so the persisted-state fields are not
+            // yet known; leave them empty rather than fabricating values.
+            criticality: String::new(),
+            requester: String::new(),
+            owner: String::new(),
+            plan: String::new(),
+            approval_route: Vec::new(),
+            stages: Vec::new(),
+            payload_fields: Vec::new(),
         }),
     }
 }

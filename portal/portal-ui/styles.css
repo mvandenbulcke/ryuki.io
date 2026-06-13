@@ -1284,6 +1284,42 @@ tbody tr:hover {
   text-transform: uppercase;
 }
 
+/* Per-type request payload, the real dry-run plan, and the approval route are
+   surfaced from the now-persisted request state. They share the detail
+   section spacing/heading rhythm. */
+.request-payload,
+.request-plan,
+.request-approval-route {
+  display: grid;
+  gap: 10px;
+}
+
+.request-payload h3,
+.request-plan h3,
+.request-approval-route h3 {
+  margin: 0;
+}
+
+.plan-text {
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.approval-route-list {
+  margin: 0;
+  padding-left: 22px;
+  display: grid;
+  gap: 6px;
+  font-size: 14px;
+}
+
 .request-actions {
   display: grid;
   gap: 10px;
