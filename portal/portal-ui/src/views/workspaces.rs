@@ -1450,7 +1450,7 @@ fn OperationsWorkspaceDetail() -> impl IntoView {
                                     Ok(health) => {
                                         let checks = health.checks;
                                         let overall = health.overall_status;
-                                        let timestamp = health.timestamp;
+                                        let timestamp = condense_timestamp(&health.timestamp);
                                         view! {
                                             <div class="workspace-detail-item">
                                                 <span class="badge good">{overall}</span>
@@ -1473,7 +1473,7 @@ fn OperationsWorkspaceDetail() -> impl IntoView {
                                                             <span class=check_badge_class>{check.status}</span>
                                                             <strong>{check.name}</strong>
                                                             <p>{check.message}</p>
-                                                            <span class="table-note">{check.component} " / " {check.last_check}</span>
+                                                            <span class="table-note">{check.component} " / " {condense_timestamp(&check.last_check)}</span>
                                                         </div>
                                                     }
                                                 })

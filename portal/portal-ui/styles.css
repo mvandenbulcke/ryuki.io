@@ -872,7 +872,10 @@ p {
 
 .workspace-detail-columns {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* auto-fit so a panel with a SINGLE list (e.g. Evidence) fills the full width
+     instead of leaving an empty right column; two-list panels (catalog,
+     inventory, cmdb) still go side-by-side and collapse when narrow. */
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
   gap: 10px;
 }
 
