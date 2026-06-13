@@ -1659,6 +1659,36 @@ fn SecurityWorkspaceDetail() -> impl IntoView {
     }
 }
 
+/// Maps a platform-settings server-function error message to the appropriate
+/// feedback badge class and display text.
+///
+/// Returns `("badge neutral", preview-only message)` when the error originates
+/// from the static dry-run boundary (expected, informational), and
+/// `("badge bad", human-readable error)` for every real failure (auth, network,
+/// validation, DB persistence).
+///
+/// The Leptos wire-format prefix `"error running server function: "` is
+/// stripped before comparison and display so the user always sees the
+/// API/boundary message rather than the transport wrapper.
+pub(crate) fn admin_settings_error_feedback(error_message: &str) -> (&'static str, String) {
+    use crate::server_boundary::STATIC_PREVIEW_PLATFORM_SETTINGS_SENTINEL;
+
+    // Strip the Leptos transport prefix if present (mirrors server_error_message
+    // in request_detail.rs:84).
+    let stripped = error_message
+        .strip_prefix("error running server function: ")
+        .unwrap_or(error_message);
+
+    if stripped.contains(STATIC_PREVIEW_PLATFORM_SETTINGS_SENTINEL) {
+        (
+            "badge neutral",
+            "Preview only: settings were not persisted".to_string(),
+        )
+    } else {
+        ("badge bad", stripped.to_string())
+    }
+}
+
 #[component]
 fn AdminSettingsDetail() -> impl IntoView {
     #[allow(deprecated)]
@@ -1695,9 +1725,10 @@ fn AdminSettingsDetail() -> impl IntoView {
                     set_feedback.set("Settings saved".to_string());
                     set_feedback_class.set("badge good");
                 }
-                Err(_) => {
-                    set_feedback.set("Preview only: settings were not persisted".to_string());
-                    set_feedback_class.set("badge neutral");
+                Err(error) => {
+                    let (cls, msg) = admin_settings_error_feedback(&error.to_string());
+                    set_feedback.set(msg);
+                    set_feedback_class.set(cls);
                 }
             }
         }
@@ -1717,9 +1748,10 @@ fn AdminSettingsDetail() -> impl IntoView {
                     set_feedback.set("Settings reset to defaults".to_string());
                     set_feedback_class.set("badge good");
                 }
-                Err(_) => {
-                    set_feedback.set("Preview only: settings were not reset".to_string());
-                    set_feedback_class.set("badge neutral");
+                Err(error) => {
+                    let (cls, msg) = admin_settings_error_feedback(&error.to_string());
+                    set_feedback.set(msg);
+                    set_feedback_class.set(cls);
                 }
             }
         }
