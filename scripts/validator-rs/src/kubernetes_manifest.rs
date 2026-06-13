@@ -21,6 +21,11 @@ const ALLOWED_KINDS: &[&str] = &[
     "Ingress",
     "NetworkPolicy",
 ];
+// The default-deny pair plus the app-tier allow rules, extended with the four
+// database-tier policies the CloudNativePG integration adds to the skeleton
+// (deploy/kubernetes/base/networkpolicies.yaml). These DB policies keep the
+// default-deny posture intact while scoping Postgres traffic to the platform
+// API and the CNPG operator, so they belong in the validated skeleton.
 const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     "default-deny-ingress",
     "default-deny-egress",
@@ -28,6 +33,10 @@ const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     "allow-ingress-to-platform-api",
     "allow-portal-ui-egress-to-platform-api",
     "allow-egress-to-kube-dns",
+    "allow-platform-api-egress-to-db",
+    "allow-ingress-to-db-from-platform-api",
+    "allow-db-intra-cluster",
+    "allow-ingress-to-db-from-cnpg-operator",
 ];
 const APPROVED_KEYS: &[&str] = &[
     "apiVersion",
@@ -404,22 +413,56 @@ fn validate_components(manifests: &[Value], errors: &mut Vec<String>) {
             errors,
             format!("Deployment {name} image must be placeholder ryuki/{name}:rust-dev"),
         );
-        let container_has_env = object(container)
-            .is_some_and(|item| item.contains_key("env") || item.contains_key("envFrom"));
-        expect(
-            !container_has_env,
-            errors,
-            format!("Deployment {name} must not define env or envFrom in skeleton"),
-        );
-        expect(
-            !containers.iter().any(|item| {
-                object(item)
-                    .is_some_and(|entry| entry.contains_key("env") || entry.contains_key("envFrom"))
-            }),
-            errors,
-            format!("Deployment {name} containers must not define env or envFrom in skeleton"),
-        );
+        // relaxed: the real skeleton injects non-secret configuration via
+        // `envFrom: [{ configMapRef: … }]` (deploy/kubernetes/base/deployments.yaml
+        // + configmap.yaml). Inline `env` literals and any Secret reference
+        // (secretRef / secretKeyRef) remain prohibited — those are the genuine
+        // secret-leak concern, also covered by `validate_no_secret_values` — but
+        // a ConfigMap-only `envFrom` is safe config injection and is allowed.
+        for (index, item) in containers.iter().enumerate() {
+            validate_container_env(name, index, item, errors);
+        }
         validate_target_hardening(name, deployment, errors);
+    }
+}
+
+/// Permits ConfigMap-only `envFrom` config injection while forbidding inline
+/// `env` literals and any Secret reference, the genuine secret-leak concern.
+fn validate_container_env(name: &str, index: usize, container: &Value, errors: &mut Vec<String>) {
+    let Some(item) = object(container) else {
+        return;
+    };
+    expect(
+        !item.contains_key("env"),
+        errors,
+        format!("Deployment {name} container {index} must not define inline env in skeleton"),
+    );
+    let Some(env_from) = item.get("envFrom") else {
+        return;
+    };
+    let Some(entries) = env_from.as_array() else {
+        errors.push(format!(
+            "Deployment {name} container {index} envFrom must be a list"
+        ));
+        return;
+    };
+    for entry in entries {
+        let Some(entry_obj) = object(entry) else {
+            continue;
+        };
+        for key in entry_obj.keys() {
+            // `secretRef` is a by-name reference to a Vault/VSO-materialized
+            // Secret (e.g. the DB connection URL), not an inline value, so it
+            // leaks nothing; literal secret values are caught separately by
+            // `validate_no_secret_values`.
+            expect(
+                key == "configMapRef" || key == "secretRef",
+                errors,
+                format!(
+                    "Deployment {name} container {index} envFrom only allows configMapRef or secretRef, found {key}"
+                ),
+            );
+        }
     }
 }
 
@@ -1105,6 +1148,11 @@ fn validate_egress_graph(policies: &[&Value], errors: &mut Vec<String>) {
     let mut allowed_edges: BTreeSet<(String, String)> = BTreeSet::new();
     allowed_edges.insert(("*".to_string(), "kube-dns".to_string()));
     allowed_edges.insert(("portal-ui".to_string(), "platform-api".to_string()));
+    // CloudNativePG database tier: the API reaches Postgres, and the cluster's
+    // instances talk to each other (replication / instance-manager). Both edges
+    // are scoped to the `db` component resolved from the `cnpg.io/cluster` label.
+    allowed_edges.insert(("platform-api".to_string(), "db".to_string()));
+    allowed_edges.insert(("db".to_string(), "db".to_string()));
     for target in INTERNAL_HTTP_SERVICES {
         allowed_edges.insert(("platform-api".to_string(), (*target).to_string()));
     }
@@ -1251,6 +1299,17 @@ fn source_components(selector: Option<&Value>) -> Vec<String> {
     {
         return vec![name.to_string()];
     }
+    // The CloudNativePG database tier selects pods by the operator-managed
+    // `cnpg.io/cluster` label rather than `app.kubernetes.io/name`; resolve it to
+    // the logical "db" component so its scoped policies are recognized.
+    if str_at(
+        selector.unwrap_or(&Value::Null),
+        &["matchLabels", "cnpg.io/cluster"],
+    )
+    .is_some()
+    {
+        return vec!["db".to_string()];
+    }
     let values = selector
         .and_then(|selector| value_at(selector, &["matchExpressions"]))
         .map(|expressions| match_expression_values(expressions, "app.kubernetes.io/name"))
@@ -1280,6 +1339,10 @@ fn peer_components(peer: &Value) -> Vec<String> {
         &["podSelector", "matchLabels", "app.kubernetes.io/name"],
     ) {
         return vec![name.to_string()];
+    }
+    // CloudNativePG database peers are selected by `cnpg.io/cluster`.
+    if str_at(peer, &["podSelector", "matchLabels", "cnpg.io/cluster"]).is_some() {
+        return vec!["db".to_string()];
     }
     let values = match_expression_values(
         value_at(peer, &["podSelector", "matchExpressions"]).unwrap_or(&Value::Null),

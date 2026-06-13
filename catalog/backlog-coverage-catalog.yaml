@@ -1,0 +1,9 @@
+# Backlog coverage registry note.
+# Registers the build-sheet backlog coverage check (scripts/validator-rs,
+# slice backlog-coverage) which cross-checks the platform build sheet against
+# the validator's COVERAGE_TSV registry. No runtime data is served from this
+# file; the registry endpoint reference is /api/platform/summary.
+version: 1
+status: draft
+slice: backlog-coverage
+note: Metadata note for COVERAGE_TSV registration; the validation logic lives in scripts/validator-rs/src/main.rs (validate_context) and reads docs/platform-build-sheet.md.

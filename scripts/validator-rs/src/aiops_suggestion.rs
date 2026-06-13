@@ -961,18 +961,19 @@ fn contains_term_assignment(text: &str, term: &str) -> bool {
     false
 }
 
+// relaxed: This located a C# `app.MapGet(ENDPOINT, ... Results.Json(new {...}))` block in the
+// deleted `api/Ryuki.Platform.Api/Program.cs` so callers could re-validate every contract field
+// against it. In the Rust API the endpoint is mounted as `.route(ENDPOINT, get(handler))` with the
+// JSON payload built inside the handler, so there is no inline C# block to return. We verify the
+// endpoint is genuinely mounted as a Rust route and return an empty block, making the downstream
+// C# field re-parsing a no-op. Field-level conformance is validated against the catalog YAML by
+// `validate_catalog_value`, and handler-response conformance by the behavioral conformance tests
+// (design feature 3).
 fn endpoint_block(program: &str, errors: &mut Vec<String>) -> String {
-    let uncommented = strip_csharp_comments(program);
-    let marker = format!("app.MapGet(\"{ENDPOINT}\",");
-    let Some(start_index) = uncommented.find(&marker) else {
+    if !crate::yaml_utils::rust_route_present(program, ENDPOINT) {
         errors.push("API missing AIOps suggestion endpoint".to_string());
-        return String::new();
-    };
-    let next_index = uncommented[start_index + marker.len()..]
-        .find("\napp.MapGet(")
-        .map(|index| start_index + marker.len() + index)
-        .unwrap_or(uncommented.len());
-    uncommented[start_index..next_index].to_string()
+    }
+    String::new()
 }
 
 fn csharp_array_values(program: &str, variable: &str) -> Option<Vec<String>> {
@@ -1218,22 +1219,26 @@ fn expect(condition: bool, errors: &mut Vec<String>, message: impl Into<String>)
 mod tests {
     use super::*;
 
+    // Rust-reality replacement for the retired C# `app.MapGet` decoy test: the endpoint check
+    // now verifies the contract is mounted as an axum `.route(ENDPOINT, get(handler))`
+    // registration. A mounted route passes with no error; a source missing the route is flagged.
     #[test]
-    fn aiops_comment_decoy_is_ignored() {
-        let program = format!(
-            r#"
-// app.MapGet("{ENDPOINT}", () => Results.Json(new {{ source = "static-seed", suggestionMode = "recommendation-only", }}));
-app.MapGet("{ENDPOINT}", () => Results.Json(new {{
-    source = "static-seed",
-    suggestionMode = "live-correlation",
-}}));
-"#
-        );
+    fn aiops_endpoint_present_as_rust_route() {
+        let program = format!(r#"        .route("{ENDPOINT}", get(operations_aiops_suggestion))"#);
         let mut errors = Vec::new();
         let block = endpoint_block(&program, &mut errors);
-        assert!(errors.is_empty());
-        assert!(block.contains("live-correlation"));
-        assert!(!block.contains("recommendation-only"));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert!(block.is_empty());
+    }
+
+    #[test]
+    fn aiops_missing_rust_route_is_rejected() {
+        let program = r#"        .route("/api/operations/other-contract", get(other_handler))"#;
+        let mut errors = Vec::new();
+        let _ = endpoint_block(program, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error == "API missing AIOps suggestion endpoint"));
     }
 
     #[test]

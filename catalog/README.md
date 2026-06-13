@@ -118,4 +118,4 @@ Catalog files define safe seed data for requestable offerings, site facts, and f
 - Use credential-reference concepts in product docs, not concrete secret paths or secret values in catalog data.
 - Keep write-capable offerings dry-run first.
 - Tie catalog entries back to the canonical request lifecycle and evidence model.
-- Validate catalog changes with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- validate catalog`.
+- Validate catalog changes from the repository root with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all` (the validator defaults to the current directory; pass `--root <path>` to validate another checkout). To validate a single slice, pipe its name to `batch-validate`, for example `echo catalog | cargo run --manifest-path scripts/validator-rs/Cargo.toml -- batch-validate`.

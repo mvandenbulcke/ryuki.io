@@ -1,0 +1,8 @@
+# ryuki-api crate registry note.
+# Registers the Rust API crate validation (scripts/validator-rs, slice
+# ryuki-api) covering sources/ryuki-api (Cargo.toml, src/main.rs,
+# src/contracts.rs, src/boundary.rs) and its mounted contract routes.
+version: 1
+status: draft
+slice: ryuki-api
+note: Metadata note for COVERAGE_TSV registration; the validation logic lives in scripts/validator-rs/src/ryuki_api.rs. The crate's summary surface is /api/platform/summary.

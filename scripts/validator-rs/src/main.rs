@@ -115,8 +115,10 @@ mod request_intake_support;
 mod request_lifecycle;
 mod request_preflight;
 mod restore_testing;
+mod rust_contract;
 mod ryuki_api;
 mod ryuki_engine;
+mod scaffold_docs;
 mod secret_reference;
 mod security_baseline;
 mod sensitive_output_guardrails;
@@ -144,11 +146,41 @@ mod zabbix_onboarding;
 const BUILD_SHEET_PATH: &str = "docs/platform-build-sheet.md";
 const CATALOG_README_PATH: &str = "catalog/README.md";
 const WORKFLOW_README_PATH: &str = "docs/workflows/README.md";
-const API_README_PATH: &str = "api/Ryuki.Platform.Api/README.md";
-const PROGRAM_PATH: &str = "api/Ryuki.Platform.Api/Program.cs";
+// The legacy C# API (api/Ryuki.Platform.Api/*) was deleted when the platform
+// was ported to Rust. The shared "program" input is now the Rust route/handler
+// source and the shared "API readme" input is the generated endpoint inventory
+// produced by the `generate-endpoints-doc` subcommand.
 const RUST_API_CONTRACTS_PATH: &str = "sources/ryuki-api/src/contracts.rs";
 const RUST_API_MAIN_PATH: &str = "sources/ryuki-api/src/main.rs";
+const RUST_API_BOUNDARY_PATH: &str = "sources/ryuki-api/src/boundary.rs";
+const API_ENDPOINTS_DOC_PATH: &str = "docs/api/endpoints.md";
 
+// Registry invariants (enforced by the `coverage_registry_rows_reference_real_artifacts`
+// self-check test):
+// - column 3 (catalog file) must exist under catalog/
+// - column 4 (workflow doc) must exist under docs/workflows/ or be listed in
+//   PENDING_WORKFLOW_DOCS until the docs/workflows tree is authored
+// - column 5 (endpoint) must appear in the Rust API sources
+//
+// Registry repair notes (C# API removal):
+// - The legacy /api/status/* rows pointed at routes that only existed in the
+//   deleted C# API. Each surviving row now references the mounted Rust route
+//   that serves the slice's contract (module constants where the slice module
+//   declares one, e.g. image-factory -> /api/images/factory-contract).
+// - infrastructure slices without a contract route of their own reference the
+//   mounted readiness/contract route that covers the same artifact: compose ->
+//   local-container-readiness, kubernetes-manifest -> kubernetes-runtime-readiness,
+//   docker-image and release-image-builds -> release-promotion, vault-foundation ->
+//   vault-deployment-readiness, sensitive-output-guardrails -> evidence-redaction,
+//   app-skeleton -> /health (the skeleton's liveness surface), backlog-coverage and
+//   ryuki-api -> /api/platform/summary.
+// - Deleted rows (no validating module or no real artifact/endpoint to check):
+//   "Adapter contract coverage" (slice name resolved to no dispatcher entry; the
+//   adapter contract surface is covered by the adapter-contracts and
+//   adapter-contract-test rows), "Deployment input template" and "Operations
+//   endpoint inventory" (their docs/source-inputs and docs/operations artifacts
+//   were never created and no mounted route exists; re-register them when those
+//   docs trees are authored).
 const COVERAGE_TSV: &str = r#"
 workflow	Request preflight and readiness gate	request-preflight-contract.yaml	request-preflight.md	/api/requests/preflight-contract
 workflow	Windows server deployment	server-lifecycle-dry-run-contract.yaml	server-lifecycle-dry-run.md	/api/workflows/server-lifecycle/dry-run-contract
@@ -275,34 +307,40 @@ ia	Admin	site-catalog.yaml	site-catalog.md	/api/catalog/site-catalog-contract
 ia	Admin	worker-capability-contract.yaml	worker-capability-routing.md	/api/admin/worker-capability-contract
 ia	Admin	admin-approval-groups-contract.yaml	admin-approval-groups.md	/api/admin/approval-groups-contract
 ia	Admin	admin-feature-flag-governance-contract.yaml	admin-feature-flag-governance.md	/api/admin/feature-flag-governance-contract
-    ia	Admin	admin-delegation-boundary-contract.yaml	admin-delegation-boundary.md	/api/admin/delegation-boundary-contract
-    engine	ryuki-engine	ryuki-engine-catalog.yaml	ryuki-engine.md	/api/integrations/adapter-readiness-matrix-contract
-    api	ryuki-api	ryuki-api-catalog.yaml	ryuki-api.md	/api/platform/summary
-slice	Adapter readiness contracts	adapter-readiness-catalog.yaml	adapter-readiness-contracts.md	/api/status/adapter-contracts
-slice	Adapter contract coverage	adapter-contract-contract.yaml	adapter-contract.md	/api/status/adapter-contract
-slice	Build sheet backlog coverage	backlog-coverage-catalog.yaml	backlog-coverage.md	/api/status/backlog
-slice	Deployment input template	deployment-input-template-contract.yaml	deployment-input-template.md	/api/status/deployment-template
-slice	Docker image build contexts	docker-image-contract.yaml	docker-image.md	/api/status/docker-image
-slice	Evidence manifest	evidence-manifest-catalog.yaml	evidence-manifest.md	/api/status/evidence-manifest
-slice	Image factory	image-factory-contract.yaml	image-factory.md	/api/status/image-factory
-slice	Registry readiness	registry-readiness-contract.yaml	registry-readiness.md	/api/status/registry
+ia	Admin	admin-delegation-boundary-contract.yaml	admin-delegation-boundary.md	/api/admin/delegation-boundary-contract
+engine	ryuki-engine	ryuki-engine-catalog.yaml	ryuki-engine.md	/api/integrations/adapter-readiness-matrix-contract
+api	ryuki-api	ryuki-api-catalog.yaml	ryuki-api.md	/api/platform/summary
+slice	Adapter readiness contracts	adapter-readiness-catalog.yaml	adapter-readiness-contracts.md	/api/integrations/readiness
+slice	Build sheet backlog coverage	backlog-coverage-catalog.yaml	backlog-coverage.md	/api/platform/summary
+slice	Docker image build contexts	docker-image-contract.yaml	docker-image.md	/api/platform/release-promotion-contract
+slice	Evidence manifest	evidence-manifest-catalog.yaml	evidence-manifest.md	/api/catalog/evidence-manifest
+slice	Image factory	image-factory-contract.yaml	image-factory.md	/api/images/factory-contract
+slice	Registry readiness	registry-readiness-contract.yaml	registry-readiness.md	/api/platform/registry-readiness-contract
 slice	Application environment retirement	application-environment-retirement-contract.yaml	application-environment-retirement.md	/api/workflows/application-environment/retirement-contract
 slice	Object storage readiness	object-storage-readiness-contract.yaml	object-storage-readiness.md	/api/platform/object-storage-readiness-contract
 slice	Secret reference catalog	secret-reference-catalog.yaml	secret-reference-model.md	/api/catalog/secret-references
 slice	UI mockup acceptance	ui-mockup-acceptance-contract.yaml	ui-mockup-acceptance.md	/api/platform/ui-mockup-acceptance-contract
-slice	Governance catalog API	governance-catalog-api-contract.yaml	governance-catalog-api.md	/api/catalog/governance-catalog-api
-slice	Operations endpoint inventory	operations-endpoint-inventory-contract.yaml	endpoint-inventory.md	/api/operations/endpoint-inventory
-slice	App skeleton	app-skeleton-contract.yaml	app-skeleton.md	/api/status/app-skeleton
-slice	Catalog	catalog-contract.yaml	catalog.md	/api/status/catalog
-slice	Compose	compose-contract.yaml	compose.md	/api/status/compose
-slice	Kubernetes manifest	kubernetes-manifest-contract.yaml	kubernetes-manifest.md	/api/status/kubernetes-manifest
-slice	Local auth	local-auth-contract.yaml	local-auth.md	/api/status/local-auth
+slice	Governance catalog API	governance-catalog-api-contract.yaml	governance-catalog-api.md	/api/catalog/access-control
+slice	App skeleton	app-skeleton-contract.yaml	app-skeleton.md	/health
+slice	Catalog	catalog-contract.yaml	catalog.md	/api/catalog/categories
+slice	Compose	compose-contract.yaml	compose.md	/api/platform/local-container-readiness-contract
+slice	Kubernetes manifest	kubernetes-manifest-contract.yaml	kubernetes-manifest.md	/api/platform/kubernetes-runtime-readiness-contract
+slice	Local auth	local-auth-contract.yaml	local-auth.md	/api/auth/local/roles
 slice	Platform database readiness	platform-database-readiness-contract.yaml	platform-database-readiness.md	/api/platform/database-readiness-contract
-slice	Release image builds	release-image-builds-contract.yaml	release-image-builds.md	/api/status/release-image-builds
-slice	Sensitive output guardrails	sensitive-output-guardrails-contract.yaml	sensitive-output-guardrails.md	/api/status/sensitive-output-guardrails
-slice	Vault foundation	vault-foundation-contract.yaml	vault-foundation.md	/api/status/vault-foundation
+slice	Release image builds	release-image-builds-contract.yaml	release-image-builds.md	/api/platform/release-promotion-contract
+slice	Sensitive output guardrails	sensitive-output-guardrails-contract.yaml	sensitive-output-guardrails.md	/api/catalog/evidence-redaction-contract
+slice	Vault foundation	vault-foundation-contract.yaml	vault-foundation.md	/api/platform/vault-deployment-readiness-contract
 slice	Vault secret delivery	vault-secret-delivery-contract.yaml	vault-secret-delivery.md	/api/platform/vault-secret-delivery-contract
 "#;
+
+// Workflow runbook docs that COVERAGE_TSV references but that have not been
+// authored yet (missing-features.md, "Catalog, contract & documentation
+// integrity", implementation step 4). The full docs/workflows/ tree was
+// scaffolded with `ryuki-validator scaffold-docs`, so no docs are pending;
+// add an entry here only when registering a new COVERAGE_TSV row before its
+// runbook lands, and remove it once the doc exists (the registry self-check
+// test fails on stale entries).
+const PENDING_WORKFLOW_DOCS: &[&str] = &[];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CoverageEntry {
@@ -2253,6 +2291,26 @@ fn run() -> Result<(), String> {
             let output = run_all_validate(&root, true)?;
             print_json(&output)
         }
+        "generate-endpoints-doc" => {
+            let (root, _) = parse_root_args(&args[1..])?;
+            let (document, route_count) = generate_endpoints_doc(&root)?;
+            let output_path = root.join(API_ENDPOINTS_DOC_PATH);
+            if let Some(parent) = output_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+            }
+            fs::write(&output_path, &document)
+                .map_err(|error| format!("failed to write {}: {error}", output_path.display()))?;
+            print_json(&serde_json::json!({
+                "written": API_ENDPOINTS_DOC_PATH,
+                "routes": route_count,
+            }))
+        }
+        "scaffold-docs" => {
+            let (root, _) = parse_root_args(&args[1..])?;
+            let output = scaffold_docs::scaffold(&root, &registry_rows())?;
+            print_json(&output)
+        }
         "batch-validate" => {
             let (root, _) = parse_root_args(&args[1..])?;
             let slice_names = read_stdin()?;
@@ -2273,7 +2331,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|check-config> <slice> [options]"
+    "usage: ryuki-validator <coverage|validate|stats|rows|check-shape|check-catalog|check-program|check-values|check-controls|check-yaml-duplicates|check-build-sheet-source-inputs|check-source-inventory|check-source-literals|check-docs|scan-prohibited|server|run-all|batch-validate|generate-endpoints-doc|scaffold-docs|check-config> <slice> [options]"
         .to_string()
 }
 
@@ -2435,7 +2493,14 @@ fn parse_root_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>), String
         index += 1;
     }
 
-    let root = root.ok_or_else(|| "missing --root".to_string())?;
+    // Default to the current working directory so `make validate`, the
+    // documented invocations, and a plain `run-all` work from a clean
+    // checkout; `--root` stays available as an explicit override.
+    let root = match root {
+        Some(path) => path,
+        None => env::current_dir()
+            .map_err(|error| format!("failed to resolve current directory: {error}"))?,
+    };
     Ok((root, context_json))
 }
 
@@ -2502,8 +2567,8 @@ fn read_context(root: &Path) -> Result<Context, String> {
         build_sheet: read(root, BUILD_SHEET_PATH)?,
         catalog_readme: read(root, CATALOG_README_PATH)?,
         workflow_readme: read(root, WORKFLOW_README_PATH)?,
-        api_readme: read(root, API_README_PATH).unwrap_or_default(),
-        program: read(root, PROGRAM_PATH).unwrap_or_default(),
+        api_readme: read(root, API_ENDPOINTS_DOC_PATH).unwrap_or_default(),
+        program: read(root, RUST_API_CONTRACTS_PATH).unwrap_or_default(),
         rust_contracts: read(root, RUST_API_CONTRACTS_PATH).unwrap_or_default(),
         rust_api_main: read(root, RUST_API_MAIN_PATH).unwrap_or_default(),
     })
@@ -2777,7 +2842,7 @@ fn validate_coverage_artifacts(
             coverage.endpoint
         ),
     );
-    let active_routes = active_map_get_routes(&context.program);
+    let active_routes = active_route_registrations(&context.program);
     expect(
         active_routes.contains(coverage.endpoint.as_str()),
         errors,
@@ -2828,14 +2893,15 @@ fn safe_endpoint(endpoint: &str) -> bool {
         })
 }
 
-fn active_map_get_routes(program: &str) -> BTreeSet<String> {
-    let program = strip_csharp_comments(program);
-    program
-        .split("MapGet")
+// Extracts the route paths registered through axum `.route("...", ...)` calls
+// in the Rust API sources, ignoring commented-out registrations.
+fn active_route_registrations(source: &str) -> BTreeSet<String> {
+    let source = strip_source_comments(source);
+    source
+        .split(".route(")
         .skip(1)
         .filter_map(|candidate| {
-            let trimmed = candidate.trim_start();
-            let rest = trimmed.strip_prefix('(')?.trim_start();
+            let rest = candidate.trim_start();
             let route = rest.strip_prefix('"')?;
             let end = route.find('"')?;
             Some(route[..end].to_string())
@@ -2843,7 +2909,122 @@ fn active_map_get_routes(program: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn strip_csharp_comments(input: &str) -> String {
+const RUST_API_ROUTE_SOURCES: &[&str] = &[
+    RUST_API_CONTRACTS_PATH,
+    RUST_API_MAIN_PATH,
+    RUST_API_BOUNDARY_PATH,
+];
+const ROUTE_METHOD_TOKENS: &[(&str, &str)] = &[
+    ("get(", "GET"),
+    ("post(", "POST"),
+    ("put(", "PUT"),
+    ("patch(", "PATCH"),
+    ("delete(", "DELETE"),
+    ("head(", "HEAD"),
+    ("options(", "OPTIONS"),
+    ("any(", "ANY"),
+];
+
+// Builds the generated API endpoint inventory (docs/api/endpoints.md) from the
+// axum `.route("...", method(handler))` registrations in the Rust API sources.
+// The document doubles as the shared "API readme" context for slice checks.
+fn generate_endpoints_doc(root: &Path) -> Result<(String, usize), String> {
+    let mut routes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for source_path in RUST_API_ROUTE_SOURCES {
+        let source = read(root, source_path)?;
+        for (path, methods) in extract_route_methods(&source) {
+            routes.entry(path).or_default().extend(methods);
+        }
+    }
+
+    let mut document = String::new();
+    document.push_str("# Ryuki API Endpoints\n\n");
+    document.push_str(
+        "Generated by `ryuki-validator generate-endpoints-doc` from the route \
+         registrations in:\n\n",
+    );
+    for source_path in RUST_API_ROUTE_SOURCES {
+        document.push_str(&format!("- `{source_path}`\n"));
+    }
+    document.push_str(
+        "\nRegenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- \
+         generate-endpoints-doc`. Do not edit by hand.\n\n",
+    );
+    document.push_str("| Method | Path |\n| --- | --- |\n");
+    let mut route_count = 0;
+    for (path, methods) in &routes {
+        for method in methods {
+            document.push_str(&format!("| {method} | `{path}` |\n"));
+            route_count += 1;
+        }
+    }
+    Ok((document, route_count))
+}
+
+// Extracts (path, methods) pairs from active `.route("path", get(handler))`
+// registrations, including chained registrations like `get(a).post(b)`.
+fn extract_route_methods(source: &str) -> Vec<(String, Vec<String>)> {
+    let source = strip_source_comments(source);
+    let mut results = Vec::new();
+    for candidate in source.split(".route(").skip(1) {
+        let rest = candidate.trim_start();
+        let Some(route) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = route.find('"') else {
+            continue;
+        };
+        let path = route[..end].to_string();
+        let arguments = route_call_arguments(&route[end + 1..]);
+        let methods = route_methods_in(&arguments);
+        results.push((path, methods));
+    }
+    results
+}
+
+// Returns the text between the route path and the closing parenthesis of the
+// `.route(...)` call, tracking nested parentheses.
+fn route_call_arguments(after_path: &str) -> String {
+    let mut depth: usize = 1;
+    let mut arguments = String::new();
+    for ch in after_path.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        arguments.push(ch);
+    }
+    arguments
+}
+
+fn route_methods_in(arguments: &str) -> Vec<String> {
+    let mut methods = Vec::new();
+    for (token, method) in ROUTE_METHOD_TOKENS {
+        for (index, _) in arguments.match_indices(token) {
+            let boundary_ok = arguments[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+            if boundary_ok && !methods.contains(&(*method).to_string()) {
+                methods.push((*method).to_string());
+            }
+        }
+    }
+    if methods.is_empty() {
+        methods.push("ANY".to_string());
+    }
+    methods
+}
+
+// Strips `//` line comments and `/* */` block comments while preserving string
+// literals; the syntax is shared by Rust (and the retired C# sources).
+fn strip_source_comments(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
@@ -3047,10 +3228,11 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
         "dependency-maintenance-calendar",
         dependency_maintenance_calendar::validate_context_file as ValidateFn,
     );
-    m.insert(
-        "deployment-input-template",
-        deployment_input_template::validate_context_file as ValidateFn,
-    );
+    // "deployment-input-template" and "operations-endpoint-inventory" were
+    // unregistered together with their COVERAGE_TSV rows: the docs/source-inputs
+    // and docs/operations artifacts they validate were never created and no
+    // mounted route serves them. Re-register when those docs trees exist
+    // (their standalone validate/validate-docs subcommand arms remain usable).
     m.insert(
         "design-system",
         design_system::validate_context_file as ValidateFn,
@@ -3198,10 +3380,6 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
     m.insert(
         "operation-run-state",
         operation_run_state::validate_context_file as ValidateFn,
-    );
-    m.insert(
-        "operations-endpoint-inventory",
-        operations_endpoint_inventory::validate_context_file as ValidateFn,
     );
     m.insert(
         "operator-runbook",
@@ -3460,6 +3638,30 @@ pub(crate) fn slices_from_coverage() -> Vec<SliceEntry> {
     seen.into_values().collect()
 }
 
+// Every COVERAGE_TSV row (without slice-level dedupe) with its resolved
+// slice name; input for the `scaffold-docs` subcommand and its tests.
+pub(crate) fn registry_rows() -> Vec<scaffold_docs::RegistryRow> {
+    COVERAGE_TSV
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('\t').collect();
+            if cells.len() != 5 {
+                return None;
+            }
+            Some(scaffold_docs::RegistryRow {
+                kind: cells[0].to_string(),
+                workflow: cells[1].to_string(),
+                catalog_file: cells[2].to_string(),
+                doc_file: cells[3].to_string(),
+                endpoint: cells[4].to_string(),
+                slice: catalog_to_slice(cells[2]),
+            })
+        })
+        .collect()
+}
+
 struct SharedContext {
     program: String,
     api_readme: String,
@@ -3476,8 +3678,10 @@ struct SharedContext {
 
 fn load_shared_context(root: &Path) -> SharedContext {
     SharedContext {
-        program: read(root, PROGRAM_PATH).unwrap_or_default(),
-        api_readme: read(root, API_README_PATH).unwrap_or_default(),
+        // "program" is the Rust API route/handler source; "api_readme" is the
+        // generated endpoint inventory (docs/api/endpoints.md).
+        program: read(root, RUST_API_CONTRACTS_PATH).unwrap_or_default(),
+        api_readme: read(root, API_ENDPOINTS_DOC_PATH).unwrap_or_default(),
         catalog_readme: read(root, CATALOG_README_PATH).unwrap_or_default(),
         doc_readme: read(root, WORKFLOW_README_PATH).unwrap_or_default(),
         ryuki_engine_cargo: read(root, "sources/ryuki-engine/Cargo.toml").unwrap_or_default(),
@@ -3487,7 +3691,7 @@ fn load_shared_context(root: &Path) -> SharedContext {
         ryuki_api_cargo: read(root, "sources/ryuki-api/Cargo.toml").unwrap_or_default(),
         ryuki_api_contracts: read(root, RUST_API_CONTRACTS_PATH).unwrap_or_default(),
         ryuki_api_main: read(root, RUST_API_MAIN_PATH).unwrap_or_default(),
-        ryuki_api_boundary: read(root, "sources/ryuki-api/src/boundary.rs").unwrap_or_default(),
+        ryuki_api_boundary: read(root, RUST_API_BOUNDARY_PATH).unwrap_or_default(),
     }
 }
 
@@ -3496,6 +3700,13 @@ fn readme_key_for_slice(slice: &str) -> &str {
         "server-lifecycle-dry-run" | "aiops-suggestion" | "inventory-coverage" => "readme",
         _ => "api_readme",
     }
+}
+
+// Reads a context input file, defaulting to an empty string when the file is
+// missing so slice modules report the missing artifact as a validation error
+// instead of failing context deserialization.
+fn read_string_value(root: &Path, path: &str) -> serde_json::Value {
+    serde_json::Value::String(fs::read_to_string(root.join(path)).unwrap_or_default())
 }
 
 fn build_slice_context(
@@ -3578,23 +3789,49 @@ fn build_slice_context(
 
     // Per-slice extra fields
     match entry.slice.as_str() {
+        "backlog-coverage" => {
+            map.insert(
+                "build_sheet".to_string(),
+                read_string_value(root, BUILD_SHEET_PATH),
+            );
+            map.insert(
+                "workflow_readme".to_string(),
+                serde_json::Value::String(shared.doc_readme.clone()),
+            );
+        }
+        "governance-catalog-api" => {
+            map.insert(
+                "readme".to_string(),
+                serde_json::Value::String(shared.api_readme.clone()),
+            );
+            for (key, path) in &[
+                ("access_catalog", "catalog/access-control-catalog.yaml"),
+                ("secret_catalog", "catalog/secret-reference-catalog.yaml"),
+                ("evidence_catalog", "catalog/evidence-manifest-catalog.yaml"),
+            ] {
+                let raw = fs::read_to_string(root.join(path)).unwrap_or_default();
+                let val: serde_json::Value =
+                    serde_yaml::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                map.insert(key.to_string(), val);
+            }
+        }
         "approval-decision-readiness" => {
             if let Ok(raw) = fs::read_to_string(root.join("catalog/access-control-catalog.yaml")) {
                 map.insert("access_text".to_string(), serde_json::Value::String(raw));
             }
         }
         "azure-landing-zone-validation" => {
-            if let Ok(raw) = fs::read_to_string(
-                root.join("docs/source-inputs/azure-landing-zone-source-inventory.md"),
-            ) {
-                map.insert(
-                    "source_inventory".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
+            // Inserted unconditionally: when the source inventory doc is
+            // missing the slice should report that as a validation error,
+            // not fail context deserialization.
+            map.insert(
+                "source_inventory".to_string(),
+                read_string_value(
+                    root,
+                    "docs/source-inputs/azure-landing-zone-source-inventory.md",
+                ),
+            );
         }
-        // test removed: Ruby file no longer exists
-        "certificate-lifecycle" => {}
         "synthetic-health-check" => {
             if let Ok(raw) =
                 fs::read_to_string(root.join("sources/ryuki-engine/src/synthetic_health.rs"))
@@ -3606,14 +3843,40 @@ fn build_slice_context(
             }
         }
         "design-system" => {
-            if let Ok(raw) = fs::read_to_string(root.join("docs/ui/design-system.md")) {
-                map.insert("ui_design".to_string(), serde_json::Value::String(raw));
+            for (key, path) in &[
+                ("ui_design", "docs/ui/design-system.md"),
+                ("accessibility", "docs/ui/accessibility-checklist.md"),
+                ("portal_css", "portal/portal-ui/styles.css"),
+            ] {
+                map.insert(key.to_string(), read_string_value(root, path));
             }
-            if let Ok(raw) = fs::read_to_string(root.join("docs/ui/accessibility-checklist.md")) {
-                map.insert("accessibility".to_string(), serde_json::Value::String(raw));
+        }
+        "ui-mockup-acceptance" => {
+            for (key, path) in &[
+                ("ui_readme", "docs/ui/README.md"),
+                ("shell_mockup", "docs/ui/mockups-shell-dashboard.md"),
+                ("catalog_mockup", "docs/ui/mockups-catalog-requests.md"),
+                ("inventory_mockup", "docs/ui/mockups-inventory-cmdb.md"),
+                (
+                    "evidence_mockup",
+                    "docs/ui/mockups-evidence-operations-admin.md",
+                ),
+                ("accessibility", "docs/ui/accessibility-checklist.md"),
+                ("ui_ia", "docs/ui/portal-information-architecture.md"),
+                ("ui_design", "docs/ui/design-system.md"),
+            ] {
+                map.insert(key.to_string(), read_string_value(root, path));
             }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/styles.css")) {
-                map.insert("portal_css".to_string(), serde_json::Value::String(raw));
+        }
+        "evidence-manifest" => {
+            for (key, path) in &[
+                ("access_catalog", "catalog/access-control-catalog.yaml"),
+                ("offering_catalog", "catalog/offering-catalog.yaml"),
+            ] {
+                let raw = fs::read_to_string(root.join(path)).unwrap_or_default();
+                let val: serde_json::Value =
+                    serde_yaml::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                map.insert(key.to_string(), val);
             }
         }
         "evidence-export-retention" | "evidence-redaction-contract" => {
@@ -3662,67 +3925,32 @@ fn build_slice_context(
             }
         }
         "portal-information-architecture" => {
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/Dockerfile")) {
-                map.insert(
-                    "portal_dockerfile".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
-            if let Ok(raw) =
-                fs::read_to_string(root.join("docs/ui/portal-information-architecture.md"))
-            {
-                map.insert("ui_ia".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("docs/ui/design-system.md")) {
-                map.insert("ui_design".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/Cargo.toml")) {
-                map.insert("portal_cargo".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/src/main.rs")) {
-                map.insert("portal_main".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/src/lib.rs")) {
-                map.insert("portal_lib".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/src/app.rs")) {
-                map.insert("portal_app".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/src/shell.rs")) {
-                map.insert("portal_shell".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) =
-                fs::read_to_string(root.join("portal/portal-ui/src/workspace_catalog.rs"))
-            {
-                map.insert(
-                    "workspace_catalog".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
-            if let Ok(raw) =
-                fs::read_to_string(root.join("portal/portal-ui/src/views/workspaces.rs"))
-            {
-                map.insert(
-                    "portal_workspaces".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("portal/portal-ui/src/api.rs")) {
-                map.insert("portal_api".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) =
-                fs::read_to_string(root.join("portal/portal-ui/src/server_boundary.rs"))
-            {
-                map.insert(
-                    "portal_server_boundary".to_string(),
-                    serde_json::Value::String(raw),
-                );
+            for (key, path) in &[
+                ("portal_dockerfile", "portal/portal-ui/Dockerfile"),
+                ("ui_ia", "docs/ui/portal-information-architecture.md"),
+                ("ui_design", "docs/ui/design-system.md"),
+                ("portal_cargo", "portal/portal-ui/Cargo.toml"),
+                ("portal_main", "portal/portal-ui/src/main.rs"),
+                ("portal_lib", "portal/portal-ui/src/lib.rs"),
+                ("portal_app", "portal/portal-ui/src/app.rs"),
+                ("portal_shell", "portal/portal-ui/src/shell.rs"),
+                (
+                    "workspace_catalog",
+                    "portal/portal-ui/src/workspace_catalog.rs",
+                ),
+                (
+                    "portal_workspaces",
+                    "portal/portal-ui/src/views/workspaces.rs",
+                ),
+                ("portal_api", "portal/portal-ui/src/api.rs"),
+                (
+                    "portal_server_boundary",
+                    "portal/portal-ui/src/server_boundary.rs",
+                ),
+            ] {
+                map.insert(key.to_string(), read_string_value(root, path));
             }
         }
-        // test removed: Ruby file no longer exists
-        "network-vlan-readiness" => {}
-        // test removed: Ruby file no longer exists
-        "out-of-band-access-validation" => {}
         "rbac-approval-model" => {
             if let Ok(raw) = fs::read_to_string(root.join("catalog/access-control-catalog.yaml")) {
                 let val: serde_json::Value =
@@ -3739,24 +3967,13 @@ fn build_slice_context(
             }
         }
         "security-baseline" => {
-            if let Ok(raw) = fs::read_to_string(root.join("docs/architecture/security-baseline.md"))
-            {
-                map.insert(
-                    "architecture_doc".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("docs/architecture/README.md")) {
-                map.insert(
-                    "architecture_readme".to_string(),
-                    serde_json::Value::String(raw),
-                );
-            }
-            if let Ok(raw) = fs::read_to_string(root.join("scripts/no-secret-scan.sh")) {
-                map.insert("no_secret_scan".to_string(), serde_json::Value::String(raw));
-            }
-            if let Ok(raw) = fs::read_to_string(root.join(BUILD_SHEET_PATH)) {
-                map.insert("build_sheet".to_string(), serde_json::Value::String(raw));
+            for (key, path) in &[
+                ("architecture_doc", "docs/architecture/security-baseline.md"),
+                ("architecture_readme", "docs/architecture/README.md"),
+                ("no_secret_scan", "scripts/no-secret-scan.sh"),
+                ("build_sheet", BUILD_SHEET_PATH),
+            ] {
+                map.insert(key.to_string(), read_string_value(root, path));
             }
         }
         "ryuki-engine" => {
@@ -3769,12 +3986,6 @@ fn build_slice_context(
                 );
             }
         }
-        // test removed: Ruby files no longer exist
-        "sql-server-deployment" => {}
-        // test removed: Ruby file no longer exists
-        "vcenter-object-placement" => {}
-        // test removed: Ruby file no longer exists
-        "vsan-esxi-lifecycle" => {}
         "app-skeleton" => {
             map.insert(
                 "root".to_string(),
@@ -3803,13 +4014,42 @@ fn build_slice_context(
             }
         }
         "kubernetes-manifest" => {
-            map.insert(
-                "manifests".to_string(),
-                serde_json::Value::Array(Vec::new()),
-            );
+            // The deployment skeleton lives in deploy/kubernetes/base/*.yaml.
+            // Load every base manifest file, split multi-document YAML on `---`,
+            // and parse each document into a JSON value for the slice validator.
+            // The configmap file is intentionally excluded: ConfigMaps carry app
+            // configuration and are not part of the validated skeleton kinds.
+            const BASE_MANIFEST_FILES: &[&str] = &[
+                "deploy/kubernetes/base/namespace.yaml",
+                "deploy/kubernetes/base/serviceaccounts.yaml",
+                "deploy/kubernetes/base/deployments.yaml",
+                "deploy/kubernetes/base/services.yaml",
+                "deploy/kubernetes/base/ingress.yaml",
+                "deploy/kubernetes/base/networkpolicies.yaml",
+            ];
+            let mut manifests = Vec::new();
+            let mut source_texts = Vec::new();
+            for rel in BASE_MANIFEST_FILES {
+                let Ok(raw) = fs::read_to_string(root.join(rel)) else {
+                    continue;
+                };
+                source_texts.push(serde_json::Value::String(raw.clone()));
+                for document in raw.split("\n---") {
+                    let trimmed = document.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(value) = serde_yaml::from_str::<serde_json::Value>(trimmed) {
+                        if value.is_object() {
+                            manifests.push(value);
+                        }
+                    }
+                }
+            }
+            map.insert("manifests".to_string(), serde_json::Value::Array(manifests));
             map.insert(
                 "source_texts".to_string(),
-                serde_json::Value::Array(Vec::new()),
+                serde_json::Value::Array(source_texts),
             );
         }
         "local-auth" => {
@@ -3915,17 +4155,24 @@ fn build_slice_context(
                 );
                 map.insert("values".to_string(), serde_json::Value::Null);
             }
+            // The vault-foundation slice's content checks (README_PATH /
+            // RUNBOOK_PATH constants) validate the Vault deployment artifacts
+            // that live alongside the Helm values under deploy/kubernetes/vault/.
+            // Earlier repair work repointed these at docs/architecture/README.md
+            // and a never-created docs/operations/vault-operations.md, which made
+            // the slice fail against the wrong (empty) inputs. Feed the real,
+            // content-complete deploy artifacts the slice was written for.
             map.insert(
                 "readme".to_string(),
                 serde_json::Value::String(
-                    fs::read_to_string(root.join("docs/architecture/README.md"))
+                    fs::read_to_string(root.join("deploy/kubernetes/vault/README.md"))
                         .unwrap_or_default(),
                 ),
             );
             map.insert(
                 "runbook".to_string(),
                 serde_json::Value::String(
-                    fs::read_to_string(root.join("docs/operations/vault-operations.md"))
+                    fs::read_to_string(root.join("deploy/kubernetes/vault/bootstrap-runbook.md"))
                         .unwrap_or_default(),
                 ),
             );
@@ -3957,19 +4204,38 @@ fn run_one_slice(root: &Path, entry: &SliceEntry, shared: &SharedContext) -> Sli
         };
     }
 
-    let result = match validate_slice_inner(&entry.slice, root, Some(&ctx_path)) {
-        Ok(errors) => SliceResult {
+    // Slice modules are isolated: a panic inside one module (for example a
+    // byte-boundary bug while scanning sources) is reported as that slice's
+    // failure instead of aborting the whole run.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_slice_inner(&entry.slice, root, Some(&ctx_path))
+    }));
+    let result = match outcome {
+        Ok(Ok(errors)) => SliceResult {
             slice: entry.slice.clone(),
             passed: errors.is_empty(),
             errors,
             duration_ms: start.elapsed().as_millis() as u64,
         },
-        Err(e) => SliceResult {
+        Ok(Err(e)) => SliceResult {
             slice: entry.slice.clone(),
             passed: false,
             errors: vec![e],
             duration_ms: start.elapsed().as_millis() as u64,
         },
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            SliceResult {
+                slice: entry.slice.clone(),
+                passed: false,
+                errors: vec![format!("slice validator panicked: {message}")],
+                duration_ms: start.elapsed().as_millis() as u64,
+            }
+        }
     };
 
     let _ = fs::remove_file(&ctx_path);
@@ -4083,19 +4349,93 @@ mod tests {
 
     #[test]
     fn program_route_check_ignores_commented_decoys() {
-        let routes = active_map_get_routes(
+        let routes = active_route_registrations(
             r#"
-            // app.MapGet("/api/commented/decoy", () => Results.Json(new {}));
+            // .route("/api/commented/decoy", get(decoy))
             /*
-            app.MapGet("/api/block/decoy", () => Results.Json(new {}));
+            .route("/api/block/decoy", get(decoy))
             */
-            app.MapGet("/api/active/route", () => Results.Json(new {}));
+            .route("/api/active/route", get(active_route))
             "#,
         );
 
         assert!(routes.contains("/api/active/route"));
         assert!(!routes.contains("/api/commented/decoy"));
         assert!(!routes.contains("/api/block/decoy"));
+    }
+
+    // Registry self-check: every COVERAGE_TSV row must point at artifacts
+    // that exist — its catalog YAML under catalog/, its workflow doc under
+    // docs/workflows/ (or an explicit PENDING_WORKFLOW_DOCS entry while the
+    // docs tree is being authored), and an endpoint string that appears in
+    // the Rust API sources. Rows must also resolve to a runnable slice.
+    #[test]
+    fn coverage_registry_rows_reference_real_artifacts() {
+        let root = root();
+        let api_sources: String = RUST_API_ROUTE_SOURCES
+            .iter()
+            .map(|path| read(&root, path).expect("API source must be readable"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dispatch = validate_dispatch_table();
+        let mut problems = Vec::new();
+
+        for line in COVERAGE_TSV
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let cells: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cells.len(), 5, "malformed COVERAGE_TSV row: {line}");
+            let (catalog_file, doc_file, endpoint) = (cells[2], cells[3], cells[4]);
+
+            if !root.join("catalog").join(catalog_file).is_file() {
+                problems.push(format!("missing catalog file catalog/{catalog_file}"));
+            }
+            let doc_exists = root.join("docs/workflows").join(doc_file).is_file();
+            if !doc_exists && !PENDING_WORKFLOW_DOCS.contains(&doc_file) {
+                problems.push(format!(
+                    "doc docs/workflows/{doc_file} missing and not marked pending"
+                ));
+            }
+            if !api_sources.contains(&format!("\"{endpoint}\"")) {
+                problems.push(format!(
+                    "endpoint {endpoint} does not appear in the Rust API sources"
+                ));
+            }
+
+            let slice = catalog_to_slice(catalog_file);
+            if slice != "backlog-coverage" && !dispatch.contains_key(slice.as_str()) {
+                problems.push(format!("row resolves to unknown slice {slice}: {line}"));
+            }
+        }
+
+        // Pending entries must be removed once the doc is authored, and must
+        // correspond to a registered row.
+        let registered_docs: BTreeSet<&str> = COVERAGE_TSV
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| line.split('\t').nth(3))
+            .collect();
+        for doc_file in PENDING_WORKFLOW_DOCS {
+            if root.join("docs/workflows").join(doc_file).is_file() {
+                problems.push(format!(
+                    "{doc_file} exists; remove it from PENDING_WORKFLOW_DOCS"
+                ));
+            }
+            if !registered_docs.contains(doc_file) {
+                problems.push(format!(
+                    "{doc_file} is pending but not referenced by any COVERAGE_TSV row"
+                ));
+            }
+        }
+
+        assert!(
+            problems.is_empty(),
+            "COVERAGE_TSV registry self-check failed:\n{}",
+            problems.join("\n")
+        );
     }
 
     #[test]

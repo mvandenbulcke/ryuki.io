@@ -555,89 +555,204 @@ fn validate_required_rules(catalog: &Value, errors: &mut Vec<String>) {
     }
 }
 
+// relaxed: the legacy C# `app.MapGet` endpoint-block parser was replaced with a
+// JSON read of the Rust handler payload. The deleted C# API was ported to the
+// Rust crate `sources/ryuki-api/src/contracts.rs`, where this contract is a
+// `.route(ENDPOINT, get(handler))` whose handler returns `Json(json!({ … }))`.
+// `crate::rust_contract::handler_payload` resolves the route → handler → JSON,
+// so the same safety invariants (static-seed source, every provider flag
+// disabled, required arrays/rules matching the catalog) are still enforced —
+// now against the real Rust source rather than the deleted C# layout.
 fn validate_program_value(program: &str, catalog: &Value, errors: &mut Vec<String>) {
-    let blocks = extract_endpoint_blocks(program);
-    if blocks.is_empty() {
+    let count = crate::rust_contract::route_registration_count(program, ENDPOINT);
+    if count == 0 {
         errors.push("API missing Entra RBAC approval readiness endpoint".to_string());
         return;
     }
-    if blocks.len() != 1 {
+    if count != 1 {
         errors.push(format!("API must expose exactly one {ENDPOINT} endpoint"));
     }
-    let block = &blocks[0];
-    let top_level_assignments = assignments_at_brace_depth(&block.text, 1);
+    let Some(payload) = crate::rust_contract::handler_payload(program, ENDPOINT) else {
+        errors.push("API missing Entra RBAC approval readiness endpoint".to_string());
+        return;
+    };
 
     expect(
-        exact_string_assignment(&top_level_assignments, "source", "static-seed"),
+        payload_string(&payload, "source") == Some("static-seed"),
         errors,
         "API must keep static-seed source",
     );
     expect(
-        exact_string_assignment(&top_level_assignments, "readinessMode", "static-readiness"),
+        payload_string(&payload, "readinessMode") == Some("static-readiness"),
         errors,
         "API must keep static-readiness mode",
     );
     expect(
-        exact_string_assignment(
-            &top_level_assignments,
-            "identityProvider",
-            "Microsoft Entra ID",
-        ),
+        payload_string(&payload, "identityProvider") == Some("Microsoft Entra ID"),
         errors,
         "API must keep Microsoft Entra ID provider",
     );
     expect(
-        exact_assignment(&top_level_assignments, "configuredForProduction", "false"),
+        payload
+            .get("configuredForProduction")
+            .and_then(Value::as_bool)
+            == Some(false),
         errors,
         "API must keep configuredForProduction disabled",
     );
     expect(
-        exact_assignment(&top_level_assignments, "localMockAuthAllowed", "true"),
+        payload.get("localMockAuthAllowed").and_then(Value::as_bool) == Some(true),
         errors,
         "API must keep localMockAuthAllowed true",
     );
     for field in REQUIRED_DISABLED_FIELDS {
         expect(
-            exact_assignment(&top_level_assignments, field, "false"),
+            payload.get(*field).and_then(Value::as_bool) == Some(false),
             errors,
             &format!("API must keep {field} disabled"),
         );
     }
 
-    for (field, variable, _) in ENDPOINT_ARRAY_BINDINGS {
-        expect(
-            exact_assignment(&top_level_assignments, field, variable),
-            errors,
-            &format!("API must bind {field} to {variable}"),
-        );
-        let values = validate_endpoint_array_binding_unchanged(
-            program,
-            block.start,
-            variable,
-            field,
-            errors,
-        );
+    for (field, _, _) in ENDPOINT_ARRAY_BINDINGS {
+        let values = payload_string_array_owned(&payload, field);
         validate_api_array(field, values, &catalog_string_array(catalog, field), errors);
     }
     for (field, _) in ENDPOINT_INLINE_ARRAYS {
-        let values = values_for_field(&top_level_assignments, field);
-        if values.len() != 1 {
-            errors.push(format!("API must define exactly one {field} inline array"));
-        }
-        let inline_values = values
-            .first()
-            .and_then(|value| inline_array_values_from_assignment(value));
-        validate_api_array(
-            field,
-            inline_values,
-            &catalog_string_array(catalog, field),
-            errors,
-        );
+        let values = payload_string_array_owned(&payload, field);
+        validate_api_array(field, values, &catalog_string_array(catalog, field), errors);
     }
 
-    validate_api_rules(&block.text, catalog, errors);
-    validate_endpoint_field_names(&block.text, errors);
-    validate_no_unsafe_true_flags(&top_level_assignments, errors);
+    validate_api_rules_value(&payload, catalog, errors);
+    validate_payload_field_names(&payload, errors);
+    validate_no_unsafe_true_flags_value(&payload, errors);
+}
+
+/// Returns a top-level string field of the handler payload.
+fn payload_string<'a>(payload: &'a Value, field: &str) -> Option<&'a str> {
+    payload.get(field).and_then(Value::as_str)
+}
+
+/// Returns the string elements of a top-level array field, owned, when present.
+fn payload_string_array_owned(payload: &Value, field: &str) -> Option<Vec<String>> {
+    crate::rust_contract::payload_string_array(payload, field)
+        .map(|items| items.into_iter().map(str::to_string).collect())
+}
+
+/// Reads the handler's `rules` array as `ApiRule`s and compares them to the
+/// catalog rules (mirrors the former `validate_api_rules` C# block parse).
+fn validate_api_rules_value(payload: &Value, catalog: &Value, errors: &mut Vec<String>) {
+    let api_rules: Vec<ApiRule> = payload
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|rule| {
+            Some(ApiRule {
+                id: string_field(rule, "id")?.to_string(),
+                decision: string_field(rule, "decision")?.to_string(),
+                requirement: string_field(rule, "requirement")?.to_string(),
+                evidence: string_field(rule, "evidence")?.to_string(),
+            })
+        })
+        .collect();
+    let catalog_rules = catalog_rules(catalog);
+    let api_ids: Vec<String> = api_rules.iter().map(|rule| rule.id.clone()).collect();
+    let catalog_ids: Vec<String> = catalog_rules.iter().map(|rule| rule.id.clone()).collect();
+    let api_set: BTreeSet<&str> = api_ids.iter().map(String::as_str).collect();
+    let catalog_set: BTreeSet<&str> = catalog_ids.iter().map(String::as_str).collect();
+    for id in catalog_set.difference(&api_set) {
+        errors.push(format!("API missing rule {id}"));
+    }
+    for id in api_set.difference(&catalog_set) {
+        errors.push(format!("API has unexpected API rule {id}"));
+    }
+    expect(
+        api_ids.len() == api_set.len(),
+        errors,
+        "API rule IDs must be unique",
+    );
+    for catalog_rule in catalog_rules {
+        let Some(api_rule) = api_rules.iter().find(|rule| rule.id == catalog_rule.id) else {
+            continue;
+        };
+        expect(
+            api_rule.decision == catalog_rule.decision,
+            errors,
+            &format!("API rule {} decision must match catalog", catalog_rule.id),
+        );
+        expect(
+            api_rule.requirement == catalog_rule.requirement,
+            errors,
+            &format!(
+                "API rule {} requirement must match catalog",
+                catalog_rule.id
+            ),
+        );
+        expect(
+            api_rule.evidence == catalog_rule.evidence,
+            errors,
+            &format!("API rule {} evidence must match catalog", catalog_rule.id),
+        );
+    }
+}
+
+/// Asserts the handler payload only carries allowed top-level field names and no
+/// prohibited identity field (mirrors the former `validate_endpoint_field_names`).
+fn validate_payload_field_names(payload: &Value, errors: &mut Vec<String>) {
+    let Some(object) = payload.as_object() else {
+        return;
+    };
+    for field in object.keys() {
+        if !ALLOWED_ENDPOINT_FIELDS.contains(&field.as_str()) {
+            errors.push(format!(
+                "API endpoint has unexpected Entra RBAC approval readiness field {field}"
+            ));
+            continue;
+        }
+        if prohibited_field(field) {
+            errors.push(format!(
+                "API endpoint has prohibited identity field {field}"
+            ));
+        }
+    }
+}
+
+/// Flags any top-level boolean field set to `true` that names a live/provider
+/// capability and is not on the safe allowlist (mirrors the former
+/// `validate_no_unsafe_true_flags`).
+fn validate_no_unsafe_true_flags_value(payload: &Value, errors: &mut Vec<String>) {
+    let Some(object) = payload.as_object() else {
+        return;
+    };
+    for (field, value) in object {
+        if value.as_bool() != Some(true) || SAFE_TRUE_FIELDS.contains(&field.as_str()) {
+            continue;
+        }
+        let name = field.to_ascii_lowercase();
+        if [
+            "live",
+            "provider",
+            "auth",
+            "token",
+            "graph",
+            "group",
+            "app",
+            "role",
+            "approval",
+            "servicenow",
+            "raw",
+            "identifier",
+            "principal",
+            "tenant",
+            "object",
+            "credential",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle))
+        {
+            errors.push(format!("API endpoint has unsafe true flag {field}"));
+        }
+    }
 }
 
 fn validate_api_array(

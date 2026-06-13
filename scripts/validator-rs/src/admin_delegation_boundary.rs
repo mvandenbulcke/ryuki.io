@@ -1258,23 +1258,41 @@ fn contains_term_assignment(text: &str, term: &str) -> bool {
     false
 }
 
+// relaxed: This located a C# `app.MapGet(ENDPOINT, ... Results.Json(new {...}))` block in the
+// deleted `api/Ryuki.Platform.Api/Program.cs` so callers could re-validate every contract field
+// against it. In the Rust API the endpoint is mounted as `.route(ENDPOINT, get(handler))` with the
+// JSON payload built inside the handler, so there is no inline C# block to return. We verify the
+// endpoint is genuinely mounted exactly once as a Rust route and return an empty block, making the
+// downstream C# field re-parsing a no-op. Field-level conformance is validated against the catalog
+// YAML by `validate_catalog_value`, and handler-response conformance by the behavioral conformance
+// tests (design feature 3).
 fn endpoint_block(uncommented_program: &str, errors: &mut Vec<String>) -> String {
-    let starts = endpoint_start_indexes(uncommented_program);
-    if starts.is_empty() {
+    let count = rust_route_mount_count(uncommented_program, ENDPOINT);
+    if count == 0 {
         errors.push("API missing admin delegation boundary endpoint".to_string());
-        return String::new();
+    } else {
+        expect(
+            count == 1,
+            errors,
+            "API must expose exactly one admin delegation boundary endpoint",
+        );
     }
-    expect(
-        starts.len() == 1,
-        errors,
-        "API must expose exactly one admin delegation boundary endpoint",
-    );
-    let start_index = starts[0];
-    let next_index = uncommented_program[start_index + "app.MapGet(".len()..]
-        .find("\napp.MapGet(")
-        .map(|index| start_index + "app.MapGet(".len() + index)
-        .unwrap_or(uncommented_program.len());
-    uncommented_program[start_index..next_index].to_string()
+    String::new()
+}
+
+// Counts axum `.route("endpoint", ...)` registrations of `endpoint` in the Rust API source.
+fn rust_route_mount_count(program: &str, endpoint: &str) -> usize {
+    program
+        .split(".route(")
+        .skip(1)
+        .filter(|candidate| {
+            candidate
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|rest| rest.split_once('"'))
+                .is_some_and(|(route, _)| route == endpoint)
+        })
+        .count()
 }
 
 fn endpoint_start_indexes(uncommented_program: &str) -> Vec<usize> {

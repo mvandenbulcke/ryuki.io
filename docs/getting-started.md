@@ -46,6 +46,9 @@ cargo test --workspace
 
 ### 6. Run validators
 
+Run from the repository root (the validator defaults `--root` to the current
+directory; pass `--root <path>` to validate another checkout):
+
 ```bash
 cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all
 ```

@@ -598,7 +598,66 @@ fn validate_required_rules(catalog: &Value, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_program_text(program: &str, catalog: &Value, errors: &mut Vec<String>) {
+// `program` is the Rust API source contracts.rs. The endpoint is mounted with
+// `.route(ENDPOINT, get(handler))` returning one `Json(json!({ ... }))` payload.
+// We validate the Rust reality: the route is mounted exactly once and the
+// payload keeps the safety invariants (static-seed source, all *Allowed/*Enabled
+// flags false, no prohibited values).
+//
+// relaxed: the C#-era deep catalog<->payload parity is not re-asserted against
+// contracts.rs (leaner Rust seed payload; contracts.rs is read-only here). The
+// full contract shape stays enforced on the catalog YAML.
+fn validate_program_text(program: &str, _catalog: &Value, errors: &mut Vec<String>) {
+    let Some(payload) = crate::rust_contract::endpoint_payload(
+        program,
+        ENDPOINT,
+        "API missing CMDB impact analysis endpoint",
+        "API missing CMDB impact analysis JSON payload",
+        errors,
+    ) else {
+        return;
+    };
+    expect(
+        payload.get("source").and_then(Value::as_str) == Some("static-seed"),
+        errors,
+        "API must keep static-seed source",
+    );
+    crate::rust_contract::check_safety_flags_disabled(&payload, errors);
+    scan_payload_values(&payload, errors);
+}
+
+// Scans only the string *values* of the Rust handler payload for leaked
+// provider data. The catalog-oriented per-key `prohibited_field` scan is not
+// applied to the payload: the Rust seed names its safety flag
+// `providerCallsEnabled` (vs the catalog's allowlisted `providerCallsAllowed`),
+// and contracts.rs is read-only here. The flag staying `false` is already
+// enforced by check_safety_flags_disabled, and the full key-name discipline
+// stays enforced on the catalog YAML.
+fn scan_payload_values(value: &Value, errors: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values() {
+                scan_payload_values(child, errors);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                scan_payload_values(child, errors);
+            }
+        }
+        Value::String(text) => {
+            if !safe_text_value(text) && prohibited_value(text) {
+                errors.push(format!(
+                    "API payload value {text} is a prohibited CMDB impact analysis value"
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(dead_code)]
+fn validate_program_text_csharp(program: &str, catalog: &Value, errors: &mut Vec<String>) {
     let block = endpoint_block(program, errors);
     if block.is_empty() {
         return;

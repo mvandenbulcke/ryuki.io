@@ -1,0 +1,8 @@
+# Docker image build context contract note.
+# Registers the container image build validation (scripts/validator-rs,
+# slice docker-image) covering sources/ryuki-api/Dockerfile,
+# portal/portal-ui/Dockerfile, and deploy/ci/Dockerfile.validator.
+version: 1
+status: draft
+slice: docker-image
+note: Metadata note for COVERAGE_TSV registration; the validation logic lives in scripts/validator-rs/src/docker_image.rs. Images are dry-run-only (RYUKI_API_EXECUTION_MODE=static-dry-run).

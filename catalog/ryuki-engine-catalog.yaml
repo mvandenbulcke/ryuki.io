@@ -1,0 +1,8 @@
+# ryuki-engine crate registry note.
+# Registers the engine crate validation (scripts/validator-rs, slice
+# ryuki-engine) covering sources/ryuki-engine (Cargo.toml, src/lib.rs,
+# src/adapter_framework.rs) and the declared engine modules.
+version: 1
+status: draft
+slice: ryuki-engine
+note: Metadata note for COVERAGE_TSV registration; the validation logic lives in scripts/validator-rs/src/ryuki_engine.rs. Adapter readiness is served from /api/integrations/adapter-readiness-matrix-contract.

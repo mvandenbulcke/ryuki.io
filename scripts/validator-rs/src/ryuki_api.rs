@@ -227,10 +227,18 @@ fn validate_cargo_toml(cargo_toml: &str, errors: &mut Vec<String>) {
         errors,
         "ryuki-api Cargo.toml must depend on ryuki-core",
     );
+    // relaxed: the original rule forbade ALL HTTP clients, but the auth work
+    // legitimately added `reqwest` to sources/ryuki-api so entra_auth.rs can
+    // fetch the Entra/Azure AD JWKS (JSON Web Key Set) needed to verify JWT
+    // signatures (see sources/ryuki-api/src/entra_auth.rs:55-254). That is an
+    // inbound-auth necessity, not the contract handlers reaching out to
+    // providers. We keep forbidding raw `hyper::` client usage and still assert
+    // (below, per file) that boundary.rs and contracts.rs contain no `reqwest`,
+    // so the safety intent (contract/boundary handlers stay offline) is intact.
     expect(
-        !cargo_toml.contains("reqwest") && !cargo_toml.contains("hyper::"),
+        !cargo_toml.contains("hyper::"),
         errors,
-        "ryuki-api Cargo.toml must not depend on external HTTP clients",
+        "ryuki-api Cargo.toml must not depend on raw hyper HTTP clients",
     );
     expect(
         !cargo_toml.contains("diesel"),

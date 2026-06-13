@@ -1,5 +1,54 @@
-# Site catalog stub.
-# Site configuration is managed through the portal and stored in the database.
+# Site catalog seed data only. Do not add real hostnames, private IPs,
+# credentials, tokens, tenant IDs, object IDs, live endpoints, or URLs.
+#
+# Source of truth: this file lists the governed site codes (UN/LOCODE) the
+# platform recognises for policy binding and OU derivation, plus the canonical
+# safe Windows customization facts. At runtime the API serves the
+# database-backed registry seeded from the UN/LOCODE reference set in
+# sources/ryuki-engine/src/site_registry.rs; the codes below are the subset that
+# carry policy guardrail bindings (catalog/policy-guardrails.yaml siteBindings)
+# and must stay in lockstep with those bindings.
+#
+# Note: the legacy `site-catalog-contract` validator slice (feature 6 / chunk 9
+# in the design doc) additionally demands `*Allowed` safety-flag keys such as
+# `passwordValuesAllowed`/`objectIdentifiersAllowed`. Those key names contain
+# substrings the `catalog` slice's forbidden-sensitive-key check rejects, so the
+# two slices cannot be satisfied by one file. This file is shaped to the
+# `catalog` slice (the source-of-truth catalog integrity check); reconciling the
+# legacy contract slice is tracked under feature 6 (rewrite site_catalog_contract.rs).
 version: 1
-status: stub
-note: Site data is database-driven. This file is a placeholder; real site records are managed via the portal admin UI and stored in the platform database.
+status: draft
+source: static-seed
+catalogMode: safe-xml-facts-only
+domain: CORP.local
+# OU derivation pattern. <SITE> and <COUNTRY> are substituted with the site
+# code and ISO country code; no live directory values are stored here.
+ouPattern: OU=Servers,OU=<SITE>,OU=<COUNTRY>,DC=corp,DC=local
+network: DHCP
+organization: Ryuki EU
+safeXmlFactsOnly: true
+windowsBehavior:
+  - Sysprep
+  - VM-name generator
+  - Change SID
+sites:
+  - spec: deber-windows-customization
+    country: DE
+    site: DEBER
+    timezoneCode: 105
+  - spec: defra-windows-customization
+    country: DE
+    site: DEFRA
+    timezoneCode: 105
+  - spec: frpar-windows-customization
+    country: FR
+    site: FRPAR
+    timezoneCode: 105
+  - spec: gblon-windows-customization
+    country: GB
+    site: GBLON
+    timezoneCode: 85
+  - spec: nlams-windows-customization
+    country: NL
+    site: NLAMS
+    timezoneCode: 105

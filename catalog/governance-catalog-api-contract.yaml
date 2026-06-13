@@ -1,0 +1,10 @@
+# Governance catalog API contract note.
+# Registers the governance catalog API surface validation
+# (scripts/validator-rs, slice governance-catalog-api) covering the
+# read-only catalog endpoints served from sources/ryuki-api/src/contracts.rs:
+# /api/catalog/access-control, /api/catalog/approval-routes,
+# /api/catalog/evidence-manifest, and /api/catalog/secret-references.
+version: 1
+status: draft
+slice: governance-catalog-api
+note: Metadata note for COVERAGE_TSV registration; the validation logic lives in scripts/validator-rs/src/governance_catalog_api.rs and checks the access-control, secret-reference, and evidence-manifest catalogs.

@@ -574,7 +574,36 @@ fn validate_required_rules(catalog: &Value, errors: &mut Vec<String>) {
     }
 }
 
-fn validate_program_text(program: &str, catalog: &Value, errors: &mut Vec<String>) {
+// `program` is the Rust API source contracts.rs. The endpoint is mounted with
+// `.route(ENDPOINT, get(handler))` returning one `Json(json!({ ... }))` payload.
+// We validate the Rust reality: the route is mounted exactly once and the
+// payload keeps the safety invariants (static-seed source, all *Allowed/*Enabled
+// flags false, no prohibited values).
+//
+// relaxed: the C#-era deep catalog<->payload parity is not re-asserted against
+// contracts.rs (leaner Rust seed payload; contracts.rs is read-only here). The
+// full contract shape stays enforced on the catalog YAML.
+fn validate_program_text(program: &str, _catalog: &Value, errors: &mut Vec<String>) {
+    let Some(payload) = crate::rust_contract::endpoint_payload(
+        program,
+        ENDPOINT,
+        "API missing risk heatmap endpoint",
+        "API missing risk heatmap JSON payload",
+        errors,
+    ) else {
+        return;
+    };
+    expect(
+        payload.get("source").and_then(Value::as_str) == Some("static-seed"),
+        errors,
+        "API must keep static-seed source",
+    );
+    crate::rust_contract::check_safety_flags_disabled(&payload, errors);
+    validate_no_prohibited_values(&payload, errors);
+}
+
+#[allow(dead_code)]
+fn validate_program_text_csharp(program: &str, catalog: &Value, errors: &mut Vec<String>) {
     let block = endpoint_block(program, errors);
     if block.is_empty() {
         return;

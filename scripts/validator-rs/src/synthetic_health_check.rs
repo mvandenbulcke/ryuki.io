@@ -289,12 +289,24 @@ fn text_identifiers(text: &str) -> Vec<String> {
     unique.into_iter().collect()
 }
 
+// Guard-vocabulary identifiers that name a *safety control* rather than a field
+// that would carry provider data. These are part of the contract's own
+// "no live data is exposed" declaration (a `*Allowed: false` flag and the rule
+// id that asserts the same), so the substring scan ("rawprobe") must not flag
+// them. Without this allowlist the slice contradicts itself: validate_catalog_value
+// REQUIRES `rawProbeOutputAllowed: false` to be present, while the prohibited-key
+// scan would reject the very field it requires.
+const GUARD_KEY_ALLOWLIST: &[&str] = &["rawprobeoutputallowed", "rawprobeoutputnotexposed"];
+
 fn prohibited_key(key: &str) -> bool {
     let normalized = key
         .to_ascii_lowercase()
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect::<String>();
+    if GUARD_KEY_ALLOWLIST.contains(&normalized.as_str()) {
+        return false;
+    }
     PROHIBITED_KEYS.contains(&normalized.as_str())
         || PROHIBITED_KEYS.iter().any(|term| normalized.contains(term))
 }

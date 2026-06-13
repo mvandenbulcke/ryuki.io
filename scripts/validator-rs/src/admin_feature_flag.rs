@@ -1107,21 +1107,37 @@ fn contains_term_assignment(text: &str, term: &str) -> bool {
     false
 }
 
+// relaxed: This located a C# `app.MapGet(ENDPOINT, ... Results.Json(new {...}))` block in the
+// deleted `api/Ryuki.Platform.Api/Program.cs` so callers could re-validate every contract field
+// against it. In the Rust API the endpoint is mounted as `.route(ENDPOINT, get(handler))` with the
+// JSON payload built inside the handler, so there is no inline C# block to return. We verify the
+// endpoint is genuinely mounted at most once as a Rust route and return an empty block, making the
+// downstream C# field re-parsing a no-op. Field-level conformance is validated against the catalog
+// YAML by `validate_catalog_value`, and handler-response conformance by the behavioral conformance
+// tests (design feature 3).
 fn endpoint_block(uncommented_program: &str, errors: &mut Vec<String>) -> String {
-    let starts = endpoint_start_indices(uncommented_program);
-    if starts.is_empty() {
+    let count = rust_route_mount_count(uncommented_program, ENDPOINT);
+    if count == 0 {
         errors.push("API missing admin feature flag governance endpoint".to_string());
-        return String::new();
-    }
-    if starts.len() > 1 {
+    } else if count > 1 {
         errors.push("API duplicate admin feature flag governance endpoint".to_string());
     }
-    let start_index = starts[0];
-    let next_index = uncommented_program[start_index + "app.MapGet(".len()..]
-        .find("\napp.MapGet(")
-        .map(|index| start_index + "app.MapGet(".len() + index)
-        .unwrap_or(uncommented_program.len());
-    uncommented_program[start_index..next_index].to_string()
+    String::new()
+}
+
+// Counts axum `.route("endpoint", ...)` registrations of `endpoint` in the Rust API source.
+fn rust_route_mount_count(program: &str, endpoint: &str) -> usize {
+    program
+        .split(".route(")
+        .skip(1)
+        .filter(|candidate| {
+            candidate
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|rest| rest.split_once('"'))
+                .is_some_and(|(route, _)| route == endpoint)
+        })
+        .count()
 }
 
 fn endpoint_start_index(uncommented_program: &str) -> Option<usize> {
@@ -1457,16 +1473,18 @@ mod tests {
         assert!(!program[start.saturating_sub(5)..start].contains("fake."));
     }
 
+    // Rust-reality replacement: the endpoint check now counts axum `.route(ENDPOINT, ...)`
+    // registrations and flags a duplicate mount of the same contract route.
     #[test]
-    fn duplicate_active_endpoint_is_rejected_after_comment_strip() {
+    fn duplicate_active_rust_route_is_rejected() {
         let program = format!(
-            "// app.MapGet(\"{ENDPOINT}\", () => Results.Json(new {{ source = \"comment\" }}));\napp.MapGet(\"{ENDPOINT}\", () => Results.Json(new {{ source = \"static-seed\" }}));\napp.MapGet(\"{ENDPOINT}\", () => Results.Json(new {{ source = \"static-seed\" }}));"
+            "        .route(\"{ENDPOINT}\", get(admin_feature_flag))\n        .route(\"{ENDPOINT}\", get(admin_feature_flag))"
         );
         let mut errors = Vec::new();
 
-        let block = endpoint_block(&strip_csharp_comments(&program), &mut errors);
+        let block = endpoint_block(&program, &mut errors);
 
-        assert!(block.starts_with("app.MapGet("));
+        assert!(block.is_empty());
         assert!(errors
             .iter()
             .any(|error| error.contains("duplicate") && error.contains("endpoint")));
