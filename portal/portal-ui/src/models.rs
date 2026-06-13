@@ -983,6 +983,8 @@ pub struct RequestIntakeForm {
 }
 
 pub fn request_intake_form_fallback() -> RequestIntakeForm {
+    use crate::views::request_create::{ENVIRONMENT_OPTIONS, REQUEST_TYPE_OPTIONS, SITE_OPTIONS};
+
     RequestIntakeForm {
         title: "Request Intake".to_string(),
         description: "Review-only preview — submission available in next release".to_string(),
@@ -991,32 +993,30 @@ pub fn request_intake_form_fallback() -> RequestIntakeForm {
                 label: "Request type".to_string(),
                 field_type: "select".to_string(),
                 required: true,
-                options: vec![
-                    "VM".to_string(),
-                    "Application".to_string(),
-                    "SQL".to_string(),
-                    "Network".to_string(),
-                    "Storage".to_string(),
-                ],
+                options: REQUEST_TYPE_OPTIONS
+                    .iter()
+                    .map(|(value, _)| value.to_string())
+                    .collect(),
                 placeholder: "Select request type".to_string(),
             },
             RequestFormField {
                 label: "Site".to_string(),
                 field_type: "select".to_string(),
                 required: true,
-                options: vec!["site-alpha".to_string(), "site-bravo".to_string()],
+                options: SITE_OPTIONS
+                    .iter()
+                    .map(|(value, _)| value.to_string())
+                    .collect(),
                 placeholder: "Select site".to_string(),
             },
             RequestFormField {
                 label: "Environment".to_string(),
                 field_type: "select".to_string(),
                 required: true,
-                options: vec![
-                    "dev".to_string(),
-                    "test".to_string(),
-                    "staging".to_string(),
-                    "prod".to_string(),
-                ],
+                options: ENVIRONMENT_OPTIONS
+                    .iter()
+                    .map(|(value, _)| value.to_string())
+                    .collect(),
                 placeholder: "Select environment".to_string(),
             },
             RequestFormField {
@@ -2400,6 +2400,46 @@ pub const DASHBOARD_SUMMARIES: &[SafeSummary] = &[
         redaction_state: "Safe summary",
     },
 ];
+
+#[cfg(all(test, feature = "ssr"))]
+mod ssr_tests {
+    use super::*;
+
+    #[test]
+    fn intake_fallback_vocabulary_matches_canonical_request_create_lists() {
+        use crate::views::request_create::{
+            ENVIRONMENT_OPTIONS, REQUEST_TYPE_OPTIONS, SITE_OPTIONS,
+        };
+        let form = request_intake_form_fallback();
+        let field = |label: &str| {
+            form.fields
+                .iter()
+                .find(|f| f.label == label)
+                .unwrap_or_else(|| panic!("fallback must have a {label} field"))
+        };
+
+        let rt: Vec<&str> = REQUEST_TYPE_OPTIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            field("Request type").options,
+            rt,
+            "fallback request types drifted from canonical"
+        );
+
+        let sites: Vec<&str> = SITE_OPTIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            field("Site").options,
+            sites,
+            "fallback sites drifted from canonical"
+        );
+
+        let envs: Vec<&str> = ENVIRONMENT_OPTIONS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            field("Environment").options,
+            envs,
+            "fallback environments drifted from canonical"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
