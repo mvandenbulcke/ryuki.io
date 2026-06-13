@@ -11992,24 +11992,141 @@ struct IpamSiteQuery {
     site: Option<String>,
 }
 
+/// One persisted `dns_records` row. `record_type` / `status` are stored as the
+/// canonical serde strings, so `to_json` reproduces the engine `DnsRecord`
+/// serialization byte-for-byte (no enum round-trip needed on read).
+#[derive(sqlx::FromRow)]
+struct DnsRecordRow {
+    id: String,
+    name: String,
+    record_type: String,
+    value: String,
+    zone: String,
+    ttl: i32,
+    site: String,
+    status: String,
+}
+
+impl DnsRecordRow {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "record_type": self.record_type,
+            "value": self.value,
+            "zone": self.zone,
+            "ttl": self.ttl,
+            "site": self.site,
+            "status": self.status,
+        })
+    }
+}
+
+/// The canonical serde string for a DNS record status ("Pending" etc.).
+fn dns_status_str(status: &dns_ipam::DnsRecordStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "Pending".to_string())
+}
+
+const DNS_COLUMNS: &str = "id, name, record_type, value, zone, ttl, site, status";
+
 async fn dns_records_list(
     Query(q): Query<DnsListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dns_ipam::list_dns_records(
-        q.site.as_deref().unwrap_or(""),
-        q.record_type.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let record_type = q.record_type.as_deref().unwrap_or("");
+    // Durable path: read from the DB (authoritative, survives restart).
+    if let Some(pool) = get_db() {
+        let rows: Vec<DnsRecordRow> = sqlx::query_as(&format!(
+            "SELECT {DNS_COLUMNS} FROM dns_records \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR record_type = $2) ORDER BY id"
+        ))
+        .bind(site)
+        .bind(record_type)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        let records: Vec<Value> = rows.iter().map(DnsRecordRow::to_json).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "records": records,
+            "count": records.len(),
+        })));
+    }
+    // No-DB fallback: the process-local engine store.
+    dns_ipam::list_dns_records(site, record_type)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn dns_record_create(
     Json(b): Json<DnsCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Validate + construct via the pure engine builder (no static mutation),
+        // then persist. The engine stays storage-free; the DB is the source of
+        // truth that survives restart.
+        let record =
+            dns_ipam::build_dns_record(&b.name, &b.record_type, &b.value, &b.zone, b.ttl, &b.site)
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+        sqlx::query(&format!(
+            "INSERT INTO dns_records ({DNS_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        ))
+        .bind(&record.id)
+        .bind(&record.name)
+        .bind(record.record_type.to_string())
+        .bind(&record.value)
+        .bind(&record.zone)
+        .bind(record.ttl as i32)
+        .bind(&record.site)
+        .bind(dns_status_str(&record.status))
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        return Ok(Json(json!({
+            "source": "database",
+            "record": serde_json::to_value(&record).unwrap_or_default(),
+        })));
+    }
     dns_ipam::create_dns_record(&b.name, &b.record_type, &b.value, &b.zone, b.ttl, &b.site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<DnsRecordRow> = sqlx::query_as(&format!(
+            "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        return match row {
+            Some(record) => Ok(Json(
+                json!({"source": "database", "record": record.to_json()}),
+            )),
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("DNS record '{}' not found", id)})),
+            )),
+        };
+    }
     dns_ipam::get_dns_record(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -12017,6 +12134,29 @@ async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
 async fn dns_record_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let result = sqlx::query("DELETE FROM dns_records WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+            })?;
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("DNS record '{}' not found", id)})),
+            ));
+        }
+        return Ok(Json(json!({
+            "source": "database",
+            "deleted": true,
+            "record_id": id,
+        })));
+    }
     dns_ipam::delete_dns_record(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))

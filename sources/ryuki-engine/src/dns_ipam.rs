@@ -364,14 +364,19 @@ pub fn get_dns_record(id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn create_dns_record(
+/// Pure validation + construction of a DNS record — NO store mutation, NO I/O.
+/// This is the building block the persistence layer (ryuki-api) uses: it can
+/// construct the typed record, persist it to the database, and reconstruct the
+/// same shape on read, while the engine stays storage-free. `create_dns_record`
+/// keeps the in-memory (no-DB) behavior by pushing the result onto the static.
+pub fn build_dns_record(
     name: &str,
     record_type: &str,
     value: &str,
     zone: &str,
     ttl: u32,
     site: &str,
-) -> Result<Value, String> {
+) -> Result<DnsRecord, String> {
     if name.trim().is_empty() {
         return Err("name cannot be empty".into());
     }
@@ -396,7 +401,7 @@ pub fn create_dns_record(
             .unwrap_or("unknown")
     );
 
-    let record = DnsRecord {
+    Ok(DnsRecord {
         id,
         name: name.to_string(),
         record_type,
@@ -405,8 +410,18 @@ pub fn create_dns_record(
         ttl,
         site: site.to_string(),
         status: DnsRecordStatus::Pending,
-    };
+    })
+}
 
+pub fn create_dns_record(
+    name: &str,
+    record_type: &str,
+    value: &str,
+    zone: &str,
+    ttl: u32,
+    site: &str,
+) -> Result<Value, String> {
+    let record = build_dns_record(name, record_type, value, zone, ttl, site)?;
     store().lock().unwrap().0.push(record.clone());
 
     Ok(json!({
@@ -609,6 +624,31 @@ pub fn check_ip_availability(subnet_id: &str, count: u32) -> Result<Value, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_dns_record_validates_and_constructs() {
+        // Pure validation + construction — it never touches the static store
+        // (that is create_dns_record's / the DB layer's job), so this test makes
+        // no global-state assertions that would race other parallel tests.
+        let record = build_dns_record(
+            "pure.defra.ryuki.local",
+            "CNAME",
+            "alias.defra.ryuki.local",
+            "defra.ryuki.local",
+            300,
+            "DEFRA",
+        )
+        .expect("valid record builds");
+        assert!(record.id.starts_with("dns-defra-"));
+        assert_eq!(record.record_type, DnsRecordType::CNAME);
+        assert_eq!(record.status, DnsRecordStatus::Pending);
+        // The Display string the DB persists matches the serde serialization.
+        assert_eq!(record.record_type.to_string(), "CNAME");
+
+        // Validation rejects empties and bad record types.
+        assert!(build_dns_record("", "A", "v", "z", 1, "S").is_err());
+        assert!(build_dns_record("n", "BOGUS", "v", "z", 1, "S").is_err());
+    }
 
     #[test]
     fn test_create_and_list_dns_records() {
