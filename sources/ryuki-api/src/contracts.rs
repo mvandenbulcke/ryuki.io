@@ -6962,9 +6962,26 @@ fn is_interactive_external_admin(session: &AuthSession) -> bool {
 
 fn require_verified_external_admin_permission(
     session: &AuthSession,
+    auth_mode: &AuthMode,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     require_admin_permission(session)?;
     if is_interactive_external_admin(session) {
+        return Ok(());
+    }
+    // Local-mode bootstrap (breaks the circular onboarding where you cannot
+    // configure Entra without first writing settings, but settings writes
+    // required an external Entra admin). When the platform runs in LOCAL auth
+    // mode there is no external IdP to authenticate against, so the verified
+    // local admin IS the configured trust anchor and may write settings.
+    //
+    // Tightly scoped, never weakening the Entra path:
+    //   - only when the RUNTIME auth_mode is Local (not Entra, not the dry-run
+    //     demo modes — so the static demo's preview-only writes are unchanged),
+    //   - only a verified (token_valid) admin session,
+    //   - NEVER a machine `api-token` identity (preserves the credential-
+    //     escalation guard: a standing token can never write settings).
+    if *auth_mode == AuthMode::Local && session.token_valid && session.provider_mode != "api-token"
+    {
         return Ok(());
     }
     Err((
@@ -7213,7 +7230,10 @@ async fn admin_platform_settings_update(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PlatformConfig>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    require_verified_external_admin_permission(&session)?;
+    require_verified_external_admin_permission(
+        &session,
+        &crate::config_store::get_app_config().auth_mode,
+    )?;
 
     let validation_errors = ryuki_core::types::validate_platform_config(&body);
     if !validation_errors.is_empty() {
@@ -7242,7 +7262,10 @@ async fn admin_platform_settings_update(
 async fn admin_platform_settings_reset(
     AuthExtractor(session): AuthExtractor,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    require_verified_external_admin_permission(&session)?;
+    require_verified_external_admin_permission(
+        &session,
+        &crate::config_store::get_app_config().auth_mode,
+    )?;
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
@@ -13555,7 +13578,9 @@ mod unit_tests {
     #[test]
     fn test_verified_external_admin_permission_rejects_static_admin() {
         let session = AuthSession::static_dry_run();
-        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+        let Err((status, Json(body))) =
+            require_verified_external_admin_permission(&session, &AuthMode::StaticDryRun)
+        else {
             panic!("static admin should not be allowed to write platform settings");
         };
 
@@ -13565,11 +13590,16 @@ mod unit_tests {
 
     #[test]
     fn test_verified_external_admin_permission_rejects_persisted_session() {
+        // In ENTRA mode a persisted browser session is non-interactive-external
+        // and must be refused. (The local-mode bootstrap exception is asserted
+        // separately below.)
         let mut session = AuthSession::static_dry_run();
         session.token_valid = true;
         session.provider_mode = "persisted-session".into();
-        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
-            panic!("persisted mock session should not be allowed to write platform settings");
+        let Err((status, Json(body))) =
+            require_verified_external_admin_permission(&session, &AuthMode::EntraId)
+        else {
+            panic!("persisted session must be refused settings writes in Entra mode");
         };
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -13582,7 +13612,40 @@ mod unit_tests {
         session.token_valid = true;
         session.provider_mode = "entra-id".into();
 
-        assert!(require_verified_external_admin_permission(&session).is_ok());
+        assert!(require_verified_external_admin_permission(&session, &AuthMode::EntraId).is_ok());
+    }
+
+    /// Local-mode bootstrap: when the platform runs in LOCAL auth mode, a
+    /// verified local admin (persisted browser session) MAY write settings —
+    /// there is no external IdP to authenticate against, so the local admin is
+    /// the configured trust anchor. This is what breaks the circular onboarding.
+    #[test]
+    fn test_verified_external_admin_permission_allows_local_admin_in_local_mode() {
+        let mut session = AuthSession::static_dry_run();
+        session.token_valid = true;
+        session.provider_mode = "persisted-session".into();
+        assert!(
+            require_verified_external_admin_permission(&session, &AuthMode::Local).is_ok(),
+            "a verified local admin must be able to write settings in local auth mode"
+        );
+
+        // ...but the SAME session is refused once the platform is Entra-configured.
+        assert!(require_verified_external_admin_permission(&session, &AuthMode::EntraId).is_err());
+    }
+
+    /// Local-mode bootstrap must NOT admit an unverified session: an anonymous
+    /// local session (token_valid=false) is still refused even in local mode.
+    #[test]
+    fn test_local_bootstrap_refuses_unverified_session() {
+        let mut session = AuthSession::static_dry_run();
+        session.token_valid = false;
+        session.provider_mode = "persisted-session".into();
+        let Err((status, _)) =
+            require_verified_external_admin_permission(&session, &AuthMode::Local)
+        else {
+            panic!("an unverified session must be refused settings writes even in local mode");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -14128,8 +14191,11 @@ mod unit_tests {
         };
         // It still holds the coarse admin permission via its roles...
         assert!(require_admin_permission(&session).is_ok());
-        // ...but can never satisfy the verified-external-admin gate.
-        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+        // ...but can never satisfy the verified-external-admin gate — not even in
+        // local auth mode (the bootstrap exception never admits api-tokens).
+        let Err((status, Json(body))) =
+            require_verified_external_admin_permission(&session, &AuthMode::Local)
+        else {
             panic!("dry-run-minted token must be rejected by the verified-admin gate");
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -14151,7 +14217,11 @@ mod unit_tests {
         };
         assert!(require_admin_permission(&session).is_ok());
         assert!(!is_interactive_external_admin(&session));
-        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+        // A live machine api-token must be refused in EVERY mode, including the
+        // local-mode bootstrap path (credential-escalation regression guard).
+        let Err((status, Json(body))) =
+            require_verified_external_admin_permission(&session, &AuthMode::Local)
+        else {
             panic!("a live api-token must not pass the verified-external-admin gate");
         };
         assert_eq!(status, StatusCode::UNAUTHORIZED);

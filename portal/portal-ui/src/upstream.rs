@@ -164,6 +164,18 @@ impl UpstreamClient {
         }
         self.dispatch(request, session_id).await
     }
+
+    /// PUT an allowlisted API path with a JSON body (full-resource replace,
+    /// e.g. platform settings).
+    pub async fn put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        session_id: Option<&str>,
+    ) -> Result<UpstreamResponse, UpstreamUnreachable> {
+        let request = self.http.put(self.url(path)).json(body);
+        self.dispatch(request, session_id).await
+    }
 }
 
 /// Transport errors can embed full URLs; keep only the failure class.

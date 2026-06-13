@@ -1361,23 +1361,82 @@ pub async fn save_platform_settings(
     settings: PlatformSettingsSummary,
 ) -> Result<PlatformSettingsSummary, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(admin_platform_settings_path())
         .map_err(|_| {
             ServerFnError::new("admin platform settings API path failed same-origin guard")
         })?;
-    reject_static_preview_platform_settings_save(settings)
+    let upstream = upstream_context();
+    // Static-dry-run is preview-only: writes never persist.
+    if !upstream.live() {
+        return reject_static_preview_platform_settings_save(settings);
+    }
+    let session_id = session_id_from_request().await;
+    // Round-trip the FULL current config so editing the summary's five fields
+    // never clobbers the ~20 other provider fields the API persists wholesale.
+    let mut full: serde_json::Value = match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => response
+            .json()
+            .map_err(|_| ServerFnError::new("admin platform settings response was malformed"))?,
+        Ok(response) => {
+            return Err(ServerFnError::new(api_error_text(
+                &response,
+                "admin platform settings fetch failed",
+            )))
+        }
+        Err(_) => return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE)),
+    };
+    // Merge the edited summary fields onto the full config by serializing the
+    // typed summary (its serde definition supplies the field names, so no
+    // provider field is named in this boundary code) and copying its keys over.
+    let edited = serde_json::to_value(&settings)
+        .map_err(|_| ServerFnError::new("admin platform settings payload was malformed"))?;
+    if let (Some(full_object), Some(edited_object)) = (full.as_object_mut(), edited.as_object()) {
+        for (key, value) in edited_object {
+            full_object.insert(key.clone(), value.clone());
+        }
+    }
+    match upstream.put(path, &full, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let updated: PlatformSettingsSummary = response.json().map_err(|_| {
+                ServerFnError::new("admin platform settings update response was malformed")
+            })?;
+            Ok(updated)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "platform settings save failed",
+        ))),
+        Err(_) => Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE)),
+    }
 }
 
 #[server(prefix = "/portal/api", endpoint = "admin-platform-settings-reset")]
 pub async fn reset_platform_settings() -> Result<PlatformSettingsSummary, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
-    boundary
+    let path = boundary
         .validate_platform_api_path(admin_platform_settings_reset_path())
         .map_err(|_| {
             ServerFnError::new("admin platform settings reset API path failed same-origin guard")
         })?;
-    reject_static_preview_platform_settings_reset()
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_platform_settings_reset();
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.post(path, None, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let updated: PlatformSettingsSummary = response.json().map_err(|_| {
+                ServerFnError::new("admin platform settings reset response was malformed")
+            })?;
+            Ok(updated)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "platform settings reset failed",
+        ))),
+        Err(_) => Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE)),
+    }
 }
 
 /// Validation message for an unknown role in the create-token form. The check
