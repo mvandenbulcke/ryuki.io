@@ -27,7 +27,7 @@ fn api_path(path: &'static str) -> &'static str {
 /// values must stay in lockstep with the API's `parse_request_type`
 /// vocabulary (sources/ryuki-api/src/contracts.rs) — anything else is
 /// rejected at intake.
-const REQUEST_TYPE_OPTIONS: &[(&str, &str)] = &[
+pub(crate) const REQUEST_TYPE_OPTIONS: &[(&str, &str)] = &[
     ("server-deployment", "Server Deployment"),
     ("patch-maintenance", "Patch Maintenance"),
     ("reboot-orchestration", "Reboot Orchestration"),
@@ -49,7 +49,7 @@ const REQUEST_TYPE_OPTIONS: &[(&str, &str)] = &[
 
 /// `(API value, display label)` pairs for the site select; values mirror the
 /// engine's valid site codes (ryuki-engine request lifecycle).
-const SITE_OPTIONS: &[(&str, &str)] = &[
+pub(crate) const SITE_OPTIONS: &[(&str, &str)] = &[
     ("DEBER", "DEBER — Berlin"),
     ("DEFRA", "DEFRA — Frankfurt"),
     ("FRPAR", "FRPAR — Paris"),
@@ -59,7 +59,7 @@ const SITE_OPTIONS: &[(&str, &str)] = &[
 
 /// `(API value, display label)` pairs for the environment select; values
 /// mirror the engine's valid environments (ryuki-engine request lifecycle).
-const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
+pub(crate) const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
     ("development", "Development"),
     ("test", "Test"),
     ("acceptance", "Acceptance"),
