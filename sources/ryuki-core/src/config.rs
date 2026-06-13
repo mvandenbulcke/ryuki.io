@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use figment::{
     Figment,
@@ -911,6 +912,106 @@ pub struct RateLimitConfig {
     pub burst_size: u32,
     #[serde(default)]
     pub path_overrides: HashMap<String, RateLimitPathOverride>,
+    /// Reverse proxies whose `X-Forwarded-For` header may be trusted for
+    /// rate-limit client identity. Entries are plain IPs ("203.0.113.7") or
+    /// CIDR blocks ("10.0.0.0/8"); validated at config load via
+    /// [`TrustedProxyNetwork::parse`]. Empty (default) means no proxy is
+    /// trusted and the connecting peer address is always the client key.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+impl RateLimitConfig {
+    /// Parses every `trusted_proxies` entry, failing on the first malformed
+    /// one with an error naming the offending entry.
+    pub fn parsed_trusted_proxies(&self) -> Result<Vec<TrustedProxyNetwork>, String> {
+        self.trusted_proxies
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                TrustedProxyNetwork::parse(entry)
+                    .map_err(|error| format!("rate_limit.trusted_proxies[{index}]: {error}"))
+            })
+            .collect()
+    }
+}
+
+/// A trusted proxy network: a single IP address (treated as /32 or /128) or
+/// an explicit CIDR block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxyNetwork {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxyNetwork {
+    /// Parses a plain IP ("203.0.113.7", "::1") or CIDR block
+    /// ("10.0.0.0/8", "fd00::/8"). Host bits beyond the prefix are masked
+    /// off; malformed input yields a descriptive error.
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err("entry must not be empty".into());
+        }
+        let (ip_part, prefix_part) = match entry.split_once('/') {
+            Some((ip, prefix)) => (ip, Some(prefix)),
+            None => (entry, None),
+        };
+        let ip: IpAddr = ip_part
+            .parse()
+            .map_err(|_| format!("'{entry}' is not a valid IP address or CIDR block"))?;
+        let max_prefix: u8 = if ip.is_ipv4() { 32 } else { 128 };
+        let prefix_len = match prefix_part {
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|p| *p <= max_prefix)
+                .ok_or_else(|| {
+                    format!("'{entry}' has an invalid CIDR prefix (expected 0-{max_prefix})")
+                })?,
+            None => max_prefix,
+        };
+        Ok(Self {
+            network: mask_ip(ip, prefix_len),
+            prefix_len,
+        })
+    }
+
+    /// True when the candidate address falls inside this network. The
+    /// candidate is canonicalized first so IPv4-mapped IPv6 peers
+    /// (`::ffff:a.b.c.d`) match IPv4 entries. Address families never match
+    /// across each other.
+    pub fn contains(&self, candidate: IpAddr) -> bool {
+        let candidate = candidate.to_canonical();
+        match (self.network, candidate) {
+            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {
+                mask_ip(candidate, self.prefix_len) == self.network
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Zeroes the host bits of `ip` beyond `prefix_len`.
+fn mask_ip(ip: IpAddr, prefix_len: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix_len))
+            };
+            IpAddr::V4(Ipv4Addr::from(u32::from(v4) & mask))
+        }
+        IpAddr::V6(v6) => {
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix_len))
+            };
+            IpAddr::V6(Ipv6Addr::from(u128::from(v6) & mask))
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -939,6 +1040,7 @@ impl Default for RateLimitConfig {
             requests_per_second: default_requests_per_second(),
             burst_size: default_burst_size(),
             path_overrides: HashMap::new(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -1457,6 +1559,14 @@ impl RyukiConfig {
             );
         }
 
+        // Validated regardless of rate_limit.enabled: a malformed entry is a
+        // typo that would silently change client keying when enabled later.
+        for (index, entry) in self.rate_limit.trusted_proxies.iter().enumerate() {
+            if let Err(error) = TrustedProxyNetwork::parse(entry) {
+                errors.push(format!("rate_limit.trusted_proxies[{index}]: {error}"));
+            }
+        }
+
         if self.rate_limit.enabled {
             for (path, override_cfg) in &self.rate_limit.path_overrides {
                 if override_cfg.requests_per_second == 0 {
@@ -1894,6 +2004,83 @@ mod tests {
         config.rate_limit.burst_size = 0;
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("rate_limit.burst_size")));
+    }
+
+    #[test]
+    fn test_trusted_proxy_network_parses_plain_ips_and_cidr_blocks() {
+        let single = TrustedProxyNetwork::parse("203.0.113.7").unwrap();
+        assert!(single.contains("203.0.113.7".parse().unwrap()));
+        assert!(!single.contains("203.0.113.8".parse().unwrap()));
+
+        let block = TrustedProxyNetwork::parse("10.0.0.0/8").unwrap();
+        assert!(block.contains("10.255.255.255".parse().unwrap()));
+        assert!(!block.contains("11.0.0.1".parse().unwrap()));
+
+        let v6 = TrustedProxyNetwork::parse("fd00::/8").unwrap();
+        assert!(v6.contains("fd12::1".parse().unwrap()));
+        assert!(!v6.contains("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxy_network_masks_host_bits_and_canonicalizes() {
+        // host bits beyond the prefix are masked off
+        let block = TrustedProxyNetwork::parse("10.1.2.3/8").unwrap();
+        assert!(block.contains("10.200.0.1".parse().unwrap()));
+
+        // IPv4-mapped IPv6 peers (dual-stack listeners) match IPv4 entries
+        let v4 = TrustedProxyNetwork::parse("127.0.0.1").unwrap();
+        assert!(v4.contains("::ffff:127.0.0.1".parse().unwrap()));
+
+        // address families never match across each other
+        let v6 = TrustedProxyNetwork::parse("::1").unwrap();
+        assert!(!v6.contains("127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxy_network_rejects_malformed_entries() {
+        for entry in [
+            "",
+            "not-an-ip",
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/abc",
+        ] {
+            assert!(
+                TrustedProxyNetwork::parse(entry).is_err(),
+                "entry '{entry}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_trusted_proxies_with_clear_error() {
+        let mut config = RyukiConfig::default();
+        // not gated on rate_limit.enabled: typos surface immediately
+        config.rate_limit.trusted_proxies = vec!["10.0.0.0/8".into(), "10.0.0.0/33".into()];
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains(
+            "rate_limit.trusted_proxies[1]: '10.0.0.0/33' has an invalid CIDR prefix (expected 0-32)"
+        )));
+
+        config.rate_limit.trusted_proxies = vec!["not-an-ip".into()];
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains(
+            "rate_limit.trusted_proxies[0]: 'not-an-ip' is not a valid IP address or CIDR block"
+        )));
+    }
+
+    #[test]
+    fn test_parsed_trusted_proxies_fails_on_first_malformed_entry() {
+        let mut config = RateLimitConfig::default();
+        config.trusted_proxies = vec!["127.0.0.1".into(), "10.0.0.0/8".into()];
+        assert_eq!(config.parsed_trusted_proxies().unwrap().len(), 2);
+
+        config.trusted_proxies = vec!["127.0.0.1".into(), "bogus".into()];
+        let error = config.parsed_trusted_proxies().unwrap_err();
+        assert!(error.contains("rate_limit.trusted_proxies[1]"));
+        assert!(error.contains("'bogus' is not a valid IP address or CIDR block"));
     }
 
     #[test]

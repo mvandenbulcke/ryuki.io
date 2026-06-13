@@ -7,6 +7,7 @@ mod contracts;
 pub mod database;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request as HttpRequest, StatusCode};
 use axum::middleware;
 use axum::response::Response;
@@ -15,6 +16,7 @@ use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,7 +32,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::database::MigrationStatus;
-use ryuki_core::config::AuthMode;
+use ryuki_core::config::{AuthMode, TrustedProxyNetwork};
 use ryuki_core::types::{ApiError, ValidationResult};
 use ryuki_engine::auth::AuthSession;
 
@@ -495,6 +497,9 @@ type SharedRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>,
 struct RateLimiters {
     default: SharedRateLimiter,
     path_overrides: Arc<HashMap<String, SharedRateLimiter>>,
+    /// Peers matching one of these networks may speak for their clients via
+    /// X-Forwarded-For; everyone else is keyed on their own peer address.
+    trusted_proxies: Arc<Vec<TrustedProxyNetwork>>,
 }
 
 impl RateLimiters {
@@ -510,22 +515,100 @@ impl RateLimiters {
 
 type SharedRateLimiters = Arc<RateLimiters>;
 
+/// How the rate-limit client key was derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientKeySource {
+    /// The TCP peer address (the default; never spoofable).
+    Peer,
+    /// X-Forwarded-For, honored only because the peer is a trusted proxy.
+    Forwarded,
+}
+
+impl ClientKeySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClientKeySource::Peer => "peer",
+            ClientKeySource::Forwarded => "forwarded",
+        }
+    }
+}
+
+/// Resolves the rate-limit client key. The connecting peer address is
+/// authoritative; X-Forwarded-For is consulted only when the peer is a
+/// trusted proxy, in which case the rightmost entry that is not itself a
+/// trusted proxy wins (entries left of it are client-controlled, entries
+/// right of it are our own proxy tier). If the whole chain is trusted
+/// proxies — or the header is absent — the peer address is the key.
+fn resolve_rate_limit_client_key(
+    peer_addr: SocketAddr,
+    forwarded_for: Option<&str>,
+    trusted_proxies: &[TrustedProxyNetwork],
+) -> (String, ClientKeySource) {
+    let peer_ip = peer_addr.ip().to_canonical();
+    let is_trusted = |ip: IpAddr| trusted_proxies.iter().any(|network| network.contains(ip));
+    let peer_key = || (peer_ip.to_string(), ClientKeySource::Peer);
+
+    if !is_trusted(peer_ip) {
+        return peer_key();
+    }
+    let Some(forwarded_for) = forwarded_for else {
+        return peer_key();
+    };
+    for entry in forwarded_for.rsplit(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match parse_forwarded_entry_ip(entry) {
+            Some(ip) => {
+                let ip = ip.to_canonical();
+                if is_trusted(ip) {
+                    // a hop our own proxy tier appended; keep walking left
+                    continue;
+                }
+                return (ip.to_string(), ClientKeySource::Forwarded);
+            }
+            // A non-IP entry (e.g. an RFC 7239 obfuscated identifier written
+            // by the trusted proxy) cannot be a trusted proxy: key on it.
+            None => return (entry.to_string(), ClientKeySource::Forwarded),
+        }
+    }
+    peer_key()
+}
+
+/// Parses one X-Forwarded-For entry: a plain IP, `ip:port`, or `[v6]:port`.
+fn parse_forwarded_entry_ip(entry: &str) -> Option<IpAddr> {
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    entry.parse::<SocketAddr>().map(|socket| socket.ip()).ok()
+}
+
 async fn rate_limit_middleware(
     limiter: Option<SharedRateLimiters>,
     request: HttpRequest<Body>,
     next: middleware::Next,
 ) -> Response {
     if let Some(ref limiters) = limiter {
-        let client_key = request
+        // Inserted by into_make_service_with_connect_info in main(); absent
+        // only if the router is served without connect info (a programming
+        // error), in which case requests pass unlimited rather than sharing
+        // one global bucket.
+        let Some(ConnectInfo(peer_addr)) = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .copied()
+        else {
+            tracing::error!("peer address unavailable; request not rate limited");
+            return next.run(request).await;
+        };
+
+        let forwarded_for = request
             .headers()
             .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .split(',')
-            .next()
-            .unwrap_or("unknown")
-            .trim()
-            .to_string();
+            .and_then(|v| v.to_str().ok());
+        let (client_key, key_source) =
+            resolve_rate_limit_client_key(peer_addr, forwarded_for, &limiters.trusted_proxies);
 
         let path_group = rate_limit_path_group(request.uri().path());
 
@@ -533,7 +616,12 @@ async fn rate_limit_middleware(
         let limiter = limiters.for_path_group(&path_group);
 
         if limiter.check_key(&key).is_err() {
-            tracing::warn!(client = %client_key, path_group, "rate limit exceeded");
+            tracing::warn!(
+                client = %client_key,
+                key_source = key_source.as_str(),
+                path_group,
+                "rate limit exceeded"
+            );
             let body =
                 serde_json::to_string(&ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests"))
                     .unwrap_or_else(|_| {
@@ -596,9 +684,25 @@ fn create_rate_limiter(config: &ryuki_core::config::RateLimitConfig) -> Option<S
         })
         .collect();
 
+    // Config validation (RyukiConfig::validate) already flags malformed
+    // entries as hard errors; skipping here keeps boot resilient while
+    // never silently trusting a peer the operator did not spell correctly.
+    let trusted_proxies = config
+        .trusted_proxies
+        .iter()
+        .filter_map(|entry| {
+            TrustedProxyNetwork::parse(entry)
+                .inspect_err(|error| {
+                    tracing::warn!(entry = %entry, error = %error, "invalid trusted proxy entry, skipping");
+                })
+                .ok()
+        })
+        .collect();
+
     Some(Arc::new(RateLimiters {
         default,
         path_overrides: Arc::new(path_overrides),
+        trusted_proxies: Arc::new(trusted_proxies),
     }))
 }
 
@@ -838,9 +942,13 @@ async fn main() {
         }
     };
     tracing::info!("ryuki-api listening on {}", app_config.server.bind_address);
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(app_config.server.shutdown_timeout_secs))
-        .await
+    // Connect info gives rate limiting a trustworthy peer address.
+    if let Err(e) = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(app_config.server.shutdown_timeout_secs))
+    .await
     {
         tracing::error!(error = %e, "server error");
         std::process::exit(1);
@@ -1496,6 +1604,7 @@ mod tests {
             requests_per_second: 1,
             burst_size: 1,
             path_overrides: HashMap::new(),
+            trusted_proxies: Vec::new(),
         };
         config.path_overrides.insert(
             "/HEALTH/".into(),
@@ -1521,6 +1630,7 @@ mod tests {
             requests_per_second: 1,
             burst_size: 1,
             path_overrides: HashMap::new(),
+            trusted_proxies: Vec::new(),
         };
         config.path_overrides.insert(
             "health".into(),
@@ -1542,6 +1652,120 @@ mod tests {
         assert!(health_limiter.check_key(&health_key).is_ok());
         assert!(health_limiter.check_key(&health_key).is_ok());
         assert!(health_limiter.check_key(&health_key).is_err());
+    }
+
+    fn peer(addr: &str) -> SocketAddr {
+        addr.parse().expect("test peer address should parse")
+    }
+
+    fn trusted(networks: &[&str]) -> Vec<TrustedProxyNetwork> {
+        networks
+            .iter()
+            .map(|n| TrustedProxyNetwork::parse(n).expect("test network should parse"))
+            .collect()
+    }
+
+    #[test]
+    fn test_forged_xff_from_untrusted_peer_keys_on_peer_address() {
+        let trusted_proxies = trusted(&["10.0.0.0/8"]);
+        let (key, source) = resolve_rate_limit_client_key(
+            peer("198.51.100.7:50000"),
+            Some("203.0.113.99, 203.0.113.100"),
+            &trusted_proxies,
+        );
+        assert_eq!(key, "198.51.100.7");
+        assert_eq!(source, ClientKeySource::Peer);
+
+        // no trusted proxies configured at all: the header is always ignored
+        let (key, source) =
+            resolve_rate_limit_client_key(peer("198.51.100.7:50000"), Some("203.0.113.99"), &[]);
+        assert_eq!(key, "198.51.100.7");
+        assert_eq!(source, ClientKeySource::Peer);
+    }
+
+    #[test]
+    fn test_trusted_proxy_xff_resolves_rightmost_non_trusted_hop() {
+        let trusted_proxies = trusted(&["10.0.0.0/8", "127.0.0.1"]);
+
+        // forged client-supplied entry on the left, real client in the
+        // middle, our own proxy hop on the right: the real client wins
+        let (key, source) = resolve_rate_limit_client_key(
+            peer("10.0.0.5:443"),
+            Some("203.0.113.99, 198.51.100.20, 10.0.0.6"),
+            &trusted_proxies,
+        );
+        assert_eq!(key, "198.51.100.20");
+        assert_eq!(source, ClientKeySource::Forwarded);
+
+        // chain made entirely of trusted proxies: fall back to the peer
+        let (key, source) = resolve_rate_limit_client_key(
+            peer("10.0.0.5:443"),
+            Some("10.0.0.6, 127.0.0.1"),
+            &trusted_proxies,
+        );
+        assert_eq!(key, "10.0.0.5");
+        assert_eq!(source, ClientKeySource::Peer);
+
+        // trusted peer without the header: peer address is the key
+        let (key, source) =
+            resolve_rate_limit_client_key(peer("10.0.0.5:443"), None, &trusted_proxies);
+        assert_eq!(key, "10.0.0.5");
+        assert_eq!(source, ClientKeySource::Peer);
+    }
+
+    #[test]
+    fn test_forwarded_entries_with_ports_resolve_to_their_ip() {
+        let trusted_proxies = trusted(&["127.0.0.1"]);
+        let (key, source) = resolve_rate_limit_client_key(
+            peer("127.0.0.1:9000"),
+            Some("198.51.100.20:38422"),
+            &trusted_proxies,
+        );
+        assert_eq!(key, "198.51.100.20");
+        assert_eq!(source, ClientKeySource::Forwarded);
+
+        let (key, _) = resolve_rate_limit_client_key(
+            peer("127.0.0.1:9000"),
+            Some("[2001:db8::1]:38422"),
+            &trusted_proxies,
+        );
+        assert_eq!(key, "2001:db8::1");
+    }
+
+    #[test]
+    fn test_two_distinct_direct_clients_get_distinct_buckets() {
+        let config = ryuki_core::config::RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+            path_overrides: HashMap::new(),
+            trusted_proxies: Vec::new(),
+        };
+        let limiters = create_rate_limiter(&config).expect("rate limiter should be enabled");
+
+        let (key_a, _) = resolve_rate_limit_client_key(peer("198.51.100.1:50000"), None, &[]);
+        let (key_b, _) = resolve_rate_limit_client_key(peer("198.51.100.2:50000"), None, &[]);
+        assert_ne!(key_a, key_b);
+
+        let limiter = limiters.for_path_group("api");
+        // client A exhausts its own bucket without touching client B's
+        assert!(limiter.check_key(&format!("api:{key_a}")).is_ok());
+        assert!(limiter.check_key(&format!("api:{key_a}")).is_err());
+        assert!(limiter.check_key(&format!("api:{key_b}")).is_ok());
+    }
+
+    #[test]
+    fn test_create_rate_limiter_parses_trusted_proxies_and_skips_malformed() {
+        let config = ryuki_core::config::RateLimitConfig {
+            enabled: true,
+            requests_per_second: 1,
+            burst_size: 1,
+            path_overrides: HashMap::new(),
+            trusted_proxies: vec!["10.0.0.0/8".into(), "not-an-ip".into()],
+        };
+        let limiters = create_rate_limiter(&config).expect("rate limiter should be enabled");
+        assert_eq!(limiters.trusted_proxies.len(), 1);
+        assert!(limiters.trusted_proxies[0].contains("10.1.2.3".parse().unwrap()));
     }
 
     #[test]
