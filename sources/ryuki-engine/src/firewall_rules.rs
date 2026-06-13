@@ -435,8 +435,12 @@ pub fn get_rule(id: &str) -> Result<Value, String> {
     }))
 }
 
+/// Pure validation + construction of a firewall rule — NO store mutation, NO
+/// I/O. `priority` is supplied by the caller (computed from whichever store is
+/// authoritative: the DB in the persistence layer, the static in no-DB mode), so
+/// this stays storage-free for the persistence path to reuse.
 #[allow(clippy::too_many_arguments)]
-pub fn create_rule(
+pub fn build_rule(
     name: &str,
     source_ip: &str,
     dest_ip: &str,
@@ -445,7 +449,8 @@ pub fn create_rule(
     direction: &str,
     site: &str,
     description: &str,
-) -> Result<Value, String> {
+    priority: u32,
+) -> Result<FirewallRule, String> {
     if name.trim().is_empty() {
         return Err("name cannot be empty".into());
     }
@@ -463,18 +468,8 @@ pub fn create_rule(
     let action = parse_action(action)?;
     let direction = parse_direction(direction)?;
 
-    let mut store = store().lock().unwrap();
-    let priority = store
-        .0
-        .iter()
-        .filter(|rule| rule.site == site)
-        .map(|rule| rule.priority)
-        .max()
-        .unwrap_or(0)
-        + 10;
-    let id = format!("fw-{}-{}", site.to_lowercase(), short_id());
-    let rule = FirewallRule {
-        id: id.clone(),
+    Ok(FirewallRule {
+        id: format!("fw-{}-{}", site.to_lowercase(), short_id()),
         name: name.into(),
         source_ip: source_ip.into(),
         source_port: "any".into(),
@@ -489,9 +484,47 @@ pub fn create_rule(
         created_by: "ryuki.engine".into(),
         created_at: now_iso(),
         description: description.into(),
-    };
+    })
+}
 
-    store.0.push(rule.clone());
+/// Next priority for a site within the in-memory store (no-DB mode).
+pub fn next_static_priority(site: &str) -> u32 {
+    store()
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .filter(|rule| rule.site == site)
+        .map(|rule| rule.priority)
+        .max()
+        .unwrap_or(0)
+        + 10
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_rule(
+    name: &str,
+    source_ip: &str,
+    dest_ip: &str,
+    protocol: &str,
+    action: &str,
+    direction: &str,
+    site: &str,
+    description: &str,
+) -> Result<Value, String> {
+    let priority = next_static_priority(site);
+    let rule = build_rule(
+        name,
+        source_ip,
+        dest_ip,
+        protocol,
+        action,
+        direction,
+        site,
+        description,
+        priority,
+    )?;
+    store().lock().unwrap().0.push(rule.clone());
 
     Ok(json!({
         "source": "dry-run",

@@ -12460,19 +12460,132 @@ struct FwConflictsQuery {
     site: Option<String>,
 }
 
+/// One persisted `firewall_rules` row (migration 049). Enum columns hold the
+/// kebab-case serde strings, so `to_json` reproduces the engine FirewallRule
+/// serde shape (priority as a number, created_at as the engine ISO string).
+#[derive(sqlx::FromRow)]
+struct FirewallRuleRow {
+    id: String,
+    name: String,
+    source_ip: String,
+    source_port: String,
+    dest_ip: String,
+    dest_port: String,
+    protocol: String,
+    action: String,
+    direction: String,
+    priority: i32,
+    site: String,
+    status: String,
+    created_by: String,
+    created_at: String,
+    description: String,
+}
+
+impl FirewallRuleRow {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "source_ip": self.source_ip,
+            "source_port": self.source_port,
+            "dest_ip": self.dest_ip,
+            "dest_port": self.dest_port,
+            "protocol": self.protocol,
+            "action": self.action,
+            "direction": self.direction,
+            "priority": self.priority,
+            "site": self.site,
+            "status": self.status,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "description": self.description,
+        })
+    }
+}
+
+const FIREWALL_COLUMNS: &str = "id, name, source_ip, source_port, dest_ip, dest_port, protocol, \
+     action, direction, priority, site, status, created_by, created_at, description";
+
 async fn firewall_rules_list(
     Query(q): Query<FwListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firewall_rules::list_rules(
-        q.site.as_deref().unwrap_or(""),
-        q.direction.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let direction = q.direction.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        let rows: Vec<FirewallRuleRow> = sqlx::query_as(&format!(
+            "SELECT {FIREWALL_COLUMNS} FROM firewall_rules \
+             WHERE ($1 = '' OR site = $1) AND ($2 = '' OR direction = $2) \
+             ORDER BY site, priority, id"
+        ))
+        .bind(site)
+        .bind(direction)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let rules: Vec<Value> = rows.iter().map(FirewallRuleRow::to_json).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "rules": rules,
+            "count": rules.len(),
+        })));
+    }
+    firewall_rules::list_rules(site, direction)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn firewall_rule_create(
     Json(b): Json<FwCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Next priority is computed from the DURABLE rules for the site (the
+        // engine's static-store version would miss persisted rules).
+        let next_priority: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(priority), 0) + 10 FROM firewall_rules WHERE site = $1",
+        )
+        .bind(&b.site)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        let rule = firewall_rules::build_rule(
+            &b.name,
+            &b.source_ip,
+            &b.dest_ip,
+            &b.protocol,
+            &b.action,
+            &b.direction,
+            &b.site,
+            &b.description,
+            next_priority.max(0) as u32,
+        )
+        .map_err(|e| status_400(&e))?;
+        sqlx::query(&format!(
+            "INSERT INTO firewall_rules ({FIREWALL_COLUMNS}) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
+        ))
+        .bind(&rule.id)
+        .bind(&rule.name)
+        .bind(&rule.source_ip)
+        .bind(&rule.source_port)
+        .bind(&rule.dest_ip)
+        .bind(&rule.dest_port)
+        .bind(serde_enum_str(&rule.protocol))
+        .bind(serde_enum_str(&rule.action))
+        .bind(serde_enum_str(&rule.direction))
+        .bind(rule.priority as i32)
+        .bind(&rule.site)
+        .bind(serde_enum_str(&rule.status))
+        .bind(&rule.created_by)
+        .bind(&rule.created_at)
+        .bind(&rule.description)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "source": "database",
+            "rule": serde_json::to_value(&rule).unwrap_or_default(),
+        })));
+    }
     firewall_rules::create_rule(
         &b.name,
         &b.source_ip,
@@ -12489,6 +12602,19 @@ async fn firewall_rule_create(
 async fn firewall_rule_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<FirewallRuleRow> = sqlx::query_as(&format!(
+            "SELECT {FIREWALL_COLUMNS} FROM firewall_rules WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        return match row {
+            Some(rule) => Ok(Json(json!({"source": "database", "rule": rule.to_json()}))),
+            None => Err(status_404(&id)),
+        };
+    }
     firewall_rules::get_rule(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
