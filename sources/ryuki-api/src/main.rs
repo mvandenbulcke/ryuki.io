@@ -68,9 +68,11 @@ fn resolve_auth_metadata(header: Option<&str>, provider_mode: &'static str) -> A
 
 fn auth_session_for_request(auth_mode: AuthMode, auth_header: Option<&str>) -> AuthSession {
     match auth_mode {
-        AuthMode::MockDryRun | AuthMode::StaticDryRun | AuthMode::Local => {
-            AuthSession::static_dry_run()
-        }
+        AuthMode::MockDryRun | AuthMode::StaticDryRun => AuthSession::static_dry_run(),
+        // Local mode without a persisted session is unauthenticated: zero
+        // roles, token_valid=false. Unsafe methods 401 until login; GET stays
+        // anonymous this wave (read authentication is a later wave).
+        AuthMode::Local => unverified_session("local-unauthenticated"),
         AuthMode::EntraId => auth_header
             .map(ryuki_engine::auth::validate_token)
             .unwrap_or_else(AuthSession::unverified_entra),
@@ -108,45 +110,97 @@ fn bearer_value(auth_header: Option<&str>) -> Option<&str> {
     auth_header?.trim().strip_prefix("Bearer ").map(str::trim)
 }
 
+/// Extracts the `ryuki_session` cookie value from the Cookie header, if any.
+fn session_cookie_value(headers: &HeaderMap) -> Option<&str> {
+    let cookie_header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        if name.trim() == "ryuki_session" {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+/// Which request surface carried the session id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionIdSource {
+    /// `X-Ryuki-Session-Id` header (the portal's canonical surface).
+    Header,
+    /// `Authorization: Bearer <uuid>` (direct API callers).
+    Bearer,
+    /// `ryuki_session` cookie. Browsers attach it automatically, so it never
+    /// authorizes unsafe methods (CSRF defense).
+    Cookie,
+}
+
+/// Resolves the caller's session id, in order: X-Ryuki-Session-Id header,
+/// `Authorization: Bearer <uuid>`, then the `ryuki_session` cookie. Returns
+/// the parse result together with the source that carried the id.
 fn session_id_from_headers(
     headers: &HeaderMap,
     auth_header: Option<&str>,
-) -> Option<Result<Uuid, ()>> {
+) -> Option<(Result<Uuid, ()>, SessionIdSource)> {
     if let Some(raw_session_id) = headers
         .get("X-Ryuki-Session-Id")
         .and_then(|value| value.to_str().ok())
     {
-        return Some(Uuid::parse_str(raw_session_id.trim()).map_err(|_| ()));
+        return Some((
+            Uuid::parse_str(raw_session_id.trim()).map_err(|_| ()),
+            SessionIdSource::Header,
+        ));
     }
 
-    let auth_value = bearer_value(auth_header)?;
-    if auth_value.is_empty() {
-        return None;
+    if let Some(auth_value) = bearer_value(auth_header) {
+        // A non-UUID bearer value is not a session id (e.g. a JWT); fall
+        // through to the cookie source instead of failing.
+        if !auth_value.is_empty() {
+            if let Ok(session_id) = Uuid::parse_str(auth_value) {
+                return Some((Ok(session_id), SessionIdSource::Bearer));
+            }
+        }
     }
-    Uuid::parse_str(auth_value).ok().map(Ok)
+
+    if let Some(cookie_value) = session_cookie_value(headers) {
+        return Some((
+            Uuid::parse_str(cookie_value).map_err(|_| ()),
+            SessionIdSource::Cookie,
+        ));
+    }
+
+    None
 }
 
 async fn auth_session_from_persisted_session(
     headers: &HeaderMap,
     auth_header: Option<&str>,
-) -> Option<AuthSession> {
-    let session_id = match session_id_from_headers(headers, auth_header)? {
+    auth_mode: &AuthMode,
+) -> Option<(AuthSession, SessionIdSource)> {
+    let (parsed, source) = session_id_from_headers(headers, auth_header)?;
+    let session_id = match parsed {
         Ok(session_id) => session_id,
-        Err(()) => return Some(unverified_session("invalid-session-id")),
+        Err(()) => return Some((unverified_session("invalid-session-id"), source)),
     };
     let pool = crate::database::get_db()?;
-    match sqlx::query_as::<_, DbAuthSessionRow>(
-        "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await
+    // Local mode only honors sessions minted by the local login flow: stale
+    // dry-run sessions must not survive a switch to local auth.
+    let query = if *auth_mode == AuthMode::Local {
+        "SELECT user_id, display_name, roles FROM sessions \
+         WHERE id = $1 AND expires_at > NOW() AND provider = 'local'"
+    } else {
+        "SELECT user_id, display_name, roles FROM sessions WHERE id = $1 AND expires_at > NOW()"
+    };
+    match sqlx::query_as::<_, DbAuthSessionRow>(query)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
     {
-        Ok(Some(row)) => Some(session_from_db_row(row)),
-        Ok(None) => Some(unverified_session("session-not-found")),
+        Ok(Some(row)) => Some((session_from_db_row(row), source)),
+        Ok(None) => Some((unverified_session("session-not-found"), source)),
         Err(error) => {
             tracing::error!(error = %error, "auth session lookup failed");
-            Some(unverified_session("session-lookup-failed"))
+            Some((unverified_session("session-lookup-failed"), source))
         }
     }
 }
@@ -159,11 +213,60 @@ fn is_unsafe_method(method: &Method) -> bool {
 }
 
 fn is_auth_exempt_path(path: &str) -> bool {
-    matches!(path, "/api/auth/login" | "/api/auth/logout")
+    // local logout stays exempt so an expired session can still clear cookies
+    matches!(
+        path,
+        "/api/auth/login" | "/api/auth/logout" | "/api/auth/local/login" | "/api/auth/local/logout"
+    )
 }
 
 fn auth_session_allows_unsafe_method(session: &AuthSession) -> bool {
     session.token_valid || session.provider_mode == "static-dry-run"
+}
+
+/// Decides whether the resolved session may perform this request.
+///
+/// CSRF defense: the `ryuki_session` cookie is attached automatically by
+/// browsers, so a session resolved from the COOKIE source alone never
+/// authorizes unsafe methods (POST/PUT/PATCH/DELETE). The portal always
+/// sends X-Ryuki-Session-Id; direct API callers use `Authorization: Bearer`.
+/// Auth endpoints keep their existing exemption only because they are
+/// already auth-exempt.
+fn session_authorizes_request(
+    method: &Method,
+    path: &str,
+    session: &AuthSession,
+    session_source: Option<SessionIdSource>,
+) -> bool {
+    if !is_unsafe_method(method) || is_auth_exempt_path(path) {
+        return true;
+    }
+    if session_source == Some(SessionIdSource::Cookie) {
+        return false;
+    }
+    auth_session_allows_unsafe_method(session)
+}
+
+/// Returns the first configured local-auth role that is not in the
+/// application role catalog, as (entry index, role). Never touches passwords.
+fn find_unknown_local_auth_role(
+    local_auth: &ryuki_core::config::LocalAuthConfig,
+) -> Option<(usize, String)> {
+    for (entry_index, user) in local_auth.users.users().iter().enumerate() {
+        for role in &user.roles {
+            if !ryuki_engine::auth::ALL_APP_ROLES.contains(&role.as_str()) {
+                return Some((entry_index, role.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn bind_address_is_loopback(bind_address: &str) -> bool {
+    bind_address
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
 }
 
 async fn auth_middleware(
@@ -181,14 +284,13 @@ async fn auth_middleware(
         provider_mode = log.provider_mode,
         "auth middleware"
     );
-    let session = auth_session_from_persisted_session(&headers, auth_header)
-        .await
-        .unwrap_or_else(|| auth_session_for_request(auth_mode, auth_header));
+    let (session, session_source) =
+        match auth_session_from_persisted_session(&headers, auth_header, &auth_mode).await {
+            Some((session, source)) => (session, Some(source)),
+            None => (auth_session_for_request(auth_mode, auth_header), None),
+        };
 
-    if is_unsafe_method(&method)
-        && !is_auth_exempt_path(&path)
-        && !auth_session_allows_unsafe_method(&session)
-    {
+    if !session_authorizes_request(&method, &path, &session, session_source) {
         let body = serde_json::to_string(&ApiError::new(
             "AUTH_REQUIRED",
             "Verified authentication is required for this operation",
@@ -610,6 +712,25 @@ async fn main() {
         }
     }
 
+    if app_config.auth_mode == AuthMode::Local {
+        if let Some((entry_index, role)) = find_unknown_local_auth_role(&app_config.local_auth) {
+            tracing::error!(
+                entry_index,
+                role = %role,
+                "local_auth.users entry references a role outside the application role catalog"
+            );
+            std::process::exit(1);
+        }
+    }
+    if !app_config.session.cookie_secure
+        && !bind_address_is_loopback(&app_config.server.bind_address)
+    {
+        tracing::warn!(
+            bind_address = %app_config.server.bind_address,
+            "session.cookie_secure is false on a non-loopback bind address; session cookies may be exposed over plain HTTP"
+        );
+    }
+
     database::try_connect_with_url(
         &app_config.database_url,
         app_config.server.pool_max_connections,
@@ -622,6 +743,9 @@ async fn main() {
     database::migrate_if_connected().await;
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
+    // Per-username failed-login throttle for POST /api/auth/local/login,
+    // shared with the handler through an Extension (no global mutable state).
+    let local_login_throttle = Arc::new(contracts::LocalLoginThrottle::default());
 
     let cors_origins: Vec<_> = app_config
         .cors
@@ -659,6 +783,7 @@ async fn main() {
         .merge(contracts::routes())
         .merge(boundary::routes())
         .fallback(not_found)
+        .layer(Extension(local_login_throttle))
         .layer(ConcurrencyLimitLayer::new(
             app_config.server.max_concurrent_connections,
         ))
@@ -1077,10 +1202,10 @@ mod tests {
             HeaderValue::from_str(&session_id.to_string()).unwrap(),
         );
 
-        let parsed = session_id_from_headers(&headers, None)
-            .expect("session header should be recognized")
-            .expect("session header should parse");
-        assert_eq!(parsed, session_id);
+        let (parsed, source) =
+            session_id_from_headers(&headers, None).expect("session header should be recognized");
+        assert_eq!(parsed.expect("session header should parse"), session_id);
+        assert_eq!(source, SessionIdSource::Header);
     }
 
     #[test]
@@ -1088,16 +1213,93 @@ mod tests {
         let session_id = Uuid::new_v4();
         let headers = HeaderMap::new();
 
-        let parsed = session_id_from_headers(&headers, Some(&format!("Bearer {}", session_id)))
-            .expect("bearer uuid should be recognized")
-            .expect("bearer uuid should parse");
-        assert_eq!(parsed, session_id);
+        let (parsed, source) =
+            session_id_from_headers(&headers, Some(&format!("Bearer {}", session_id)))
+                .expect("bearer uuid should be recognized");
+        assert_eq!(parsed.expect("bearer uuid should parse"), session_id);
+        assert_eq!(source, SessionIdSource::Bearer);
     }
 
     #[test]
     fn test_non_uuid_bearer_is_not_session_id() {
         let headers = HeaderMap::new();
         assert!(session_id_from_headers(&headers, Some("Bearer jwt-token")).is_none());
+    }
+
+    #[test]
+    fn test_session_id_from_ryuki_session_cookie() {
+        let session_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "other=1; ryuki_session={}; theme=dark",
+                session_id
+            ))
+            .unwrap(),
+        );
+
+        let (parsed, source) =
+            session_id_from_headers(&headers, None).expect("session cookie should be recognized");
+        assert_eq!(parsed.expect("session cookie should parse"), session_id);
+        assert_eq!(source, SessionIdSource::Cookie);
+    }
+
+    #[test]
+    fn test_malformed_session_cookie_is_invalid_not_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("ryuki_session=not-a-uuid"),
+        );
+
+        assert_eq!(
+            session_id_from_headers(&headers, None),
+            Some((Err(()), SessionIdSource::Cookie))
+        );
+    }
+
+    #[test]
+    fn test_session_header_takes_precedence_over_cookie() {
+        let header_id = Uuid::new_v4();
+        let cookie_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Ryuki-Session-Id",
+            HeaderValue::from_str(&header_id.to_string()).unwrap(),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("ryuki_session={}", cookie_id)).unwrap(),
+        );
+
+        let (parsed, source) = session_id_from_headers(&headers, None).unwrap();
+        assert_eq!(parsed.unwrap(), header_id);
+        assert_eq!(source, SessionIdSource::Header);
+    }
+
+    #[test]
+    fn test_non_uuid_bearer_falls_through_to_cookie() {
+        let cookie_id = Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(&format!("ryuki_session={}", cookie_id)).unwrap(),
+        );
+
+        let (parsed, source) = session_id_from_headers(&headers, Some("Bearer jwt-token")).unwrap();
+        assert_eq!(parsed.unwrap(), cookie_id);
+        assert_eq!(source, SessionIdSource::Cookie);
+    }
+
+    #[test]
+    fn test_no_session_sources_yields_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("theme=dark; other=1"),
+        );
+        assert!(session_id_from_headers(&headers, None).is_none());
     }
 
     #[test]
@@ -1128,7 +1330,50 @@ mod tests {
     fn test_auth_exempt_paths_are_limited_to_auth_flow() {
         assert!(is_auth_exempt_path("/api/auth/login"));
         assert!(is_auth_exempt_path("/api/auth/logout"));
+        assert!(is_auth_exempt_path("/api/auth/local/login"));
+        assert!(is_auth_exempt_path("/api/auth/local/logout"));
+        assert!(!is_auth_exempt_path("/api/auth/local/me"));
         assert!(!is_auth_exempt_path("/api/requests"));
+    }
+
+    #[test]
+    fn test_local_auth_mode_yields_unauthenticated_session_without_login() {
+        let session = auth_session_for_request(AuthMode::Local, None);
+        assert_eq!(session.provider_mode, "local-unauthenticated");
+        assert!(session.roles.is_empty());
+        assert!(!session.token_valid);
+        assert!(!auth_session_allows_unsafe_method(&session));
+    }
+
+    fn local_auth_with_roles(roles: &str) -> ryuki_core::config::LocalAuthConfig {
+        // placeholder credentials for tests only
+        serde_json::from_value(serde_json::json!({
+            "users": format!("alice:placeholder-pass-1:{roles}")
+        }))
+        .expect("test local auth config should parse")
+    }
+
+    #[test]
+    fn test_find_unknown_local_auth_role_accepts_catalog_roles() {
+        let local_auth = local_auth_with_roles("PlatformAdmin|VMwareOperator");
+        assert_eq!(find_unknown_local_auth_role(&local_auth), None);
+    }
+
+    #[test]
+    fn test_find_unknown_local_auth_role_names_role_and_entry_index() {
+        let local_auth = local_auth_with_roles("PlatformAdmin|NotARole");
+        assert_eq!(
+            find_unknown_local_auth_role(&local_auth),
+            Some((0, "NotARole".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_bind_address_is_loopback() {
+        assert!(bind_address_is_loopback("127.0.0.1:8081"));
+        assert!(bind_address_is_loopback("[::1]:8081"));
+        assert!(!bind_address_is_loopback("0.0.0.0:8080"));
+        assert!(!bind_address_is_loopback("not-an-address"));
     }
 
     #[test]
@@ -1141,6 +1386,83 @@ mod tests {
         assert!(auth_session_allows_unsafe_method(&static_session));
         assert!(auth_session_allows_unsafe_method(&verified));
         assert!(!auth_session_allows_unsafe_method(&unverified));
+    }
+
+    fn verified_persisted_session() -> AuthSession {
+        session_from_db_row(DbAuthSessionRow {
+            user_id: "admin".into(),
+            display_name: "admin".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.into()],
+        })
+    }
+
+    #[test]
+    fn test_cookie_sourced_session_never_authorizes_unsafe_methods() {
+        let session = verified_persisted_session();
+
+        // unsafe method with a cookie-only session → denied (middleware 401)
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!session_authorizes_request(
+                &method,
+                "/api/requests",
+                &session,
+                Some(SessionIdSource::Cookie),
+            ));
+        }
+
+        // the same session via the portal header or a bearer uuid → allowed (200)
+        assert!(session_authorizes_request(
+            &Method::POST,
+            "/api/requests",
+            &session,
+            Some(SessionIdSource::Header),
+        ));
+        assert!(session_authorizes_request(
+            &Method::POST,
+            "/api/requests",
+            &session,
+            Some(SessionIdSource::Bearer),
+        ));
+    }
+
+    #[test]
+    fn test_cookie_sourced_session_still_allows_safe_methods_and_exempt_paths() {
+        let session = verified_persisted_session();
+
+        // safe methods remain readable with a cookie session
+        assert!(session_authorizes_request(
+            &Method::GET,
+            "/api/requests",
+            &session,
+            Some(SessionIdSource::Cookie),
+        ));
+        // auth endpoints keep their existing auth exemption (cookie logout)
+        assert!(session_authorizes_request(
+            &Method::POST,
+            "/api/auth/local/logout",
+            &session,
+            Some(SessionIdSource::Cookie),
+        ));
+    }
+
+    #[test]
+    fn test_sessionless_unsafe_requests_keep_existing_auth_gate() {
+        // no session id at all: the existing token_valid/static-dry-run gate
+        // decides, unchanged.
+        let unverified = unverified_session("local-unauthenticated");
+        assert!(!session_authorizes_request(
+            &Method::POST,
+            "/api/requests",
+            &unverified,
+            None,
+        ));
+        let static_session = AuthSession::static_dry_run();
+        assert!(session_authorizes_request(
+            &Method::POST,
+            "/api/requests",
+            &static_session,
+            None,
+        ));
     }
 
     #[test]

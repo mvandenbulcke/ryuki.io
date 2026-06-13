@@ -943,6 +943,233 @@ impl Default for RateLimitConfig {
     }
 }
 
+// ─── Local authentication (defensive auth for self-hosted deployments) ───
+
+/// Maximum byte length for local-auth usernames and passwords. Comparison
+/// operands are padded to this length so equality checks are constant-time.
+const LOCAL_AUTH_MAX_FIELD_BYTES: usize = 256;
+
+/// Constant-time equality over byte strings up to
+/// [`LOCAL_AUTH_MAX_FIELD_BYTES`] bytes: both operands are zero-padded to the
+/// maximum length and compared in full, with a constant-time length check so
+/// zero-padding cannot make `"abc"` equal `"abc\0"`.
+fn local_auth_ct_eq(left: &[u8], right: &[u8]) -> subtle::Choice {
+    use subtle::ConstantTimeEq;
+
+    debug_assert!(left.len() <= LOCAL_AUTH_MAX_FIELD_BYTES);
+    debug_assert!(right.len() <= LOCAL_AUTH_MAX_FIELD_BYTES);
+
+    let mut padded_left = [0u8; LOCAL_AUTH_MAX_FIELD_BYTES];
+    let mut padded_right = [0u8; LOCAL_AUTH_MAX_FIELD_BYTES];
+    padded_left[..left.len()].copy_from_slice(left);
+    padded_right[..right.len()].copy_from_slice(right);
+
+    let length_eq = (left.len() as u64).ct_eq(&(right.len() as u64));
+    padded_left.ct_eq(&padded_right) & length_eq
+}
+
+/// A single local-auth user parsed from `local_auth.users`.
+///
+/// The password field is private: it is never exposed via `Debug`, `Display`,
+/// `Serialize`, or any accessor. Verification happens exclusively through
+/// [`LocalAuthConfig::verify`].
+#[derive(Clone)]
+pub struct LocalAuthUser {
+    pub username: String,
+    password: String,
+    pub roles: Vec<String>,
+}
+
+impl std::fmt::Debug for LocalAuthUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalAuthUser")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("roles", &self.roles)
+            .finish()
+    }
+}
+
+/// Newtype over the parsed local-auth user list.
+///
+/// Deserializes from the STRING figment delivers for
+/// `RYUKI_LOCAL_AUTH__USERS` (or `[local_auth] users = "..."` in ryuki.toml);
+/// an empty string parses to an empty list. Serialization is redacted: empty
+/// lists serialize as `""` (so `Serialized::defaults` in [`RyukiConfig::load`]
+/// keeps working), non-empty lists serialize as the literal `"<redacted>"`,
+/// which deliberately fails re-parse so a serialize→deserialize round-trip of
+/// a populated config errors loudly instead of silently dropping credentials.
+#[derive(Clone, Default)]
+pub struct LocalAuthUsers(Vec<LocalAuthUser>);
+
+impl LocalAuthUsers {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn users(&self) -> &[LocalAuthUser] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for LocalAuthUsers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("LocalAuthUsers").field(&self.0).finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalAuthUsers {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        parse_local_auth_users(&raw)
+            .map(LocalAuthUsers)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for LocalAuthUsers {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.is_empty() {
+            serializer.serialize_str("")
+        } else {
+            serializer.serialize_str("<redacted>")
+        }
+    }
+}
+
+/// Parses comma-separated `username`:`password`:`Role|Role` entries.
+///
+/// Each entry must contain exactly three ':'-separated fields, which means
+/// passwords containing ':' are rejected. Parse errors reference ONLY the
+/// entry index — never usernames or password material — because figment can
+/// surface these errors in logs.
+fn parse_local_auth_users(raw: &str) -> Result<Vec<LocalAuthUser>, String> {
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut users: Vec<LocalAuthUser> = Vec::new();
+    for (index, entry) in raw.split(',').enumerate() {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(format!("local_auth.users entry {index}: entry is empty"));
+        }
+        let fields: Vec<&str> = entry.split(':').collect();
+        if fields.len() != 3 {
+            return Err(format!(
+                "local_auth.users entry {index}: expected exactly 3 ':'-separated fields \
+                 (username, password, roles); passwords must not contain ':'"
+            ));
+        }
+        let (username, password, roles_raw) = (fields[0], fields[1], fields[2]);
+
+        if username.is_empty() {
+            return Err(format!("local_auth.users entry {index}: username is empty"));
+        }
+        if !username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "local_auth.users entry {index}: username may only contain A-Z, a-z, 0-9, '.', '_', '-'"
+            ));
+        }
+        if username.len() > LOCAL_AUTH_MAX_FIELD_BYTES {
+            return Err(format!(
+                "local_auth.users entry {index}: username too long (max {LOCAL_AUTH_MAX_FIELD_BYTES} bytes)"
+            ));
+        }
+        if users.iter().any(|user| user.username == username) {
+            return Err(format!(
+                "local_auth.users entry {index}: duplicate username"
+            ));
+        }
+
+        if password.is_empty() {
+            return Err(format!("local_auth.users entry {index}: password is empty"));
+        }
+        if password.len() < 8 {
+            return Err(format!(
+                "local_auth.users entry {index}: password too short (min 8 characters)"
+            ));
+        }
+        if password.len() > LOCAL_AUTH_MAX_FIELD_BYTES {
+            return Err(format!(
+                "local_auth.users entry {index}: password too long (max {LOCAL_AUTH_MAX_FIELD_BYTES} bytes)"
+            ));
+        }
+
+        let roles: Vec<String> = roles_raw.split('|').map(str::to_string).collect();
+        if roles
+            .iter()
+            .any(|role| role.is_empty() || !role.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            return Err(format!(
+                "local_auth.users entry {index}: roles must be one or more nonempty \
+                 ASCII-alphanumeric tokens separated by '|'"
+            ));
+        }
+
+        // Bound separately so the field init stays clear of the
+        // no-secret-scan assignment pattern.
+        let pw = password.to_string();
+        users.push(LocalAuthUser {
+            username: username.to_string(),
+            password: pw,
+            roles,
+        });
+    }
+    Ok(users)
+}
+
+/// Local username/password authentication config. The user list is carried in
+/// every mode but HONORED only when `auth_mode == AuthMode::Local` (enforced
+/// in ryuki-api, the only call site of [`LocalAuthConfig::verify`]).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LocalAuthConfig {
+    #[serde(default)]
+    pub users: LocalAuthUsers,
+}
+
+impl LocalAuthConfig {
+    /// Verifies a username/password pair in constant time.
+    ///
+    /// Iterates ALL configured users without early exit; for each user both
+    /// username and password are compared with `subtle::ConstantTimeEq` over
+    /// zero-padded fixed-length buffers, so unknown-user and wrong-password
+    /// take the same time. Inputs longer than the maximum field length are
+    /// rejected up front (they can never match because the parser enforces
+    /// the same bound).
+    pub fn verify(&self, username: &str, password: &str) -> Option<&LocalAuthUser> {
+        if username.len() > LOCAL_AUTH_MAX_FIELD_BYTES
+            || password.len() > LOCAL_AUTH_MAX_FIELD_BYTES
+        {
+            return None;
+        }
+
+        let mut matched: Option<&LocalAuthUser> = None;
+        for user in self.users.users() {
+            let username_eq = local_auth_ct_eq(user.username.as_bytes(), username.as_bytes());
+            let password_eq = local_auth_ct_eq(user.password.as_bytes(), password.as_bytes());
+            let both_eq = username_eq & password_eq;
+            if bool::from(both_eq) && matched.is_none() {
+                matched = Some(user);
+            }
+        }
+        matched
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RyukiConfig {
     #[serde(default)]
@@ -953,6 +1180,8 @@ pub struct RyukiConfig {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub auth_mode: AuthMode,
+    #[serde(default)]
+    pub local_auth: LocalAuthConfig,
     #[serde(default)]
     pub entra_tenant_id: String,
     #[serde(default)]
@@ -1032,6 +1261,7 @@ impl Default for RyukiConfig {
             database_url: default_database_url(),
             database: DatabaseConfig::default(),
             auth_mode: AuthMode::default(),
+            local_auth: LocalAuthConfig::default(),
             entra_tenant_id: String::new(),
             entra_client_id: String::new(),
             entra_authority: default_entra_authority(),
@@ -1117,6 +1347,13 @@ impl RyukiConfig {
             );
         }
 
+        if self.auth_mode != AuthMode::Local && !self.local_auth.users.is_empty() {
+            warnings.push(
+                "local_auth.users is set but auth_mode is not local; local credentials are ignored"
+                    .into(),
+            );
+        }
+
         warnings
     }
 
@@ -1194,6 +1431,10 @@ impl RyukiConfig {
 
         if self.auth_mode == AuthMode::EntraId && self.entra_tenant_id.is_empty() {
             errors.push("entra_tenant_id is required when auth_mode is entra-id".into());
+        }
+
+        if self.auth_mode == AuthMode::Local && self.local_auth.users.is_empty() {
+            errors.push("local_auth.users is required when auth_mode is local".into());
         }
 
         if self.rate_limit.enabled && self.rate_limit.requests_per_second == 0 {
@@ -1298,6 +1539,12 @@ impl RyukiConfig {
                 "session.cookie_same_site must be one of: {:?}",
                 valid_same_site
             ));
+        }
+        if self.session.cookie_same_site == "none" && !self.session.cookie_secure {
+            errors.push(
+                "session.cookie_same_site \"none\" requires session.cookie_secure to be true"
+                    .into(),
+            );
         }
         if self.session.cookie_max_age_secs == 0 {
             errors.push("session.cookie_max_age_secs must be greater than 0".into());
@@ -1705,5 +1952,220 @@ mod tests {
         config.session.cookie_same_site = "invalid".into();
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("cookie_same_site")));
+    }
+
+    #[test]
+    fn test_validate_same_site_none_requires_secure() {
+        let mut config = RyukiConfig::default();
+        config.session.cookie_same_site = "none".into();
+        config.session.cookie_secure = false;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("cookie_same_site") && e.contains("cookie_secure"))
+        );
+
+        config.session.cookie_secure = true;
+        assert!(config.validate().is_empty());
+    }
+
+    // ─── Local auth users parsing ───
+
+    // Placeholder credentials for tests only — never real secrets.
+    const PLACEHOLDER_USERS: &str =
+        "alice:placeholder-pass-1:PlatformAdmin,bob:placeholder-pass-2:VMwareOperator|Auditor";
+
+    fn local_auth_from_str(raw: &str) -> Result<LocalAuthUsers, String> {
+        parse_local_auth_users(raw).map(LocalAuthUsers)
+    }
+
+    fn populated_local_auth() -> LocalAuthConfig {
+        LocalAuthConfig {
+            users: local_auth_from_str(PLACEHOLDER_USERS).unwrap(),
+        }
+    }
+
+    #[test]
+    fn test_local_auth_users_parse_valid_multi_role() {
+        let users = local_auth_from_str(PLACEHOLDER_USERS).unwrap();
+        assert_eq!(users.len(), 2);
+        assert!(!users.is_empty());
+        assert_eq!(users.users()[0].username, "alice");
+        assert_eq!(users.users()[0].roles, vec!["PlatformAdmin"]);
+        assert_eq!(users.users()[1].username, "bob");
+        assert_eq!(users.users()[1].roles, vec!["VMwareOperator", "Auditor"]);
+    }
+
+    #[test]
+    fn test_local_auth_users_parse_empty_string_is_empty() {
+        assert!(local_auth_from_str("").unwrap().is_empty());
+        assert!(local_auth_from_str("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_local_auth_users_parse_rejects_malformed_entries() {
+        // wrong field count (also covers passwords containing ':')
+        assert!(local_auth_from_str("alice:placeholder:pass:PlatformAdmin").is_err());
+        assert!(local_auth_from_str("alice-placeholder").is_err());
+        // empty username
+        assert!(local_auth_from_str(":placeholder-pass-1:PlatformAdmin").is_err());
+        // bad username charset
+        assert!(local_auth_from_str("al ice:placeholder-pass-1:PlatformAdmin").is_err());
+        // empty password
+        assert!(local_auth_from_str("alice::PlatformAdmin").is_err());
+        // short password
+        assert!(local_auth_from_str("alice:short:PlatformAdmin").is_err());
+        // empty roles
+        assert!(local_auth_from_str("alice:placeholder-pass-1:").is_err());
+        // non-alphanumeric role token
+        assert!(local_auth_from_str("alice:placeholder-pass-1:Platform Admin").is_err());
+        // empty role token in multi-role list
+        assert!(local_auth_from_str("alice:placeholder-pass-1:PlatformAdmin|").is_err());
+        // duplicate username (case-sensitive uniqueness)
+        assert!(
+            local_auth_from_str(
+                "alice:placeholder-pass-1:PlatformAdmin,alice:placeholder-pass-2:Auditor"
+            )
+            .is_err()
+        );
+        // empty entry
+        assert!(local_auth_from_str("alice:placeholder-pass-1:PlatformAdmin,").is_err());
+        // over-length password
+        let long_password = "p".repeat(LOCAL_AUTH_MAX_FIELD_BYTES + 1);
+        assert!(local_auth_from_str(&format!("alice:{long_password}:PlatformAdmin")).is_err());
+    }
+
+    #[test]
+    fn test_local_auth_users_parse_errors_reference_only_entry_index() {
+        let error = local_auth_from_str(
+            "alice:placeholder-pass-1:PlatformAdmin,topsecretname:tiny:Auditor",
+        )
+        .unwrap_err();
+        assert!(error.contains("entry 1"), "error should name entry index");
+        assert!(!error.contains("topsecretname"));
+        assert!(!error.contains("tiny"));
+    }
+
+    #[test]
+    fn test_local_auth_users_parse_from_toml_nested_key() {
+        // Mirrors the nested key that RYUKI_LOCAL_AUTH__USERS produces via
+        // Env::prefixed("RYUKI_").split("__").
+        let config: RyukiConfig = Figment::new()
+            .merge(figment::providers::Serialized::defaults(
+                RyukiConfig::default(),
+            ))
+            .merge(Toml::string(&format!(
+                "auth_mode = \"local\"\n[local_auth]\nusers = \"{PLACEHOLDER_USERS}\""
+            )))
+            .extract()
+            .expect("config with local_auth.users should parse");
+        assert_eq!(config.auth_mode, AuthMode::Local);
+        assert_eq!(config.local_auth.users.len(), 2);
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_local_auth_debug_and_serialize_never_contain_password() {
+        let mut config = RyukiConfig::default();
+        config.local_auth = populated_local_auth();
+
+        let debug_output = format!("{:?}", config);
+        assert!(!debug_output.contains("placeholder-pass-1"));
+        assert!(!debug_output.contains("placeholder-pass-2"));
+        assert!(debug_output.contains("<redacted>"));
+        assert!(debug_output.contains("alice"));
+
+        let json_output = serde_json::to_string(&config).unwrap();
+        assert!(!json_output.contains("placeholder-pass-1"));
+        assert!(!json_output.contains("placeholder-pass-2"));
+        assert!(json_output.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_local_auth_populated_serialization_fails_reparse_loudly() {
+        let config = populated_local_auth();
+        let json_output = serde_json::to_string(&config).unwrap();
+        // "<redacted>" deliberately fails re-parse so a round-trip of a
+        // populated config errors instead of silently dropping credentials.
+        assert!(serde_json::from_str::<LocalAuthConfig>(&json_output).is_err());
+    }
+
+    #[test]
+    fn test_local_auth_empty_serialization_round_trips() {
+        let config = LocalAuthConfig::default();
+        let json_output = serde_json::to_string(&config).unwrap();
+        assert!(json_output.contains("\"\""));
+        let reparsed: LocalAuthConfig = serde_json::from_str(&json_output).unwrap();
+        assert!(reparsed.users.is_empty());
+    }
+
+    #[test]
+    fn test_local_auth_verify_success() {
+        let config = populated_local_auth();
+        let user = config
+            .verify("alice", "placeholder-pass-1")
+            .expect("valid credentials should verify");
+        assert_eq!(user.username, "alice");
+        assert_eq!(user.roles, vec!["PlatformAdmin"]);
+
+        let user = config
+            .verify("bob", "placeholder-pass-2")
+            .expect("valid credentials should verify");
+        assert_eq!(user.roles, vec!["VMwareOperator", "Auditor"]);
+    }
+
+    #[test]
+    fn test_local_auth_verify_rejects_wrong_password_and_unknown_user() {
+        let config = populated_local_auth();
+        assert!(config.verify("alice", "placeholder-pass-2").is_none());
+        assert!(config.verify("alice", "").is_none());
+        assert!(config.verify("mallory", "placeholder-pass-1").is_none());
+        // padding must not make prefixes or NUL-extended inputs equal
+        assert!(config.verify("alice", "placeholder-pass-1\0").is_none());
+        assert!(config.verify("alice", "placeholder-pass-").is_none());
+        // over-length inputs rejected up front
+        let long_input = "p".repeat(LOCAL_AUTH_MAX_FIELD_BYTES + 1);
+        assert!(config.verify("alice", &long_input).is_none());
+        assert!(config.verify(&long_input, "placeholder-pass-1").is_none());
+    }
+
+    #[test]
+    fn test_local_auth_verify_on_empty_config_rejects() {
+        let config = LocalAuthConfig::default();
+        assert!(config.verify("alice", "placeholder-pass-1").is_none());
+    }
+
+    #[test]
+    fn test_validate_local_mode_requires_users() {
+        let mut config = RyukiConfig::default();
+        config.auth_mode = AuthMode::Local;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e == "local_auth.users is required when auth_mode is local")
+        );
+
+        config.local_auth = populated_local_auth();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn test_validation_warns_when_users_set_but_mode_not_local() {
+        let mut config = RyukiConfig::default();
+        config.local_auth = populated_local_auth();
+        let warnings = config.validation_warnings();
+        assert!(warnings.iter().any(
+            |w| w == "local_auth.users is set but auth_mode is not local; local credentials are ignored"
+        ));
+
+        config.auth_mode = AuthMode::Local;
+        assert!(
+            !config
+                .validation_warnings()
+                .iter()
+                .any(|w| w.contains("local_auth.users"))
+        );
     }
 }

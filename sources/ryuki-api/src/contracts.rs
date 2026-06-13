@@ -1,6 +1,7 @@
 use axum::{
     extract::{Path, Query},
-    http::StatusCode,
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::delete,
     routing::put,
     routing::{get, post},
@@ -1110,8 +1111,8 @@ pub fn routes() -> Router {
         .route("/api/auth/local/roles", get(auth_local_roles))
         .route("/api/auth/local/me", get(auth_local_me))
         .route("/api/auth/local/decision", get(auth_local_decision))
-        .route("/api/auth/local/login", get(auth_local_login))
-        .route("/api/auth/local/logout", get(auth_local_logout))
+        .route("/api/auth/local/login", post(auth_local_login))
+        .route("/api/auth/local/logout", post(auth_local_logout))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/roles", get(auth_roles))
@@ -6021,11 +6022,32 @@ async fn auth_local_roles() -> Json<Value> {
     )
 }
 
-async fn auth_local_me() -> Json<Value> {
-    let role = json!({"id":"platform-admin","title":"Platform Admin","visibility":"all","canRequest":true,"canApprove":true,"canExecute":true,"canAdmin":true,"canAudit":true,"executionDomains":["platform","governance","emergency"]});
-    Json(
-        json!({"authenticationMode":"local-mock","configuredForProduction":false,"entraGroupsConfigured":false,"requiredProductionProvider":"Microsoft Entra ID","user":"local-operator","requestedRole":null,"roleFallbackApplied":false,"role":role,"externalAccessBlocked":true}),
-    )
+/// Pure decision for GET /api/auth/local/me: in Local mode an unverified
+/// session is rejected; otherwise the engine `AuthSession` serialization is
+/// returned. Persisted sessions resolve with provider_mode
+/// "persisted-session" — clients must gate on `token_valid`, not the
+/// provider_mode string.
+fn local_me_response(
+    auth_mode: &AuthMode,
+    session: AuthSession,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    if *auth_mode == AuthMode::Local && !session.token_valid {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError::new(
+                "AUTH_REQUIRED",
+                "Verified authentication is required for this operation",
+            )),
+        ));
+    }
+    Ok(Json(serde_json::to_value(session).unwrap_or_default()))
+}
+
+async fn auth_local_me(
+    Extension(session): Extension<AuthSession>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let app_cfg = crate::config_store::get_app_config();
+    local_me_response(&app_cfg.auth_mode, session)
 }
 
 async fn auth_local_decision() -> Json<Value> {
@@ -6034,13 +6056,290 @@ async fn auth_local_decision() -> Json<Value> {
     )
 }
 
-async fn auth_local_login() -> Json<Value> {
-    let session = ryuki_engine::auth::AuthSession::static_dry_run();
-    Json(serde_json::to_value(session).unwrap_or_default())
+/// Login request body. Deliberately no Debug/Display so the password can
+/// never leak through logging.
+#[derive(Deserialize)]
+struct LocalLoginRequest {
+    username: String,
+    password: String,
 }
 
-async fn auth_local_logout() -> Json<Value> {
-    Json(json!({"status": "logged_out"}))
+fn cookie_same_site_attribute(cookie_same_site: &str) -> &'static str {
+    match cookie_same_site {
+        "strict" => "Strict",
+        "none" => "None",
+        _ => "Lax",
+    }
+}
+
+/// Builds the `Set-Cookie` value for the API-origin session cookie. The
+/// cookie is ALWAYS HttpOnly regardless of `session.cookie_http_only`.
+fn session_cookie_set_header(
+    session_id: &str,
+    session: &ryuki_core::config::SessionConfig,
+) -> String {
+    let mut header = format!(
+        "ryuki_session={}; Path=/; HttpOnly; Max-Age={}; SameSite={}",
+        session_id,
+        session.cookie_max_age_secs,
+        cookie_same_site_attribute(&session.cookie_same_site)
+    );
+    if session.cookie_secure {
+        header.push_str("; Secure");
+    }
+    header
+}
+
+/// Builds the `Set-Cookie` value that clears the session cookie on logout.
+fn session_cookie_clear_header(session: &ryuki_core::config::SessionConfig) -> String {
+    let mut header = format!(
+        "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite={}",
+        cookie_same_site_attribute(&session.cookie_same_site)
+    );
+    if session.cookie_secure {
+        header.push_str("; Secure");
+    }
+    header
+}
+
+/// Mode gate for POST /api/auth/local/login: only AuthMode::Local may use
+/// local credential login.
+fn local_login_gate(auth_mode: &AuthMode) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if *auth_mode == AuthMode::Local {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new(
+                "LOCAL_AUTH_DISABLED",
+                "Local authentication is not enabled",
+            )),
+        ))
+    }
+}
+
+/// The single generic local-login failure: identical status, code, and body
+/// for unknown-user, wrong-password, and throttled usernames.
+fn invalid_credentials_problem() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(ApiError::new(
+            "INVALID_CREDENTIALS",
+            "Invalid username or password",
+        )),
+    )
+}
+
+/// Verifies local credentials. Failure is a single generic 401 with an
+/// identical body, status, and code path for unknown-user vs wrong-password
+/// (no enumeration); failure logs never include the username.
+fn verify_local_credentials<'a>(
+    local_auth: &'a ryuki_core::config::LocalAuthConfig,
+    username: &str,
+    password: &str,
+) -> Result<&'a ryuki_core::config::LocalAuthUser, (StatusCode, Json<ApiError>)> {
+    local_auth.verify(username, password).ok_or_else(|| {
+        tracing::warn!("local login failed");
+        invalid_credentials_problem()
+    })
+}
+
+// ─── Local login brute-force throttle ───
+
+/// Consecutive failures per username after which local login attempts are
+/// rejected without credential verification.
+const LOCAL_LOGIN_LOCKOUT_THRESHOLD: u32 = 5;
+
+/// Uniform delay applied to EVERY failed local login attempt — wrong
+/// credentials and throttled usernames alike — so failure timing carries no
+/// signal about lockout state.
+const LOCAL_LOGIN_FAILURE_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Failure entries older than this are pruned: a lockout naturally expires
+/// after 15 minutes without further failed attempts, and the tracker never
+/// retains stale usernames.
+const LOCAL_LOGIN_TRACKER_RETENTION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Hard cap on tracked usernames so attacker-chosen usernames cannot grow
+/// the tracker unbounded; the stalest entry is evicted at the cap.
+const LOCAL_LOGIN_TRACKER_MAX_ENTRIES: usize = 1024;
+
+struct LocalLoginFailureEntry {
+    consecutive_failures: u32,
+    last_failure: std::time::Instant,
+}
+
+/// In-process per-username failed-attempt tracker for
+/// POST /api/auth/local/login. Held in the router as an `Extension` (created
+/// in `main`, no global mutable state). Source-address (ConnectInfo) keyed
+/// rate limiting is a separate, later wave.
+#[derive(Default)]
+pub struct LocalLoginThrottle {
+    entries: std::sync::Mutex<std::collections::HashMap<String, LocalLoginFailureEntry>>,
+}
+
+impl LocalLoginThrottle {
+    fn prune(
+        entries: &mut std::collections::HashMap<String, LocalLoginFailureEntry>,
+        now: std::time::Instant,
+    ) {
+        entries.retain(|_, entry| {
+            now.duration_since(entry.last_failure) < LOCAL_LOGIN_TRACKER_RETENTION
+        });
+    }
+
+    fn is_locked_out_at(&self, username: &str, now: std::time::Instant) -> bool {
+        let mut entries = self.entries.lock().unwrap();
+        Self::prune(&mut entries, now);
+        entries
+            .get(username)
+            .is_some_and(|entry| entry.consecutive_failures >= LOCAL_LOGIN_LOCKOUT_THRESHOLD)
+    }
+
+    fn record_failure_at(&self, username: &str, now: std::time::Instant) {
+        let mut entries = self.entries.lock().unwrap();
+        Self::prune(&mut entries, now);
+        if !entries.contains_key(username) && entries.len() >= LOCAL_LOGIN_TRACKER_MAX_ENTRIES {
+            // Evict the stalest entry so the tracker stays bounded.
+            if let Some(stalest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_failure)
+                .map(|(username, _)| username.clone())
+            {
+                entries.remove(&stalest);
+            }
+        }
+        let entry = entries
+            .entry(username.to_string())
+            .or_insert(LocalLoginFailureEntry {
+                consecutive_failures: 0,
+                last_failure: now,
+            });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        entry.last_failure = now;
+    }
+
+    fn is_locked_out(&self, username: &str) -> bool {
+        self.is_locked_out_at(username, std::time::Instant::now())
+    }
+
+    fn record_failure(&self, username: &str) {
+        self.record_failure_at(username, std::time::Instant::now());
+    }
+
+    fn record_success(&self, username: &str) {
+        self.entries.lock().unwrap().remove(username);
+    }
+}
+
+/// Canonical login response body (seam shared with the portal — see the
+/// fixture tests; field changes break the portal DTO).
+fn local_login_response_body(
+    session_id: &Uuid,
+    username: &str,
+    roles: &[String],
+    expires_at: &chrono::DateTime<chrono::Utc>,
+) -> Value {
+    json!({
+        "session_id": session_id.to_string(),
+        "user_id": username,
+        "display_name": username,
+        "roles": roles,
+        "token_valid": true,
+        "provider_mode": "local",
+        "expires_at": expires_at.to_rfc3339(),
+    })
+}
+
+async fn auth_local_login(
+    Extension(throttle): Extension<std::sync::Arc<LocalLoginThrottle>>,
+    Json(body): Json<LocalLoginRequest>,
+) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let app_cfg = crate::config_store::get_app_config();
+    local_login_gate(&app_cfg.auth_mode)?;
+
+    // Brute-force throttle: locked-out usernames are rejected WITHOUT
+    // credential verification, with the same generic 401 body and the same
+    // uniform failure delay as a wrong credential, so lockout state cannot
+    // be probed. Throttle logs never include the username.
+    if throttle.is_locked_out(&body.username) {
+        throttle.record_failure(&body.username);
+        tracing::warn!("local login rejected by failed-attempt throttle");
+        tokio::time::sleep(LOCAL_LOGIN_FAILURE_DELAY).await;
+        return Err(invalid_credentials_problem());
+    }
+
+    let user = match verify_local_credentials(&app_cfg.local_auth, &body.username, &body.password) {
+        Ok(user) => {
+            throttle.record_success(&body.username);
+            user
+        }
+        Err(problem) => {
+            throttle.record_failure(&body.username);
+            tokio::time::sleep(LOCAL_LOGIN_FAILURE_DELAY).await;
+            return Err(problem);
+        }
+    };
+
+    // Local sessions are never minted in-memory: a database is required.
+    let Some(pool) = get_db() else {
+        tracing::error!("local login requires a database for session persistence");
+        return Err(auth_session_persistence_problem());
+    };
+
+    // Session fixation defense: the session id is generated server-side at
+    // login, one fresh session per login; client-supplied ids are never
+    // accepted for creation.
+    let session_id = Uuid::new_v4();
+    let expires_at: chrono::DateTime<chrono::Utc> = map_auth_session_persistence_result(
+        sqlx::query_scalar(
+            "INSERT INTO sessions (id, user_id, display_name, roles, provider, expires_at) \
+             VALUES ($1, $2, $3, $4, 'local', NOW() + make_interval(secs => $5)) \
+             RETURNING expires_at",
+        )
+        .bind(session_id)
+        .bind(&user.username)
+        .bind(&user.username)
+        .bind(&user.roles)
+        .bind(app_cfg.session.cookie_max_age_secs as f64)
+        .fetch_one(pool)
+        .await,
+        "create",
+    )?;
+
+    // Success log: username + session creation only, never the password.
+    tracing::info!(username = %user.username, session_id = %session_id, "local login session created");
+
+    let response_body =
+        local_login_response_body(&session_id, &user.username, &user.roles, &expires_at);
+    let cookie = session_cookie_set_header(&session_id.to_string(), &app_cfg.session);
+    Ok(([(SET_COOKIE, cookie)], Json(response_body)).into_response())
+}
+
+async fn auth_local_logout(headers: HeaderMap) -> Result<Response, (StatusCode, Json<ApiError>)> {
+    let auth_header = headers.get("Authorization").and_then(|h| h.to_str().ok());
+    // Same session resolution order as auth_middleware (X-Ryuki-Session-Id,
+    // Bearer UUID, ryuki_session cookie); local logout only ever deletes the
+    // caller's own session and is idempotent for missing/invalid sessions.
+    if let Some((Ok(session_id), _source)) = crate::session_id_from_headers(&headers, auth_header) {
+        if let Some(pool) = get_db() {
+            map_auth_session_persistence_result(
+                sqlx::query("DELETE FROM sessions WHERE id = $1")
+                    .bind(session_id)
+                    .execute(pool)
+                    .await,
+                "delete",
+            )?;
+            tracing::info!(session_id = %session_id, "local logout deleted session");
+        }
+    }
+    let app_cfg = crate::config_store::get_app_config();
+    let cookie = session_cookie_clear_header(&app_cfg.session);
+    Ok((
+        [(SET_COOKIE, cookie)],
+        Json(json!({"status": "logged_out"})),
+    )
+        .into_response())
 }
 
 async fn auth_status() -> Json<Value> {
@@ -6097,46 +6396,63 @@ fn static_login_roles() -> [&'static str; 2] {
     ]
 }
 
+/// Mode gate for POST /api/auth/login: the anonymous mock mint only exists in
+/// the dry-run modes. In Local mode it would bypass local auth entirely, so
+/// it is rejected with a pointer at the local login endpoint.
+fn mock_login_gate(auth_mode: &AuthMode) -> Result<(), (StatusCode, Json<ApiError>)> {
+    match auth_mode {
+        AuthMode::MockDryRun | AuthMode::StaticDryRun => Ok(()),
+        AuthMode::Local => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new(
+                "LOCAL_AUTH_MODE",
+                "Use /api/auth/local/login in local auth mode",
+            )),
+        )),
+        AuthMode::EntraId => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError::new(
+                "ENTRA_NOT_CONFIGURED",
+                "Entra SSO not configured",
+            )),
+        )),
+    }
+}
+
 async fn auth_login() -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let app_cfg = crate::config_store::get_app_config();
-    if app_cfg.auth_mode == AuthMode::MockDryRun || app_cfg.entra_tenant_id.is_empty() {
-        let session_id = Uuid::new_v4();
-        let roles = static_login_roles();
-        let session_data = json!({
-            "session_id": session_id.to_string(),
-            "user_id": "platform-engineer",
-            "display_name": "Platform Engineer",
-            "email": "platform-engineer@ryuki.local",
-            "roles": roles,
-            "token_valid": false,
-            "provider_mode": "static-dry-run"
-        });
+    mock_login_gate(&app_cfg.auth_mode)?;
 
-        if let Some(pool) = get_db() {
-            map_auth_session_persistence_result(
-                sqlx::query(
-                "INSERT INTO sessions (id, user_id, display_name, email, roles) VALUES ($1, $2, $3, $4, $5)"
+    let session_id = Uuid::new_v4();
+    let roles = static_login_roles();
+    let session_data = json!({
+        "session_id": session_id.to_string(),
+        "user_id": "platform-engineer",
+        "display_name": "Platform Engineer",
+        "email": "platform-engineer@ryuki.local",
+        "roles": roles,
+        "token_valid": false,
+        "provider_mode": "static-dry-run"
+    });
+
+    if let Some(pool) = get_db() {
+        map_auth_session_persistence_result(
+            sqlx::query(
+                "INSERT INTO sessions (id, user_id, display_name, email, roles, provider) \
+                 VALUES ($1, $2, $3, $4, $5, 'static-dry-run')",
             )
-                .bind(session_id)
-                .bind("platform-engineer")
-                .bind("Platform Engineer")
-                .bind("platform-engineer@ryuki.local")
-                .bind(&roles as &[&str])
-                .execute(pool)
-                .await,
-                "create",
-            )?;
-        }
-
-        return Ok(Json(session_data));
+            .bind(session_id)
+            .bind("platform-engineer")
+            .bind("Platform Engineer")
+            .bind("platform-engineer@ryuki.local")
+            .bind(&roles as &[&str])
+            .execute(pool)
+            .await,
+            "create",
+        )?;
     }
-    Err((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ApiError::new(
-            "ENTRA_NOT_CONFIGURED",
-            "Entra SSO not configured",
-        )),
-    ))
+
+    Ok(Json(session_data))
 }
 
 async fn auth_logout(
@@ -7070,6 +7386,19 @@ async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
     Ok(Json(serde_json::to_value(&request).unwrap_or_default()))
 }
 
+/// Current lifecycle stage name for an in-memory request record: the first
+/// stage that is not completed, the last stage when all are completed, or
+/// "intake" when no stages exist (mirrors the requests.stage column default).
+fn current_stage_name(request: &ryuki_engine::models::Request) -> String {
+    request
+        .stages
+        .iter()
+        .find(|stage| stage.status != ryuki_engine::models::StageStatus::Completed)
+        .or_else(|| request.stages.last())
+        .map(|stage| stage.name.clone())
+        .unwrap_or_else(|| "intake".to_string())
+}
+
 async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
@@ -7092,6 +7421,8 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
                     "status": r.status,
                     "name": r.name,
                     "site": r.site,
+                    "environment": r.environment,
+                    "stage": r.stage,
                     "created_at": r.created_at.to_rfc3339()
                 })
             })
@@ -7111,6 +7442,8 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
                 "status": r.status.as_str(),
                 "name": r.requester,
                 "site": r.site,
+                "environment": r.environment,
+                "stage": current_stage_name(r),
                 "created_at": r.created_at
             })
         })
@@ -11881,5 +12214,374 @@ mod unit_tests {
             .collect();
         assert!(names.contains(&"portal-ui"));
         assert!(names.contains(&"platform-api"));
+    }
+
+    // ─── Local auth handlers ───
+
+    /// CANONICAL SEAM — copied verbatim from the wave contract; the portal
+    /// tests the same literal (do not retype). `<uuid>` and `<rfc3339>` are
+    /// placeholders for the per-login values.
+    const LOCAL_LOGIN_RESPONSE_FIXTURE: &str = r#"{"session_id":"<uuid>","user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local","expires_at":"<rfc3339>"}"#;
+
+    /// Engine `AuthSession` serialization seam (GET /api/auth/local/me body).
+    const AUTH_SESSION_FIXTURE: &str = r#"{"user_id":"admin","display_name":"admin","roles":["PlatformAdmin"],"token_valid":true,"provider_mode":"local"}"#;
+
+    fn test_local_auth_config(users: &str) -> ryuki_core::config::LocalAuthConfig {
+        // placeholder credentials for tests only — never real secrets
+        serde_json::from_value(json!({ "users": users }))
+            .expect("test local auth config should parse")
+    }
+
+    #[test]
+    fn test_local_login_response_matches_canonical_fixture() {
+        let session_id = Uuid::new_v4();
+        let expires_at = chrono::Utc::now();
+        let mut body = local_login_response_body(
+            &session_id,
+            "admin",
+            &["PlatformAdmin".to_string()],
+            &expires_at,
+        );
+
+        assert_eq!(body["session_id"], json!(session_id.to_string()));
+        assert_eq!(body["expires_at"], json!(expires_at.to_rfc3339()));
+
+        body["session_id"] = json!("<uuid>");
+        body["expires_at"] = json!("<rfc3339>");
+        let fixture: Value = serde_json::from_str(LOCAL_LOGIN_RESPONSE_FIXTURE).unwrap();
+        assert_eq!(body, fixture);
+    }
+
+    #[test]
+    fn test_engine_auth_session_serializes_canonical_seam_shape() {
+        let session = AuthSession {
+            user_id: "admin".into(),
+            display_name: "admin".into(),
+            roles: vec!["PlatformAdmin".into()],
+            token_valid: true,
+            provider_mode: "local".into(),
+        };
+        let fixture: Value = serde_json::from_str(AUTH_SESSION_FIXTURE).unwrap();
+        assert_eq!(serde_json::to_value(&session).unwrap(), fixture);
+    }
+
+    #[test]
+    fn test_local_login_gate_allows_only_local_mode() {
+        assert!(local_login_gate(&AuthMode::Local).is_ok());
+
+        for mode in [
+            AuthMode::MockDryRun,
+            AuthMode::StaticDryRun,
+            AuthMode::EntraId,
+        ] {
+            let Err((status, Json(body))) = local_login_gate(&mode) else {
+                panic!("non-local mode should reject local login");
+            };
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body.error, "LOCAL_AUTH_DISABLED");
+            assert_eq!(body.message, "Local authentication is not enabled");
+        }
+    }
+
+    #[test]
+    fn test_mock_login_gate_rejects_local_and_entra_modes() {
+        assert!(mock_login_gate(&AuthMode::MockDryRun).is_ok());
+        assert!(mock_login_gate(&AuthMode::StaticDryRun).is_ok());
+
+        let Err((status, Json(body))) = mock_login_gate(&AuthMode::Local) else {
+            panic!("local mode should reject the anonymous mock mint");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "LOCAL_AUTH_MODE");
+        assert_eq!(body.message, "Use /api/auth/local/login in local auth mode");
+
+        let Err((status, Json(body))) = mock_login_gate(&AuthMode::EntraId) else {
+            panic!("entra mode should reject the anonymous mock mint");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "ENTRA_NOT_CONFIGURED");
+    }
+
+    #[test]
+    fn test_verify_local_credentials_success_returns_user() {
+        let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin|Auditor");
+        let user = verify_local_credentials(&local_auth, "admin", "placeholder-pass-1")
+            .expect("valid credentials should verify");
+        assert_eq!(user.username, "admin");
+        assert_eq!(user.roles, vec!["PlatformAdmin", "Auditor"]);
+    }
+
+    #[test]
+    fn test_verify_local_credentials_failures_are_indistinguishable() {
+        let local_auth = test_local_auth_config("admin:placeholder-pass-1:PlatformAdmin");
+
+        let Err((wrong_password_status, Json(wrong_password_body))) =
+            verify_local_credentials(&local_auth, "admin", "wrong-password-1")
+        else {
+            panic!("wrong password should fail");
+        };
+        let Err((unknown_user_status, Json(unknown_user_body))) =
+            verify_local_credentials(&local_auth, "mallory", "placeholder-pass-1")
+        else {
+            panic!("unknown user should fail");
+        };
+
+        // identical status, code, and body for unknown-user vs wrong-password
+        assert_eq!(wrong_password_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(unknown_user_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong_password_body.error, "INVALID_CREDENTIALS");
+        assert_eq!(wrong_password_body.message, "Invalid username or password");
+        assert_eq!(
+            serde_json::to_string(&wrong_password_body).unwrap(),
+            serde_json::to_string(&unknown_user_body).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_local_login_rejects_wrong_auth_mode() {
+        // Initialize the config store with defaults (mock-dry-run): the mode
+        // gate must reject local login before any credential check.
+        crate::config_store::init_with_config(
+            "platform-config.json",
+            &ryuki_core::config::RyukiConfig::default(),
+        );
+        let Err((status, Json(body))) = auth_local_login(
+            Extension(std::sync::Arc::new(LocalLoginThrottle::default())),
+            Json(LocalLoginRequest {
+                username: "admin".into(),
+                password: "placeholder-pass-1".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("local login should be rejected outside local mode");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error, "LOCAL_AUTH_DISABLED");
+    }
+
+    // ─── Local login brute-force throttle ───
+
+    #[test]
+    fn test_local_login_throttle_locks_after_threshold_and_resets_on_success() {
+        let throttle = LocalLoginThrottle::default();
+        let now = std::time::Instant::now();
+
+        for _ in 0..LOCAL_LOGIN_LOCKOUT_THRESHOLD - 1 {
+            throttle.record_failure_at("admin", now);
+            assert!(!throttle.is_locked_out_at("admin", now));
+        }
+        throttle.record_failure_at("admin", now);
+        assert!(throttle.is_locked_out_at("admin", now));
+
+        // other usernames are tracked independently
+        assert!(!throttle.is_locked_out_at("operator", now));
+
+        // a successful login resets the counter entirely
+        throttle.record_success("admin");
+        assert!(!throttle.is_locked_out_at("admin", now));
+        throttle.record_failure_at("admin", now);
+        assert!(!throttle.is_locked_out_at("admin", now));
+    }
+
+    #[test]
+    fn test_local_login_throttle_expires_stale_entries() {
+        let throttle = LocalLoginThrottle::default();
+        let now = std::time::Instant::now();
+
+        for _ in 0..LOCAL_LOGIN_LOCKOUT_THRESHOLD {
+            throttle.record_failure_at("admin", now);
+        }
+        assert!(throttle.is_locked_out_at("admin", now));
+
+        // entries older than the retention window are pruned: the lockout
+        // expires and the username is no longer tracked at all
+        let later = now + LOCAL_LOGIN_TRACKER_RETENTION;
+        assert!(!throttle.is_locked_out_at("admin", later));
+        assert!(throttle.entries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_local_login_throttle_caps_tracked_usernames() {
+        let throttle = LocalLoginThrottle::default();
+        let now = std::time::Instant::now();
+
+        for i in 0..LOCAL_LOGIN_TRACKER_MAX_ENTRIES {
+            throttle.record_failure_at(
+                &format!("user-{i}"),
+                now + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        assert_eq!(
+            throttle.entries.lock().unwrap().len(),
+            LOCAL_LOGIN_TRACKER_MAX_ENTRIES
+        );
+
+        // one more attacker-chosen username evicts the stalest entry instead
+        // of growing the tracker
+        throttle.record_failure_at("one-more", now + std::time::Duration::from_secs(60));
+        let entries = throttle.entries.lock().unwrap();
+        assert_eq!(entries.len(), LOCAL_LOGIN_TRACKER_MAX_ENTRIES);
+        assert!(!entries.contains_key("user-0"));
+        assert!(entries.contains_key("one-more"));
+    }
+
+    #[test]
+    fn test_local_me_response_requires_verified_session_in_local_mode() {
+        let unverified = AuthSession {
+            user_id: "unauthenticated".into(),
+            display_name: "Unauthenticated".into(),
+            roles: Vec::new(),
+            token_valid: false,
+            provider_mode: "local-unauthenticated".into(),
+        };
+        let Err((status, Json(body))) = local_me_response(&AuthMode::Local, unverified) else {
+            panic!("unverified session should be rejected in local mode");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error, "AUTH_REQUIRED");
+        assert_eq!(
+            body.message,
+            "Verified authentication is required for this operation"
+        );
+    }
+
+    #[test]
+    fn test_local_me_response_returns_persisted_session() {
+        // persisted sessions resolve with provider_mode "persisted-session";
+        // the gate is token_valid, never the provider_mode string.
+        let session = AuthSession {
+            user_id: "admin".into(),
+            display_name: "admin".into(),
+            roles: vec!["PlatformAdmin".into()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+        };
+        let Ok(Json(body)) = local_me_response(&AuthMode::Local, session) else {
+            panic!("verified session should be returned");
+        };
+        assert_eq!(body["user_id"], "admin");
+        assert_eq!(body["roles"], json!(["PlatformAdmin"]));
+        assert_eq!(body["token_valid"], true);
+        assert_eq!(body["provider_mode"], "persisted-session");
+    }
+
+    #[test]
+    fn test_local_me_response_passes_through_outside_local_mode() {
+        let session = AuthSession::static_dry_run();
+        let Ok(Json(body)) = local_me_response(&AuthMode::MockDryRun, session) else {
+            panic!("non-local mode should pass the session through");
+        };
+        assert_eq!(body["provider_mode"], "static-dry-run");
+        assert_eq!(body["token_valid"], false);
+    }
+
+    #[test]
+    fn test_session_cookie_set_header_flags_from_config() {
+        let mut session = ryuki_core::config::SessionConfig::default();
+        session.cookie_max_age_secs = 3600;
+        session.cookie_secure = true;
+        session.cookie_same_site = "lax".into();
+        assert_eq!(
+            session_cookie_set_header("abc-123", &session),
+            "ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax; Secure"
+        );
+
+        session.cookie_secure = false;
+        session.cookie_same_site = "strict".into();
+        assert_eq!(
+            session_cookie_set_header("abc-123", &session),
+            "ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Strict"
+        );
+
+        // cookie_http_only=false is ignored: the API session cookie is
+        // always HttpOnly.
+        session.cookie_http_only = false;
+        assert!(session_cookie_set_header("abc-123", &session).contains("HttpOnly"));
+    }
+
+    #[test]
+    fn test_session_cookie_clear_header_expires_cookie() {
+        let mut session = ryuki_core::config::SessionConfig::default();
+        session.cookie_secure = true;
+        assert_eq!(
+            session_cookie_clear_header(&session),
+            "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
+        );
+
+        session.cookie_secure = false;
+        assert_eq!(
+            session_cookie_clear_header(&session),
+            "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax"
+        );
+    }
+
+    #[test]
+    fn test_current_stage_name_for_in_memory_requests() {
+        let mut request = test_request("stage-name-test");
+        // empty stage list falls back to the requests.stage column default
+        request.stages.clear();
+        assert_eq!(current_stage_name(&request), "intake");
+
+        request.stages = vec![
+            ryuki_engine::models::Stage {
+                name: "intake".into(),
+                status: ryuki_engine::models::StageStatus::Completed,
+                started_at: None,
+                completed_at: None,
+                evidence: Vec::new(),
+                metadata: std::collections::HashMap::new(),
+            },
+            ryuki_engine::models::Stage {
+                name: "validate".into(),
+                status: ryuki_engine::models::StageStatus::InProgress,
+                started_at: None,
+                completed_at: None,
+                evidence: Vec::new(),
+                metadata: std::collections::HashMap::new(),
+            },
+        ];
+        assert_eq!(current_stage_name(&request), "validate");
+
+        request.stages[1].status = ryuki_engine::models::StageStatus::Completed;
+        assert_eq!(current_stage_name(&request), "validate");
+    }
+
+    #[tokio::test]
+    async fn test_requests_list_items_include_environment_and_stage() {
+        let request = test_request("requests-list-seam-test");
+        request_store().lock().await.push(request);
+
+        let Json(body) = requests_list(Query(PaginationParams {
+            limit: Some(100),
+            offset: Some(0),
+        }))
+        .await;
+
+        let item = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["request_id"] == "requests-list-seam-test")
+            .expect("stored request should be listed")
+            .clone();
+
+        // existing keys unchanged (request_id, created_at, ...), additive
+        // environment + stage only
+        for key in [
+            "request_id",
+            "request_type",
+            "status",
+            "name",
+            "site",
+            "environment",
+            "stage",
+            "created_at",
+        ] {
+            assert!(item.get(key).is_some(), "missing key {key}");
+        }
+        assert_eq!(item["site"], "DEFRA");
+        assert_eq!(item["environment"], "production");
+        assert_eq!(item["stage"], "intake");
     }
 }
