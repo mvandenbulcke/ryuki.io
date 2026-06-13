@@ -398,6 +398,10 @@ pub fn request_audit_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("audit"))
 }
 
+pub fn request_evidence_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("evidence"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +449,10 @@ mod tests {
         assert_eq!(
             request_audit_path(request_id),
             Ok("/api/requests/REQ-123/audit".to_string())
+        );
+        assert_eq!(
+            request_evidence_path(request_id),
+            Ok("/api/requests/REQ-123/evidence".to_string())
         );
     }
 

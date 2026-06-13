@@ -12,6 +12,7 @@ use ryuki_core::types::{ApiError, PlatformConfig};
 use ryuki_engine::auth::{check_permission, get_rbac_roles, AuthSession};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -120,6 +121,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route("/api/requests/{id}/audit", get(requests_audit))
+        .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route(
             "/api/platform/security-baseline-contract",
@@ -9096,6 +9098,110 @@ async fn requests_audit(
     ))
 }
 
+/// GET /api/requests/{id}/evidence — a tamper-evident compliance evidence pack
+/// for ONE persisted request: the redacted evidence pack (from the pure engine
+/// pipeline, built off the REAL persisted request state) plus the durable,
+/// actor-attributed audit trail, sealed with a SHA-256 digest over the stable
+/// `content`. The digest deliberately excludes `generated_at`, so re-exporting
+/// an unchanged request yields the SAME digest (tamper-evidence). Gated on the
+/// `audit` tier — the same identity-grade sensitivity as the audit trail.
+async fn request_evidence_pack(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "Audit-tier access is required to export a request evidence pack"
+            })),
+        ));
+    }
+
+    // Load the REAL persisted request (DB authoritative; in-memory store in
+    // no-DB / dry-run mode), mirroring requests_get.
+    let request = if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| status_404(&request_id))?;
+        db_row_to_request(&row, &request_id)
+    } else {
+        let store = request_store().lock().await;
+        store
+            .iter()
+            .find(|r| r.id == request_id)
+            .cloned()
+            .ok_or_else(|| status_404(&request_id))?
+    };
+
+    // Redacted evidence pack from the pure engine pipeline (sensitive keys are
+    // redacted by collect_evidence before it returns).
+    let pack = evidence_pipeline::collect_evidence(&request)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    let mut pack_value = serde_json::to_value(&pack).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    // The pack's own `id` (random uuid) and `created_at` (export instant) are
+    // freshly generated on every call. Exclude them from the SEALED content so
+    // the digest is reproducible for an unchanged request — the seal covers the
+    // substantive evidence (items, request, audit trail), not the export moment
+    // (which is reported separately as `generated_at`).
+    if let Some(object) = pack_value.as_object_mut() {
+        object.remove("id");
+        object.remove("created_at");
+    }
+
+    // Durable, actor-attributed audit trail for the request.
+    let trail = audit::audit_trail_for_request(get_db(), &request_id).await;
+    let durable = trail
+        .get("durable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let audit_entries = trail.get("entries").cloned().unwrap_or_else(|| json!([]));
+
+    // The digested content. Field order is fixed here, so serialization (and the
+    // digest) is deterministic and reproducible for an unchanged request.
+    let content = json!({
+        "request_id": request.id,
+        "pack": pack_value,
+        "audit_trail": audit_entries,
+    });
+    let canonical = serde_json::to_vec(&content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    let digest = format!("sha256:{:x}", hasher.finalize());
+
+    Ok(Json(json!({
+        "request_id": request.id,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "algorithm": "sha256",
+        "digest": digest,
+        "durable": durable,
+        "item_count": pack.items.len(),
+        "redacted": pack.redacted,
+        "content": content,
+    })))
+}
+
 /// GET /api/activity/audit — the global, newest-first, actor-attributed audit
 /// feed across all requests. Same audit-tier gate as the per-request trail:
 /// who-acted-when is sensitive identity data. Static/mock sessions carry
@@ -14466,6 +14572,70 @@ mod unit_tests {
         assert!(trail.get("durable").is_some());
         assert!(trail["entries"].is_array());
         assert_eq!(trail["limit"], 200);
+    }
+
+    /// The evidence pack is identity-grade compliance data and must be gated on
+    /// audit-tier access: a no-roles session is refused; an Auditor is admitted
+    /// (and gets a 404 for a non-existent request — proving it cleared the gate
+    /// and reached the lookup, not a 403).
+    #[tokio::test]
+    async fn request_evidence_pack_requires_audit_permission() {
+        let no_roles = AuthSession {
+            user_id: "anon".to_string(),
+            display_name: "No roles".to_string(),
+            roles: vec![],
+            token_valid: false,
+            provider_mode: "local-unauthenticated".to_string(),
+        };
+        let Err((status, _)) =
+            request_evidence_pack(AuthExtractor(no_roles), Path("whatever".to_string())).await
+        else {
+            panic!("a no-audit session must be refused the evidence pack");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let auditor = single_role_session("aud-ev", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let Err((status, _)) =
+            request_evidence_pack(AuthExtractor(auditor), Path("no-such-request".to_string()))
+                .await
+        else {
+            panic!("an auditor reaches the lookup; a missing request is a 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// The evidence pack is tamper-evident: it carries a `sha256:` digest over
+    /// stable content, and re-exporting an UNCHANGED request reproduces the same
+    /// digest (the volatile `generated_at` is excluded from the digest).
+    #[tokio::test]
+    async fn request_evidence_pack_is_digest_sealed_and_reproducible() {
+        let id = format!("req-evidence-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+        let admin = AuthSession::static_dry_run();
+
+        let Ok(Json(first)) =
+            request_evidence_pack(AuthExtractor(admin.clone()), Path(id.clone())).await
+        else {
+            panic!("admin must export the evidence pack");
+        };
+        let digest = first["digest"].as_str().expect("digest present");
+        assert!(
+            digest.starts_with("sha256:"),
+            "digest must be sha256-tagged"
+        );
+        assert_eq!(first["algorithm"], "sha256");
+        assert_eq!(first["request_id"], id);
+        assert!(first["content"]["pack"].is_object());
+        assert!(first["content"]["audit_trail"].is_array());
+
+        let Ok(Json(second)) = request_evidence_pack(AuthExtractor(admin), Path(id.clone())).await
+        else {
+            panic!("second export must succeed");
+        };
+        assert_eq!(
+            first["digest"], second["digest"],
+            "an unchanged request must reproduce the same digest"
+        );
     }
 
     /// B5: a structural assertion of the precedence rule without a live DB.

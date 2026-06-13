@@ -22,8 +22,9 @@ use crate::api::{
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
     admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
-    request_cancel_path, request_detail_path, request_execute_path, request_lock_path,
-    request_plan_path, request_reject_path, request_validate_path, request_verify_path,
+    request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
+    request_lock_path, request_plan_path, request_reject_path, request_validate_path,
+    request_verify_path,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -40,8 +41,8 @@ use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
     actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
-    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiLoginSession,
-    ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
+    platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiEvidencePack,
+    ApiLoginSession, ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -56,10 +57,10 @@ use crate::models::{
     CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload, CreateTokenPayload,
     CreateTokenResult, DatacenterFailingChecksSummary, DatacenterFullReadiness,
     DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
-    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, OperationRunSummary,
-    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
-    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
-    RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
+    DryRunPlanSummary, EvidencePackExport, EvidenceSummary, InventoryResourceSummary,
+    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
+    PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail,
+    RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
     StageActionResponse,
 };
 #[cfg(feature = "ssr")]
@@ -235,6 +236,7 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | "execute"
             | "verify"
             | "audit"
+            | "evidence"
     ) {
         return false;
     }
@@ -250,6 +252,7 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("execute"), None)
             | (Some("verify"), None)
             | (Some("audit"), None)
+            | (Some("evidence"), None)
     )
 }
 
@@ -2085,6 +2088,86 @@ pub async fn get_request_audit(request_id: String) -> Result<Vec<AuditEventRow>,
     }
 }
 
+/// Exports the tamper-evident compliance evidence pack for one request through
+/// the allowlisted `GET /api/requests/{id}/evidence` read endpoint (gated
+/// server-side on the `audit` permission). Static mode serves a labeled,
+/// clearly non-durable preview pack; a live API that is unreachable surfaces an
+/// error so the panel renders an explicit degraded state rather than a pack
+/// that was never sealed against real data.
+#[server(prefix = "/portal/api", endpoint = "request-evidence-pack")]
+pub async fn get_request_evidence(request_id: String) -> Result<EvidencePackExport, ServerFnError> {
+    let path = request_evidence_path(&request_id)
+        .map_err(|_| ServerFnError::new("request evidence API path failed same-origin guard"))?;
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request evidence API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(static_preview_evidence_pack(&request_id));
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(&path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            // Pretty-print the canonical pack for the copy/export affordance
+            // before consuming the typed view-model.
+            let pretty = serde_json::from_str::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                .unwrap_or_else(|| response.body.clone());
+            let pack: ApiEvidencePack = response
+                .json()
+                .map_err(|_| ServerFnError::new("request evidence response was malformed"))?;
+            Ok(pack.into_export(pretty))
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "request evidence fetch failed",
+        ))),
+        // Live mode never substitutes an unsealed preview for an unreachable
+        // API; the panel renders an explicit degraded state instead.
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Labeled, clearly non-durable preview evidence pack for static-dry-run mode.
+/// `durable=false` and a non-sealed digest flag that nothing was sealed against
+/// persisted data; the items are illustrative and already redacted.
+#[cfg(any(feature = "ssr", test))]
+fn static_preview_evidence_pack(request_id: &str) -> EvidencePackExport {
+    let items = vec![
+        crate::models::EvidencePackItem {
+            key: "request-payload-summary".into(),
+            value: format!(
+                "Preview evidence for request {request_id} (static dry-run; not sealed against persisted data)"
+            ),
+            redacted: false,
+            evidence_type: "Summary".into(),
+        },
+        crate::models::EvidencePackItem {
+            key: "approval-route-entry".into(),
+            value: "Approver role: DatacenterApprover".into(),
+            redacted: false,
+            evidence_type: "ApprovalDecision".into(),
+        },
+    ];
+    let pack_json =
+        "{\n  \"preview\": true,\n  \"note\": \"static dry-run preview — no persisted evidence\"\n}"
+            .to_string();
+    EvidencePackExport {
+        request_id: request_id.to_string(),
+        generated_at: "2026-06-13T08:00:00Z".into(),
+        algorithm: "sha256".into(),
+        digest: "sha256:preview-not-sealed".into(),
+        durable: false,
+        item_count: items.len(),
+        audit_count: 0,
+        redacted: true,
+        items,
+        pack_json,
+    }
+}
+
 /// Reads the global, newest-first governance audit feed across all requests
 /// through the allowlisted `GET /api/activity/audit` read endpoint (gated
 /// server-side on the `audit` permission). Static mode serves a labeled,
@@ -2491,6 +2574,7 @@ mod tests {
             request_execute_path(request_id),
             request_verify_path(request_id),
             request_audit_path(request_id),
+            request_evidence_path(request_id),
         ] {
             let path = path.expect("request lifecycle path must build");
             assert_eq!(
@@ -2504,6 +2588,7 @@ mod tests {
             "/api/requests/reject",
             "/api/requests/cancel",
             "/api/requests/audit",
+            "/api/requests/evidence",
             "/api/requests/REQ-123/validate/extra",
             "/api/requests/REQ-123/reject/extra",
             "/api/requests/REQ 123/validate",

@@ -1,8 +1,9 @@
 use crate::api::{platform_summary_path, request_detail_path};
-use crate::models::AuthSession;
+use crate::models::{AuthSession, EvidencePackExport};
 use crate::server_boundary::{
     approve_request, cancel_request, execute_request, get_request_audit, get_request_detail,
-    lock_request, plan_request, reject_request, validate_request, verify_request,
+    get_request_evidence, lock_request, plan_request, reject_request, validate_request,
+    verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -817,6 +818,146 @@ pub fn RequestDetail() -> impl IntoView {
                     })
                 }}
             </Suspense>
+            <RequestEvidencePanel/>
         </div>
     }
+}
+
+/// Renders a loaded, digest-sealed compliance evidence pack: the tamper-evident
+/// seal, its metadata, the redacted evidence items, and a JSON export.
+fn render_evidence_pack(pack: EvidencePackExport) -> impl IntoView {
+    let seal_badge = if pack.durable {
+        view! { <span class="badge good">"Sealed · durable"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Preview · not sealed"</span> }.into_any()
+    };
+    let redaction_badge = if pack.redacted {
+        view! { <span class="badge good">"Redacted"</span> }.into_any()
+    } else {
+        view! { <span class="badge warn">"Unredacted"</span> }.into_any()
+    };
+    let digest = pack.digest.clone();
+    let algorithm = pack.algorithm.to_uppercase();
+    let generated_at = pack.generated_at.clone();
+    let item_count = pack.item_count;
+    let audit_count = pack.audit_count;
+    let pack_json = pack.pack_json.clone();
+    let items = pack.items.clone();
+
+    view! {
+        <article class="workspace-detail-panel evidence-panel-card" aria-labelledby="evidence-panel-title">
+            <div class="workspace-detail-head">
+                <div>
+                    <span class="eyebrow">"Compliance"</span>
+                    <h2 id="evidence-panel-title">"Evidence pack"</h2>
+                </div>
+                {seal_badge}
+            </div>
+            <p class="workspace-detail-lede">
+                "A tamper-evident export of this request's redacted evidence and its durable audit trail. The seal below is reproducible: re-exporting an unchanged request yields the same digest."
+            </p>
+            <div class="evidence-seal" aria-label="Evidence pack digest">
+                <span class="evidence-seal-label">{algorithm} " digest"</span>
+                <code class="evidence-seal-digest">{digest}</code>
+            </div>
+            <div class="evidence-meta">
+                <span class="table-note">"Generated " {generated_at}</span>
+                <span class="table-note">{item_count} " evidence items"</span>
+                <span class="table-note">{audit_count} " audit entries"</span>
+                {redaction_badge}
+            </div>
+            <div class="timeline-list" aria-label="Evidence items">
+                {items
+                    .into_iter()
+                    .map(|item| {
+                        let type_label = item.evidence_type.clone();
+                        let redacted = item.redacted;
+                        view! {
+                            <div class="timeline-item">
+                                <div class="timeline-row-head">
+                                    <span class="badge neutral">{type_label}</span>
+                                    {redacted
+                                        .then(|| view! { <span class="badge warn">"redacted"</span> })}
+                                </div>
+                                <strong>{item.key.clone()}</strong>
+                                <p>{item.value.clone()}</p>
+                            </div>
+                        }
+                    })
+                    .collect_view()}
+            </div>
+            <details class="evidence-export">
+                <summary>"Export pack (JSON)"</summary>
+                <pre class="evidence-json">{pack_json}</pre>
+            </details>
+        </article>
+    }
+}
+
+/// `/requests/:id` compliance evidence — a digest-sealed, redacted pack bundling
+/// the request's evidence and its durable audit trail. Audit-grade data, so the
+/// panel is shown only to `audit`-capable sessions; others never see it.
+#[component]
+fn RequestEvidencePanel() -> impl IntoView {
+    let params = use_params_map();
+    let request_id = Memo::new(move |_| params.read().get("id").unwrap_or_default());
+    let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
+    if !session_can(&session, "audit") {
+        return ().into_any();
+    }
+    let evidence_resource = Resource::new(move || request_id.get(), get_request_evidence);
+
+    view! {
+        <section class="evidence-panel" aria-label="Compliance evidence pack">
+            <Suspense fallback=|| {
+                view! {
+                    <article
+                        class="workspace-detail-panel evidence-panel-card"
+                        aria-labelledby="evidence-panel-title"
+                        aria-busy="true"
+                    >
+                        <div class="workspace-detail-head">
+                            <div>
+                                <span class="eyebrow">"Compliance"</span>
+                                <h2 id="evidence-panel-title">"Evidence pack"</h2>
+                            </div>
+                            <span class="badge neutral">"Sealing…"</span>
+                        </div>
+                    </article>
+                }
+            }>
+                {move || {
+                    Suspend::new(async move {
+                        match evidence_resource.await {
+                            Ok(pack) => render_evidence_pack(pack).into_any(),
+                            Err(_) => {
+                                view! {
+                                    <article
+                                        class="workspace-detail-panel evidence-panel-card"
+                                        aria-labelledby="evidence-panel-title"
+                                    >
+                                        <div class="workspace-detail-head">
+                                            <div>
+                                                <span class="eyebrow">"Compliance"</span>
+                                                <h2 id="evidence-panel-title">"Evidence pack"</h2>
+                                            </div>
+                                            <span class="badge bad">"Unavailable"</span>
+                                        </div>
+                                        <div class="empty-state" role="status">
+                                            <p class="empty-state-title">"Evidence pack unavailable"</p>
+                                            <p class="table-note">
+                                                "The platform API is unreachable, so a sealed evidence pack cannot be generated. No unsealed or stale pack is shown."
+                                            </p>
+                                        </div>
+                                    </article>
+                                }
+                                    .into_any()
+                            }
+                        }
+                    })
+                }}
+            </Suspense>
+        </section>
+    }
+    .into_any()
 }

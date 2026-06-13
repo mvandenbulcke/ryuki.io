@@ -1494,6 +1494,78 @@ tbody tr:hover {
   }
 }
 
+/* ── Compliance evidence pack (request detail) ──────────────── */
+.evidence-panel {
+  margin-top: 18px;
+}
+
+.evidence-panel-card {
+  display: grid;
+  gap: 12px;
+}
+
+/* The tamper-evident seal: a prominent, monospace digest block. */
+.evidence-seal {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.evidence-seal-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.evidence-seal-digest {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-text);
+  word-break: break-all;
+}
+
+.evidence-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.evidence-export > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent-text);
+  width: fit-content;
+  transition: color var(--transition);
+}
+
+.evidence-export > summary:hover {
+  color: var(--accent);
+}
+
+.evidence-json {
+  margin: 8px 0 0;
+  padding: 12px;
+  max-height: 340px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre;
+}
+
 /* ── Request create & forms ─────────────────────────────────── */
 .request-create-panel {
   display: grid;

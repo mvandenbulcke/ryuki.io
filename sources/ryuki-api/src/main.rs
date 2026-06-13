@@ -607,16 +607,19 @@ fn read_permission_for(path: &str) -> &'static str {
     }
 }
 
-/// Audit-trail reads carry identity-grade who-did-what-when data and require
+/// Audit-grade reads carry identity-grade who-did-what-when data and require
 /// the `audit` tier SPECIFICALLY — never the ordinary `request` tier. Matching
 /// the central gate to the handler's own `check_permission(audit)` closes the
 /// defense-in-depth gap where a `request`-only Requester passed the route gate
-/// (and was only stopped by the handler). Covers the global activity feed and
-/// every per-request `/api/requests/{id}/audit` trail; the plain request detail
-/// (`/api/requests/{id}`, no `/audit` suffix) stays `request`-readable.
+/// (and was only stopped by the handler). Covers the global activity feed, every
+/// per-request `/api/requests/{id}/audit` trail, and the per-request
+/// `/api/requests/{id}/evidence` compliance pack (which embeds the audit trail);
+/// the plain request detail (`/api/requests/{id}`, no suffix) stays
+/// `request`-readable.
 fn is_audit_read_path(path: &str) -> bool {
     path == "/api/activity/audit"
-        || (path.starts_with("/api/requests/") && path.ends_with("/audit"))
+        || (path.starts_with("/api/requests/")
+            && (path.ends_with("/audit") || path.ends_with("/evidence")))
 }
 
 /// Whether `session` may read `path`. Sensitive prefixes require `admin`; audit
@@ -2950,6 +2953,7 @@ mod tests {
         "/api/requests",
         "/api/requests/00000000-0000-0000-0000-000000000000",
         "/api/requests/00000000-0000-0000-0000-000000000000/audit",
+        "/api/requests/00000000-0000-0000-0000-000000000000/evidence",
         "/api/activity/audit",
         "/api/catalog/categories",
         "/api/identity/shares",
@@ -3118,6 +3122,9 @@ mod tests {
         assert!(is_audit_read_path(
             "/api/requests/00000000-0000-0000-0000-000000000000/audit"
         ));
+        assert!(is_audit_read_path(
+            "/api/requests/00000000-0000-0000-0000-000000000000/evidence"
+        ));
         assert!(!is_audit_read_path(
             "/api/requests/00000000-0000-0000-0000-000000000000"
         ));
@@ -3135,6 +3142,7 @@ mod tests {
         for path in [
             "/api/activity/audit",
             "/api/requests/00000000-0000-0000-0000-000000000000/audit",
+            "/api/requests/00000000-0000-0000-0000-000000000000/evidence",
         ] {
             assert!(read_authorized(&auditor, path), "auditor reads {path}");
             assert!(

@@ -1560,6 +1560,124 @@ impl ApiAuditEventRow {
     }
 }
 
+/// One redacted line of a compliance evidence pack, mirroring an engine
+/// `EvidenceItem` as serialized by the API.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiEvidenceItem {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub redacted_value: Option<String>,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub evidence_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct ApiEvidencePackBody {
+    #[serde(default)]
+    pub items: Vec<ApiEvidenceItem>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct ApiEvidenceContent {
+    #[serde(default)]
+    pub pack: ApiEvidencePackBody,
+    #[serde(default)]
+    pub audit_trail: Vec<serde_json::Value>,
+}
+
+/// Mirrors the `GET /api/requests/{id}/evidence` envelope: a digest-sealed,
+/// redacted compliance pack (request evidence + the durable audit trail).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ApiEvidencePack {
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub generated_at: String,
+    #[serde(default)]
+    pub algorithm: String,
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub durable: bool,
+    #[serde(default)]
+    pub item_count: usize,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub content: ApiEvidenceContent,
+}
+
+/// One evidence item resolved for display — the redacted value is substituted
+/// when present so a sensitive raw value is never shown.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidencePackItem {
+    pub key: String,
+    pub value: String,
+    pub redacted: bool,
+    pub evidence_type: String,
+}
+
+/// Portal view-model for an exported compliance evidence pack: the tamper-
+/// evident digest seal, its metadata, the redacted items, and a pretty-printed
+/// JSON copy for export. `durable=false` flags a static-preview pack that was
+/// not sealed against persisted data.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EvidencePackExport {
+    pub request_id: String,
+    pub generated_at: String,
+    pub algorithm: String,
+    pub digest: String,
+    pub durable: bool,
+    pub item_count: usize,
+    pub audit_count: usize,
+    pub redacted: bool,
+    pub items: Vec<EvidencePackItem>,
+    pub pack_json: String,
+}
+
+impl ApiEvidencePack {
+    /// Flattens the wire envelope into the display view-model, substituting the
+    /// redacted value for any redacted item and carrying a pretty JSON copy.
+    pub fn into_export(self, pack_json: String) -> EvidencePackExport {
+        let items = self
+            .content
+            .pack
+            .items
+            .into_iter()
+            .map(|item| {
+                let value = if item.redacted {
+                    item.redacted_value
+                        .unwrap_or_else(|| "***REDACTED***".into())
+                } else {
+                    item.value
+                };
+                EvidencePackItem {
+                    key: item.key,
+                    value,
+                    redacted: item.redacted,
+                    evidence_type: item.evidence_type,
+                }
+            })
+            .collect();
+        EvidencePackExport {
+            request_id: self.request_id,
+            generated_at: self.generated_at,
+            algorithm: self.algorithm,
+            digest: self.digest,
+            durable: self.durable,
+            item_count: self.item_count,
+            audit_count: self.content.audit_trail.len(),
+            redacted: self.redacted,
+            items,
+            pack_json,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CreateRequestPayload {
     pub request_type: String,
