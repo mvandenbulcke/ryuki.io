@@ -68,7 +68,7 @@ const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
 
 /// The kind of input a per-type field renders as.
 #[derive(Clone, Copy)]
-enum FieldKind {
+pub(crate) enum FieldKind {
     Text,
     Number,
     Select,
@@ -77,13 +77,21 @@ enum FieldKind {
 
 /// One per-type intake field. `key` is the snake_case payload key (the API
 /// merges it into the request payload JSONB; the detail view humanizes it).
+/// `required` marks fields whose absence yields a structurally meaningless
+/// work-order — the conservative set is enumerated in the per-type tables
+/// below.  CPU/Memory typed inputs are intentionally excluded: they are typed
+/// `u32` signals with a guaranteed non-empty floor value, so marking them here
+/// would add a parallel non-FieldDef code path for no correctness gain.
+///
+/// `pub(crate)` so the SSR test module can inspect fields without a Leptos runtime.
 #[derive(Clone, Copy)]
-struct FieldDef {
-    key: &'static str,
-    label: &'static str,
-    kind: FieldKind,
-    placeholder: &'static str,
-    options: &'static [&'static str],
+pub(crate) struct FieldDef {
+    pub(crate) key: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) kind: FieldKind,
+    pub(crate) placeholder: &'static str,
+    pub(crate) options: &'static [&'static str],
+    pub(crate) required: bool,
 }
 
 const fn text(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
@@ -93,6 +101,7 @@ const fn text(key: &'static str, label: &'static str, placeholder: &'static str)
         kind: FieldKind::Text,
         placeholder,
         options: &[],
+        required: false,
     }
 }
 const fn number(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
@@ -102,6 +111,7 @@ const fn number(key: &'static str, label: &'static str, placeholder: &'static st
         kind: FieldKind::Number,
         placeholder,
         options: &[],
+        required: false,
     }
 }
 const fn textarea(key: &'static str, label: &'static str, placeholder: &'static str) -> FieldDef {
@@ -111,6 +121,7 @@ const fn textarea(key: &'static str, label: &'static str, placeholder: &'static 
         kind: FieldKind::Textarea,
         placeholder,
         options: &[],
+        required: false,
     }
 }
 const fn select(
@@ -125,39 +136,67 @@ const fn select(
         kind: FieldKind::Select,
         placeholder,
         options,
+        required: false,
     }
+}
+
+/// Wraps a `FieldDef` to mark it as required. Stable const fn: mutable param
+/// with field assignment is accepted by the Rust edition in use here.  If the
+/// pinned toolchain rejects this form, replace with explicit `text_req` /
+/// `select_req` variants; the required-field tables are the only call sites.
+const fn req(mut def: FieldDef) -> FieldDef {
+    def.required = true;
+    def
 }
 
 // Per-type intake fields. `server-deployment` keeps the typed CPU/Memory inputs
 // (rendered separately) and adds OS/disk here; every other type defines the
 // fields meaningful to it. Keys are snake_case so the detail view humanizes them
 // ("patch_wave" -> "Patch wave"). The API persists them into the payload JSONB.
+//
+// Required-field rationale (conservative rule: required iff an empty value has
+// NO safe default / "not applicable" reading and yields a structurally
+// meaningless work-order):
+//   server-deployment  → operating_system (OS is identity of the deployment)
+//   patch-maintenance  → target_host_group, maintenance_window (WHAT + WHEN)
+//   reboot-orchestration → target_host_group, reboot_strategy (target + action)
+//   controlled-restore → source_backup_id, restore_point, target_host (all load-bearing)
+//   zabbix-onboarding  → target_host_group, monitoring_template (what to monitor + how)
+//   cmdb-import        → source_system, record_type (source + record type)
+//   cmdb-update-export → export_scope, format (scope + format define the export)
+//   operator-runbook-launch → runbook_id (identity of the runbook)
+//   application-environment-retirement → application, confirm_data_deletion (target + deliberate gate)
+//   vm-decommission-quarantine → vm_identifier, action (which VM + what action)
+//   request-preflight  → target_request_type (must name what it previews)
+//   vm-day2-change     → vm_identifier, change_type (which VM + what change)
+//   snapshot-governance → target_scope, snapshot_policy (scope + policy)
+//   backup-coverage-report → report_scope, period (both define the report shape)
 const SERVER_DEPLOYMENT_FIELDS: &[FieldDef] = &[
-    select(
+    req(select(
         "operating_system",
         "Operating System",
         "Select OS",
         &["Windows Server 2022", "RHEL 9", "Ubuntu 22.04 LTS"],
-    ),
+    )),
     number("data_disk_gb", "Data Disk GB", "e.g. 100"),
 ];
 const PATCH_FIELDS: &[FieldDef] = &[
-    text(
+    req(text(
         "target_host_group",
         "Target Host Group",
         "e.g. wintel-prod-web",
-    ),
+    )),
     select(
         "patch_wave",
         "Patch Wave",
         "Select wave",
         &["Wave 1", "Wave 2", "Wave 3"],
     ),
-    text(
+    req(text(
         "maintenance_window",
         "Maintenance Window",
         "e.g. 2026-07-01 02:00 UTC",
-    ),
+    )),
     select(
         "reboot_required",
         "Reboot Required",
@@ -166,17 +205,17 @@ const PATCH_FIELDS: &[FieldDef] = &[
     ),
 ];
 const REBOOT_FIELDS: &[FieldDef] = &[
-    text(
+    req(text(
         "target_host_group",
         "Target Host Group",
         "e.g. linux-prod-db",
-    ),
-    select(
+    )),
+    req(select(
         "reboot_strategy",
         "Reboot Strategy",
         "Select strategy",
         &["Rolling", "Sequential", "Parallel"],
-    ),
+    )),
     number(
         "drain_timeout_minutes",
         "Drain Timeout (minutes)",
@@ -184,30 +223,30 @@ const REBOOT_FIELDS: &[FieldDef] = &[
     ),
 ];
 const RESTORE_FIELDS: &[FieldDef] = &[
-    text(
+    req(text(
         "source_backup_id",
         "Source Backup ID",
         "e.g. bk-2026-06-30-0231",
-    ),
-    text(
+    )),
+    req(text(
         "restore_point",
         "Restore Point",
         "e.g. 2026-06-30 23:00 UTC",
-    ),
-    text("target_host", "Target Host", "e.g. srv-app-01"),
+    )),
+    req(text("target_host", "Target Host", "e.g. srv-app-01")),
 ];
 const ZABBIX_FIELDS: &[FieldDef] = &[
-    text(
+    req(text(
         "target_host_group",
         "Target Host Group",
         "e.g. monitored-prod",
-    ),
-    select(
+    )),
+    req(select(
         "monitoring_template",
         "Monitoring Template",
         "Select template",
         &["Linux", "Windows", "Network", "Database"],
-    ),
+    )),
     select(
         "alert_severity",
         "Alert Severity",
@@ -216,22 +255,27 @@ const ZABBIX_FIELDS: &[FieldDef] = &[
     ),
 ];
 const CMDB_IMPORT_FIELDS: &[FieldDef] = &[
-    select(
+    req(select(
         "source_system",
         "Source System",
         "Select source",
         &["ServiceNow", "NetBox", "Spreadsheet"],
-    ),
-    text("record_type", "Record Type", "e.g. cmdb_ci_server"),
+    )),
+    req(text("record_type", "Record Type", "e.g. cmdb_ci_server")),
     select("dry_run", "Dry Run", "Select", &["Yes", "No"]),
 ];
 const CMDB_EXPORT_FIELDS: &[FieldDef] = &[
-    text("export_scope", "Export Scope", "e.g. site:DEFRA"),
-    select("format", "Format", "Select format", &["CSV", "JSON", "XML"]),
+    req(text("export_scope", "Export Scope", "e.g. site:DEFRA")),
+    req(select(
+        "format",
+        "Format",
+        "Select format",
+        &["CSV", "JSON", "XML"],
+    )),
     text("target_system", "Target System", "e.g. ServiceNow"),
 ];
 const RUNBOOK_FIELDS: &[FieldDef] = &[
-    text("runbook_id", "Runbook ID", "e.g. rb-failover-db"),
+    req(text("runbook_id", "Runbook ID", "e.g. rb-failover-db")),
     textarea("parameters", "Parameters", "key=value per line"),
     select(
         "approval_required",
@@ -241,28 +285,28 @@ const RUNBOOK_FIELDS: &[FieldDef] = &[
     ),
 ];
 const APP_RETIRE_FIELDS: &[FieldDef] = &[
-    text("application", "Application", "e.g. app-team-web"),
+    req(text("application", "Application", "e.g. app-team-web")),
     select(
         "retention_policy",
         "Retention Policy",
         "Select retention",
         &["30 days", "90 days", "365 days"],
     ),
-    select(
+    req(select(
         "confirm_data_deletion",
         "Confirm Data Deletion",
         "Select",
         &["No", "Yes"],
-    ),
+    )),
 ];
 const VM_DECOMMISSION_FIELDS: &[FieldDef] = &[
-    text("vm_identifier", "VM Identifier", "e.g. vm-app-0142"),
-    select(
+    req(text("vm_identifier", "VM Identifier", "e.g. vm-app-0142")),
+    req(select(
         "action",
         "Action",
         "Select action",
         &["Quarantine", "Decommission"],
-    ),
+    )),
     select(
         "snapshot_before",
         "Snapshot Before",
@@ -271,51 +315,58 @@ const VM_DECOMMISSION_FIELDS: &[FieldDef] = &[
     ),
 ];
 const PREFLIGHT_FIELDS: &[FieldDef] = &[
-    text(
+    req(text(
         "target_request_type",
         "Target Request Type",
         "e.g. server-deployment",
-    ),
+    )),
     text("scope", "Scope", "e.g. site:DEFRA env:production"),
 ];
 const VM_DAY2_FIELDS: &[FieldDef] = &[
-    text("vm_identifier", "VM Identifier", "e.g. vm-app-0142"),
-    select(
+    req(text("vm_identifier", "VM Identifier", "e.g. vm-app-0142")),
+    req(select(
         "change_type",
         "Change Type",
         "Select change",
         &["Resize", "Add disk", "Network change", "Reconfigure"],
-    ),
+    )),
     textarea("details", "Details", "Describe the change"),
 ];
 const SNAPSHOT_FIELDS: &[FieldDef] = &[
-    text("target_scope", "Target Scope", "e.g. cluster:prod-vmw-01"),
-    select(
+    req(text(
+        "target_scope",
+        "Target Scope",
+        "e.g. cluster:prod-vmw-01",
+    )),
+    req(select(
         "snapshot_policy",
         "Snapshot Policy",
         "Select policy",
         &["Daily", "Weekly", "Monthly"],
-    ),
+    )),
     number("retention_days", "Retention Days", "e.g. 30"),
 ];
 const BACKUP_REPORT_FIELDS: &[FieldDef] = &[
-    select(
+    req(select(
         "report_scope",
         "Report Scope",
         "Select scope",
         &["Site", "Cluster", "Application"],
-    ),
-    select(
+    )),
+    req(select(
         "period",
         "Period",
         "Select period",
         &["Last 7 days", "Last 30 days", "Last 90 days"],
-    ),
+    )),
 ];
 
 /// Resolves the per-type intake fields for a request type. Unknown types (none
 /// expected — the select is fixed) render no extra fields.
-fn type_fields(request_type: &str) -> &'static [FieldDef] {
+///
+/// Exposed as `pub(crate)` so the SSR test module can call it directly without
+/// requiring a Leptos reactive runtime.
+pub(crate) fn type_fields(request_type: &str) -> &'static [FieldDef] {
     match request_type {
         "server-deployment" => SERVER_DEPLOYMENT_FIELDS,
         "patch-maintenance" => PATCH_FIELDS,
@@ -333,6 +384,33 @@ fn type_fields(request_type: &str) -> &'static [FieldDef] {
         "backup-coverage-report" => BACKUP_REPORT_FIELDS,
         _ => &[],
     }
+}
+
+/// Returns the labels of required per-type fields whose trimmed value is
+/// absent or empty in `values`.
+///
+/// Pure function — no signals, no DOM, no Leptos runtime required.  Both the
+/// production `is_valid()` closure and the SSR test module call this directly,
+/// ensuring a single source of truth with no test-only fork.
+///
+/// Name and justification are top-level signals validated separately in
+/// `is_valid()`; they are intentionally not threaded through this helper so it
+/// stays focused on the per-type FieldDef domain.
+pub(crate) fn missing_required_fields(
+    request_type: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> Vec<&'static str> {
+    type_fields(request_type)
+        .iter()
+        .filter(|f| f.required)
+        .filter(|f| {
+            values
+                .get(f.key)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .map(|f| f.label)
+        .collect()
 }
 
 /// Renders one per-type field bound to the shared `values` map signal. Editing a
@@ -485,7 +563,11 @@ pub fn RequestCreate() -> impl IntoView {
     // the request type changes so stale values from the previous type never leak.
     let field_values = RwSignal::new(std::collections::HashMap::<String, String>::new());
 
-    let is_valid = move || !name.get().trim().is_empty() && !justification.get().trim().is_empty();
+    let is_valid = move || {
+        !name.get().trim().is_empty()
+            && !justification.get().trim().is_empty()
+            && missing_required_fields(&request_type.get(), &field_values.get()).is_empty()
+    };
 
     let submit_action = Action::new(move |input: &CreateRequestPayload| {
         let payload = input.clone();
@@ -678,6 +760,31 @@ pub fn RequestCreate() -> impl IntoView {
                         <span class="form-error">"Justification is required"</span>
                     </Show>
                 </div>
+
+                // Per-type required-field errors — shown after the user first
+                // attempts to submit (show_errors) when any required field of
+                // the currently selected type is empty.  Reuses the existing
+                // show_errors signal and form-error CSS class; no new infra.
+                <Show when=move || {
+                    show_errors.get()
+                        && !missing_required_fields(&request_type.get(), &field_values.get())
+                            .is_empty()
+                }>
+                    <div class="form-field">
+                        {move || {
+                            missing_required_fields(&request_type.get(), &field_values.get())
+                                .into_iter()
+                                .map(|label| {
+                                    view! {
+                                        <span class="form-error">
+                                            {label} " is required"
+                                        </span>
+                                    }
+                                })
+                                .collect_view()
+                        }}
+                    </div>
+                </Show>
 
                 <div class="form-actions">
                     <button

@@ -116,52 +116,74 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
 
     #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
-        if let Some(window) = web_sys::window() {
-            let doc = window.document().unwrap();
-            let html = doc.document_element().unwrap();
-            let explicit = html.get_attribute("data-theme");
-            let is_dark = match explicit.as_deref() {
-                Some("dark") => true,
-                Some("light") => false,
-                _ => window
-                    .match_media("(prefers-color-scheme: dark)")
-                    .ok()
-                    .flatten()
-                    .map(|m| m.matches())
-                    .unwrap_or(false),
-            };
-            set_theme_icon.set(if is_dark {
-                "\u{2600}\u{FE0F}".to_string()
-            } else {
-                "\u{1F319}".to_string()
-            });
-        }
+        // let-else guards: a missing window/document/document_element during
+        // hydration must not panic the WASM runtime — just skip the icon sync.
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Some(doc) = window.document() else {
+            return;
+        };
+        let Some(html) = doc.document_element() else {
+            return;
+        };
+        let explicit = html.get_attribute("data-theme");
+        let is_dark = match explicit.as_deref() {
+            Some("dark") => true,
+            Some("light") => false,
+            _ => window
+                .match_media("(prefers-color-scheme: dark)")
+                .ok()
+                .flatten()
+                .map(|m| m.matches())
+                .unwrap_or(false),
+        };
+        set_theme_icon.set(if is_dark {
+            "\u{2600}\u{FE0F}".to_string()
+        } else {
+            "\u{1F319}".to_string()
+        });
     });
 
     let on_theme_click = {
         move |_| {
             #[cfg(feature = "hydrate")]
             {
+                // let-else guards: if window/document/document_element are
+                // absent (e.g. SSR dry-run), bail early — nothing to toggle.
                 let Some(window) = web_sys::window() else {
                     return;
                 };
-                let doc = window.document().unwrap();
-                let html = doc.document_element().unwrap();
-                let storage = window.local_storage().unwrap().unwrap();
+                let Some(doc) = window.document() else {
+                    return;
+                };
+                let Some(html) = doc.document_element() else {
+                    return;
+                };
+                // Storage may be denied (Safari Private Browsing, blocked
+                // storage policy).  Degrade gracefully: the in-DOM toggle
+                // ALWAYS runs; persistence is best-effort only.
+                let storage = window.local_storage().ok().flatten();
 
                 let current = html.get_attribute("data-theme");
                 match current.as_deref() {
                     None | Some("") => {
                         let _ = html.set_attribute("data-theme", "dark");
-                        let _ = storage.set_item("ryuki-theme", "dark");
+                        if let Some(s) = &storage {
+                            let _ = s.set_item("ryuki-theme", "dark");
+                        }
                     }
                     Some("dark") => {
                         let _ = html.set_attribute("data-theme", "light");
-                        let _ = storage.set_item("ryuki-theme", "light");
+                        if let Some(s) = &storage {
+                            let _ = s.set_item("ryuki-theme", "light");
+                        }
                     }
                     Some("light") => {
                         let _ = html.remove_attribute("data-theme");
-                        let _ = storage.remove_item("ryuki-theme");
+                        if let Some(s) = &storage {
+                            let _ = s.remove_item("ryuki-theme");
+                        }
                     }
                     _ => {}
                 }
