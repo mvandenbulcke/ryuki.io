@@ -7347,7 +7347,16 @@ fn validation_failed_response(
     )
 }
 
-async fn requests_create(Json(body): Json<CreateRequest>) -> ApiResult {
+async fn requests_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<CreateRequest>,
+) -> ApiResult {
+    // Defense-in-depth: the central route gate also enforces "request" for
+    // POST /api/requests. Keeping the handler check makes the requirement
+    // explicit and survives any future routing refactor.
+    if !check_permission(&session, "request") {
+        return Err(status_403());
+    }
     let request_type = parse_request_type(&body.request_type)?;
     let request = request_lifecycle::create_request(
         &body.request_type,
@@ -7487,7 +7496,15 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     }
 }
 
-async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_validate(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    // Defense-in-depth: validate is operator-tier ("execute"). The central
+    // route gate enforces the same requirement.
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(
@@ -7557,7 +7574,15 @@ async fn requests_validate(Path(request_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn requests_plan(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_plan(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    // Defense-in-depth: plan is operator-tier ("execute"). The central route
+    // gate enforces the same requirement.
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(
@@ -11957,7 +11982,12 @@ mod unit_tests {
 
         request_store().lock().await.push(request);
 
-        let Err((status, Json(body))) = requests_validate(Path(id.clone())).await else {
+        let Err((status, Json(body))) = requests_validate(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        else {
             panic!("invalid request should fail validation");
         };
 
@@ -11978,7 +12008,12 @@ mod unit_tests {
         let id = format!("req-test-{}", Uuid::new_v4());
         request_store().lock().await.push(test_request(&id));
 
-        let Err((status, Json(body))) = requests_plan(Path(id.clone())).await else {
+        let Err((status, Json(body))) = requests_plan(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        else {
             panic!("unvalidated request should not plan");
         };
 
@@ -11998,14 +12033,20 @@ mod unit_tests {
         let id = format!("req-test-{}", Uuid::new_v4());
         request_store().lock().await.push(test_request(&id));
 
-        let Json(validation) = requests_validate(Path(id.clone()))
-            .await
-            .expect("validation should pass");
+        let Json(validation) = requests_validate(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("validation should pass");
         assert_eq!(validation["passed"], true);
 
-        let Json(stages) = requests_plan(Path(id.clone()))
-            .await
-            .expect("planning should pass after validation");
+        let Json(stages) = requests_plan(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("planning should pass after validation");
         assert!(stages
             .as_array()
             .unwrap()

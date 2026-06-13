@@ -1036,6 +1036,28 @@ tbody tr:hover {
   margin-top: 14px;
 }
 
+/* Insufficient-permission notice on /requests/new when the session lacks the
+   "request" capability; warn-toned so it reads as a gate, not a failure. */
+.request-create-denied {
+  padding: 28px 16px;
+  text-align: center;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  color: var(--warn);
+}
+
+.request-create-denied p {
+  margin: 0;
+  font-weight: 700;
+}
+
+.request-create-denied .table-note {
+  color: inherit;
+  font-weight: 500;
+  opacity: 0.85;
+}
+
 .request-list-loading,
 .request-detail-loading {
   padding: 28px 16px;

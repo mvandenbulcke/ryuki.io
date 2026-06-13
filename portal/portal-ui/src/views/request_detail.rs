@@ -1,10 +1,37 @@
 use crate::api::{platform_summary_path, request_detail_path};
+use crate::models::AuthSession;
 use crate::server_boundary::{
     approve_request, execute_request, get_request_detail, lock_request, plan_request,
     validate_request, verify_request,
 };
+use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
+
+/// Zero-capability session used when no `AuthSession` is in context. An absent
+/// context must HIDE every lifecycle button, never reveal one — so this is
+/// deliberately not `auth_session_fallback` (which carries PlatformAdmin).
+fn no_capability_session() -> AuthSession {
+    AuthSession {
+        user_id: String::new(),
+        display_name: String::new(),
+        roles: Vec::new(),
+        token_valid: false,
+        provider_mode: String::new(),
+    }
+}
+
+/// Maps a lifecycle action to the capability that gates it, mirroring the
+/// engine action->permission map (sources/ryuki-api/src/contracts.rs request
+/// lifecycle handlers): validate/plan/lock/execute/verify require `execute`;
+/// approve requires `approve`.
+fn action_capability(action: &str) -> &'static str {
+    match action {
+        "approve" => "approve",
+        // validate, plan, lock, execute, verify are operator-tier mechanics.
+        _ => "execute",
+    }
+}
 
 fn status_badge_class(status: &str) -> &'static str {
     match status {
@@ -58,6 +85,10 @@ pub fn RequestDetail() -> impl IntoView {
     // detail pages are directly addressable deep links.
     let params = use_params_map();
     let request_id = Memo::new(move |_| params.read().get("id").unwrap_or_default());
+    // The verified session is provided by AuthenticatedShell (app.rs). An
+    // absent context falls back to a zero-capability session so buttons are
+    // hidden rather than shown.
+    let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
     let detail_path = Memo::new(move |_| {
         request_detail_path(&request_id.get())
             .unwrap_or_else(|_| platform_summary_path().to_string())
@@ -213,6 +244,7 @@ pub fn RequestDetail() -> impl IntoView {
                 }
             }>
                 {move || {
+                    let session = session.clone();
                     Suspend::new(async move {
                         let detail = match detail_resource.await {
                             Ok(d) => d,
@@ -241,7 +273,14 @@ pub fn RequestDetail() -> impl IntoView {
                         let status_class = status_badge_class(&detail.status);
                         let stage_text = stage_label(&detail.stage);
                         let current_stage = detail.stage.clone();
-                        let actions = detail.actions_available.clone();
+                        // Gate each stage-available action on its capability,
+                        // using the same action->permission map as the engine.
+                        let actions: Vec<String> = detail
+                            .actions_available
+                            .iter()
+                            .filter(|action| session_can(&session, action_capability(action)))
+                            .cloned()
+                            .collect();
                         let request_id_for_action = detail.id.clone();
 
                         view! {

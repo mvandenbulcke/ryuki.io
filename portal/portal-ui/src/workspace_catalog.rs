@@ -35,6 +35,45 @@ pub struct WorkspaceDefinition {
     pub required_role: Option<&'static str>,
 }
 
+/// Mirror of ryuki-engine `check_permission` (sources/ryuki-engine/src/auth.rs
+/// `get_rbac_roles` / `check_permission`): a capability is held if any of the
+/// session roles grants it, or the session holds the `admin` superuser perm.
+/// The portal must not depend on ryuki-engine, so this role->permission table
+/// is duplicated here; keep it in lockstep with `get_rbac_roles` so drift is
+/// reviewable.
+pub fn session_can(session: &AuthSession, capability: &str) -> bool {
+    fn perms_for(role: &str) -> &'static [&'static str] {
+        match role {
+            "PlatformAdmin" => &["admin", "approve", "audit"],
+            "BreakGlassAdmin" => &["admin", "audit"],
+            "DatacenterApprover" => &["approve", "audit"],
+            "VMwareOperator"
+            | "HyperVOperator"
+            | "ProxmoxOperator"
+            | "WintelLinuxOperator"
+            | "BackupOperator"
+            | "MonitoringOperator" => &["execute", "audit"],
+            "ServiceDesk" => &["request", "audit"],
+            "Auditor" => &["audit"],
+            "Requester" => &["request"],
+            _ => &[],
+        }
+    }
+    let mut held: bool = false;
+    let mut is_admin = false;
+    for role in &session.roles {
+        for p in perms_for(role) {
+            if *p == "admin" {
+                is_admin = true;
+            }
+            if *p == capability {
+                held = true;
+            }
+        }
+    }
+    is_admin || held
+}
+
 pub fn role_satisfies(session: &AuthSession, required_role: Option<&str>) -> bool {
     let Some(required) = required_role else {
         return true;
@@ -316,6 +355,83 @@ pub const PRIMARY_WORKSPACES: &[WorkspaceDefinition] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AuthSession;
+
+    fn session_with_roles(roles: &[&str]) -> AuthSession {
+        AuthSession {
+            user_id: "test".to_string(),
+            display_name: "Test".to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            token_valid: true,
+            provider_mode: "local".to_string(),
+        }
+    }
+
+    #[test]
+    fn session_can_platform_admin_is_superuser() {
+        let session = session_with_roles(&["PlatformAdmin"]);
+        for capability in ["request", "execute", "approve", "audit"] {
+            assert!(
+                session_can(&session, capability),
+                "PlatformAdmin must hold {capability} via the admin superuser perm"
+            );
+        }
+    }
+
+    #[test]
+    fn session_can_auditor_read_only() {
+        let session = session_with_roles(&["Auditor"]);
+        assert!(!session_can(&session, "request"));
+        assert!(!session_can(&session, "execute"));
+        assert!(!session_can(&session, "approve"));
+        assert!(session_can(&session, "audit"));
+    }
+
+    #[test]
+    fn session_can_requester_only_request() {
+        let session = session_with_roles(&["Requester"]);
+        assert!(session_can(&session, "request"));
+        assert!(!session_can(&session, "execute"));
+        assert!(!session_can(&session, "approve"));
+        assert!(!session_can(&session, "audit"));
+    }
+
+    #[test]
+    fn session_can_operator_holds_execute() {
+        let session = session_with_roles(&["VMwareOperator"]);
+        assert!(session_can(&session, "execute"));
+        assert!(session_can(&session, "audit"));
+        assert!(!session_can(&session, "approve"));
+        assert!(!session_can(&session, "request"));
+    }
+
+    #[test]
+    fn session_can_approver_holds_approve_not_execute() {
+        let session = session_with_roles(&["DatacenterApprover"]);
+        assert!(session_can(&session, "approve"));
+        assert!(session_can(&session, "audit"));
+        assert!(!session_can(&session, "execute"));
+        assert!(!session_can(&session, "request"));
+    }
+
+    #[test]
+    fn session_can_break_glass_admin_is_superuser() {
+        let session = session_with_roles(&["BreakGlassAdmin"]);
+        for capability in ["request", "execute", "approve", "audit"] {
+            assert!(
+                session_can(&session, capability),
+                "BreakGlassAdmin must hold {capability} via the admin superuser perm"
+            );
+        }
+    }
+
+    #[test]
+    fn session_can_empty_roles_holds_nothing() {
+        let session = session_with_roles(&[]);
+        for capability in ["request", "execute", "approve", "audit"] {
+            assert!(!session_can(&session, capability));
+        }
+    }
 
     #[test]
     fn primary_nav_items_use_real_route_paths() {

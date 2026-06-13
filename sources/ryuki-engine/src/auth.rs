@@ -216,16 +216,25 @@ pub fn validate_token(_token: &str) -> AuthSession {
     AuthSession::unverified_entra()
 }
 
+/// Returns true when the session is authorized for `permission`.
+///
+/// A permission `p` is satisfied if the session holds `p` exactly OR the
+/// session holds the `admin` permission. `admin` is therefore a superuser
+/// permission: PlatformAdmin and BreakGlassAdmin both carry it and thus pass
+/// every coarse permission (request/execute/approve/admin) in this wave. The
+/// check is keyed on the held PERMISSION, not the role name, so it stays
+/// role-name-agnostic — any future role that carries `admin` inherits the same
+/// superuser semantics, and a role that merely holds `audit` never leaks into
+/// the mutating permissions.
 pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
     let roles = get_rbac_roles();
+    let mut held = std::collections::HashSet::new();
     for role_name in &session.roles {
-        if let Some(role) = roles.iter().find(|r| &r.name == role_name)
-            && role.permissions.iter().any(|p| p == permission)
-        {
-            return true;
+        if let Some(role) = roles.iter().find(|r| &r.name == role_name) {
+            held.extend(role.permissions.iter().map(String::as_str));
         }
     }
-    false
+    held.contains("admin") || held.contains(permission)
 }
 
 pub fn get_entra_config_from_env(tenant_id: &str, client_id: &str, instance: &str) -> EntraConfig {
@@ -479,5 +488,70 @@ mod tests {
         let roles = get_rbac_roles();
         let auditor = roles.iter().find(|r| r.name == APP_ROLE_AUDITOR).unwrap();
         assert_eq!(auditor.permissions, vec!["audit"]);
+    }
+
+    #[test]
+    fn test_platform_admin_is_superuser() {
+        // PlatformAdmin's role permissions are [admin, approve, audit] — it does
+        // NOT literally hold "execute" or "request". The superuser model makes
+        // the `admin` permission satisfy every check, so PlatformAdmin now passes
+        // execute/request/approve/admin alike (these were false before the fix).
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![APP_ROLE_PLATFORM_ADMIN.to_string()];
+        assert!(check_permission(&session, "execute"));
+        assert!(check_permission(&session, "request"));
+        assert!(check_permission(&session, "approve"));
+        assert!(check_permission(&session, "admin"));
+        assert!(check_permission(&session, "audit"));
+    }
+
+    #[test]
+    fn test_break_glass_admin_is_superuser() {
+        // BreakGlassAdmin carries `admin` (and `audit`); the superuser model
+        // makes it pass every coarse permission too.
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![APP_ROLE_BREAK_GLASS_ADMIN.to_string()];
+        assert!(check_permission(&session, "execute"));
+        assert!(check_permission(&session, "request"));
+        assert!(check_permission(&session, "approve"));
+        assert!(check_permission(&session, "admin"));
+        assert!(check_permission(&session, "audit"));
+    }
+
+    #[test]
+    fn test_superuser_does_not_leak_to_audit_only_roles() {
+        // Auditor holds only `audit`, never `admin`, so the superuser fallthrough
+        // does not apply: it must remain locked out of every mutating permission.
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![APP_ROLE_AUDITOR.to_string()];
+        assert!(check_permission(&session, "audit"));
+        assert!(!check_permission(&session, "execute"));
+        assert!(!check_permission(&session, "request"));
+        assert!(!check_permission(&session, "approve"));
+        assert!(!check_permission(&session, "admin"));
+    }
+
+    #[test]
+    fn test_operator_holds_execute_but_not_admin_tier() {
+        // A plain operator holds `execute`/`audit` and passes execute, but the
+        // superuser fallthrough never grants it approve/request/admin.
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![APP_ROLE_VMWARE_OPERATOR.to_string()];
+        assert!(check_permission(&session, "execute"));
+        assert!(check_permission(&session, "audit"));
+        assert!(!check_permission(&session, "approve"));
+        assert!(!check_permission(&session, "request"));
+        assert!(!check_permission(&session, "admin"));
+    }
+
+    #[test]
+    fn test_approver_holds_approve_but_not_execute() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![APP_ROLE_DATACENTER_APPROVER.to_string()];
+        assert!(check_permission(&session, "approve"));
+        assert!(check_permission(&session, "audit"));
+        assert!(!check_permission(&session, "execute"));
+        assert!(!check_permission(&session, "request"));
+        assert!(!check_permission(&session, "admin"));
     }
 }

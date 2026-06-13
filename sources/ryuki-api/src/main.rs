@@ -249,6 +249,165 @@ fn session_authorizes_request(
     auth_session_allows_unsafe_method(session)
 }
 
+/// One row of the central mutating-route RBAC table: an unsafe-method path
+/// prefix and the coarse permission required to reach it.
+struct RoutePermission {
+    prefix: &'static str,
+    permission: &'static str,
+}
+
+/// Central route -> required-permission table for unsafe methods.
+///
+/// ORDER MATTERS: more-specific prefixes come FIRST so the longest match wins
+/// (e.g. `/api/protect/secrets/rotate-all` is `admin` while the rest of
+/// `/api/protect` is `execute`, and `/api/ops/emergency` is `admin` while the
+/// rest of `/api/ops` is `execute`). `route_permission_for` scans this slice in
+/// order and returns the first prefix that matches. The method is implicitly
+/// "any unsafe method" this wave (POST/PUT/PATCH/DELETE on a family share a
+/// permission; finer method/sub-path granularity is a later wave).
+///
+/// `/api/requests` is handled by the dedicated `requests_route_permission`
+/// resolver BEFORE this table is consulted, because its sub-paths split across
+/// request/approve/execute.
+static ROUTE_PERMISSIONS: &[RoutePermission] = &[
+    // emergency / break-glass and platform admin (most specific first)
+    RoutePermission {
+        prefix: "/api/ops/emergency",
+        permission: "admin",
+    },
+    RoutePermission {
+        prefix: "/api/admin",
+        permission: "admin",
+    },
+    RoutePermission {
+        prefix: "/api/protect/secrets/rotate-all",
+        permission: "admin",
+    },
+    RoutePermission {
+        prefix: "/api/protect",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/identity",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/network",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/build",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/vm",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/maintain",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/observe",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/monitoring",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/datacenter",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/inventory",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/cmdb",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/analytics",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/evidence",
+        permission: "execute",
+    },
+    // incident/runbook/shift — after the /api/ops/emergency admin row above
+    RoutePermission {
+        prefix: "/api/ops",
+        permission: "execute",
+    },
+    RoutePermission {
+        prefix: "/api/retire",
+        permission: "execute",
+    },
+];
+
+/// Fail-closed default: an unsafe, non-exempt route that matches no row is
+/// locked to `admin` until someone classifies it. A newly added mutating route
+/// is never silently open.
+const DEFAULT_ROUTE_PERMISSION: &str = "admin";
+
+/// Resolves the permission for a mutation under `/api/requests`.
+///
+/// - `/api/requests` exactly (POST create)                -> "request"
+/// - `/api/requests/{id}/approve`                          -> "approve"
+/// - `/api/requests/{id}/{validate|plan|lock|execute|verify}` -> "execute"
+/// - any other `/api/requests/...` mutation                -> "execute"
+///   (fail-toward-operator; a request-family mutation never falls back to the
+///   requester tier or to the global admin default)
+///
+/// Returns `None` when `path` is not under `/api/requests`, so the caller falls
+/// through to the static prefix table.
+fn requests_route_permission(path: &str) -> Option<&'static str> {
+    if path == "/api/requests" {
+        return Some("request");
+    }
+    let rest = path.strip_prefix("/api/requests/")?;
+    // rest looks like "{id}", "{id}/approve", "{id}/validate", ...
+    match rest.rsplit('/').next() {
+        Some("approve") => Some("approve"),
+        // every other request-family mutation is operator-tier
+        _ => Some("execute"),
+    }
+}
+
+/// Central resolver applied in `auth_middleware` for unsafe methods. `method`
+/// is accepted for forward-compatibility (per-method granularity is a later
+/// wave); this wave treats every unsafe method on a path family identically.
+/// Returns the required coarse permission, defaulting fail-closed to `admin`.
+fn route_permission_for(_method: &Method, path: &str) -> &'static str {
+    if let Some(permission) = requests_route_permission(path) {
+        return permission;
+    }
+    ROUTE_PERMISSIONS
+        .iter()
+        .find(|row| path == row.prefix || path.starts_with(&format!("{}/", row.prefix)))
+        .map(|row| row.permission)
+        .unwrap_or(DEFAULT_ROUTE_PERMISSION)
+}
+
+/// Builds the 403 ProblemDetails response for a missing mutating permission.
+fn forbidden(required: &str) -> Response {
+    let body = serde_json::to_string(&ApiError::with_detail(
+        "FORBIDDEN",
+        "You do not have permission to perform this operation",
+        format!("Missing required permission: {required}"),
+    ))
+    .unwrap_or_else(|_| {
+        r#"{"error":"FORBIDDEN","message":"You do not have permission to perform this operation"}"#
+            .into()
+    });
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// Returns the first configured local-auth role that is not in the
 /// application role catalog, as (entry index, role). Never touches passwords.
 fn find_unknown_local_auth_role(
@@ -271,6 +430,17 @@ fn bind_address_is_loopback(bind_address: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolves the session, enforces the 401 verified-auth gate, then the
+/// mutating-route RBAC gate, before handing off to the handler.
+///
+/// SCOPED DEFERRAL — GET reads are intentionally NOT authenticated this wave.
+/// The RBAC gate below is wrapped in `is_unsafe_method`, so GETs never hit it:
+/// mock/static-dry-run demos and the local-mode portal keep rendering reads
+/// anonymously. Read authentication (audit-tier GETs and dropping the
+/// `is_unsafe_method` precondition) is a known, SEQUENCED deferral to the Entra
+/// wave — it is gated on real Entra token validation so EntraId deployments are
+/// not locked out of reads, and on keeping the static/mock demos zero-friction.
+/// This is a deliberate boundary, not an oversight.
 async fn auth_middleware(
     headers: HeaderMap,
     mut request: HttpRequest<Body>,
@@ -305,6 +475,25 @@ async fn auth_middleware(
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap();
+    }
+
+    // Mutating-route RBAC gate. Runs only for unsafe, non-exempt methods (GET
+    // reads are deferred per the doc comment above) and AFTER the 401 gate, so
+    // an unauthenticated caller still 401s and only an authenticated-but-
+    // underprivileged caller 403s. Handler-level check_permission calls stay as
+    // defense-in-depth.
+    if is_unsafe_method(&method) && !is_auth_exempt_path(&path) {
+        let required = route_permission_for(&method, &path);
+        if !ryuki_engine::auth::check_permission(&session, required) {
+            tracing::warn!(
+                user_id = %session.user_id,
+                method = %method,
+                path = %path,
+                required,
+                "authorization denied: missing required permission"
+            );
+            return forbidden(required);
+        }
     }
 
     request.extensions_mut().insert(session);
@@ -1907,6 +2096,389 @@ mod tests {
         assert!(json.contains("RESOURCE_NOT_FOUND"));
         assert!(json.contains("The requested resource was not found"));
         assert!(!json.contains("detail"));
+    }
+
+    /// Hardcoded list of mutating-route prefixes the API exposes (excluding the
+    /// auth-exempt /api/auth/* endpoints, which the gate never reaches). Kept in
+    /// sync by hand with `contracts::routes()`; the coverage test below asserts
+    /// every one resolves to a non-empty permission.
+    const MUTATING_ROUTES: &[&str] = &[
+        "/api/requests",
+        "/api/requests/00000000-0000-0000-0000-000000000000/validate",
+        "/api/requests/00000000-0000-0000-0000-000000000000/plan",
+        "/api/requests/00000000-0000-0000-0000-000000000000/approve",
+        "/api/requests/00000000-0000-0000-0000-000000000000/lock",
+        "/api/requests/00000000-0000-0000-0000-000000000000/execute",
+        "/api/requests/00000000-0000-0000-0000-000000000000/verify",
+        "/api/identity/access-review/r1/start",
+        "/api/identity/access-review/r1/approve",
+        "/api/identity/access-review/r1/revoke",
+        "/api/identity/access-review/r1/exempt",
+        "/api/identity/access-review/campaign",
+        "/api/identity/ad/prestage",
+        "/api/identity/ad/validate",
+        "/api/identity/ad/move/host1",
+        "/api/identity/ad/disable/host1",
+        "/api/identity/ad/enable/host1",
+        "/api/identity/ad/delete/host1",
+        "/api/identity/gmsa/create",
+        "/api/identity/gmsa/validate",
+        "/api/identity/gmsa/assign/svc1/host1",
+        "/api/identity/gmsa/remove/svc1/host1",
+        "/api/identity/gmsa/rotate/svc1",
+        "/api/identity/gmsa/test/svc1/host1",
+        "/api/identity/shares/recertify/s1",
+        "/api/identity/shares/revoke/s1/g1",
+        "/api/audit/compliance/controls/c1/assess",
+        "/api/audit/compliance/reports/generate",
+        "/api/audit/compliance/findings/f1/resolve",
+        "/api/audit/compliance/findings/f1/waive",
+        "/api/evidence/collect",
+        "/api/evidence/redact",
+        "/api/evidence/verify-compliance",
+        "/api/inventory/sync",
+        "/api/inventory/reconcile",
+        "/api/build/sql/plan",
+        "/api/build/sql/validate",
+        "/api/build/sql/install/d1",
+        "/api/build/sql/configure/d1",
+        "/api/build/sql/verify/d1",
+        "/api/build/sql/backup/d1",
+        "/api/build/sql/monitoring/d1",
+        "/api/ops/runbook/start",
+        "/api/ops/runbook/step/e1/s1",
+        "/api/ops/runbook/approve/e1",
+        "/api/ops/runbook/complete/e1",
+        "/api/ops/runbook/fail/e1",
+        "/api/ops/runbook/rollback/e1",
+        "/api/ops/shift/acknowledge/i1",
+        "/api/ops/shift/assign/i1",
+        "/api/ops/shift/escalate/i1",
+        "/api/ops/shift/resolve/i1",
+        "/api/ops/emergency/initiate",
+        "/api/ops/emergency/approve/e1",
+        "/api/ops/emergency/execute/e1",
+        "/api/ops/emergency/verify/e1",
+        "/api/ops/emergency/close/e1",
+        "/api/ops/incident/assemble",
+        "/api/ops/incident/i1/resolve",
+        "/api/ops/incident/i1/add-ci",
+        "/api/ops/incident/i1/escalate",
+        "/api/operations/outage-comms/notices",
+        "/api/operations/outage-comms/notices/n1/send",
+        "/api/operations/outage-comms/notices/n1/acknowledge",
+        "/api/operations/outage-comms/notices/n1/complete",
+        "/api/operations/outage-comms/notices/n1/cancel",
+        "/api/platform/degradation/check/SITE",
+        "/api/platform/degradation/enter/SITE",
+        "/api/platform/degradation/exit/SITE",
+        "/api/maintain/patch/plan",
+        "/api/maintain/patch/validate",
+        "/api/maintain/patch/approve",
+        "/api/maintain/patch/execute",
+        "/api/maintain/patch/verify",
+        "/api/maintain/software/validate",
+        "/api/maintain/software/plan",
+        "/api/maintain/software/approve/s1",
+        "/api/maintain/software/execute/s1",
+        "/api/maintain/software/verify/s1",
+        "/api/maintain/baseline/check/srv1",
+        "/api/maintain/baseline/remediate/srv1/chk1",
+        "/api/protect/repository-capacity/update/r1",
+        "/api/protect/secrets",
+        "/api/protect/secrets/s1/rotate",
+        "/api/protect/secrets/rotate-all",
+        "/api/protect/secrets/fail",
+        "/api/protect/immutability/check/i1",
+        "/api/protect/immutability/retention-lock/i1",
+        "/api/protect/immutability/air-gap/i1",
+        "/api/protect/immutability/verify-all",
+        "/api/protect/legal-hold/place",
+        "/api/protect/legal-hold/validate/l1",
+        "/api/protect/legal-hold/extend/l1",
+        "/api/protect/legal-hold/release/l1",
+        "/api/observe/synthetic/run/c1",
+        "/api/observe/synthetic/run-all",
+        "/api/observe/logs/onboard",
+        "/api/observe/logs/validate/host1",
+        "/api/observe/logs/verify/host1",
+        "/api/observe/logs/disable/host1",
+        "/api/cmdb/import",
+        "/api/cmdb/reconcile",
+        "/api/cmdb/impact/analyze",
+        "/api/cmdb/servicenow/incident",
+        "/api/cmdb/servicenow/change",
+        "/api/cmdb/servicenow/request",
+        "/api/cmdb/servicenow/validate/x1",
+        "/api/cmdb/servicenow/approve/x1",
+        "/api/cmdb/servicenow/submit/x1",
+        "/api/cmdb/servicenow/cancel/x1",
+        "/api/admin/sites/USNYC/activate",
+        "/api/admin/sites/USNYC/deactivate",
+        "/api/admin/platform-settings",
+        "/api/admin/platform-settings/reset",
+        "/api/analytics/aiops/generate",
+        "/api/analytics/aiops/review/a1",
+        "/api/analytics/aiops/accept/a1",
+        "/api/analytics/aiops/reject/a1",
+        "/api/analytics/aiops/implement/a1",
+        "/api/monitoring/alert-routes",
+        "/api/monitoring/alert-routes/a1",
+        "/api/monitoring/alerts/resolve",
+        "/api/monitoring/zabbix/drift/detect",
+        "/api/monitoring/zabbix/drift/plan/d1",
+        "/api/monitoring/zabbix/drift/execute/d1",
+        "/api/monitoring/zabbix/drift/verify/d1",
+        "/api/monitoring/noise/detect",
+        "/api/monitoring/noise/flapping",
+        "/api/monitoring/noise/suggest/n1",
+        "/api/monitoring/noise/suppress/n1",
+        "/api/monitoring/noise/resolve/n1",
+        "/api/maintain/certificates/request",
+        "/api/maintain/certificates/validate",
+        "/api/maintain/certificates/approve/c1",
+        "/api/maintain/certificates/install/c1",
+        "/api/maintain/certificates/verify/c1",
+        "/api/maintain/certificates/renew/c1",
+        "/api/maintain/certificates/revoke/c1",
+        "/api/vm/day2/plan",
+        "/api/vm/day2/validate",
+        "/api/vm/day2/execute",
+        "/api/vm/day2/verify",
+        "/api/protect/dr/plans",
+        "/api/protect/dr/plans/p1/rpo-rto",
+        "/api/protect/dr/tests/start",
+        "/api/protect/dr/tests/complete",
+        "/api/protect/snapshot/plan",
+        "/api/protect/snapshot/validate",
+        "/api/protect/snapshot/review",
+        "/api/protect/snapshot/flag-stale",
+        "/api/protect/snapshot/remediate",
+        "/api/protect/backup/coverage-report",
+        "/api/protect/backup/restore-plan",
+        "/api/protect/backup/restore-validate",
+        "/api/protect/backup/restore-approve",
+        "/api/protect/backup/restore-execute",
+        "/api/build/k8s/namespaces",
+        "/api/build/k8s/namespaces/n1/quota",
+        "/api/build/k8s/namespaces/n1/suspend",
+        "/api/build/k8s/namespaces/n1/resume",
+        "/api/build/k8s/namespaces/n1/terminate",
+        "/api/build/k8s/validate-name",
+        "/api/build/linux/plan",
+        "/api/build/linux/validate",
+        "/api/build/linux/execute",
+        "/api/build/linux/verify",
+        "/api/build/app-environment/plan",
+        "/api/build/app-environment/validate",
+        "/api/build/app-environment/approve/a1",
+        "/api/build/app-environment/deploy/a1",
+        "/api/build/app-environment/verify/a1",
+        "/api/build/app-environment/retire/a1",
+        "/api/retire/decommission/plan",
+        "/api/retire/decommission/validate",
+        "/api/retire/decommission/approve/d1",
+        "/api/retire/decommission/quarantine/d1",
+        "/api/retire/decommission/execute/d1",
+        "/api/retire/decommission/verify/d1",
+        "/api/retire/decommission/rollback/d1",
+        "/api/maintain/calendar/schedule",
+        "/api/maintain/calendar/cancel/c1",
+        "/api/network/dns/records",
+        "/api/network/dns/records/r1",
+        "/api/network/ipam/reserve",
+        "/api/network/ipam/release/r1",
+        "/api/network/firewall/rules",
+        "/api/network/firewall/rules/r1",
+        "/api/network/firewall/rules/r1/update",
+        "/api/network/firewall/validate",
+        "/api/network/firewall/rule-sets",
+        "/api/network/firewall/rule-sets/r1/apply",
+        "/api/network/firewall/rule-sets/r1/revoke",
+        "/api/network/loadbalancer/vs",
+        "/api/network/loadbalancer/vs/v1/member",
+        "/api/network/loadbalancer/vs/v1/member/host1",
+        "/api/network/loadbalancer/vs/v1/drain",
+        "/api/network/loadbalancer/vs/v1/disable",
+        "/api/network/loadbalancer/vs/v1/enable",
+        "/api/network/loadbalancer/validate-vip",
+        "/api/datacenter/network/reserve-ports",
+        "/api/datacenter/network/reserve-ips",
+        "/api/datacenter/network/release/r1",
+        "/api/datacenter/oob/test/o1",
+        "/api/datacenter/oob/validate-cert/o1",
+        "/api/datacenter/oob/check-defaults/o1",
+        "/api/datacenter/oob/validate-site/SITE",
+        "/api/datacenter/storage/volumes",
+        "/api/datacenter/storage/volumes/v1/extend",
+        "/api/datacenter/storage/volumes/v1/map",
+        "/api/datacenter/storage/volumes/v1/unmap",
+        "/api/datacenter/storage/volumes/v1/retire",
+        "/api/datacenter/storage/check-capacity",
+        "/api/datacenter/hardware/firmware-check/h1",
+        "/api/datacenter/hardware/add",
+        "/api/datacenter/hardware/update-firmware/h1",
+        "/api/datacenter/firmware/check/f1",
+        "/api/datacenter/firmware/exception",
+        "/api/datacenter/firmware/revoke/f1",
+        "/api/datacenter/image-factory/initiate-build",
+        "/api/datacenter/image-factory/run-tests/i1",
+        "/api/datacenter/image-factory/promote/i1",
+        "/api/datacenter/image-factory/reject/i1",
+        "/api/datacenter/image-factory/schedule-monthly",
+    ];
+
+    #[test]
+    fn test_every_mutating_route_resolves_to_a_permission() {
+        for path in MUTATING_ROUTES {
+            let permission = route_permission_for(&Method::POST, path);
+            assert!(
+                !permission.is_empty(),
+                "route {path} resolved to an empty permission"
+            );
+            // Every resolved permission must be one the model recognizes.
+            assert!(
+                ["request", "execute", "approve", "admin"].contains(&permission),
+                "route {path} resolved to unexpected permission {permission}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_mutating_route_fails_closed_to_admin() {
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/totally-new/thing"),
+            "admin"
+        );
+        // A brand-new top-level family also fails closed.
+        assert_eq!(
+            route_permission_for(&Method::DELETE, "/api/something/else/entirely"),
+            "admin"
+        );
+    }
+
+    #[test]
+    fn test_high_risk_routes_resolve_to_expected_permissions() {
+        // emergency / break-glass is admin-only
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/ops/emergency/initiate"),
+            "admin"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/ops/emergency/approve/e1"),
+            "admin"
+        );
+        // rotate-all secrets is admin-only, more specific than /api/protect
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/protect/secrets/rotate-all"),
+            "admin"
+        );
+        // but a regular protect mutation is operator-tier
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/protect/secrets/s1/rotate"),
+            "execute"
+        );
+        // AD delete is operator-tier (execute), not admin
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/identity/ad/delete/host1"),
+            "execute"
+        );
+        // request lifecycle split
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/requests"),
+            "request"
+        );
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/requests/00000000-0000-0000-0000-000000000000/approve"
+            ),
+            "approve"
+        );
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/requests/00000000-0000-0000-0000-000000000000/execute"
+            ),
+            "execute"
+        );
+        // /api/admin family is admin-only
+        assert_eq!(
+            route_permission_for(&Method::PUT, "/api/admin/platform-settings"),
+            "admin"
+        );
+        // a non-emergency ops route is operator-tier (after the emergency carve-out)
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/ops/runbook/start"),
+            "execute"
+        );
+    }
+
+    #[test]
+    fn test_requests_route_permission_splits_correctly() {
+        assert_eq!(requests_route_permission("/api/requests"), Some("request"));
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/validate"),
+            Some("execute")
+        );
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/plan"),
+            Some("execute")
+        );
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/lock"),
+            Some("execute")
+        );
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/execute"),
+            Some("execute")
+        );
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/verify"),
+            Some("execute")
+        );
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/approve"),
+            Some("approve")
+        );
+        // GET /api/requests/{id} would also resolve here, but the gate only runs
+        // for unsafe methods; a request-family mutation never falls back to the
+        // requester tier — it fails toward operator.
+        assert_eq!(
+            requests_route_permission("/api/requests/abc"),
+            Some("execute")
+        );
+        // not a requests path -> None so the static table is consulted
+        assert_eq!(requests_route_permission("/api/identity/ad/prestage"), None);
+    }
+
+    /// Pins the static-dry-run / mock demo: with the superuser model, the
+    /// static_dry_run session (roles=[PlatformAdmin], holds `admin`) must
+    /// satisfy every distinct permission in the route table plus the fail-closed
+    /// default. Guards against a future change to the superuser model silently
+    /// breaking the GitHub Pages / static demo.
+    #[test]
+    fn test_static_dry_run_session_passes_every_route_permission() {
+        let session = AuthSession::static_dry_run();
+        for perm in ["request", "execute", "approve", "admin"] {
+            assert!(
+                ryuki_engine::auth::check_permission(&session, perm),
+                "static-dry-run must satisfy permission {perm}"
+            );
+        }
+        // fail-closed default is "admin"; static-dry-run satisfies it too.
+        assert!(ryuki_engine::auth::check_permission(
+            &session,
+            DEFAULT_ROUTE_PERMISSION
+        ));
+        // And it satisfies every concrete mutating route resolution.
+        for path in MUTATING_ROUTES {
+            let required = route_permission_for(&Method::POST, path);
+            assert!(
+                ryuki_engine::auth::check_permission(&session, required),
+                "static-dry-run must pass route {path} (requires {required})"
+            );
+        }
     }
 }
 

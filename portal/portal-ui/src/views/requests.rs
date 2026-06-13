@@ -1,9 +1,23 @@
 use crate::api::{platform_summary_path, request_list_path, same_origin_api_path};
-use crate::models::RequestSummary;
+use crate::models::{AuthSession, RequestSummary};
 use crate::server_boundary::get_request_list;
+use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
+
+/// Zero-capability session used when no `AuthSession` is in context. An absent
+/// context must HIDE capability-gated controls, never reveal them — so this is
+/// deliberately not `auth_session_fallback` (which carries PlatformAdmin).
+fn no_capability_session() -> AuthSession {
+    AuthSession {
+        user_id: String::new(),
+        display_name: String::new(),
+        roles: Vec::new(),
+        token_valid: false,
+        provider_mode: String::new(),
+    }
+}
 
 fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
@@ -36,14 +50,21 @@ pub fn RequestList() -> impl IntoView {
     let request_list_path_guard = api_path(request_list_path());
     let list_resource = Resource::new(|| (), |_| get_request_list());
     let navigate = use_navigate();
+    // The verified session is provided by AuthenticatedShell (app.rs). An
+    // absent context falls back to a zero-capability session so the control
+    // is hidden rather than shown.
+    let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
+    let can_request = session_can(&session, "request");
 
     view! {
         <div class="request-list-view">
             <div class="request-list-toolbar">
                 <h2 id="request-list-title">"Requests"</h2>
-                <a class="btn btn-primary" href="/requests/new">
-                    "New Request"
-                </a>
+                <Show when=move || can_request>
+                    <a class="btn btn-primary" href="/requests/new">
+                        "New Request"
+                    </a>
+                </Show>
             </div>
 
             <Suspense fallback=move || {

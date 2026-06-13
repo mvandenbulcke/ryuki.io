@@ -1,9 +1,23 @@
 use crate::api::{platform_summary_path, request_create_path, same_origin_api_path};
-use crate::models::CreateRequestPayload;
+use crate::models::{AuthSession, CreateRequestPayload};
 use crate::server_boundary::create_request;
+use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
+
+/// Zero-capability session used when no `AuthSession` is in context. An absent
+/// context must HIDE the submit affordance, never reveal it — so this is
+/// deliberately not `auth_session_fallback` (which carries PlatformAdmin).
+fn no_capability_session() -> AuthSession {
+    AuthSession {
+        user_id: String::new(),
+        display_name: String::new(),
+        roles: Vec::new(),
+        token_valid: false,
+        provider_mode: String::new(),
+    }
+}
 
 fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
@@ -56,6 +70,38 @@ const ENVIRONMENT_OPTIONS: &[(&str, &str)] = &[
 pub fn RequestCreate() -> impl IntoView {
     let create_path_guard = api_path(request_create_path());
     let navigate = use_navigate();
+    // The verified session is provided by AuthenticatedShell (app.rs). A user
+    // who reaches /requests/new without the "request" capability sees a
+    // read-only notice rather than a form that would 403 on submit.
+    let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
+    let can_request = session_can(&session, "request");
+
+    if !can_request {
+        return view! {
+            <article
+                class="request-create-panel"
+                aria-labelledby="request-create-title"
+                data-api-path=create_path_guard
+            >
+                <div class="request-create-head">
+                    <div>
+                        <span class="eyebrow">"Requests"</span>
+                        <h2 id="request-create-title">"New Request"</h2>
+                    </div>
+                    <a class="btn btn-secondary" href="/requests">
+                        "Back to list"
+                    </a>
+                </div>
+                <div class="request-create-denied" role="alert">
+                    <p>"Insufficient permission"</p>
+                    <p class="table-note">
+                        "Your role cannot file requests. Filing a request requires the request capability."
+                    </p>
+                </div>
+            </article>
+        }
+        .into_any();
+    }
 
     #[allow(deprecated)]
     let (request_type, set_request_type) = create_signal("server-deployment".to_string());
@@ -272,6 +318,7 @@ pub fn RequestCreate() -> impl IntoView {
             </div>
         </article>
     }
+    .into_any()
 }
 
 #[cfg(test)]
