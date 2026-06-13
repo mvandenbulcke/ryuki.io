@@ -10172,25 +10172,109 @@ async fn certificate_lifecycle_contract() -> Json<Value> {
 
 // ─── Alert routing handlers ───
 
+/// One persisted `alert_routes` row (migration 008). `to_json` reproduces the
+/// engine `AlertRoute` serialization (id and timestamps as strings) so a DB row
+/// is indistinguishable from the in-memory shape on read.
+#[derive(sqlx::FromRow)]
+struct AlertRouteRow {
+    id: uuid::Uuid,
+    trigger_name: String,
+    severity: String,
+    host_group: String,
+    support_group: String,
+    priority: String,
+    enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl AlertRouteRow {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id.to_string(),
+            "trigger_name": self.trigger_name,
+            "severity": self.severity,
+            "host_group": self.host_group,
+            "support_group": self.support_group,
+            "priority": self.priority,
+            "enabled": self.enabled,
+            "created_at": self.created_at.to_rfc3339(),
+            "updated_at": self.updated_at.to_rfc3339(),
+        })
+    }
+}
+
+const ALERT_ROUTE_COLUMNS: &str = "id, trigger_name, severity, host_group, \
+     support_group, priority, enabled, created_at, updated_at";
+
 async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiResult {
-    match alert_routing_engine::build_alert_route(
+    // Validate + construct via the engine (severity/priority vocab enforced).
+    let route = alert_routing_engine::build_alert_route(
         &body.trigger_name,
         &body.severity,
         &body.host_group,
         &body.support_group,
         &body.priority,
-    ) {
-        Ok(route) => Ok(Json(serde_json::to_value(route).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    )
+    .map_err(|e| status_400(&e))?;
+
+    // Durable path: persist to the `alert_routes` table and return the stored
+    // row so the response matches the DB exactly (survives restart).
+    if let Some(pool) = get_db() {
+        let uid = uuid::Uuid::parse_str(&route.id).map_err(|e| status_400(&e.to_string()))?;
+        let row: AlertRouteRow = sqlx::query_as(&format!(
+            "INSERT INTO alert_routes \
+                (id, trigger_name, severity, host_group, support_group, priority, enabled) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {ALERT_ROUTE_COLUMNS}"
+        ))
+        .bind(uid)
+        .bind(&route.trigger_name)
+        .bind(&route.severity)
+        .bind(&route.host_group)
+        .bind(&route.support_group)
+        .bind(&route.priority)
+        .bind(route.enabled)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(row.to_json()));
     }
+    // No-DB fallback: build_alert_route already pushed onto the engine static.
+    Ok(Json(serde_json::to_value(route).unwrap()))
 }
 
 async fn alert_routes_list() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<AlertRouteRow> = sqlx::query_as(&format!(
+            "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes ORDER BY created_at, id"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let routes: Vec<Value> = rows.iter().map(AlertRouteRow::to_json).collect();
+        return Json(json!(routes));
+    }
     let routes = alert_routing_engine::list_routes();
     Json(serde_json::to_value(routes).unwrap())
 }
 
 async fn alert_routes_get(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let Ok(uid) = uuid::Uuid::parse_str(&id) else {
+            return Err(status_404(&id));
+        };
+        let row: Option<AlertRouteRow> = sqlx::query_as(&format!(
+            "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        return match row {
+            Some(route) => Ok(Json(route.to_json())),
+            None => Err(status_404(&id)),
+        };
+    }
     match alert_routing_engine::get_route(&id) {
         Some(route) => Ok(Json(serde_json::to_value(route).unwrap())),
         None => Err(status_404(&id)),
