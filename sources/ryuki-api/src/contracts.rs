@@ -203,6 +203,7 @@ pub fn routes() -> Router {
             "/api/catalog/secret-references",
             get(catalog_secret_references),
         )
+        .route("/api/approvals/pending", get(approvals_pending))
         .route(
             "/api/approvals/decision-readiness-contract",
             get(approvals_decision_readiness),
@@ -3662,6 +3663,76 @@ async fn approvals_decision_readiness() -> Json<Value> {
             {"id":"raw-approval-data-not-exposed","decision":"block","requirement":"Approval readiness evidence must use safe summaries only and must not expose approver records, raw approval payloads, raw request payloads, raw recipient data, raw provider payloads, raw logs, raw rows, tenant IDs, object IDs, principal IDs, group IDs, ServiceNow identifiers, private network values, credentials, or tokens.","evidence":"Approval evidence references"}
         ]
     }))
+}
+
+/// Returns the list of requests pending approval by the calling approver.
+///
+/// A request is "pending my approval" iff ALL hold:
+///   1. `status = 'planned'` (the only approvable from-state), AND
+///   2. NO decision row exists in `request_approval_decisions` for `(request_id, role)`.
+///
+/// NOTE: The `approval_route @>` containment filter is intentionally NOT applied here.
+/// The request lifecycle does not populate `approval_route` with canonical role constants
+/// before the approval step: new requests start with `approval_route = []` and the plan
+/// transition does not push any role into it. Filtering on `approval_route` would therefore
+/// return nothing for real data. Per-request approver-type routing is a documented follow-up
+/// (resolve the display-vs-canonical role-string mismatch and have the lifecycle push
+/// canonical roles into `approval_route` per required-approver-per-type if that model is
+/// adopted). Until then, an approver's inbox = all planned requests they have not yet decided.
+///
+/// The role constant `$1` IS used in the `NOT EXISTS` sub-query — that sub-query is correct
+/// because the approve/reject handlers write `request_approval_decisions` rows keyed on the
+/// same `approval_role_for` canonical constant.
+///
+/// CRITICAL AUTHZ NOTE: this is a GET, so the central read middleware admits any
+/// "request"/"audit" role holder through (it treats all non-sensitive GETs as ordinary
+/// reads). The `approve`-only requirement MUST be enforced here in the handler — exactly
+/// mirroring `requests_approve` and `requests_reject`.
+async fn approvals_pending(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    // In-handler approver gate: enforced here because the central read gate
+    // does NOT apply the `approve` tier to GET requests (see auth_middleware).
+    if !check_permission(&session, "approve") {
+        return Err(status_403());
+    }
+
+    let role = approval_role_for(&session);
+
+    if let Some(pool) = get_db() {
+        let rows: Vec<DbRequestRow> = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests \
+             WHERE status = 'planned' \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM request_approval_decisions rad \
+                   WHERE rad.request_id = requests.id AND rad.role = $1 \
+               ) \
+             ORDER BY created_at ASC"
+        ))
+        .bind(&role)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let summaries: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "request_id": r.id.to_string(),
+                    "request_type": r.request_type,
+                    "status": r.status,
+                    "name": r.name,
+                    "site": r.site,
+                    "environment": r.environment,
+                    "stage": r.stage,
+                    "created_at": r.created_at.to_rfc3339()
+                })
+            })
+            .collect();
+        return Ok(Json(json!(summaries)));
+    }
+
+    // No-DB fallback: the in-memory store has no decision-ledger, so decision-exclusion
+    // cannot be evaluated. Per the design, return an empty array (must not error).
+    Ok(Json(json!([])))
 }
 
 async fn identity_rbac_approval_model() -> Json<Value> {
@@ -15955,6 +16026,74 @@ mod unit_tests {
         assert_eq!(validate["to_status"], "validated");
         assert_eq!(validate["to_stage"], "validate");
     }
+
+    // ─── approvals_pending ───
+
+    /// T1 (RED→GREEN): A Requester (no "approve" permission) calling
+    /// `approvals_pending` must receive 403 FORBIDDEN.
+    /// This guards the critical in-handler AuthZ gate (central read middleware
+    /// passes GET /api/approvals/pending as an ordinary read for "request"/"audit"
+    /// roles — the 403 MUST be enforced inside the handler).
+    #[tokio::test]
+    async fn approvals_pending_forbidden_for_requester() {
+        let requester =
+            single_role_session("req-pending-1", ryuki_engine::auth::APP_ROLE_REQUESTER);
+        let result = approvals_pending(AuthExtractor(requester)).await;
+        let Err((status, _)) = result else {
+            panic!("a Requester must be forbidden from approvals_pending");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// T1 (TRIANGULATE): An Auditor (no "approve" permission) also gets 403.
+    #[tokio::test]
+    async fn approvals_pending_forbidden_for_auditor() {
+        let auditor = single_role_session("aud-pending-1", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let result = approvals_pending(AuthExtractor(auditor)).await;
+        let Err((status, _)) = result else {
+            panic!("an Auditor must be forbidden from approvals_pending");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// T2 (RED→GREEN): A DatacenterApprover calling `approvals_pending` in
+    /// no-DB mode must receive an empty array — must NOT error.
+    /// (No-DB mode has no decision-ledger; per the design, we return `[]`.)
+    #[tokio::test]
+    async fn approvals_pending_empty_in_no_db_mode() {
+        let approver = single_role_session(
+            "appr-pending-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let result = approvals_pending(AuthExtractor(approver)).await;
+        let Ok(Json(body)) = result else {
+            panic!("approver must receive Ok in no-DB mode, not an error");
+        };
+        // Must be a JSON array (possibly empty).
+        assert!(
+            body.as_array().is_some(),
+            "response body must be a JSON array; got: {body}"
+        );
+        // The no-DB path returns [] unconditionally: the in-memory store has no
+        // decision-ledger, so the `NOT EXISTS (decision)` predicate cannot be
+        // evaluated and the handler returns an empty array by design. Asserting
+        // is_array() is the real behavioral assertion: the function ran and
+        // produced an array.
+    }
+
+    // T3 and T4 are DB-backed integration tests that verify the full SQL predicate.
+    // This test module has no live-DB harness (unit_tests uses the in-memory store
+    // only); the DB-backed variants are in `db_lifecycle_tests` where a real pool
+    // is available.  These are kept here as documentation stubs so the spec's
+    // AC1/AC2 have named coverage points.
+    //
+    // T3: DatacenterApprover sees a planned request (empty approval_route, as the
+    //     real lifecycle produces) with no decision row for their role → request_id
+    //     appears with correct shape.
+    //     [db test: test_approvals_pending_returns_matching_request — in db_lifecycle_tests]
+    //
+    // T4: Same request after a decision row is inserted → request ABSENT.
+    //     [db test: test_approvals_pending_excludes_decided_request — in db_lifecycle_tests]
 }
 
 /// Live-DB integration tests for the transactional/CAS lifecycle (B2), logout
@@ -16693,6 +16832,141 @@ mod db_lifecycle_tests {
         assert_eq!(decision, "rejected");
         assert_eq!(reason.as_deref(), Some("policy violation"));
         assert_eq!(read_global_row(pool, id).await.status, "rejected");
+
+        cleanup_request(pool, id).await;
+    }
+
+    // ─── approvals_pending — DB-backed integration tests (T3 / T4) ───
+
+    fn dc_approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s.roles = vec![ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string()];
+        s
+    }
+
+    /// Seeds a request row in 'planned' status with an EMPTY approval_route,
+    /// matching real request behaviour: the lifecycle starts with `approval_route = []`
+    /// and does not populate it with canonical roles before the approval step.
+    /// This is the correct fixture for testing the approvals_pending inbox query.
+    async fn seed_planned_empty_route(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let approval_route = serde_json::json!([]);
+        sqlx::query(
+            "INSERT INTO requests \
+             (id, request_type, status, stage, site, environment, name, cpu, memory_gb, \
+              created_by, approval_route) \
+             VALUES ($1, 'server-deployment', 'planned', 'approve', 'DEFRA', 'production', \
+                     'pending-test', 2, 4, 'requester-db', $2)",
+        )
+        .bind(id)
+        .bind(&approval_route)
+        .execute(pool)
+        .await
+        .expect("seed planned request with empty approval_route");
+        id
+    }
+
+    /// T3 (AC1): A DatacenterApprover sees a planned request that has an EMPTY
+    /// approval_route (as real requests do after planning) and has no decision row.
+    ///
+    /// This is the correct happy-path fixture: if the old `approval_route @>`
+    /// containment filter were re-introduced, this test would fail (RED) because
+    /// a request with `approval_route = []` would never match the containment check.
+    /// With the fixed predicate (NOT EXISTS only), it passes (GREEN).
+    ///
+    /// Skips when RYUKI_DATABASE_URL is unset (no live-DB harness in CI).
+    #[tokio::test]
+    async fn test_approvals_pending_returns_matching_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let id = seed_planned_empty_route(pool).await;
+        let session = dc_approver_session("approver-t3");
+
+        let Ok(Json(body)) = approvals_pending(AuthExtractor(session)).await else {
+            cleanup_request(pool, id).await;
+            panic!("approvals_pending must return Ok for a DatacenterApprover");
+        };
+
+        let items = body.as_array().expect("response must be a JSON array");
+        let found = items
+            .iter()
+            .any(|item| item["request_id"].as_str() == Some(&id.to_string()));
+        assert!(
+            found,
+            "pending request {id} must appear in approvals_pending response; got: {items:?}"
+        );
+        // AC6: verify summary shape contains all required keys.
+        if let Some(item) = items
+            .iter()
+            .find(|i| i["request_id"].as_str() == Some(&id.to_string()))
+        {
+            assert_eq!(item["status"], "planned", "AC6: status must be 'planned'");
+            assert!(
+                item.get("request_type").is_some(),
+                "AC6: request_type missing"
+            );
+            assert!(item.get("name").is_some(), "AC6: name missing");
+            assert!(item.get("site").is_some(), "AC6: site missing");
+            assert!(
+                item.get("environment").is_some(),
+                "AC6: environment missing"
+            );
+            assert!(item.get("stage").is_some(), "AC6: stage missing");
+            assert!(item.get("created_at").is_some(), "AC6: created_at missing");
+        }
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// T4 (AC2): A request already decided by that role (decision row exists) is
+    /// EXCLUDED from the approvals_pending response, even when approval_route is empty
+    /// (matching real data). Exclusion is driven solely by the decision row.
+    /// Skips when RYUKI_DATABASE_URL is unset.
+    #[tokio::test]
+    async fn test_approvals_pending_excludes_decided_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let role = ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER;
+        // Seed with empty approval_route (real state) — exclusion is via decision row only.
+        let id = seed_planned_empty_route(pool).await;
+
+        // Insert a decision row for this request + role → it must be excluded.
+        sqlx::query(
+            "INSERT INTO request_approval_decisions \
+             (request_id, role, decision, actor) \
+             VALUES ($1, $2, 'approved', 'approver-t4')",
+        )
+        .bind(id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("seed decision row");
+
+        let session = dc_approver_session("approver-t4");
+        let Ok(Json(body)) = approvals_pending(AuthExtractor(session)).await else {
+            cleanup_request(pool, id).await;
+            panic!("approvals_pending must return Ok even when all requests are excluded");
+        };
+
+        let items = body.as_array().expect("response must be a JSON array");
+        let found = items
+            .iter()
+            .any(|item| item["request_id"].as_str() == Some(&id.to_string()));
+        assert!(
+            !found,
+            "decided request {id} must NOT appear in approvals_pending; got: {items:?}"
+        );
 
         cleanup_request(pool, id).await;
     }
