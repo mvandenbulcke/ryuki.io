@@ -141,6 +141,16 @@ impl UpstreamClient {
             .await
     }
 
+    /// DELETE an allowlisted API path, forwarding the session id when present.
+    pub async fn delete(
+        &self,
+        path: &str,
+        session_id: Option<&str>,
+    ) -> Result<UpstreamResponse, UpstreamUnreachable> {
+        self.dispatch(self.http.delete(self.url(path)), session_id)
+            .await
+    }
+
     /// POST an allowlisted API path with an optional JSON body.
     pub async fn post(
         &self,

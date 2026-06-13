@@ -1506,6 +1506,55 @@ tbody tr:hover {
   gap: 10px;
 }
 
+/* ── Token administration ───────────────────────────────────── */
+.role-multiselect {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 4px 0 6px;
+}
+
+.role-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.role-option input {
+  accent-color: var(--accent);
+}
+
+.token-secret-callout {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--accent-glow);
+}
+
+.token-secret-callout strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.token-secret-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.token-secret-value {
+  flex: 1 1 280px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
 .branding-section {
   display: grid;
   gap: 14px;

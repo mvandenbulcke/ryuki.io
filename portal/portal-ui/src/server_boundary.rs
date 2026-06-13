@@ -1,27 +1,29 @@
 use crate::api::{
     activity_operation_queue_path, admin_feature_flag_governance_path,
     admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
-    admin_worker_capability_path, approval_decision_readiness_path, auth_local_login_path,
-    auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
-    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
-    catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
-    cmdb_reconciliation_path, cmdb_relationship_graph_path, datacenter_check_cooling_path,
-    datacenter_check_power_path, datacenter_check_rack_space_path,
-    datacenter_check_switchports_path, datacenter_failing_checks_path,
-    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
-    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
-    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
-    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
-    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
-    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
+    admin_sessions_path, admin_tokens_path, admin_worker_capability_path,
+    approval_decision_readiness_path, auth_local_login_path, auth_local_logout_path,
+    auth_login_path, auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
+    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
+    cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
+    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
+    datacenter_check_rack_space_path, datacenter_check_switchports_path,
+    datacenter_failing_checks_path, datacenter_full_readiness_path,
+    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
+    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
+    evidence_export_retention_path, evidence_summary_path, inventory_ownership_risk_path,
+    inventory_resource_overview_path, operation_runs_path, operations_platform_health_path,
+    operations_runbook_launch_path, platform_health_path, platform_status_path,
+    platform_summary_path, policy_outcomes_path, request_create_path,
     request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    request_approve_path, request_detail_path, request_execute_path, request_lock_path,
-    request_plan_path, request_validate_path, request_verify_path,
+    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_detail_path,
+    request_execute_path, request_lock_path, request_plan_path, request_validate_path,
+    request_verify_path,
 };
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -33,6 +35,8 @@ use crate::api_client::{
 use crate::models::platform_settings_summary_fallback;
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
+#[cfg(any(feature = "ssr", test))]
+use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
 use crate::models::{
     actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
@@ -47,15 +51,18 @@ use crate::models::{
     datacenter_sites_catalog_fallback, dry_run_plan_fallbacks, evidence_summary_fallbacks,
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
-    secret_reference_fallbacks, ActivityQueueSummary, AuthSession, CapacityAdmissionSummary,
-    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
-    CreateRequestPayload, DatacenterFailingChecksSummary, DatacenterFullReadiness,
-    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
-    DryRunPlanSummary, EvidenceSummary, InventoryResourceSummary, OperationRunSummary,
-    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
-    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
-    RequestIntakeSummary, RequestSummary, SecretReferenceSummary, StageActionResponse,
+    secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
+    AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary, CmdbReconciliationSummary,
+    CmdbRelationshipSummary, CreateRequestPayload, CreateTokenPayload, CreateTokenResult,
+    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
+    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
+    EvidenceSummary, InventoryResourceSummary, OperationRunSummary, PlatformHealth,
+    PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
+    PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
+    RequestSummary, RevokeResult, SecretReferenceSummary, StageActionResponse,
 };
+#[cfg(feature = "ssr")]
+use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
 #[cfg(feature = "ssr")]
 use crate::models::{request_detail_fallback, request_summary_fallbacks};
 #[cfg(feature = "ssr")]
@@ -111,6 +118,8 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     admin_rbac_roles_path,
     admin_platform_settings_path,
     admin_platform_settings_reset_path,
+    admin_tokens_path,
+    admin_sessions_path,
     secret_references_path,
     policy_outcomes_path,
     evidence_summary_path,
@@ -230,6 +239,43 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
     )
 }
 
+/// Validates `/api/admin/tokens/{id}` and `/api/admin/sessions/{id}` — the
+/// revoke paths that carry an id and so cannot live in the static allowlist.
+/// Only a single safe id segment is accepted; the resource collection (no id)
+/// is validated through the static allowlist instead.
+fn is_allowed_admin_resource_revoke_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/admin/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(resource) = segments.next() else {
+        return false;
+    };
+    if !matches!(resource, "tokens" | "sessions") {
+        return false;
+    }
+    let Some(id) = segments.next() else {
+        return false;
+    };
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains("..")
+        || id.contains('\\')
+        || id.contains('?')
+        || id.contains('#')
+        || id.contains("://")
+        || id.starts_with("//")
+        || !id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return false;
+    }
+    // Exactly `/{resource}/{id}` — no trailing segments.
+    segments.next().is_none()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalBoundaryError {
     ApiPath(ApiPathError),
@@ -289,6 +335,19 @@ impl PortalServerBoundary {
     ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if is_allowed_request_lifecycle_path(guarded) {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    /// Validates the id-bearing admin revoke paths (`/api/admin/tokens/{id}`,
+    /// `/api/admin/sessions/{id}`) before a DELETE is dispatched.
+    pub fn validate_admin_resource_revoke_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_admin_resource_revoke_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -1280,6 +1339,220 @@ pub async fn reset_platform_settings() -> Result<PlatformSettingsSummary, Server
     reject_static_preview_platform_settings_reset()
 }
 
+/// Validation message for an unknown role in the create-token form. The check
+/// runs portal-side first (the API repeats it authoritatively) so the operator
+/// gets immediate feedback without a round trip. Returns the offending role.
+#[cfg(any(feature = "ssr", test))]
+fn first_unknown_role(roles: &[String]) -> Option<String> {
+    roles
+        .iter()
+        .find(|role| !ALL_APP_ROLES.contains(&role.as_str()))
+        .cloned()
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_token_create(
+    payload: &CreateTokenPayload,
+) -> Result<CreateTokenResult, ServerFnError> {
+    let _ = payload;
+    Err(ServerFnError::new(
+        "Portal token creation is preview-only in static dry-run mode; no token was minted",
+    ))
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_revoke(action: &str) -> Result<RevokeResult, ServerFnError> {
+    Err(ServerFnError::new(format!(
+        "Portal {action} revoke is preview-only in static dry-run mode; nothing was revoked"
+    )))
+}
+
+/// `GET /api/admin/tokens` — list API token metadata (hash redacted). The
+/// handler still expects the API to gate on the `admin` permission; in static
+/// mode it returns labeled synthetic rows.
+#[server(prefix = "/portal/api", endpoint = "admin-tokens-list")]
+pub async fn load_admin_tokens() -> Result<Vec<AdminTokenSummary>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(admin_tokens_path())
+        .map_err(|_| ServerFnError::new("admin tokens API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(admin_token_summary_fallbacks());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let mut tokens: Vec<AdminTokenSummary> = response
+                .json()
+                .map_err(|_| ServerFnError::new("admin tokens response was malformed"))?;
+            // Defense-in-depth: even if a future API leak attached a hash, the
+            // portal type cannot carry it — but explicitly drop any scope
+            // strings that are empty so the UI renders a clean "—".
+            for token in &mut tokens {
+                token.site_scope = token.site_scope.take().filter(|s| !s.is_empty());
+                token.environment_scope = token.environment_scope.take().filter(|s| !s.is_empty());
+            }
+            Ok(tokens)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "admin tokens fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// `POST /api/admin/tokens` — mint a token. The 201 response carries the
+/// one-time plaintext secret, which is returned to the caller component
+/// exactly once and never persisted. Mutations never degrade to fallbacks.
+#[server(prefix = "/portal/api", endpoint = "admin-tokens-create")]
+pub async fn create_admin_token(
+    payload: CreateTokenPayload,
+) -> Result<CreateTokenResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(admin_tokens_path())
+        .map_err(|_| ServerFnError::new("admin tokens API path failed same-origin guard"))?;
+    if let Some(role) = first_unknown_role(&payload.roles) {
+        return Err(ServerFnError::new(format!("Unknown role: {role}")));
+    }
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_token_create(&payload);
+    }
+    let body = serde_json::json!({
+        "name": payload.name,
+        "owner_principal": payload.owner_principal,
+        "roles": payload.roles,
+        "site_scope": payload.site_scope,
+        "environment_scope": payload.environment_scope,
+        "expires_at": payload.expires_at,
+    });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(path, Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "token creation was rejected by the API",
+        )));
+    }
+    // The create body interleaves the row metadata with the one-time `token`.
+    // Parse the metadata via the redacted type (so any hash is dropped) and
+    // pull the plaintext out separately.
+    let value: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("token create response was malformed"))?;
+    let token = value
+        .get("token")
+        .and_then(|token| token.as_str())
+        .ok_or_else(|| ServerFnError::new("token create response did not include the secret"))?
+        .to_string();
+    let metadata: AdminTokenSummary = serde_json::from_value(value)
+        .map_err(|_| ServerFnError::new("token create metadata was malformed"))?;
+    Ok(CreateTokenResult { token, metadata })
+}
+
+/// `DELETE /api/admin/tokens/{id}` — revoke (soft-delete) a token.
+#[server(prefix = "/portal/api", endpoint = "admin-tokens-revoke")]
+pub async fn revoke_admin_token(token_id: String) -> Result<RevokeResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = admin_token_revoke_path(&token_id)
+        .map_err(|_| ServerFnError::new("admin token revoke API path failed same-origin guard"))?;
+    boundary
+        .validate_admin_resource_revoke_path(&path)
+        .map_err(|_| ServerFnError::new("admin token revoke API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_revoke("token");
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .delete(&path, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "token revoke was rejected by the API",
+        )));
+    }
+    Ok(RevokeResult {
+        status: "revoked".to_string(),
+        id: token_id,
+    })
+}
+
+/// `GET /api/admin/sessions` — list active sessions. Static mode returns a
+/// labeled synthetic row.
+#[server(prefix = "/portal/api", endpoint = "admin-sessions-list")]
+pub async fn load_admin_sessions() -> Result<Vec<AdminSessionSummary>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(admin_sessions_path())
+        .map_err(|_| ServerFnError::new("admin sessions API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(admin_session_summary_fallbacks());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let sessions: Vec<AdminSessionSummary> = response
+                .json()
+                .map_err(|_| ServerFnError::new("admin sessions response was malformed"))?;
+            Ok(sessions)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "admin sessions fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// `DELETE /api/admin/sessions/{id}` — admin revoke of ANY session (closes the
+/// self-only `auth_logout` gap). Hard-delete server-side; mutation never
+/// degrades.
+#[server(prefix = "/portal/api", endpoint = "admin-sessions-revoke")]
+pub async fn revoke_admin_session(
+    session_target_id: String,
+) -> Result<RevokeResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = admin_session_revoke_path(&session_target_id).map_err(|_| {
+        ServerFnError::new("admin session revoke API path failed same-origin guard")
+    })?;
+    boundary
+        .validate_admin_resource_revoke_path(&path)
+        .map_err(|_| {
+            ServerFnError::new("admin session revoke API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_revoke("session");
+    }
+    // Forward the caller's own session id so the API gate authenticates the
+    // admin; the target session to delete is carried in the path.
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .delete(&path, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "session revoke was rejected by the API",
+        )));
+    }
+    Ok(RevokeResult {
+        status: "revoked".to_string(),
+        id: session_target_id,
+    })
+}
+
 #[server(prefix = "/portal/api", endpoint = "platform-status")]
 pub async fn get_platform_status() -> Result<PlatformStatus, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
@@ -1761,6 +2034,88 @@ mod tests {
         assert_ne!(
             admin_platform_settings_path(),
             admin_platform_settings_reset_path()
+        );
+    }
+
+    #[test]
+    fn boundary_allows_admin_token_and_session_collection_routes() {
+        let boundary = PortalServerBoundary::static_dry_run();
+
+        assert_eq!(
+            boundary.validate_platform_api_path(crate::api::admin_tokens_path()),
+            Ok("/api/admin/tokens")
+        );
+        assert_eq!(
+            boundary.validate_platform_api_path(crate::api::admin_sessions_path()),
+            Ok("/api/admin/sessions")
+        );
+    }
+
+    #[test]
+    fn boundary_validates_admin_revoke_paths_and_rejects_traversal() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let id = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+
+        for path in [
+            admin_token_revoke_path(id).expect("token revoke path must build"),
+            admin_session_revoke_path(id).expect("session revoke path must build"),
+        ] {
+            assert_eq!(
+                boundary.validate_admin_resource_revoke_path(&path),
+                Ok(path.as_str())
+            );
+        }
+
+        for path in [
+            "/api/admin/tokens",
+            "/api/admin/sessions",
+            "/api/admin/tokens/",
+            "/api/admin/tokens/../platform-settings",
+            "/api/admin/tokens/id/extra",
+            "/api/admin/rbac-roles/id",
+            "/api/admin/sessions/id?x=1",
+        ] {
+            assert_eq!(
+                boundary.validate_admin_resource_revoke_path(path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {path} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn create_admin_token_refuses_static_preview_persistence() {
+        let payload = CreateTokenPayload {
+            name: "ci-deployer".to_string(),
+            owner_principal: "svc:ci".to_string(),
+            roles: vec!["VMwareOperator".to_string()],
+            site_scope: None,
+            environment_scope: None,
+            expires_at: None,
+        };
+        let result = reject_static_preview_token_create(&payload);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("preview-only"));
+    }
+
+    #[test]
+    fn admin_revoke_refuses_static_preview_persistence() {
+        for action in ["token", "session"] {
+            let result = reject_static_preview_revoke(action);
+            assert!(result.is_err());
+            assert!(result.unwrap_err().to_string().contains("preview-only"));
+        }
+    }
+
+    #[test]
+    fn unknown_role_detection_matches_app_role_catalog() {
+        assert_eq!(
+            first_unknown_role(&["VMwareOperator".to_string(), "Auditor".to_string()]),
+            None
+        );
+        assert_eq!(
+            first_unknown_role(&["VMwareOperator".to_string(), "NotARole".to_string()]),
+            Some("NotARole".to_string())
         );
     }
 
@@ -2343,5 +2698,38 @@ mod tests {
                 .any(|(path, _)| path == "/portal/api/request-intake-form"),
             "request intake form server function must stay under the portal-owned route"
         );
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn admin_token_and_session_server_functions_register_portal_routes() {
+        let registered: Vec<&str> = leptos::server_fn::axum::server_fn_paths()
+            .map(|(path, _)| path)
+            .collect();
+        for endpoint in [
+            "/portal/api/admin-tokens-list",
+            "/portal/api/admin-tokens-create",
+            "/portal/api/admin-tokens-revoke",
+            "/portal/api/admin-sessions-list",
+            "/portal/api/admin-sessions-revoke",
+        ] {
+            assert!(
+                registered.contains(&endpoint),
+                "{endpoint} must register under the portal-owned route"
+            );
+        }
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn admin_token_fallbacks_carry_no_executable_credential() {
+        // Static-preview rows must never imply an executable machine
+        // credential: token_valid is false for every synthetic row.
+        for token in admin_token_summary_fallbacks() {
+            assert!(
+                !token.token_valid,
+                "static token fallback must not be executable"
+            );
+        }
     }
 }

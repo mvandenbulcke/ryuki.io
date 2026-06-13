@@ -1,11 +1,12 @@
 use crate::api::same_origin_api_path;
 use crate::api::{
     activity_operation_queue_path, admin_platform_settings_path, admin_rbac_roles_path,
-    approval_decision_readiness_path, auth_status_path, boundary_status_path,
-    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
-    emergency_change_path, evidence_export_retention_path, operations_platform_health_path,
-    operations_runbook_launch_path, platform_health_path, platform_status_path,
-    platform_summary_path, request_intake_form_preview_path, shift_queue_path, site_catalog_path,
+    admin_sessions_path, admin_tokens_path, approval_decision_readiness_path, auth_status_path,
+    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
+    catalog_request_form_path, emergency_change_path, evidence_export_retention_path,
+    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
+    platform_status_path, platform_summary_path, request_intake_form_preview_path,
+    shift_queue_path, site_catalog_path,
 };
 use crate::api_client::{
     cmdb_file_exchange_resource, cmdb_reconciliation_resource, cmdb_relationship_graph_resource,
@@ -16,21 +17,24 @@ use crate::models::{
     audit_gate_fallbacks, audit_workflow_fallbacks, auth_session_fallback,
     catalog_contract_fallbacks, catalog_readiness_fallbacks, operation_run_fallbacks,
     platform_settings_summary_fallback, rbac_role_summary_fallbacks, request_intake_form_fallback,
-    AuthSession, PlatformSettingsSummary,
+    AdminSessionSummary, AdminTokenSummary, AuthSession, CreateTokenPayload,
+    PlatformSettingsSummary, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
-    get_admin_platform_settings, get_auth_session, get_boundary_status, get_platform_health,
-    get_platform_status, load_portal_activity_run_state, load_portal_evidence_summary_status,
-    load_portal_inventory_capacity_status, reset_platform_settings, save_platform_settings,
-    PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
-    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
-    PortalSecretReferenceSnapshot, PortalServerBoundary,
+    create_admin_token, get_admin_platform_settings, get_auth_session, get_boundary_status,
+    get_platform_health, get_platform_status, load_admin_sessions, load_admin_tokens,
+    load_portal_activity_run_state, load_portal_evidence_summary_status,
+    load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
+    revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
+    PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
+    PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
+    PortalServerBoundary,
 };
 use crate::views::dashboard::DashboardView;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
 use crate::views::requests::RequestList;
-use crate::workspace_catalog::{role_satisfies, PRIMARY_WORKSPACES};
+use crate::workspace_catalog::{role_satisfies, session_can, PRIMARY_WORKSPACES};
 use leptos::prelude::*;
 
 fn api_path(path: &'static str) -> &'static str {
@@ -254,9 +258,16 @@ pub fn OperationsWorkspaceView() -> impl IntoView {
     }
 }
 
-/// `/admin` — platform settings, security posture, and secret references.
+/// `/admin` — platform settings, security posture, secret references, and
+/// (for `admin`-capability sessions) token + session administration.
 #[component]
 pub fn AdminWorkspaceView() -> impl IntoView {
+    // The admin workspace card is already role-gated to PlatformAdmin via the
+    // catalog; the token/session panels are gated again on the `admin`
+    // capability so non-admins never see them even if the route is reached.
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let is_admin = session_can(&auth_session, "admin");
+
     view! {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="admin"/>
@@ -264,6 +275,10 @@ pub fn AdminWorkspaceView() -> impl IntoView {
                 <AdminSettingsDetail/>
                 <SecurityWorkspaceDetail/>
                 <SecretReferenceWorkspaceDetail/>
+                <Show when=move || is_admin fallback=|| ()>
+                    <TokenAdministrationDetail/>
+                    <SessionAdministrationDetail/>
+                </Show>
             </section>
         </div>
     }
@@ -1676,6 +1691,541 @@ fn AdminSettingsDetail() -> impl IntoView {
                                             }
                                         })
                                         .collect_view()}
+                                </div>
+                            </div>
+                        </article>
+                    }
+                        .into_any()
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Renders a scope value or an em dash for an absent/empty scope.
+fn scope_label(scope: &Option<String>) -> String {
+    match scope {
+        Some(value) if !value.is_empty() => value.clone(),
+        _ => "—".to_string(),
+    }
+}
+
+/// Renders a timestamp or an em dash for an absent one.
+fn timestamp_label(value: &Option<String>) -> String {
+    value
+        .clone()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Status text + badge class for a token row: revoked > active > inactive.
+/// Plaintext and hash are never part of this rendering.
+fn token_status(token: &AdminTokenSummary) -> (&'static str, &'static str) {
+    if token.revoked_at.as_deref().is_some_and(|v| !v.is_empty()) {
+        ("Revoked", "badge bad")
+    } else if token.token_valid {
+        ("Active", "badge good")
+    } else {
+        ("Inactive", "badge neutral")
+    }
+}
+
+/// Extracts a user-facing message from a server function error, falling back
+/// to a generic label. Server function transport noise is never surfaced raw.
+fn server_error_message(error: &ServerFnError, fallback: &str) -> String {
+    let text = error.to_string();
+    if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    }
+}
+
+/// Admin token management: list (hash never shown), create (one-time secret
+/// reveal), and revoke. Gated by the caller on the `admin` capability.
+#[component]
+fn TokenAdministrationDetail() -> impl IntoView {
+    let tokens_resource = Resource::new(|| (), |_| load_admin_tokens());
+    // Working copy of the table so create/revoke can update it in place.
+    let tokens = RwSignal::new(Vec::<AdminTokenSummary>::new());
+    let loaded = RwSignal::new(false);
+
+    let _tokens_path_guard = api_path(admin_tokens_path());
+
+    // Create-form state.
+    let name = RwSignal::new(String::new());
+    let owner = RwSignal::new(String::new());
+    let roles = RwSignal::new(Vec::<String>::new());
+    let site_scope = RwSignal::new(String::new());
+    let environment_scope = RwSignal::new(String::new());
+    let expires_at = RwSignal::new(String::new());
+
+    let feedback = RwSignal::new(String::new());
+    let feedback_class = RwSignal::new("badge neutral");
+    // The one-time plaintext secret. Held only transiently for the copy-once
+    // callout; never written to storage and dropped when a new token is
+    // created or the operator dismisses it.
+    let revealed_secret = RwSignal::new(Option::<String>::None);
+    let secret_input: NodeRef<leptos::html::Input> = NodeRef::new();
+
+    let create_action = Action::new(move |payload: &CreateTokenPayload| {
+        let payload = payload.clone();
+        async move {
+            feedback.set("Creating token...".to_string());
+            feedback_class.set("badge neutral");
+            match create_admin_token(payload).await {
+                Ok(result) => {
+                    tokens.update(|rows| rows.insert(0, result.metadata));
+                    revealed_secret.set(Some(result.token));
+                    feedback.set("Token created — copy the secret now".to_string());
+                    feedback_class.set("badge good");
+                    name.set(String::new());
+                    owner.set(String::new());
+                    roles.set(Vec::new());
+                    site_scope.set(String::new());
+                    environment_scope.set(String::new());
+                    expires_at.set(String::new());
+                }
+                Err(err) => {
+                    revealed_secret.set(None);
+                    feedback.set(server_error_message(&err, "Token creation failed"));
+                    feedback_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    let revoke_action = Action::new(move |token_id: &String| {
+        let token_id = token_id.clone();
+        async move {
+            match revoke_admin_token(token_id.clone()).await {
+                Ok(result) => {
+                    tokens.update(|rows| {
+                        if let Some(row) = rows.iter_mut().find(|row| row.id == result.id) {
+                            row.token_valid = false;
+                            row.revoked_at.get_or_insert_with(|| "just now".to_string());
+                        }
+                    });
+                    feedback.set("Token revoked".to_string());
+                    feedback_class.set("badge good");
+                }
+                Err(err) => {
+                    feedback.set(server_error_message(&err, "Token revoke failed"));
+                    feedback_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    let copy_secret = move |_| {
+        #[cfg(feature = "hydrate")]
+        if let Some(input) = secret_input.get() {
+            use wasm_bindgen::JsCast;
+            input.select();
+            if let Some(html_document) = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.dyn_into::<web_sys::HtmlDocument>().ok())
+            {
+                let _ = html_document.exec_command("copy");
+            }
+        }
+        #[cfg(not(feature = "hydrate"))]
+        let _ = &secret_input;
+    };
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="token-admin-detail-title"
+                    aria-busy="true"
+                    data-api-path=admin_tokens_path()
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Admin"</span>
+                            <h2 id="token-admin-detail-title">"API token administration"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    let initial = tokens_resource.await.unwrap_or_default();
+                    if !loaded.get_untracked() {
+                        tokens.set(initial);
+                        loaded.set(true);
+                    }
+                    view! {
+                        <article
+                            class="workspace-detail-panel"
+                            aria-labelledby="token-admin-detail-title"
+                            data-api-path=admin_tokens_path()
+                        >
+                            <div class="workspace-detail-head">
+                                <div>
+                                    <span class="eyebrow">"Admin"</span>
+                                    <h2 id="token-admin-detail-title">"API token administration"</h2>
+                                </div>
+                                <span class=move || feedback_class.get()>
+                                    {move || {
+                                        let text = feedback.get();
+                                        if text.is_empty() {
+                                            "Service accounts".to_string()
+                                        } else {
+                                            text
+                                        }
+                                    }}
+                                </span>
+                            </div>
+                            <Show when=move || revealed_secret.get().is_some() fallback=|| ()>
+                                <div class="token-secret-callout" role="status" aria-live="polite">
+                                    <strong>"Copy this token now — it is shown only once."</strong>
+                                    <p class="table-note">
+                                        "The plaintext secret is never stored or shown again. If you lose it, revoke this token and create a new one."
+                                    </p>
+                                    <div class="token-secret-row">
+                                        <input
+                                            node_ref=secret_input
+                                            class="settings-input token-secret-value"
+                                            type="text"
+                                            readonly=true
+                                            aria-label="One-time token secret"
+                                            prop:value=move || revealed_secret.get().unwrap_or_default()
+                                        />
+                                        <button class="btn btn-secondary" on:click=copy_secret>
+                                            "Copy"
+                                        </button>
+                                        <button
+                                            class="btn btn-secondary"
+                                            on:click=move |_| revealed_secret.set(None)
+                                        >
+                                            "Dismiss"
+                                        </button>
+                                    </div>
+                                </div>
+                            </Show>
+                            <div class="workspace-detail-columns">
+                                <div class="workspace-detail-list" aria-label="Existing API tokens">
+                                    <div class="table-wrap">
+                                        <table class="dense-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>"Name"</th>
+                                                    <th>"Owner"</th>
+                                                    <th>"Roles"</th>
+                                                    <th>"Scopes"</th>
+                                                    <th>"Last used"</th>
+                                                    <th>"Expires"</th>
+                                                    <th>"Status"</th>
+                                                    <th>"Action"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <For
+                                                    each=move || tokens.get()
+                                                    key=|token| (token.id.clone(), token.revoked_at.clone())
+                                                    children=move |token| {
+                                                        let (status_label, status_class) = token_status(&token);
+                                                        let is_revoked = token
+                                                            .revoked_at
+                                                            .as_deref()
+                                                            .is_some_and(|v| !v.is_empty());
+                                                        let roles_label = if token.roles.is_empty() {
+                                                            "—".to_string()
+                                                        } else {
+                                                            token.roles.join(", ")
+                                                        };
+                                                        let scopes_label = format!(
+                                                            "{} / {}",
+                                                            scope_label(&token.site_scope),
+                                                            scope_label(&token.environment_scope),
+                                                        );
+                                                        let token_id = token.id.clone();
+                                                        view! {
+                                                            <tr>
+                                                                <td>
+                                                                    <strong>{token.name.clone()}</strong>
+                                                                </td>
+                                                                <td>{token.owner_principal.clone()}</td>
+                                                                <td>{roles_label}</td>
+                                                                <td>{scopes_label}</td>
+                                                                <td>{timestamp_label(&token.last_used_at)}</td>
+                                                                <td>{timestamp_label(&token.expires_at)}</td>
+                                                                <td>
+                                                                    <span class=status_class>{status_label}</span>
+                                                                </td>
+                                                                <td>
+                                                                    <button
+                                                                        class="btn btn-secondary"
+                                                                        disabled=is_revoked
+                                                                        on:click=move |_| {
+                                                                            revoke_action.dispatch(token_id.clone());
+                                                                        }
+                                                                    >
+                                                                        "Revoke"
+                                                                    </button>
+                                                                </td>
+                                                            </tr>
+                                                        }
+                                                    }
+                                                />
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <span class="table-note">
+                                        "Token hashes are never returned to the portal; only metadata is shown."
+                                    </span>
+                                </div>
+                                <div class="workspace-detail-list" aria-label="Create API token">
+                                    <div class="workspace-detail-item">
+                                        <strong>"Create service-account token"</strong>
+                                        <input
+                                            type="text"
+                                            class="settings-input"
+                                            placeholder="Token name"
+                                            prop:value=move || name.get()
+                                            on:input=move |ev| name.set(event_target_value(&ev))
+                                        />
+                                        <input
+                                            type="text"
+                                            class="settings-input"
+                                            placeholder="Owner principal (e.g. svc:ci-pipeline)"
+                                            prop:value=move || owner.get()
+                                            on:input=move |ev| owner.set(event_target_value(&ev))
+                                        />
+                                        <span class="table-note">"Roles (select at least one)"</span>
+                                        <div class="role-multiselect" aria-label="Token roles">
+                                            {ALL_APP_ROLES
+                                                .iter()
+                                                .map(|role| {
+                                                    let role = role.to_string();
+                                                    let role_for_checked = role.clone();
+                                                    let role_for_toggle = role.clone();
+                                                    view! {
+                                                        <label class="role-option">
+                                                            <input
+                                                                type="checkbox"
+                                                                prop:checked=move || {
+                                                                    roles.get().contains(&role_for_checked)
+                                                                }
+                                                                on:change=move |_| {
+                                                                    roles
+                                                                        .update(|selected| {
+                                                                            if let Some(pos) = selected
+                                                                                .iter()
+                                                                                .position(|r| r == &role_for_toggle)
+                                                                            {
+                                                                                selected.remove(pos);
+                                                                            } else {
+                                                                                selected.push(role_for_toggle.clone());
+                                                                            }
+                                                                        });
+                                                                }
+                                                            />
+                                                            <span>{role.clone()}</span>
+                                                        </label>
+                                                    }
+                                                })
+                                                .collect_view()}
+                                        </div>
+                                        <input
+                                            type="text"
+                                            class="settings-input"
+                                            placeholder="Site scope (optional)"
+                                            prop:value=move || site_scope.get()
+                                            on:input=move |ev| site_scope.set(event_target_value(&ev))
+                                        />
+                                        <input
+                                            type="text"
+                                            class="settings-input"
+                                            placeholder="Environment scope (optional)"
+                                            prop:value=move || environment_scope.get()
+                                            on:input=move |ev| environment_scope.set(event_target_value(&ev))
+                                        />
+                                        <input
+                                            type="text"
+                                            class="settings-input"
+                                            placeholder="Expires at (RFC 3339, optional)"
+                                            prop:value=move || expires_at.get()
+                                            on:input=move |ev| expires_at.set(event_target_value(&ev))
+                                        />
+                                        <div class="settings-actions">
+                                            <button
+                                                class="btn btn-primary"
+                                                disabled=move || {
+                                                    name.get().trim().is_empty()
+                                                        || owner.get().trim().is_empty()
+                                                        || roles.get().is_empty()
+                                                }
+                                                on:click=move |_| {
+                                                    let optional = |value: String| {
+                                                        let value = value.trim().to_string();
+                                                        (!value.is_empty()).then_some(value)
+                                                    };
+                                                    create_action
+                                                        .dispatch(CreateTokenPayload {
+                                                            name: name.get().trim().to_string(),
+                                                            owner_principal: owner.get().trim().to_string(),
+                                                            roles: roles.get(),
+                                                            site_scope: optional(site_scope.get()),
+                                                            environment_scope: optional(environment_scope.get()),
+                                                            expires_at: optional(expires_at.get()),
+                                                        });
+                                                }
+                                            >
+                                                "Create token"
+                                            </button>
+                                        </div>
+                                        <span class="table-note">
+                                            "The plaintext secret is returned exactly once on creation."
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </article>
+                    }
+                        .into_any()
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// Admin session management: list active sessions and revoke any of them
+/// (closing the self-only logout gap). Gated by the caller on `admin`.
+#[component]
+fn SessionAdministrationDetail() -> impl IntoView {
+    let sessions_resource = Resource::new(|| (), |_| load_admin_sessions());
+    let sessions = RwSignal::new(Vec::<AdminSessionSummary>::new());
+    let loaded = RwSignal::new(false);
+    let feedback = RwSignal::new(String::new());
+    let feedback_class = RwSignal::new("badge neutral");
+
+    let _sessions_path_guard = api_path(admin_sessions_path());
+
+    let revoke_action = Action::new(move |session_id: &String| {
+        let session_id = session_id.clone();
+        async move {
+            match revoke_admin_session(session_id.clone()).await {
+                Ok(result) => {
+                    sessions.update(|rows| rows.retain(|row| row.id != result.id));
+                    feedback.set("Session revoked".to_string());
+                    feedback_class.set("badge good");
+                }
+                Err(err) => {
+                    feedback.set(server_error_message(&err, "Session revoke failed"));
+                    feedback_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    view! {
+        <Suspense fallback=|| {
+            view! {
+                <article
+                    class="workspace-detail-panel"
+                    aria-labelledby="session-admin-detail-title"
+                    aria-busy="true"
+                    data-api-path=admin_sessions_path()
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Admin"</span>
+                            <h2 id="session-admin-detail-title">"Session administration"</h2>
+                        </div>
+                        <span class="badge neutral">"Loading"</span>
+                    </div>
+                </article>
+            }
+        }>
+            {move || {
+                Suspend::new(async move {
+                    let initial = sessions_resource.await.unwrap_or_default();
+                    if !loaded.get_untracked() {
+                        sessions.set(initial);
+                        loaded.set(true);
+                    }
+                    view! {
+                        <article
+                            class="workspace-detail-panel"
+                            aria-labelledby="session-admin-detail-title"
+                            data-api-path=admin_sessions_path()
+                        >
+                            <div class="workspace-detail-head">
+                                <div>
+                                    <span class="eyebrow">"Admin"</span>
+                                    <h2 id="session-admin-detail-title">"Session administration"</h2>
+                                </div>
+                                <span class=move || feedback_class.get()>
+                                    {move || {
+                                        let text = feedback.get();
+                                        if text.is_empty() {
+                                            "Active sessions".to_string()
+                                        } else {
+                                            text
+                                        }
+                                    }}
+                                </span>
+                            </div>
+                            <div class="workspace-detail-columns">
+                                <div class="workspace-detail-list" aria-label="Active sessions">
+                                    <div class="table-wrap">
+                                        <table class="dense-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>"User"</th>
+                                                    <th>"Display name"</th>
+                                                    <th>"Roles"</th>
+                                                    <th>"Provider"</th>
+                                                    <th>"Expires"</th>
+                                                    <th>"Action"</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                <For
+                                                    each=move || sessions.get()
+                                                    key=|session| session.id.clone()
+                                                    children=move |session| {
+                                                        let roles_label = if session.roles.is_empty() {
+                                                            "—".to_string()
+                                                        } else {
+                                                            session.roles.join(", ")
+                                                        };
+                                                        let session_id = session.id.clone();
+                                                        view! {
+                                                            <tr>
+                                                                <td>
+                                                                    <strong>{session.user_id.clone()}</strong>
+                                                                </td>
+                                                                <td>{session.display_name.clone()}</td>
+                                                                <td>{roles_label}</td>
+                                                                <td>{scope_label(&session.provider)}</td>
+                                                                <td>{timestamp_label(&session.expires_at)}</td>
+                                                                <td>
+                                                                    <button
+                                                                        class="btn btn-secondary"
+                                                                        on:click=move |_| {
+                                                                            revoke_action.dispatch(session_id.clone());
+                                                                        }
+                                                                    >
+                                                                        "Revoke"
+                                                                    </button>
+                                                                </td>
+                                                            </tr>
+                                                        }
+                                                    }
+                                                />
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <span class="table-note">
+                                        "Revoking a session signs that principal out immediately."
+                                    </span>
                                 </div>
                             </div>
                         </article>

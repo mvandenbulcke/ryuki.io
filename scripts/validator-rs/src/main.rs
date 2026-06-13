@@ -28,6 +28,7 @@ mod admin_delegation_boundary;
 mod admin_feature_flag;
 mod aiops_suggestion;
 mod alert_routing;
+mod api_token_safety;
 mod app_skeleton;
 mod application_aware_backup;
 mod application_environment_deployment;
@@ -1200,6 +1201,12 @@ fn run() -> Result<(), String> {
                     })?;
                     ryuki_api::validate_context_file(&path)?
                 }
+                "api-token-safety" => {
+                    let path = context_json.ok_or_else(|| {
+                        "api-token-safety validation requires --context-json".to_string()
+                    })?;
+                    api_token_safety::validate_context_file(&path)?
+                }
                 _ => return Err(format!("validate not implemented for slice: {slice}")),
             };
             print_json(&ErrorsOutput { errors })
@@ -2365,6 +2372,7 @@ fn require_slice(args: &[String]) -> Result<&str, String> {
             | "adapter-readiness-matrix"
             | "admin-approval-groups"
             | "admin-delegation-boundary"
+            | "api-token-safety"
             | "approval-decision-readiness"
             | "catalog"
             | "cmdb-file-exchange"
@@ -3097,6 +3105,10 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
     m.insert(
         "activity-operation-queue",
         activity_operation_queue::validate_context_file as ValidateFn,
+    );
+    m.insert(
+        "api-token-safety",
+        api_token_safety::validate_context_file as ValidateFn,
     );
     m.insert(
         "ad-computer-lifecycle",

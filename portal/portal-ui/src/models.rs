@@ -1227,6 +1227,146 @@ pub struct StageActionResponse {
     pub message: String,
 }
 
+/// Canonical app roles assignable to an API token. Mirrors the engine's
+/// `ALL_APP_ROLES`; kept in lockstep with `rbac_role_summary_fallbacks` so the
+/// create-token role multiselect always offers the full set. The portal must
+/// not depend on ryuki-engine, so the list is duplicated and pinned by a test.
+pub const ALL_APP_ROLES: &[&str] = &[
+    "PlatformAdmin",
+    "DatacenterApprover",
+    "VMwareOperator",
+    "HyperVOperator",
+    "ProxmoxOperator",
+    "WintelLinuxOperator",
+    "BackupOperator",
+    "MonitoringOperator",
+    "ServiceDesk",
+    "Auditor",
+    "Requester",
+    "BreakGlassAdmin",
+];
+
+/// API token metadata as returned by `GET /api/admin/tokens` and echoed by the
+/// create endpoint. The token hash is NEVER part of this shape: the API
+/// redacts it (omitted or `null`) and the portal never deserializes, stores,
+/// or renders it. Plaintext lives only in [`CreateTokenResult::token`].
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct AdminTokenSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub owner_principal: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub site_scope: Option<String>,
+    #[serde(default)]
+    pub environment_scope: Option<String>,
+    #[serde(default)]
+    pub token_valid: bool,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+/// Create-token request body for `POST /api/admin/tokens`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct CreateTokenPayload {
+    pub name: String,
+    pub owner_principal: String,
+    pub roles: Vec<String>,
+    pub site_scope: Option<String>,
+    pub environment_scope: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+/// Result of a successful create. `token` is the one-time plaintext secret:
+/// it is surfaced to the caller component exactly once and is never persisted
+/// or re-fetched. `metadata` carries the redacted (hash-free) row.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CreateTokenResult {
+    pub token: String,
+    pub metadata: AdminTokenSummary,
+}
+
+/// Active session metadata as returned by `GET /api/admin/sessions`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct AdminSessionSummary {
+    pub id: String,
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+/// Result of a revoke (`DELETE` of a token or session). `id` echoes the
+/// affected resource so the UI can prune the row optimistically.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RevokeResult {
+    pub status: String,
+    pub id: String,
+}
+
+/// Labeled synthetic token rows for static-dry-run mode. No plaintext, no
+/// hash; `token_valid=false` reflects that no machine credential can execute
+/// in preview mode.
+pub fn admin_token_summary_fallbacks() -> Vec<AdminTokenSummary> {
+    vec![
+        AdminTokenSummary {
+            id: "00000000-0000-4000-8000-000000000001".to_string(),
+            name: "ci-deployer (preview)".to_string(),
+            owner_principal: "svc:ci-pipeline".to_string(),
+            roles: vec!["VMwareOperator".to_string()],
+            site_scope: Some("DEBER".to_string()),
+            environment_scope: Some("staging".to_string()),
+            token_valid: false,
+            created_at: Some("2026-06-13T09:00:00Z".to_string()),
+            expires_at: Some("2026-09-13T09:00:00Z".to_string()),
+            last_used_at: None,
+            revoked_at: None,
+        },
+        AdminTokenSummary {
+            id: "00000000-0000-4000-8000-000000000002".to_string(),
+            name: "audit-export (preview)".to_string(),
+            owner_principal: "svc:audit-export".to_string(),
+            roles: vec!["Auditor".to_string()],
+            site_scope: None,
+            environment_scope: None,
+            token_valid: false,
+            created_at: Some("2026-05-01T09:00:00Z".to_string()),
+            expires_at: None,
+            last_used_at: Some("2026-06-12T18:30:00Z".to_string()),
+            revoked_at: Some("2026-06-12T19:00:00Z".to_string()),
+        },
+    ]
+}
+
+/// Labeled synthetic active-session rows for static-dry-run mode.
+pub fn admin_session_summary_fallbacks() -> Vec<AdminSessionSummary> {
+    vec![AdminSessionSummary {
+        id: "00000000-0000-4000-8000-0000000000a1".to_string(),
+        user_id: "admin".to_string(),
+        display_name: "Platform Admin (preview)".to_string(),
+        roles: vec!["PlatformAdmin".to_string()],
+        provider: Some("local".to_string()),
+        created_at: Some("2026-06-13T08:00:00Z".to_string()),
+        expires_at: Some("2026-06-14T08:00:00Z".to_string()),
+    }]
+}
+
 pub fn request_summary_fallbacks() -> Vec<RequestSummary> {
     vec![
         RequestSummary {
@@ -1800,6 +1940,74 @@ mod tests {
         assert_eq!(session.roles.len(), 2);
         assert!(session.token_valid);
         assert_eq!(session.provider_mode, "persisted-session");
+    }
+
+    #[test]
+    fn all_app_roles_matches_rbac_role_catalog() {
+        // ALL_APP_ROLES must stay in lockstep with the displayed RBAC catalog
+        // so the create-token multiselect never offers an unknown role (the
+        // API rejects those with UNKNOWN_ROLE) nor omits an assignable one.
+        let catalog: Vec<String> = rbac_role_summary_fallbacks()
+            .into_iter()
+            .map(|role| role.name)
+            .collect();
+        let app_roles: Vec<String> = ALL_APP_ROLES.iter().map(|r| r.to_string()).collect();
+        assert_eq!(app_roles, catalog);
+    }
+
+    #[test]
+    fn admin_token_summary_decodes_without_hash_field() {
+        // GET /api/admin/tokens element: hash redacted (omitted entirely).
+        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","name":"ci-deployer","owner_principal":"svc:ci","roles":["VMwareOperator"],"site_scope":"DEBER","environment_scope":null,"token_valid":false,"created_at":"2026-06-13T10:00:00Z","expires_at":null,"last_used_at":null,"revoked_at":null}"#;
+        let token: AdminTokenSummary = serde_json::from_str(body).expect("token row must decode");
+
+        assert_eq!(token.id, "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b");
+        assert_eq!(token.name, "ci-deployer");
+        assert_eq!(token.owner_principal, "svc:ci");
+        assert_eq!(token.roles, vec!["VMwareOperator".to_string()]);
+        assert_eq!(token.site_scope.as_deref(), Some("DEBER"));
+        assert!(!token.token_valid);
+
+        // The portal type has no field that could carry a hash; even a body
+        // that smuggled one in is dropped on deserialize.
+        let with_hash = r#"{"id":"x","name":"n","token_hash":"deadbeef"}"#;
+        let token: AdminTokenSummary = serde_json::from_str(with_hash).expect("decodes");
+        let reserialized = serde_json::to_value(&token).expect("serializes");
+        assert!(reserialized.get("token_hash").is_none());
+    }
+
+    #[test]
+    fn create_token_result_carries_one_time_secret_and_redacted_metadata() {
+        // Build the one-time secret at runtime from the bare prefix so no
+        // full `ryk_…`-shaped literal is committed to the source tree.
+        let token = format!("{}{}", "ryk_", "generated-at-runtime");
+        let result = CreateTokenResult {
+            token,
+            metadata: AdminTokenSummary {
+                id: "abc".to_string(),
+                name: "ci-deployer".to_string(),
+                token_valid: false,
+                ..AdminTokenSummary::default()
+            },
+        };
+        let value = serde_json::to_value(&result).expect("create result serializes");
+        assert!(value.get("token").is_some());
+        // The metadata sub-object never carries a hash field.
+        assert!(value
+            .get("metadata")
+            .and_then(|m| m.get("token_hash"))
+            .is_none());
+    }
+
+    #[test]
+    fn admin_session_summary_decodes_active_session_row() {
+        let body = r#"{"id":"3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b","user_id":"admin","display_name":"Admin","roles":["PlatformAdmin"],"provider":"local","created_at":"2026-06-13T10:00:00Z","expires_at":"2026-06-14T10:00:00Z"}"#;
+        let session: AdminSessionSummary =
+            serde_json::from_str(body).expect("session row must decode");
+
+        assert_eq!(session.user_id, "admin");
+        assert_eq!(session.provider.as_deref(), Some("local"));
+        assert_eq!(session.roles, vec!["PlatformAdmin".to_string()]);
     }
 
     #[test]

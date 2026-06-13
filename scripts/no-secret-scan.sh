@@ -23,6 +23,7 @@ patterns=(
   'gh[pousr]_[0-9A-Za-z_]{36,255}'
   'AIza[0-9A-Za-z_-]{35}'
   '(?i)(password|passwd|pwd|client_secret|secret_key|access_token|refresh_token|bearer)[[:space:]]*[:=][[:space:]]*[^[:space:]"'\''`]{8,}'
+  'ryk_[A-Za-z0-9_-]{20,}'
 )
 
 pattern_names=(
@@ -32,6 +33,7 @@ pattern_names=(
   'GitHub token'
   'Google API key'
   'secret assignment'
+  'Ryuki API token'
 )
 
 found_any=false

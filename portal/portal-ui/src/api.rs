@@ -32,6 +32,8 @@ const ADMIN_FEATURE_FLAG_GOVERNANCE_PATH: &str = "/api/admin/feature-flag-govern
 const ADMIN_RBAC_ROLES_PATH: &str = "/api/admin/rbac-roles";
 const ADMIN_PLATFORM_SETTINGS_PATH: &str = "/api/admin/platform-settings";
 const ADMIN_PLATFORM_SETTINGS_RESET_PATH: &str = "/api/admin/platform-settings/reset";
+const ADMIN_TOKENS_PATH: &str = "/api/admin/tokens";
+const ADMIN_SESSIONS_PATH: &str = "/api/admin/sessions";
 const REQUEST_INTAKE_FORM_PREVIEW_PATH: &str = "/api/requests/intake-form";
 const REQUEST_LIST_PATH: &str = "/api/requests";
 const REQUEST_CREATE_PATH: &str = "/api/requests";
@@ -213,6 +215,33 @@ pub fn admin_platform_settings_path() -> &'static str {
 
 pub fn admin_platform_settings_reset_path() -> &'static str {
     ADMIN_PLATFORM_SETTINGS_RESET_PATH
+}
+
+pub fn admin_tokens_path() -> &'static str {
+    ADMIN_TOKENS_PATH
+}
+
+pub fn admin_sessions_path() -> &'static str {
+    ADMIN_SESSIONS_PATH
+}
+
+/// Builds `/api/admin/tokens/{id}` after validating the id as a single safe
+/// URL path segment (rejects traversal, slashes, query/fragment markers).
+pub fn admin_token_revoke_path(token_id: &str) -> Result<String, ApiPathError> {
+    admin_resource_revoke_path("tokens", token_id)
+}
+
+/// Builds `/api/admin/sessions/{id}` after validating the id as a single safe
+/// URL path segment (rejects traversal, slashes, query/fragment markers).
+pub fn admin_session_revoke_path(session_id: &str) -> Result<String, ApiPathError> {
+    admin_resource_revoke_path("sessions", session_id)
+}
+
+fn admin_resource_revoke_path(resource: &str, id: &str) -> Result<String, ApiPathError> {
+    let id = safe_request_id(id)?;
+    let path = format!("/api/admin/{resource}/{id}");
+    same_origin_api_path(&path)?;
+    Ok(path)
 }
 
 pub fn request_intake_form_preview_path() -> &'static str {
@@ -416,6 +445,44 @@ mod tests {
             admin_platform_settings_path(),
             admin_platform_settings_reset_path()
         );
+    }
+
+    #[test]
+    fn admin_token_and_session_paths_match_api_contract() {
+        assert_eq!(admin_tokens_path(), "/api/admin/tokens");
+        assert_eq!(admin_sessions_path(), "/api/admin/sessions");
+        assert_eq!(
+            admin_token_revoke_path("3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b"),
+            Ok("/api/admin/tokens/3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b".to_string())
+        );
+        assert_eq!(
+            admin_session_revoke_path("3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b"),
+            Ok("/api/admin/sessions/3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b".to_string())
+        );
+    }
+
+    #[test]
+    fn admin_revoke_paths_reject_unsafe_ids() {
+        for id in [
+            "",
+            "../tokens",
+            "id/extra",
+            r"id\extra",
+            "id?x=1",
+            "id#frag",
+            "https://evil.test/id",
+            "//evil.test",
+            "..",
+        ] {
+            assert!(
+                admin_token_revoke_path(id).is_err(),
+                "{id} must be rejected"
+            );
+            assert!(
+                admin_session_revoke_path(id).is_err(),
+                "{id} must be rejected"
+            );
+        }
     }
 
     #[test]

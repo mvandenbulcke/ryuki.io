@@ -209,11 +209,117 @@ fn session_id_from_headers(
     None
 }
 
+/// The dispatch discriminator for API-token bearers. A bearer that starts with
+/// this prefix is an `api_tokens` credential, never a session UUID.
+pub const API_TOKEN_PREFIX: &str = "ryk_";
+
+/// Lowercase-hex SHA-256 of the FULL plaintext token (prefix included). This is
+/// exactly what is persisted in `api_tokens.token_hash`; the token carries 256
+/// bits of CSPRNG entropy, so a single fast hash is sufficient (slow KDFs exist
+/// to stretch low-entropy passwords and would only add per-request latency).
+pub fn sha256_hex(plaintext: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(plaintext.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiTokenRow {
+    id: Uuid,
+    name: String,
+    owner_principal: String,
+    roles: Vec<String>,
+    token_valid: bool,
+    token_hash: String,
+}
+
+/// Resolves an `ryk_` API-token bearer to an `AuthSession`.
+///
+/// The WHERE clause filters by the exact hash and excludes revoked/expired rows;
+/// the returned row's stored hash is then re-verified against the recomputed
+/// digest with a constant-time compare (defense-in-depth). Not-found, expired,
+/// revoked, and hash-mismatch all collapse to a single low-cardinality reason so
+/// the failure surface cannot be used as an enumeration oracle. On success the
+/// session carries the row's `roles`/`token_valid` verbatim and
+/// `provider_mode = "api-token"`; scopes are persisted but not yet carried on
+/// the session (scoped enforcement is a later feature).
+async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession {
+    use subtle::ConstantTimeEq;
+
+    let hash_hex = sha256_hex(plaintext);
+    let row = sqlx::query_as::<_, ApiTokenRow>(
+        "SELECT id, name, owner_principal, roles, token_valid, token_hash \
+         FROM api_tokens \
+         WHERE token_hash = $1 AND revoked_at IS NULL \
+         AND (expires_at IS NULL OR expires_at > NOW())",
+    )
+    .bind(&hash_hex)
+    .fetch_optional(pool)
+    .await;
+
+    let row = match row {
+        Ok(Some(row)) => row,
+        Ok(None) => return unverified_session("api-token-invalid"),
+        Err(error) => {
+            tracing::error!(error = %error, "api token lookup failed");
+            return unverified_session("api-token-invalid");
+        }
+    };
+
+    // Constant-time compare over the recomputed hash and the stored hash. The
+    // WHERE already filtered by exact hash, so this is belt-and-suspenders, but
+    // it guards against any non-constant-time comparator on the lookup path.
+    if hash_hex.as_bytes().ct_eq(row.token_hash.as_bytes()).into() {
+        // Update last_used_at; a failure here is non-fatal to resolution.
+        if let Err(error) = sqlx::query("UPDATE api_tokens SET last_used_at = NOW() WHERE id = $1")
+            .bind(row.id)
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(error = %error, token_id = %row.id, "api token last_used_at update failed");
+        }
+        AuthSession {
+            user_id: row.owner_principal,
+            display_name: row.name,
+            roles: row.roles,
+            token_valid: row.token_valid,
+            provider_mode: "api-token".into(),
+        }
+    } else {
+        unverified_session("api-token-mismatch")
+    }
+}
+
 async fn auth_session_from_persisted_session(
     headers: &HeaderMap,
     auth_header: Option<&str>,
     auth_mode: &AuthMode,
 ) -> Option<(AuthSession, SessionIdSource)> {
+    // API-token bearers (`ryk_...`) are resolved BEFORE the UUID/cookie path: a
+    // `ryk_` string is not a valid UUID, so without this explicit branch it
+    // would silently fall through to the UUID parse and become unverified. The
+    // branch runs even when no DB pool is available so an API-token bearer can
+    // never leak into the session-id resolution path.
+    if let Some(token) = bearer_value(auth_header) {
+        if token.strip_prefix(API_TOKEN_PREFIX).is_some() {
+            let Some(pool) = crate::database::get_db() else {
+                return Some((
+                    unverified_session("api-token-no-db"),
+                    SessionIdSource::Bearer,
+                ));
+            };
+            return Some((
+                resolve_api_token(token, pool).await,
+                SessionIdSource::Bearer,
+            ));
+        }
+    }
+
     let (parsed, source) = session_id_from_headers(headers, auth_header)?;
     let session_id = match parsed {
         Ok(session_id) => session_id,
@@ -1529,6 +1635,57 @@ mod tests {
         let fields = resolve_auth_metadata(Some("invalid"), "entra-id");
         assert!(fields.auth_header_present);
         assert_eq!(fields.provider_mode, "entra-id");
+    }
+
+    #[test]
+    fn test_sha256_hex_is_lowercase_64_hex() {
+        // Known SHA-256 of the empty string. Confirms lowercase hex, fixed width.
+        let digest = sha256_hex("");
+        assert_eq!(
+            digest,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    }
+
+    #[test]
+    fn test_sha256_hex_covers_full_prefixed_plaintext() {
+        // The hash is over the full `ryk_`-prefixed string, so two tokens that
+        // differ only after the prefix hash to different values, and the prefix
+        // is part of the hashed input (changing it changes the digest).
+        let token_a = format!("{API_TOKEN_PREFIX}aaaa");
+        let token_b = format!("{API_TOKEN_PREFIX}bbbb");
+        assert_ne!(sha256_hex(&token_a), sha256_hex(&token_b));
+        assert_ne!(sha256_hex(&token_a), sha256_hex("xyz_aaaa"));
+    }
+
+    #[test]
+    fn test_constant_time_hash_compare_matches_only_identical() {
+        use subtle::ConstantTimeEq;
+        let token = format!("{API_TOKEN_PREFIX}sometoken");
+        let hash = sha256_hex(&token);
+        let same = sha256_hex(&token);
+        let different = sha256_hex(&format!("{API_TOKEN_PREFIX}othertoken"));
+        let matches: bool = hash.as_bytes().ct_eq(same.as_bytes()).into();
+        let mismatches: bool = hash.as_bytes().ct_eq(different.as_bytes()).into();
+        assert!(matches);
+        assert!(!mismatches);
+    }
+
+    #[test]
+    fn test_api_token_prefix_dispatch() {
+        // The resolution branch keys on the `ryk_` prefix; a bearer that lacks
+        // it falls through to the session-id path (it is not an API token).
+        assert!(format!("{API_TOKEN_PREFIX}abc")
+            .strip_prefix(API_TOKEN_PREFIX)
+            .is_some());
+        assert!(Uuid::parse_str("not-a-ryk-token").is_err());
+        assert!("550e8400-e29b-41d4-a716-446655440000"
+            .strip_prefix(API_TOKEN_PREFIX)
+            .is_none());
     }
 
     /// Builds an enabled, network-backed validator with no usable keyset. It is

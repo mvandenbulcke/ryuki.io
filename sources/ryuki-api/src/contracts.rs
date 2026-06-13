@@ -1128,6 +1128,11 @@ pub fn routes() -> Router {
             "/api/admin/platform-settings/reset",
             post(admin_platform_settings_reset),
         )
+        .route("/api/admin/tokens", post(admin_tokens_create))
+        .route("/api/admin/tokens", get(admin_tokens_list))
+        .route("/api/admin/tokens/{id}", delete(admin_tokens_revoke))
+        .route("/api/admin/sessions", get(admin_sessions_list))
+        .route("/api/admin/sessions/{id}", delete(admin_sessions_revoke))
         .route(
             "/api/analytics/cost-capacity-contract",
             get(analytics_cost_capacity),
@@ -6861,11 +6866,22 @@ fn require_admin_permission(session: &AuthSession) -> Result<(), (StatusCode, Js
     }
 }
 
+/// Interactive external identity modes that may write platform settings.
+/// Long-lived non-interactive credentials — the browser `persisted-session`
+/// and machine `api-token` — are deliberately excluded: settings writes
+/// (auth mode, Entra config) require a freshly verified interactive admin so a
+/// stolen or over-scoped standing credential cannot rewrite the auth posture.
+fn is_interactive_external_admin(session: &AuthSession) -> bool {
+    session.token_valid
+        && session.provider_mode != "persisted-session"
+        && session.provider_mode != "api-token"
+}
+
 fn require_verified_external_admin_permission(
     session: &AuthSession,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
     require_admin_permission(session)?;
-    if session.token_valid && session.provider_mode != "persisted-session" {
+    if is_interactive_external_admin(session) {
         return Ok(());
     }
     Err((
@@ -7151,6 +7167,393 @@ async fn admin_platform_settings_reset(
     }
     save_platform_config_file(&defaults).await?;
     Ok(Json(serde_json::to_value(defaults).unwrap_or_default()))
+}
+
+// ─── API token & session administration handlers (design doc feature 3) ───
+
+/// base64url-no-pad alphabet (`[A-Za-z0-9_-]`) used to encode the 32 raw CSPRNG
+/// bytes. Chosen over standard base64 so the token is header/URL-safe (no `+`,
+/// `/`, or `=`) and copy-paste clean.
+fn generate_api_token() -> String {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw);
+    format!("{}{}", crate::API_TOKEN_PREFIX, encoded)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTokenRequest {
+    name: String,
+    owner_principal: String,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    site_scope: Option<String>,
+    #[serde(default)]
+    environment_scope: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+/// Returns the first requested role that is not in the application role catalog.
+fn find_unknown_role(roles: &[String]) -> Option<&str> {
+    roles
+        .iter()
+        .map(String::as_str)
+        .find(|role| !ryuki_engine::auth::ALL_APP_ROLES.contains(role))
+}
+
+/// Persistence failure for the api_tokens table. The raw DB error is logged but
+/// never returned to the caller.
+fn api_token_persistence_problem() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError::new(
+            "API_TOKEN_PERSISTENCE_FAILED",
+            "API token could not be persisted",
+        )),
+    )
+}
+
+fn map_api_token_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    operation: &str,
+) -> Result<T, (StatusCode, Json<ApiError>)> {
+    result.map_err(|error| {
+        tracing::error!(operation, error = %error, "api token persistence failed");
+        api_token_persistence_problem()
+    })
+}
+
+fn api_token_db_required() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError::new(
+            "DATABASE_REQUIRED",
+            "API token administration requires a database",
+        )),
+    )
+}
+
+/// Row returned to list callers — `token_hash` is REDACTED (never serialized).
+#[derive(sqlx::FromRow)]
+struct TokenListRow {
+    id: Uuid,
+    name: String,
+    owner_principal: String,
+    roles: Vec<String>,
+    site_scope: Option<String>,
+    environment_scope: Option<String>,
+    token_valid: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// POST /api/admin/tokens — mint a service-account credential. The plaintext
+/// `ryk_...` token is returned EXACTLY ONCE in this response and is never
+/// persisted (only its SHA-256 hash) or logged.
+async fn admin_tokens_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<CreateTokenRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    // Only an interactive admin may mint tokens. A machine `api-token` passing
+    // the admin gate must not be able to mint further admin tokens — that would
+    // be a self-perpetuating credential chain with no interactive re-auth ever
+    // re-entering the loop. Token issuance is an interactive administrative act.
+    if session.provider_mode == "api-token" {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError::new(
+                "INTERACTIVE_ADMIN_REQUIRED",
+                "API tokens cannot mint other tokens; sign in interactively to issue tokens",
+            )),
+        ));
+    }
+
+    if let Some(unknown) = find_unknown_role(&body.roles) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::with_detail(
+                "UNKNOWN_ROLE",
+                "Requested role is not a known application role",
+                unknown.to_string(),
+            )),
+        ));
+    }
+
+    // Parse the optional RFC3339 expiry. A malformed value is a 400, never a
+    // silently-ignored "never expires".
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = match &body.expires_at {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiError::new(
+                            "INVALID_EXPIRES_AT",
+                            "expires_at must be an RFC3339 timestamp",
+                        )),
+                    )
+                })?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    // Dry-run-non-privileged safety rule made durable: tokens minted while the
+    // auth mode is a dry-run mode are token_valid=FALSE forever, so they can
+    // never satisfy require_verified_external_admin_permission even after the
+    // mode later changes. Only an EntraId/Local mint by a token_valid session
+    // is TRUE.
+    let auth_mode = crate::config_store::get_app_config().auth_mode.clone();
+    let token_valid =
+        matches!(auth_mode, AuthMode::EntraId | AuthMode::Local) && session.token_valid;
+
+    // Plaintext exists only transiently here and in the 201 response below; it
+    // is hashed for storage and never written to a column or a log.
+    let plaintext = generate_api_token();
+    let token_hash = crate::sha256_hex(&plaintext);
+
+    let row: TokenListRow = map_api_token_result(
+        sqlx::query_as::<_, TokenListRow>(
+            "INSERT INTO api_tokens \
+             (name, owner_principal, token_hash, roles, site_scope, environment_scope, token_valid, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             RETURNING id, name, owner_principal, roles, site_scope, environment_scope, \
+                       token_valid, created_at, expires_at, last_used_at, revoked_at",
+        )
+        .bind(&body.name)
+        .bind(&body.owner_principal)
+        .bind(&token_hash)
+        .bind(&body.roles)
+        .bind(&body.site_scope)
+        .bind(&body.environment_scope)
+        .bind(token_valid)
+        .bind(expires_at)
+        .fetch_one(pool)
+        .await,
+        "create",
+    )?;
+
+    // Audit line: actor + action + token metadata. NEVER the plaintext or hash.
+    tracing::info!(
+        actor = %session.user_id,
+        action = "api-token-create",
+        token_id = %row.id,
+        token_name = %row.name,
+        owner_principal = %row.owner_principal,
+        roles = ?row.roles,
+        site_scope = ?row.site_scope,
+        environment_scope = ?row.environment_scope,
+        token_valid = row.token_valid,
+        "api token created"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": row.id,
+            "name": row.name,
+            "owner_principal": row.owner_principal,
+            "roles": row.roles,
+            "site_scope": row.site_scope,
+            "environment_scope": row.environment_scope,
+            "token_valid": row.token_valid,
+            "expires_at": row.expires_at,
+            "created_at": row.created_at,
+            // ONE-TIME plaintext reveal — never returned again, never stored.
+            "token": plaintext,
+        })),
+    ))
+}
+
+/// GET /api/admin/tokens — list token metadata with the hash REDACTED. Reads
+/// are not gated by the central ROUTE_PERMISSIONS table this wave, so the
+/// handler enforces the admin gate explicitly (these reads expose token
+/// metadata).
+async fn admin_tokens_list(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    let rows: Vec<TokenListRow> = map_api_token_result(
+        sqlx::query_as::<_, TokenListRow>(
+            "SELECT id, name, owner_principal, roles, site_scope, environment_scope, \
+                    token_valid, created_at, expires_at, last_used_at, revoked_at \
+             FROM api_tokens ORDER BY created_at DESC",
+        )
+        .fetch_all(pool)
+        .await,
+        "list",
+    )?;
+
+    let tokens: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "name": row.name,
+                "owner_principal": row.owner_principal,
+                "roles": row.roles,
+                "site_scope": row.site_scope,
+                "environment_scope": row.environment_scope,
+                "token_valid": row.token_valid,
+                "created_at": row.created_at,
+                "expires_at": row.expires_at,
+                "last_used_at": row.last_used_at,
+                "revoked_at": row.revoked_at,
+                // Hash is never exposed; plaintext is unrecoverable by design.
+                "token_hash": Value::Null,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "tokens": tokens })))
+}
+
+/// DELETE /api/admin/tokens/{id} — soft-revoke (sets revoked_at). 404 when no
+/// active token by that id (already-revoked or absent are indistinguishable to
+/// the caller). Never a hard DELETE: the row survives as evidence.
+async fn admin_tokens_revoke(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    let result = map_api_token_result(
+        sqlx::query(
+            "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .execute(pool)
+        .await,
+        "revoke",
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new(
+                "NOT_FOUND",
+                "No active API token with that id",
+            )),
+        ));
+    }
+
+    tracing::info!(
+        actor = %session.user_id,
+        action = "api-token-revoke",
+        token_id = %id,
+        "api token revoked"
+    );
+
+    Ok(Json(json!({ "status": "revoked", "id": id })))
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionListRow {
+    id: Uuid,
+    user_id: String,
+    display_name: String,
+    roles: Vec<String>,
+    provider: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// GET /api/admin/sessions — list active (non-expired) browser sessions.
+async fn admin_sessions_list(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    let rows: Vec<SessionListRow> = map_api_token_result(
+        sqlx::query_as::<_, SessionListRow>(
+            "SELECT id, user_id, display_name, roles, provider, created_at, expires_at \
+             FROM sessions WHERE expires_at > NOW() ORDER BY created_at DESC",
+        )
+        .fetch_all(pool)
+        .await,
+        "list-sessions",
+    )?;
+
+    let sessions: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "id": row.id,
+                "user_id": row.user_id,
+                "display_name": row.display_name,
+                "roles": row.roles,
+                "provider": row.provider,
+                "created_at": row.created_at,
+                "expires_at": row.expires_at,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// DELETE /api/admin/sessions/{id} — admin revoke of ANY session (closes the
+/// self-only gap in auth_logout). Sessions are ephemeral, so a hard DELETE is
+/// acceptable here (unlike tokens, which are soft-revoked as evidence). 404
+/// when absent.
+async fn admin_sessions_revoke(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    let result = map_api_token_result(
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await,
+        "revoke-session",
+    )?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new("NOT_FOUND", "No session with that id")),
+        ));
+    }
+
+    tracing::info!(
+        actor = %session.user_id,
+        action = "session-revoke",
+        session_id = %id,
+        "session revoked by admin"
+    );
+
+    Ok(Json(json!({ "status": "revoked", "id": id })))
 }
 
 // ─── Request lifecycle handlers ───
@@ -12624,5 +13027,195 @@ mod unit_tests {
         assert_eq!(item["site"], "DEFRA");
         assert_eq!(item["environment"], "production");
         assert_eq!(item["stage"], "intake");
+    }
+
+    // ─── API token & session administration ───
+
+    #[test]
+    fn test_generate_api_token_format() {
+        let token = generate_api_token();
+        // ryk_ prefix + 43 base64url-no-pad chars (32 bytes) = 47 total.
+        assert!(token.starts_with(crate::API_TOKEN_PREFIX));
+        assert_eq!(token.len(), 47);
+        let suffix = token.strip_prefix(crate::API_TOKEN_PREFIX).unwrap();
+        assert_eq!(suffix.len(), 43);
+        assert!(suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn test_generate_api_token_is_unique_per_call() {
+        // CSPRNG: two mints are (astronomically certainly) distinct, and their
+        // hashes differ — so neither the token nor its hash is ever a literal.
+        let a = generate_api_token();
+        let b = generate_api_token();
+        assert_ne!(a, b);
+        assert_ne!(crate::sha256_hex(&a), crate::sha256_hex(&b));
+    }
+
+    #[test]
+    fn test_find_unknown_role_accepts_known_roles() {
+        let roles = vec![
+            ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR.to_string(),
+            ryuki_engine::auth::APP_ROLE_AUDITOR.to_string(),
+        ];
+        assert!(find_unknown_role(&roles).is_none());
+    }
+
+    #[test]
+    fn test_find_unknown_role_rejects_unknown_role() {
+        let roles = vec![
+            ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR.to_string(),
+            "NotARealRole".to_string(),
+        ];
+        assert_eq!(find_unknown_role(&roles), Some("NotARealRole"));
+    }
+
+    /// A token row resolves to an AuthSession that carries the row's roles and
+    /// token_valid verbatim with provider_mode "api-token". This mirrors the
+    /// resolve_api_token success arm; the scopes are persisted but not carried
+    /// on the session (scoped enforcement is a later feature).
+    #[test]
+    fn test_token_row_maps_to_api_token_session() {
+        let session = AuthSession {
+            user_id: "svc-backup".to_string(),
+            display_name: "Nightly backup runner".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR.to_string()],
+            token_valid: true,
+            provider_mode: "api-token".to_string(),
+        };
+        assert_eq!(session.provider_mode, "api-token");
+        assert!(check_permission(&session, "execute"));
+        assert!(!check_permission(&session, "admin"));
+    }
+
+    /// Dry-run-minted tokens carry token_valid=false forever, so they pass
+    /// coarse check_permission for their roles but are rejected by the
+    /// verified-external-admin gate regardless of provider_mode.
+    #[test]
+    fn test_dry_run_minted_token_rejected_by_verified_admin_gate() {
+        let session = AuthSession {
+            user_id: "svc-admin".to_string(),
+            display_name: "Dry-run admin token".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            // minted under MockDryRun/StaticDryRun -> token_valid persisted FALSE
+            token_valid: false,
+            provider_mode: "api-token".to_string(),
+        };
+        // It still holds the coarse admin permission via its roles...
+        assert!(require_admin_permission(&session).is_ok());
+        // ...but can never satisfy the verified-external-admin gate.
+        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+            panic!("dry-run-minted token must be rejected by the verified-admin gate");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error, "VERIFIED_ADMIN_REQUIRED");
+    }
+
+    /// Security: a fully-valid (token_valid=true) machine api-token must NOT
+    /// satisfy the verified-external-admin gate either — settings writes require
+    /// an interactive external identity, not a standing machine credential.
+    /// (Regression guard for the credential-escalation finding.)
+    #[test]
+    fn test_valid_api_token_rejected_by_verified_admin_gate() {
+        let session = AuthSession {
+            user_id: "svc-admin".to_string(),
+            display_name: "Live admin token".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            provider_mode: "api-token".to_string(),
+        };
+        assert!(require_admin_permission(&session).is_ok());
+        assert!(!is_interactive_external_admin(&session));
+        let Err((status, Json(body))) = require_verified_external_admin_permission(&session) else {
+            panic!("a live api-token must not pass the verified-external-admin gate");
+        };
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.error, "VERIFIED_ADMIN_REQUIRED");
+    }
+
+    /// A persisted browser session is likewise non-interactive-external and a
+    /// genuine Entra-verified session is the only mode that passes.
+    #[test]
+    fn test_interactive_external_admin_only_for_verified_entra() {
+        let entra = AuthSession {
+            user_id: "u".to_string(),
+            display_name: "Verified admin".to_string(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
+            token_valid: true,
+            provider_mode: "entra-id".to_string(),
+        };
+        assert!(is_interactive_external_admin(&entra));
+        for mode in ["persisted-session", "api-token"] {
+            let s = AuthSession {
+                provider_mode: mode.to_string(),
+                ..entra.clone()
+            };
+            assert!(
+                !is_interactive_external_admin(&s),
+                "{mode} must not count as interactive external admin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_tokens_create_rejects_non_admin() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        let body = CreateTokenRequest {
+            name: "x".into(),
+            owner_principal: "svc".into(),
+            roles: vec![],
+            site_scope: None,
+            environment_scope: None,
+            expires_at: None,
+        };
+        let Err((status, _)) = admin_tokens_create(AuthExtractor(session), Json(body)).await else {
+            panic!("non-admin must be forbidden from minting tokens");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_admin_tokens_create_rejects_unknown_role() {
+        let session = AuthSession::static_dry_run();
+        let body = CreateTokenRequest {
+            name: "x".into(),
+            owner_principal: "svc".into(),
+            roles: vec!["NotARole".into()],
+            site_scope: None,
+            environment_scope: None,
+            expires_at: None,
+        };
+        let Err((status, Json(err))) =
+            admin_tokens_create(AuthExtractor(session), Json(body)).await
+        else {
+            panic!("unknown role must be a 400");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error, "UNKNOWN_ROLE");
+    }
+
+    #[tokio::test]
+    async fn test_admin_tokens_list_rejects_non_admin() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
+        let Err((status, _)) = admin_tokens_list(AuthExtractor(session)).await else {
+            panic!("auditor must be forbidden from listing tokens");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_admin_sessions_revoke_rejects_non_admin() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()];
+        let Err((status, _)) =
+            admin_sessions_revoke(AuthExtractor(session), Path(Uuid::new_v4())).await
+        else {
+            panic!("non-admin must be forbidden from revoking sessions");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 }
