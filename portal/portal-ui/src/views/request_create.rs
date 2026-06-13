@@ -189,6 +189,15 @@ pub fn RequestCreate() -> impl IntoView {
                             .map(|(value, label)| view! { <option value=*value>{*label}</option> })
                             .collect_view()}
                     </select>
+                    <span class="table-note">
+                        {move || {
+                            if request_type.get() == "server-deployment" {
+                                "VM sizing (CPU / memory) applies to this request type."
+                            } else {
+                                "No VM sizing fields apply to this request type."
+                            }
+                        }}
+                    </span>
                 </div>
 
                 <div class="form-field">
@@ -242,37 +251,44 @@ pub fn RequestCreate() -> impl IntoView {
                     </Show>
                 </div>
 
-                <div class="form-field">
-                    <label for="request-cpu">"CPU cores"</label>
-                    <input
-                        id="request-cpu"
-                        type="number"
-                        class="settings-input"
-                        placeholder="e.g. 4"
-                        min="1"
-                        prop:value=cpu
-                        on:input=move |ev| {
-                            let val: u32 = event_target_value(&ev).parse().unwrap_or(4);
-                            set_cpu.set(val);
-                        }
-                    />
-                </div>
+                // VM sizing is only meaningful for server-deployment; the API's
+                // build_request_payload reads cpu/memory only for that type, so
+                // the form mirrors the contract — these fields appear (and are
+                // only submitted) for Server Deployment, and disappear when the
+                // request type changes to any of the other types.
+                <Show when=move || request_type.get() == "server-deployment">
+                    <div class="form-field">
+                        <label for="request-cpu">"CPU cores"</label>
+                        <input
+                            id="request-cpu"
+                            type="number"
+                            class="settings-input"
+                            placeholder="e.g. 4"
+                            min="1"
+                            prop:value=cpu
+                            on:input=move |ev| {
+                                let val: u32 = event_target_value(&ev).parse().unwrap_or(4);
+                                set_cpu.set(val);
+                            }
+                        />
+                    </div>
 
-                <div class="form-field">
-                    <label for="request-memory">"Memory GB"</label>
-                    <input
-                        id="request-memory"
-                        type="number"
-                        class="settings-input"
-                        placeholder="e.g. 16"
-                        min="1"
-                        prop:value=memory
-                        on:input=move |ev| {
-                            let val: u32 = event_target_value(&ev).parse().unwrap_or(16);
-                            set_memory.set(val);
-                        }
-                    />
-                </div>
+                    <div class="form-field">
+                        <label for="request-memory">"Memory GB"</label>
+                        <input
+                            id="request-memory"
+                            type="number"
+                            class="settings-input"
+                            placeholder="e.g. 16"
+                            min="1"
+                            prop:value=memory
+                            on:input=move |ev| {
+                                let val: u32 = event_target_value(&ev).parse().unwrap_or(16);
+                                set_memory.set(val);
+                            }
+                        />
+                    </div>
+                </Show>
 
                 <div class="form-field">
                     <label for="request-justification">"Business Justification"</label>
@@ -296,13 +312,17 @@ pub fn RequestCreate() -> impl IntoView {
                         on:click=move |_| {
                             set_show_errors.set(true);
                             if is_valid() {
+                                // VM sizing is only sent for server-deployment; other
+                                // types store 0 (not applicable) rather than the
+                                // form defaults, matching the API's typed payload.
+                                let is_vm = request_type.get() == "server-deployment";
                                 let payload = CreateRequestPayload {
                                     request_type: request_type.get(),
                                     name: name.get().trim().to_string(),
                                     site: site.get(),
                                     environment: environment.get(),
-                                    cpu: cpu.get(),
-                                    memory: memory.get(),
+                                    cpu: if is_vm { cpu.get() } else { 0 },
+                                    memory: if is_vm { memory.get() } else { 0 },
                                     justification: justification.get().trim().to_string(),
                                 };
                                 submit_action.dispatch(payload);
