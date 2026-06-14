@@ -25,6 +25,7 @@
 //!   passed.
 
 pub mod ansible;
+pub mod iac;
 pub mod scrub;
 pub mod terraform;
 pub mod workspace;

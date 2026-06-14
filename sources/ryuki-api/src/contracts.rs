@@ -8942,6 +8942,129 @@ async fn requests_validate(
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
+/// Enrich the plan stages produced by `plan_request` with a real Terraform
+/// dry-run evidence item, if the offering has wired IaC.
+///
+/// # Enrichment logic
+/// 1. Resolve the IaC bundle for `offering_id`. If `None`, return immediately
+///    (unwired offering — no change at all).
+/// 2. Build a `TerraformRunner` with the embedded IaC and call `run_dry` with
+///    empty `ResolvedCredentials` (this IaC needs no secrets).
+/// 3. If the run succeeds (status `Planned`): append an `EvidenceItem` with
+///    key `"terraform-plan"` and `evidence_type = Plan` to the `"plan"` stage.
+/// 4. If the runner is unavailable or the run fails: append a note item with
+///    key `"terraform-plan-note"` describing the skip. Never return an error.
+///
+/// # Soundness invariant
+/// Callers MUST call this function BEFORE building `stages_json`/`plan_json`
+/// for the DB write. Enriching after serialization loses the output.
+fn enrich_plan_stages_with_terraform(
+    request: &ryuki_engine::models::Request,
+    stages: &mut [ryuki_engine::models::Stage],
+) {
+    use crate::integration::ResolvedCredentials;
+    use crate::runner::iac;
+    use crate::runner::terraform::TerraformRunner;
+    use crate::runner::Runner;
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus};
+
+    let offering_id = request.offering_id.as_str();
+
+    // Step 1: resolve IaC bundle — if None, no wiring for this offering.
+    let Some(iac_bundle) = iac::resolve(offering_id) else {
+        return;
+    };
+
+    // Step 2: build runner with embedded IaC and invoke dry-run. The request's
+    // site/environment/id flow in as non-secret Terraform vars (the runner
+    // writes them to a tfvars JSON file, never argv) so the plan reflects the
+    // real request instead of the IaC defaults.
+    let runner = TerraformRunner::new().with_iac(iac_bundle);
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("site".to_string(), request.site.clone());
+    vars.insert("environment".to_string(), request.environment.clone());
+    vars.insert("request_id".to_string(), request.id.clone());
+    let run_plan = RunPlan {
+        runner_kind: ryuki_engine::runners::RunnerKind::Terraform,
+        mode: RunMode::DryRun,
+        offering_id: offering_id.to_string(),
+        vars,
+        secret_var_names: Vec::new(),
+    };
+    let empty_creds = ResolvedCredentials {
+        material: Vec::new(),
+        descriptor: "none".to_string(),
+    };
+
+    let outcome = match runner.run_dry(&run_plan, &empty_creds) {
+        Ok(o) => o,
+        Err(e) => {
+            // Workspace or spawn error — degrade gracefully.
+            append_terraform_note(stages, &format!("terraform plan skipped: {e}"));
+            return;
+        }
+    };
+
+    // Step 3/4: build evidence item from outcome.
+    let evidence_item = if outcome.status == RunStatus::Planned {
+        let value = if outcome.log.is_empty() {
+            outcome.summary.clone()
+        } else {
+            // Truncate to ~4 KiB for evidence, on a UTF-8 char boundary so a
+            // multi-byte sequence at the cut point cannot panic.
+            let log_excerpt = if outcome.log.len() > 4096 {
+                let truncated: String = outcome.log.chars().take(4096).collect();
+                format!("{truncated}...[truncated]")
+            } else {
+                outcome.log.clone()
+            };
+            format!("{}\n\n{}", outcome.summary, log_excerpt)
+        };
+        EvidenceItem {
+            key: "terraform-plan".to_string(),
+            value,
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        }
+    } else {
+        // RunnerUnavailable or Failed — degrade gracefully.
+        let note = format!(
+            "terraform plan skipped: runner unavailable or failed (status: {}; {})",
+            outcome.status, outcome.summary
+        );
+        EvidenceItem {
+            key: "terraform-plan-note".to_string(),
+            value: note,
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        }
+    };
+
+    // Append to the "plan" stage. The stage is always present (plan_request
+    // guarantees it), but we guard defensively.
+    if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
+        plan_stage.evidence.push(evidence_item);
+    }
+}
+
+/// Append a note EvidenceItem to the "plan" stage (graceful degradation path).
+fn append_terraform_note(stages: &mut [ryuki_engine::models::Stage], note: &str) {
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    let item = EvidenceItem {
+        key: "terraform-plan-note".to_string(),
+        value: note.to_string(),
+        redacted_value: None,
+        redacted: false,
+        evidence_type: EvidenceType::Plan,
+    };
+    if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
+        plan_stage.evidence.push(item);
+    }
+}
+
 async fn requests_plan(
     Path(request_id): Path<String>,
     AuthExtractor(session): AuthExtractor,
@@ -8964,7 +9087,14 @@ async fn requests_plan(
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
-        let stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
+        let mut stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
+
+        // Enrich plan stage with real Terraform dry-run output for wired
+        // offerings. This MUST happen before serialization so the enriched
+        // evidence is what gets persisted (soundness invariant).
+        // Graceful degradation: if terraform is absent or fails, a note item is
+        // appended instead and the transition continues normally.
+        enrich_plan_stages_with_terraform(&request, &mut stages);
 
         // plan_request returns the full cumulative Vec<Stage> (including the
         // plan stage). The no-DB arm sets store[idx].stages = stages.clone();
@@ -9005,7 +9135,11 @@ async fn requests_plan(
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
 
-    let stages = request_lifecycle::plan_request(&store[idx]).map_err(map_engine_error)?;
+    let mut stages = request_lifecycle::plan_request(&store[idx]).map_err(map_engine_error)?;
+
+    // Enrich plan stage with Terraform evidence before persisting to store.
+    // Same soundness rule: enrich before store write.
+    enrich_plan_stages_with_terraform(&store[idx], &mut stages);
 
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
@@ -17760,5 +17894,207 @@ mod maint_calendar_db_tests {
         };
         assert_eq!(body["status"], "Cancelled");
         assert_eq!(body["source"], "database");
+    }
+
+    // -------------------------------------------------------------------------
+    // Terraform plan wiring tests (Slice 1b.1)
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a minimal `Validated` patch-maintenance request suitable
+    /// for calling `plan_request` and `enrich_plan_stages_with_terraform`.
+    fn make_validated_patch_maintenance_request() -> ryuki_engine::models::Request {
+        use ryuki_engine::models::{Request, RequestStatus, RequestType};
+        let mut req = Request::new(
+            "test-plan-wire-id".to_string(),
+            "patch-maintenance".to_string(),
+            RequestType::PatchMaintenance,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+        req
+    }
+
+    /// Unit test: resolver returns Some for patch-maintenance, None for others.
+    #[test]
+    fn terraform_iac_resolver_known_and_unknown_offerings() {
+        use crate::runner::iac;
+        let bundle = iac::resolve("patch-maintenance");
+        assert!(bundle.is_some(), "patch-maintenance must have wired IaC");
+        assert!(
+            iac::resolve("server-deployment").is_none(),
+            "server-deployment must be unwired (None)"
+        );
+        assert!(
+            iac::resolve("zabbix-onboarding").is_none(),
+            "zabbix-onboarding must be unwired (None)"
+        );
+    }
+
+    /// TDD — wired offering enriches plan stage with "terraform-plan" evidence.
+    ///
+    /// If `terraform` is on PATH the test asserts real plan output.
+    /// If `terraform` is absent (CI) the test asserts graceful-degradation
+    /// (note item present, no panic, transition succeeds).
+    #[test]
+    fn plan_stages_enriched_with_terraform_evidence_for_patch_maintenance() {
+        use crate::runner::terraform::TerraformRunner;
+        use crate::runner::Runner;
+        use ryuki_engine::models::EvidenceType;
+
+        let request = make_validated_patch_maintenance_request();
+        let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
+            .expect("plan_request must succeed for Validated request");
+
+        // Check whether terraform binary is available.
+        let runner = TerraformRunner::new();
+        let terraform_available = runner.available();
+
+        // Enrich stages using the same logic as the handler.
+        enrich_plan_stages_with_terraform(&request, &mut stages);
+
+        // Find the "plan" stage.
+        let plan_stage = stages
+            .iter()
+            .find(|s| s.name == "plan")
+            .expect("plan stage must exist");
+
+        if terraform_available {
+            // Happy path: real terraform plan output is present.
+            let tf_evidence = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan");
+            assert!(
+                tf_evidence.is_some(),
+                "terraform-plan evidence must be present when terraform is available; \
+                 evidence keys: {:?}",
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
+            );
+            let ev = tf_evidence.unwrap();
+            assert_eq!(ev.evidence_type, EvidenceType::Plan);
+            // The value must contain genuine terraform output.
+            assert!(
+                ev.value.contains("Terraform")
+                    || ev.value.contains("Plan:")
+                    || ev.value.contains("to add"),
+                "terraform-plan evidence must contain real terraform output; got: {:?}",
+                ev.value
+            );
+            // The simulated dry-run evidence must still be present (additive).
+            let has_simulated = plan_stage.evidence.iter().any(|e| e.key == "dry-run-plan");
+            assert!(
+                has_simulated,
+                "simulated dry-run-plan evidence must still be present alongside terraform evidence"
+            );
+        } else {
+            // Graceful degradation: no terraform binary — a note item must be present.
+            let note = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan-note");
+            assert!(
+                note.is_some(),
+                "graceful degradation: terraform-plan-note must be present when terraform is absent; \
+                 evidence keys: {:?}",
+                plan_stage.evidence.iter().map(|e| &e.key).collect::<Vec<_>>()
+            );
+            let note_ev = note.unwrap();
+            assert!(
+                note_ev.value.contains("skipped") || note_ev.value.contains("unavailable"),
+                "note must describe the skip; got: {:?}",
+                note_ev.value
+            );
+        }
+
+        // In both branches: the transition must succeed (stages is well-formed).
+        assert!(
+            !stages.is_empty(),
+            "stages must not be empty after enrichment"
+        );
+    }
+
+    /// TDD — unwired offering is completely unchanged after enrichment.
+    #[test]
+    fn plan_stages_unchanged_for_unwired_offering() {
+        use ryuki_engine::models::{Request, RequestStatus, RequestType};
+
+        let mut req = Request::new(
+            "test-unwired-id".to_string(),
+            "server-deployment".to_string(),
+            RequestType::ServerDeployment,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+
+        let stages_before =
+            ryuki_engine::request_lifecycle::plan_request(&req).expect("plan_request must succeed");
+        let mut stages_after = stages_before.clone();
+
+        enrich_plan_stages_with_terraform(&req, &mut stages_after);
+
+        // Stages must be identical — no terraform evidence added for unwired type.
+        assert_eq!(
+            stages_before, stages_after,
+            "unwired offering must produce identical stages before and after enrichment"
+        );
+    }
+
+    /// TDD — soundness: the stages_json built for DB write contains the terraform
+    /// evidence when terraform is available, not just the in-memory stages.
+    #[test]
+    fn plan_json_for_db_write_contains_terraform_evidence_when_available() {
+        use crate::runner::terraform::TerraformRunner;
+        use crate::runner::Runner;
+
+        let request = make_validated_patch_maintenance_request();
+        let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
+            .expect("plan_request must succeed");
+
+        let runner = TerraformRunner::new();
+        let terraform_available = runner.available();
+
+        // Enrich (same logic as handler).
+        enrich_plan_stages_with_terraform(&request, &mut stages);
+
+        // Serialize to JSON as the handler does for the DB write.
+        let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
+
+        if terraform_available {
+            // The serialized JSON must carry the terraform-plan evidence key.
+            let json_str = stages_json.to_string();
+            assert!(
+                json_str.contains("terraform-plan"),
+                "stages_json for DB write must contain terraform-plan evidence when terraform is available; \
+                 got: {json_str}"
+            );
+        } else {
+            // Graceful degradation: note key must be in serialized JSON.
+            let json_str = stages_json.to_string();
+            assert!(
+                json_str.contains("terraform-plan-note"),
+                "stages_json for DB write must contain terraform-plan-note when terraform is absent; \
+                 got: {json_str}"
+            );
+        }
+
+        // In all cases: plan stage must be present in serialized JSON.
+        let plan_stages: Vec<ryuki_engine::models::Stage> = serde_json::from_value(stages_json)
+            .expect("stages_json must deserialize as Vec<Stage>");
+        assert!(
+            plan_stages.iter().any(|s| s.name == "plan"),
+            "serialized stages must contain the plan stage"
+        );
     }
 }

@@ -14,6 +14,25 @@ pub struct Workspace {
     dir: tempfile::TempDir,
 }
 
+/// Reject filenames that could escape the workspace directory. Workspace files
+/// must be plain names — no path separators, parent refs, or absolute paths —
+/// so a name can never write outside the per-run TempDir even if a future
+/// caller supplies it dynamically.
+fn validate_workspace_filename(name: &str) -> Result<(), RunnerError> {
+    let is_plain = !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && !Path::new(name).is_absolute()
+        && Path::new(name).components().count() == 1;
+    if !is_plain {
+        return Err(RunnerError::WorkspaceSetup(format!(
+            "unsafe workspace filename: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
 impl Workspace {
     /// Create a new isolated workspace directory (mode 0700 on Unix).
     pub fn new() -> Result<Self, RunnerError> {
@@ -39,6 +58,22 @@ impl Workspace {
         self.dir.path()
     }
 
+    /// Write a non-secret file into the workspace with default permissions.
+    ///
+    /// # Arguments
+    /// * `name` — filename within the workspace (no path separators).
+    /// * `content` — byte content to write.
+    ///
+    /// Use this for IaC source files (`.tf`) that contain no secret material.
+    /// For vars files and credential files use `write_file_0600` instead.
+    pub fn write_file(&self, name: &str, content: &[u8]) -> Result<PathBuf, RunnerError> {
+        validate_workspace_filename(name)?;
+        let path = self.dir.path().join(name);
+        std::fs::write(&path, content)
+            .map_err(|e| RunnerError::WorkspaceSetup(format!("write {name}: {e}")))?;
+        Ok(path)
+    }
+
     /// Write a file into the workspace with mode 0600 (owner read/write only).
     ///
     /// # Arguments
@@ -49,6 +84,7 @@ impl Workspace {
     /// 0600 permissions ensure that only the process owner can read the file.
     /// Secret files (vars, credential files) MUST use this method.
     pub fn write_file_0600(&self, name: &str, content: &[u8]) -> Result<PathBuf, RunnerError> {
+        validate_workspace_filename(name)?;
         let path = self.dir.path().join(name);
         std::fs::write(&path, content)
             .map_err(|e| RunnerError::WorkspaceSetup(format!("write {name}: {e}")))?;
@@ -100,6 +136,21 @@ mod tests {
         assert!(path.exists(), "file must exist");
         let read_back = std::fs::read(&path).expect("must be readable");
         assert_eq!(read_back, content);
+    }
+
+    #[test]
+    fn write_file_rejects_path_traversal_names() {
+        let ws = Workspace::new().expect("workspace creation");
+        for bad in ["../escape.tf", "a/b.tf", "/etc/passwd", "..", ""] {
+            assert!(
+                ws.write_file(bad, b"x").is_err(),
+                "write_file must reject unsafe name {bad:?}"
+            );
+            assert!(
+                ws.write_file_0600(bad, b"x").is_err(),
+                "write_file_0600 must reject unsafe name {bad:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

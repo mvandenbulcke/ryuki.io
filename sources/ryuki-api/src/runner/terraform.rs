@@ -54,14 +54,23 @@ static OFFERING_SLUG_RE: std::sync::LazyLock<regex::Regex> =
 /// # Binary injection
 /// Use `TerraformRunner::with_binary("/path/to/fake-terraform")` in tests
 /// to avoid requiring a real Terraform installation.
+///
+/// # IaC content injection
+/// Use `TerraformRunner::with_iac` to embed static IaC file content that is
+/// written into the workspace before `terraform init`. Each entry is a
+/// `(filename, content)` pair; content must be valid Terraform HCL.
 pub struct TerraformRunner {
     binary: String,
+    /// Static IaC files written into the workspace before `terraform init`.
+    /// Each entry is `(filename, utf8_content)`.
+    iac_files: Vec<(&'static str, &'static str)>,
 }
 
 impl Default for TerraformRunner {
     fn default() -> Self {
         Self {
             binary: DEFAULT_BINARY.to_string(),
+            iac_files: Vec::new(),
         }
     }
 }
@@ -75,7 +84,19 @@ impl TerraformRunner {
     pub fn with_binary(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            iac_files: Vec::new(),
         }
+    }
+
+    /// Attach static IaC file content to be written into the workspace before
+    /// `terraform init`. Each entry is `(filename, utf8_content)`.
+    ///
+    /// This is the mechanism by which per-offering IaC (embedded via
+    /// `include_str!`) reaches the temporary workspace without touching the
+    /// filesystem outside of the per-run TempDir.
+    pub fn with_iac(mut self, files: Vec<(&'static str, &'static str)>) -> Self {
+        self.iac_files = files;
+        self
     }
 }
 
@@ -229,6 +250,12 @@ impl Runner for TerraformRunner {
 
         // --- Workspace setup ---
         let ws = Workspace::new()?;
+
+        // Write IaC source files (non-secret .tf content) into the workspace
+        // before init so `terraform init` has configuration to process.
+        for (filename, content) in &self.iac_files {
+            ws.write_file(filename, content.as_bytes())?;
+        }
 
         // Write non-secret vars to a JSON vars file.
         if !plan.vars.is_empty() {
