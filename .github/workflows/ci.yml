@@ -9,6 +9,14 @@ on:
   pull_request:
     branches: ["main"]
 
+# Least-privilege default token: every job below only reads the repo (build,
+# test, lint, secret scan, validator, and local image builds with no push). No
+# job writes to the repo, registry, or pull requests, so the token is read-only
+# for all jobs; add a per-job `permissions:` override if that ever changes. The
+# Pages deploy lives in a separate workflow and is unaffected.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
