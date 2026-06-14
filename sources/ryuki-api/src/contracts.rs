@@ -8994,7 +8994,13 @@ async fn requests_validate(
 /// # Soundness invariant
 /// Callers MUST call this function BEFORE building `stages_json`/`plan_json`
 /// for the DB write. Enriching after serialization loses the output.
-fn enrich_plan_stages_with_terraform(
+/// Synchronous inner implementation of terraform plan enrichment.
+///
+/// Extracted so that:
+/// - Tests (which may be sync) can call this directly.
+/// - The async wrapper can invoke it inside `spawn_blocking`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn enrich_plan_stages_with_terraform_sync(
     request: &ryuki_engine::models::Request,
     stages: &mut [ryuki_engine::models::Stage],
 ) {
@@ -9040,7 +9046,7 @@ fn enrich_plan_stages_with_terraform(
     let outcome = match runner.run_dry(&run_plan, &empty_creds) {
         Ok(o) => o,
         Err(e) => {
-            // Workspace or spawn error — degrade gracefully.
+            // Workspace, spawn, or timeout error — degrade gracefully.
             append_terraform_note(stages, &format!("terraform plan skipped: {e}"));
             return;
         }
@@ -9090,6 +9096,117 @@ fn enrich_plan_stages_with_terraform(
     }
 }
 
+/// Async wrapper: moves the blocking `runner.run_dry` call off the tokio
+/// executor thread via `spawn_blocking` so a slow/hung terraform subprocess
+/// does not starve other async tasks.
+///
+/// The stages mutation still happens on the async task after the blocking call
+/// returns — only the subprocess wait is offloaded.
+///
+/// # Graceful degradation on JoinError
+/// If the blocking task panics (e.g. OOM inside the subprocess), the panic is
+/// caught here and a note item is appended instead of propagating the panic.
+async fn enrich_plan_stages_with_terraform(
+    request: &ryuki_engine::models::Request,
+    stages: &mut [ryuki_engine::models::Stage],
+) {
+    use crate::integration::ResolvedCredentials;
+    use crate::runner::iac;
+    use crate::runner::terraform::TerraformRunner;
+    use crate::runner::Runner;
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus};
+
+    // Resolve offering_id before entering spawn_blocking (cheap, borrows request).
+    let offering_id = iac::resolve_offering_id(request);
+    let offering_id_str = offering_id.clone();
+
+    // Resolve IaC bundle — if None, no wiring for this offering.
+    let Some(iac_bundle) = iac::resolve(&offering_id_str) else {
+        return;
+    };
+
+    // Build all owned values before entering spawn_blocking (no borrows cross
+    // the thread boundary).
+    let runner = TerraformRunner::new().with_iac(iac_bundle);
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("site".to_string(), request.site.clone());
+    vars.insert("environment".to_string(), request.environment.clone());
+    vars.insert("request_id".to_string(), request.id.clone());
+    let run_plan = RunPlan {
+        runner_kind: ryuki_engine::runners::RunnerKind::Terraform,
+        mode: RunMode::DryRun,
+        offering_id: offering_id_str.clone(),
+        vars,
+        secret_var_names: Vec::new(),
+    };
+    let empty_creds = ResolvedCredentials {
+        material: Vec::new(),
+        descriptor: "none".to_string(),
+    };
+
+    // Offload the blocking subprocess call to a dedicated thread so the tokio
+    // worker is not blocked for the duration of terraform init + plan.
+    let run_result =
+        tokio::task::spawn_blocking(move || runner.run_dry(&run_plan, &empty_creds)).await;
+
+    // Unpack the JoinResult<Result<RunOutcome, RunnerError>>.
+    let outcome = match run_result {
+        Err(_join_err) => {
+            // The spawn_blocking task panicked — degrade gracefully, never propagate.
+            append_terraform_note(
+                stages,
+                "terraform plan skipped: internal error (spawn_blocking panic)",
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            // RunnerError (workspace, spawn, or timeout) — degrade gracefully.
+            append_terraform_note(stages, &format!("terraform plan skipped: {e}"));
+            return;
+        }
+        Ok(Ok(o)) => o,
+    };
+
+    // Build evidence item from outcome.
+    let evidence_item = if outcome.status == RunStatus::Planned {
+        let value = if outcome.log.is_empty() {
+            outcome.summary.clone()
+        } else {
+            let log_excerpt = if outcome.log.len() > 4096 {
+                let truncated: String = outcome.log.chars().take(4096).collect();
+                format!("{truncated}...[truncated]")
+            } else {
+                outcome.log.clone()
+            };
+            format!("{}\n\n{}", outcome.summary, log_excerpt)
+        };
+        EvidenceItem {
+            key: "terraform-plan".to_string(),
+            value,
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        }
+    } else {
+        let note = format!(
+            "terraform plan skipped: runner unavailable or failed (status: {}; {})",
+            outcome.status, outcome.summary
+        );
+        EvidenceItem {
+            key: "terraform-plan-note".to_string(),
+            value: note,
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        }
+    };
+
+    if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
+        plan_stage.evidence.push(evidence_item);
+    }
+}
+
 /// Append a note EvidenceItem to the "plan" stage (graceful degradation path).
 fn append_terraform_note(stages: &mut [ryuki_engine::models::Stage], note: &str) {
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
@@ -9105,25 +9222,13 @@ fn append_terraform_note(stages: &mut [ryuki_engine::models::Stage], note: &str)
     }
 }
 
-/// Enrich the "verify" stage of a request's stages with a real
-/// `ansible-playbook --check` evidence item for offerings that have wired
-/// Ansible IaC.
+/// Synchronous inner implementation of ansible verify enrichment.
 ///
-/// # Wiring contract
-/// 1. Resolve the Ansible IaC bundle via `iac::resolve_ansible`. If None, return
-///    immediately — no mutation, no panic.
-/// 2. Build `AnsibleRunner::new().with_iac(bundle)` and invoke `run_dry` in
-///    DryRun mode with the request's site/environment/id as non-secret vars and
-///    empty credentials (dry-run carries no secrets).
-/// 3. On `CheckOk`: append an `"ansible-check"` EvidenceItem (type Summary)
-///    with the runner log excerpt (truncated on a UTF-8 char boundary).
-/// 4. On `RunnerUnavailable` / failure / Err: append an `"ansible-check-note"`
-///    item describing the skip. Never panic, never error the transition.
-///
-/// # Soundness invariant
-/// Callers MUST call this function AFTER building the "verify" stage (so it
-/// exists in `stages`) but BEFORE serializing `stages_json` for the DB write.
-fn enrich_verify_stages_with_ansible(
+/// Extracted so that:
+/// - Tests (which may be sync) can call this directly.
+/// - The async wrapper can invoke it inside `spawn_blocking`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn enrich_verify_stages_with_ansible_sync(
     request: &ryuki_engine::models::Request,
     stages: &mut [ryuki_engine::models::Stage],
 ) {
@@ -9163,7 +9268,6 @@ fn enrich_verify_stages_with_ansible(
 
     let evidence_item = match runner.run_dry(&run_plan, &empty_creds) {
         Ok(outcome) if outcome.status == RunStatus::CheckOk => {
-            // Happy path: real ansible --check output available.
             let log_excerpt = if outcome.log.len() > 4096 {
                 let truncated: String = outcome.log.chars().take(4096).collect();
                 format!("{truncated}...[truncated]")
@@ -9183,33 +9287,122 @@ fn enrich_verify_stages_with_ansible(
                 evidence_type: EvidenceType::Summary,
             }
         }
-        Ok(outcome) => {
-            // RunnerUnavailable or Failed — degrade gracefully.
-            EvidenceItem {
-                key: "ansible-check-note".to_string(),
-                value: format!(
-                    "ansible --check skipped: runner unavailable or failed (status: {}; {})",
-                    outcome.status, outcome.summary
-                ),
-                redacted_value: None,
-                redacted: false,
-                evidence_type: EvidenceType::Summary,
-            }
-        }
-        Err(e) => {
-            // Workspace or spawn error — degrade gracefully.
-            EvidenceItem {
-                key: "ansible-check-note".to_string(),
-                value: format!("ansible --check skipped: {e}"),
-                redacted_value: None,
-                redacted: false,
-                evidence_type: EvidenceType::Summary,
-            }
-        }
+        Ok(outcome) => EvidenceItem {
+            key: "ansible-check-note".to_string(),
+            value: format!(
+                "ansible --check skipped: runner unavailable or failed (status: {}; {})",
+                outcome.status, outcome.summary
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+        Err(e) => EvidenceItem {
+            key: "ansible-check-note".to_string(),
+            value: format!("ansible --check skipped: {e}"),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
     };
 
-    // Append to the "verify" stage. The stage is always present (verify_request
-    // guarantees it), but we guard defensively.
+    if let Some(verify_stage) = stages.iter_mut().find(|s| s.name == "verify") {
+        verify_stage.evidence.push(evidence_item);
+    }
+}
+
+/// Async wrapper: moves the blocking `runner.run_dry` call off the tokio
+/// executor thread via `spawn_blocking` so a slow/hung ansible subprocess
+/// does not starve other async tasks.
+///
+/// # Graceful degradation on JoinError
+/// If the blocking task panics, the panic is caught and a note item is appended
+/// instead of propagating the panic.
+async fn enrich_verify_stages_with_ansible(
+    request: &ryuki_engine::models::Request,
+    stages: &mut [ryuki_engine::models::Stage],
+) {
+    use crate::integration::ResolvedCredentials;
+    use crate::runner::ansible::AnsibleRunner;
+    use crate::runner::iac;
+    use crate::runner::Runner;
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
+
+    let offering_id = iac::resolve_offering_id(request);
+    let offering_id_str = offering_id.clone();
+
+    let Some(iac_bundle) = iac::resolve_ansible(&offering_id_str) else {
+        return;
+    };
+
+    let runner = AnsibleRunner::new().with_iac(iac_bundle);
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("site".to_string(), request.site.clone());
+    vars.insert("environment".to_string(), request.environment.clone());
+    vars.insert("request_id".to_string(), request.id.clone());
+    let run_plan = RunPlan {
+        runner_kind: RunnerKind::Ansible,
+        mode: RunMode::DryRun,
+        offering_id: offering_id_str.clone(),
+        vars,
+        secret_var_names: Vec::new(),
+    };
+    let empty_creds = ResolvedCredentials {
+        material: Vec::new(),
+        descriptor: "none".to_string(),
+    };
+
+    let run_result =
+        tokio::task::spawn_blocking(move || runner.run_dry(&run_plan, &empty_creds)).await;
+
+    let evidence_item = match run_result {
+        Err(_join_err) => EvidenceItem {
+            key: "ansible-check-note".to_string(),
+            value: "ansible --check skipped: internal error (spawn_blocking panic)".to_string(),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+        Ok(Err(e)) => EvidenceItem {
+            key: "ansible-check-note".to_string(),
+            value: format!("ansible --check skipped: {e}"),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+        Ok(Ok(outcome)) if outcome.status == RunStatus::CheckOk => {
+            let log_excerpt = if outcome.log.len() > 4096 {
+                let truncated: String = outcome.log.chars().take(4096).collect();
+                format!("{truncated}...[truncated]")
+            } else {
+                outcome.log.clone()
+            };
+            let value = if log_excerpt.is_empty() {
+                outcome.summary.clone()
+            } else {
+                format!("{}\n\n{}", outcome.summary, log_excerpt)
+            };
+            EvidenceItem {
+                key: "ansible-check".to_string(),
+                value,
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }
+        }
+        Ok(Ok(outcome)) => EvidenceItem {
+            key: "ansible-check-note".to_string(),
+            value: format!(
+                "ansible --check skipped: runner unavailable or failed (status: {}; {})",
+                outcome.status, outcome.summary
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+    };
+
     if let Some(verify_stage) = stages.iter_mut().find(|s| s.name == "verify") {
         verify_stage.evidence.push(evidence_item);
     }
@@ -9242,9 +9435,13 @@ async fn requests_plan(
         // Enrich plan stage with real Terraform dry-run output for wired
         // offerings. This MUST happen before serialization so the enriched
         // evidence is what gets persisted (soundness invariant).
-        // Graceful degradation: if terraform is absent or fails, a note item is
-        // appended instead and the transition continues normally.
-        enrich_plan_stages_with_terraform(&request, &mut stages);
+        // The async wrapper offloads the blocking subprocess onto a spawn_blocking
+        // thread so this tokio worker is not blocked during terraform init+plan.
+        // Graceful degradation: if terraform is absent/fails/times out, a note
+        // item is appended instead and the transition continues normally.
+        // No DB transaction is held here — the TX is opened inside
+        // apply_transition_audited AFTER the enrich completes.
+        enrich_plan_stages_with_terraform(&request, &mut stages).await;
 
         // plan_request returns the full cumulative Vec<Stage> (including the
         // plan stage). The no-DB arm sets store[idx].stages = stages.clone();
@@ -9279,17 +9476,45 @@ async fn requests_plan(
         return Ok(Json(serde_json::to_value(&stages).unwrap_or_default()));
     }
 
+    // ── No-DB branch (Task 3 restructure) ───────────────────────────────────
+    // The async enrich call (.await) cannot hold a MutexGuard across the await
+    // point (the guard is !Send on tokio::sync::Mutex). Restructure:
+    //   1. Lock → clone the request → drop the guard.
+    //   2. Run plan_request + async enrich on the clone (no lock held).
+    //   3. Re-acquire → re-find by id → write the enriched stages + transition.
+
+    // Step 1: clone + release lock.
+    let cloned_request = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].clone()
+        // guard drops here
+    };
+
+    // Step 2: compute stages + enrich — no lock held across the subprocess.
+    let mut stages = request_lifecycle::plan_request(&cloned_request).map_err(map_engine_error)?;
+    enrich_plan_stages_with_terraform(&cloned_request, &mut stages).await;
+
+    // Step 3: re-acquire, re-find, write enriched result.
     let mut store = request_store().lock().await;
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
 
-    let mut stages = request_lifecycle::plan_request(&store[idx]).map_err(map_engine_error)?;
-
-    // Enrich plan stage with Terraform evidence before persisting to store.
-    // Same soundness rule: enrich before store write.
-    enrich_plan_stages_with_terraform(&store[idx], &mut stages);
+    // Optimistic-concurrency guard: the request must still be in the pre-state
+    // the plan was computed against. If a concurrent transition (e.g. cancel)
+    // changed it between the clone and this re-lock, do NOT overwrite it —
+    // return 409, mirroring the DB CAS path. (The store lock is released across
+    // the subprocess, so this window is real.)
+    if store[idx].status != cloned_request.status {
+        return Err(status_409(&format!(
+            "request {request_id} was modified concurrently during planning; retry"
+        )));
+    }
 
     // B8: snapshot prior status/stage before overwriting store[idx].
     let from_status = request_status_to_db(&store[idx].status).to_string();
@@ -9297,6 +9522,8 @@ async fn requests_plan(
     store[idx].status = ryuki_engine::models::RequestStatus::Planned;
     store[idx].stages = stages.clone();
     store[idx].updated_at = now_iso();
+    drop(store);
+
     record_local_transition(
         &session,
         &request_id,
@@ -9559,9 +9786,11 @@ async fn requests_verify(
 
         // Enrich verify stage with real ansible --check output for wired
         // offerings. MUST happen before stages_json serialization (soundness
-        // invariant). Graceful degradation: ansible absent/failed → note item,
-        // transition continues normally.
-        enrich_verify_stages_with_ansible(&request, &mut verified_request.stages);
+        // invariant). The async wrapper offloads the blocking subprocess.
+        // Graceful degradation: ansible absent/fails/times out → note item.
+        // No DB transaction is held here — TX is opened inside
+        // apply_transition_audited AFTER the enrich completes.
+        enrich_verify_stages_with_ansible(&request, &mut verified_request.stages).await;
 
         let completed = request_lifecycle::transition_status(
             &verified_request,
@@ -9589,25 +9818,27 @@ async fn requests_verify(
         return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
     }
 
-    let mut store = request_store().lock().await;
-    let idx = store
-        .iter()
-        .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+    // ── No-DB branch (Task 3 restructure) ───────────────────────────────────
+    // Same pattern as requests_plan: clone+drop → enrich (async) → re-lock+rewrite.
 
-    let evidence = request_lifecycle::verify_request(&store[idx]).map_err(map_engine_error)?;
+    // Step 1: clone + release lock.
+    let cloned_request = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].clone()
+        // guard drops here
+    };
 
-    // B8: snapshot prior status/stage before overwriting store[idx].
-    let from_status = request_status_to_db(&store[idx].status).to_string();
-    let from_stage = current_stage_name(&store[idx]);
-    let mut verified_request = store[idx].clone();
+    // Step 2: compute evidence + build verified_request + enrich — no lock held.
+    let evidence = request_lifecycle::verify_request(&cloned_request).map_err(map_engine_error)?;
+    let mut verified_request = cloned_request.clone();
     verified_request
         .stages
         .push(completed_request_stage("verify", evidence.clone()));
-
-    // Enrich verify stage with ansible --check evidence before persisting.
-    // Same soundness rule: enrich before store write.
-    enrich_verify_stages_with_ansible(&store[idx], &mut verified_request.stages);
+    enrich_verify_stages_with_ansible(&cloned_request, &mut verified_request.stages).await;
 
     let completed = request_lifecycle::transition_status(
         &verified_request,
@@ -9615,15 +9846,38 @@ async fn requests_verify(
     )
     .map_err(map_engine_error)?;
 
-    let to_status = completed.status.as_str();
+    // Step 3: re-acquire, re-find, write completed result.
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+
+    // Optimistic-concurrency guard: the request must still be in the pre-state
+    // the verify was computed against. If a concurrent transition changed it
+    // between the clone and this re-lock, do NOT overwrite it — return 409,
+    // mirroring the DB CAS path. (The store lock is released across the
+    // subprocess, so this window is real.)
+    if store[idx].status != cloned_request.status {
+        return Err(status_409(&format!(
+            "request {request_id} was modified concurrently during verification; retry"
+        )));
+    }
+
+    // B8: snapshot prior status/stage before overwriting store[idx].
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    let to_status = completed.status.as_str().to_string();
     store[idx] = completed;
+    drop(store);
+
     record_local_transition(
         &session,
         &request_id,
         "request.verify",
         Some(&from_status),
         Some(&from_stage),
-        to_status,
+        &to_status,
         "verify",
     )
     .await;
@@ -18116,7 +18370,7 @@ mod maint_calendar_db_tests {
         let terraform_available = runner.available();
 
         // Enrich stages using the same logic as the handler.
-        enrich_plan_stages_with_terraform(&request, &mut stages);
+        enrich_plan_stages_with_terraform_sync(&request, &mut stages);
 
         // Find the "plan" stage.
         let plan_stage = stages
@@ -18204,7 +18458,7 @@ mod maint_calendar_db_tests {
             ryuki_engine::request_lifecycle::plan_request(&req).expect("plan_request must succeed");
         let mut stages_after = stages_before.clone();
 
-        enrich_plan_stages_with_terraform(&req, &mut stages_after);
+        enrich_plan_stages_with_terraform_sync(&req, &mut stages_after);
 
         // Stages must be identical — no terraform evidence added for unwired type.
         assert_eq!(
@@ -18228,7 +18482,7 @@ mod maint_calendar_db_tests {
         let terraform_available = runner.available();
 
         // Enrich (same logic as handler).
-        enrich_plan_stages_with_terraform(&request, &mut stages);
+        enrich_plan_stages_with_terraform_sync(&request, &mut stages);
 
         // Serialize to JSON as the handler does for the DB write.
         let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
@@ -18324,7 +18578,7 @@ mod maint_calendar_db_tests {
         let ansible_available = runner.available();
 
         // Enrich stages using the same logic as the handler.
-        enrich_verify_stages_with_ansible(&request, &mut stages);
+        enrich_verify_stages_with_ansible_sync(&request, &mut stages);
 
         let verify_stage = stages
             .iter()
@@ -18419,7 +18673,7 @@ mod maint_calendar_db_tests {
         let stages_before = vec![completed_request_stage("verify", evidence.clone())];
         let mut stages_after = stages_before.clone();
 
-        enrich_verify_stages_with_ansible(&req, &mut stages_after);
+        enrich_verify_stages_with_ansible_sync(&req, &mut stages_after);
 
         assert_eq!(
             stages_before, stages_after,
@@ -18444,7 +18698,7 @@ mod maint_calendar_db_tests {
         let ansible_available = runner.available();
 
         // Enrich (same logic as handler).
-        enrich_verify_stages_with_ansible(&request, &mut stages);
+        enrich_verify_stages_with_ansible_sync(&request, &mut stages);
 
         // Serialize to JSON as the handler does for the DB write.
         let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
@@ -18550,7 +18804,7 @@ mod maint_calendar_db_tests {
         let runner = TerraformRunner::new();
         let terraform_available = runner.available();
 
-        enrich_plan_stages_with_terraform(&req, &mut stages);
+        enrich_plan_stages_with_terraform_sync(&req, &mut stages);
 
         let plan_stage = stages
             .iter()
@@ -18607,7 +18861,7 @@ mod maint_calendar_db_tests {
         let runner = TerraformRunner::new();
         let terraform_available = runner.available();
 
-        enrich_plan_stages_with_terraform(&req, &mut stages);
+        enrich_plan_stages_with_terraform_sync(&req, &mut stages);
 
         let plan_stage = stages
             .iter()

@@ -19,11 +19,16 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::time::Duration;
 
 use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind};
 
-use super::{scrub::scrub_output, workspace::Workspace, Runner};
+use super::{exec::run_command_with_timeout, scrub::scrub_output, workspace::Workspace, Runner};
 use crate::integration::ResolvedCredentials;
+
+/// Per-subprocess timeout for terraform init and terraform plan.
+/// A hung terraform (e.g. waiting for a remote backend) is killed after this.
+const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default binary name; overridable for tests via `TerraformRunner::with_binary`.
 const DEFAULT_BINARY: &str = "terraform";
@@ -169,6 +174,18 @@ fn apply_env_allowlist(cmd: &mut Command) {
     }
 }
 
+/// Pin the child's HOME and TMPDIR to the isolated workspace directory.
+///
+/// This prevents the subprocess from writing to the real $HOME (e.g.
+/// `~/.terraform.d`, `~/.ansible/tmp`) and constrains any temp files it
+/// creates to the per-run workspace that is cleaned up on drop.
+///
+/// Call this AFTER `apply_env_allowlist` so the workspace override wins.
+pub(crate) fn pin_home_tmpdir_to_workspace(cmd: &mut Command, workspace_path: &std::path::Path) {
+    let ws = workspace_path.to_string_lossy();
+    cmd.env("HOME", ws.as_ref()).env("TMPDIR", ws.as_ref());
+}
+
 /// Split credential material that may be comma-joined into individual
 /// non-empty component slices. Each component is scrubbed independently,
 /// preventing a partial match from escaping scrubbing when values are joined.
@@ -275,6 +292,10 @@ impl Runner for TerraformRunner {
         // control added explicitly after the allowlist.
         let mut init_cmd = Command::new(&self.binary);
         apply_env_allowlist(&mut init_cmd);
+        // Pin HOME and TMPDIR to the workspace so terraform cannot write to
+        // the real $HOME (e.g. ~/.terraform.d plugin cache). Any cache writes
+        // go into the per-run workspace and are cleaned up on drop.
+        pin_home_tmpdir_to_workspace(&mut init_cmd, ws.path());
         init_cmd
             .args(["init", "-input=false"])
             .current_dir(ws.path())
@@ -290,9 +311,11 @@ impl Runner for TerraformRunner {
             init_cmd.env(&env_key, &cred_str);
         }
 
-        let init_output = init_cmd
-            .output()
-            .map_err(|e| RunnerError::Spawn(format!("terraform init: {e}")))?;
+        let init_output =
+            run_command_with_timeout(init_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
+                RunnerError::Timeout => RunnerError::Timeout,
+                other => RunnerError::Spawn(format!("terraform init: {other}")),
+            })?;
 
         if !init_output.status.success() {
             let raw = combine_output(&init_output.stdout, &init_output.stderr);
@@ -313,6 +336,7 @@ impl Runner for TerraformRunner {
         // --- Step 2: terraform plan ---
         let mut plan_cmd = Command::new(&self.binary);
         apply_env_allowlist(&mut plan_cmd);
+        pin_home_tmpdir_to_workspace(&mut plan_cmd, ws.path());
         plan_cmd
             .args(["plan", "-input=false", "-no-color"])
             .current_dir(ws.path())
@@ -324,9 +348,11 @@ impl Runner for TerraformRunner {
             plan_cmd.env(&env_key, &cred_str);
         }
 
-        let plan_output = plan_cmd
-            .output()
-            .map_err(|e| RunnerError::Spawn(format!("terraform plan: {e}")))?;
+        let plan_output =
+            run_command_with_timeout(plan_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
+                RunnerError::Timeout => RunnerError::Timeout,
+                other => RunnerError::Spawn(format!("terraform plan: {other}")),
+            })?;
 
         let raw = combine_output(&plan_output.stdout, &plan_output.stderr);
         let scrubbed_log = scrub_output(&raw, &secret_refs);

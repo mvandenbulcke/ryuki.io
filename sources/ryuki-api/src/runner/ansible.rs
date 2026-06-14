@@ -22,16 +22,25 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
+use std::time::Duration;
 
 use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind};
 
 use super::{
+    exec::run_command_with_timeout,
     scrub::scrub_output,
-    terraform::{credential_components, validate_offering_slug, validate_var_name, ENV_ALLOWLIST},
+    terraform::{
+        credential_components, pin_home_tmpdir_to_workspace, validate_offering_slug,
+        validate_var_name, ENV_ALLOWLIST,
+    },
     workspace::Workspace,
     Runner,
 };
 use crate::integration::ResolvedCredentials;
+
+/// Per-subprocess timeout for ansible-playbook --check.
+/// A hung ansible (e.g. waiting for an unreachable host) is killed after this.
+const RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Default binary name; overridable for tests via `AnsibleRunner::with_binary`.
 const DEFAULT_BINARY: &str = "ansible-playbook";
@@ -295,9 +304,15 @@ impl Runner for AnsibleRunner {
         // env_clear() + allowlist applied; then explicit Ansible control vars added.
         let mut cmd = Command::new(&self.binary);
         apply_env_allowlist(&mut cmd);
+        // Pin HOME and TMPDIR to the workspace so ansible cannot write to
+        // the real $HOME (e.g. ~/.ansible/tmp). Also set ANSIBLE_LOCAL_TEMP
+        // so ansible's internal temp dir stays inside the per-run workspace.
+        pin_home_tmpdir_to_workspace(&mut cmd, ws.path());
         cmd.arg("--check")
             .arg(&playbook_ref)
             .current_dir(ws.path())
+            // Redirect ansible temp files into the workspace.
+            .env("ANSIBLE_LOCAL_TEMP", ws.path())
             // Disable host key checking for the check run.
             .env("ANSIBLE_HOST_KEY_CHECKING", "False")
             // Suppress Python warnings that would pollute output.
@@ -316,10 +331,12 @@ impl Runner for AnsibleRunner {
             cmd.args(["--extra-vars", secrets_arg]);
         }
 
-        // Execute.
-        let output = cmd
-            .output()
-            .map_err(|e| RunnerError::Spawn(format!("ansible-playbook --check: {e}")))?;
+        // Execute with bounded timeout. A hung ansible (unreachable host, etc.)
+        // is killed and returns Err(RunnerError::Timeout) to the caller.
+        let output = run_command_with_timeout(cmd, RUNNER_TIMEOUT).map_err(|e| match e {
+            RunnerError::Timeout => RunnerError::Timeout,
+            other => RunnerError::Spawn(format!("ansible-playbook --check: {other}")),
+        })?;
 
         let raw = combine_output(&output.stdout, &output.stderr);
         let scrubbed_log = scrub_output(&raw, &secret_refs);
