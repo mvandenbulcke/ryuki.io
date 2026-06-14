@@ -1,5 +1,32 @@
 # Ryuki — Missing Features: Analysis & Implementation Design
 
+> ## ⚠️ Reconciliation status — 2026-06-14, HEAD 2ad1a53
+>
+> This document was authored at `7172ea8` (2026-06-12). Approximately 50 commits have landed since
+> on `main`, implementing substantial portions of every P0 theme. The "Current state" sections,
+> file:line anchors, and gap counts in the body below are **largely stale** — they describe the
+> codebase as it was on 2026-06-12. Trust this banner for present status; treat the body as
+> design rationale and implementation context, not as an accurate current-state assessment.
+>
+> | # | Theme | Status | Evidence |
+> |---|-------|--------|----------|
+> | 1 | Live adapter execution & provider integration | **PARTIAL** | Vendor-integration framework + connections DB landed (`d298a91`, `052_integration_connections.sql`); execution-runner library for Terraform/Ansible dry-run added (`2ad1a53`, `sources/ryuki-api/src/runner/`). `ryuki-adapters` crate, live provider I/O, real secrets resolution, and async execution jobs remain unbuilt — adapters still `static_dry_run()` only (`sources/ryuki-engine/src/adapter_framework.rs`). |
+> | 2 | Authentication & authorization completion | **PARTIAL** | Real Entra ID RS256/JWKS validation (`f0c3d5e`, `entra_auth.rs`), coherent RBAC + route-level permission gates (`d14f589`), scoped API tokens + service accounts (`8e9f6e4`, `045_api_tokens.sql`), local credential-checking auth (`cf4985f`), and session persistence (`044_session_provider.sql`) all shipped. Remaining: not all 226+ mutating routes have been individually audited for RBAC coverage — some GET routes may still be effectively anonymous in non-Entra mode. |
+> | 3 | Durable persistence & data model wiring | **PARTIAL** | Request lifecycle now fully durable — payload/stages/approvals persisted as JSONB (`496061b`, `047_request_state.sql`). DNS records (`048`), firewall rules (`049`), IPAM (`050`), secrets rotation (`051`), alert routes, legal holds, maintenance windows (`5eedc52`), integration connections (`052`) all wired to DB. Engine state (61-table gap) is substantially closed for request-centric and most P1 data; inventory/metric tables (`046_inventory_state` design) and execution-job tables remain unbuilt. |
+> | 4 | Request lifecycle & approval workflow completeness | **DONE** | `reject_request` / `cancel_request` with actor attribution and audit records implemented (`a4d9d72`); approver inbox endpoint + portal view shipped (`7b831ff`, `85fc56e`); locking and request locking path improved; audit trail is durable and append-only (`046_audit_log.sql`). Approver is no longer the literal `"admin"`. |
+> | 5 | Audit trail, evidence & compliance export | **DONE** | Durable append-only audit trail with real session identity (`68e61ff`, `046_audit_log.sql`); per-request digest-sealed compliance evidence pack (`e96e818`); secret-bearing free-text redacted in audit reads (`0b093cb`). |
+> | 6 | Portal feature parity & functionality | **PARTIAL** | Portal now makes real HTTP calls to the API via `UpstreamClient` (`6b2d489`); login, requests list/create/detail, approvals inbox, integrations workspace, and admin settings are all live-wired. Mutations (approve/reject/cancel), execution progress, and several domain workspaces still have no portal surface or degrade to static/fallback. |
+> | 7 | Deployability, CI/CD & release engineering | **DONE** | Both Dockerfiles fixed and building (`2956c72`); CI pipeline gating `main` with build/test/lint/secret-scan/validator/image jobs (`0dc9544`); K8s config + DB network policies + Vault VSO wiring (`62c5049`); Makefile targets added (`7587d30`). No DB is opened in CI (no Postgres service container) so DB-path tests remain skipped there. |
+> | 8 | Lifecycle extension: Protect/Publish/Maintain/Retire & offering availability | **OPEN** | No post-completion lifecycle stages (Protect/Publish/Maintain/Retire) implemented in the engine or API. Catalog offerings remain `status: planned`. No Windows deployment engine. |
+> | 9 | Notifications, webhooks & eventing | **OPEN** | No SMTP, no webhook outbox, no portal feed, no `statusCallback` dispatch. No commits touch this theme. |
+> | 10 | Scheduling & background automation | **PARTIAL** | Maintenance windows are now durably persisted to DB (`5eedc52`). No general job queue, timer worker, or scheduled-execution pipeline exists; `schedule` endpoints remain in-process statics for non-maintenance-window domains. |
+> | 11 | Platform observability & self-monitoring | **PARTIAL** | Metrics mutex-poisoning crash fixed (`323a06a`). Health checks still return `HealthSource::Simulated` for all seven subsystems (`sources/ryuki-engine/src/health_monitor.rs`); quantile fabrication unchanged; no scrape/alert/log-shipping wiring. |
+> | 12 | Catalog, contract & documentation integrity | **DONE** | Validator driven to 119/119 green (`ba0827b`); deleted C# layout purged from all 120 slice modules; docs/workflows, docs/ui, docs/architecture, docs/source-inputs, new catalog YAMLs authored. Validator runs in CI (`0dc9544`) but still `continue-on-error: true` pending enforcement promotion. |
+> | 13 | Test & verification depth | **PARTIAL** | CI now builds and runs `cargo test --workspace`; workspace-level integration tests exist (`tests/`). No test constructs the real Axum router against a live DB (no Postgres service in CI), no portal component render tests, and no provider mock layer. Engine unit tests and lifecycle tests are solid but coverage of the auth and API surface remains shallow. |
+> | 14 | Adapter & vendor expansion | **PARTIAL** | Integration connections framework and credential-source model landed (`d298a91`, `052`); portal integrations workspace with CRUD shipped (`099f80b`, `b734241`). All 17 adapters remain `static_dry_run()` only; no second vendor category has a real implementation behind it. |
+>
+> **Summary: 4 DONE · 8 PARTIAL · 2 OPEN** (themes 8 and 9 untouched).
+
 **Date:** 2026-06-12
 
 ## Executive summary
