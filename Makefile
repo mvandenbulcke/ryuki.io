@@ -18,11 +18,11 @@ test-unit:
 # Run DB integration tests only (requires a live Postgres instance).
 # Filtered by module name so only DB tests run in this process — no in-memory
 # unit_tests are executed, and the global pool contamination cannot occur.
-# The `db_lifecycle_tests` filter is included so existing lifecycle DB tests
-# run alongside the new maintenance-calendar DB tests.
+# Filters: db_lifecycle_tests (request lifecycle), maint_calendar_db_tests
+# (maintenance windows), integration_db_tests (vendor integration connections).
 test-db:
 	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
-	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests
+	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests integration_db_tests
 
 test:
 	cargo test --workspace
