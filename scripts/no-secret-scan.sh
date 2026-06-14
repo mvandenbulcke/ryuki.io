@@ -36,11 +36,47 @@ pattern_names=(
   'Ryuki API token'
 )
 
+# Inline allowlist marker. A line carrying this marker is exempt from the
+# heuristic "secret assignment" check ONLY. Use it to annotate VERIFIED false
+# positives — e.g. an HCL `password = var.x` provider argument that references a
+# variable, not a literal credential. The marker is visible on the line and
+# reviewable in every diff, so suppression is explicit and auditable rather than
+# hidden. High-confidence formats (AWS keys, private keys, provider/API tokens)
+# are NEVER suppressible — the allowlist cannot become a real bypass.
+allow_marker='secret-scan-allow'
+
 found_any=false
 
 for i in "${!patterns[@]}"; do
   pattern="${patterns[$i]}"
   category="${pattern_names[$i]}"
+
+  # The heuristic "secret assignment" category supports the inline allowlist:
+  # scan line-by-line, then drop lines explicitly marked as verified false
+  # positives before deciding whether to fail.
+  if [ "$category" = "secret assignment" ]; then
+    set +e
+    raw=$(rg --hidden --glob '!.git/**' --line-number --no-heading -- "$pattern" "${paths[@]}" 2>/dev/null)
+    status=$?
+    set -e
+
+    if [ "$status" -gt 1 ]; then
+      printf 'No-secret scan failed while reading scoped paths.\n' >&2
+      exit "$status"
+    fi
+
+    if [ "$status" -eq 0 ] && [ -n "$raw" ]; then
+      flagged=$(printf '%s\n' "$raw" | rg --invert-match -- "$allow_marker" || true)
+      if [ -n "$flagged" ]; then
+        found_any=true
+        while IFS= read -r line; do
+          [ -n "$line" ] && printf 'category=%s match=%s\n' "$category" "$line" >&2
+        done <<< "$flagged"
+      fi
+    fi
+
+    continue
+  fi
 
   set +e
   matched_files=$(rg --hidden --glob '!.git/**' --files-with-matches -- "$pattern" "${paths[@]}" 2>/dev/null)

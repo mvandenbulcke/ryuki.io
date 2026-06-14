@@ -10,11 +10,18 @@
 //! runtime filesystem reads and the binary is self-contained. Each file is a
 //! `(&'static str, &'static str)` pair of `(filename, utf8_content)`.
 //!
-//! # Offline guarantee
-//! Every embedded `.tf` file uses ONLY built-in Terraform resources
-//! (`terraform_data`, variables, outputs) — no providers, no
-//! `required_providers`, no cloud calls. `terraform init` + `terraform plan`
-//! run fully offline.
+//! # Offline guarantee (per offering)
+//! Built-in offerings (`patch-maintenance`, `request-preflight`) use ONLY
+//! `terraform_data` resources — no external providers, fully offline init+plan.
+//!
+//! Server-deployment offerings (`linux-server-deployment`,
+//! `windows-server-deployment`) use the real `vmware/vsphere` provider.
+//! `terraform init` downloads the provider from the public registry (network
+//! egress required once; cached by Terraform's plugin cache). `terraform
+//! validate` then runs fully offline against the downloaded schema — this is
+//! the correctness oracle. `terraform plan` requires a reachable vCenter and
+//! is attempted best-effort; failure without a live endpoint degrades
+//! gracefully to `RunStatus::Validated`.
 
 /// A bundle of IaC files for one offering.
 ///
@@ -298,9 +305,34 @@ mod tests {
             "linux-server-deployment bundle must include main.tf"
         );
         let (_, content) = files.iter().find(|(name, _)| *name == "main.tf").unwrap();
+        // Now uses real vSphere IaC — no longer terraform_data.
         assert!(
-            content.contains("terraform_data"),
-            "linux-server-deployment main.tf must use terraform_data"
+            content.contains("vsphere_virtual_machine"),
+            "linux-server-deployment main.tf must declare vsphere_virtual_machine resource; \
+             got: {content:.200}"
+        );
+        assert!(
+            content.contains("vmware/vsphere"),
+            "linux-server-deployment main.tf must use vmware/vsphere provider source"
+        );
+        // Credentials are injected at apply time (TF_VAR_vsphere_password / the
+        // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
+        // the secret scan. Guard against regression of all three.
+        assert!(
+            !content.contains("changeme"),
+            "linux-server-deployment main.tf must not embed a default credential"
+        );
+        assert!(
+            !content.contains("format(\"%s\""),
+            "linux-server-deployment main.tf must not obfuscate a credential to evade the secret scan"
+        );
+        assert!(
+            content.contains("sensitive"),
+            "linux-server-deployment main.tf must mark the credential variable sensitive"
+        );
+        assert!(
+            content.contains("VSPHERE_PASSWORD"),
+            "linux-server-deployment main.tf must document credential injection"
         );
     }
 
@@ -318,9 +350,34 @@ mod tests {
             "windows-server-deployment bundle must include main.tf"
         );
         let (_, content) = files.iter().find(|(name, _)| *name == "main.tf").unwrap();
+        // Now uses real vSphere IaC — no longer terraform_data.
         assert!(
-            content.contains("terraform_data"),
-            "windows-server-deployment main.tf must use terraform_data"
+            content.contains("vsphere_virtual_machine"),
+            "windows-server-deployment main.tf must declare vsphere_virtual_machine resource; \
+             got: {content:.200}"
+        );
+        assert!(
+            content.contains("vmware/vsphere"),
+            "windows-server-deployment main.tf must use vmware/vsphere provider source"
+        );
+        // Credentials are injected at apply time (TF_VAR_vsphere_password / the
+        // VSPHERE_PASSWORD env var) — never embedded, never obfuscated to dodge
+        // the secret scan. Guard against regression of all three.
+        assert!(
+            !content.contains("changeme"),
+            "windows-server-deployment main.tf must not embed a default credential"
+        );
+        assert!(
+            !content.contains("format(\"%s\""),
+            "windows-server-deployment main.tf must not obfuscate a credential to evade the secret scan"
+        );
+        assert!(
+            content.contains("sensitive"),
+            "windows-server-deployment main.tf must mark the credential variable sensitive"
+        );
+        assert!(
+            content.contains("VSPHERE_PASSWORD"),
+            "windows-server-deployment main.tf must document credential injection"
         );
     }
 

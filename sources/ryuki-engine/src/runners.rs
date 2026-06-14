@@ -142,6 +142,12 @@ pub enum RunStatus {
     RunnerUnavailable,
     /// Workspace setup failed before the binary was invoked.
     WorkspaceError,
+    /// `terraform validate` passed (configuration is schema-valid) but
+    /// `terraform plan` was not attempted or failed gracefully because a live
+    /// provider endpoint (e.g. vCenter) is not reachable offline. The IaC is
+    /// confirmed correct against the real provider schema; live planning
+    /// requires a reachable provider.
+    Validated,
 }
 
 impl RunStatus {
@@ -154,6 +160,7 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::RunnerUnavailable => "runner-unavailable",
             Self::WorkspaceError => "workspace-error",
+            Self::Validated => "validated",
         }
     }
 }
@@ -360,6 +367,16 @@ mod tests {
         assert_eq!(RunStatus::Failed.as_str(), "failed");
         assert_eq!(RunStatus::RunnerUnavailable.as_str(), "runner-unavailable");
         assert_eq!(RunStatus::WorkspaceError.as_str(), "workspace-error");
+        assert_eq!(RunStatus::Validated.as_str(), "validated");
+    }
+
+    #[test]
+    fn run_status_validated_serde_roundtrip() {
+        let status = RunStatus::Validated;
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(json, "\"validated\"");
+        let back: RunStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, RunStatus::Validated);
     }
 
     // --- classify ---

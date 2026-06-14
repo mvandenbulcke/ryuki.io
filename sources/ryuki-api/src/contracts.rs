@@ -9138,18 +9138,20 @@ async fn requests_validate(
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-// Enrich the plan stages produced by `plan_request` with a real Terraform
-// dry-run evidence item, if the offering has wired IaC.
+// Enrich the plan stages produced by `plan_request` with Terraform dry-run
+// evidence items, if the offering has wired IaC.
 //
 // Enrichment logic:
 // 1. Resolve the IaC bundle for `offering_id`. If None, return immediately
 //    (unwired offering — no change at all).
 // 2. Build a TerraformRunner with the embedded IaC and call run_dry with
-//    empty ResolvedCredentials (this IaC needs no secrets).
-// 3. If the run succeeds (status Planned): append an EvidenceItem with
-//    key "terraform-plan" and evidence_type = Plan to the "plan" stage.
-// 4. If the runner is unavailable or the run fails: append a note item with
-//    key "terraform-plan-note" describing the skip. Never return an error.
+//    empty ResolvedCredentials (server-deployment vsphere IaC needs no
+//    secrets for validate; plan would need them for a live vCenter).
+// 3. run_dry now runs: init → validate (always) → plan (best-effort).
+//    - status Planned  → append "terraform-validate" + "terraform-plan" items.
+//    - status Validated → append "terraform-validate" item only (plan requires
+//      live vCenter, not available offline).
+//    - other status → append "terraform-plan-note" (skip note). Never error.
 //
 // Soundness invariant:
 // Callers MUST call this function BEFORE building stages_json/plan_json
@@ -9159,48 +9161,83 @@ async fn requests_validate(
 // Shared evidence builders
 // ---------------------------------------------------------------------------
 
-/// Build the `EvidenceItem` for a Terraform dry-run result.
+/// Build the `EvidenceItem` list for a Terraform dry-run result.
 ///
 /// Maps:
-/// - `Ok(outcome)` with `status == Planned` → `"terraform-plan"` item with
-///   summary + UTF-8-safe truncated log (4 KiB).
-/// - `Ok(outcome)` with any other status → `"terraform-plan-note"` item
-///   (runner unavailable or failed).
-/// - `Err(e)` → `"terraform-plan-note"` item (skipped: {e}).
+/// - `Ok(outcome)` with `status == Planned` → two items:
+///   1. `"terraform-validate"` item: "configuration is valid"
+///   2. `"terraform-plan"` item with summary + UTF-8-safe truncated log (4 KiB).
+/// - `Ok(outcome)` with `status == Validated` → one item:
+///   1. `"terraform-validate"` item: "configuration is valid; plan requires live
+///      provider (vsphere/vCenter not reachable offline)".
+/// - `Ok(outcome)` with any other status → one item:
+///   `"terraform-plan-note"` (runner unavailable or failed).
+/// - `Err(e)` → one item: `"terraform-plan-note"` (skipped: {e}).
 ///
 /// This is the single source of truth for evidence construction; both the
 /// synchronous inner function and the async wrapper call it so the two paths
 /// cannot drift.
-fn terraform_evidence_item(
+fn terraform_evidence_items(
     result: Result<ryuki_engine::runners::RunOutcome, ryuki_engine::runners::RunnerError>,
-) -> ryuki_engine::models::EvidenceItem {
+) -> Vec<ryuki_engine::models::EvidenceItem> {
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
     use ryuki_engine::runners::RunStatus;
 
+    /// Truncate a log to ~4 KiB on a UTF-8 char boundary.
+    fn truncate_log(log: &str) -> String {
+        if log.len() > 4096 {
+            let truncated: String = log.chars().take(4096).collect();
+            format!("{truncated}...[truncated]")
+        } else {
+            log.to_string()
+        }
+    }
+
     match result {
         Ok(outcome) if outcome.status == RunStatus::Planned => {
-            let value = if outcome.log.is_empty() {
+            // Both validate and plan succeeded.
+            // Emit validate item + plan item.
+            let log_excerpt = truncate_log(&outcome.log);
+            let plan_value = if log_excerpt.is_empty() {
                 outcome.summary.clone()
             } else {
-                // Truncate to ~4 KiB on a UTF-8 char boundary so a multi-byte
-                // sequence at the cut point cannot panic.
-                let log_excerpt = if outcome.log.len() > 4096 {
-                    let truncated: String = outcome.log.chars().take(4096).collect();
-                    format!("{truncated}...[truncated]")
-                } else {
-                    outcome.log.clone()
-                };
                 format!("{}\n\n{}", outcome.summary, log_excerpt)
             };
-            EvidenceItem {
-                key: "terraform-plan".to_string(),
+            vec![
+                EvidenceItem {
+                    key: "terraform-validate".to_string(),
+                    value: "configuration is valid".to_string(),
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::Plan,
+                },
+                EvidenceItem {
+                    key: "terraform-plan".to_string(),
+                    value: plan_value,
+                    redacted_value: None,
+                    redacted: false,
+                    evidence_type: EvidenceType::Plan,
+                },
+            ]
+        }
+        Ok(outcome) if outcome.status == RunStatus::Validated => {
+            // Validate passed; plan requires a live provider (e.g. vCenter).
+            // Emit validate item only — plan is deferred until live execution.
+            let log_excerpt = truncate_log(&outcome.log);
+            let value = format!(
+                "configuration is valid; plan requires live provider \
+                 (vsphere/vCenter not reachable offline)\n\n{}",
+                log_excerpt.trim()
+            );
+            vec![EvidenceItem {
+                key: "terraform-validate".to_string(),
                 value,
                 redacted_value: None,
                 redacted: false,
                 evidence_type: EvidenceType::Plan,
-            }
+            }]
         }
-        Ok(outcome) => EvidenceItem {
+        Ok(outcome) => vec![EvidenceItem {
             // RunnerUnavailable or Failed — degrade gracefully.
             key: "terraform-plan-note".to_string(),
             value: format!(
@@ -9210,15 +9247,15 @@ fn terraform_evidence_item(
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
-        },
-        Err(e) => EvidenceItem {
+        }],
+        Err(e) => vec![EvidenceItem {
             // Workspace, spawn, or timeout error — degrade gracefully.
             key: "terraform-plan-note".to_string(),
             value: format!("terraform plan skipped: {e}"),
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
-        },
+        }],
     }
 }
 
@@ -9290,7 +9327,7 @@ fn ansible_evidence_item(
 ///
 /// Extracted so that:
 /// - Tests (which may be sync) can call this directly and exercise the shared
-///   `terraform_evidence_item` builder.
+///   `terraform_evidence_items` builder.
 /// - The async wrapper can offload `run_dry` via `spawn_blocking` and then
 ///   call the same builder on the result.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -9336,12 +9373,12 @@ fn enrich_plan_stages_with_terraform_sync(
         descriptor: "none".to_string(),
     };
 
-    // Step 3/4: delegate result→EvidenceItem mapping to the shared builder,
-    // then append to the "plan" stage. The stage is always present (plan_request
+    // Step 3/4: delegate result→EvidenceItem list mapping to the shared builder,
+    // then extend the "plan" stage. The stage is always present (plan_request
     // guarantees it), but we guard defensively.
-    let evidence_item = terraform_evidence_item(runner.run_dry(&run_plan, &empty_creds));
+    let evidence_items = terraform_evidence_items(runner.run_dry(&run_plan, &empty_creds));
     if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
-        plan_stage.evidence.push(evidence_item);
+        plan_stage.evidence.extend(evidence_items);
     }
 }
 
@@ -9356,7 +9393,7 @@ fn enrich_plan_stages_with_terraform_sync(
 /// If the blocking task panics (e.g. OOM inside the subprocess), the panic is
 /// caught here and a note item is appended instead of propagating the panic.
 /// The JoinError path builds the note inline (distinct message); all other
-/// result variants go through `terraform_evidence_item`.
+/// result variants go through `terraform_evidence_items`.
 async fn enrich_plan_stages_with_terraform(
     request: &ryuki_engine::models::Request,
     stages: &mut [ryuki_engine::models::Stage],
@@ -9404,19 +9441,19 @@ async fn enrich_plan_stages_with_terraform(
     // Unpack the JoinResult<Result<RunOutcome, RunnerError>>.
     // JoinError (spawn_blocking panic) gets an inline note with a distinct
     // message. All other variants go through the shared builder.
-    let evidence_item = match run_result {
-        Err(_join_err) => EvidenceItem {
+    let evidence_items: Vec<ryuki_engine::models::EvidenceItem> = match run_result {
+        Err(_join_err) => vec![EvidenceItem {
             key: "terraform-plan-note".to_string(),
             value: "terraform plan skipped: internal error (spawn_blocking panic)".to_string(),
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
-        },
-        Ok(result) => terraform_evidence_item(result),
+        }],
+        Ok(result) => terraform_evidence_items(result),
     };
 
     if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
-        plan_stage.evidence.push(evidence_item);
+        plan_stage.evidence.extend(evidence_items);
     }
 }
 
@@ -18870,10 +18907,11 @@ mod maint_calendar_db_tests {
     // -------------------------------------------------------------------------
 
     /// Async smoke test: `enrich_plan_stages_with_terraform` (the production async
-    /// path) produces a "terraform-plan" evidence item when the binary is present,
+    /// path) produces a "terraform-plan" evidence item (patch-maintenance uses
+    /// terraform_data — offline plan succeeds) when the binary is present,
     /// or a "terraform-plan-note" graceful-degradation item when it is absent.
     ///
-    /// This exercises the async wrapper + `terraform_evidence_item` builder
+    /// This exercises the async wrapper + `terraform_evidence_items` builder
     /// end-to-end for patch-maintenance.
     #[tokio::test]
     async fn async_enrich_plan_stages_terraform_smoke_patch_maintenance() {
@@ -19054,10 +19092,16 @@ mod maint_calendar_db_tests {
         );
     }
 
-    /// TDD — server-deployment with Windows OS routes to windows IaC for terraform plan.
+    /// TDD — server-deployment with Windows OS routes to windows vSphere IaC.
     ///
-    /// If `terraform` is on PATH: asserts real plan output from windows-server-deployment IaC.
-    /// If absent (CI): asserts graceful-degradation note, no panic.
+    /// With real vSphere IaC (vmware/vsphere provider):
+    /// - `terraform init` downloads the vsphere provider (network egress, once).
+    /// - `terraform validate` passes offline against the downloaded schema → emits
+    ///   `terraform-validate` evidence item ("configuration is valid").
+    /// - `terraform plan` requires a live vCenter; without one it fails gracefully →
+    ///   no `terraform-plan` item emitted (Validated status, not Planned).
+    ///
+    /// When terraform is absent (CI without binary): graceful-degradation note.
     #[test]
     fn plan_stages_enriched_with_windows_terraform_for_windows_os() {
         use crate::runner::terraform::TerraformRunner;
@@ -19078,26 +19122,27 @@ mod maint_calendar_db_tests {
             .expect("plan stage must exist");
 
         if terraform_available {
-            let tf_evidence = plan_stage
+            // vSphere IaC: validate passes (offline), plan fails without vCenter.
+            // Expect terraform-validate item; terraform-plan may or may not be
+            // present (only present when a live vCenter is reachable).
+            let validate_ev = plan_stage
                 .evidence
                 .iter()
-                .find(|e| e.key == "terraform-plan");
+                .find(|e| e.key == "terraform-validate");
             assert!(
-                tf_evidence.is_some(),
-                "terraform-plan evidence must be present for Windows OS; evidence keys: {:?}",
+                validate_ev.is_some(),
+                "terraform-validate evidence must be present for Windows OS \
+                 when terraform is available; evidence keys: {:?}",
                 plan_stage
                     .evidence
                     .iter()
                     .map(|e| &e.key)
                     .collect::<Vec<_>>()
             );
-            // The plan output should reference windows-server-deployment IaC.
-            let ev = tf_evidence.unwrap();
+            let ev = validate_ev.unwrap();
             assert!(
-                ev.value.contains("Terraform")
-                    || ev.value.contains("Plan:")
-                    || ev.value.contains("to add"),
-                "plan evidence must contain real terraform output; got: {:?}",
+                ev.value.contains("configuration is valid"),
+                "terraform-validate evidence must confirm schema validity; got: {:?}",
                 ev.value
             );
         } else {
@@ -19114,7 +19159,10 @@ mod maint_calendar_db_tests {
         assert!(!stages.is_empty(), "stages must not be empty");
     }
 
-    /// TDD — server-deployment with Linux OS routes to linux IaC for terraform plan.
+    /// TDD — server-deployment with Linux OS routes to linux vSphere IaC.
+    ///
+    /// Same validate-only oracle as the Windows variant — `terraform validate`
+    /// confirms schema correctness offline; live plan requires vCenter.
     #[test]
     fn plan_stages_enriched_with_linux_terraform_for_linux_os() {
         use crate::runner::terraform::TerraformRunner;
@@ -19135,18 +19183,26 @@ mod maint_calendar_db_tests {
             .expect("plan stage must exist");
 
         if terraform_available {
-            let tf_evidence = plan_stage
+            // vSphere IaC: validate passes (offline), plan fails without vCenter.
+            let validate_ev = plan_stage
                 .evidence
                 .iter()
-                .find(|e| e.key == "terraform-plan");
+                .find(|e| e.key == "terraform-validate");
             assert!(
-                tf_evidence.is_some(),
-                "terraform-plan evidence must be present for Linux OS; evidence keys: {:?}",
+                validate_ev.is_some(),
+                "terraform-validate evidence must be present for Linux OS \
+                 when terraform is available; evidence keys: {:?}",
                 plan_stage
                     .evidence
                     .iter()
                     .map(|e| &e.key)
                     .collect::<Vec<_>>()
+            );
+            let ev = validate_ev.unwrap();
+            assert!(
+                ev.value.contains("configuration is valid"),
+                "terraform-validate evidence must confirm schema validity; got: {:?}",
+                ev.value
             );
         } else {
             let note = plan_stage

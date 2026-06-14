@@ -333,7 +333,51 @@ impl Runner for TerraformRunner {
             });
         }
 
-        // --- Step 2: terraform plan ---
+        // --- Step 2: terraform validate ---
+        // Always runs — offline correctness oracle against the real provider
+        // schema. Requires no live vCenter or credentials; validate only checks
+        // that the configuration is structurally valid per the downloaded schema.
+        let mut validate_cmd = Command::new(&self.binary);
+        apply_env_allowlist(&mut validate_cmd);
+        pin_home_tmpdir_to_workspace(&mut validate_cmd, ws.path());
+        validate_cmd
+            .args(["validate", "-no-color"])
+            .current_dir(ws.path())
+            .env("CHECKPOINT_DISABLE", "1")
+            .env_remove("TF_LOG");
+
+        let validate_output =
+            run_command_with_timeout(validate_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
+                RunnerError::Timeout => RunnerError::Timeout,
+                other => RunnerError::Spawn(format!("terraform validate: {other}")),
+            })?;
+
+        let validate_raw = combine_output(&validate_output.stdout, &validate_output.stderr);
+        let validate_log = scrub_output(&validate_raw, &secret_refs);
+
+        if !validate_output.status.success() {
+            // Validate failed — configuration is invalid against the provider
+            // schema. This is a hard failure; do not attempt plan.
+            return Ok(RunOutcome {
+                runner_kind: RunnerKind::Terraform,
+                mode: plan.mode,
+                status: RunStatus::Failed,
+                summary: format!(
+                    "terraform validate failed (exit {})",
+                    validate_output.status.code().unwrap_or(-1)
+                ),
+                log: validate_log,
+                exit_code: validate_output.status.code(),
+            });
+        }
+
+        // Validate passed — configuration is schema-valid.
+        let validate_summary = extract_validate_summary(&validate_log);
+
+        // --- Step 3: terraform plan (best-effort) ---
+        // For built-in terraform_data offerings this succeeds fully offline.
+        // For vsphere/external-provider offerings it will fail without a
+        // reachable vCenter — that failure is captured gracefully.
         let mut plan_cmd = Command::new(&self.binary);
         apply_env_allowlist(&mut plan_cmd);
         pin_home_tmpdir_to_workspace(&mut plan_cmd, ws.path());
@@ -348,41 +392,77 @@ impl Runner for TerraformRunner {
             plan_cmd.env(&env_key, &cred_str);
         }
 
-        let plan_output =
-            run_command_with_timeout(plan_cmd, RUNNER_TIMEOUT).map_err(|e| match e {
-                RunnerError::Timeout => RunnerError::Timeout,
-                other => RunnerError::Spawn(format!("terraform plan: {other}")),
-            })?;
+        let plan_result = run_command_with_timeout(plan_cmd, RUNNER_TIMEOUT);
 
-        let raw = combine_output(&plan_output.stdout, &plan_output.stderr);
-        let scrubbed_log = scrub_output(&raw, &secret_refs);
+        match plan_result {
+            Err(RunnerError::Timeout) => {
+                // Plan timed out — degraded but validate evidence is preserved.
+                Ok(RunOutcome {
+                    runner_kind: RunnerKind::Terraform,
+                    mode: plan.mode,
+                    status: RunStatus::Validated,
+                    summary: format!("terraform validate: {validate_summary}; plan timed out"),
+                    log: validate_log,
+                    exit_code: None,
+                })
+            }
+            Err(other) => {
+                // Spawn error for plan — degrade gracefully.
+                Ok(RunOutcome {
+                    runner_kind: RunnerKind::Terraform,
+                    mode: plan.mode,
+                    status: RunStatus::Validated,
+                    summary: format!(
+                        "terraform validate: {validate_summary}; plan unavailable: {other}"
+                    ),
+                    log: validate_log,
+                    exit_code: None,
+                })
+            }
+            Ok(plan_output) => {
+                let plan_raw = combine_output(&plan_output.stdout, &plan_output.stderr);
+                let plan_log = scrub_output(&plan_raw, &secret_refs);
 
-        // Terraform exit codes:
-        //   0 — succeeded, no changes
-        //   1 — error
-        //   2 — succeeded, changes detected (only with -detailed-exitcode)
-        // We use -no-color but not -detailed-exitcode, so 0 = ok, 1 = error.
-        let (status, summary) = match plan_output.status.code() {
-            Some(0) => (RunStatus::Planned, extract_plan_summary(&scrubbed_log)),
-            Some(2) => (RunStatus::Planned, extract_plan_summary(&scrubbed_log)),
-            Some(code) => (
-                RunStatus::Failed,
-                format!("terraform plan failed (exit {code})"),
-            ),
-            None => (
-                RunStatus::Failed,
-                "terraform plan killed by signal".to_string(),
-            ),
-        };
-
-        Ok(RunOutcome {
-            runner_kind: RunnerKind::Terraform,
-            mode: plan.mode,
-            status,
-            summary,
-            log: scrubbed_log,
-            exit_code: plan_output.status.code(),
-        })
+                // Terraform exit codes:
+                //   0 — succeeded, no changes
+                //   1 — error
+                //   2 — succeeded, changes detected (only with -detailed-exitcode)
+                // We use -no-color but not -detailed-exitcode, so 0 = ok, 1 = error.
+                match plan_output.status.code() {
+                    Some(0) | Some(2) => {
+                        // Both validate and plan succeeded — combine logs.
+                        let plan_summary = extract_plan_summary(&plan_log);
+                        let combined_log = combine_validate_and_plan_logs(&validate_log, &plan_log);
+                        Ok(RunOutcome {
+                            runner_kind: RunnerKind::Terraform,
+                            mode: plan.mode,
+                            status: RunStatus::Planned,
+                            summary: plan_summary,
+                            log: combined_log,
+                            exit_code: plan_output.status.code(),
+                        })
+                    }
+                    _ => {
+                        // Plan failed (e.g. vsphere needs live vCenter) — degrade
+                        // gracefully. Validate already passed; emit Validated status
+                        // so the evidence builder can emit the validate item.
+                        let plan_exit = plan_output.status.code().unwrap_or(-1);
+                        let combined_log = combine_validate_and_plan_logs(&validate_log, &plan_log);
+                        Ok(RunOutcome {
+                            runner_kind: RunnerKind::Terraform,
+                            mode: plan.mode,
+                            status: RunStatus::Validated,
+                            summary: format!(
+                                "terraform validate: {validate_summary}; \
+                                 plan requires live provider (exit {plan_exit})"
+                            ),
+                            log: combined_log,
+                            exit_code: Some(plan_exit),
+                        })
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -429,6 +509,43 @@ fn extract_plan_summary(log: &str) -> String {
         }
     }
     "terraform plan completed".to_string()
+}
+
+/// Extract a one-line validate summary from scrubbed terraform validate output.
+/// Returns "configuration is valid" when terraform reports success, or a
+/// short error fragment otherwise.
+fn extract_validate_summary(log: &str) -> String {
+    for line in log.lines() {
+        let trimmed = line.trim();
+        // terraform validate emits "Success! The configuration is valid."
+        if trimmed.starts_with("Success!") || trimmed.contains("configuration is valid") {
+            return "configuration is valid".to_string();
+        }
+        // Error summary lines start with "Error:" — capture the first one.
+        if trimmed.starts_with("Error:") {
+            return trimmed.chars().take(120).collect();
+        }
+    }
+    "terraform validate completed".to_string()
+}
+
+/// Combine validate and plan logs with section headers for evidence readability.
+fn combine_validate_and_plan_logs(validate_log: &str, plan_log: &str) -> String {
+    let mut out = String::new();
+    if !validate_log.is_empty() {
+        out.push_str("[terraform validate]\n");
+        out.push_str(validate_log.trim_end());
+        out.push('\n');
+    }
+    if !plan_log.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[terraform plan]\n");
+        out.push_str(plan_log.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
