@@ -28,7 +28,7 @@ pub(crate) fn status_badge_class(status: &str) -> &'static str {
         "intake" => "badge neutral",
         "validated" => "badge good",
         "approved" => "badge good",
-        "executed" => "badge good",
+        "executed" | "verified" | "completed" => "badge good",
         "failed" => "badge bad",
         "rejected" | "cancelled" => "badge bad",
         "executing" | "verifying" => "badge warn",

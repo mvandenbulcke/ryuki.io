@@ -1484,8 +1484,13 @@ pub fn actions_for_stage(stage: &str) -> Vec<String> {
         "locked" => vec!["execute".to_string(), "cancel".to_string()],
         "executed" => vec!["verify".to_string()],
         "failed" => vec!["validate".to_string(), "plan".to_string()],
-        // Terminal states offer no further lifecycle actions.
-        "rejected" | "cancelled" => vec![],
+        // Terminal states offer no further lifecycle actions. `verified` is the
+        // resting stage of a fully-completed request (verify is the last action,
+        // stamped stage='verify' -> normalized 'verified'); `completed` covers a
+        // status-driven completed display. Neither offers further actions —
+        // without these arms they fell through to the wildcard and wrongly
+        // offered "validate" on a finished request.
+        "verified" | "completed" | "rejected" | "cancelled" => vec![],
         _ => vec!["validate".to_string()],
     }
 }
@@ -2740,6 +2745,11 @@ mod tests {
         assert!(!actions_for_stage("executed").contains(&"cancel".to_string()));
         assert!(actions_for_stage("rejected").is_empty());
         assert!(actions_for_stage("cancelled").is_empty());
+        // A fully-verified/completed request is terminal: no stray actions.
+        // Regression guard — these previously fell through to the wildcard and
+        // wrongly offered "validate" on a finished request.
+        assert!(actions_for_stage("verified").is_empty());
+        assert!(actions_for_stage("completed").is_empty());
     }
 
     #[test]
