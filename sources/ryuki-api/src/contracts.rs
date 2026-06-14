@@ -8809,6 +8809,75 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
     Json(json!(summaries))
 }
 
+/// Sanitize persisted stage evidence before sending to the portal.
+///
+/// # Security
+/// An `EvidenceItem` stores both `value` (raw runner output) and
+/// `redacted_value` (the safe display form). For items with `redacted: true`
+/// we MUST NOT send the raw `value` to the portal; we send the
+/// `redacted_value` instead (or `"***REDACTED***"` when absent). This mirrors
+/// the audit/evidence-pack redaction discipline and is the last safety net
+/// before the data leaves the API process.
+///
+/// For items with `redacted: false` the raw `value` is passed through
+/// unchanged — the runner's pre-scrub (`runner::scrub`) already ensured no
+/// known secret appears in it.
+///
+/// The input is the raw JSONB stages value (a JSON array of Stage objects as
+/// serialized by serde from `Vec<ryuki_engine::models::Stage>`). The output
+/// replaces each evidence item's serialized `value` field with the safe form.
+///
+/// Non-array or malformed inputs are returned as-is (defensive; the DB should
+/// always store a valid array).
+fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
+    let Some(arr) = stages.as_array() else {
+        return stages.clone();
+    };
+    let sanitized: Vec<serde_json::Value> = arr
+        .iter()
+        .map(|stage| {
+            let Some(evidence_arr) = stage.get("evidence").and_then(|e| e.as_array()) else {
+                // No evidence array — pass stage through unchanged.
+                return stage.clone();
+            };
+            let sanitized_evidence: Vec<serde_json::Value> = evidence_arr
+                .iter()
+                .map(|item| {
+                    let is_redacted = item
+                        .get("redacted")
+                        .and_then(|r| r.as_bool())
+                        .unwrap_or(false);
+                    if !is_redacted {
+                        return item.clone();
+                    }
+                    // Redacted item: replace `value` with the safe display form.
+                    let safe_value = item
+                        .get("redacted_value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("***REDACTED***");
+                    let mut out = item.clone();
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.insert(
+                            "value".to_string(),
+                            serde_json::Value::String(safe_value.to_string()),
+                        );
+                    }
+                    out
+                })
+                .collect();
+            let mut stage_out = stage.clone();
+            if let Some(obj) = stage_out.as_object_mut() {
+                obj.insert(
+                    "evidence".to_string(),
+                    serde_json::Value::Array(sanitized_evidence),
+                );
+            }
+            stage_out
+        })
+        .collect();
+    serde_json::Value::Array(sanitized)
+}
+
 async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
@@ -8828,6 +8897,13 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
         // The durable lifecycle state (047): payload is authoritative for all
         // 14 types; stages/approval_route/plan/validation_results are the REAL
         // persisted history that survives a restart (no fabrication).
+        //
+        // Sanitize stages before sending to the portal: for any evidence item
+        // with redacted:true the raw `value` is replaced by the safe
+        // `redacted_value` (or "***REDACTED***"). The plan JSONB is also a
+        // Vec<Stage> and receives the same treatment.
+        let sanitized_stages = sanitize_stages_for_portal(&row.stages);
+        let sanitized_plan = sanitize_stages_for_portal(&row.plan);
         return Ok(Json(json!({
             "request_id": row.id.to_string(),
             "request_type": row.request_type,
@@ -8843,9 +8919,9 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
             "created_at": row.created_at.to_rfc3339(),
             "updated_at": row.updated_at.to_rfc3339(),
             "payload": row.payload,
-            "stages": row.stages,
+            "stages": sanitized_stages,
             "approval_route": row.approval_route,
-            "plan": row.plan,
+            "plan": sanitized_plan,
             "validation_results": row.validation_results,
             "criticality": row.criticality,
             "requester": row.requester,
@@ -8857,7 +8933,23 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     let store = request_store().lock().await;
     let record = store.iter().find(|r| r.id == request_id);
     match record {
-        Some(r) => Ok(Json(serde_json::to_value(r).unwrap_or_default())),
+        Some(r) => {
+            // Sanitize in-memory request stages/plan before sending to portal,
+            // applying the same redaction discipline as the DB path.
+            let mut val = serde_json::to_value(r).unwrap_or_default();
+            if let Some(obj) = val.as_object_mut() {
+                if let Some(stages_val) = obj.get("stages").cloned() {
+                    obj.insert(
+                        "stages".to_string(),
+                        sanitize_stages_for_portal(&stages_val),
+                    );
+                }
+                if let Some(plan_val) = obj.get("plan").cloned() {
+                    obj.insert("plan".to_string(), sanitize_stages_for_portal(&plan_val));
+                }
+            }
+            Ok(Json(val))
+        }
         None => Err(status_404(&request_id)),
     }
 }
@@ -18966,6 +19058,151 @@ mod maint_calendar_db_tests {
         assert!(
             iac::resolve_ansible("controlled-restore-request").is_some(),
             "controlled-restore-request must now have wired ansible IaC"
+        );
+    }
+
+    // ─── Stage-evidence redaction + portal serialization ───────────────────────
+
+    /// Security regression guard: a stage with a redacted evidence item must
+    /// serialize the redacted form (redacted_value or "***REDACTED***"), NEVER
+    /// the raw `value`, in the JSON sent to the portal via `requests_get`.
+    #[test]
+    fn sanitize_stages_redacted_item_never_leaks_raw_value() {
+        use ryuki_engine::models::{EvidenceItem, EvidenceType, Stage, StageStatus};
+        use std::collections::HashMap;
+
+        let stage = Stage {
+            name: "plan".to_string(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "terraform-plan".to_string(),
+                value: "RAW_SECRET_OUTPUT_MUST_NOT_LEAK".to_string(),
+                redacted_value: Some("***REDACTED***".to_string()),
+                redacted: true,
+                evidence_type: EvidenceType::Plan,
+            }],
+            metadata: HashMap::new(),
+        };
+        let stages = vec![stage];
+        let stages_json = serde_json::to_value(&stages).expect("stages must serialize");
+        let sanitized = sanitize_stages_for_portal(&stages_json);
+
+        // The raw value must never appear in the sanitized output.
+        let sanitized_str = sanitized.to_string();
+        assert!(
+            !sanitized_str.contains("RAW_SECRET_OUTPUT_MUST_NOT_LEAK"),
+            "raw secret value must never appear in sanitized stages; got: {sanitized_str}"
+        );
+        // The redacted placeholder must be present.
+        assert!(
+            sanitized_str.contains("***REDACTED***"),
+            "redacted placeholder must appear in sanitized stages; got: {sanitized_str}"
+        );
+    }
+
+    /// A non-redacted terraform-plan evidence item passes its value through
+    /// unchanged in the sanitized output.
+    #[test]
+    fn sanitize_stages_non_redacted_item_passes_value_through() {
+        use ryuki_engine::models::{EvidenceItem, EvidenceType, Stage, StageStatus};
+        use std::collections::HashMap;
+
+        let stage = Stage {
+            name: "plan".to_string(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "terraform-plan".to_string(),
+                value: "Plan: 2 to add, 0 to change, 0 to destroy.".to_string(),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Plan,
+            }],
+            metadata: HashMap::new(),
+        };
+        let stages = vec![stage];
+        let stages_json = serde_json::to_value(&stages).expect("stages must serialize");
+        let sanitized = sanitize_stages_for_portal(&stages_json);
+
+        let sanitized_str = sanitized.to_string();
+        assert!(
+            sanitized_str.contains("Plan: 2 to add, 0 to change, 0 to destroy."),
+            "non-redacted value must be present in sanitized output; got: {sanitized_str}"
+        );
+    }
+
+    /// A non-redacted ansible-check evidence item on the verify stage passes
+    /// its value through in the sanitized output.
+    #[test]
+    fn sanitize_stages_ansible_check_evidence_passes_through() {
+        use ryuki_engine::models::{EvidenceItem, EvidenceType, Stage, StageStatus};
+        use std::collections::HashMap;
+
+        let stage = Stage {
+            name: "verify".to_string(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "ansible-check".to_string(),
+                value: "PLAY [verify] ok=3 changed=0 unreachable=0 failed=0".to_string(),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }],
+            metadata: HashMap::new(),
+        };
+        let stages = vec![stage];
+        let stages_json = serde_json::to_value(&stages).expect("stages must serialize");
+        let sanitized = sanitize_stages_for_portal(&stages_json);
+
+        let sanitized_str = sanitized.to_string();
+        assert!(
+            sanitized_str.contains("ansible-check"),
+            "ansible-check key must be present in sanitized stages; got: {sanitized_str}"
+        );
+        assert!(
+            sanitized_str.contains("ok=3"),
+            "ansible-check value must be present in sanitized stages; got: {sanitized_str}"
+        );
+    }
+
+    /// A redacted item with no redacted_value falls back to the canonical
+    /// "***REDACTED***" sentinel — never exposes the raw value.
+    #[test]
+    fn sanitize_stages_redacted_item_without_redacted_value_uses_sentinel() {
+        use ryuki_engine::models::{EvidenceItem, EvidenceType, Stage, StageStatus};
+        use std::collections::HashMap;
+
+        let stage = Stage {
+            name: "verify".to_string(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "ansible-check".to_string(),
+                value: "SENSITIVE_OUTPUT".to_string(),
+                redacted_value: None, // no explicit redacted_value
+                redacted: true,
+                evidence_type: EvidenceType::Summary,
+            }],
+            metadata: HashMap::new(),
+        };
+        let stages = vec![stage];
+        let stages_json = serde_json::to_value(&stages).expect("stages must serialize");
+        let sanitized = sanitize_stages_for_portal(&stages_json);
+
+        let sanitized_str = sanitized.to_string();
+        assert!(
+            !sanitized_str.contains("SENSITIVE_OUTPUT"),
+            "sensitive value must not appear in sanitized output; got: {sanitized_str}"
+        );
+        assert!(
+            sanitized_str.contains("***REDACTED***"),
+            "sentinel must appear when redacted_value is absent; got: {sanitized_str}"
         );
     }
 }

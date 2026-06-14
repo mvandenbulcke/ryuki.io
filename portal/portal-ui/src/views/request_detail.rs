@@ -429,6 +429,19 @@ pub fn RequestDetail() -> impl IntoView {
                         // emptiness checks are hoisted to bools the closures
                         // capture by value (the data itself is cloned into the
                         // bodies below).
+                        // Stages with evidence (terraform-plan on plan stage,
+                        // ansible-check on verify stage). Filtered to stages
+                        // that actually carry at least one evidence item so the
+                        // section is hidden for early-stage or legacy requests
+                        // that never ran a runner.
+                        let stages_with_evidence: Vec<_> = detail
+                            .stages
+                            .iter()
+                            .filter(|s| !s.evidence.is_empty())
+                            .cloned()
+                            .collect();
+                        let has_stage_evidence = !stages_with_evidence.is_empty();
+
                         let has_criticality = !criticality.is_empty();
                         let has_requester = !requester.is_empty();
                         let has_owner = !owner.is_empty();
@@ -590,6 +603,63 @@ pub fn RequestDetail() -> impl IntoView {
                                     <div class="request-plan" aria-label="Dry-run plan">
                                         <h3>"Dry-Run Plan"</h3>
                                         <pre class="plan-text">{plan.clone()}</pre>
+                                    </div>
+                                </Show>
+
+                                // Per-stage runner evidence (terraform-plan on
+                                // the plan stage, ansible-check on the verify
+                                // stage). Hidden for requests that have no
+                                // runner evidence (pre-runner or early-stage).
+                                // Each item value is rendered in a <pre> so
+                                // multi-line plan/check output is readable.
+                                // Redacted items show a visual indicator.
+                                <Show when=move || has_stage_evidence>
+                                    <div class="stage-evidence" aria-label="Stage runner evidence">
+                                        <h3>"Stage Evidence"</h3>
+                                        {stages_with_evidence
+                                            .clone()
+                                            .into_iter()
+                                            .map(|stage| {
+                                                let stage_label_text = stage_label(&stage.name);
+                                                let evidence_items = stage.evidence.clone();
+                                                view! {
+                                                    <div class="stage-evidence-group">
+                                                        <h4>{stage_label_text}</h4>
+                                                        {evidence_items
+                                                            .into_iter()
+                                                            .map(|ev| {
+                                                                let badge_class = if ev.redacted {
+                                                                    "badge bad"
+                                                                } else {
+                                                                    "badge neutral"
+                                                                };
+                                                                let redacted_label = if ev.redacted {
+                                                                    Some(" (redacted)")
+                                                                } else {
+                                                                    None
+                                                                };
+                                                                view! {
+                                                                    <div
+                                                                        class="stage-evidence-item"
+                                                                        aria-label=ev.key.clone()
+                                                                    >
+                                                                        <div class="evidence-item-header">
+                                                                            <code class="evidence-item-key">{ev.key.clone()}</code>
+                                                                            <Show when=move || ev.redacted>
+                                                                                <span class=badge_class>
+                                                                                    {redacted_label}
+                                                                                </span>
+                                                                            </Show>
+                                                                        </div>
+                                                                        <pre class="evidence-item-value">{ev.value.clone()}</pre>
+                                                                    </div>
+                                                                }
+                                                            })
+                                                            .collect_view()}
+                                                    </div>
+                                                }
+                                            })
+                                            .collect_view()}
                                     </div>
                                 </Show>
 

@@ -1277,6 +1277,26 @@ pub struct ApiRequestDetail {
     pub payload: serde_json::Value,
 }
 
+/// One evidence item on a lifecycle stage, as received from the API.
+/// The API's `sanitize_stages_for_portal` ensures that when `redacted` is
+/// `true`, `value` already holds the safe display form (the raw secret never
+/// crosses the wire to the portal). The `redacted` flag is forwarded so the
+/// portal can render a visual indicator for redacted items.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+pub struct StageEvidenceItem {
+    pub key: String,
+    /// Display value — safe for rendering. When `redacted` is `true` this is
+    /// the placeholder sent by the API, never the original runner output.
+    pub value: String,
+    /// `true` when the API applied redaction to this item.
+    #[serde(default)]
+    pub redacted: bool,
+    /// The engine `EvidenceType` discriminant as a string (`"Plan"`,
+    /// `"Summary"`, etc.). Optional — older API responses may omit it.
+    #[serde(default)]
+    pub evidence_type: String,
+}
+
 /// Mirrors one persisted lifecycle stage as serialized by the API
 /// (`ryuki_engine::models::Stage`). All fields default so an absent or partial
 /// stage object still decodes.
@@ -1289,6 +1309,11 @@ pub struct ApiRequestStage {
     pub started_at: Option<String>,
     #[serde(default)]
     pub completed_at: Option<String>,
+    /// Evidence items collected during this stage (e.g. "terraform-plan" on
+    /// the plan stage, "ansible-check" on the verify stage). Defaults to
+    /// empty so responses from older API versions still decode.
+    #[serde(default)]
+    pub evidence: Vec<StageEvidenceItem>,
 }
 
 impl From<ApiRequestDetail> for RequestDetail {
@@ -1311,7 +1336,9 @@ impl From<ApiRequestDetail> for RequestDetail {
         }];
         let actions_available = actions_for_stage(&stage);
         // Persisted stages map directly to display stages (normalizing the
-        // action-name vocabulary onto the portal state vocabulary).
+        // action-name vocabulary onto the portal state vocabulary). Evidence
+        // items are forwarded as-is — the API has already applied redaction so
+        // the `value` field is safe for display.
         let stages = detail
             .stages
             .into_iter()
@@ -1319,6 +1346,7 @@ impl From<ApiRequestDetail> for RequestDetail {
                 name: normalize_api_stage(&s.name),
                 status: s.status,
                 timestamp: s.completed_at.or(s.started_at).unwrap_or_default(),
+                evidence: s.evidence,
             })
             .collect();
         // Flatten the per-type payload into display rows so non-VM request
@@ -1354,28 +1382,41 @@ impl From<ApiRequestDetail> for RequestDetail {
 }
 
 /// Extracts the human-readable dry-run plan summary from the API's persisted
-/// `plan` value (a JSON array of Stage objects, or null until planned). Looks
-/// for the `plan` stage's `dry-run-plan` evidence value; returns "" when the
-/// request is not yet planned or the shape is absent. Never assumes `plan` is
-/// a string (the API serializes it as `Vec<Stage>`).
+/// `plan` value (a JSON array of Stage objects, or null until planned).
+///
+/// Key priority (first match wins):
+/// 1. `"terraform-plan"` — real Terraform dry-run output (preferred; set by
+///    the execution runner since the wiring wave).
+/// 2. `"dry-run-plan"` — legacy simulated plan string (pre-runner requests).
+///
+/// Returns "" when the request is not yet planned or neither key is present.
+/// Never assumes `plan` is a string (the API serializes it as `Vec<Stage>`).
 pub fn plan_summary_text(plan: &serde_json::Value) -> String {
     let Some(stages) = plan.as_array() else {
         return String::new();
     };
-    stages
+    let evidence = stages
         .iter()
         .find(|stage| {
             stage.get("name").and_then(|n| n.as_str()) == Some("plan")
                 || stage.get("name").and_then(|n| n.as_str()) == Some("dry-run-plan")
         })
-        .and_then(|stage| stage.get("evidence").and_then(|e| e.as_array()))
-        .and_then(|evidence| {
-            evidence
-                .iter()
-                .find(|item| item.get("key").and_then(|k| k.as_str()) == Some("dry-run-plan"))
-        })
-        .and_then(|item| item.get("value").and_then(|v| v.as_str()))
-        .map(str::to_string)
+        .and_then(|stage| stage.get("evidence").and_then(|e| e.as_array()));
+
+    let Some(evidence) = evidence else {
+        return String::new();
+    };
+
+    // Prefer the real terraform-plan output over the legacy simulated key.
+    let find_by_key = |key: &str| {
+        evidence
+            .iter()
+            .find(|item| item.get("key").and_then(|k| k.as_str()) == Some(key))
+            .and_then(|item| item.get("value").and_then(|v| v.as_str()))
+            .map(str::to_string)
+    };
+    find_by_key("terraform-plan")
+        .or_else(|| find_by_key("dry-run-plan"))
         .unwrap_or_default()
 }
 
@@ -1540,6 +1581,11 @@ pub struct PersistedStage {
     pub status: String,
     /// Best-available timestamp (completed, else started).
     pub timestamp: String,
+    /// Evidence items collected during this stage (e.g. `terraform-plan`,
+    /// `ansible-check`). Empty when the stage produced no evidence or the
+    /// API response predates evidence forwarding.
+    #[serde(default)]
+    pub evidence: Vec<StageEvidenceItem>,
 }
 
 /// A flattened key/value row used to render per-type request payloads and
@@ -3023,5 +3069,136 @@ mod tests {
         assert!(session.roles.is_empty());
         assert!(!session.token_valid);
         assert_eq!(session.provider_mode, "degraded-static-fallback");
+    }
+
+    // ─── Stage evidence mapping ───────────────────────────────────────────────
+
+    /// `ApiRequestDetail::from` maps stage evidence into `PersistedStage.evidence`
+    /// when the API payload includes evidence items.
+    #[test]
+    fn from_api_request_detail_maps_stage_evidence() {
+        let body = r#"{
+            "request_id":"r1","request_type":"server-deployment","status":"planned",
+            "stage":"plan","site":"s","environment":"prod","name":"srv-01",
+            "cpu":2,"memory_gb":4,"justification":"j","created_by":"op",
+            "created_at":"t","updated_at":"t2",
+            "stages":[
+                {
+                    "name":"plan","status":"Completed",
+                    "started_at":"t1","completed_at":"t2",
+                    "evidence":[
+                        {"key":"terraform-plan","value":"Plan: 2 to add.","redacted":false,"evidence_type":"Plan"}
+                    ]
+                },
+                {
+                    "name":"verify","status":"Completed",
+                    "started_at":"t3","completed_at":"t4",
+                    "evidence":[
+                        {"key":"ansible-check","value":"PLAY ok=3 changed=0","redacted":false,"evidence_type":"Summary"}
+                    ]
+                }
+            ]
+        }"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+
+        // The plan stage (normalized to "planned") must carry terraform-plan evidence.
+        let plan_stage = mapped
+            .stages
+            .iter()
+            .find(|s| s.name == "planned")
+            .expect("planned stage must be present");
+        assert_eq!(plan_stage.evidence.len(), 1);
+        assert_eq!(plan_stage.evidence[0].key, "terraform-plan");
+        assert_eq!(plan_stage.evidence[0].value, "Plan: 2 to add.");
+        assert!(!plan_stage.evidence[0].redacted);
+
+        // The verify stage must carry ansible-check evidence.
+        let verify_stage = mapped
+            .stages
+            .iter()
+            .find(|s| s.name == "verified")
+            .expect("verified stage must be present");
+        assert_eq!(verify_stage.evidence.len(), 1);
+        assert_eq!(verify_stage.evidence[0].key, "ansible-check");
+        assert_eq!(verify_stage.evidence[0].value, "PLAY ok=3 changed=0");
+    }
+
+    /// Redacted evidence items decode with `redacted: true` and carry the safe
+    /// display value, never the raw secret.
+    #[test]
+    fn from_api_request_detail_maps_redacted_stage_evidence() {
+        let body = r#"{
+            "request_id":"r2","request_type":"server-deployment","status":"planned",
+            "stage":"plan","site":"s","environment":"prod","name":"srv-02",
+            "created_at":"t","updated_at":"t",
+            "stages":[
+                {
+                    "name":"plan","status":"Completed",
+                    "evidence":[
+                        {"key":"terraform-plan","value":"***REDACTED***","redacted":true,"evidence_type":"Plan"}
+                    ]
+                }
+            ]
+        }"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+
+        let plan_stage = mapped
+            .stages
+            .iter()
+            .find(|s| s.name == "planned")
+            .expect("planned stage must be present");
+        assert_eq!(plan_stage.evidence.len(), 1);
+        let ev = &plan_stage.evidence[0];
+        assert_eq!(ev.key, "terraform-plan");
+        // The API already replaced the raw value with ***REDACTED***; the portal
+        // must surface exactly what the API sent (the redacted form).
+        assert_eq!(ev.value, "***REDACTED***");
+        assert!(ev.redacted);
+    }
+
+    /// A detail with no stage evidence decodes cleanly — evidence defaults to
+    /// empty Vec so older API responses without the field still work.
+    #[test]
+    fn from_api_request_detail_empty_evidence_defaults_ok() {
+        // Existing test body from api_request_detail_maps_to_portal_detail_with_honest_timeline
+        let body = r#"{"request_id":"r3","request_type":"VM","status":"validated","stage":"validate","site":"site-alpha","environment":"prod","name":"srv-app-01","cpu":4,"memory_gb":16,"justification":"Need capacity","created_by":"admin","created_at":"2026-06-12T10:00:00+00:00","updated_at":"2026-06-12T11:00:00+00:00"}"#;
+        let detail: ApiRequestDetail = serde_json::from_str(body).expect("detail must decode");
+        let mapped = RequestDetail::from(detail);
+        // No stages in payload → stages is empty, no evidence.
+        assert!(mapped.stages.is_empty());
+    }
+
+    /// `plan_summary_text` prefers the "terraform-plan" evidence key over the
+    /// legacy "dry-run-plan" key when both are present.
+    #[test]
+    fn plan_summary_text_prefers_terraform_plan_key() {
+        let plan = serde_json::json!([{
+            "name": "plan",
+            "evidence": [
+                {"key": "dry-run-plan", "value": "SIMULATED"},
+                {"key": "terraform-plan", "value": "Plan: 2 to add, 0 to change, 0 to destroy."}
+            ]
+        }]);
+        let result = plan_summary_text(&plan);
+        assert_eq!(
+            result, "Plan: 2 to add, 0 to change, 0 to destroy.",
+            "terraform-plan must be preferred over dry-run-plan"
+        );
+    }
+
+    /// `plan_summary_text` falls back to "dry-run-plan" when "terraform-plan"
+    /// is absent (backward compatibility with pre-runner requests).
+    #[test]
+    fn plan_summary_text_falls_back_to_dry_run_plan_key() {
+        let plan = serde_json::json!([{
+            "name": "plan",
+            "evidence": [
+                {"key": "dry-run-plan", "value": "Simulated plan output."}
+            ]
+        }]);
+        let result = plan_summary_text(&plan);
+        assert_eq!(result, "Simulated plan output.");
     }
 }
