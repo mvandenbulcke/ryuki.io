@@ -356,6 +356,12 @@ impl EntraTokenValidator {
         validation.leeway = self.leeway_secs;
         validation.validate_exp = true;
         validation.validate_nbf = true;
+        // Demand the pinned claims are PRESENT, not merely correct-when-present.
+        // jsonwebtoken's default `required_spec_claims` is only {"exp"}, so a
+        // token that simply OMITS iss/aud/nbf would otherwise slip past the
+        // issuer/audience pins. Entra ID always issues all four. This call
+        // REPLACES the default set, so "exp" must be listed too.
+        validation.set_required_spec_claims(&["exp", "nbf", "iss", "aud"]);
 
         // Step 5: verify signature + iss/aud/exp/nbf atomically.
         let data = match decode::<EntraClaims>(token, &decoding_key, &validation) {
@@ -558,6 +564,56 @@ mod tests {
         let outcome = validator.validate_with_reason(&auth(&token)).await;
         assert!(!outcome.session.token_valid);
         assert_eq!(outcome.failure_reason, Some("wrong-issuer"));
+    }
+
+    // A token that simply OMITS a pinned claim must be rejected just like one
+    // that carries a wrong value — otherwise the issuer/audience pins are
+    // bypassable by dropping the claim. jsonwebtoken's default
+    // `required_spec_claims` is only {"exp"}, so iss/aud/nbf presence must be
+    // demanded explicitly (see `set_required_spec_claims` in the validator).
+    #[tokio::test]
+    async fn test_missing_audience_rejected() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator(dec, true);
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("aud");
+        let token = sign(&enc, claims);
+
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(
+            !outcome.session.token_valid,
+            "a token with no aud claim must not pass the audience pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_issuer_rejected() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator(dec, true);
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("iss");
+        let token = sign(&enc, claims);
+
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(
+            !outcome.session.token_valid,
+            "a token with no iss claim must not pass the issuer pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_nbf_rejected() {
+        let (enc, dec, _) = make_keypair();
+        let validator = static_validator(dec, true);
+        let mut claims = valid_claims();
+        claims.as_object_mut().unwrap().remove("nbf");
+        let token = sign(&enc, claims);
+
+        let outcome = validator.validate_with_reason(&auth(&token)).await;
+        assert!(
+            !outcome.session.token_valid,
+            "a token with no nbf claim must not pass when nbf is required"
+        );
     }
 
     #[tokio::test]
