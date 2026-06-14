@@ -212,10 +212,6 @@ fn base64_decode_internal(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-pub fn validate_token(_token: &str) -> AuthSession {
-    AuthSession::unverified_entra()
-}
-
 /// Returns true when the session is authorized for `permission`.
 ///
 /// A permission `p` is satisfied if the session holds `p` exactly OR the
@@ -330,17 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_token_returns_unverified_entra_on_empty_or_junk() {
-        let session1 = validate_token("");
-        assert_eq!(session1.provider_mode, "entra-id-unverified");
-        assert!(!session1.token_valid);
-
-        let session2 = validate_token("some-fake-jwt-token");
-        assert_eq!(session2.provider_mode, "entra-id-unverified");
-        assert!(!session2.token_valid);
-    }
-
-    #[test]
     fn test_get_untrusted_roles_from_token_empty_or_junk() {
         assert!(get_untrusted_roles_from_token("").is_empty());
         assert!(get_untrusted_roles_from_token("garbage").is_empty());
@@ -361,17 +346,6 @@ mod tests {
         let payload = base64_url_encode(r#"{"sub":"user123"}"#);
         let token = format!("{}.{}", header, payload);
         assert!(get_untrusted_roles_from_token(&token).is_empty());
-    }
-
-    #[test]
-    fn test_validate_token_rejects_unsigned_roles_claim() {
-        let header = base64_url_encode(r#"{"alg":"RS256"}"#);
-        let payload = base64_url_encode(r#"{"roles":["VMwareOperator"]}"#);
-        let token = format!("{}.{}", header, payload);
-        let session = validate_token(&token);
-        assert!(!session.token_valid);
-        assert_eq!(session.provider_mode, "entra-id-unverified");
-        assert!(session.roles.is_empty());
     }
 
     fn base64_url_encode(input: &str) -> String {

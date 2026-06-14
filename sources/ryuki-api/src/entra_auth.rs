@@ -1,11 +1,11 @@
 //! Entra ID (Azure AD) JWT bearer-token validation.
 //!
 //! This module owns the entire Entra token-validation path for the API. The
-//! `ryuki-engine` crate is a pure, I/O-free domain crate and is intentionally
-//! NOT touched: its `validate_token` stub stays as-is and the API stops calling
-//! it. We reuse the engine's `AuthSession` / `unverified_entra()` / `EntraConfig`
-//! types (not fork them) and construct verified sessions here from claims that
-//! `jsonwebtoken` has cryptographically validated.
+//! `ryuki-engine` crate is a pure, I/O-free domain crate; we reuse its
+//! `AuthSession` / `unverified_entra()` / `EntraConfig` types (not fork them) and
+//! construct verified sessions here from claims that `jsonwebtoken` has
+//! cryptographically validated. (The engine's dead `validate_token` stub — which
+//! the API never called — has been removed.)
 //!
 //! Security model:
 //! - RS256 is the ONLY accepted signature algorithm (alg-confusion defense).

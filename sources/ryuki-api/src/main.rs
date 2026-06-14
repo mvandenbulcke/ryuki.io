@@ -94,8 +94,7 @@ async fn resolve_request_session(
         AuthMode::Local => (unverified_session("local-unauthenticated"), None),
         // EntraId: a real bearer token is cryptographically validated by the
         // injected validator (RS256 + iss/aud/exp/nbf + JWKS). A missing header
-        // or any failure path is unverified_entra(). The engine's validate_token
-        // stub is no longer called from the API.
+        // or any failure path is unverified_entra().
         AuthMode::EntraId => match auth_header {
             Some(h) => {
                 let outcome = validator.validate_with_reason(h).await;
