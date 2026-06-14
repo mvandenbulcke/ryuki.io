@@ -13367,9 +13367,124 @@ struct ServicenowRequestRequest {
     description: String,
 }
 
+// ─── ServiceNow queue — DB row + helpers ───
+
+/// One persisted `servicenow_queue` row (migration 034). JSONB `metadata` is
+/// selected as `::text` (raw string — not parsed/emitted in responses). Timestamps
+/// are chrono-typed for RFC-3339 formatting in the JSON helper functions.
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct ServiceNowRow {
+    id: String,
+    request_type: String,
+    external_ref: String,
+    status: String,
+    ci_name: String,
+    payload_summary: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: String,
+}
+
+const SNOW_COLUMNS: &str = "id::text, request_type, external_ref, status, ci_name, \
+     payload_summary, created_at, submitted_at, metadata::text AS metadata";
+
+/// Full status-detail shape (mirrors `get_submission_status` engine response).
+fn snow_row_to_status_json(r: &ServiceNowRow) -> Value {
+    json!({
+        "id": r.id,
+        "request_type": r.request_type,
+        "ci_name": r.ci_name,
+        "status": r.status,
+        "external_ref": r.external_ref,
+        "payload_summary": r.payload_summary,
+        "created_at": r.created_at.to_rfc3339(),
+        "submitted_at": r.submitted_at.as_ref().map(|t| t.to_rfc3339()),
+        "source": "database",
+    })
+}
+
+/// Summary item shape used by `get_pending_submissions` and
+/// `get_submission_history`.
+fn snow_row_to_summary_json(r: &ServiceNowRow) -> Value {
+    json!({
+        "id": r.id,
+        "request_type": r.request_type,
+        "ci_name": r.ci_name,
+        "status": r.status,
+        "payload_summary": r.payload_summary,
+        "created_at": r.created_at.to_rfc3339(),
+    })
+}
+
+/// History item shape — includes external_ref + submitted_at to mirror
+/// `get_submission_history` engine response.
+fn snow_row_to_history_json(r: &ServiceNowRow) -> Value {
+    json!({
+        "id": r.id,
+        "request_type": r.request_type,
+        "external_ref": r.external_ref,
+        "status": r.status,
+        "payload_summary": r.payload_summary,
+        "created_at": r.created_at.to_rfc3339(),
+        "submitted_at": r.submitted_at.as_ref().map(|t| t.to_rfc3339()),
+    })
+}
+
+/// Parse a path id as a UUID for the DB path. A malformed id is treated as a
+/// missing request (404) — matching the engine fallback, which finds no match
+/// for an arbitrary string — rather than letting Postgres reject the cast and
+/// surface a 500.
+fn parse_snow_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value>)> {
+    sqlx::types::Uuid::parse_str(id).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+        )
+    })
+}
+
 // ─── ServiceNow API handlers ───
 
 async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // Replicate engine validation (prepare_incident checks these before new_request).
+        if body.ci_name.is_empty() {
+            return Err(status_400("ci_name is required"));
+        }
+        if body.description.is_empty() {
+            return Err(status_400("description is required"));
+        }
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let meta = serde_json::json!({
+            "urgency": body.urgency,
+            "assignment_group": body.assignment_group,
+        });
+        sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary, \
+              created_at, submitted_at, metadata) \
+             VALUES ($1, 'incident', '', 'Draft', $2, $3, $4, NULL, $5::jsonb)",
+        )
+        .bind(id)
+        .bind(&body.ci_name)
+        .bind(&body.description)
+        .bind(now)
+        .bind(meta.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "id": id.to_string(),
+            "request_type": "incident",
+            "ci_name": body.ci_name,
+            "status": "Draft",
+            "payload_summary": body.description,
+            "created_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
     match servicenow_api::prepare_incident(
         &body.ci_name,
         &body.description,
@@ -13382,6 +13497,49 @@ async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> Api
 }
 
 async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // Replicate engine validation (prepare_change checks these before new_request).
+        if body.ci_name.is_empty() {
+            return Err(status_400("ci_name is required"));
+        }
+        if body.description.is_empty() {
+            return Err(status_400("description is required"));
+        }
+        if body.planned_start.is_empty() || body.planned_end.is_empty() {
+            return Err(status_400("planned_start and planned_end are required"));
+        }
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let meta = serde_json::json!({
+            "change_type": body.change_type,
+            "risk": body.risk,
+            "planned_start": body.planned_start,
+            "planned_end": body.planned_end,
+        });
+        sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary, \
+              created_at, submitted_at, metadata) \
+             VALUES ($1, 'change', '', 'Draft', $2, $3, $4, NULL, $5::jsonb)",
+        )
+        .bind(id)
+        .bind(&body.ci_name)
+        .bind(&body.description)
+        .bind(now)
+        .bind(meta.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "id": id.to_string(),
+            "request_type": "change",
+            "ci_name": body.ci_name,
+            "status": "Draft",
+            "payload_summary": body.description,
+            "created_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
     match servicenow_api::prepare_change(
         &body.ci_name,
         &body.change_type,
@@ -13396,6 +13554,43 @@ async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResu
 }
 
 async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // Replicate engine validation (prepare_request checks these before new_request).
+        if body.ci_name.is_empty() {
+            return Err(status_400("ci_name is required"));
+        }
+        if body.description.is_empty() {
+            return Err(status_400("description is required"));
+        }
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let meta = serde_json::json!({
+            "request_type": body.request_type,
+        });
+        sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary, \
+              created_at, submitted_at, metadata) \
+             VALUES ($1, 'request', '', 'Draft', $2, $3, $4, NULL, $5::jsonb)",
+        )
+        .bind(id)
+        .bind(&body.ci_name)
+        .bind(&body.description)
+        .bind(now)
+        .bind(meta.to_string())
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(json!({
+            "id": id.to_string(),
+            "request_type": "request",
+            "ci_name": body.ci_name,
+            "status": "Draft",
+            "payload_summary": body.description,
+            "created_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
     match servicenow_api::prepare_request(&body.ci_name, &body.request_type, &body.description) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err(status_400(&e)),
@@ -13403,46 +13598,258 @@ async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiRe
 }
 
 async fn servicenow_validate(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uuid = parse_snow_id(&id)?;
+        // Fetch current row to check status and validate required fields.
+        let row: Option<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue WHERE id = $1"
+        ))
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = row else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+            ));
+        };
+        // Engine guards: must be Draft, ci_name and payload_summary non-empty.
+        if row.status != "Draft" {
+            return Err(status_400(&format!(
+                "Request {} is not in Draft status (current: {})",
+                id, row.status
+            )));
+        }
+        if row.ci_name.is_empty() {
+            return Err(status_400("ci_name is missing"));
+        }
+        if row.payload_summary.is_empty() {
+            return Err(status_400("payload_summary is missing"));
+        }
+        return Ok(Json(json!({
+            "id": row.id,
+            "status": "validated",
+            "passed": true,
+            "errors": [],
+            "warnings": ["DRY-RUN: static validation only — no live ServiceNow connectivity check"],
+            "source": "database",
+        })));
+    }
     match servicenow_api::validate_request(&id) {
         Ok(result) => Ok(Json(result)),
+        Err(e) if e.contains("not found") => {
+            Err((StatusCode::NOT_FOUND, Json(json!({ "error": e }))))
+        }
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn servicenow_approve(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uuid = parse_snow_id(&id)?;
+        // Fetch row — engine reads the request to check guards but does NOT
+        // mutate status (approve_request returns a response without writing to
+        // the store). Mirror that: read-only guard check, no UPDATE.
+        let row: Option<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue WHERE id = $1"
+        ))
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = row else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+            ));
+        };
+        // Engine guards: Submitted → error, Failed → error.
+        if row.status == "Submitted" {
+            return Err(status_400("Cannot approve — already submitted"));
+        }
+        if row.status == "Failed" {
+            return Err(status_400("Cannot approve — request has failed"));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        return Ok(Json(json!({
+            "id": row.id,
+            "status": "approved",
+            "approved_at": now,
+            "source": "database",
+            "note": "DRY-RUN: approval recorded locally — live ServiceNow API is pending approval",
+        })));
+    }
     match servicenow_api::approve_request(&id) {
         Ok(result) => Ok(Json(result)),
+        Err(e) if e.contains("not found") => {
+            Err((StatusCode::NOT_FOUND, Json(json!({ "error": e }))))
+        }
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn servicenow_submit(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uuid = parse_snow_id(&id)?;
+        // Engine guards: Submitted → error, Failed → error.
+        // Engine also gates Draft: if not Ready/Pending, it first sets status=Ready
+        // then immediately sets status=Pending. Net effect: any non-Submitted
+        // non-Failed status ends up as Pending. Use a conditional UPDATE that
+        // rejects Submitted/Failed.
+        let result = sqlx::query(
+            "UPDATE servicenow_queue \
+             SET status = 'Pending' \
+             WHERE id = $1 AND status NOT IN ('Submitted', 'Failed')",
+        )
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        if result.rows_affected() == 1 {
+            let now = chrono::Utc::now().to_rfc3339();
+            return Ok(Json(json!({
+                "id": uuid.to_string(),
+                "status": "Pending",
+                "queued_at": now,
+                "source": "database",
+                "note": "DRY-RUN: submission queued locally — live ServiceNow submission is disabled pending API approval",
+            })));
+        }
+        // 0 rows affected: distinguish 404 vs wrong-state (400).
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1")
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+        return match existing {
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+            )),
+            Some(s) if s == "Submitted" => Err(status_400("Already submitted")),
+            Some(_) => Err(status_400("Cannot queue — request has failed")),
+        };
+    }
     match servicenow_api::queue_for_submission(&id) {
         Ok(result) => Ok(Json(result)),
+        Err(e) if e.contains("not found") => {
+            Err((StatusCode::NOT_FOUND, Json(json!({ "error": e }))))
+        }
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn servicenow_status(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uuid = parse_snow_id(&id)?;
+        let row: Option<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue WHERE id = $1"
+        ))
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        return match row {
+            Some(r) => Ok(Json(snow_row_to_status_json(&r))),
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+            )),
+        };
+    }
     match servicenow_api::get_submission_status(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err(status_404(&e)),
     }
 }
 
-async fn servicenow_pending() -> Json<Value> {
-    Json(servicenow_api::get_pending_submissions())
+async fn servicenow_pending() -> ApiResult {
+    if let Some(pool) = get_db() {
+        let rows: Vec<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue \
+             WHERE status IN ('Pending', 'Ready') ORDER BY created_at"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let items: Vec<Value> = rows.iter().map(snow_row_to_summary_json).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "count": items.len(),
+            "items": items,
+        })));
+    }
+    Ok(Json(servicenow_api::get_pending_submissions()))
 }
 
 async fn servicenow_cancel(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let uuid = parse_snow_id(&id)?;
+        // Engine guard: Submitted → error. Unconditional set to Failed otherwise.
+        let result = sqlx::query(
+            "UPDATE servicenow_queue \
+             SET status = 'Failed' \
+             WHERE id = $1 AND status <> 'Submitted'",
+        )
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        if result.rows_affected() == 1 {
+            return Ok(Json(json!({
+                "id": uuid.to_string(),
+                "status": "cancelled",
+                "cancelled_at": chrono::Utc::now().to_rfc3339(),
+                "source": "database",
+            })));
+        }
+        // 0 rows: distinguish 404 vs wrong-state (Submitted → 400).
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1")
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+        return match existing {
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("ServiceNow request {} not found", id) })),
+            )),
+            Some(_) => Err(status_400(
+                "Cannot cancel — request has already been submitted",
+            )),
+        };
+    }
     match servicenow_api::cancel_request(&id) {
         Ok(result) => Ok(Json(result)),
+        Err(e) if e.contains("not found") => {
+            Err((StatusCode::NOT_FOUND, Json(json!({ "error": e }))))
+        }
         Err(e) => Err(status_400(&e)),
     }
 }
 
-async fn servicenow_history(Path(ci): Path<String>) -> Json<Value> {
-    Json(servicenow_api::get_submission_history(&ci))
+async fn servicenow_history(Path(ci): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let rows: Vec<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue \
+             WHERE ci_name = $1 ORDER BY created_at"
+        ))
+        .bind(&ci)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let entries: Vec<Value> = rows.iter().map(snow_row_to_history_json).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "ci_name": ci,
+            "count": entries.len(),
+            "items": entries,
+        })));
+    }
+    Ok(Json(servicenow_api::get_submission_history(&ci)))
 }
 
 async fn servicenow_contract() -> Json<Value> {
@@ -23234,5 +23641,946 @@ mod noise_remediation_db_tests {
             panic!("expected Err 400 for lowercase site, got Ok");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+// ─── ServiceNow queue DB-gated tests ───────────────────────────────────────
+//
+// STRICT TDD: tests were written before implementation. DB-gated tests REQUIRE
+// RYUKI_DATABASE_URL to be set and skip (print SKIP) when it is not.
+
+#[cfg(test)]
+mod servicenow_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// Insert a test row and return its UUID string.
+    async fn seed_row(
+        pool: &PgPool,
+        id: &str,
+        request_type: &str,
+        ci_name: &str,
+        status: &str,
+        external_ref: &str,
+        payload_summary: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary, \
+              created_at, submitted_at, metadata) \
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, NOW(), NULL, '{}') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(request_type)
+        .bind(external_ref)
+        .bind(status)
+        .bind(ci_name)
+        .bind(payload_summary)
+        .execute(pool)
+        .await
+        .expect("seed servicenow_queue row");
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM servicenow_queue WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ─── unit tests (no DB — call engine functions directly) ───
+
+    #[test]
+    fn test_servicenow_incident_engine_validates_empty_ci_name() {
+        // Engine must reject empty ci_name — this is the contract the DB path also enforces.
+        let result = ryuki_engine::servicenow_api::prepare_incident("", "description", "1", "Ops");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ci_name"));
+    }
+
+    #[test]
+    fn test_servicenow_incident_engine_creates_draft() {
+        let result = ryuki_engine::servicenow_api::prepare_incident(
+            "srv-test-01.corp.local",
+            "Disk space critical",
+            "2",
+            "Wintel-Operations",
+        );
+        let v = result.expect("engine should succeed");
+        assert_eq!(v["request_type"], "incident");
+        assert_eq!(v["status"], "Draft");
+        assert_eq!(v["source"], "static-dry-run");
+    }
+
+    #[test]
+    fn test_servicenow_pending_engine_returns_count() {
+        let v = ryuki_engine::servicenow_api::get_pending_submissions();
+        assert_eq!(v["source"], "static-dry-run");
+        assert!(v["count"].as_u64().is_some());
+    }
+
+    // ── Fix 5: engine fallback maps "not found" → 404, not 400 ──
+
+    #[test]
+    fn test_engine_validate_not_found_is_not_found_error() {
+        let err =
+            ryuki_engine::servicenow_api::validate_request("sn-req-does-not-exist").unwrap_err();
+        assert!(err.contains("not found"), "expected 'not found' in: {err}");
+    }
+
+    #[test]
+    fn test_engine_approve_not_found_is_not_found_error() {
+        let err =
+            ryuki_engine::servicenow_api::approve_request("sn-req-does-not-exist").unwrap_err();
+        assert!(err.contains("not found"), "expected 'not found' in: {err}");
+    }
+
+    #[test]
+    fn test_engine_queue_not_found_is_not_found_error() {
+        let err = ryuki_engine::servicenow_api::queue_for_submission("sn-req-does-not-exist")
+            .unwrap_err();
+        assert!(err.contains("not found"), "expected 'not found' in: {err}");
+    }
+
+    #[test]
+    fn test_engine_cancel_not_found_is_not_found_error() {
+        let err =
+            ryuki_engine::servicenow_api::cancel_request("sn-req-does-not-exist").unwrap_err();
+        assert!(err.contains("not found"), "expected 'not found' in: {err}");
+    }
+
+    // ── Fix 3: engine validate warning string is exact ──
+
+    #[test]
+    fn test_engine_validate_warning_exact_string() {
+        // sn-req-003 is Draft in the engine seed store.
+        let v = ryuki_engine::servicenow_api::validate_request("sn-req-003").unwrap();
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w.as_str()
+                == Some("DRY-RUN: static validation only — no live ServiceNow connectivity check")),
+            "engine warning must be exact: {warnings:?}"
+        );
+    }
+
+    // ── Fix 3: engine approve note string is exact ──
+
+    #[test]
+    fn test_engine_approve_note_exact_string() {
+        // sn-req-003 is Draft — approvable.
+        let v = ryuki_engine::servicenow_api::approve_request("sn-req-003").unwrap();
+        assert_eq!(
+            v["note"].as_str().unwrap(),
+            "DRY-RUN: approval recorded locally — live ServiceNow API is pending approval"
+        );
+    }
+
+    // ── Fix 3: engine queue note string is exact ──
+
+    #[test]
+    fn test_engine_queue_note_exact_string() {
+        // sn-req-002 is Ready — queueable.
+        let v = ryuki_engine::servicenow_api::queue_for_submission("sn-req-002").unwrap();
+        assert_eq!(
+            v["note"].as_str().unwrap(),
+            "DRY-RUN: submission queued locally — live ServiceNow submission is disabled pending API approval"
+        );
+    }
+
+    // ─── DB-gated tests ───
+
+    // ── prepare_incident persists a Draft row ──
+
+    #[tokio::test]
+    async fn test_prepare_incident_persists_draft() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let body = ServicenowIncidentRequest {
+            ci_name: "srv-test-snow-01.corp.local".into(),
+            description: "High CPU test incident".into(),
+            urgency: "2".into(),
+            assignment_group: "Wintel-Operations".into(),
+        };
+        let result = servicenow_incident(Json(body)).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok, got: {result:?}");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["request_type"], "incident");
+        assert_eq!(v["status"], "Draft");
+        let id = v["id"].as_str().expect("id present");
+
+        // Verify row in DB.
+        let row: Option<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+        cleanup(pool, id).await;
+
+        let row = row.expect("row must exist after prepare_incident");
+        assert_eq!(row.request_type, "incident");
+        assert_eq!(row.status, "Draft");
+        assert_eq!(row.ci_name, "srv-test-snow-01.corp.local");
+    }
+
+    // ── prepare_incident rejects empty ci_name — NOT persisted ──
+
+    #[tokio::test]
+    async fn test_prepare_incident_empty_ci_name_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servicenow_queue")
+            .fetch_one(pool)
+            .await
+            .expect("count");
+
+        let body = ServicenowIncidentRequest {
+            ci_name: "".into(),
+            description: "Some description".into(),
+            urgency: "1".into(),
+            assignment_group: "Ops".into(),
+        };
+        let result = servicenow_incident(Json(body)).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty ci_name");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM servicenow_queue")
+            .fetch_one(pool)
+            .await
+            .expect("count");
+        assert_eq!(
+            before, after,
+            "no row should be inserted on validation failure"
+        );
+    }
+
+    // ── prepare_incident rejects empty description — NOT persisted ──
+
+    #[tokio::test]
+    async fn test_prepare_incident_empty_description_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let body = ServicenowIncidentRequest {
+            ci_name: "srv-test-01.corp.local".into(),
+            description: "".into(),
+            urgency: "1".into(),
+            assignment_group: "Ops".into(),
+        };
+        let result = servicenow_incident(Json(body)).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty description");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── prepare_change rejects empty planned_start/end ──
+
+    #[tokio::test]
+    async fn test_prepare_change_empty_window_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_change(Json(ServicenowChangeRequest {
+            ci_name: "srv-test-01.corp.local".into(),
+            change_type: "Normal".into(),
+            description: "Memory upgrade".into(),
+            planned_start: "".into(),
+            planned_end: "".into(),
+            risk: "Low".into(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty window");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── prepare_change persists a Draft row ──
+
+    #[tokio::test]
+    async fn test_prepare_change_persists_draft() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_change(Json(ServicenowChangeRequest {
+            ci_name: "srv-test-snow-02.corp.local".into(),
+            change_type: "Standard".into(),
+            description: "Memory upgrade test".into(),
+            planned_start: "2026-06-20T02:00:00Z".into(),
+            planned_end: "2026-06-20T04:00:00Z".into(),
+            risk: "Low".into(),
+        }))
+        .await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["request_type"], "change");
+        assert_eq!(v["status"], "Draft");
+        let id = v["id"].as_str().expect("id");
+
+        let row: Option<ServiceNowRow> = sqlx::query_as(&format!(
+            "SELECT {SNOW_COLUMNS} FROM servicenow_queue WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read");
+        cleanup(pool, id).await;
+
+        assert_eq!(row.expect("row").request_type, "change");
+    }
+
+    // ── prepare_request persists a Draft row ──
+
+    #[tokio::test]
+    async fn test_prepare_request_persists_draft() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_request(Json(ServicenowRequestRequest {
+            ci_name: "srv-test-snow-03.corp.local".into(),
+            request_type: "software-upgrade".into(),
+            description: "Zabbix agent upgrade".into(),
+        }))
+        .await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["request_type"], "request");
+        assert_eq!(v["status"], "Draft");
+        cleanup(pool, v["id"].as_str().expect("id")).await;
+    }
+
+    // ── validate persists nothing + returns validated shape ──
+
+    #[tokio::test]
+    async fn test_validate_request_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000301";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-val-01.local",
+            "Draft",
+            "",
+            "High CPU test",
+        )
+        .await;
+
+        let result = servicenow_validate(Path(id.into())).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["status"], "validated");
+        assert_eq!(v["passed"], true);
+        assert_eq!(v["source"], "database");
+
+        // Verify status was NOT mutated.
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1::uuid")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("status");
+        cleanup(pool, id).await;
+        assert_eq!(status, "Draft", "validate must not mutate status");
+    }
+
+    // ── validate rejects non-Draft status (400) ──
+
+    #[tokio::test]
+    async fn test_validate_wrong_state_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000302";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-val-02.local",
+            "Ready",
+            "",
+            "Some summary",
+        )
+        .await;
+
+        let result = servicenow_validate(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err for non-Draft status");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── validate on missing id returns 404 ──
+
+    #[tokio::test]
+    async fn test_validate_missing_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_validate(Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── validate malformed id returns 404 ──
+
+    #[tokio::test]
+    async fn test_validate_malformed_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_validate(Path("not-a-uuid".into())).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // ── approve on Submitted returns 400 ──
+
+    #[tokio::test]
+    async fn test_approve_submitted_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000303";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-app-01.local",
+            "Submitted",
+            "INC-2026-9999",
+            "desc",
+        )
+        .await;
+
+        let result = servicenow_approve(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for Submitted");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── approve on Failed returns 400 ──
+
+    #[tokio::test]
+    async fn test_approve_failed_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000304";
+        seed_row(pool, id, "change", "srv-app-02.local", "Failed", "", "desc").await;
+
+        let result = servicenow_approve(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for Failed");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── approve on approvable status succeeds + does NOT mutate ──
+
+    #[tokio::test]
+    async fn test_approve_draft_succeeds_no_mutation() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000305";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-app-03.local",
+            "Draft",
+            "",
+            "CPU alert",
+        )
+        .await;
+
+        let result = servicenow_approve(Path(id.into())).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["status"], "approved");
+        assert_eq!(v["source"], "database");
+
+        // Engine does NOT mutate status on approve — DB must match.
+        let db_status: String =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1::uuid")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("status");
+        cleanup(pool, id).await;
+        assert_eq!(db_status, "Draft", "approve must NOT mutate status in DB");
+    }
+
+    // ── queue_for_submission transitions to Pending ──
+
+    #[tokio::test]
+    async fn test_submit_transitions_to_pending() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000306";
+        seed_row(
+            pool,
+            id,
+            "change",
+            "srv-queue-01.local",
+            "Ready",
+            "CHG-TEST",
+            "change desc",
+        )
+        .await;
+
+        let result = servicenow_submit(Path(id.into())).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["status"], "Pending");
+        assert_eq!(v["source"], "database");
+        // Fix 4: returned id must be the canonical UUID form (from uuid.to_string()).
+        assert_eq!(
+            v["id"].as_str().unwrap(),
+            id,
+            "returned id must be canonical UUID"
+        );
+
+        let db_status: String =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1::uuid")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("status");
+        cleanup(pool, id).await;
+        assert_eq!(db_status, "Pending");
+    }
+
+    // ── queue_for_submission on Submitted returns 400 ──
+
+    #[tokio::test]
+    async fn test_submit_already_submitted_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000307";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-queue-02.local",
+            "Submitted",
+            "INC-X",
+            "submitted already",
+        )
+        .await;
+
+        let result = servicenow_submit(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err for Submitted");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("submitted"));
+    }
+
+    // ── queue_for_submission on Failed returns 400 ──
+
+    #[tokio::test]
+    async fn test_submit_failed_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000308";
+        seed_row(
+            pool,
+            id,
+            "request",
+            "srv-queue-03.local",
+            "Failed",
+            "",
+            "cancelled req",
+        )
+        .await;
+
+        let result = servicenow_submit(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err for Failed");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── queue_for_submission on missing id returns 404 ──
+
+    #[tokio::test]
+    async fn test_submit_missing_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_submit(Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── status returns full detail for seeded row ──
+
+    #[tokio::test]
+    async fn test_status_reads_seeded_row() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Use the seeded row from the migration.
+        let id = "d0000100-1000-1000-1000-000000000201";
+        let result = servicenow_status(Path(id.into())).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok for seeded row: {result:?}");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["request_type"], "incident");
+        assert_eq!(v["status"], "Submitted");
+        assert_eq!(v["external_ref"], "INC-2026-0042");
+    }
+
+    // ── status on missing id returns 404 ──
+
+    #[tokio::test]
+    async fn test_status_missing_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_status(Path("d0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── status on malformed id returns 404 ──
+
+    #[tokio::test]
+    async fn test_status_malformed_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_status(Path("sn-req-001".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404 for non-UUID id");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── pending returns only Ready and Pending rows ──
+
+    #[tokio::test]
+    async fn test_pending_returns_ready_and_pending() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let Ok(Json(v)) = servicenow_pending().await else {
+            panic!("expected Ok from servicenow_pending");
+        };
+        assert_eq!(v["source"], "database");
+        let items = v["items"].as_array().expect("items array");
+        for item in items {
+            let s = item["status"].as_str().expect("status");
+            assert!(
+                s == "Ready" || s == "Pending",
+                "pending must only include Ready/Pending, got: {s}"
+            );
+        }
+        // Seeded: row 202 is Ready, row 204 is Pending.
+        assert!(v["count"].as_u64().unwrap() >= 2);
+    }
+
+    // ── cancel transitions to Failed ──
+
+    #[tokio::test]
+    async fn test_cancel_transitions_to_failed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000309";
+        seed_row(
+            pool,
+            id,
+            "request",
+            "srv-cancel-01.local",
+            "Draft",
+            "",
+            "cancel me",
+        )
+        .await;
+
+        let result = servicenow_cancel(Path(id.into())).await;
+        let Ok(Json(v)) = result else {
+            panic!("expected Ok: {result:?}");
+        };
+        assert_eq!(v["status"], "cancelled");
+        assert_eq!(v["source"], "database");
+        // Fix 4: returned id must be the canonical UUID form (from uuid.to_string()).
+        assert_eq!(
+            v["id"].as_str().unwrap(),
+            id,
+            "returned id must be canonical UUID"
+        );
+
+        let db_status: String =
+            sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1::uuid")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("status");
+        cleanup(pool, id).await;
+        assert_eq!(db_status, "Failed");
+    }
+
+    // ── cancel on Submitted returns 400 ──
+
+    #[tokio::test]
+    async fn test_cancel_submitted_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "f0000100-1000-1000-1000-000000000310";
+        seed_row(
+            pool,
+            id,
+            "incident",
+            "srv-cancel-02.local",
+            "Submitted",
+            "INC-XXX",
+            "submitted",
+        )
+        .await;
+
+        let result = servicenow_cancel(Path(id.into())).await;
+        cleanup(pool, id).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 400 for Submitted cancel");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("submitted"));
+    }
+
+    // ── cancel on missing id returns 404 ──
+
+    #[tokio::test]
+    async fn test_cancel_missing_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_cancel(Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── cancel malformed id returns 404 ──
+
+    #[tokio::test]
+    async fn test_cancel_malformed_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = servicenow_cancel(Path("bad-uuid".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404 for malformed id");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── history filters by exact ci_name ──
+
+    #[tokio::test]
+    async fn test_history_filters_by_ci_name() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seeded row 201: ci_name = 'srv-defra-web01.example.local'
+        let Ok(Json(v)) = servicenow_history(Path("srv-defra-web01.example.local".into())).await
+        else {
+            panic!("expected Ok from servicenow_history");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["ci_name"], "srv-defra-web01.example.local");
+        assert!(v["count"].as_u64().unwrap() >= 1);
+        let items = v["items"].as_array().expect("items");
+        assert!(items.iter().any(|i| i["request_type"] == "incident"));
+    }
+
+    #[tokio::test]
+    async fn test_history_empty_for_unknown_ci() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let Ok(Json(v)) = servicenow_history(Path("nonexistent.ci.example.local".into())).await
+        else {
+            panic!("expected Ok from servicenow_history");
+        };
+        assert_eq!(v["source"], "database");
+        assert_eq!(v["count"].as_u64().unwrap(), 0);
+        assert!(v["items"].as_array().unwrap().is_empty());
+    }
+
+    // ── CHECK constraint: invalid request_type rejected by DB ──
+
+    #[tokio::test]
+    async fn test_check_constraint_invalid_request_type_rejected() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary) \
+             VALUES (gen_random_uuid(), 'INVALID_TYPE', '', 'Draft', 'test.local', 'test')",
+        )
+        .execute(pool)
+        .await;
+        assert!(result.is_err(), "DB should reject invalid request_type");
+    }
+
+    // ── CHECK constraint: invalid status rejected by DB ──
+
+    #[tokio::test]
+    async fn test_check_constraint_invalid_status_rejected() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = sqlx::query(
+            "INSERT INTO servicenow_queue \
+             (id, request_type, external_ref, status, ci_name, payload_summary) \
+             VALUES (gen_random_uuid(), 'incident', '', 'submitted', 'test.local', 'test')",
+        )
+        .execute(pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "DB should reject lowercase status 'submitted' (CHECK enforces PascalCase)"
+        );
     }
 }
