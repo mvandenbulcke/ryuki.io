@@ -7,6 +7,7 @@ mod config_store;
 mod contracts;
 pub mod database;
 mod entra_auth;
+mod integration;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -1424,6 +1425,7 @@ async fn main() {
         .route("/api/platform/uptime", get(uptime))
         .merge(contracts::routes())
         .merge(boundary::routes())
+        .merge(integration::routes())
         .fallback(not_found)
         .layer(Extension(local_login_throttle))
         .layer(ConcurrencyLimitLayer::new(
