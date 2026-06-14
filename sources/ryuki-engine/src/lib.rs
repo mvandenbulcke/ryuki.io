@@ -44,6 +44,7 @@ pub mod patch_engine;
 pub mod repository_capacity;
 pub mod request_lifecycle;
 pub mod runbook_execution;
+pub mod runners;
 pub mod secrets_rotation;
 pub mod server_decommission;
 pub mod servicenow_api;

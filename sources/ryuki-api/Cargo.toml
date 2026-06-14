@@ -28,6 +28,8 @@ base64 = "0.22"
 aes-gcm = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"
+tempfile = "3"
+regex = "1"
 
 [dev-dependencies]
 rsa = "0.9"

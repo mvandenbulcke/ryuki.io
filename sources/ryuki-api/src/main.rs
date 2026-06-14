@@ -8,6 +8,7 @@ mod contracts;
 pub mod database;
 mod entra_auth;
 mod integration;
+pub mod runner;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
