@@ -50,6 +50,28 @@ impl ConfigStore {
     }
 }
 
+pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
+    let _ = APP_CONFIG.set(app_cfg.clone());
+    let store = ConfigStore::new(path);
+    STORE
+        .set(Mutex::new(store))
+        .expect("config store already initialized");
+}
+
+pub fn get_app_config() -> &'static RyukiConfig {
+    APP_CONFIG.get().expect("app config not initialized")
+}
+
+pub async fn load_config() -> Result<PlatformConfig, String> {
+    let store = STORE.get().expect("config store not initialized");
+    store.lock().await.load_config()
+}
+
+pub async fn save_config(config: &PlatformConfig) -> Result<(), String> {
+    let store = STORE.get().expect("config store not initialized");
+    store.lock().await.save_config(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,10 +91,12 @@ mod tests {
     #[test]
     fn test_load_config_reads_full_file_config() {
         let path = temp_config_path();
-        let mut expected = PlatformConfig::default();
-        expected.storage_provider = "netapp".to_string();
-        expected.retention_daily_backups = 45;
-        expected.max_concurrent_connections = 1024;
+        let expected = PlatformConfig {
+            storage_provider: "netapp".to_string(),
+            retention_daily_backups: 45,
+            max_concurrent_connections: 1024,
+            ..Default::default()
+        };
         std::fs::write(&path, serde_json::to_string(&expected).unwrap()).unwrap();
 
         let store = ConfigStore::new(&path);
@@ -96,26 +120,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("failed to parse config file"));
     }
-}
-
-pub fn init_with_config(path: &str, app_cfg: &RyukiConfig) {
-    let _ = APP_CONFIG.set(app_cfg.clone());
-    let store = ConfigStore::new(path);
-    STORE
-        .set(Mutex::new(store))
-        .expect("config store already initialized");
-}
-
-pub fn get_app_config() -> &'static RyukiConfig {
-    APP_CONFIG.get().expect("app config not initialized")
-}
-
-pub async fn load_config() -> Result<PlatformConfig, String> {
-    let store = STORE.get().expect("config store not initialized");
-    store.lock().await.load_config()
-}
-
-pub async fn save_config(config: &PlatformConfig) -> Result<(), String> {
-    let store = STORE.get().expect("config store not initialized");
-    store.lock().await.save_config(config)
 }

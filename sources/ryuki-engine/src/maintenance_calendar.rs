@@ -765,6 +765,11 @@ mod tests {
         let contract = get_calendar_contract();
         assert_eq!(contract["source"], "static-seed");
         assert_eq!(contract["dryRunRequired"], true);
-        assert!(contract["supportedWorkflows"].as_array().unwrap().len() > 0);
+        assert!(
+            !contract["supportedWorkflows"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }

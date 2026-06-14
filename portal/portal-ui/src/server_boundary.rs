@@ -26,7 +26,7 @@ use crate::api::{
     request_lock_path, request_plan_path, request_reject_path, request_validate_path,
     request_verify_path,
 };
-#[cfg(any(feature = "ssr", test))]
+#[cfg(feature = "ssr")]
 use crate::api::{integration_id_path, integration_test_path};
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
@@ -2264,6 +2264,7 @@ pub async fn get_request_evidence(request_id: String) -> Result<EvidencePackExpo
 /// `durable=false` and a non-sealed digest flag that nothing was sealed against
 /// persisted data; the items are illustrative and already redacted.
 #[cfg(any(feature = "ssr", test))]
+#[allow(dead_code)]
 fn static_preview_evidence_pack(request_id: &str) -> EvidencePackExport {
     let items = vec![
         crate::models::EvidencePackItem {
@@ -2339,6 +2340,7 @@ pub async fn get_activity_audit_feed() -> Result<Vec<AuditEventRow>, ServerFnErr
 /// is marked `durable=false` so the Activity timeline can flag that nothing was
 /// persisted, and carries a `request_id` so the deep-links still resolve.
 #[cfg(any(feature = "ssr", test))]
+#[allow(dead_code)]
 fn static_preview_activity_feed() -> Vec<AuditEventRow> {
     #[allow(clippy::too_many_arguments)]
     fn preview_row(

@@ -552,7 +552,7 @@ mod tests {
     fn test_get_site_capacity_gblon() {
         let result = get_site_capacity("GBLON").unwrap();
         assert_eq!(result["site"], "GBLON");
-        assert!(result["clusters"].as_array().unwrap().len() > 0);
+        assert!(!result["clusters"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -571,12 +571,8 @@ mod tests {
         let projected_cpu = result["projected"]["cpu_utilization_pct"].as_f64().unwrap();
         let current_cpu = result["current"]["cpu_utilization_pct"].as_f64().unwrap();
         assert!(projected_cpu > current_cpu);
-        assert!(
-            result["risk_flags"]["cpu_at_risk"]
-                .as_bool()
-                .unwrap_or(false)
-                || true
-        );
+        // cpu_at_risk field must be present and parseable as bool (may be true or false)
+        assert!(result["risk_flags"]["cpu_at_risk"].as_bool().is_some());
     }
 
     #[test]

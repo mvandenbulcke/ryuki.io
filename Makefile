@@ -29,7 +29,7 @@ test:
 
 lint:
 	cargo fmt --check --all
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 validate:
 	cargo run --manifest-path scripts/validator-rs/Cargo.toml -- run-all --root .
@@ -57,7 +57,7 @@ docker-build:
 
 release-check:
 	cargo fmt --check --all
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 	cargo test --workspace
 	$(MAKE) validate
 	$(MAKE) docker-build

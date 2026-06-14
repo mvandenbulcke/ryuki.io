@@ -571,11 +571,11 @@ fn api_and_portal_deployments_have_security_context() {
             .unwrap()[0];
         let sec = &container["securityContext"];
 
-        assert_eq!(sec["runAsNonRoot"].as_bool().unwrap(), true);
+        assert!(sec["runAsNonRoot"].as_bool().unwrap());
         assert_eq!(sec["runAsUser"].as_i64().unwrap(), 10001);
         assert_eq!(sec["runAsGroup"].as_i64().unwrap(), 10001);
-        assert_eq!(sec["allowPrivilegeEscalation"].as_bool().unwrap(), false);
-        assert_eq!(sec["readOnlyRootFilesystem"].as_bool().unwrap(), true);
+        assert!(!sec["allowPrivilegeEscalation"].as_bool().unwrap());
+        assert!(sec["readOnlyRootFilesystem"].as_bool().unwrap());
         assert_eq!(
             sec["capabilities"]["drop"]
                 .as_sequence()
@@ -616,10 +616,10 @@ fn network_policies_cover_all_deployment_names() {
 
     let mut covered: HashSet<String> = HashSet::new();
     for policy in &np_docs {
-        if let Some(selector) = policy["spec"]["podSelector"]["matchLabels"].as_mapping() {
-            if let Some(name) = selector.get("app.kubernetes.io/name") {
-                covered.insert(name.as_str().unwrap().to_string());
-            }
+        if let Some(selector) = policy["spec"]["podSelector"]["matchLabels"].as_mapping()
+            && let Some(name) = selector.get("app.kubernetes.io/name")
+        {
+            covered.insert(name.as_str().unwrap().to_string());
         }
         if let Some(selectors) = policy["spec"]["podSelector"]["matchExpressions"].as_sequence() {
             for expr in selectors {

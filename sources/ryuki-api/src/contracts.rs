@@ -15413,7 +15413,7 @@ mod unit_tests {
         let part = test_catalog_offerings_json();
         assert_eq!(part["source"], "static-seed");
         assert_eq!(part["catalogMode"], "planned-offerings");
-        assert!(part["offerings"].as_array().unwrap().len() >= 1);
+        assert!(!part["offerings"].as_array().unwrap().is_empty());
         assert_eq!(part["categories"].as_array().unwrap().len(), 6);
     }
 
@@ -16084,10 +16084,12 @@ mod unit_tests {
 
     #[test]
     fn test_session_cookie_set_header_flags_from_config() {
-        let mut session = ryuki_core::config::SessionConfig::default();
-        session.cookie_max_age_secs = 3600;
-        session.cookie_secure = true;
-        session.cookie_same_site = "lax".into();
+        let mut session = ryuki_core::config::SessionConfig {
+            cookie_max_age_secs: 3600,
+            cookie_secure: true,
+            cookie_same_site: "lax".into(),
+            ..Default::default()
+        };
         assert_eq!(
             session_cookie_set_header("abc-123", &session),
             "ryuki_session=abc-123; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax; Secure"
@@ -16108,8 +16110,10 @@ mod unit_tests {
 
     #[test]
     fn test_session_cookie_clear_header_expires_cookie() {
-        let mut session = ryuki_core::config::SessionConfig::default();
-        session.cookie_secure = true;
+        let mut session = ryuki_core::config::SessionConfig {
+            cookie_secure: true,
+            ..Default::default()
+        };
         assert_eq!(
             session_cookie_clear_header(&session),
             "ryuki_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax; Secure"
@@ -19109,16 +19113,16 @@ mod maint_calendar_db_tests {
         );
         // Non-allowlisted fields — even strings like "name" — are NOT mirrored.
         assert!(
-            meta.get("name").is_none(),
+            !meta.contains_key("name"),
             "non-allowlisted string fields must be skipped"
         );
-        assert!(meta.get("cpu").is_none(), "numeric fields must be skipped");
+        assert!(!meta.contains_key("cpu"), "numeric fields must be skipped");
         assert!(
-            meta.get("active").is_none(),
+            !meta.contains_key("active"),
             "boolean fields must be skipped"
         );
         assert!(
-            meta.get("nested").is_none(),
+            !meta.contains_key("nested"),
             "object fields must be skipped"
         );
         // Exactly one key (the allowlisted one) is present.

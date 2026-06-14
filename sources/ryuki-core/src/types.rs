@@ -696,8 +696,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_auth_mode() {
-        let mut config = PlatformConfig::default();
-        config.auth_mode = "ldap".into();
+        let config = PlatformConfig {
+            auth_mode: "ldap".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("auth_mode")));
@@ -705,8 +707,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_database_provider() {
-        let mut config = PlatformConfig::default();
-        config.database_provider = "mysql".into();
+        let config = PlatformConfig {
+            database_provider: "mysql".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("database_provider")));
@@ -714,8 +718,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_secret_provider() {
-        let mut config = PlatformConfig::default();
-        config.secret_provider = "azure-keyvault-private".into();
+        let config = PlatformConfig {
+            secret_provider: "azure-keyvault-private".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("secret_provider")));
@@ -723,8 +729,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_kubernetes_runtime() {
-        let mut config = PlatformConfig::default();
-        config.kubernetes_runtime = "pks".into();
+        let config = PlatformConfig {
+            kubernetes_runtime: "pks".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("kubernetes_runtime")));
@@ -732,8 +740,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_monitoring_provider() {
-        let mut config = PlatformConfig::default();
-        config.monitoring_provider = "splunk".into();
+        let config = PlatformConfig {
+            monitoring_provider: "splunk".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("monitoring_provider")));
@@ -741,8 +751,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_backup_provider() {
-        let mut config = PlatformConfig::default();
-        config.backup_provider = "acronis".into();
+        let config = PlatformConfig {
+            backup_provider: "acronis".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("backup_provider")));
@@ -750,8 +762,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_invalid_hypervisor_provider() {
-        let mut config = PlatformConfig::default();
-        config.hypervisor_provider = "virtualbox".into();
+        let config = PlatformConfig {
+            hypervisor_provider: "virtualbox".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("hypervisor_provider")));
@@ -759,8 +773,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_mock_dry_run_auth_valid() {
-        let mut config = PlatformConfig::default();
-        config.auth_mode = "mock-dry-run".into();
+        let config = PlatformConfig {
+            auth_mode: "mock-dry-run".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(
             errors.is_empty(),
@@ -771,10 +787,12 @@ mod tests {
 
     #[test]
     fn validate_platform_config_entra_id_auth_valid() {
-        let mut config = PlatformConfig::default();
-        config.auth_mode = "entra-id".into();
-        config.entra_tenant_id = "tenant-id".into();
-        config.entra_client_id = "client-id".into();
+        let config = PlatformConfig {
+            auth_mode: "entra-id".into(),
+            entra_tenant_id: "tenant-id".into(),
+            entra_client_id: "client-id".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(
             errors.is_empty(),
@@ -785,8 +803,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_provider_none_valid() {
-        let mut config = PlatformConfig::default();
-        config.secret_provider = "none".into();
+        let config = PlatformConfig {
+            secret_provider: "none".into(),
+            ..Default::default()
+        };
         let errors = validate_platform_config(&config);
         assert!(
             errors.is_empty(),
@@ -797,12 +817,14 @@ mod tests {
 
     #[test]
     fn validate_platform_config_rejects_blank_identity_fields() {
-        let mut config = PlatformConfig::default();
-        config.platform_name = "   ".into();
-        config.platform_url = "   ".into();
-        config.auth_mode = "entra-id".into();
-        config.entra_tenant_id = "   ".into();
-        config.entra_client_id = "".into();
+        let config = PlatformConfig {
+            platform_name: "   ".into(),
+            platform_url: "   ".into(),
+            auth_mode: "entra-id".into(),
+            entra_tenant_id: "   ".into(),
+            entra_client_id: "".into(),
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 
@@ -814,9 +836,11 @@ mod tests {
 
     #[test]
     fn validate_platform_config_rejects_invalid_urls() {
-        let mut config = PlatformConfig::default();
-        config.platform_url = "ftp://ryuki.local".into();
-        config.entra_authority = "login.microsoftonline.com".into();
+        let config = PlatformConfig {
+            platform_url: "ftp://ryuki.local".into(),
+            entra_authority: "login.microsoftonline.com".into(),
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 
@@ -826,8 +850,10 @@ mod tests {
 
     #[test]
     fn validate_platform_config_allows_empty_entra_authority() {
-        let mut config = PlatformConfig::default();
-        config.entra_authority = "".into();
+        let config = PlatformConfig {
+            entra_authority: "".into(),
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 
@@ -836,11 +862,13 @@ mod tests {
 
     #[test]
     fn validate_platform_config_rejects_zero_retention_values() {
-        let mut config = PlatformConfig::default();
-        config.retention_daily_backups = 0;
-        config.retention_weekly_backups = 0;
-        config.retention_monthly_backups = 0;
-        config.retention_yearly_backups = 0;
+        let config = PlatformConfig {
+            retention_daily_backups: 0,
+            retention_weekly_backups: 0,
+            retention_monthly_backups: 0,
+            retention_yearly_backups: 0,
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 
@@ -864,10 +892,12 @@ mod tests {
 
     #[test]
     fn validate_platform_config_rejects_invalid_maintenance_values() {
-        let mut config = PlatformConfig::default();
-        config.maintenance_window_day = "funday".into();
-        config.maintenance_window_start_hour = 24;
-        config.maintenance_window_duration_hours = 0;
+        let config = PlatformConfig {
+            maintenance_window_day: "funday".into(),
+            maintenance_window_start_hour: 24,
+            maintenance_window_duration_hours: 0,
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 
@@ -886,9 +916,11 @@ mod tests {
 
     #[test]
     fn validate_platform_config_rejects_zero_server_limits() {
-        let mut config = PlatformConfig::default();
-        config.keep_alive_timeout_secs = 0;
-        config.max_concurrent_connections = 0;
+        let config = PlatformConfig {
+            keep_alive_timeout_secs: 0,
+            max_concurrent_connections: 0,
+            ..Default::default()
+        };
 
         let errors = validate_platform_config(&config);
 

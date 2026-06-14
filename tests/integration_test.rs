@@ -1,12 +1,10 @@
-use serde_json;
-
 #[test]
 fn ryuki_core_types_round_trip() {
     let status = ryuki_core::types::BoundaryStatus::default();
     let json = serde_json::to_string(&status).unwrap();
     let parsed: ryuki_core::types::BoundaryStatus = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.http_request_allowed, false);
-    assert_eq!(parsed.provider_calls_allowed, false);
+    assert!(!parsed.http_request_allowed);
+    assert!(!parsed.provider_calls_allowed);
 }
 
 #[test]

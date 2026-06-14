@@ -1796,8 +1796,10 @@ mod tests {
 
     #[test]
     fn test_validation_warnings_include_operational_guidance() {
-        let mut config = RyukiConfig::default();
-        config.kubernetes_runtime = KubernetesRuntime::None;
+        let mut config = RyukiConfig {
+            kubernetes_runtime: KubernetesRuntime::None,
+            ..Default::default()
+        };
         config.server.pool_acquire_timeout_secs = config.server.request_timeout_secs + 1;
         let warnings = config.validation_warnings();
 
@@ -1808,8 +1810,10 @@ mod tests {
 
     #[test]
     fn test_validate_ryuki_config_invalid_url() {
-        let mut config = RyukiConfig::default();
-        config.platform_url = "invalid-url".into();
+        let config = RyukiConfig {
+            platform_url: "invalid-url".into(),
+            ..Default::default()
+        };
         let errors = config.validate();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("platform_url")));
@@ -1817,8 +1821,10 @@ mod tests {
 
     #[test]
     fn test_validate_database_url_does_not_echo_value() {
-        let mut config = RyukiConfig::default();
-        config.database_url = "mysql://user:pass@db.internal/ryuki".into();
+        let config = RyukiConfig {
+            database_url: "mysql://user:pass@db.internal/ryuki".into(),
+            ..Default::default()
+        };
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("database_url")));
         assert!(!errors.iter().any(|e| e.contains("user:pass")));
@@ -1827,8 +1833,10 @@ mod tests {
 
     #[test]
     fn test_validate_ryuki_config_empty_database() {
-        let mut config = RyukiConfig::default();
-        config.database_url = String::new();
+        let config = RyukiConfig {
+            database_url: String::new(),
+            ..Default::default()
+        };
         let errors = config.validate();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("database_url")));
@@ -2091,8 +2099,10 @@ mod tests {
 
     #[test]
     fn test_parsed_trusted_proxies_fails_on_first_malformed_entry() {
-        let mut config = RateLimitConfig::default();
-        config.trusted_proxies = vec!["127.0.0.1".into(), "10.0.0.0/8".into()];
+        let mut config = RateLimitConfig {
+            trusted_proxies: vec!["127.0.0.1".into(), "10.0.0.0/8".into()],
+            ..Default::default()
+        };
         assert_eq!(config.parsed_trusted_proxies().unwrap().len(), 2);
 
         config.trusted_proxies = vec!["127.0.0.1".into(), "bogus".into()];
@@ -2120,9 +2130,11 @@ mod tests {
 
     #[test]
     fn test_validate_entra_id_requires_tenant() {
-        let mut config = RyukiConfig::default();
-        config.auth_mode = AuthMode::EntraId;
-        config.entra_tenant_id = String::new();
+        let config = RyukiConfig {
+            auth_mode: AuthMode::EntraId,
+            entra_tenant_id: String::new(),
+            ..Default::default()
+        };
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("entra_tenant_id")));
     }
@@ -2272,8 +2284,10 @@ mod tests {
 
     #[test]
     fn test_local_auth_debug_and_serialize_never_contain_password() {
-        let mut config = RyukiConfig::default();
-        config.local_auth = populated_local_auth();
+        let config = RyukiConfig {
+            local_auth: populated_local_auth(),
+            ..Default::default()
+        };
 
         let debug_output = format!("{:?}", config);
         assert!(!debug_output.contains("placeholder-pass-1"));
@@ -2343,8 +2357,10 @@ mod tests {
 
     #[test]
     fn test_validate_local_mode_requires_users() {
-        let mut config = RyukiConfig::default();
-        config.auth_mode = AuthMode::Local;
+        let mut config = RyukiConfig {
+            auth_mode: AuthMode::Local,
+            ..Default::default()
+        };
         let errors = config.validate();
         assert!(
             errors
@@ -2358,8 +2374,10 @@ mod tests {
 
     #[test]
     fn test_validation_warns_when_users_set_but_mode_not_local() {
-        let mut config = RyukiConfig::default();
-        config.local_auth = populated_local_auth();
+        let mut config = RyukiConfig {
+            local_auth: populated_local_auth(),
+            ..Default::default()
+        };
         let warnings = config.validation_warnings();
         assert!(warnings.iter().any(
             |w| w == "local_auth.users is set but auth_mode is not local; local credentials are ignored"

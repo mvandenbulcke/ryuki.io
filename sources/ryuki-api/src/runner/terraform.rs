@@ -503,7 +503,7 @@ mod tests {
             "PARENT-SECRET-SENTINEL",
         );
 
-        let runner = TerraformRunner::with_binary(shim.to_string_lossy().to_string());
+        let _runner = TerraformRunner::with_binary(shim.to_string_lossy().to_string());
         // Directly call available() to exercise the probe path.
         // Since the shim prints env to stdout and we suppress it in available(),
         // we need to run the probe manually here so we can capture output.
