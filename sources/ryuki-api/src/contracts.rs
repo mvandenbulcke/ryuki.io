@@ -18254,8 +18254,8 @@ mod maint_calendar_db_tests {
             "server-deployment must be unwired (None)"
         );
         assert!(
-            iac::resolve_ansible("zabbix-onboarding").is_none(),
-            "zabbix-onboarding must be unwired (None)"
+            iac::resolve_ansible("zabbix-onboarding").is_some(),
+            "zabbix-onboarding is now wired to ansible IaC"
         );
     }
 

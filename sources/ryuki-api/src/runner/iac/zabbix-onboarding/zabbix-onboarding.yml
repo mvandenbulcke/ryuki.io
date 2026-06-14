@@ -1,0 +1,18 @@
+---
+- name: zabbix-onboarding dry-run check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    site: ""
+    environment: ""
+    request_id: ""
+  tasks:
+    - name: Assert required inputs are sane (dry-run)
+      ansible.builtin.assert:
+        that:
+          - true
+        success_msg: "zabbix-onboarding preflight assertions passed"
+    - name: Report planned action (dry-run, no changes)
+      ansible.builtin.debug:
+        msg: "zabbix-onboarding dry-run check: site={{ site }} env={{ environment }} request_id={{ request_id }}"

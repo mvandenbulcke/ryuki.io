@@ -29,6 +29,13 @@ const PATCH_MAINTENANCE_MAIN_TF: &str = include_str!("iac/patch-maintenance/main
 const PATCH_MAINTENANCE_PLAYBOOK: &str =
     include_str!("iac/patch-maintenance/patch-maintenance.yml");
 
+/// Embedded Terraform IaC for the `request-preflight` offering.
+const REQUEST_PREFLIGHT_MAIN_TF: &str = include_str!("iac/request-preflight/main.tf");
+
+/// Embedded Ansible playbook for the `zabbix-onboarding` offering.
+const ZABBIX_ONBOARDING_PLAYBOOK: &str =
+    include_str!("iac/zabbix-onboarding/zabbix-onboarding.yml");
+
 /// Resolve the IaC bundle for the given offering ID.
 ///
 /// Returns `Some(IacBundle)` when the offering has wired IaC, `None` otherwise.
@@ -37,6 +44,7 @@ const PATCH_MAINTENANCE_PLAYBOOK: &str =
 pub fn resolve(offering_id: &str) -> Option<IacBundle> {
     match offering_id {
         "patch-maintenance" => Some(vec![("main.tf", PATCH_MAINTENANCE_MAIN_TF)]),
+        "request-preflight" => Some(vec![("main.tf", REQUEST_PREFLIGHT_MAIN_TF)]),
         _ => None,
     }
 }
@@ -51,6 +59,7 @@ pub fn resolve(offering_id: &str) -> Option<IacBundle> {
 pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
     match offering_id {
         "patch-maintenance" => Some(vec![("patch-maintenance.yml", PATCH_MAINTENANCE_PLAYBOOK)]),
+        "zabbix-onboarding" => Some(vec![("zabbix-onboarding.yml", ZABBIX_ONBOARDING_PLAYBOOK)]),
         _ => None,
     }
 }
@@ -62,6 +71,22 @@ pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_wires_request_preflight_terraform() {
+        assert!(
+            resolve("request-preflight").is_some(),
+            "request-preflight must resolve to terraform IaC (DeepSeek-authored)"
+        );
+    }
+
+    #[test]
+    fn resolve_ansible_wires_zabbix_onboarding() {
+        assert!(
+            resolve_ansible("zabbix-onboarding").is_some(),
+            "zabbix-onboarding must resolve to ansible IaC (DeepSeek-authored)"
+        );
+    }
 
     #[test]
     fn resolver_returns_some_for_patch_maintenance() {
