@@ -9070,27 +9070,161 @@ async fn requests_validate(
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-/// Enrich the plan stages produced by `plan_request` with a real Terraform
-/// dry-run evidence item, if the offering has wired IaC.
+// Enrich the plan stages produced by `plan_request` with a real Terraform
+// dry-run evidence item, if the offering has wired IaC.
+//
+// Enrichment logic:
+// 1. Resolve the IaC bundle for `offering_id`. If None, return immediately
+//    (unwired offering — no change at all).
+// 2. Build a TerraformRunner with the embedded IaC and call run_dry with
+//    empty ResolvedCredentials (this IaC needs no secrets).
+// 3. If the run succeeds (status Planned): append an EvidenceItem with
+//    key "terraform-plan" and evidence_type = Plan to the "plan" stage.
+// 4. If the runner is unavailable or the run fails: append a note item with
+//    key "terraform-plan-note" describing the skip. Never return an error.
+//
+// Soundness invariant:
+// Callers MUST call this function BEFORE building stages_json/plan_json
+// for the DB write. Enriching after serialization loses the output.
+
+// ---------------------------------------------------------------------------
+// Shared evidence builders
+// ---------------------------------------------------------------------------
+
+/// Build the `EvidenceItem` for a Terraform dry-run result.
 ///
-/// # Enrichment logic
-/// 1. Resolve the IaC bundle for `offering_id`. If `None`, return immediately
-///    (unwired offering — no change at all).
-/// 2. Build a `TerraformRunner` with the embedded IaC and call `run_dry` with
-///    empty `ResolvedCredentials` (this IaC needs no secrets).
-/// 3. If the run succeeds (status `Planned`): append an `EvidenceItem` with
-///    key `"terraform-plan"` and `evidence_type = Plan` to the `"plan"` stage.
-/// 4. If the runner is unavailable or the run fails: append a note item with
-///    key `"terraform-plan-note"` describing the skip. Never return an error.
+/// Maps:
+/// - `Ok(outcome)` with `status == Planned` → `"terraform-plan"` item with
+///   summary + UTF-8-safe truncated log (4 KiB).
+/// - `Ok(outcome)` with any other status → `"terraform-plan-note"` item
+///   (runner unavailable or failed).
+/// - `Err(e)` → `"terraform-plan-note"` item (skipped: {e}).
 ///
-/// # Soundness invariant
-/// Callers MUST call this function BEFORE building `stages_json`/`plan_json`
-/// for the DB write. Enriching after serialization loses the output.
+/// This is the single source of truth for evidence construction; both the
+/// synchronous inner function and the async wrapper call it so the two paths
+/// cannot drift.
+fn terraform_evidence_item(
+    result: Result<ryuki_engine::runners::RunOutcome, ryuki_engine::runners::RunnerError>,
+) -> ryuki_engine::models::EvidenceItem {
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::RunStatus;
+
+    match result {
+        Ok(outcome) if outcome.status == RunStatus::Planned => {
+            let value = if outcome.log.is_empty() {
+                outcome.summary.clone()
+            } else {
+                // Truncate to ~4 KiB on a UTF-8 char boundary so a multi-byte
+                // sequence at the cut point cannot panic.
+                let log_excerpt = if outcome.log.len() > 4096 {
+                    let truncated: String = outcome.log.chars().take(4096).collect();
+                    format!("{truncated}...[truncated]")
+                } else {
+                    outcome.log.clone()
+                };
+                format!("{}\n\n{}", outcome.summary, log_excerpt)
+            };
+            EvidenceItem {
+                key: "terraform-plan".to_string(),
+                value,
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Plan,
+            }
+        }
+        Ok(outcome) => EvidenceItem {
+            // RunnerUnavailable or Failed — degrade gracefully.
+            key: "terraform-plan-note".to_string(),
+            value: format!(
+                "terraform plan skipped: runner unavailable or failed (status: {}; {})",
+                outcome.status, outcome.summary
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        },
+        Err(e) => EvidenceItem {
+            // Workspace, spawn, or timeout error — degrade gracefully.
+            key: "terraform-plan-note".to_string(),
+            value: format!("terraform plan skipped: {e}"),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Plan,
+        },
+    }
+}
+
+/// Build the `EvidenceItem` for an Ansible dry-run (--check) result.
+///
+/// Maps:
+/// - `Ok(outcome)` with `status == CheckOk` → `"ansible-check"` item with
+///   summary + UTF-8-safe truncated log (4 KiB).
+/// - `Ok(outcome)` with any other status → `"ansible-check-note"` item
+///   (runner unavailable or failed).
+/// - `Err(e)` → `"ansible-check-note"` item (skipped: {e}).
+///
+/// Single source of truth used by both the sync inner function and the async
+/// wrapper so the two paths cannot drift.
+fn ansible_evidence_item(
+    result: Result<ryuki_engine::runners::RunOutcome, ryuki_engine::runners::RunnerError>,
+) -> ryuki_engine::models::EvidenceItem {
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::RunStatus;
+
+    match result {
+        Ok(outcome) if outcome.status == RunStatus::CheckOk => {
+            let log_excerpt = if outcome.log.len() > 4096 {
+                let truncated: String = outcome.log.chars().take(4096).collect();
+                format!("{truncated}...[truncated]")
+            } else {
+                outcome.log.clone()
+            };
+            let value = if log_excerpt.is_empty() {
+                outcome.summary.clone()
+            } else {
+                format!("{}\n\n{}", outcome.summary, log_excerpt)
+            };
+            EvidenceItem {
+                key: "ansible-check".to_string(),
+                value,
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }
+        }
+        Ok(outcome) => EvidenceItem {
+            // RunnerUnavailable or Failed — degrade gracefully.
+            key: "ansible-check-note".to_string(),
+            value: format!(
+                "ansible --check skipped: runner unavailable or failed (status: {}; {})",
+                outcome.status, outcome.summary
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+        Err(e) => EvidenceItem {
+            // Workspace, spawn, or timeout error — degrade gracefully.
+            key: "ansible-check-note".to_string(),
+            value: format!("ansible --check skipped: {e}"),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Synchronous inner implementations
+// ---------------------------------------------------------------------------
+
 /// Synchronous inner implementation of terraform plan enrichment.
 ///
 /// Extracted so that:
-/// - Tests (which may be sync) can call this directly.
-/// - The async wrapper can invoke it inside `spawn_blocking`.
+/// - Tests (which may be sync) can call this directly and exercise the shared
+///   `terraform_evidence_item` builder.
+/// - The async wrapper can offload `run_dry` via `spawn_blocking` and then
+///   call the same builder on the result.
 #[cfg_attr(not(test), allow(dead_code))]
 fn enrich_plan_stages_with_terraform_sync(
     request: &ryuki_engine::models::Request,
@@ -9100,8 +9234,7 @@ fn enrich_plan_stages_with_terraform_sync(
     use crate::runner::iac;
     use crate::runner::terraform::TerraformRunner;
     use crate::runner::Runner;
-    use ryuki_engine::models::{EvidenceItem, EvidenceType};
-    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus};
+    use ryuki_engine::runners::{RunMode, RunPlan};
 
     // Resolve the effective offering_id via the OS-discriminating resolver.
     // For server-deployment this maps to linux- or windows- by OS metadata;
@@ -9135,54 +9268,10 @@ fn enrich_plan_stages_with_terraform_sync(
         descriptor: "none".to_string(),
     };
 
-    let outcome = match runner.run_dry(&run_plan, &empty_creds) {
-        Ok(o) => o,
-        Err(e) => {
-            // Workspace, spawn, or timeout error — degrade gracefully.
-            append_terraform_note(stages, &format!("terraform plan skipped: {e}"));
-            return;
-        }
-    };
-
-    // Step 3/4: build evidence item from outcome.
-    let evidence_item = if outcome.status == RunStatus::Planned {
-        let value = if outcome.log.is_empty() {
-            outcome.summary.clone()
-        } else {
-            // Truncate to ~4 KiB for evidence, on a UTF-8 char boundary so a
-            // multi-byte sequence at the cut point cannot panic.
-            let log_excerpt = if outcome.log.len() > 4096 {
-                let truncated: String = outcome.log.chars().take(4096).collect();
-                format!("{truncated}...[truncated]")
-            } else {
-                outcome.log.clone()
-            };
-            format!("{}\n\n{}", outcome.summary, log_excerpt)
-        };
-        EvidenceItem {
-            key: "terraform-plan".to_string(),
-            value,
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Plan,
-        }
-    } else {
-        // RunnerUnavailable or Failed — degrade gracefully.
-        let note = format!(
-            "terraform plan skipped: runner unavailable or failed (status: {}; {})",
-            outcome.status, outcome.summary
-        );
-        EvidenceItem {
-            key: "terraform-plan-note".to_string(),
-            value: note,
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Plan,
-        }
-    };
-
-    // Append to the "plan" stage. The stage is always present (plan_request
+    // Step 3/4: delegate result→EvidenceItem mapping to the shared builder,
+    // then append to the "plan" stage. The stage is always present (plan_request
     // guarantees it), but we guard defensively.
+    let evidence_item = terraform_evidence_item(runner.run_dry(&run_plan, &empty_creds));
     if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
         plan_stage.evidence.push(evidence_item);
     }
@@ -9198,6 +9287,8 @@ fn enrich_plan_stages_with_terraform_sync(
 /// # Graceful degradation on JoinError
 /// If the blocking task panics (e.g. OOM inside the subprocess), the panic is
 /// caught here and a note item is appended instead of propagating the panic.
+/// The JoinError path builds the note inline (distinct message); all other
+/// result variants go through `terraform_evidence_item`.
 async fn enrich_plan_stages_with_terraform(
     request: &ryuki_engine::models::Request,
     stages: &mut [ryuki_engine::models::Stage],
@@ -9207,7 +9298,7 @@ async fn enrich_plan_stages_with_terraform(
     use crate::runner::terraform::TerraformRunner;
     use crate::runner::Runner;
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
-    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus};
+    use ryuki_engine::runners::{RunMode, RunPlan};
 
     // Resolve offering_id before entering spawn_blocking (cheap, borrows request).
     let offering_id = iac::resolve_offering_id(request);
@@ -9243,55 +9334,17 @@ async fn enrich_plan_stages_with_terraform(
         tokio::task::spawn_blocking(move || runner.run_dry(&run_plan, &empty_creds)).await;
 
     // Unpack the JoinResult<Result<RunOutcome, RunnerError>>.
-    let outcome = match run_result {
-        Err(_join_err) => {
-            // The spawn_blocking task panicked — degrade gracefully, never propagate.
-            append_terraform_note(
-                stages,
-                "terraform plan skipped: internal error (spawn_blocking panic)",
-            );
-            return;
-        }
-        Ok(Err(e)) => {
-            // RunnerError (workspace, spawn, or timeout) — degrade gracefully.
-            append_terraform_note(stages, &format!("terraform plan skipped: {e}"));
-            return;
-        }
-        Ok(Ok(o)) => o,
-    };
-
-    // Build evidence item from outcome.
-    let evidence_item = if outcome.status == RunStatus::Planned {
-        let value = if outcome.log.is_empty() {
-            outcome.summary.clone()
-        } else {
-            let log_excerpt = if outcome.log.len() > 4096 {
-                let truncated: String = outcome.log.chars().take(4096).collect();
-                format!("{truncated}...[truncated]")
-            } else {
-                outcome.log.clone()
-            };
-            format!("{}\n\n{}", outcome.summary, log_excerpt)
-        };
-        EvidenceItem {
-            key: "terraform-plan".to_string(),
-            value,
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Plan,
-        }
-    } else {
-        let note = format!(
-            "terraform plan skipped: runner unavailable or failed (status: {}; {})",
-            outcome.status, outcome.summary
-        );
-        EvidenceItem {
+    // JoinError (spawn_blocking panic) gets an inline note with a distinct
+    // message. All other variants go through the shared builder.
+    let evidence_item = match run_result {
+        Err(_join_err) => EvidenceItem {
             key: "terraform-plan-note".to_string(),
-            value: note,
+            value: "terraform plan skipped: internal error (spawn_blocking panic)".to_string(),
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
-        }
+        },
+        Ok(result) => terraform_evidence_item(result),
     };
 
     if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
@@ -9299,26 +9352,13 @@ async fn enrich_plan_stages_with_terraform(
     }
 }
 
-/// Append a note EvidenceItem to the "plan" stage (graceful degradation path).
-fn append_terraform_note(stages: &mut [ryuki_engine::models::Stage], note: &str) {
-    use ryuki_engine::models::{EvidenceItem, EvidenceType};
-    let item = EvidenceItem {
-        key: "terraform-plan-note".to_string(),
-        value: note.to_string(),
-        redacted_value: None,
-        redacted: false,
-        evidence_type: EvidenceType::Plan,
-    };
-    if let Some(plan_stage) = stages.iter_mut().find(|s| s.name == "plan") {
-        plan_stage.evidence.push(item);
-    }
-}
-
 /// Synchronous inner implementation of ansible verify enrichment.
 ///
 /// Extracted so that:
-/// - Tests (which may be sync) can call this directly.
-/// - The async wrapper can invoke it inside `spawn_blocking`.
+/// - Tests (which may be sync) can call this directly and exercise the shared
+///   `ansible_evidence_item` builder.
+/// - The async wrapper can offload `run_dry` via `spawn_blocking` and then
+///   call the same builder on the result.
 #[cfg_attr(not(test), allow(dead_code))]
 fn enrich_verify_stages_with_ansible_sync(
     request: &ryuki_engine::models::Request,
@@ -9328,8 +9368,7 @@ fn enrich_verify_stages_with_ansible_sync(
     use crate::runner::ansible::AnsibleRunner;
     use crate::runner::iac;
     use crate::runner::Runner;
-    use ryuki_engine::models::{EvidenceItem, EvidenceType};
-    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunnerKind};
 
     // Resolve the effective offering_id via the OS-discriminating resolver.
     let offering_id = iac::resolve_offering_id(request);
@@ -9358,46 +9397,9 @@ fn enrich_verify_stages_with_ansible_sync(
         descriptor: "none".to_string(),
     };
 
-    let evidence_item = match runner.run_dry(&run_plan, &empty_creds) {
-        Ok(outcome) if outcome.status == RunStatus::CheckOk => {
-            let log_excerpt = if outcome.log.len() > 4096 {
-                let truncated: String = outcome.log.chars().take(4096).collect();
-                format!("{truncated}...[truncated]")
-            } else {
-                outcome.log.clone()
-            };
-            let value = if log_excerpt.is_empty() {
-                outcome.summary.clone()
-            } else {
-                format!("{}\n\n{}", outcome.summary, log_excerpt)
-            };
-            EvidenceItem {
-                key: "ansible-check".to_string(),
-                value,
-                redacted_value: None,
-                redacted: false,
-                evidence_type: EvidenceType::Summary,
-            }
-        }
-        Ok(outcome) => EvidenceItem {
-            key: "ansible-check-note".to_string(),
-            value: format!(
-                "ansible --check skipped: runner unavailable or failed (status: {}; {})",
-                outcome.status, outcome.summary
-            ),
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Summary,
-        },
-        Err(e) => EvidenceItem {
-            key: "ansible-check-note".to_string(),
-            value: format!("ansible --check skipped: {e}"),
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Summary,
-        },
-    };
-
+    // Step 3/4: delegate result→EvidenceItem mapping to the shared builder,
+    // then append to the "verify" stage.
+    let evidence_item = ansible_evidence_item(runner.run_dry(&run_plan, &empty_creds));
     if let Some(verify_stage) = stages.iter_mut().find(|s| s.name == "verify") {
         verify_stage.evidence.push(evidence_item);
     }
@@ -9409,7 +9411,8 @@ fn enrich_verify_stages_with_ansible_sync(
 ///
 /// # Graceful degradation on JoinError
 /// If the blocking task panics, the panic is caught and a note item is appended
-/// instead of propagating the panic.
+/// instead of propagating the panic. The JoinError path builds the note inline
+/// (distinct message); all other result variants go through `ansible_evidence_item`.
 async fn enrich_verify_stages_with_ansible(
     request: &ryuki_engine::models::Request,
     stages: &mut [ryuki_engine::models::Stage],
@@ -9419,7 +9422,7 @@ async fn enrich_verify_stages_with_ansible(
     use crate::runner::iac;
     use crate::runner::Runner;
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
-    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunnerKind};
 
     let offering_id = iac::resolve_offering_id(request);
     let offering_id_str = offering_id.clone();
@@ -9448,6 +9451,8 @@ async fn enrich_verify_stages_with_ansible(
     let run_result =
         tokio::task::spawn_blocking(move || runner.run_dry(&run_plan, &empty_creds)).await;
 
+    // JoinError (spawn_blocking panic) gets an inline note with a distinct
+    // message. All other variants go through the shared builder.
     let evidence_item = match run_result {
         Err(_join_err) => EvidenceItem {
             key: "ansible-check-note".to_string(),
@@ -9456,43 +9461,7 @@ async fn enrich_verify_stages_with_ansible(
             redacted: false,
             evidence_type: EvidenceType::Summary,
         },
-        Ok(Err(e)) => EvidenceItem {
-            key: "ansible-check-note".to_string(),
-            value: format!("ansible --check skipped: {e}"),
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Summary,
-        },
-        Ok(Ok(outcome)) if outcome.status == RunStatus::CheckOk => {
-            let log_excerpt = if outcome.log.len() > 4096 {
-                let truncated: String = outcome.log.chars().take(4096).collect();
-                format!("{truncated}...[truncated]")
-            } else {
-                outcome.log.clone()
-            };
-            let value = if log_excerpt.is_empty() {
-                outcome.summary.clone()
-            } else {
-                format!("{}\n\n{}", outcome.summary, log_excerpt)
-            };
-            EvidenceItem {
-                key: "ansible-check".to_string(),
-                value,
-                redacted_value: None,
-                redacted: false,
-                evidence_type: EvidenceType::Summary,
-            }
-        }
-        Ok(Ok(outcome)) => EvidenceItem {
-            key: "ansible-check-note".to_string(),
-            value: format!(
-                "ansible --check skipped: runner unavailable or failed (status: {}; {})",
-                outcome.status, outcome.summary
-            ),
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Summary,
-        },
+        Ok(result) => ansible_evidence_item(result),
     };
 
     if let Some(verify_stage) = stages.iter_mut().find(|s| s.name == "verify") {
@@ -18817,6 +18786,139 @@ mod maint_calendar_db_tests {
         assert!(
             verify_stages.iter().any(|s| s.name == "verify"),
             "serialized stages must contain the verify stage"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Async wrapper smoke tests (enrich_plan_stages_with_terraform /
+    // enrich_verify_stages_with_ansible) — exercises the PRODUCTION path end-to-end.
+    //
+    // Uses `runner.available()` to branch deterministically: passes in CI
+    // without the binaries AND locally with them.
+    // -------------------------------------------------------------------------
+
+    /// Async smoke test: `enrich_plan_stages_with_terraform` (the production async
+    /// path) produces a "terraform-plan" evidence item when the binary is present,
+    /// or a "terraform-plan-note" graceful-degradation item when it is absent.
+    ///
+    /// This exercises the async wrapper + `terraform_evidence_item` builder
+    /// end-to-end for patch-maintenance.
+    #[tokio::test]
+    async fn async_enrich_plan_stages_terraform_smoke_patch_maintenance() {
+        use crate::runner::terraform::TerraformRunner;
+        use crate::runner::Runner;
+        use ryuki_engine::models::EvidenceType;
+
+        let request = make_validated_patch_maintenance_request();
+        let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
+            .expect("plan_request must succeed for Validated request");
+
+        let terraform_available = TerraformRunner::new().available();
+
+        // Exercise the async PRODUCTION path.
+        enrich_plan_stages_with_terraform(&request, &mut stages).await;
+
+        let plan_stage = stages
+            .iter()
+            .find(|s| s.name == "plan")
+            .expect("plan stage must exist");
+
+        if terraform_available {
+            let ev = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan")
+                .expect("terraform-plan evidence must be present when terraform is available");
+            assert_eq!(ev.evidence_type, EvidenceType::Plan);
+            assert!(
+                ev.value.contains("Terraform")
+                    || ev.value.contains("Plan:")
+                    || ev.value.contains("to add"),
+                "terraform-plan evidence must contain real terraform output; got: {:?}",
+                ev.value
+            );
+        } else {
+            let note = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan-note")
+                .expect(
+                    "terraform-plan-note must be present when terraform is absent (graceful degradation)",
+                );
+            assert!(
+                note.value.contains("skipped") || note.value.contains("unavailable"),
+                "note must describe the skip; got: {:?}",
+                note.value
+            );
+        }
+
+        assert!(
+            !stages.is_empty(),
+            "stages must not be empty after async enrichment"
+        );
+    }
+
+    /// Async smoke test: `enrich_verify_stages_with_ansible` (the production async
+    /// path) produces an "ansible-check" evidence item when the binary is present,
+    /// or an "ansible-check-note" graceful-degradation item when it is absent.
+    ///
+    /// This exercises the async wrapper + `ansible_evidence_item` builder
+    /// end-to-end for patch-maintenance.
+    #[tokio::test]
+    async fn async_enrich_verify_stages_ansible_smoke_patch_maintenance() {
+        use crate::runner::ansible::AnsibleRunner;
+        use crate::runner::Runner;
+        use ryuki_engine::models::EvidenceType;
+
+        let request = make_verifying_patch_maintenance_request();
+        let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
+            .expect("verify_request must succeed for Verifying request");
+        let mut stages = vec![completed_request_stage("verify", evidence)];
+
+        let ansible_available = AnsibleRunner::new().available();
+
+        // Exercise the async PRODUCTION path.
+        enrich_verify_stages_with_ansible(&request, &mut stages).await;
+
+        let verify_stage = stages
+            .iter()
+            .find(|s| s.name == "verify")
+            .expect("verify stage must exist");
+
+        if ansible_available {
+            let ev = verify_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "ansible-check")
+                .expect(
+                    "ansible-check evidence must be present when ansible-playbook is available",
+                );
+            assert_eq!(ev.evidence_type, EvidenceType::Summary);
+            assert!(
+                ev.value.contains("ok=")
+                    || ev.value.contains("PLAY RECAP")
+                    || ev.value.contains("check"),
+                "ansible-check evidence must contain real ansible output; got: {:?}",
+                ev.value
+            );
+        } else {
+            let note = verify_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "ansible-check-note")
+                .expect(
+                    "ansible-check-note must be present when ansible-playbook is absent (graceful degradation)",
+                );
+            assert!(
+                note.value.contains("skipped") || note.value.contains("unavailable"),
+                "note must describe the skip; got: {:?}",
+                note.value
+            );
+        }
+
+        assert!(
+            !stages.is_empty(),
+            "stages must not be empty after async enrichment"
         );
     }
 
