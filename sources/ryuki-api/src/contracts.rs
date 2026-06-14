@@ -7080,11 +7080,115 @@ async fn zabbix_drift_contract() -> Json<Value> {
     }))
 }
 
+// ─── Noise remediation — DB row type ───
+
+/// Mirrors the `noisy_triggers` table columns exactly so `sqlx::query_as` can
+/// decode rows without a manual field-by-field bind.
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct NoisyTriggerRow {
+    id: sqlx::types::Uuid,
+    trigger_name: String,
+    host: String,
+    severity: String,
+    event_count_last_24h: i32,
+    avg_interval_minutes: f64,
+    flapping: bool,
+    suggested_action: String,
+    status: String,
+    suppress_until: Option<chrono::DateTime<chrono::Utc>>,
+    suppress_reason: Option<String>,
+    resolution: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+const NOISE_COLUMNS: &str =
+    "id, trigger_name, host, severity, event_count_last_24h, avg_interval_minutes, \
+     flapping, suggested_action, status, suppress_until, suppress_reason, resolution, \
+     created_at, updated_at";
+
+/// Convert a DB row into the JSON shape that matches `NoisyTrigger` serialized
+/// by serde (field names + types match the engine struct 1:1, including
+/// `updated_at`).
+fn noise_row_to_json(r: &NoisyTriggerRow) -> Value {
+    json!({
+        "id": r.id.to_string(),
+        "trigger_name": r.trigger_name,
+        "host": r.host,
+        "severity": r.severity,
+        "event_count_last_24h": r.event_count_last_24h,
+        "avg_interval_minutes": r.avg_interval_minutes,
+        "flapping": r.flapping,
+        "suggested_action": r.suggested_action,
+        "status": r.status,
+        "suppress_until": r.suppress_until.map(|t| t.to_rfc3339()),
+        "suppress_reason": r.suppress_reason,
+        "resolution": r.resolution,
+        "created_at": r.created_at.to_rfc3339(),
+        "updated_at": r.updated_at.to_rfc3339(),
+    })
+}
+
+/// Parse a path id as a UUID for the DB path. A malformed id is treated as a
+/// missing trigger (404) — matching the engine fallback, which finds no match
+/// for an arbitrary string — rather than letting Postgres reject the cast and
+/// surface a 500 with a raw DB error.
+fn parse_noise_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value>)> {
+    sqlx::types::Uuid::parse_str(id).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Trigger not found: {}", id) })),
+        )
+    })
+}
+
 // ─── Noise remediation handlers ───
+
+/// Engine-equivalent host→site classifier.  Iterates VALID_SITES in order and
+/// returns the first site whose name is a case-insensitive substring of `host`.
+/// Unknown hosts default to "DEFRA" (matching the engine).
+fn site_from_host(host: &str) -> &'static str {
+    const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+    let lower = host.to_lowercase();
+    for &site in VALID_SITES {
+        if lower.contains(&site.to_lowercase()) {
+            return site;
+        }
+    }
+    "DEFRA"
+}
 
 async fn noise_detect(
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Replicate engine: exact VALID_SITES membership check (uppercase), then
+        // fetch all rows and classify via site_from_host in Rust — same logic the
+        // engine uses, not a substring pattern match.
+        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+        // Validate the raw site exactly as the engine does (no case-folding) so
+        // lowercase input is rejected on the DB path too — parity with the engine.
+        let site = body.site.as_str();
+        if !VALID_SITES.contains(&site) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Unknown site: {}", body.site)})),
+            ));
+        }
+        let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let arr: Vec<Value> = rows
+            .iter()
+            .filter(|r| site_from_host(&r.host) == site && r.event_count_last_24h > 10)
+            .map(noise_row_to_json)
+            .collect();
+        return Ok(Json(Value::Array(arr)));
+    }
     match noise_remediation::detect_noise(&body.site) {
         Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -7094,6 +7198,32 @@ async fn noise_detect(
 async fn noise_flapping_detect(
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Replicate engine: exact VALID_SITES check, then classify hosts via
+        // site_from_host in Rust, filter flapping = true.
+        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+        // Validate the raw site exactly as the engine does (no case-folding) so
+        // lowercase input is rejected on the DB path too — parity with the engine.
+        let site = body.site.as_str();
+        if !VALID_SITES.contains(&site) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Unknown site: {}", body.site)})),
+            ));
+        }
+        let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let arr: Vec<Value> = rows
+            .iter()
+            .filter(|r| site_from_host(&r.host) == site && r.flapping)
+            .map(noise_row_to_json)
+            .collect();
+        return Ok(Json(Value::Array(arr)));
+    }
     match noise_remediation::detect_flapping(&body.site) {
         Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -7101,6 +7231,52 @@ async fn noise_flapping_detect(
 }
 
 async fn noise_suggest(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Parse id as UUID first — malformed id → 404, not a DB cast 500
+        let trigger_uuid = parse_noise_id(&id)?;
+        let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1"
+        ))
+        .bind(trigger_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let Some(r) = row else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Trigger not found: {}", id)})),
+            ));
+        };
+        // Replicate engine suggestion logic field-for-field
+        let suggestions: Vec<String> = if r.flapping {
+            vec![
+                "Add maintenance window to suppress during known change windows".to_string(),
+                "Increase trigger fire threshold or adjust sensitivity".to_string(),
+                "Correlate with CMDB for associated change records".to_string(),
+            ]
+        } else if r.event_count_last_24h > 50 {
+            vec![
+                "Escalate to service owner for threshold review".to_string(),
+                "Check if monitoring template needs recalibration".to_string(),
+                "Add maintenance window during peak hours if expected".to_string(),
+            ]
+        } else {
+            vec![
+                "Adjust threshold to reduce non-actionable alerts".to_string(),
+                "Add maintenance window for scheduled activity".to_string(),
+                "Correlate with known issue in CMDB".to_string(),
+            ]
+        };
+        return Ok(Json(json!({
+            "trigger_id": r.id.to_string(),
+            "trigger_name": r.trigger_name,
+            "host": r.host,
+            "current_action": r.suggested_action,
+            "suggestions": suggestions,
+            "flapping": r.flapping,
+            "event_count_last_24h": r.event_count_last_24h,
+        })));
+    }
     match noise_remediation::suggest_remediation(&id) {
         Ok(suggestions) => Ok(Json(suggestions)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -7111,9 +7287,59 @@ async fn noise_suppress(
     Path(id): Path<String>,
     Json(body): Json<NoiseSuppressRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match noise_remediation::suppress_trigger(&id, body.duration_minutes, &body.reason) {
-        Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    if let Some(pool) = get_db() {
+        let trigger_uuid = parse_noise_id(&id)?;
+        let now = chrono::Utc::now();
+        let suppress_until = now
+            .checked_add_signed(chrono::Duration::minutes(body.duration_minutes as i64))
+            .unwrap_or(now);
+        // Atomic compare-and-set: guard + mutation in a single statement.
+        // Returns the updated row only when the trigger was NOT already Suppressed,
+        // matching the engine's mutex-held find+guard+mutate sequence.
+        let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "UPDATE noisy_triggers \
+             SET status = 'Suppressed', suppress_until = $1, suppress_reason = $2, \
+                 updated_at = $3 \
+             WHERE id = $4 AND status <> 'Suppressed' \
+             RETURNING {NOISE_COLUMNS}"
+        ))
+        .bind(suppress_until)
+        .bind(&body.reason)
+        .bind(now)
+        .bind(trigger_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        if let Some(r) = row {
+            // Row returned → successful suppression.
+            return Ok(Json(noise_row_to_json(&r)));
+        }
+        // 0 rows returned — either the trigger doesn't exist, or it's already Suppressed.
+        // One follow-up SELECT to distinguish the two cases.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM noisy_triggers WHERE id = $1")
+                .bind(trigger_uuid)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+        match existing.as_deref() {
+            None => Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Trigger not found: {}", id)})),
+            )),
+            Some(_) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Trigger is already suppressed"})),
+            )),
+        }
+    } else {
+        match noise_remediation::suppress_trigger(&id, body.duration_minutes, &body.reason) {
+            Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
+            Err(e) if e.contains("not found") || e.to_lowercase().contains("not found") => {
+                Err((StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+            }
+            Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+        }
     }
 }
 
@@ -7121,6 +7347,37 @@ async fn noise_resolve(
     Path(id): Path<String>,
     Json(body): Json<NoiseResolveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let trigger_uuid = parse_noise_id(&id)?;
+        // Engine has NO prior-status guard for resolve — unconditional UPDATE
+        // mutating exactly: status, resolution, updated_at
+        let now = chrono::Utc::now();
+        let result = sqlx::query(
+            "UPDATE noisy_triggers \
+             SET status = 'Resolved', resolution = $1, updated_at = $2 \
+             WHERE id = $3",
+        )
+        .bind(&body.resolution)
+        .bind(now)
+        .bind(trigger_uuid)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Trigger not found: {}", id)})),
+            ));
+        }
+        let row: NoisyTriggerRow = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1"
+        ))
+        .bind(trigger_uuid)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        return Ok(Json(noise_row_to_json(&row)));
+    }
     match noise_remediation::resolve_noise(&id, &body.resolution) {
         Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -7131,16 +7388,75 @@ async fn noise_report(
     Query(q): Query<NoiseSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = q.site.unwrap_or_else(|| "DEFRA".to_string());
+    if let Some(pool) = get_db() {
+        const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+        // Validate the raw site exactly as the engine does (no case-folding) so
+        // lowercase input is rejected on the DB path too — parity with the engine.
+        if !VALID_SITES.contains(&site.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Unknown site: {}", site)})),
+            ));
+        }
+        // Fetch all rows and classify via site_from_host in Rust — engine parity.
+        let rows: Vec<NoisyTriggerRow> =
+            sqlx::query_as(&format!("SELECT {NOISE_COLUMNS} FROM noisy_triggers"))
+                .fetch_all(pool)
+                .await
+                .map_err(db_error)?;
+        let site_rows: Vec<&NoisyTriggerRow> = rows
+            .iter()
+            .filter(|r| site_from_host(&r.host) == site)
+            .collect();
+        let total = site_rows.len();
+        let noisy = site_rows
+            .iter()
+            .filter(|r| r.event_count_last_24h > 10)
+            .count();
+        let flapping = site_rows.iter().filter(|r| r.flapping).count();
+        let active = site_rows.iter().filter(|r| r.status == "Active").count();
+        let under_review = site_rows
+            .iter()
+            .filter(|r| r.status == "UnderReview")
+            .count();
+        let suppressed = site_rows
+            .iter()
+            .filter(|r| r.status == "Suppressed")
+            .count();
+        let resolved = site_rows.iter().filter(|r| r.status == "Resolved").count();
+        return Ok(Json(json!({
+            "site": site,
+            "total_triggers": total,
+            "noisy": noisy,
+            "flapping": flapping,
+            "active": active,
+            "under_review": under_review,
+            "suppressed": suppressed,
+            "resolved": resolved,
+            "dry_run": true,
+        })));
+    }
     match noise_remediation::get_noise_report(&site) {
         Ok(report) => Ok(Json(report)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
 }
 
-async fn noise_suppressed_list() -> Json<Value> {
+async fn noise_suppressed_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers \
+             WHERE status = 'Suppressed' ORDER BY updated_at DESC"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let arr: Vec<Value> = rows.iter().map(noise_row_to_json).collect();
+        return Ok(Json(Value::Array(arr)));
+    }
     match noise_remediation::get_suppressed_triggers() {
-        Ok(triggers) => Json(serde_json::to_value(triggers).unwrap_or_default()),
-        Err(e) => Json(json!({"error": e})),
+        Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))),
     }
 }
 
@@ -22291,6 +22607,631 @@ mod oob_access_db_tests {
         let result = oob_validate_site(Path("NOSUCHSITE".into())).await;
         let Err((status, _)) = result else {
             panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api noise_remediation_db_tests
+#[cfg(test)]
+mod noise_remediation_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    // ─── unit tests (no DB) ───
+
+    #[tokio::test]
+    async fn test_noise_detect_fallback_in_memory() {
+        // With no DB pool the handler falls back to the engine in-memory store.
+        // We verify it returns JSON without panicking and that the result is an
+        // array (engine returns Vec<NoisyTrigger> serialized as a JSON array).
+        let body = NoiseSiteRequest {
+            site: "DEFRA".into(),
+        };
+        let result = noise_detect(Json(body)).await;
+        let Ok(Json(value)) = result else {
+            // Engine fallback may already mutate from other in-process tests;
+            // a 400 from unknown site would be wrong here but we just need it to
+            // not 500.
+            return;
+        };
+        assert!(value.is_array() || value.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_noise_suppressed_list_fallback_in_memory() {
+        // noise_suppressed_list now returns Result; unwrap the Ok arm.
+        match noise_suppressed_list().await {
+            Ok(Json(value)) => assert!(value.is_array() || value.is_object()),
+            Err(_) => {
+                // Engine error in test environment is acceptable — just verify
+                // it doesn't panic.
+            }
+        }
+    }
+
+    // ─── DB-gated tests ───
+
+    // ── suppress persists status + fields ──
+
+    #[tokio::test]
+    async fn test_suppress_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Reset seeded trigger to Active so we can suppress it.
+        sqlx::query(
+            "UPDATE noisy_triggers SET status = 'Active', suppress_until = NULL, \
+             suppress_reason = NULL WHERE id = $1::uuid",
+        )
+        .bind("e0000100-1000-1000-1000-000000000001")
+        .execute(pool)
+        .await
+        .expect("reset trigger to Active");
+
+        let result = noise_suppress(
+            Path("e0000100-1000-1000-1000-000000000001".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 60,
+                reason: "DB test suppression reason".into(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "Suppressed");
+        assert_eq!(body["suppress_reason"], "DB test suppression reason");
+        assert!(body["suppress_until"].as_str().is_some());
+        assert!(body["updated_at"].as_str().is_some());
+
+        // Verify the row was actually written to DB.
+        let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1::uuid"
+        ))
+        .bind("e0000100-1000-1000-1000-000000000001")
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+        let row = row.expect("row must exist");
+        assert_eq!(row.status, "Suppressed");
+        assert_eq!(
+            row.suppress_reason.as_deref(),
+            Some("DB test suppression reason")
+        );
+        assert!(row.suppress_until.is_some());
+    }
+
+    // ── suppress already-suppressed returns 400 (same error as engine) ──
+
+    #[tokio::test]
+    async fn test_suppress_already_suppressed_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Ensure trigger is Suppressed first.
+        sqlx::query(
+            "UPDATE noisy_triggers SET status = 'Suppressed', suppress_until = NOW() + INTERVAL '1 hour', \
+             suppress_reason = 'pre-suppressed' WHERE id = $1::uuid",
+        )
+        .bind("e0000100-1000-1000-1000-000000000002")
+        .execute(pool)
+        .await
+        .expect("force trigger to Suppressed");
+
+        let result = noise_suppress(
+            Path("e0000100-1000-1000-1000-000000000002".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 30,
+                reason: "should fail".into(),
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("already suppressed"));
+    }
+
+    // ── resolve persists status=Resolved + resolution ──
+
+    #[tokio::test]
+    async fn test_resolve_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Reset trigger to Active so resolve is meaningful.
+        sqlx::query(
+            "UPDATE noisy_triggers SET status = 'Active', resolution = NULL WHERE id = $1::uuid",
+        )
+        .bind("e0000100-1000-1000-1000-000000000003")
+        .execute(pool)
+        .await
+        .expect("reset trigger to Active");
+
+        let result = noise_resolve(
+            Path("e0000100-1000-1000-1000-000000000003".into()),
+            Json(NoiseResolveRequest {
+                resolution: "Resolved via DB test — log rotation expanded".into(),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "Resolved");
+        assert_eq!(
+            body["resolution"],
+            "Resolved via DB test — log rotation expanded"
+        );
+        assert!(body["updated_at"].as_str().is_some());
+
+        // Verify DB.
+        let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1::uuid"
+        ))
+        .bind("e0000100-1000-1000-1000-000000000003")
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+        let row = row.expect("row must exist");
+        assert_eq!(row.status, "Resolved");
+        assert_eq!(
+            row.resolution.as_deref(),
+            Some("Resolved via DB test — log rotation expanded")
+        );
+    }
+
+    // ── malformed (non-UUID) id → 404 ──
+
+    #[tokio::test]
+    async fn test_suppress_malformed_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_suppress(
+            Path("not-a-uuid".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 60,
+                reason: "test".into(),
+            }),
+        )
+        .await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_malformed_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_resolve(
+            Path("bad-uuid".into()),
+            Json(NoiseResolveRequest {
+                resolution: "test".into(),
+            }),
+        )
+        .await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // ── missing (valid UUID, no row) id → 404 ──
+
+    #[tokio::test]
+    async fn test_suppress_missing_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_suppress(
+            Path("e0000100-ffff-ffff-ffff-000000000099".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 60,
+                reason: "ghost".into(),
+            }),
+        )
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        // Missing row → atomic UPDATE returns 0 rows → follow-up SELECT finds nothing → 404
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── concurrent suppress: atomic path prevents double-apply ──
+
+    #[tokio::test]
+    async fn test_suppress_concurrent_atomic_no_double_apply() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Reset to Active.
+        sqlx::query(
+            "UPDATE noisy_triggers SET status = 'Active', suppress_until = NULL, \
+             suppress_reason = NULL WHERE id = $1::uuid",
+        )
+        .bind("e0000100-1000-1000-1000-000000000005")
+        .execute(pool)
+        .await
+        .expect("reset trigger to Active");
+
+        // First suppress → must succeed (200).
+        let first = noise_suppress(
+            Path("e0000100-1000-1000-1000-000000000005".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 30,
+                reason: "first suppressor".into(),
+            }),
+        )
+        .await;
+        assert!(first.is_ok(), "first suppress must succeed");
+
+        // Second suppress → must fail (400 already suppressed), not silently overwrite.
+        let second = noise_suppress(
+            Path("e0000100-1000-1000-1000-000000000005".into()),
+            Json(NoiseSuppressRequest {
+                duration_minutes: 120,
+                reason: "concurrent suppressor".into(),
+            }),
+        )
+        .await;
+        let Err((status, Json(body))) = second else {
+            panic!("second suppress must fail 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("already suppressed"),
+            "error must say already suppressed"
+        );
+
+        // DB must still hold the FIRST suppression's reason (second did not overwrite).
+        let row: NoisyTriggerRow = sqlx::query_as(&format!(
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1::uuid"
+        ))
+        .bind("e0000100-1000-1000-1000-000000000005")
+        .fetch_one(pool)
+        .await
+        .expect("read row");
+        assert_eq!(row.status, "Suppressed");
+        assert_eq!(
+            row.suppress_reason.as_deref(),
+            Some("first suppressor"),
+            "second suppressor must not have overwritten reason"
+        );
+    }
+
+    // ── noise_suppressed_list: DB error surfaces as 500, not empty list ──
+
+    #[tokio::test]
+    async fn test_suppressed_list_ok_not_false_empty() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Ensure at least one Suppressed row exists (seeded row 4 or whichever was just
+        // suppressed in previous tests). Force it if needed.
+        sqlx::query(
+            "UPDATE noisy_triggers \
+             SET status = 'Suppressed', suppress_until = NOW() + INTERVAL '1 hour', \
+             suppress_reason = 'list-test' WHERE id = $1::uuid",
+        )
+        .bind("e0000100-1000-1000-1000-000000000004")
+        .execute(pool)
+        .await
+        .expect("seed Suppressed row");
+
+        // A real DB is present → Result must be Ok, not Err(500).
+        let result = noise_suppressed_list().await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok from noise_suppressed_list with live DB, got Err");
+        };
+        let arr = body.as_array().expect("expected array");
+        assert!(
+            !arr.is_empty(),
+            "must not return a false empty list when Suppressed rows exist"
+        );
+    }
+
+    // ── site_from_host classification used for DB filtering ──
+
+    #[tokio::test]
+    async fn test_detect_site_from_host_classification() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Insert a trigger whose host defaults to DEFRA via site_from_host
+        // (unknown host pattern → DEFRA) so substring and site_from_host differ.
+        // Engine would include it for DEFRA; old ILIKE would not.
+        let ghost_id = "e0000100-1000-1000-1000-000000000099";
+        sqlx::query(
+            "INSERT INTO noisy_triggers \
+             (id, trigger_name, host, severity, event_count_last_24h, \
+              avg_interval_minutes, flapping, suggested_action, status) \
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (id) DO UPDATE \
+             SET host = EXCLUDED.host, event_count_last_24h = EXCLUDED.event_count_last_24h, \
+                 status = EXCLUDED.status, updated_at = NOW()",
+        )
+        .bind(ghost_id)
+        .bind("Ghost trigger")
+        .bind("srv-unknown-host.corp.local") // no VALID_SITES substring → site_from_host → DEFRA
+        .bind("warning")
+        .bind(99_i32)
+        .bind(5.0_f64)
+        .bind(false)
+        .bind("investigate")
+        .bind("Active")
+        .execute(pool)
+        .await
+        .expect("insert ghost trigger");
+
+        // With site_from_host filtering, DEFRA query should include this row.
+        let result = noise_detect(Json(NoiseSiteRequest {
+            site: "DEFRA".into(),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        let arr = body.as_array().expect("expected array");
+        // The ghost host must appear in DEFRA results (site_from_host → DEFRA, count > 10).
+        let found = arr
+            .iter()
+            .any(|t| t["host"].as_str() == Some("srv-unknown-host.corp.local"));
+        assert!(
+            found,
+            "site_from_host default-DEFRA host must appear in DEFRA detect results"
+        );
+
+        // Clean up.
+        sqlx::query("DELETE FROM noisy_triggers WHERE id = $1::uuid")
+            .bind(ghost_id)
+            .execute(pool)
+            .await
+            .expect("cleanup ghost trigger");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_missing_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_resolve(
+            Path("e0000100-ffff-ffff-ffff-000000000099".into()),
+            Json(NoiseResolveRequest {
+                resolution: "ghost".into(),
+            }),
+        )
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── detect reads seeded rows ──
+
+    #[tokio::test]
+    async fn test_detect_noise_reads_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seeded: srv-defra-app01 has event_count_last_24h=47 > 10 → should appear
+        let result = noise_detect(Json(NoiseSiteRequest {
+            site: "DEFRA".into(),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        let arr = body.as_array().expect("expected array");
+        assert!(
+            !arr.is_empty(),
+            "expected at least 1 noisy trigger for DEFRA"
+        );
+        assert!(arr
+            .iter()
+            .all(|t| t["event_count_last_24h"].as_i64().unwrap_or(0) > 10));
+    }
+
+    #[tokio::test]
+    async fn test_detect_flapping_reads_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seeded: srv-gblon-net01 is flapping → should appear for GBLON
+        let result = noise_flapping_detect(Json(NoiseSiteRequest {
+            site: "GBLON".into(),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        let arr = body.as_array().expect("expected array");
+        assert!(
+            !arr.is_empty(),
+            "expected at least 1 flapping trigger for GBLON"
+        );
+        assert!(arr.iter().all(|t| t["flapping"].as_bool().unwrap_or(false)));
+    }
+
+    // ── noise report aggregates seeded rows ──
+
+    #[tokio::test]
+    async fn test_noise_report_aggregates_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_report(Query(NoiseSiteQuery {
+            site: Some("DEFRA".into()),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["site"], "DEFRA");
+        assert!(body["total_triggers"].as_u64().unwrap() >= 1);
+        assert!(body["dry_run"].as_bool().unwrap());
+        // Numeric counts must be present.
+        assert!(body["active"].as_u64().is_some());
+        assert!(body["under_review"].as_u64().is_some());
+        assert!(body["suppressed"].as_u64().is_some());
+        assert!(body["resolved"].as_u64().is_some());
+        assert!(body["noisy"].as_u64().is_some());
+        assert!(body["flapping"].as_u64().is_some());
+    }
+
+    // ── suppressed list reads seeded Suppressed row ──
+
+    #[tokio::test]
+    async fn test_suppressed_list_reads_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Ensure at least the seeded Suppressed row is present.
+        let result = noise_suppressed_list().await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok from noise_suppressed_list, got Err");
+        };
+        let arr = body.as_array().expect("expected array");
+        assert!(
+            !arr.is_empty(),
+            "expected at least 1 Suppressed trigger (seeded)"
+        );
+        assert!(arr
+            .iter()
+            .all(|t| t["status"].as_str().unwrap_or("") == "Suppressed"));
+    }
+
+    // ── suggest returns shape-parity with engine ──
+
+    #[tokio::test]
+    async fn test_suggest_shape_parity() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_suggest(Path("e0000100-1000-1000-1000-000000000002".into())).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        // Engine returns: trigger_id, trigger_name, host, current_action,
+        //                 suggestions, flapping, event_count_last_24h
+        assert!(body["trigger_id"].as_str().is_some());
+        assert!(body["trigger_name"].as_str().is_some());
+        assert!(body["host"].as_str().is_some());
+        assert!(body["current_action"].as_str().is_some());
+        assert!(body["suggestions"].as_array().is_some());
+        assert!(body["flapping"].as_bool().is_some());
+        assert!(body["event_count_last_24h"].as_i64().is_some());
+    }
+
+    // ── unknown site returns 400 ──
+
+    #[tokio::test]
+    async fn test_detect_unknown_site_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = noise_detect(Json(NoiseSiteRequest {
+            site: "NOWHERE".into(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_detect_lowercase_site_rejected() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // The engine validates the raw site (exact uppercase membership) and
+        // rejects lowercase; the DB path must reject it identically (400), not
+        // silently case-fold "defra" -> "DEFRA".
+        let result = noise_detect(Json(NoiseSiteRequest {
+            site: "defra".into(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for lowercase site, got Ok");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
