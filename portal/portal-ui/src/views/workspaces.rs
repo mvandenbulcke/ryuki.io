@@ -33,7 +33,7 @@ use crate::server_boundary::{
 };
 use crate::views::approvals::ApprovalsList;
 use crate::views::dashboard::DashboardView;
-use crate::views::integrations::IntegrationsPlaceholder;
+use crate::views::integrations::IntegrationsList;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
 use crate::views::request_detail::{audit_action_label, stage_label};
@@ -356,7 +356,7 @@ pub fn IntegrationsWorkspaceView() -> impl IntoView {
                         }
                     }
                 >
-                    <IntegrationsPlaceholder/>
+                    <IntegrationsList/>
                 </Show>
             </section>
         </div>
