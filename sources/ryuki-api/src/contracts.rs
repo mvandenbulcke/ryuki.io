@@ -5031,9 +5031,114 @@ struct MaintenanceCalendarMonthQuery {
     month: String,
 }
 
+/// One persisted `maintenance_windows` row (migration 017). Timestamps are
+/// stored as `TIMESTAMPTZ` and serialized as RFC3339 strings to match the
+/// engine MaintenanceWindow JSON shape.  The table has no `metadata` column;
+/// `to_value` / `to_value_with_source` emit an empty metadata object for
+/// shape-parity with the engine response.  Follows the FirewallRuleRow
+/// precedent (~line 12830).
+#[derive(sqlx::FromRow)]
+struct MaintWindowRow {
+    id: Uuid,
+    site: String,
+    start_time: chrono::DateTime<chrono::Utc>,
+    end_time: chrono::DateTime<chrono::Utc>,
+    reason: String,
+    affected_cis: Vec<String>,
+    status: String,
+    created_by: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl MaintWindowRow {
+    fn to_value(&self) -> Value {
+        self.to_value_with_source("database")
+    }
+
+    fn to_value_with_source(&self, source: &str) -> Value {
+        json!({
+            "id": self.id.to_string(),
+            "site": self.site,
+            "start_time": self.start_time.to_rfc3339(),
+            "end_time": self.end_time.to_rfc3339(),
+            "reason": self.reason,
+            "affected_cis": self.affected_cis,
+            "status": self.status,
+            "created_by": self.created_by,
+            "created_at": self.created_at.to_rfc3339(),
+            "metadata": {},
+            "source": source,
+        })
+    }
+}
+
+const MW_COLUMNS: &str =
+    "id, site, start_time, end_time, reason, affected_cis, status, created_by, created_at";
+
 async fn maintenance_calendar_schedule(
     Json(body): Json<MaintenanceCalendarScheduleRequest>,
 ) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // 1. Pure validation — no store read, no push.
+        let window = maintenance_calendar::validate_window_inputs(
+            &body.site,
+            &body.start_time,
+            &body.end_time,
+            &body.reason,
+            body.affected_cis.clone(),
+        )
+        .map_err(|e| status_400(&e))?;
+
+        // 2. DB conflict pre-check: tstzrange '[)' half-open overlap, same site,
+        //    status NOT IN ('Cancelled','Completed'). Mirrors check_conflicts_internal exactly.
+        let conflicts: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = $1 AND status NOT IN ('Cancelled','Completed') \
+               AND tstzrange(start_time, end_time, '[)') \
+                   && tstzrange($2::timestamptz, $3::timestamptz, '[)')"
+        ))
+        .bind(&window.site)
+        .bind(&window.start_time)
+        .bind(&window.end_time)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        // 3. Same message shape as the engine.
+        if !conflicts.is_empty() {
+            let detail = conflicts
+                .iter()
+                .map(|w| format!("{} ({})", w.id, w.reason))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(status_400(&format!(
+                "Conflict detected with {} existing window(s): {}",
+                conflicts.len(),
+                detail
+            )));
+        }
+
+        // 4. INSERT — omit id so gen_random_uuid() fills it, RETURNING full cols.
+        let row: MaintWindowRow = sqlx::query_as(&format!(
+            "INSERT INTO maintenance_windows \
+             (site, start_time, end_time, reason, affected_cis, status, created_by) \
+             VALUES ($1, $2::timestamptz, $3::timestamptz, $4, $5, 'Planned', $6) \
+             RETURNING {MW_COLUMNS}"
+        ))
+        .bind(&window.site)
+        .bind(&window.start_time)
+        .bind(&window.end_time)
+        .bind(&window.reason)
+        .bind(&window.affected_cis)
+        .bind(&window.created_by)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+
+        return Ok(Json(row.to_value_with_source("database")));
+    }
+
+    // No-DB: engine path unchanged.
     match maintenance_calendar::schedule_window(
         &body.site,
         &body.start_time,
@@ -5049,6 +5154,24 @@ async fn maintenance_calendar_schedule(
 async fn maintenance_calendar_conflicts(
     Query(q): Query<MaintenanceCalendarConflictsQuery>,
 ) -> Json<Value> {
+    if let Some(pool) = get_db() {
+        // Mirrors check_conflicts_internal: site filter + status NOT IN
+        // ('Cancelled','Completed') + tstzrange '[)' overlap.
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = $1 AND status NOT IN ('Cancelled','Completed') \
+               AND tstzrange(start_time, end_time, '[)') \
+                   && tstzrange($2::timestamptz, $3::timestamptz, '[)')"
+        ))
+        .bind(&q.site)
+        .bind(&q.start)
+        .bind(&q.end)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
+        return Json(json!({ "source": "database", "windows": windows }));
+    }
     let conflicts = maintenance_calendar::check_conflicts(&q.site, &q.start, &q.end);
     Json(serde_json::to_value(conflicts).unwrap())
 }
@@ -5056,16 +5179,91 @@ async fn maintenance_calendar_conflicts(
 async fn maintenance_calendar_upcoming(
     Query(q): Query<MaintenanceCalendarSiteQuery>,
 ) -> Json<Value> {
+    if let Some(pool) = get_db() {
+        // Mirrors get_upcoming: excludes Cancelled only (NOT Completed), 30-day window.
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = $1 AND status <> 'Cancelled' \
+               AND start_time >= now() AND start_time <= now() + interval '30 days'"
+        ))
+        .bind(&q.site)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
+        return Json(json!({ "source": "database", "windows": windows }));
+    }
     let windows = maintenance_calendar::get_upcoming(&q.site);
     Json(serde_json::to_value(windows).unwrap())
 }
 
 async fn maintenance_calendar_active(Query(q): Query<MaintenanceCalendarSiteQuery>) -> Json<Value> {
+    if let Some(pool) = get_db() {
+        // Mirrors get_active: NO status filter (engine get_active does not filter status).
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = $1 AND now() >= start_time AND now() <= end_time"
+        ))
+        .bind(&q.site)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
+        return Json(json!({ "source": "database", "windows": windows }));
+    }
     let windows = maintenance_calendar::get_active(&q.site);
     Json(serde_json::to_value(windows).unwrap())
 }
 
 async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuery>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // Validate and parse the "YYYY-MM" month string; mirrors the engine's error message.
+        let month_start_rfc = format!("{}-01T00:00:00Z", q.month);
+        let month_start: chrono::DateTime<chrono::Utc> =
+            chrono::DateTime::parse_from_rfc3339(&month_start_rfc)
+                .map_err(|e| {
+                    status_400(&format!("Invalid month format (expected YYYY-MM): {}", e))
+                })?
+                .with_timezone(&chrono::Utc);
+
+        // Compute the first day of the next month by parsing the YYYY-MM string directly.
+        // Mirrors the engine's get_calendar logic, avoiding a Datelike trait import.
+        let parts: Vec<&str> = q.month.splitn(2, '-').collect();
+        let (year_str, month_str) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            return Err(status_400("Invalid month format (expected YYYY-MM)"));
+        };
+        let year: i32 = year_str
+            .parse()
+            .map_err(|_| status_400("Invalid month format (expected YYYY-MM)"))?;
+        let month: u32 = month_str
+            .parse()
+            .map_err(|_| status_400("Invalid month format (expected YYYY-MM)"))?;
+        let next_month_rfc = if month == 12 {
+            format!("{}-01-01T00:00:00Z", year + 1)
+        } else {
+            format!("{}-{:02}-01T00:00:00Z", year, month + 1)
+        };
+        let next_month: chrono::DateTime<chrono::Utc> =
+            chrono::DateTime::parse_from_rfc3339(&next_month_rfc)
+                .map_err(|e| status_400(&format!("Date calculation error: {}", e)))?
+                .with_timezone(&chrono::Utc);
+
+        // Mirrors get_calendar: site + start_time in [month_start, next_month); no status filter.
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = $1 AND start_time >= $2 AND start_time < $3"
+        ))
+        .bind(&q.site)
+        .bind(month_start)
+        .bind(next_month)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
+        return Ok(Json(json!({ "source": "database", "windows": windows })));
+    }
     match maintenance_calendar::get_calendar(&q.site, &q.month) {
         Ok(windows) => Ok(Json(serde_json::to_value(windows).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -5073,6 +5271,46 @@ async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuer
 }
 
 async fn maintenance_calendar_cancel(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        // Try-parse the path param as a UUID; fall through to the engine on parse failure.
+        if let Ok(uid) = Uuid::parse_str(&id) {
+            // Pre-SELECT to distinguish not-found vs. already-cancelled vs. completed,
+            // mirroring the engine's error strings exactly.
+            let existing: Option<MaintWindowRow> = sqlx::query_as(&format!(
+                "SELECT {MW_COLUMNS} FROM maintenance_windows WHERE id = $1"
+            ))
+            .bind(uid)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+
+            match existing {
+                None => {
+                    return Err(status_400(&format!("Maintenance window not found: {}", id)));
+                }
+                Some(ref row) if row.status == "Completed" => {
+                    return Err(status_400("Cannot cancel a completed maintenance window"));
+                }
+                Some(ref row) if row.status == "Cancelled" => {
+                    return Err(status_400("Maintenance window is already cancelled"));
+                }
+                _ => {}
+            }
+
+            let updated: MaintWindowRow = sqlx::query_as(&format!(
+                "UPDATE maintenance_windows SET status = 'Cancelled' WHERE id = $1 \
+                 RETURNING {MW_COLUMNS}"
+            ))
+            .bind(uid)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
+
+            return Ok(Json(updated.to_value_with_source("database")));
+        }
+    }
+
+    // No-DB or non-UUID id: engine path unchanged.
     match maintenance_calendar::cancel_window(&id) {
         Ok(window) => Ok(Json(serde_json::to_value(window).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -16969,5 +17207,558 @@ mod db_lifecycle_tests {
         );
 
         cleanup_request(pool, id).await;
+    }
+}
+
+/// DB integration tests for the maintenance-calendar handlers.
+///
+/// These tests REQUIRE a live Postgres instance (RYUKI_DATABASE_URL set) and
+/// SKIP automatically when the variable is unset so CI without Postgres stays
+/// green.  They are filtered by name in `make test-db` so they run in a
+/// separate process from the in-memory unit_tests.
+///
+/// IMPORTANT — test-run split: do NOT run these tests together with the
+/// in-memory `contracts::unit_tests::requests_*` tests in the same process
+/// with RYUKI_DATABASE_URL set.  Any test that calls `global_pool()` sets the
+/// process-global `database::POOL` OnceLock.  Once set, every `get_db()` call
+/// returns Some, which causes the in-memory request handlers to enter their DB
+/// code paths and fail (they expect no-DB mode and reference synthetic
+/// `req-test-*` IDs that do not exist in the DB).  The Makefile `test-unit`
+/// and `test-db` targets enforce this split.
+#[cfg(test)]
+mod maint_calendar_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Returns a fresh isolated pool (does NOT touch the global POOL OnceLock).
+    /// Used for tests that seed rows and query directly without calling handlers.
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations run");
+        Some(pool)
+    }
+
+    /// Initialises the PROCESS-GLOBAL `database::POOL` so that handler calls
+    /// routed through `get_db()` hit the real DB.  Used only for tests that
+    /// call the actual handlers (which read the global pool via `get_db()`).
+    /// Side-effect: sets the OnceLock for the lifetime of the process.  Run
+    /// these tests in a separate process from the in-memory unit_tests.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn cleanup_window(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM maintenance_windows WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn seed_window(
+        pool: &PgPool,
+        site: &str,
+        start_time: &str,
+        end_time: &str,
+        reason: &str,
+        status: &str,
+    ) -> Uuid {
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO maintenance_windows \
+             (site, start_time, end_time, reason, affected_cis, status, created_by) \
+             VALUES ($1, $2::timestamptz, $3::timestamptz, $4, '{}', $5, 'test-seed') \
+             RETURNING id",
+        )
+        .bind(site)
+        .bind(start_time)
+        .bind(end_time)
+        .bind(reason)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("seed window");
+        row.0
+    }
+
+    /// THE PROOF TEST: in-memory store is EMPTY; a conflicting window is seeded
+    /// directly into the DB only (no engine call); scheduling an overlapping
+    /// window via the handler must return 400.
+    ///
+    /// This test FAILS under the old in-memory-validation handler because the
+    /// in-memory store is empty → no conflict detected → false-accept.
+    /// With the DB overlay handler it passes: the tstzrange overlap query hits
+    /// the DB row and returns 400.
+    #[tokio::test]
+    async fn test_schedule_db_conflict_with_empty_in_memory_store() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Verify the in-memory store has no windows for this site+time combination.
+        let store_conflicts = ryuki_engine::maintenance_calendar::check_conflicts(
+            "DEFRA",
+            "2030-01-10T00:00:00Z",
+            "2030-01-10T08:00:00Z",
+        );
+        assert!(
+            store_conflicts.is_empty(),
+            "in-memory store must not have conflicts for this test to prove the DB check fires"
+        );
+
+        // Seed a conflicting window directly into DB (no engine call → in-memory store untouched).
+        let seeded_id = seed_window(
+            pool,
+            "DEFRA",
+            "2030-01-10T00:00:00Z",
+            "2030-01-10T08:00:00Z",
+            "DB-seeded conflict for proof test",
+            "Planned",
+        )
+        .await;
+
+        // Call the handler with an overlapping window.
+        let body = MaintenanceCalendarScheduleRequest {
+            site: "DEFRA".into(),
+            start_time: "2030-01-10T02:00:00Z".into(),
+            end_time: "2030-01-10T06:00:00Z".into(),
+            reason: "Proof: DB conflict must be enforced".into(),
+            affected_cis: vec![],
+        };
+        let result = maintenance_calendar_schedule(Json(body)).await;
+
+        cleanup_window(pool, seeded_id).await;
+
+        let Err((status, Json(err_body))) = result else {
+            panic!("expected 400 conflict, got Ok — DB pre-check did not fire");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = err_body["error"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("Conflict detected"),
+            "expected 'Conflict detected' in error, got: {msg}"
+        );
+    }
+
+    /// DB-mode success: INSERT RETURNING returns a UUID id and source=database.
+    #[tokio::test]
+    async fn test_schedule_db_success_inserts_row() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let body = MaintenanceCalendarScheduleRequest {
+            site: "GBLON".into(),
+            start_time: "2030-02-01T00:00:00Z".into(),
+            end_time: "2030-02-01T04:00:00Z".into(),
+            reason: "DB success test".into(),
+            affected_cis: vec!["srv-test-01".into()],
+        };
+        let result = maintenance_calendar_schedule(Json(body)).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err");
+        };
+
+        let id_str = body["id"].as_str().expect("id must be a string");
+        let id = Uuid::parse_str(id_str).expect("id must be a UUID in DB mode");
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["status"], "Planned");
+
+        // Confirm the row actually exists in the DB.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM maintenance_windows WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("count row");
+        assert_eq!(count, 1, "row must exist in DB after successful schedule");
+
+        cleanup_window(pool, id).await;
+    }
+
+    /// A ghost overlapping window in the in-memory store must NOT false-reject a
+    /// schedule in DB mode (DB has no conflict for this time slot).
+    #[tokio::test]
+    async fn test_schedule_ignores_in_memory_ghost() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seed a ghost overlapping window via the engine (in-memory only, not in DB).
+        let _ghost = ryuki_engine::maintenance_calendar::schedule_window(
+            "NLAMS",
+            "2030-03-01T00:00:00Z",
+            "2030-03-01T08:00:00Z",
+            "Ghost window — in-memory only",
+            vec![],
+        );
+
+        // DB has no matching row; handler must succeed.
+        let body = MaintenanceCalendarScheduleRequest {
+            site: "NLAMS".into(),
+            start_time: "2030-03-01T02:00:00Z".into(),
+            end_time: "2030-03-01T06:00:00Z".into(),
+            reason: "Must not be rejected by ghost".into(),
+            affected_cis: vec![],
+        };
+        let result = maintenance_calendar_schedule(Json(body)).await;
+        let Ok(Json(body)) = result else {
+            panic!("ghost in-memory window must NOT false-reject DB-mode schedule; got Err");
+        };
+        let id = Uuid::parse_str(body["id"].as_str().unwrap()).expect("UUID id");
+        cleanup_window(pool, id).await;
+    }
+
+    /// get_active must return a Cancelled window (no status filter in the engine's
+    /// get_active — the DB query must match exactly).
+    #[tokio::test]
+    async fn test_active_ignores_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seed a Cancelled window that is currently in the active time range.
+        let now = chrono::Utc::now();
+        let start = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let end = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let id = seed_window(
+            &pool,
+            "FRPAR",
+            &start,
+            &end,
+            "Cancelled-but-active",
+            "Cancelled",
+        )
+        .await;
+
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = 'FRPAR' AND now() >= start_time AND now() <= end_time"
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("query active");
+
+        cleanup_window(&pool, id).await;
+
+        assert!(
+            rows.iter().any(|r| r.id == id),
+            "get_active must include Cancelled windows (no status filter)"
+        );
+    }
+
+    /// get_upcoming must exclude Cancelled but INCLUDE Completed (engine filters
+    /// Cancelled only, not Completed).
+    #[tokio::test]
+    async fn test_upcoming_excludes_cancelled_not_completed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let start = (chrono::Utc::now() + chrono::Duration::days(5)).to_rfc3339();
+        let end = (chrono::Utc::now() + chrono::Duration::days(5) + chrono::Duration::hours(4))
+            .to_rfc3339();
+
+        let completed_id = seed_window(
+            &pool,
+            "DEBER",
+            &start,
+            &end,
+            "Completed upcoming",
+            "Completed",
+        )
+        .await;
+        let cancelled_id = seed_window(
+            &pool,
+            "DEBER",
+            &start,
+            &end,
+            "Cancelled upcoming",
+            "Cancelled",
+        )
+        .await;
+
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = 'DEBER' AND status <> 'Cancelled' \
+               AND start_time >= now() AND start_time <= now() + interval '30 days'"
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("query upcoming");
+
+        cleanup_window(&pool, completed_id).await;
+        cleanup_window(&pool, cancelled_id).await;
+
+        assert!(
+            rows.iter().any(|r| r.id == completed_id),
+            "upcoming must INCLUDE Completed windows"
+        );
+        assert!(
+            !rows.iter().any(|r| r.id == cancelled_id),
+            "upcoming must EXCLUDE Cancelled windows"
+        );
+    }
+
+    /// check_conflicts must exclude both Cancelled and Completed.
+    #[tokio::test]
+    async fn test_conflicts_excludes_cancelled_completed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let cancelled_id = seed_window(
+            &pool,
+            "DEFRA",
+            "2030-04-01T00:00:00Z",
+            "2030-04-01T08:00:00Z",
+            "Cancelled conflict",
+            "Cancelled",
+        )
+        .await;
+        let completed_id = seed_window(
+            &pool,
+            "DEFRA",
+            "2030-04-01T00:00:00Z",
+            "2030-04-01T08:00:00Z",
+            "Completed conflict",
+            "Completed",
+        )
+        .await;
+        let planned_id = seed_window(
+            &pool,
+            "DEFRA",
+            "2030-04-01T00:00:00Z",
+            "2030-04-01T08:00:00Z",
+            "Planned conflict",
+            "Planned",
+        )
+        .await;
+
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = 'DEFRA' AND status NOT IN ('Cancelled','Completed') \
+               AND tstzrange(start_time, end_time, '[)') \
+                   && tstzrange('2030-04-01T02:00:00Z'::timestamptz, '2030-04-01T06:00:00Z'::timestamptz, '[)')"
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("query conflicts");
+
+        cleanup_window(&pool, cancelled_id).await;
+        cleanup_window(&pool, completed_id).await;
+        cleanup_window(&pool, planned_id).await;
+
+        assert!(
+            !rows.iter().any(|r| r.id == cancelled_id),
+            "conflicts must exclude Cancelled"
+        );
+        assert!(
+            !rows.iter().any(|r| r.id == completed_id),
+            "conflicts must exclude Completed"
+        );
+        assert!(
+            rows.iter().any(|r| r.id == planned_id),
+            "conflicts must include Planned"
+        );
+    }
+
+    /// get_calendar: site + start_time in [month_start, next_month); no status filter.
+    #[tokio::test]
+    async fn test_month_filters_by_site_and_range() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let in_month_id = seed_window(
+            &pool,
+            "GBLON",
+            "2030-05-10T00:00:00Z",
+            "2030-05-10T04:00:00Z",
+            "In month",
+            "Planned",
+        )
+        .await;
+        let out_of_month_id = seed_window(
+            &pool,
+            "GBLON",
+            "2030-06-01T00:00:00Z",
+            "2030-06-01T04:00:00Z",
+            "Out of month",
+            "Planned",
+        )
+        .await;
+        let wrong_site_id = seed_window(
+            &pool,
+            "FRPAR",
+            "2030-05-15T00:00:00Z",
+            "2030-05-15T04:00:00Z",
+            "Wrong site",
+            "Planned",
+        )
+        .await;
+
+        let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
+            "SELECT {MW_COLUMNS} FROM maintenance_windows \
+             WHERE site = 'GBLON' \
+               AND start_time >= '2030-05-01T00:00:00Z'::timestamptz \
+               AND start_time < '2030-06-01T00:00:00Z'::timestamptz"
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("query month");
+
+        cleanup_window(&pool, in_month_id).await;
+        cleanup_window(&pool, out_of_month_id).await;
+        cleanup_window(&pool, wrong_site_id).await;
+
+        assert!(
+            rows.iter().any(|r| r.id == in_month_id),
+            "must include in-month row"
+        );
+        assert!(
+            !rows.iter().any(|r| r.id == out_of_month_id),
+            "must exclude out-of-month row"
+        );
+        assert!(
+            !rows.iter().any(|r| r.id == wrong_site_id),
+            "must exclude wrong-site row"
+        );
+    }
+
+    /// cancel: random UUID that does not exist → 400 not-found.
+    #[tokio::test]
+    async fn test_cancel_db_not_found() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let random_id = Uuid::new_v4().to_string();
+        let result = maintenance_calendar_cancel(Path(random_id.clone())).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err for non-existent id");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap_or("").contains("not found"));
+    }
+
+    /// cancel: already-cancelled window → 400.
+    #[tokio::test]
+    async fn test_cancel_db_already_cancelled() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_window(
+            pool,
+            "DEFRA",
+            "2030-06-01T00:00:00Z",
+            "2030-06-01T04:00:00Z",
+            "Already cancelled",
+            "Cancelled",
+        )
+        .await;
+
+        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        cleanup_window(pool, id).await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err for already-cancelled window");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already cancelled"));
+    }
+
+    /// cancel: completed window → 400 "Cannot cancel a completed maintenance window".
+    #[tokio::test]
+    async fn test_cancel_db_cannot_cancel_completed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_window(
+            pool,
+            "DEFRA",
+            "2030-06-02T00:00:00Z",
+            "2030-06-02T04:00:00Z",
+            "Completed window",
+            "Completed",
+        )
+        .await;
+
+        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        cleanup_window(pool, id).await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err for completed window");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Cannot cancel a completed"),
+            "wrong error: {:?}",
+            body["error"]
+        );
+    }
+
+    /// cancel happy path: Planned window → status='Cancelled', source='database'.
+    #[tokio::test]
+    async fn test_cancel_db_happy_path() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = seed_window(
+            pool,
+            "GBLON",
+            "2030-07-01T00:00:00Z",
+            "2030-07-01T04:00:00Z",
+            "To be cancelled",
+            "Planned",
+        )
+        .await;
+
+        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        cleanup_window(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok for happy-path cancel");
+        };
+        assert_eq!(body["status"], "Cancelled");
+        assert_eq!(body["source"], "database");
     }
 }
