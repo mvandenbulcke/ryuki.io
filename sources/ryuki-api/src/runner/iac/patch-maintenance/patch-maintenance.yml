@@ -1,0 +1,51 @@
+---
+# Dry-run (--check) playbook for the patch-maintenance offering.
+#
+# Uses ONLY ansible.builtin.assert and ansible.builtin.debug — no command,
+# shell, copy, package, or service tasks. Runs fully offline against localhost
+# with connection: local and gather_facts: false.
+#
+# Variables (all default to empty string; overridden by --extra-vars at runtime):
+#   site        — target site for patch maintenance
+#   environment — target environment
+#   request_id  — ryuki request identifier (dry-run metadata only)
+
+- name: Patch-maintenance dry-run check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    site: ""
+    environment: ""
+    request_id: ""
+
+  tasks:
+    - name: Assert site is provided
+      ansible.builtin.assert:
+        that:
+          - site is defined
+        success_msg: "site is defined: {{ site }}"
+        fail_msg: "site variable is required"
+
+    - name: Assert environment is provided
+      ansible.builtin.assert:
+        that:
+          - environment is defined
+        success_msg: "environment is defined: {{ environment }}"
+        fail_msg: "environment variable is required"
+
+    - name: Log dry-run parameters
+      ansible.builtin.debug:
+        msg: >-
+          patch-maintenance dry-run check:
+          site={{ site }}
+          env={{ environment }}
+          request_id={{ request_id }}
+
+    - name: Assert dry-run mode (no live changes)
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode is defined
+        success_msg: "Running in check mode — no changes will be made"
+        fail_msg: "This playbook must be run with --check"

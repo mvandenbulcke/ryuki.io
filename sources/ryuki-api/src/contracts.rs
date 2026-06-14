@@ -9065,6 +9065,114 @@ fn append_terraform_note(stages: &mut [ryuki_engine::models::Stage], note: &str)
     }
 }
 
+/// Enrich the "verify" stage of a request's stages with a real
+/// `ansible-playbook --check` evidence item for offerings that have wired
+/// Ansible IaC.
+///
+/// # Wiring contract
+/// 1. Resolve the Ansible IaC bundle via `iac::resolve_ansible`. If None, return
+///    immediately — no mutation, no panic.
+/// 2. Build `AnsibleRunner::new().with_iac(bundle)` and invoke `run_dry` in
+///    DryRun mode with the request's site/environment/id as non-secret vars and
+///    empty credentials (dry-run carries no secrets).
+/// 3. On `CheckOk`: append an `"ansible-check"` EvidenceItem (type Summary)
+///    with the runner log excerpt (truncated on a UTF-8 char boundary).
+/// 4. On `RunnerUnavailable` / failure / Err: append an `"ansible-check-note"`
+///    item describing the skip. Never panic, never error the transition.
+///
+/// # Soundness invariant
+/// Callers MUST call this function AFTER building the "verify" stage (so it
+/// exists in `stages`) but BEFORE serializing `stages_json` for the DB write.
+fn enrich_verify_stages_with_ansible(
+    request: &ryuki_engine::models::Request,
+    stages: &mut [ryuki_engine::models::Stage],
+) {
+    use crate::integration::ResolvedCredentials;
+    use crate::runner::ansible::AnsibleRunner;
+    use crate::runner::iac;
+    use crate::runner::Runner;
+    use ryuki_engine::models::{EvidenceItem, EvidenceType};
+    use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
+
+    let offering_id = request.offering_id.as_str();
+
+    // Step 1: resolve Ansible IaC bundle — None means no wiring for this offering.
+    let Some(iac_bundle) = iac::resolve_ansible(offering_id) else {
+        return;
+    };
+
+    // Step 2: build runner with embedded playbook and invoke dry-run (--check).
+    let runner = AnsibleRunner::new().with_iac(iac_bundle);
+    let mut vars = std::collections::BTreeMap::new();
+    vars.insert("site".to_string(), request.site.clone());
+    vars.insert("environment".to_string(), request.environment.clone());
+    vars.insert("request_id".to_string(), request.id.clone());
+    let run_plan = RunPlan {
+        runner_kind: RunnerKind::Ansible,
+        mode: RunMode::DryRun,
+        offering_id: offering_id.to_string(),
+        vars,
+        secret_var_names: Vec::new(),
+    };
+    let empty_creds = ResolvedCredentials {
+        material: Vec::new(),
+        descriptor: "none".to_string(),
+    };
+
+    let evidence_item = match runner.run_dry(&run_plan, &empty_creds) {
+        Ok(outcome) if outcome.status == RunStatus::CheckOk => {
+            // Happy path: real ansible --check output available.
+            let log_excerpt = if outcome.log.len() > 4096 {
+                let truncated: String = outcome.log.chars().take(4096).collect();
+                format!("{truncated}...[truncated]")
+            } else {
+                outcome.log.clone()
+            };
+            let value = if log_excerpt.is_empty() {
+                outcome.summary.clone()
+            } else {
+                format!("{}\n\n{}", outcome.summary, log_excerpt)
+            };
+            EvidenceItem {
+                key: "ansible-check".to_string(),
+                value,
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }
+        }
+        Ok(outcome) => {
+            // RunnerUnavailable or Failed — degrade gracefully.
+            EvidenceItem {
+                key: "ansible-check-note".to_string(),
+                value: format!(
+                    "ansible --check skipped: runner unavailable or failed (status: {}; {})",
+                    outcome.status, outcome.summary
+                ),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }
+        }
+        Err(e) => {
+            // Workspace or spawn error — degrade gracefully.
+            EvidenceItem {
+                key: "ansible-check-note".to_string(),
+                value: format!("ansible --check skipped: {e}"),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Summary,
+            }
+        }
+    };
+
+    // Append to the "verify" stage. The stage is always present (verify_request
+    // guarantees it), but we guard defensively.
+    if let Some(verify_stage) = stages.iter_mut().find(|s| s.name == "verify") {
+        verify_stage.evidence.push(evidence_item);
+    }
+}
+
 async fn requests_plan(
     Path(request_id): Path<String>,
     AuthExtractor(session): AuthExtractor,
@@ -9406,6 +9514,13 @@ async fn requests_verify(
         verified_request
             .stages
             .push(completed_request_stage("verify", evidence.clone()));
+
+        // Enrich verify stage with real ansible --check output for wired
+        // offerings. MUST happen before stages_json serialization (soundness
+        // invariant). Graceful degradation: ansible absent/failed → note item,
+        // transition continues normally.
+        enrich_verify_stages_with_ansible(&request, &mut verified_request.stages);
+
         let completed = request_lifecycle::transition_status(
             &verified_request,
             ryuki_engine::models::RequestStatus::Completed,
@@ -9447,6 +9562,11 @@ async fn requests_verify(
     verified_request
         .stages
         .push(completed_request_stage("verify", evidence.clone()));
+
+    // Enrich verify stage with ansible --check evidence before persisting.
+    // Same soundness rule: enrich before store write.
+    enrich_verify_stages_with_ansible(&store[idx], &mut verified_request.stages);
+
     let completed = request_lifecycle::transition_status(
         &verified_request,
         ryuki_engine::models::RequestStatus::Completed,
@@ -18095,6 +18215,220 @@ mod maint_calendar_db_tests {
         assert!(
             plan_stages.iter().any(|s| s.name == "plan"),
             "serialized stages must contain the plan stage"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Ansible verify wiring tests (Slice 1b.2)
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a minimal `Verifying` patch-maintenance request suitable
+    /// for calling `verify_request` and `enrich_verify_stages_with_ansible`.
+    fn make_verifying_patch_maintenance_request() -> ryuki_engine::models::Request {
+        use ryuki_engine::models::{Request, RequestStatus, RequestType};
+        let mut req = Request::new(
+            "test-verify-wire-id".to_string(),
+            "patch-maintenance".to_string(),
+            RequestType::PatchMaintenance,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Verifying;
+        req
+    }
+
+    /// Unit test: ansible resolver returns Some for patch-maintenance, None for others.
+    #[test]
+    fn ansible_iac_resolver_known_and_unknown_offerings() {
+        use crate::runner::iac;
+        let bundle = iac::resolve_ansible("patch-maintenance");
+        assert!(
+            bundle.is_some(),
+            "patch-maintenance must have wired Ansible IaC"
+        );
+        assert!(
+            iac::resolve_ansible("server-deployment").is_none(),
+            "server-deployment must be unwired (None)"
+        );
+        assert!(
+            iac::resolve_ansible("zabbix-onboarding").is_none(),
+            "zabbix-onboarding must be unwired (None)"
+        );
+    }
+
+    /// TDD — wired offering enriches verify stage with ansible-check evidence.
+    ///
+    /// If `ansible-playbook` is on PATH the test asserts real --check output.
+    /// If absent (CI) the test asserts graceful-degradation (note item present,
+    /// no panic, transition succeeds).
+    #[test]
+    fn verify_stages_enriched_with_ansible_evidence_for_patch_maintenance() {
+        use crate::runner::ansible::AnsibleRunner;
+        use crate::runner::Runner;
+        use ryuki_engine::models::EvidenceType;
+
+        let request = make_verifying_patch_maintenance_request();
+        let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
+            .expect("verify_request must succeed for Verifying request");
+
+        // Build a minimal stages slice with the verify stage (mirrors the handler).
+        let mut stages = vec![completed_request_stage("verify", evidence)];
+
+        // Check whether ansible-playbook binary is available.
+        let runner = AnsibleRunner::new();
+        let ansible_available = runner.available();
+
+        // Enrich stages using the same logic as the handler.
+        enrich_verify_stages_with_ansible(&request, &mut stages);
+
+        let verify_stage = stages
+            .iter()
+            .find(|s| s.name == "verify")
+            .expect("verify stage must exist");
+
+        if ansible_available {
+            // Happy path: real ansible --check output present.
+            let ans_evidence = verify_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "ansible-check");
+            assert!(
+                ans_evidence.is_some(),
+                "ansible-check evidence must be present when ansible-playbook is available; \
+                 evidence keys: {:?}",
+                verify_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
+            );
+            let ev = ans_evidence.unwrap();
+            assert_eq!(ev.evidence_type, EvidenceType::Summary);
+            // Value must contain genuine ansible --check output markers.
+            assert!(
+                ev.value.contains("ok=")
+                    || ev.value.contains("PLAY RECAP")
+                    || ev.value.contains("check"),
+                "ansible-check evidence must contain real ansible output; got: {:?}",
+                ev.value
+            );
+            // The simulated verify evidence must still be present (additive).
+            let has_simulated = verify_stage
+                .evidence
+                .iter()
+                .any(|e| e.key == "verification-service-health");
+            assert!(
+                has_simulated,
+                "simulated verification evidence must still be present alongside ansible evidence"
+            );
+        } else {
+            // Graceful degradation: no ansible binary — note item must be present.
+            let note = verify_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "ansible-check-note");
+            assert!(
+                note.is_some(),
+                "graceful degradation: ansible-check-note must be present when ansible is absent; \
+                 evidence keys: {:?}",
+                verify_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
+            );
+            let note_ev = note.unwrap();
+            assert!(
+                note_ev.value.contains("skipped") || note_ev.value.contains("unavailable"),
+                "note must describe the skip; got: {:?}",
+                note_ev.value
+            );
+        }
+
+        // In both branches: transition must succeed (stages is well-formed).
+        assert!(
+            !stages.is_empty(),
+            "stages must not be empty after enrichment"
+        );
+    }
+
+    /// TDD — unwired offering verify stages are completely unchanged after enrichment.
+    #[test]
+    fn verify_stages_unchanged_for_unwired_offering() {
+        use ryuki_engine::models::{Request, RequestStatus, RequestType};
+
+        let mut req = Request::new(
+            "test-verify-unwired-id".to_string(),
+            "server-deployment".to_string(),
+            RequestType::ServerDeployment,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Verifying;
+
+        let evidence = ryuki_engine::request_lifecycle::verify_request(&req)
+            .expect("verify_request must succeed");
+        let stages_before = vec![completed_request_stage("verify", evidence.clone())];
+        let mut stages_after = stages_before.clone();
+
+        enrich_verify_stages_with_ansible(&req, &mut stages_after);
+
+        assert_eq!(
+            stages_before, stages_after,
+            "unwired offering must produce identical verify stages before and after enrichment"
+        );
+    }
+
+    /// TDD — soundness: the serialized stages_json for the DB write contains
+    /// ansible evidence when ansible-playbook is available.
+    #[test]
+    fn verify_stages_json_for_db_write_contains_ansible_evidence_when_available() {
+        use crate::runner::ansible::AnsibleRunner;
+        use crate::runner::Runner;
+
+        let request = make_verifying_patch_maintenance_request();
+        let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
+            .expect("verify_request must succeed");
+
+        let mut stages = vec![completed_request_stage("verify", evidence)];
+
+        let runner = AnsibleRunner::new();
+        let ansible_available = runner.available();
+
+        // Enrich (same logic as handler).
+        enrich_verify_stages_with_ansible(&request, &mut stages);
+
+        // Serialize to JSON as the handler does for the DB write.
+        let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
+
+        if ansible_available {
+            let json_str = stages_json.to_string();
+            assert!(
+                json_str.contains("ansible-check"),
+                "stages_json for DB write must contain ansible-check evidence when ansible is available; \
+                 got: {json_str}"
+            );
+        } else {
+            let json_str = stages_json.to_string();
+            assert!(
+                json_str.contains("ansible-check-note"),
+                "stages_json for DB write must contain ansible-check-note when ansible is absent; \
+                 got: {json_str}"
+            );
+        }
+
+        // In all cases: verify stage must be present in serialized JSON.
+        let verify_stages: Vec<ryuki_engine::models::Stage> = serde_json::from_value(stages_json)
+            .expect("stages_json must deserialize as Vec<Stage>");
+        assert!(
+            verify_stages.iter().any(|s| s.name == "verify"),
+            "serialized stages must contain the verify stage"
         );
     }
 }

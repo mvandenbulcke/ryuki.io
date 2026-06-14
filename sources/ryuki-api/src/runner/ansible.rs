@@ -44,14 +44,21 @@ const ANSIBLE_BLOCKED_PREFIXES: &[&str] = &["ANSIBLE_"];
 ///
 /// # Binary injection
 /// Use `AnsibleRunner::with_binary("/path/to/fake-ansible-playbook")` in tests.
+///
+/// # IaC embedding
+/// Use `AnsibleRunner::with_iac(files)` to embed static playbook content that is
+/// written into the workspace before `ansible-playbook --check` is invoked.
+/// This mirrors the `TerraformRunner::with_iac` pattern.
 pub struct AnsibleRunner {
     binary: String,
+    iac_files: Vec<(&'static str, &'static str)>,
 }
 
 impl Default for AnsibleRunner {
     fn default() -> Self {
         Self {
             binary: DEFAULT_BINARY.to_string(),
+            iac_files: Vec::new(),
         }
     }
 }
@@ -65,7 +72,19 @@ impl AnsibleRunner {
     pub fn with_binary(binary: impl Into<String>) -> Self {
         Self {
             binary: binary.into(),
+            iac_files: Vec::new(),
         }
+    }
+
+    /// Attach static IaC files (playbook + any supporting files) to this runner.
+    ///
+    /// The files are written into the workspace by `run_dry` BEFORE invoking
+    /// `ansible-playbook --check`. Each entry is `(filename, utf8_content)`.
+    /// The playbook must be named `<offering_id>.yml` to match the command-line
+    /// reference built by `run_dry`.
+    pub fn with_iac(mut self, files: Vec<(&'static str, &'static str)>) -> Self {
+        self.iac_files = files;
+        self
     }
 }
 
@@ -233,6 +252,12 @@ impl Runner for AnsibleRunner {
 
         // --- Workspace setup ---
         let ws = Workspace::new()?;
+
+        // Write embedded IaC files (playbook, support files) into the workspace
+        // BEFORE invoking ansible-playbook. This mirrors TerraformRunner::with_iac.
+        for (filename, content) in &self.iac_files {
+            ws.write_file(filename, content.as_bytes())?;
+        }
 
         // Write non-secret extra-vars to a 0600 JSON file.
         // Passed as `--extra-vars @ryuki-vars.json` — never inline on argv.
