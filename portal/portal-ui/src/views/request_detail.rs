@@ -48,10 +48,11 @@ pub(crate) fn status_badge_class(status: &str) -> &'static str {
         "intake" => "badge neutral",
         "validated" => "badge good",
         "approved" => "badge good",
-        "executed" | "verified" | "completed" => "badge good",
-        "failed" => "badge bad",
-        "rejected" | "cancelled" => "badge bad",
-        "executing" | "verifying" => "badge warn",
+        // Legacy portal-vocab (DB normalize path) and canonical engine-vocab both accepted.
+        "executed" | "verified" | "completed" | "Completed" => "badge good",
+        "failed" | "Failed" => "badge bad",
+        "rejected" | "cancelled" | "Rejected" | "Cancelled" => "badge bad",
+        "executing" | "verifying" | "Executing" | "Verifying" => "badge warn",
         _ => "badge neutral",
     }
 }
@@ -63,9 +64,15 @@ pub(crate) fn stage_label(stage: &str) -> &'static str {
         "planned" => "Planned",
         "approved" => "Approved",
         "locked" => "Locked",
+        // Canonical engine-vocab milestones (used in the stage rail).
+        "executing" => "Executing",
+        "verifying" => "Verifying",
+        "completed" => "Completed",
+        // Legacy portal-vocab aliases produced by normalize_api_stage on DB rows.
+        // Kept so the audit trail and timeline continue to render correctly for
+        // existing persisted requests.
         "executed" => "Executed",
         "verified" => "Verified",
-        "completed" => "Completed",
         "failed" => "Failed",
         "rejected" => "Rejected",
         "cancelled" => "Cancelled",
@@ -73,11 +80,97 @@ pub(crate) fn stage_label(stage: &str) -> &'static str {
     }
 }
 
-/// Whether a (portal-vocabulary) stage is a terminal "negative" outcome that
-/// the stepper renders with a distinct terminal styling rather than the
-/// normal forward progression.
+/// Whether a (portal-vocabulary) stage is a terminal outcome that the stepper
+/// renders with distinct terminal styling rather than forward progression.
+/// Includes `"failed"` because a failed request has no active forward step to
+/// highlight (the operator retries via a new validate/plan action).
 fn is_terminal_stage(stage: &str) -> bool {
-    matches!(stage, "rejected" | "cancelled")
+    matches!(stage, "failed" | "rejected" | "cancelled")
+}
+
+/// The ordered forward milestone sequence for the stage-progression rail.
+/// Uses canonical engine-vocab: the same strings produced by
+/// `RequestStatus::as_str()` for the executing/verifying/completed phases.
+const STAGE_MILESTONES: &[&str] = &[
+    "intake",
+    "validated",
+    "planned",
+    "approved",
+    "locked",
+    "executing",
+    "verifying",
+    "completed",
+];
+
+/// Derives the effective stage for the progression rail from the portal
+/// `detail.stage` and `detail.status`, bridging two vocabularies:
+///
+/// - **DB path**: `stage` column holds an action name (`execute`, `verify`),
+///   which `normalize_api_stage` maps to `"executed"` / `"verified"`.
+/// - **In-memory (no-DB) path**: the engine `Request` struct has no `stage`
+///   field, so `detail.stage` arrives as `""`. The status field then carries
+///   the truth (serialized as PascalCase by serde from the engine enum).
+///
+/// Both are normalized onto the canonical milestone vocab used by
+/// `STAGE_MILESTONES` so the rail always lights up the correct step.
+pub(crate) fn effective_stage_for_rail(stage: &str, status: &str) -> &'static str {
+    match stage {
+        // Already canonical forward milestones — return the 'static literal.
+        "intake" => "intake",
+        "validated" => "validated",
+        "planned" => "planned",
+        "approved" => "approved",
+        "locked" => "locked",
+        "executing" => "executing",
+        "verifying" => "verifying",
+        "completed" => "completed",
+        // Terminal states also pass through as 'static literals.
+        "failed" => "failed",
+        "rejected" => "rejected",
+        "cancelled" => "cancelled",
+        // Legacy portal-vocab produced by normalize_api_stage on the DB path.
+        // Map onto the canonical milestone names so the rail highlights them.
+        "executed" => "executing",
+        "verified" => "verifying",
+        // Empty stage (in-memory / no-DB path): derive from status.
+        // Accept both lowercase (DB / as_str()) and PascalCase (serde enum).
+        _ => match status {
+            "executing" | "Executing" => "executing",
+            "verifying" | "Verifying" => "verifying",
+            "completed" | "Completed" => "completed",
+            "failed" | "Failed" => "failed",
+            "rejected" | "Rejected" => "rejected",
+            "cancelled" | "Cancelled" => "cancelled",
+            "locked" | "Locked" => "locked",
+            "approved" | "Approved" => "approved",
+            "planned" | "Planned" => "planned",
+            "validated" | "Validated" => "validated",
+            "intake" | "Intake" => "intake",
+            _ => "intake",
+        },
+    }
+}
+
+/// Determines the CSS class for one milestone `step` in the stage-progression
+/// rail given the `current` effective stage (in canonical milestone vocab).
+///
+/// Returns:
+/// - `"stage-step active"` — `step` is the current in-progress milestone.
+/// - `"stage-step done"` — `step` precedes the current milestone in the forward
+///   sequence (all earlier milestones are complete).
+/// - `"stage-step pending"` — `step` follows the current milestone (not yet
+///   reached).
+///
+/// Terminal stages (`failed`/`rejected`/`cancelled`) are handled at the call
+/// site via `is_terminal_stage`; this function receives only forward milestones.
+pub(crate) fn stage_step_state(step: &str, current: &str) -> &'static str {
+    let step_pos = STAGE_MILESTONES.iter().position(|&m| m == step);
+    let current_pos = STAGE_MILESTONES.iter().position(|&m| m == current);
+    match (step_pos, current_pos) {
+        (Some(s), Some(c)) if s < c => "stage-step done",
+        (Some(s), Some(c)) if s == c => "stage-step active",
+        _ => "stage-step pending",
+    }
 }
 
 /// Strips the server-function transport prefix so action feedback badges
@@ -400,8 +493,13 @@ pub fn RequestDetail() -> impl IntoView {
                         let synthetic_timeline = detail.timeline.clone();
 
                         let status_class = status_badge_class(&detail.status);
-                        let stage_text = stage_label(&detail.stage);
-                        let current_stage = detail.stage.clone();
+                        // Derive the effective rail stage from both `stage` and
+                        // `status`, bridging the DB (action-name) and in-memory
+                        // (empty stage / PascalCase status) vocabularies.
+                        let effective_stage =
+                            effective_stage_for_rail(&detail.stage, &detail.status).to_string();
+                        let stage_text = stage_label(&effective_stage);
+                        let current_stage = effective_stage.clone();
                         let terminal_stage = is_terminal_stage(&current_stage);
                         let terminal_label = stage_label(&current_stage);
                         // Gate each stage-available action on its capability,
@@ -473,31 +571,18 @@ pub fn RequestDetail() -> impl IntoView {
                                 <div class="stage-progression" aria-label="Request stage progression">
                                     <h3>"Stage Progression"</h3>
                                     <ol class="stage-stepper">
-                                        {["intake", "validated", "planned", "approved", "locked", "executed", "verified"]
+                                        {STAGE_MILESTONES
                                             .iter()
-                                            .map(|stage| {
-                                                let is_done = match current_stage.as_str() {
-                                                    "intake" => false,
-                                                    "validated" => *stage == "intake",
-                                                    "planned" => matches!(*stage, "intake" | "validated"),
-                                                    "approved" => matches!(*stage, "intake" | "validated" | "planned"),
-                                                    "locked" => matches!(*stage, "intake" | "validated" | "planned" | "approved"),
-                                                    "executed" => matches!(*stage, "intake" | "validated" | "planned" | "approved" | "locked"),
-                                                    "verified" => true,
-                                                    "failed" => false,
-                                                    _ => false,
-                                                };
-                                                // A terminal reject/cancel leaves the forward steps
-                                                // un-highlighted (none is the active step); the
-                                                // distinct terminal step is appended after the row.
-                                                let step_class = if !terminal_stage && *stage == current_stage {
-                                                    "stage-step active"
-                                                } else if is_done {
-                                                    "stage-step done"
-                                                } else {
+                                            .map(|milestone| {
+                                                // A terminal reject/cancel/fail leaves the forward
+                                                // steps un-highlighted; the distinct terminal step
+                                                // is appended after the forward row.
+                                                let step_class = if terminal_stage {
                                                     "stage-step pending"
+                                                } else {
+                                                    stage_step_state(milestone, &current_stage)
                                                 };
-                                                let label = stage_label(stage);
+                                                let label = stage_label(milestone);
                                                 view! {
                                                     <li class=step_class>
                                                         <span class="stage-dot" aria-hidden="true"></span>
@@ -1032,4 +1117,214 @@ fn RequestEvidencePanel() -> impl IntoView {
         </section>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_stage_for_rail, stage_step_state, STAGE_MILESTONES};
+
+    // ── stage_step_state ────────────────────────────────────────────────────
+
+    #[test]
+    fn all_milestones_are_pending_at_intake() {
+        // When current = "intake", only "intake" is active; everything else is pending.
+        assert_eq!(stage_step_state("intake", "intake"), "stage-step active");
+        for &m in STAGE_MILESTONES.iter().skip(1) {
+            assert_eq!(
+                stage_step_state(m, "intake"),
+                "stage-step pending",
+                "expected {m} to be pending when current=intake"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_marks_intake_done() {
+        assert_eq!(stage_step_state("intake", "validated"), "stage-step done");
+        assert_eq!(
+            stage_step_state("validated", "validated"),
+            "stage-step active"
+        );
+        assert_eq!(
+            stage_step_state("planned", "validated"),
+            "stage-step pending"
+        );
+    }
+
+    #[test]
+    fn planned_marks_intake_and_validated_done() {
+        assert_eq!(stage_step_state("intake", "planned"), "stage-step done");
+        assert_eq!(stage_step_state("validated", "planned"), "stage-step done");
+        assert_eq!(stage_step_state("planned", "planned"), "stage-step active");
+        assert_eq!(
+            stage_step_state("approved", "planned"),
+            "stage-step pending"
+        );
+    }
+
+    #[test]
+    fn approved_stage_progression() {
+        assert_eq!(stage_step_state("intake", "approved"), "stage-step done");
+        assert_eq!(stage_step_state("validated", "approved"), "stage-step done");
+        assert_eq!(stage_step_state("planned", "approved"), "stage-step done");
+        assert_eq!(
+            stage_step_state("approved", "approved"),
+            "stage-step active"
+        );
+        assert_eq!(stage_step_state("locked", "approved"), "stage-step pending");
+    }
+
+    #[test]
+    fn locked_stage_progression() {
+        assert_eq!(stage_step_state("intake", "locked"), "stage-step done");
+        assert_eq!(stage_step_state("validated", "locked"), "stage-step done");
+        assert_eq!(stage_step_state("planned", "locked"), "stage-step done");
+        assert_eq!(stage_step_state("approved", "locked"), "stage-step done");
+        assert_eq!(stage_step_state("locked", "locked"), "stage-step active");
+        assert_eq!(
+            stage_step_state("executing", "locked"),
+            "stage-step pending"
+        );
+    }
+
+    /// Regression: execute action → status "verifying" (engine skips "executing").
+    /// The rail for stage "executing" must mark locked (and earlier) as done and
+    /// show "executing" as active.
+    #[test]
+    fn executing_marks_locked_done_and_itself_active() {
+        assert_eq!(stage_step_state("intake", "executing"), "stage-step done");
+        assert_eq!(
+            stage_step_state("validated", "executing"),
+            "stage-step done"
+        );
+        assert_eq!(stage_step_state("planned", "executing"), "stage-step done");
+        assert_eq!(stage_step_state("approved", "executing"), "stage-step done");
+        assert_eq!(stage_step_state("locked", "executing"), "stage-step done");
+        assert_eq!(
+            stage_step_state("executing", "executing"),
+            "stage-step active"
+        );
+        assert_eq!(
+            stage_step_state("verifying", "executing"),
+            "stage-step pending"
+        );
+        assert_eq!(
+            stage_step_state("completed", "executing"),
+            "stage-step pending"
+        );
+    }
+
+    #[test]
+    fn verifying_stage_progression() {
+        assert_eq!(stage_step_state("locked", "verifying"), "stage-step done");
+        assert_eq!(
+            stage_step_state("executing", "verifying"),
+            "stage-step done"
+        );
+        assert_eq!(
+            stage_step_state("verifying", "verifying"),
+            "stage-step active"
+        );
+        assert_eq!(
+            stage_step_state("completed", "verifying"),
+            "stage-step pending"
+        );
+    }
+
+    /// Regression: completed request must mark EVERY forward milestone as done
+    /// — previously "completed" had no milestone at all and showed nothing.
+    #[test]
+    fn completed_marks_all_milestones_done() {
+        for &m in STAGE_MILESTONES {
+            if m == "completed" {
+                assert_eq!(
+                    stage_step_state(m, "completed"),
+                    "stage-step active",
+                    "completed milestone should be active when current=completed"
+                );
+            } else {
+                assert_eq!(
+                    stage_step_state(m, "completed"),
+                    "stage-step done",
+                    "expected {m} to be done when current=completed"
+                );
+            }
+        }
+    }
+
+    /// Terminal stages (failed/rejected/cancelled) are handled at the call site
+    /// via `is_terminal_stage`; stage_step_state returns pending for unknown
+    /// milestones so nothing lights up in the forward rail.
+    #[test]
+    fn terminal_stages_return_pending_for_forward_milestones() {
+        for &terminal in &["failed", "rejected", "cancelled"] {
+            for &m in STAGE_MILESTONES {
+                assert_eq!(
+                    stage_step_state(m, terminal),
+                    "stage-step pending",
+                    "expected {m} to be pending when current={terminal}"
+                );
+            }
+        }
+    }
+
+    // ── effective_stage_for_rail ────────────────────────────────────────────
+
+    /// Regression: legacy portal-vocab "executed" (DB normalize path) must map
+    /// to canonical "executing" so the rail highlights the correct milestone.
+    #[test]
+    fn legacy_executed_maps_to_executing() {
+        assert_eq!(
+            effective_stage_for_rail("executed", "verifying"),
+            "executing"
+        );
+    }
+
+    /// Regression: legacy portal-vocab "verified" (DB normalize path) must map
+    /// to canonical "verifying".
+    #[test]
+    fn legacy_verified_maps_to_verifying() {
+        assert_eq!(
+            effective_stage_for_rail("verified", "completed"),
+            "verifying"
+        );
+    }
+
+    /// In-memory (no-DB) path: `detail.stage` is empty; effective stage is
+    /// derived from the lowercase status string.
+    #[test]
+    fn empty_stage_derives_from_status_lowercase() {
+        assert_eq!(effective_stage_for_rail("", "executing"), "executing");
+        assert_eq!(effective_stage_for_rail("", "verifying"), "verifying");
+        assert_eq!(effective_stage_for_rail("", "completed"), "completed");
+        assert_eq!(effective_stage_for_rail("", "failed"), "failed");
+        assert_eq!(effective_stage_for_rail("", "rejected"), "rejected");
+        assert_eq!(effective_stage_for_rail("", "cancelled"), "cancelled");
+        assert_eq!(effective_stage_for_rail("", "locked"), "locked");
+    }
+
+    /// In-memory (no-DB) path: serde serializes the engine `RequestStatus` enum
+    /// as PascalCase (no rename_all attribute); effective_stage_for_rail must
+    /// handle both cases.
+    #[test]
+    fn empty_stage_derives_from_status_pascal_case() {
+        assert_eq!(effective_stage_for_rail("", "Executing"), "executing");
+        assert_eq!(effective_stage_for_rail("", "Verifying"), "verifying");
+        assert_eq!(effective_stage_for_rail("", "Completed"), "completed");
+        assert_eq!(effective_stage_for_rail("", "Failed"), "failed");
+        assert_eq!(effective_stage_for_rail("", "Rejected"), "rejected");
+        assert_eq!(effective_stage_for_rail("", "Cancelled"), "cancelled");
+    }
+
+    /// Canonical forward stages pass through unchanged.
+    #[test]
+    fn canonical_stages_pass_through() {
+        for &m in STAGE_MILESTONES {
+            assert_eq!(
+                effective_stage_for_rail(m, "anything"),
+                m,
+                "canonical stage {m} should pass through unchanged"
+            );
+        }
+    }
 }
