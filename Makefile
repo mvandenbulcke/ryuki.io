@@ -22,7 +22,7 @@ test-unit:
 # (maintenance windows), integration_db_tests (vendor integration connections).
 test-db:
 	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
-	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests integration_db_tests
+	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests integration_db_tests approved_packages_db_tests
 
 test:
 	cargo test --workspace

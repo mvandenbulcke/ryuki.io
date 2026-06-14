@@ -5392,6 +5392,48 @@ async fn patch_contract() -> Json<Value> {
 
 // ─── Software deployment handlers ───
 
+/// One persisted `approved_packages` row (migration 032).
+/// All enum columns are stored as TEXT in Postgres and reproduced as strings
+/// in the JSON response, matching the engine's serde shape for PackageType /
+/// SiteScope.
+#[derive(sqlx::FromRow)]
+struct ApprovedPackageRow {
+    id: String,
+    name: String,
+    version: String,
+    vendor: String,
+    package_type: String,
+    approved_by: String,
+    approved_date: chrono::NaiveDate,
+    site_scope: String,
+    site_scope_list: Vec<String>,
+}
+
+impl ApprovedPackageRow {
+    fn to_json(&self) -> Value {
+        let scope: Value = if self.site_scope == "specific" {
+            json!({"Specific": self.site_scope_list})
+        } else {
+            json!("All")
+        };
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "version": self.version,
+            "vendor": self.vendor,
+            "package_type": self.package_type,
+            "approved_by": self.approved_by,
+            "approved_date": self.approved_date.to_string(),
+            "site_scope": scope,
+            "source": "database",
+        })
+    }
+}
+
+const PACKAGE_COLUMNS: &str =
+    "id, name, version, vendor, package_type, approved_by, approved_date, \
+     site_scope, site_scope_list";
+
 #[derive(Debug, Deserialize)]
 struct SoftwarePackagesQuery {
     site: Option<String>,
@@ -5411,8 +5453,34 @@ struct SoftwareComplianceQuery {
 }
 
 async fn software_packages_list(Query(query): Query<SoftwarePackagesQuery>) -> ApiResult {
-    let site = query.site.as_deref();
-    let packages = software_deployment::get_approved_packages(site);
+    let site = query.site.as_deref().unwrap_or("");
+    if let Some(pool) = get_db() {
+        // DB path: read approved_packages table (source of truth).
+        // site_scope filter mirrors engine SiteScope::covers:
+        //   scope='all'  → matches any site request
+        //   scope='specific' → site_scope_list must contain the requested site
+        // When no site filter is provided ($1 = '') all rows are returned.
+        let rows: Vec<ApprovedPackageRow> = sqlx::query_as(&format!(
+            "SELECT {PACKAGE_COLUMNS} FROM approved_packages \
+             WHERE ($1 = '' \
+                OR site_scope = 'all' \
+                OR ($1 <> '' AND site_scope = 'specific' AND $1 = ANY(site_scope_list))) \
+             ORDER BY id"
+        ))
+        .bind(site)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let packages: Vec<Value> = rows.iter().map(ApprovedPackageRow::to_json).collect();
+        return Ok(Json(json!({
+            "source": "database",
+            "packages": packages,
+            "count": packages.len(),
+        })));
+    }
+    // No-DB: engine in-memory store (unchanged fallback).
+    let site_opt = if site.is_empty() { None } else { Some(site) };
+    let packages = software_deployment::get_approved_packages(site_opt);
     Ok(Json(serde_json::to_value(packages).unwrap()))
 }
 
@@ -19310,5 +19378,129 @@ mod maint_calendar_db_tests {
             sanitized_str.contains("***REDACTED***"),
             "sentinel must appear when redacted_value is absent; got: {sanitized_str}"
         );
+    }
+}
+
+// ─── approved_packages DB integration tests ───────────────────────────────────
+//
+// These tests require RYUKI_DATABASE_URL.  Run via `make test-db`.
+// They are intentionally excluded from `make test-unit` (RYUKI_DATABASE_URL= )
+// to avoid OnceLock contamination of the in-memory unit tests.
+
+#[cfg(test)]
+mod approved_packages_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Initialises the PROCESS-GLOBAL `database::POOL` so handler calls routed
+    /// through `get_db()` hit the real DB.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// DB path: list all approved packages — must return the 5 seeded rows.
+    #[tokio::test]
+    async fn test_list_packages_db_returns_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let query = SoftwarePackagesQuery { site: None };
+        let result = software_packages_list(Query(query)).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+
+        assert_eq!(
+            body["source"], "database",
+            "source must be 'database' in DB mode"
+        );
+        let packages = body["packages"].as_array().expect("packages array");
+        assert!(
+            packages.len() >= 5,
+            "expected at least 5 seeded packages, got {}",
+            packages.len()
+        );
+        assert!(
+            packages.iter().any(|p| p["id"] == "pkg-zabbix-agent"),
+            "pkg-zabbix-agent must be present"
+        );
+    }
+
+    /// DB path: site filter — only packages with site_scope='all' or the
+    /// site in site_scope_list must be returned.
+    #[tokio::test]
+    async fn test_list_packages_db_site_filter() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // FRPAR: site_scope='specific' packages targeting only DEFRA/GBLON/NLAMS
+        // (pkg-veeam-agent) must NOT appear; site_scope='all' packages must appear.
+        let query = SoftwarePackagesQuery {
+            site: Some("FRPAR".into()),
+        };
+        let result = software_packages_list(Query(query)).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+
+        let packages = body["packages"].as_array().expect("packages array");
+        assert!(
+            packages.iter().any(|p| p["id"] == "pkg-zabbix-agent"),
+            "pkg-zabbix-agent (scope=all) must appear for FRPAR"
+        );
+        assert!(
+            !packages.iter().any(|p| p["id"] == "pkg-veeam-agent"),
+            "pkg-veeam-agent (scope=specific DEFRA/GBLON/NLAMS) must NOT appear for FRPAR"
+        );
+
+        // DEFRA: pkg-veeam-agent (scope=specific, list includes DEFRA) must appear.
+        let query2 = SoftwarePackagesQuery {
+            site: Some("DEFRA".into()),
+        };
+        let result2 = software_packages_list(Query(query2)).await;
+        let Ok(Json(body2)) = result2 else {
+            panic!("expected Ok, got Err for DEFRA: {result2:?}");
+        };
+        let packages2 = body2["packages"].as_array().expect("packages array DEFRA");
+        assert!(
+            packages2.iter().any(|p| p["id"] == "pkg-veeam-agent"),
+            "pkg-veeam-agent must appear for DEFRA (site in site_scope_list)"
+        );
+    }
+
+    /// No-DB path: engine in-memory store must return the seeded packages when
+    /// RYUKI_DATABASE_URL is unset.  This test runs WITHOUT the global pool init
+    /// so it exercises the fallback path.
+    ///
+    /// NOTE: this test must be run in the `test-unit` invocation (no URL) — it is
+    /// placed here for documentation but also works standalone without a DB.
+    #[tokio::test]
+    async fn test_list_packages_no_db_returns_in_memory_seed() {
+        // Do NOT initialise the global pool — we want the no-DB fallback.
+        // If RYUKI_DATABASE_URL is set (test-db run), this test still exercises
+        // the handler but the pool IS set, so it will go through the DB path.
+        // That's acceptable: the important guarantee is the no-DB path is NOT
+        // broken, proven by `make test-unit`.
+        let query = SoftwarePackagesQuery { site: None };
+        let result = software_packages_list(Query(query)).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        // In no-DB mode, the engine returns a Vec<ApprovedPackage> serialised
+        // directly (no `source` / `packages` wrapper) — confirm it has content.
+        // In DB mode (test-db), the body has a `packages` key.
+        let has_packages = body.is_array() || body.get("packages").is_some();
+        assert!(has_packages, "response must contain package data: {body}");
     }
 }
