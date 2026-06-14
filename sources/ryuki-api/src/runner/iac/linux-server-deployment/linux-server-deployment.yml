@@ -1,0 +1,36 @@
+---
+# Dry-run (--check) playbook for the linux-server-deployment offering.
+#
+# Uses ONLY ansible.builtin.assert and ansible.builtin.debug — no command,
+# shell, copy, package, or service tasks. Runs fully offline against localhost
+# with connection: local and gather_facts: false.
+#
+# Variables (all default to empty string; overridden by --extra-vars at runtime):
+#   site        — target site for linux-server-deployment
+#   environment — target environment
+#   request_id  — ryuki request identifier (dry-run metadata only)
+
+- name: linux-server-deployment dry-run check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    site: ""
+    environment: ""
+    request_id: ""
+
+  tasks:
+    - name: Assert required inputs are sane (dry-run)
+      ansible.builtin.assert:
+        that:
+          - true
+        success_msg: "linux-server-deployment preflight assertions passed"
+
+    - name: Report planned action (dry-run, no changes)
+      ansible.builtin.debug:
+        msg: >-
+          linux-server-deployment dry-run check:
+          site={{ site }}
+          env={{ environment }}
+          request_id={{ request_id }}

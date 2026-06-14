@@ -8480,6 +8480,30 @@ fn completed_request_stage(
     }
 }
 
+/// Payload/intake keys mirrored into `Request::metadata` for the resolver layer
+/// (e.g. OS-based offering discrimination). Deliberately narrow: only these keys
+/// are copied so the serialized `Request.metadata` surface is NOT broadened with
+/// arbitrary intake fields. Keep in sync with the no-DB create path.
+const METADATA_ALLOWLIST: &[&str] = &["operating_system"];
+
+/// Extract the allowlisted string-valued keys from a request's payload JSONB
+/// into a `HashMap<String, String>` suitable for `Request::metadata`.
+///
+/// Only `METADATA_ALLOWLIST` keys are copied (resolver inputs such as
+/// `operating_system`); everything else in the payload is ignored so the
+/// serialized request surface is unchanged. No schema migration needed.
+fn payload_to_metadata(payload: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(obj) = payload.as_object() {
+        for key in METADATA_ALLOWLIST {
+            if let Some(s) = obj.get(*key).and_then(|v| v.as_str()) {
+                map.insert((*key).to_string(), s.to_string());
+            }
+        }
+    }
+    map
+}
+
 /// Hydrate the engine `Request` from the persisted row. As of migration 047 the
 /// stages/approval_route are the REAL durable history — no fabrication. This is
 /// the point of P2: the engine guards (approve_request's
@@ -8520,7 +8544,10 @@ fn db_row_to_request(row: &DbRequestRow, request_id: &str) -> ryuki_engine::mode
         approval_route: serde_json::from_value::<Vec<String>>(row.approval_route.clone())
             .unwrap_or_default(),
         evidence_manifest_id: row.evidence_manifest_id.clone(),
-        metadata: std::collections::HashMap::new(),
+        // Extract string fields from the persisted payload JSONB into metadata
+        // so that resolver logic (e.g. OS-based offering discrimination) has
+        // access to them without requiring a schema migration.
+        metadata: payload_to_metadata(&row.payload),
     }
 }
 
@@ -8625,6 +8652,15 @@ async fn requests_create(
     // value rather than echoing the request name.
     request.requester = session.user_id.clone();
     request.owner = session.user_id.clone();
+    // Populate metadata from the allowlisted per-type intake fields so resolver
+    // logic (OS-based offering discrimination) is available on the in-memory
+    // path. Matches `payload_to_metadata` on the DB path — only METADATA_ALLOWLIST
+    // keys are mirrored, never the whole intake form.
+    for (k, v) in &body.fields {
+        if METADATA_ALLOWLIST.contains(&k.as_str()) {
+            request.metadata.insert(k.clone(), v.clone());
+        }
+    }
 
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_error)?;
@@ -8969,7 +9005,11 @@ fn enrich_plan_stages_with_terraform(
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
     use ryuki_engine::runners::{RunMode, RunPlan, RunStatus};
 
-    let offering_id = request.offering_id.as_str();
+    // Resolve the effective offering_id via the OS-discriminating resolver.
+    // For server-deployment this maps to linux- or windows- by OS metadata;
+    // for controlled-restore this normalises the catalog name mismatch.
+    let offering_id = iac::resolve_offering_id(request);
+    let offering_id = offering_id.as_str();
 
     // Step 1: resolve IaC bundle — if None, no wiring for this offering.
     let Some(iac_bundle) = iac::resolve(offering_id) else {
@@ -9094,7 +9134,9 @@ fn enrich_verify_stages_with_ansible(
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
     use ryuki_engine::runners::{RunMode, RunPlan, RunStatus, RunnerKind};
 
-    let offering_id = request.offering_id.as_str();
+    // Resolve the effective offering_id via the OS-discriminating resolver.
+    let offering_id = iac::resolve_offering_id(request);
+    let offering_id = offering_id.as_str();
 
     // Step 1: resolve Ansible IaC bundle — None means no wiring for this offering.
     let Some(iac_bundle) = iac::resolve_ansible(offering_id) else {
@@ -18429,6 +18471,247 @@ mod maint_calendar_db_tests {
         assert!(
             verify_stages.iter().any(|s| s.name == "verify"),
             "serialized stages must contain the verify stage"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Slice 1b.3: resolve_offering_id + OS-based IaC wiring tests
+    // -------------------------------------------------------------------------
+
+    /// Helper: server-deployment request with optional operating_system metadata.
+    fn make_server_deployment_request_with_os(os: Option<&str>) -> ryuki_engine::models::Request {
+        use ryuki_engine::models::{Request, RequestStatus, RequestType};
+        let mut req = Request::new(
+            "test-sd-resolver-id".to_string(),
+            "server-deployment".to_string(),
+            RequestType::ServerDeployment,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+        if let Some(os_str) = os {
+            req.metadata
+                .insert("operating_system".to_string(), os_str.to_string());
+        }
+        req
+    }
+
+    /// Unit test: resolver integration — iac::resolve_offering_id correctly
+    /// discriminates Windows vs Linux for server-deployment.
+    #[test]
+    fn resolve_offering_id_windows_routes_to_windows_offering() {
+        use crate::runner::iac;
+        let req = make_server_deployment_request_with_os(Some("Windows Server 2022"));
+        assert_eq!(
+            iac::resolve_offering_id(&req),
+            "windows-server-deployment",
+            "Windows Server 2022 must route to windows-server-deployment"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_linux_routes_to_linux_offering() {
+        use crate::runner::iac;
+        let req = make_server_deployment_request_with_os(Some("RHEL 9"));
+        assert_eq!(
+            iac::resolve_offering_id(&req),
+            "linux-server-deployment",
+            "RHEL 9 must route to linux-server-deployment"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_absent_os_stays_unmapped() {
+        use crate::runner::iac;
+        let req = make_server_deployment_request_with_os(None);
+        assert_eq!(
+            iac::resolve_offering_id(&req),
+            "server-deployment",
+            "absent OS must produce server-deployment (unmapped, graceful simulated)"
+        );
+    }
+
+    /// TDD — server-deployment with Windows OS routes to windows IaC for terraform plan.
+    ///
+    /// If `terraform` is on PATH: asserts real plan output from windows-server-deployment IaC.
+    /// If absent (CI): asserts graceful-degradation note, no panic.
+    #[test]
+    fn plan_stages_enriched_with_windows_terraform_for_windows_os() {
+        use crate::runner::terraform::TerraformRunner;
+        use crate::runner::Runner;
+
+        let req = make_server_deployment_request_with_os(Some("Windows Server 2022"));
+        let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
+            .expect("plan_request must succeed for Validated request");
+
+        let runner = TerraformRunner::new();
+        let terraform_available = runner.available();
+
+        enrich_plan_stages_with_terraform(&req, &mut stages);
+
+        let plan_stage = stages
+            .iter()
+            .find(|s| s.name == "plan")
+            .expect("plan stage must exist");
+
+        if terraform_available {
+            let tf_evidence = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan");
+            assert!(
+                tf_evidence.is_some(),
+                "terraform-plan evidence must be present for Windows OS; evidence keys: {:?}",
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
+            );
+            // The plan output should reference windows-server-deployment IaC.
+            let ev = tf_evidence.unwrap();
+            assert!(
+                ev.value.contains("Terraform")
+                    || ev.value.contains("Plan:")
+                    || ev.value.contains("to add"),
+                "plan evidence must contain real terraform output; got: {:?}",
+                ev.value
+            );
+        } else {
+            let note = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan-note");
+            assert!(
+                note.is_some(),
+                "graceful degradation: terraform-plan-note must be present when terraform absent"
+            );
+        }
+
+        assert!(!stages.is_empty(), "stages must not be empty");
+    }
+
+    /// TDD — server-deployment with Linux OS routes to linux IaC for terraform plan.
+    #[test]
+    fn plan_stages_enriched_with_linux_terraform_for_linux_os() {
+        use crate::runner::terraform::TerraformRunner;
+        use crate::runner::Runner;
+
+        let req = make_server_deployment_request_with_os(Some("Ubuntu 22.04 LTS"));
+        let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
+            .expect("plan_request must succeed for Validated request");
+
+        let runner = TerraformRunner::new();
+        let terraform_available = runner.available();
+
+        enrich_plan_stages_with_terraform(&req, &mut stages);
+
+        let plan_stage = stages
+            .iter()
+            .find(|s| s.name == "plan")
+            .expect("plan stage must exist");
+
+        if terraform_available {
+            let tf_evidence = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan");
+            assert!(
+                tf_evidence.is_some(),
+                "terraform-plan evidence must be present for Linux OS; evidence keys: {:?}",
+                plan_stage
+                    .evidence
+                    .iter()
+                    .map(|e| &e.key)
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            let note = plan_stage
+                .evidence
+                .iter()
+                .find(|e| e.key == "terraform-plan-note");
+            assert!(
+                note.is_some(),
+                "graceful degradation: terraform-plan-note must be present when terraform absent"
+            );
+        }
+
+        assert!(!stages.is_empty(), "stages must not be empty");
+    }
+
+    /// TDD — payload_to_metadata extracts ONLY allowlisted string fields, so the
+    /// serialized Request.metadata surface is not broadened with arbitrary intake.
+    #[test]
+    fn payload_to_metadata_extracts_only_allowlisted_fields() {
+        let payload = serde_json::json!({
+            "operating_system": "RHEL 9",
+            "name": "my-server",
+            "cpu": 4,
+            "active": true,
+            "nested": {"key": "value"}
+        });
+        let meta = payload_to_metadata(&payload);
+        // Allowlisted string field IS extracted.
+        assert_eq!(
+            meta.get("operating_system").map(String::as_str),
+            Some("RHEL 9")
+        );
+        // Non-allowlisted fields — even strings like "name" — are NOT mirrored.
+        assert!(
+            meta.get("name").is_none(),
+            "non-allowlisted string fields must be skipped"
+        );
+        assert!(meta.get("cpu").is_none(), "numeric fields must be skipped");
+        assert!(
+            meta.get("active").is_none(),
+            "boolean fields must be skipped"
+        );
+        assert!(
+            meta.get("nested").is_none(),
+            "object fields must be skipped"
+        );
+        // Exactly one key (the allowlisted one) is present.
+        assert_eq!(meta.len(), 1, "only allowlisted keys are mirrored");
+    }
+
+    /// TDD — payload_to_metadata handles null/non-object payload gracefully.
+    #[test]
+    fn payload_to_metadata_handles_non_object_payload() {
+        assert!(payload_to_metadata(&serde_json::json!(null)).is_empty());
+        assert!(payload_to_metadata(&serde_json::json!([])).is_empty());
+        assert!(payload_to_metadata(&serde_json::json!("string")).is_empty());
+        assert!(payload_to_metadata(&serde_json::json!(42)).is_empty());
+    }
+
+    /// TDD — new resolve() arms return Some for linux- and windows-server-deployment.
+    #[test]
+    fn terraform_iac_resolver_wires_server_deployment_offerings() {
+        use crate::runner::iac;
+        assert!(
+            iac::resolve("linux-server-deployment").is_some(),
+            "linux-server-deployment must now have wired terraform IaC"
+        );
+        assert!(
+            iac::resolve("windows-server-deployment").is_some(),
+            "windows-server-deployment must now have wired terraform IaC"
+        );
+    }
+
+    /// TDD — new resolve_ansible() arms return Some for linux-server-deployment
+    /// and controlled-restore-request.
+    #[test]
+    fn ansible_iac_resolver_wires_new_offerings() {
+        use crate::runner::iac;
+        assert!(
+            iac::resolve_ansible("linux-server-deployment").is_some(),
+            "linux-server-deployment must now have wired ansible IaC"
+        );
+        assert!(
+            iac::resolve_ansible("controlled-restore-request").is_some(),
+            "controlled-restore-request must now have wired ansible IaC"
         );
     }
 }

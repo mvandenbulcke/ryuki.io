@@ -36,6 +36,57 @@ const REQUEST_PREFLIGHT_MAIN_TF: &str = include_str!("iac/request-preflight/main
 const ZABBIX_ONBOARDING_PLAYBOOK: &str =
     include_str!("iac/zabbix-onboarding/zabbix-onboarding.yml");
 
+/// Embedded Terraform IaC for the `linux-server-deployment` offering.
+const LINUX_SERVER_DEPLOYMENT_MAIN_TF: &str = include_str!("iac/linux-server-deployment/main.tf");
+
+/// Embedded Ansible playbook for the `linux-server-deployment` offering.
+const LINUX_SERVER_DEPLOYMENT_PLAYBOOK: &str =
+    include_str!("iac/linux-server-deployment/linux-server-deployment.yml");
+
+/// Embedded Terraform IaC for the `windows-server-deployment` offering.
+const WINDOWS_SERVER_DEPLOYMENT_MAIN_TF: &str =
+    include_str!("iac/windows-server-deployment/main.tf");
+
+/// Embedded Ansible playbook for the `controlled-restore-request` offering.
+const CONTROLLED_RESTORE_REQUEST_PLAYBOOK: &str =
+    include_str!("iac/controlled-restore-request/controlled-restore-request.yml");
+
+/// Resolve the effective offering ID for a request, applying OS-based
+/// discrimination for `server-deployment` and name normalization for
+/// `controlled-restore`.
+///
+/// This is the single place where `request_type` (plus optional
+/// `metadata["operating_system"]`) maps to a catalog offering_id:
+///
+/// - `"server-deployment"` + metadata `operating_system` containing "windows"
+///   (case-insensitive) → `"windows-server-deployment"`
+/// - `"server-deployment"` + any other non-empty OS → `"linux-server-deployment"`
+/// - `"server-deployment"` + absent/empty OS → `"server-deployment"` (unmapped;
+///   callers fall through to graceful simulated behavior — do NOT guess)
+/// - `"controlled-restore"` → `"controlled-restore-request"` (catalog name
+///   differs from request_type slug)
+/// - Anything else → `request.offering_id` unchanged (1:1 default)
+pub fn resolve_offering_id(request: &ryuki_engine::models::Request) -> String {
+    let request_type = request.request_type.to_string();
+    match request_type.as_str() {
+        "server-deployment" => {
+            match request.metadata.get("operating_system").map(String::as_str) {
+                Some(os) if !os.trim().is_empty() => {
+                    if os.to_ascii_lowercase().contains("windows") {
+                        "windows-server-deployment".to_string()
+                    } else {
+                        "linux-server-deployment".to_string()
+                    }
+                }
+                // absent or empty OS — do not guess, keep unmapped
+                _ => "server-deployment".to_string(),
+            }
+        }
+        "controlled-restore" => "controlled-restore-request".to_string(),
+        _ => request.offering_id.clone(),
+    }
+}
+
 /// Resolve the IaC bundle for the given offering ID.
 ///
 /// Returns `Some(IacBundle)` when the offering has wired IaC, `None` otherwise.
@@ -45,6 +96,8 @@ pub fn resolve(offering_id: &str) -> Option<IacBundle> {
     match offering_id {
         "patch-maintenance" => Some(vec![("main.tf", PATCH_MAINTENANCE_MAIN_TF)]),
         "request-preflight" => Some(vec![("main.tf", REQUEST_PREFLIGHT_MAIN_TF)]),
+        "linux-server-deployment" => Some(vec![("main.tf", LINUX_SERVER_DEPLOYMENT_MAIN_TF)]),
+        "windows-server-deployment" => Some(vec![("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF)]),
         _ => None,
     }
 }
@@ -60,6 +113,14 @@ pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
     match offering_id {
         "patch-maintenance" => Some(vec![("patch-maintenance.yml", PATCH_MAINTENANCE_PLAYBOOK)]),
         "zabbix-onboarding" => Some(vec![("zabbix-onboarding.yml", ZABBIX_ONBOARDING_PLAYBOOK)]),
+        "linux-server-deployment" => Some(vec![(
+            "linux-server-deployment.yml",
+            LINUX_SERVER_DEPLOYMENT_PLAYBOOK,
+        )]),
+        "controlled-restore-request" => Some(vec![(
+            "controlled-restore-request.yml",
+            CONTROLLED_RESTORE_REQUEST_PLAYBOOK,
+        )]),
         _ => None,
     }
 }
@@ -71,6 +132,149 @@ pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ryuki_engine::models::{Request, RequestStatus, RequestType};
+
+    /// Helper: build a minimal server-deployment request with optional OS metadata.
+    fn make_server_deployment_request(os: Option<&str>) -> Request {
+        let mut req = Request::new(
+            "test-sd-id".to_string(),
+            "server-deployment".to_string(),
+            RequestType::ServerDeployment,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+        if let Some(os_str) = os {
+            req.metadata
+                .insert("operating_system".to_string(), os_str.to_string());
+        }
+        req
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_offering_id tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn resolve_offering_id_windows_os_maps_to_windows_offering() {
+        let req = make_server_deployment_request(Some("Windows Server 2022"));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "windows-server-deployment",
+            "Windows Server 2022 must map to windows-server-deployment"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_whitespace_os_stays_unmapped() {
+        // A direct-API client could send whitespace; it must be treated as
+        // absent (unmapped -> graceful simulated), not silently routed to linux.
+        let req = make_server_deployment_request(Some("   "));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "server-deployment",
+            "whitespace-only OS must be treated as absent, not routed to linux"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_windows_case_insensitive() {
+        for os in &["WINDOWS SERVER 2019", "windows 11", "Windows 10 Enterprise"] {
+            let req = make_server_deployment_request(Some(os));
+            assert_eq!(
+                resolve_offering_id(&req),
+                "windows-server-deployment",
+                "{os} must map to windows-server-deployment (case-insensitive)"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_offering_id_rhel_maps_to_linux_offering() {
+        let req = make_server_deployment_request(Some("RHEL 9"));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "linux-server-deployment",
+            "RHEL 9 must map to linux-server-deployment"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_ubuntu_maps_to_linux_offering() {
+        let req = make_server_deployment_request(Some("Ubuntu 22.04 LTS"));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "linux-server-deployment",
+            "Ubuntu 22.04 LTS must map to linux-server-deployment"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_absent_os_stays_unmapped() {
+        let req = make_server_deployment_request(None);
+        assert_eq!(
+            resolve_offering_id(&req),
+            "server-deployment",
+            "absent OS must stay unmapped (server-deployment) — do not guess"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_empty_os_stays_unmapped() {
+        let req = make_server_deployment_request(Some(""));
+        assert_eq!(
+            resolve_offering_id(&req),
+            "server-deployment",
+            "empty OS must stay unmapped (server-deployment)"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_controlled_restore_maps_to_catalog_name() {
+        let mut req = Request::new(
+            "test-cr-id".to_string(),
+            "controlled-restore".to_string(),
+            RequestType::ControlledRestore,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+        assert_eq!(
+            resolve_offering_id(&req),
+            "controlled-restore-request",
+            "controlled-restore request_type must map to controlled-restore-request offering"
+        );
+    }
+
+    #[test]
+    fn resolve_offering_id_patch_maintenance_unchanged() {
+        let mut req = Request::new(
+            "test-pm-id".to_string(),
+            "patch-maintenance".to_string(),
+            RequestType::PatchMaintenance,
+            "tester".to_string(),
+            "tester".to_string(),
+            "DEFRA".to_string(),
+            "production".to_string(),
+            "standard".to_string(),
+        );
+        req.status = RequestStatus::Validated;
+        assert_eq!(
+            resolve_offering_id(&req),
+            "patch-maintenance",
+            "patch-maintenance must pass through unchanged (1:1)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve() new offering arms
+    // -------------------------------------------------------------------------
 
     #[test]
     fn resolve_wires_request_preflight_terraform() {
@@ -81,10 +285,88 @@ mod tests {
     }
 
     #[test]
+    fn resolve_wires_linux_server_deployment_terraform() {
+        let bundle = resolve("linux-server-deployment");
+        assert!(
+            bundle.is_some(),
+            "linux-server-deployment must resolve to terraform IaC"
+        );
+        let files = bundle.unwrap();
+        let has_main = files.iter().any(|(name, _)| *name == "main.tf");
+        assert!(
+            has_main,
+            "linux-server-deployment bundle must include main.tf"
+        );
+        let (_, content) = files.iter().find(|(name, _)| *name == "main.tf").unwrap();
+        assert!(
+            content.contains("terraform_data"),
+            "linux-server-deployment main.tf must use terraform_data"
+        );
+    }
+
+    #[test]
+    fn resolve_wires_windows_server_deployment_terraform() {
+        let bundle = resolve("windows-server-deployment");
+        assert!(
+            bundle.is_some(),
+            "windows-server-deployment must resolve to terraform IaC"
+        );
+        let files = bundle.unwrap();
+        let has_main = files.iter().any(|(name, _)| *name == "main.tf");
+        assert!(
+            has_main,
+            "windows-server-deployment bundle must include main.tf"
+        );
+        let (_, content) = files.iter().find(|(name, _)| *name == "main.tf").unwrap();
+        assert!(
+            content.contains("terraform_data"),
+            "windows-server-deployment main.tf must use terraform_data"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // resolve_ansible() new offering arms
+    // -------------------------------------------------------------------------
+
+    #[test]
     fn resolve_ansible_wires_zabbix_onboarding() {
         assert!(
             resolve_ansible("zabbix-onboarding").is_some(),
             "zabbix-onboarding must resolve to ansible IaC (DeepSeek-authored)"
+        );
+    }
+
+    #[test]
+    fn resolve_ansible_wires_linux_server_deployment() {
+        let bundle = resolve_ansible("linux-server-deployment");
+        assert!(
+            bundle.is_some(),
+            "linux-server-deployment must resolve to ansible IaC"
+        );
+        let files = bundle.unwrap();
+        let has_playbook = files
+            .iter()
+            .any(|(name, _)| *name == "linux-server-deployment.yml");
+        assert!(
+            has_playbook,
+            "linux-server-deployment ansible bundle must include linux-server-deployment.yml"
+        );
+    }
+
+    #[test]
+    fn resolve_ansible_wires_controlled_restore_request() {
+        let bundle = resolve_ansible("controlled-restore-request");
+        assert!(
+            bundle.is_some(),
+            "controlled-restore-request must resolve to ansible IaC"
+        );
+        let files = bundle.unwrap();
+        let has_playbook = files
+            .iter()
+            .any(|(name, _)| *name == "controlled-restore-request.yml");
+        assert!(
+            has_playbook,
+            "controlled-restore-request ansible bundle must include controlled-restore-request.yml"
         );
     }
 
