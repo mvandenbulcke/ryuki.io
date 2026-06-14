@@ -5071,6 +5071,33 @@ async fn shift_contract() -> Json<Value> {
     Json(shift_queue::get_shift_contract())
 }
 
+// ─── Emergency Change (Break-Glass) persistence row ───
+
+/// One persisted `emergency_changes` row (migration 036). TEXT[] columns
+/// (affected_systems, audit_evidence) are natively decoded by sqlx as Vec<String>.
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct EmergencyChangeRow {
+    id: String,
+    change_description: String,
+    affected_systems: Vec<String>,
+    initiated_by: String,
+    reason_override: String,
+    approved_by: Option<String>,
+    executed_at: Option<chrono::DateTime<chrono::Utc>>,
+    status: String,
+    audit_evidence: Vec<String>,
+    site: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    post_review_notes: Option<String>,
+}
+
+const EMERGENCY_CHANGE_COLUMNS: &str =
+    "id::text, change_description, affected_systems, initiated_by, reason_override, \
+     approved_by, executed_at, status, audit_evidence, site, created_at, updated_at, \
+     post_review_notes";
+
 // ─── Emergency Change (Break-Glass) request types ───
 
 #[derive(Debug, Deserialize)]
@@ -5101,6 +5128,54 @@ struct EmergencySiteQuery {
 async fn emergency_initiate(
     Json(body): Json<EmergencyInitiateRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        if body.description.is_empty()
+            || body.initiated_by.is_empty()
+            || body.reason.is_empty()
+            || body.site.is_empty()
+        {
+            return Err(problem_details(
+                StatusCode::BAD_REQUEST,
+                "EMERGENCY_INITIATE_FAILED",
+                "description, initiated_by, reason, and site are required",
+                None::<&str>,
+            ));
+        }
+        let id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO emergency_changes \
+             (id, change_description, affected_systems, initiated_by, reason_override, \
+              status, audit_evidence, site, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 'Initiated', '{}', $6, $7, $7)",
+        )
+        .bind(id)
+        .bind(&body.description)
+        .bind(&body.systems)
+        .bind(&body.initiated_by)
+        .bind(&body.reason)
+        .bind(&body.site)
+        .bind(now)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_INITIATE_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        return Ok(Json(json!({
+            "source": "database",
+            "change_id": id.to_string(),
+            "status": "Initiated",
+            "initiated_by": body.initiated_by,
+            "site": body.site,
+            "created_at": now.to_rfc3339(),
+            "dry_run": true,
+        })));
+    }
     match emergency_change::initiate_emergency(
         &body.description,
         body.systems,
@@ -5119,6 +5194,64 @@ async fn emergency_initiate(
 }
 
 async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+        let approved_by = "EMERGENCY — auto-approved per break-glass policy";
+        let audit_entry = format!("EMERGENCY flag — auto-approved at {}", now.to_rfc3339());
+        // Atomic compare-and-set: only transitions Initiated → Approved.
+        let result = sqlx::query(
+            "UPDATE emergency_changes \
+             SET status = 'Approved', approved_by = $1, \
+                 audit_evidence = audit_evidence || ARRAY[$2::text], \
+                 updated_at = $3 \
+             WHERE id = $4::uuid AND status = 'Initiated'",
+        )
+        .bind(approved_by)
+        .bind(&audit_entry)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_APPROVE_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        if result.rows_affected() == 1 {
+            return Ok(Json(json!({
+                "source": "database",
+                "change_id": id,
+                "status": "Approved",
+                "approved_by": approved_by,
+                "approved_at": now.to_rfc3339(),
+                "dry_run": true,
+            })));
+        }
+        // 0 rows affected: distinguish 404 vs wrong-state 409.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        return match existing {
+            None => Err(problem_details(
+                StatusCode::NOT_FOUND,
+                "EMERGENCY_APPROVE_FAILED",
+                format!("Emergency change {} not found", id),
+                None::<&str>,
+            )),
+            Some(s) => Err(problem_details(
+                StatusCode::CONFLICT,
+                "EMERGENCY_APPROVE_FAILED",
+                format!("Cannot approve change in {} status", s),
+                None::<&str>,
+            )),
+        };
+    }
     match emergency_change::auto_approve(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5131,6 +5264,95 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
 }
 
 async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+        // First: read affected_systems so we can include them in the response
+        // (needed for the JSON shape parity with the engine response).
+        let row: Option<EmergencyChangeRow> = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_EXECUTE_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        let Some(row) = row else {
+            return Err(problem_details(
+                StatusCode::NOT_FOUND,
+                "EMERGENCY_EXECUTE_FAILED",
+                format!("Emergency change {} not found", id),
+                None::<&str>,
+            ));
+        };
+        if row.status != "Approved" {
+            return Err(problem_details(
+                StatusCode::CONFLICT,
+                "EMERGENCY_EXECUTE_FAILED",
+                format!(
+                    "Cannot execute change in {} status — approval required",
+                    row.status
+                ),
+                None::<&str>,
+            ));
+        }
+        let exec_entry = format!(
+            "[REDACTED] Dry-run mock execution completed at {}",
+            now.to_rfc3339()
+        );
+        let systems_entry = format!(
+            "[REDACTED] Affected systems: {}",
+            row.affected_systems.join(", ")
+        );
+        // Atomic conditional UPDATE: only transitions Approved → Executed.
+        let result = sqlx::query(
+            "UPDATE emergency_changes \
+             SET status = 'Executed', executed_at = $1, \
+                 audit_evidence = audit_evidence || ARRAY[$2::text, $3::text], \
+                 updated_at = $1 \
+             WHERE id = $4::uuid AND status = 'Approved'",
+        )
+        .bind(now)
+        .bind(&exec_entry)
+        .bind(&systems_entry)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_EXECUTE_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        if result.rows_affected() == 1 {
+            let mut updated_evidence = row.audit_evidence.clone();
+            updated_evidence.push(exec_entry);
+            updated_evidence.push(systems_entry);
+            return Ok(Json(json!({
+                "source": "database",
+                "change_id": id,
+                "status": "Executed",
+                "executed_at": now.to_rfc3339(),
+                "affected_systems": row.affected_systems,
+                "audit_evidence": updated_evidence,
+                "dry_run": true,
+            })));
+        }
+        // Race: another request got here first.
+        return Err(problem_details(
+            StatusCode::CONFLICT,
+            "EMERGENCY_EXECUTE_FAILED",
+            format!("Emergency change {} is no longer in Approved status", id),
+            None::<&str>,
+        ));
+    }
     match emergency_change::execute_emergency(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5143,6 +5365,73 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
 }
 
 async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+        let verify_entry = format!(
+            "[REDACTED] Post-execution verification passed at {}",
+            now.to_rfc3339()
+        );
+        // Atomic conditional UPDATE: only transitions Executed → Verified.
+        let result = sqlx::query(
+            "UPDATE emergency_changes \
+             SET status = 'Verified', \
+                 audit_evidence = audit_evidence || ARRAY[$1::text], \
+                 updated_at = $2 \
+             WHERE id = $3::uuid AND status = 'Executed'",
+        )
+        .bind(&verify_entry)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_VERIFY_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        if result.rows_affected() == 1 {
+            // Re-read audit_evidence for the response shape.
+            let evidence: Vec<String> = sqlx::query_scalar(
+                "SELECT audit_evidence FROM emergency_changes WHERE id = $1::uuid",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_default();
+            return Ok(Json(json!({
+                "source": "database",
+                "change_id": id,
+                "status": "Verified",
+                "verified_at": now.to_rfc3339(),
+                "audit_evidence": evidence,
+                "dry_run": true,
+            })));
+        }
+        // 0 rows affected: distinguish 404 vs wrong-state.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        return match existing {
+            None => Err(problem_details(
+                StatusCode::NOT_FOUND,
+                "EMERGENCY_VERIFY_FAILED",
+                format!("Emergency change {} not found", id),
+                None::<&str>,
+            )),
+            Some(s) => Err(problem_details(
+                StatusCode::CONFLICT,
+                "EMERGENCY_VERIFY_FAILED",
+                format!("Cannot verify change in {} status — execution required", s),
+                None::<&str>,
+            )),
+        };
+    }
     match emergency_change::verify_emergency(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5158,6 +5447,66 @@ async fn emergency_close(
     Path(id): Path<String>,
     Json(body): Json<EmergencyCloseRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+        let postmortem_entry = format!("Post-mortem review completed at {}", now.to_rfc3339());
+        // Atomic conditional UPDATE: only transitions Verified → Closed.
+        let result = sqlx::query(
+            "UPDATE emergency_changes \
+             SET status = 'Closed', post_review_notes = $1, \
+                 audit_evidence = audit_evidence || ARRAY[$2::text], \
+                 updated_at = $3 \
+             WHERE id = $4::uuid AND status = 'Verified'",
+        )
+        .bind(&body.post_review_notes)
+        .bind(&postmortem_entry)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_CLOSE_FAILED",
+                e.to_string(),
+                None::<&str>,
+            )
+        })?;
+        if result.rows_affected() == 1 {
+            return Ok(Json(json!({
+                "source": "database",
+                "change_id": id,
+                "status": "Closed",
+                "closed_at": now.to_rfc3339(),
+                "post_review_notes": body.post_review_notes,
+                "dry_run": true,
+            })));
+        }
+        // 0 rows: distinguish 404 vs wrong-state.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        return match existing {
+            None => Err(problem_details(
+                StatusCode::NOT_FOUND,
+                "EMERGENCY_CLOSE_FAILED",
+                format!("Emergency change {} not found", id),
+                None::<&str>,
+            )),
+            Some(s) => Err(problem_details(
+                StatusCode::CONFLICT,
+                "EMERGENCY_CLOSE_FAILED",
+                format!(
+                    "Cannot close change in {} status — verification required",
+                    s
+                ),
+                None::<&str>,
+            )),
+        };
+    }
     match emergency_change::close_emergency(&id, &body.post_review_notes) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5170,6 +5519,42 @@ async fn emergency_close(
 }
 
 async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<EmergencyChangeRow> = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes \
+             WHERE status != 'Closed' ORDER BY created_at DESC"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let emergencies: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "change_description": r.change_description,
+                    "affected_systems": r.affected_systems,
+                    "initiated_by": r.initiated_by,
+                    "reason_override": r.reason_override,
+                    "approved_by": r.approved_by,
+                    "executed_at": r.executed_at.map(|t| t.to_rfc3339()),
+                    "status": r.status,
+                    "site": r.site,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "updated_at": r.updated_at.to_rfc3339(),
+                    "audit_evidence_count": r.audit_evidence.len(),
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "count": emergencies.len(),
+            "emergencies": emergencies,
+            "dry_run": true,
+        })));
+    }
     match emergency_change::get_active_emergencies() {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5185,6 +5570,55 @@ async fn emergency_history(
     Query(params): Query<EmergencySiteQuery>,
 ) -> Result<Json<Value>, ProblemDetails> {
     let site = params.site.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<EmergencyChangeRow> = if site.is_empty() {
+            sqlx::query_as(&format!(
+                "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes \
+                 ORDER BY created_at DESC"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            sqlx::query_as(&format!(
+                "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes \
+                 WHERE site = $1 ORDER BY created_at DESC"
+            ))
+            .bind(&site)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        };
+
+        let history: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "change_description": r.change_description,
+                    "affected_systems": r.affected_systems,
+                    "initiated_by": r.initiated_by,
+                    "reason_override": r.reason_override,
+                    "approved_by": r.approved_by,
+                    "executed_at": r.executed_at.map(|t| t.to_rfc3339()),
+                    "status": r.status,
+                    "site": r.site,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "updated_at": r.updated_at.to_rfc3339(),
+                    "post_review_notes": r.post_review_notes,
+                    "audit_evidence": r.audit_evidence,
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "site": if site.is_empty() { "all" } else { &*site },
+            "count": history.len(),
+            "history": history,
+            "dry_run": true,
+        })));
+    }
     match emergency_change::get_emergency_history(&site) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -5200,6 +5634,60 @@ async fn emergency_stats(
     Query(params): Query<EmergencySiteQuery>,
 ) -> Result<Json<Value>, ProblemDetails> {
     let site = params.site.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<EmergencyChangeRow> = if site.is_empty() {
+            sqlx::query_as(&format!(
+                "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes ORDER BY created_at"
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            sqlx::query_as(&format!(
+                "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes \
+                 WHERE site = $1 ORDER BY created_at"
+            ))
+            .bind(&site)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+        };
+
+        let mut by_month: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut initiator_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for row in &rows {
+            let month_key = row.created_at.format("%Y-%m").to_string();
+            *by_month.entry(month_key).or_insert(0) += 1;
+            *initiator_counts
+                .entry(row.initiated_by.clone())
+                .or_insert(0) += 1;
+        }
+
+        let mut top_initiators: Vec<(String, usize)> = initiator_counts.into_iter().collect();
+        top_initiators.sort_by_key(|b| std::cmp::Reverse(b.1));
+        let top_initiators: Vec<Value> = top_initiators
+            .into_iter()
+            .map(|(name, count)| json!({ "initiator": name, "count": count }))
+            .collect();
+
+        let mut monthly: Vec<Value> = by_month
+            .into_iter()
+            .map(|(month, count)| json!({ "month": month, "count": count }))
+            .collect();
+        monthly.sort_by(|a, b| a["month"].as_str().cmp(&b["month"].as_str()));
+
+        return Ok(Json(json!({
+            "source": "database",
+            "site": if site.is_empty() { "all" } else { &*site },
+            "total": rows.len(),
+            "by_month": monthly,
+            "top_initiators": top_initiators,
+            "dry_run": true,
+        })));
+    }
     match emergency_change::get_emergency_stats(&site) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -20455,5 +20943,502 @@ mod shift_queue_db_tests {
         let Json(body) = shift_stale().await;
         assert_eq!(body["source"], "static-dry-run");
         assert_eq!(body["stale_threshold_hours"].as_u64().unwrap(), 4);
+    }
+}
+
+// ─── Unit (no-DB) fallback tests for emergency change handlers ───────────────
+//
+// These run without Postgres and exercise the in-memory engine fallback path.
+#[cfg(test)]
+mod emergency_change_unit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_initiate_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_initiate_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = emergency_initiate(Json(EmergencyInitiateRequest {
+            description: "Unit test emergency".into(),
+            systems: vec!["host-a".into()],
+            initiated_by: "unit.user".into(),
+            reason: "test reason".into(),
+            site: "DEFRA".into(),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert_eq!(body["status"], "Initiated");
+        assert_eq!(body["site"], "DEFRA");
+    }
+
+    #[tokio::test]
+    async fn test_initiate_validation_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_initiate_validation_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = emergency_initiate(Json(EmergencyInitiateRequest {
+            description: String::new(),
+            systems: vec![],
+            initiated_by: "u".into(),
+            reason: "r".into(),
+            site: "DEFRA".into(),
+        }))
+        .await;
+        assert!(result.is_err(), "empty description must fail");
+    }
+
+    #[tokio::test]
+    async fn test_approve_unknown_id_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_approve_unknown_id_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = emergency_approve(Path("nonexistent-id".into())).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_active_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_active_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Ok(Json(body)) = emergency_active().await else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert!(body["count"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_history_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_history_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Ok(Json(body)) = emergency_history(Query(EmergencySiteQuery {
+            site: Some("DEFRA".into()),
+        }))
+        .await
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert_eq!(body["site"], "DEFRA");
+        assert!(body["count"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_stats_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_stats_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Ok(Json(body)) = emergency_stats(Query(EmergencySiteQuery { site: None })).await else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert!(body["total"].as_u64().unwrap() >= 3);
+    }
+}
+
+// ─── DB-gated integration tests for emergency change persistence ──────────────
+//
+// Each test SKIPS when RYUKI_DATABASE_URL is unset.
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api emergency_change_db_tests
+#[cfg(test)]
+mod emergency_change_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Initialises the process-global DB pool so handler calls via get_db() hit
+    /// the real Postgres instance.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// Seed a row directly in a chosen status so we can test transitions without
+    /// traversing the full lifecycle each time.
+    async fn seed_change(pool: &PgPool, id: &str, status: &str, site: &str) {
+        sqlx::query(
+            "INSERT INTO emergency_changes \
+             (id, change_description, affected_systems, initiated_by, reason_override, \
+              status, audit_evidence, site) \
+             VALUES ($1::uuid, $2, ARRAY['host-a']::text[], 'seed.user', 'seed reason', \
+                    $3, '{}', $4) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(format!("Test emergency {id}"))
+        .bind(status)
+        .bind(site)
+        .execute(pool)
+        .await
+        .expect("seed emergency_change");
+    }
+
+    async fn cleanup_change(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM emergency_changes WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ── initiate persists to the DB ──
+
+    #[tokio::test]
+    async fn test_initiate_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = emergency_initiate(Json(EmergencyInitiateRequest {
+            description: "DB test emergency".into(),
+            systems: vec!["db-host-a".into()],
+            initiated_by: "db.test.user".into(),
+            reason: "DB integration test".into(),
+            site: "DEFRA".into(),
+        }))
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["status"], "Initiated");
+        assert_eq!(body["site"], "DEFRA");
+
+        let id = body["change_id"].as_str().unwrap();
+
+        // Verify the row exists in Postgres.
+        let row: Option<EmergencyChangeRow> = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read back");
+        let row = row.expect("row must exist after initiate");
+        assert_eq!(row.status, "Initiated");
+        assert_eq!(row.initiated_by, "db.test.user");
+        assert_eq!(row.site, "DEFRA");
+
+        cleanup_change(pool, id).await;
+    }
+
+    // ── approve transitions Initiated → Approved and persists approved_by ──
+
+    #[tokio::test]
+    async fn test_approve_transitions_initiated_to_approved() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000001";
+        seed_change(pool, id, "Initiated", "DEFRA").await;
+
+        let result = emergency_approve(Path(id.into())).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["status"], "Approved");
+        assert!(body["approved_by"].as_str().unwrap().contains("EMERGENCY"));
+
+        // Verify in DB.
+        let row: EmergencyChangeRow = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read back");
+        assert_eq!(row.status, "Approved");
+        assert!(row
+            .approved_by
+            .as_deref()
+            .unwrap_or("")
+            .contains("EMERGENCY"));
+        assert!(!row.audit_evidence.is_empty());
+
+        cleanup_change(pool, id).await;
+    }
+
+    // ── approve on already-Approved row returns 409 (atomic guard) ──
+
+    #[tokio::test]
+    async fn test_approve_already_approved_returns_conflict() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000002";
+        seed_change(pool, id, "Approved", "DEFRA").await;
+
+        let result = emergency_approve(Path(id.into())).await;
+
+        cleanup_change(pool, id).await;
+
+        let Err((status, _)) = result else {
+            panic!("expected Err 409, got Ok");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ── approve on missing row returns 404 (atomic guard) ──
+
+    #[tokio::test]
+    async fn test_approve_missing_row_returns_not_found() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = emergency_approve(Path("e0000360-0000-0000-0000-000000000099".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── execute transitions Approved → Executed and sets executed_at ──
+
+    #[tokio::test]
+    async fn test_execute_transitions_approved_to_executed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000003";
+        seed_change(pool, id, "Approved", "GBLON").await;
+
+        let result = emergency_execute(Path(id.into())).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["status"], "Executed");
+        assert!(body["executed_at"].as_str().is_some());
+
+        // Verify executed_at is set in DB.
+        let row: EmergencyChangeRow = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read back");
+        assert_eq!(row.status, "Executed");
+        assert!(row.executed_at.is_some());
+
+        cleanup_change(pool, id).await;
+    }
+
+    // ── execute on non-Approved row returns 409 ──
+
+    #[tokio::test]
+    async fn test_execute_wrong_state_returns_conflict() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000004";
+        seed_change(pool, id, "Initiated", "DEFRA").await;
+
+        let result = emergency_execute(Path(id.into())).await;
+
+        cleanup_change(pool, id).await;
+
+        let Err((status, _)) = result else {
+            panic!("expected Err 409, got Ok");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ── verify transitions Executed → Verified ──
+
+    #[tokio::test]
+    async fn test_verify_transitions_executed_to_verified() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000005";
+        seed_change(pool, id, "Executed", "DEFRA").await;
+
+        let result = emergency_verify(Path(id.into())).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["status"], "Verified");
+
+        let row: EmergencyChangeRow = sqlx::query_as(&format!(
+            "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read back");
+        assert_eq!(row.status, "Verified");
+
+        cleanup_change(pool, id).await;
+    }
+
+    // ── full lifecycle through close ──
+
+    #[tokio::test]
+    async fn test_full_lifecycle_through_close() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Initiate via handler.
+        let Ok(Json(init_body)) = emergency_initiate(Json(EmergencyInitiateRequest {
+            description: "Full lifecycle DB test".into(),
+            systems: vec!["host-x".into()],
+            initiated_by: "lifecycle.user".into(),
+            reason: "Full test".into(),
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("initiate failed");
+        };
+        let id = init_body["change_id"].as_str().unwrap().to_string();
+
+        // Approve.
+        let Ok(Json(approve_body)) = emergency_approve(Path(id.clone())).await else {
+            panic!("approve failed");
+        };
+        assert_eq!(approve_body["status"], "Approved");
+
+        // Execute.
+        let Ok(Json(exec_body)) = emergency_execute(Path(id.clone())).await else {
+            panic!("execute failed");
+        };
+        assert_eq!(exec_body["status"], "Executed");
+
+        // Verify.
+        let Ok(Json(verify_body)) = emergency_verify(Path(id.clone())).await else {
+            panic!("verify failed");
+        };
+        assert_eq!(verify_body["status"], "Verified");
+
+        // Close.
+        let Ok(Json(close_body)) = emergency_close(
+            Path(id.clone()),
+            Json(EmergencyCloseRequest {
+                post_review_notes: "DB lifecycle test passed".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("close failed");
+        };
+        assert_eq!(close_body["status"], "Closed");
+        assert_eq!(close_body["post_review_notes"], "DB lifecycle test passed");
+
+        cleanup_change(pool, &id).await;
+    }
+
+    // ── history and active read from Postgres ──
+
+    #[tokio::test]
+    async fn test_history_reads_from_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000006";
+        seed_change(pool, id, "Initiated", "DEFRA").await;
+
+        let Ok(Json(body)) = emergency_history(Query(EmergencySiteQuery {
+            site: Some("DEFRA".into()),
+        }))
+        .await
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["site"], "DEFRA");
+        let ids: Vec<&str> = body["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(ids.contains(&id), "seeded row must appear in history");
+
+        cleanup_change(pool, id).await;
+    }
+
+    #[tokio::test]
+    async fn test_active_reads_from_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000007";
+        seed_change(pool, id, "Approved", "GBLON").await;
+
+        let Ok(Json(body)) = emergency_active().await else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "database");
+        let ids: Vec<&str> = body["emergencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["id"].as_str())
+            .collect();
+        assert!(ids.contains(&id), "active seeded row must appear");
+
+        cleanup_change(pool, id).await;
+    }
+
+    // ── stats aggregates from Postgres ──
+
+    #[tokio::test]
+    async fn test_stats_reads_from_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000360-0000-0000-0000-000000000008";
+        seed_change(pool, id, "Verified", "DEFRA").await;
+
+        let Ok(Json(body)) = emergency_stats(Query(EmergencySiteQuery { site: None })).await else {
+            panic!("expected Ok");
+        };
+        assert_eq!(body["source"], "database");
+        assert!(body["total"].as_u64().unwrap() >= 1);
+        assert!(body["by_month"].is_array());
+        assert!(body["top_initiators"].is_array());
+
+        cleanup_change(pool, id).await;
     }
 }
