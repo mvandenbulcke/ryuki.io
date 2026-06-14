@@ -3,7 +3,7 @@ use crate::models::{condense_timestamp, AuthSession, RequestSummary};
 use crate::server_boundary::get_request_list;
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
-use leptos_router::hooks::use_navigate;
+use leptos_router::hooks::{use_navigate, use_query_map};
 use leptos_router::NavigateOptions;
 
 /// Zero-capability session used when no `AuthSession` is in context. An absent
@@ -21,6 +21,28 @@ fn no_capability_session() -> AuthSession {
 
 fn api_path(path: &'static str) -> &'static str {
     same_origin_api_path(path).unwrap_or(platform_summary_path())
+}
+
+/// Pure filtering function for the requests list.
+///
+/// Case-insensitive substring match across `id`, `name`, `request_type`,
+/// `status`, and `site`. An empty `q` returns all rows unchanged so the
+/// default (no search) view is identical to the pre-filter view.
+pub fn filter_requests<'a>(requests: &'a [RequestSummary], q: &str) -> Vec<&'a RequestSummary> {
+    if q.is_empty() {
+        return requests.iter().collect();
+    }
+    let needle = q.to_lowercase();
+    requests
+        .iter()
+        .filter(|r| {
+            r.id.to_lowercase().contains(&needle)
+                || r.name.to_lowercase().contains(&needle)
+                || r.request_type.to_lowercase().contains(&needle)
+                || r.status.to_lowercase().contains(&needle)
+                || r.site.to_lowercase().contains(&needle)
+        })
+        .collect()
 }
 
 pub(crate) fn status_badge_class(status: &str) -> &'static str {
@@ -60,6 +82,11 @@ pub fn RequestList() -> impl IntoView {
     let session = use_context::<AuthSession>().unwrap_or_else(no_capability_session);
     let can_request = session_can(&session, "request");
 
+    // Reactive query param: re-filters whenever `?q=` changes without
+    // re-fetching the server function.
+    let query = use_query_map();
+    let q_memo = Memo::new(move |_| query.with(|map| map.get("q").unwrap_or_default()));
+
     view! {
         <div class="request-list-view">
             <div class="request-list-toolbar">
@@ -80,6 +107,7 @@ pub fn RequestList() -> impl IntoView {
             }>
                 {move || {
                     let navigate = navigate.clone();
+                    let q = q_memo.get();
                     Suspend::new(async move {
                         let requests: Vec<RequestSummary> = match list_resource.await {
                             Ok(list) => list,
@@ -103,16 +131,55 @@ pub fn RequestList() -> impl IntoView {
                         };
 
                         if requests.is_empty() {
-                            view! {
+                            return view! {
                                 <div class="request-list-empty" aria-label="No requests">
                                     <p>"No requests yet."</p>
                                     <p class="table-note">"Create a new request to get started."</p>
                                 </div>
                             }
-                                .into_any()
-                        } else {
-                            view! {
-                                <div class="table-wrap">
+                                .into_any();
+                        }
+
+                        // Client-side filter: applied after the resource
+                        // resolves so no extra server round-trip is needed.
+                        let filtered: Vec<&RequestSummary> = filter_requests(&requests, &q);
+                        let total = requests.len();
+                        let match_count = filtered.len();
+                        let active_query = q.clone();
+
+                        if !active_query.is_empty() && match_count == 0 {
+                            return view! {
+                                <div class="request-list-empty" aria-label="No search results">
+                                    <p>"No requests match " <strong>{active_query.clone()}</strong></p>
+                                    <p class="table-note">
+                                        "Try a different search term or "
+                                        <a href="/requests">"clear the search"</a>
+                                        " to see all requests."
+                                    </p>
+                                </div>
+                            }
+                                .into_any();
+                        }
+
+                        // Owned copies for the iterator below (refs can't
+                        // outlive the borrowed `requests` vec in the view).
+                        let display_rows: Vec<RequestSummary> =
+                            filtered.into_iter().cloned().collect();
+                        // Extra clone for the Show `when` closure (borrows
+                        // the string reactively before the inner content
+                        // closure captures it).
+                        let show_query = active_query.clone();
+
+                        view! {
+                            <div class="table-wrap">
+                                // Search result note — only shown when a query is active.
+                                <Show when=move || !show_query.is_empty()>
+                                    <p class="search-result-note table-note">
+                                        {match_count} " result" {if match_count == 1 { "" } else { "s" }}
+                                        " for " <strong>{active_query.clone()}</strong>
+                                        " (of " {total} " total)"
+                                    </p>
+                                </Show>
                                 <table
                                     class="request-table dense-table"
                                     aria-label="Request list"
@@ -131,7 +198,7 @@ pub fn RequestList() -> impl IntoView {
                                         </tr>
                                     </thead>
                                     <tbody>
-                                        {requests
+                                        {display_rows
                                             .into_iter()
                                             .map(|req| {
                                                 let row_id = req.id.clone();
@@ -186,10 +253,9 @@ pub fn RequestList() -> impl IntoView {
                                             .collect_view()}
                                     </tbody>
                                 </table>
-                                </div>
-                            }
-                                .into_any()
+                            </div>
                         }
+                            .into_any()
                     })
                 }}
             </Suspense>

@@ -1,5 +1,5 @@
-/// Portal SSR integration tests for request-form hardening and badge/label
-/// coverage.
+/// Portal SSR integration tests for request-form hardening, badge/label
+/// coverage, and global-search filtering.
 ///
 /// These tests only compile and run under `--features ssr`; the portal default
 /// feature set is empty, so `cargo test --workspace` skips this module.  The
@@ -13,7 +13,8 @@ mod tests {
     use super::super::request_detail::{
         stage_label, status_badge_class as detail_status_badge_class,
     };
-    use super::super::requests::status_badge_class as list_status_badge_class;
+    use super::super::requests::{filter_requests, status_badge_class as list_status_badge_class};
+    use crate::models::RequestSummary;
 
     // --- Task 1.2 ---------------------------------------------------------
 
@@ -246,5 +247,130 @@ mod tests {
             msg.contains("CONFIG_VALIDATION_FAILED"),
             "underlying error must be present after stripping, got: {msg:?}"
         );
+    }
+
+    // ── Global search (P0#4) ──────────────────────────────────────────────────
+
+    fn make_requests() -> Vec<RequestSummary> {
+        vec![
+            RequestSummary {
+                id: "abc-1234".to_string(),
+                request_type: "server-build".to_string(),
+                name: "Build web server".to_string(),
+                site: "dc-west".to_string(),
+                environment: "production".to_string(),
+                status: "approved".to_string(),
+                stage: "approved".to_string(),
+                created: "2026-01-01T00:00:00Z".to_string(),
+            },
+            RequestSummary {
+                id: "def-5678".to_string(),
+                request_type: "patch-maintenance".to_string(),
+                name: "Patch Tuesday".to_string(),
+                site: "dc-east".to_string(),
+                environment: "staging".to_string(),
+                status: "intake".to_string(),
+                stage: "intake".to_string(),
+                created: "2026-01-02T00:00:00Z".to_string(),
+            },
+            RequestSummary {
+                id: "ghi-9012".to_string(),
+                request_type: "controlled-restore".to_string(),
+                name: "Restore backup".to_string(),
+                site: "dc-west".to_string(),
+                environment: "production".to_string(),
+                status: "failed".to_string(),
+                stage: "failed".to_string(),
+                created: "2026-01-03T00:00:00Z".to_string(),
+            },
+        ]
+    }
+
+    /// An empty query string returns all requests unchanged.
+    #[test]
+    fn filter_requests_empty_query_returns_all() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "");
+        assert_eq!(
+            filtered.len(),
+            all.len(),
+            "empty query must return all {n} requests",
+            n = all.len()
+        );
+    }
+
+    /// filter_requests matches against the request id (case-insensitive).
+    #[test]
+    fn filter_requests_matches_by_id() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "ABC");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "expected 1 match for 'ABC', got: {filtered:?}"
+        );
+        assert_eq!(filtered[0].id, "abc-1234");
+    }
+
+    /// filter_requests matches against the name field (case-insensitive).
+    #[test]
+    fn filter_requests_matches_by_name() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "patch");
+        assert_eq!(filtered.len(), 1, "expected 1 match for 'patch' in name");
+        assert_eq!(filtered[0].id, "def-5678");
+    }
+
+    /// filter_requests matches against request_type (case-insensitive).
+    #[test]
+    fn filter_requests_matches_by_request_type() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "server-build");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "expected 1 match for 'server-build' type"
+        );
+        assert_eq!(filtered[0].id, "abc-1234");
+    }
+
+    /// filter_requests matches against status (case-insensitive).
+    #[test]
+    fn filter_requests_matches_by_status() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "failed");
+        assert_eq!(filtered.len(), 1, "expected 1 match for status 'failed'");
+        assert_eq!(filtered[0].id, "ghi-9012");
+    }
+
+    /// filter_requests matches against site (case-insensitive).
+    #[test]
+    fn filter_requests_matches_by_site() {
+        let all = make_requests();
+        // Both abc-1234 and ghi-9012 are in dc-west.
+        let filtered = filter_requests(&all, "dc-west");
+        assert_eq!(filtered.len(), 2, "expected 2 matches for site 'dc-west'");
+    }
+
+    /// A non-matching query returns an empty vec.
+    #[test]
+    fn filter_requests_no_match_returns_empty() {
+        let all = make_requests();
+        let filtered = filter_requests(&all, "zzz-nonexistent");
+        assert!(
+            filtered.is_empty(),
+            "expected zero matches for 'zzz-nonexistent', got: {filtered:?}"
+        );
+    }
+
+    /// Matching is case-insensitive across all fields.
+    #[test]
+    fn filter_requests_is_case_insensitive() {
+        let all = make_requests();
+        let lower = filter_requests(&all, "approved");
+        let upper = filter_requests(&all, "APPROVED");
+        let mixed = filter_requests(&all, "Approved");
+        assert_eq!(lower.len(), upper.len(), "case must not affect match count");
+        assert_eq!(lower.len(), mixed.len(), "case must not affect match count");
     }
 }

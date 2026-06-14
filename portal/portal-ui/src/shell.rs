@@ -4,7 +4,8 @@ use crate::server_boundary::{perform_logout, PortalRouteStateSnapshot};
 use crate::workspace_catalog::{nav_item_is_active, role_satisfies, PRIMARY_NAV_ITEMS};
 use leptos::prelude::*;
 use leptos_router::components::Outlet;
-use leptos_router::hooks::use_location;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::NavigateOptions;
 
 /// The ryū logo mark shared with the ryuki.io landing page. Colors come from
 /// the shared `--logo-red`/`--logo-gold` tokens, which do not vary by theme;
@@ -107,6 +108,44 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
     let logout_pending = logout_action.pending();
     let on_signout_click = move |_| {
         logout_action.dispatch(());
+    };
+
+    // Global search: the input value drives navigation to /requests?q=<term>
+    // on submit (Enter key or form submit). Navigation is a no-op on SSR;
+    // the search only activates in the hydrated client.
+    let (search_value, set_search_value) = signal(String::new());
+    let navigate_search = use_navigate();
+    let on_search_submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let q = search_value.get_untracked();
+        let q = q.trim();
+        if q.is_empty() {
+            navigate_search("/requests", NavigateOptions::default());
+        } else {
+            let encoded: String = q
+                .chars()
+                .flat_map(|c| match c {
+                    ' ' => "+".chars().collect::<Vec<_>>(),
+                    c if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => {
+                        vec![c]
+                    }
+                    c => {
+                        // Percent-encode per UTF-8 BYTE: a multi-byte char must
+                        // encode as its bytes (e.g. '€' -> %E2%82%AC), not its
+                        // codepoint, so the query value round-trips correctly.
+                        let mut buf = [0u8; 4];
+                        c.encode_utf8(&mut buf)
+                            .bytes()
+                            .flat_map(|b| format!("%{b:02X}").chars().collect::<Vec<_>>())
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .collect();
+            navigate_search(
+                &format!("/requests?q={encoded}"),
+                NavigateOptions::default(),
+            );
+        }
     };
 
     let (theme_icon, set_theme_icon) = signal(String::from("\u{263C}\u{FE0F}"));
@@ -218,15 +257,15 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                         <strong>"Infrastructure Platform"</strong>
                     </span>
                 </a>
-                <form class="search" role="search">
-                    <label class="sr-only" for="global-search">"Global search"</label>
+                <form class="search" role="search" on:submit=on_search_submit>
+                    <label class="sr-only" for="global-search">"Search requests"</label>
                     <input
                         id="global-search"
                         type="search"
-                        placeholder="Global search — coming soon"
-                        title="Global search is not yet available"
-                        aria-disabled="true"
-                        disabled=true
+                        placeholder="Search requests…"
+                        aria-label="Search requests"
+                        prop:value=move || search_value.get()
+                        on:input=move |ev| set_search_value.set(event_target_value(&ev))
                     />
                 </form>
                 <div class="toolbar">
