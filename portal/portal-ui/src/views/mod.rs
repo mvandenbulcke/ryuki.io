@@ -1,5 +1,6 @@
 pub mod approvals;
 pub mod dashboard;
+pub mod integrations;
 pub mod login;
 pub mod request_create;
 pub mod request_detail;

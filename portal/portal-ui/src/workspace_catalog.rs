@@ -3,7 +3,7 @@ use crate::api::{
     admin_worker_capability_path, approval_decision_readiness_path, approvals_pending_path,
     catalog_offerings_path, catalog_request_form_path, cmdb_reconciliation_path,
     cmdb_relationship_graph_path, dry_run_plan_path, evidence_compliance_dashboard_path,
-    evidence_export_retention_path, inventory_ownership_risk_path,
+    evidence_export_retention_path, integrations_path, inventory_ownership_risk_path,
     inventory_resource_overview_path, operations_platform_health_path,
     operations_runbook_launch_path, request_intake_path, shift_queue_path,
 };
@@ -141,6 +141,11 @@ pub const PRIMARY_NAV_ITEMS: &[NavItem] = &[
         href: "/admin",
         required_role: Some("PlatformAdmin"),
     },
+    NavItem {
+        label: "Integrations",
+        href: "/integrations",
+        required_role: Some("PlatformAdmin"),
+    },
 ];
 
 /// Route-derived nav highlighting: an item is active when the current
@@ -191,6 +196,7 @@ pub fn match_portal_route(path: &str) -> Option<(String, &'static str)> {
         "/evidence" => "evidence",
         "/operations" => "operations",
         "/admin" => "admin",
+        "/integrations" => "integrations",
         _ => {
             let request_id = normalized.strip_prefix("/requests/")?;
             let id_is_safe = !request_id.is_empty()
@@ -375,6 +381,25 @@ pub const PRIMARY_WORKSPACES: &[WorkspaceDefinition] = &[
         secondary_api_path: admin_feature_flag_governance_path,
         required_role: Some("PlatformAdmin"),
     },
+    WorkspaceDefinition {
+        id: "integrations",
+        href: "/integrations",
+        label: "Integrations",
+        title: "Integrations workspace",
+        badge: "Admin only",
+        badge_class: "badge bad",
+        description: "Manage vendor integration connections: add, test, and configure credential sources for VMware, Zabbix, ServiceNow, and all other platform vendors.",
+        points: &[
+            "Vault / DB-encrypted / Env-var credentials",
+            "Per-connection test probe",
+            "Admin-gated — PlatformAdmin only",
+        ],
+        api_boundary: WORKSPACE_API_BOUNDARY,
+        execution_mode: WORKSPACE_EXECUTION_MODE,
+        primary_api_path: integrations_path,
+        secondary_api_path: integrations_path,
+        required_role: Some("PlatformAdmin"),
+    },
 ];
 
 #[cfg(test)]
@@ -457,6 +482,58 @@ mod tests {
             assert!(!session_can(&session, capability));
         }
     }
+
+    // ── Integrations workspace tests (T1, T2, T4) ─────────────────────────
+
+    /// T1 — lockstep: Integrations nav item resolves in the route table.
+    #[test]
+    fn integrations_nav_item_resolves_in_route_table() {
+        let item = PRIMARY_NAV_ITEMS
+            .iter()
+            .find(|i| i.href == "/integrations")
+            .expect("Integrations nav item must exist");
+        assert_eq!(item.required_role, Some("PlatformAdmin"));
+        assert!(
+            match_portal_route(item.href).is_some(),
+            "nav href /integrations must resolve in match_portal_route"
+        );
+    }
+
+    /// T2 — admin gating: PlatformAdmin sees it; Requester/Auditor/DatacenterApprover do not.
+    #[test]
+    fn integrations_nav_item_is_admin_gated() {
+        let item = PRIMARY_NAV_ITEMS
+            .iter()
+            .find(|i| i.href == "/integrations")
+            .expect("Integrations nav item must exist");
+        assert!(role_satisfies(
+            &session_with_roles(&["PlatformAdmin"]),
+            item.required_role
+        ));
+        assert!(!role_satisfies(
+            &session_with_roles(&["Requester"]),
+            item.required_role
+        ));
+        assert!(!role_satisfies(
+            &session_with_roles(&["Auditor"]),
+            item.required_role
+        ));
+        assert!(!role_satisfies(
+            &session_with_roles(&["DatacenterApprover"]),
+            item.required_role
+        ));
+    }
+
+    /// T4 — route matcher: /integrations resolves to "integrations".
+    #[test]
+    fn route_matcher_resolves_integrations_route() {
+        assert_eq!(
+            match_portal_route("/integrations"),
+            Some(("/integrations".to_string(), "integrations"))
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
 
     #[test]
     fn approvals_nav_item_is_gated_to_approver() {

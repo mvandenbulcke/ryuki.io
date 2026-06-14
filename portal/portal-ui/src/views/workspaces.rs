@@ -33,6 +33,7 @@ use crate::server_boundary::{
 };
 use crate::views::approvals::ApprovalsList;
 use crate::views::dashboard::DashboardView;
+use crate::views::integrations::IntegrationsPlaceholder;
 use crate::views::request_create::RequestCreate;
 use crate::views::request_detail::RequestDetail;
 use crate::views::request_detail::{audit_action_label, stage_label};
@@ -326,6 +327,36 @@ pub fn AdminWorkspaceView() -> impl IntoView {
                 <Show when=move || is_admin fallback=|| ()>
                     <TokenAdministrationDetail/>
                     <SessionAdministrationDetail/>
+                </Show>
+            </section>
+        </div>
+    }
+}
+
+/// `/integrations` — vendor integration connection management.
+///
+/// Admin-gated on the `admin` capability, mirroring `ApprovalsWorkspaceView`.
+/// PR-A ships the structural wiring; the functional list/form comes in PR-B.
+#[component]
+pub fn IntegrationsWorkspaceView() -> impl IntoView {
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let is_admin = session_can(&auth_session, "admin");
+
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="integrations"/>
+            <section class="workspace-detail-grid" aria-label="Integrations workspace details">
+                <Show
+                    when=move || is_admin
+                    fallback=|| {
+                        view! {
+                            <div class="request-list-empty" aria-label="No admin access">
+                                <p>"You do not have admin permissions."</p>
+                            </div>
+                        }
+                    }
+                >
+                    <IntegrationsPlaceholder/>
                 </Show>
             </section>
         </div>
