@@ -1,7 +1,28 @@
-.PHONY: build test lint validate clean run-api run-portal compose-up compose-down docker-build release-check
+.PHONY: build test test-unit test-db lint validate clean run-api run-portal compose-up compose-down docker-build release-check
 
 build:
 	cargo build --workspace
+
+# Run in-memory unit tests only (no database).
+# RYUKI_DATABASE_URL is explicitly unset so every DB test in ryuki-api skips
+# (they guard on the env var).  This prevents contamination: ryuki-api uses a
+# process-global `database::POOL` OnceLock — if ANY test in the same process
+# calls try_connect_with_url(), the pool is set for the entire process and the
+# in-memory request unit_tests (which expect no-DB mode) enter the DB code path
+# and fail.  Running unit tests without the URL keeps the pool unset and the
+# two test categories fully isolated.
+test-unit:
+	RYUKI_DATABASE_URL= cargo test -p ryuki-api
+	cargo test -p ryuki-engine
+
+# Run DB integration tests only (requires a live Postgres instance).
+# Filtered by module name so only DB tests run in this process — no in-memory
+# unit_tests are executed, and the global pool contamination cannot occur.
+# The `db_lifecycle_tests` filter is included so existing lifecycle DB tests
+# run alongside the new maintenance-calendar DB tests.
+test-db:
+	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
+	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests
 
 test:
 	cargo test --workspace

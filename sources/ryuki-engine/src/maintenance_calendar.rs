@@ -65,7 +65,11 @@ fn overlaps(a_start: &str, a_end: &str, b_start: &str, b_end: &str) -> bool {
     as_ < be && bs < ae
 }
 
-pub fn schedule_window(
+/// Pure input validation + window construction. Does NOT check for conflicts
+/// and does NOT mutate the in-memory store. Safe to call in DB mode without
+/// touching the OnceLock store — the handler runs the DB conflict pre-check
+/// instead.
+pub fn validate_window_inputs(
     site: &str,
     start_time: &str,
     end_time: &str,
@@ -88,19 +92,6 @@ pub fn schedule_window(
         return Err("reason cannot be empty".into());
     }
 
-    let conflicts = check_conflicts_internal(site, start_time, end_time, None);
-    if !conflicts.is_empty() {
-        return Err(format!(
-            "Conflict detected with {} existing window(s): {}",
-            conflicts.len(),
-            conflicts
-                .iter()
-                .map(|w| format!("{} ({})", w.id, w.reason))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
     let id = format!(
         "mw-{}",
         Uuid::new_v4()
@@ -110,8 +101,8 @@ pub fn schedule_window(
             .unwrap_or("unknown")
     );
 
-    let window = MaintenanceWindow {
-        id: id.clone(),
+    Ok(MaintenanceWindow {
+        id,
         site: site.to_string(),
         start_time: start_time.to_string(),
         end_time: end_time.to_string(),
@@ -124,7 +115,30 @@ pub fn schedule_window(
             ("dry_run".into(), "true".into()),
             ("source".into(), "static-seed".into()),
         ]),
-    };
+    })
+}
+
+pub fn schedule_window(
+    site: &str,
+    start_time: &str,
+    end_time: &str,
+    reason: &str,
+    affected_cis: Vec<String>,
+) -> Result<MaintenanceWindow, String> {
+    let window = validate_window_inputs(site, start_time, end_time, reason, affected_cis.clone())?;
+
+    let conflicts = check_conflicts_internal(site, start_time, end_time, None);
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "Conflict detected with {} existing window(s): {}",
+            conflicts.len(),
+            conflicts
+                .iter()
+                .map(|w| format!("{} ({})", w.id, w.reason))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
     window_store().lock().unwrap().push(window.clone());
     Ok(window)
@@ -533,6 +547,45 @@ mod tests {
 
     fn make_cis() -> Vec<String> {
         vec!["srv-01".into(), "srv-02".into()]
+    }
+
+    /// Verifies that `validate_window_inputs` is pure: it returns Ok with the
+    /// constructed window (all 5 error cases → Err) and NEVER pushes to the
+    /// in-memory store.
+    #[test]
+    fn test_validate_window_inputs_no_side_effects() {
+        let start = future_time(50, 0);
+        let end = future_time(50, 4);
+
+        // Valid inputs — should return Ok without mutating the store.
+        let store_before = window_store().lock().unwrap().len();
+        let result = validate_window_inputs("DEFRA", &start, &end, "pure validate", make_cis());
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        let store_after = window_store().lock().unwrap().len();
+        assert_eq!(
+            store_before, store_after,
+            "validate_window_inputs must NOT push to the store"
+        );
+
+        // Error: unknown site.
+        let err = validate_window_inputs("MARS", &start, &end, "bad site", make_cis());
+        assert!(err.unwrap_err().contains("Unknown site"));
+
+        // Error: invalid start_time.
+        let err = validate_window_inputs("DEFRA", "not-a-time", &end, "bad start", make_cis());
+        assert!(err.unwrap_err().contains("Invalid start_time"));
+
+        // Error: invalid end_time.
+        let err = validate_window_inputs("DEFRA", &start, "not-a-time", "bad end", make_cis());
+        assert!(err.unwrap_err().contains("Invalid end_time"));
+
+        // Error: end <= start.
+        let err = validate_window_inputs("DEFRA", &end, &start, "reversed", make_cis());
+        assert!(err.unwrap_err().contains("end_time must be after"));
+
+        // Error: empty reason.
+        let err = validate_window_inputs("DEFRA", &start, &end, "   ", make_cis());
+        assert!(err.unwrap_err().contains("reason cannot be empty"));
     }
 
     #[test]
