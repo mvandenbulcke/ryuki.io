@@ -90,7 +90,18 @@ pub fn redact_evidence(pack: &mut EvidencePack) -> Result<(), String> {
     for item in pack.items.iter_mut() {
         if should_redact(&item.key, &item.value) {
             item.redacted = true;
-            item.redacted_value = Some("***REDACTED***".into());
+            if item.redacted_value.is_none() {
+                item.redacted_value = Some("***REDACTED***".into());
+            }
+        }
+        // For every redacted item (whether just flagged above or pre-marked
+        // by the lifecycle), overwrite the raw value with the safe form so
+        // the pack — and its digest — never carry a sensitive raw value.
+        if item.redacted {
+            item.value = item
+                .redacted_value
+                .clone()
+                .unwrap_or_else(|| "***REDACTED***".into());
         }
     }
     pack.redacted = true;
@@ -521,5 +532,53 @@ mod tests {
         };
         let exported = export_evidence(&pack, "json").unwrap();
         assert!(exported.contains("web-server-01"));
+    }
+
+    /// REGRESSION: the full pipeline (collect_evidence → redact_evidence) must
+    /// not leak a raw sensitive value into the serialized pack JSON — the same
+    /// representation that the API writes into `content.pack` and the portal
+    /// renders in the JSON-export panel.
+    ///
+    /// We inject a stage with a pre-built EvidenceItem whose `key` matches a
+    /// sensitive pattern and whose `value` holds a recognisable raw secret.
+    /// After collect_evidence, we serialize the ENTIRE EvidencePack (the
+    /// pack struct, not the safe-export wrapper) to JSON and assert:
+    ///   - the raw secret is absent from the serialized bytes
+    ///   - "***REDACTED***" is present in the serialized bytes
+    #[test]
+    fn test_regression_redact_evidence_raw_value_absent_in_serialized_pack() {
+        let raw_secret = "password: hunter2";
+        let mut req = make_request_with_stages();
+
+        // Inject a stage that carries an item with the raw sensitive value.
+        req.stages.push(Stage {
+            name: "sensitive-stage".into(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: "admin_password".into(),
+                value: raw_secret.into(),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::ExecutionLog,
+            }],
+            metadata: HashMap::new(),
+        });
+
+        let pack = collect_evidence(&req).expect("collect_evidence must succeed");
+
+        // Serialize the FULL EvidencePack struct — the same path the API uses
+        // when it calls serde_json::to_value(&pack) into content.pack.
+        let serialized = serde_json::to_string(&pack).expect("pack must serialize");
+
+        assert!(
+            !serialized.contains(raw_secret),
+            "raw secret must not appear in the serialized pack; found in: {serialized}"
+        );
+        assert!(
+            serialized.contains("***REDACTED***"),
+            "***REDACTED*** must appear in the serialized pack"
+        );
     }
 }
