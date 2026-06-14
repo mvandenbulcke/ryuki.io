@@ -4607,61 +4607,463 @@ struct ShiftMyItemsQuery {
     user: Option<String>,
 }
 
+/// One persisted `shift_queue` row (migration 029). JSONB `metadata` is
+/// selected as `::text` and parsed back so `to_json` reproduces the engine
+/// `ShiftItem` serde shape (snake_case fields, ISO-8601 timestamps).
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct ShiftQueueRow {
+    id: String,
+    item_type: String,
+    title: String,
+    description: String,
+    priority: String,
+    assigned_to: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    acknowledged: bool,
+    acknowledged_by: Option<String>,
+    acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    resolved: bool,
+    resolution: Option<String>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+    escalated: bool,
+    escalation_reason: Option<String>,
+    escalated_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: String,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+const SHIFT_QUEUE_COLUMNS: &str =
+    "id, item_type, title, description, priority, assigned_to, created_at, \
+     acknowledged, acknowledged_by, acknowledged_at, resolved, resolution, resolved_at, \
+     escalated, escalation_reason, escalated_at, metadata::text AS metadata, updated_at";
+
 async fn shift_summary() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue \
+             WHERE resolved = false ORDER BY priority, created_at"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let total_open = rows.len();
+        let p1_open = rows.iter().filter(|r| r.priority == "P1").count();
+        let p2_open = rows.iter().filter(|r| r.priority == "P2").count();
+        let unacknowledged = rows.iter().filter(|r| !r.acknowledged).count();
+
+        let mut by_type: std::collections::HashMap<String, Value> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let entry = by_type.entry(row.item_type.clone()).or_insert_with(|| {
+                json!({
+                    "count": 0,
+                    "items": [],
+                    "p1_count": 0,
+                    "p2_count": 0,
+                    "unacknowledged": 0,
+                })
+            });
+            let obj = entry.as_object_mut().unwrap();
+            obj["count"] = json!(obj["count"].as_u64().unwrap() + 1);
+            if row.priority == "P1" {
+                obj["p1_count"] = json!(obj["p1_count"].as_u64().unwrap() + 1);
+            }
+            if row.priority == "P2" {
+                obj["p2_count"] = json!(obj["p2_count"].as_u64().unwrap() + 1);
+            }
+            if !row.acknowledged {
+                obj["unacknowledged"] = json!(obj["unacknowledged"].as_u64().unwrap() + 1);
+            }
+            obj["items"].as_array_mut().unwrap().push(json!({
+                "id": row.id,
+                "title": row.title,
+                "priority": row.priority,
+                "assigned_to": row.assigned_to,
+                "acknowledged": row.acknowledged,
+                "escalated": row.escalated,
+                "created_at": row.created_at.to_rfc3339(),
+            }));
+        }
+
+        return Json(json!({
+            "source": "database",
+            "total_open": total_open,
+            "p1_open": p1_open,
+            "p2_open": p2_open,
+            "unacknowledged": unacknowledged,
+            "by_type": by_type,
+        }));
+    }
     Json(shift_queue::get_shift_summary())
 }
 
 async fn shift_acknowledge(
     Path(id): Path<String>,
     Json(body): Json<ShiftActionRequest>,
-) -> Json<Value> {
-    Json(
-        shift_queue::acknowledge_item(&id, &body.user)
-            .map_err(|e| json!({"error": e}))
-            .unwrap_or_default(),
-    )
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Validate against DB state (not in-memory) — the row must exist and
+        // must not already be acknowledged or resolved.
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Shift item not found: {}", id)})),
+            )
+        })?;
+
+        if row.resolved {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Cannot acknowledge a resolved item"})),
+            ));
+        }
+        if row.acknowledged {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Item {} is already acknowledged", id)})),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "UPDATE shift_queue SET acknowledged = true, acknowledged_by = $1, \
+             acknowledged_at = $2, updated_at = $2 WHERE id = $3",
+        )
+        .bind(&body.user)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "status": "acknowledged",
+            "id": id,
+            "acknowledged_by": body.user,
+            "acknowledged_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
+    shift_queue::acknowledge_item(&id, &body.user)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
-async fn shift_assign(Path(id): Path<String>, Json(body): Json<ShiftActionRequest>) -> Json<Value> {
-    Json(
-        shift_queue::assign_item(&id, &body.user)
-            .map_err(|e| json!({"error": e}))
-            .unwrap_or_default(),
-    )
+async fn shift_assign(
+    Path(id): Path<String>,
+    Json(body): Json<ShiftActionRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Shift item not found: {}", id)})),
+            )
+        })?;
+
+        if row.resolved {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Cannot assign a resolved item"})),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        sqlx::query("UPDATE shift_queue SET assigned_to = $1, updated_at = $2 WHERE id = $3")
+            .bind(&body.user)
+            .bind(now)
+            .bind(&id)
+            .execute(pool)
+            .await
+            .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "status": "assigned",
+            "id": id,
+            "assigned_to": body.user,
+            "source": "database",
+        })));
+    }
+    shift_queue::assign_item(&id, &body.user)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
 async fn shift_escalate(
     Path(id): Path<String>,
     Json(body): Json<ShiftEscalateRequest>,
-) -> Json<Value> {
-    Json(
-        shift_queue::escalate_item(&id, &body.reason)
-            .map_err(|e| json!({"error": e}))
-            .unwrap_or_default(),
-    )
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Shift item not found: {}", id)})),
+            )
+        })?;
+
+        if row.resolved {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Cannot escalate a resolved item"})),
+            ));
+        }
+        if row.escalated {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Item {} is already escalated", id)})),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "UPDATE shift_queue SET escalated = true, escalation_reason = $1, \
+             escalated_at = $2, updated_at = $2 WHERE id = $3",
+        )
+        .bind(&body.reason)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "status": "escalated",
+            "id": id,
+            "reason": body.reason,
+            "escalated_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
+    shift_queue::escalate_item(&id, &body.reason)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
 async fn shift_resolve(
     Path(id): Path<String>,
     Json(body): Json<ShiftResolveRequest>,
-) -> Json<Value> {
-    Json(
-        shift_queue::resolve_item(&id, &body.resolution)
-            .map_err(|e| json!({"error": e}))
-            .unwrap_or_default(),
-    )
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Shift item not found: {}", id)})),
+            )
+        })?;
+
+        if row.resolved {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Item {} is already resolved", id)})),
+            ));
+        }
+
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "UPDATE shift_queue SET resolved = true, resolution = $1, \
+             resolved_at = $2, updated_at = $2 WHERE id = $3",
+        )
+        .bind(&body.resolution)
+        .bind(now)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "status": "resolved",
+            "id": id,
+            "resolution": body.resolution,
+            "resolved_at": now.to_rfc3339(),
+            "source": "database",
+        })));
+    }
+    shift_queue::resolve_item(&id, &body.resolution)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
 async fn shift_handover() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        let open_rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue \
+             WHERE resolved = false ORDER BY priority, created_at"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let recently_resolved_rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue \
+             WHERE resolved = true AND resolved_at >= NOW() - INTERVAL '12 hours' \
+             ORDER BY resolved_at DESC"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let total_open = open_rows.len();
+        let p1_count = open_rows.iter().filter(|r| r.priority == "P1").count();
+        let p2_count = open_rows.iter().filter(|r| r.priority == "P2").count();
+        let unacknowledged_count = open_rows.iter().filter(|r| !r.acknowledged).count();
+        let escalated_count = open_rows.iter().filter(|r| r.escalated).count();
+
+        let open_items: Vec<Value> = open_rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "item_type": r.item_type,
+                    "title": r.title,
+                    "description": r.description,
+                    "priority": r.priority,
+                    "assigned_to": r.assigned_to,
+                    "acknowledged": r.acknowledged,
+                    "escalated": r.escalated,
+                    "escalation_reason": r.escalation_reason,
+                    "created_at": r.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        let recently_resolved: Vec<Value> = recently_resolved_rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "title": r.title,
+                    "resolution": r.resolution,
+                    "resolved_at": r.resolved_at.as_ref().map(|d| d.to_rfc3339()),
+                })
+            })
+            .collect();
+
+        return Json(json!({
+            "source": "database",
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "shift_summary": {
+                "total_open": total_open,
+                "p1_count": p1_count,
+                "p2_count": p2_count,
+                "unacknowledged_count": unacknowledged_count,
+                "escalated_count": escalated_count,
+            },
+            "open_items": open_items,
+            "recently_resolved": recently_resolved,
+            "handover_notes": [],
+        }));
+    }
     Json(shift_queue::get_handover_report())
 }
 
 async fn shift_my_items(Query(params): Query<ShiftMyItemsQuery>) -> Json<Value> {
     let user = params.user.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue \
+             WHERE resolved = false AND assigned_to = $1 ORDER BY priority, created_at"
+        ))
+        .bind(&user)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "item_type": r.item_type,
+                    "title": r.title,
+                    "priority": r.priority,
+                    "acknowledged": r.acknowledged,
+                    "escalated": r.escalated,
+                    "created_at": r.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        return Json(json!({
+            "source": "database",
+            "user": user,
+            "count": items.len(),
+            "items": items,
+        }));
+    }
     Json(shift_queue::get_my_items(&user))
 }
 
 async fn shift_stale() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        // Stale = not resolved, not acknowledged, created more than 4 hours ago.
+        let rows: Vec<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue \
+             WHERE resolved = false AND acknowledged = false \
+               AND created_at <= NOW() - INTERVAL '4 hours' \
+             ORDER BY created_at"
+        ))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let now = chrono::Utc::now();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let hours_stale = (now - r.created_at).num_hours();
+                json!({
+                    "id": r.id,
+                    "item_type": r.item_type,
+                    "title": r.title,
+                    "priority": r.priority,
+                    "assigned_to": r.assigned_to,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "hours_stale": hours_stale,
+                })
+            })
+            .collect();
+
+        return Json(json!({
+            "source": "database",
+            "stale_threshold_hours": 4,
+            "count": items.len(),
+            "items": items,
+        }));
+    }
     Json(shift_queue::get_stale_items())
 }
 
@@ -19588,5 +19990,470 @@ mod approved_packages_db_tests {
         // In DB mode (test-db), the body has a `packages` key.
         let has_packages = body.is_array() || body.get("packages").is_some();
         assert!(has_packages, "response must contain package data: {body}");
+    }
+}
+
+#[cfg(test)]
+mod shift_queue_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Initialises the PROCESS-GLOBAL `database::POOL` so that handler calls
+    /// routed through `get_db()` hit the real DB.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn seed_item(
+        pool: &PgPool,
+        id: &str,
+        item_type: &str,
+        priority: &str,
+        assigned_to: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO shift_queue \
+             (id, item_type, title, description, priority, assigned_to) \
+             VALUES ($1::uuid, $2, $3, $4, $5, $6) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(format!("Test item {id}"))
+        .bind("Test description")
+        .bind(priority)
+        .bind(assigned_to)
+        .execute(pool)
+        .await
+        .expect("seed shift_queue item");
+    }
+
+    async fn cleanup_item(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ── DB-gated: acknowledge persists to the DB and is visible on re-read ──
+
+    #[tokio::test]
+    async fn test_acknowledge_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000001";
+        seed_item(pool, id, "failed-operation", "P2", None).await;
+
+        // Call the handler — must go through the DB path.
+        let result = shift_acknowledge(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "db-test-user".to_string(),
+            }),
+        )
+        .await;
+
+        cleanup_item(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "acknowledged");
+        assert_eq!(body["acknowledged_by"], "db-test-user");
+        assert_eq!(body["source"], "database");
+        assert!(body["acknowledged_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_returns_404_for_missing_item() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = shift_acknowledge(
+            Path("e0000291-0000-0000-0000-000000000099".to_string()),
+            Json(ShiftActionRequest {
+                user: "nobody".to_string(),
+            }),
+        )
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_acknowledge_already_acknowledged_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000002";
+        seed_item(pool, id, "pending-approval", "P3", Some("ops-lead")).await;
+
+        // First acknowledge.
+        let _ = shift_acknowledge(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "ops-lead".to_string(),
+            }),
+        )
+        .await
+        .expect("first acknowledge must succeed");
+
+        // Second acknowledge must fail with 400.
+        let result = shift_acknowledge(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "ops-lead".to_string(),
+            }),
+        )
+        .await;
+
+        cleanup_item(pool, id).await;
+
+        let Err((status, Json(err))) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("already acknowledged"),
+            "error must mention already acknowledged: {err}"
+        );
+    }
+
+    // ── DB-gated: assign persists and is visible on subsequent read ──
+
+    #[tokio::test]
+    async fn test_assign_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000003";
+        seed_item(pool, id, "blocked-request", "P3", None).await;
+
+        let result = shift_assign(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "network-team".to_string(),
+            }),
+        )
+        .await;
+
+        // Verify the DB row was actually updated.
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+
+        cleanup_item(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "assigned");
+        assert_eq!(body["source"], "database");
+
+        let row = row.expect("row must exist after assign");
+        assert_eq!(
+            row.assigned_to.as_deref(),
+            Some("network-team"),
+            "assigned_to must be persisted in DB"
+        );
+    }
+
+    // ── DB-gated: escalate persists lifecycle fields ──
+
+    #[tokio::test]
+    async fn test_escalate_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000004";
+        seed_item(pool, id, "active-incident", "P1", Some("storage-lead")).await;
+
+        let result = shift_escalate(
+            Path(id.to_string()),
+            Json(ShiftEscalateRequest {
+                reason: "P1 needs manager escalation".to_string(),
+            }),
+        )
+        .await;
+
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+
+        cleanup_item(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "escalated");
+        assert_eq!(body["source"], "database");
+
+        let row = row.expect("row must exist after escalate");
+        assert!(row.escalated, "escalated flag must be true in DB");
+        assert_eq!(
+            row.escalation_reason.as_deref(),
+            Some("P1 needs manager escalation"),
+            "escalation_reason must be persisted"
+        );
+        assert!(row.escalated_at.is_some(), "escalated_at must be set");
+    }
+
+    // ── DB-gated: resolve persists + summary shows one fewer open item ──
+
+    #[tokio::test]
+    async fn test_resolve_persists_and_summary_reflects_change() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000005";
+        seed_item(pool, id, "veeam-failure", "P2", Some("backup-eng")).await;
+
+        // Capture open count before resolve.
+        let before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM shift_queue WHERE resolved = false")
+                .fetch_one(pool)
+                .await
+                .expect("count before");
+
+        let result = shift_resolve(
+            Path(id.to_string()),
+            Json(ShiftResolveRequest {
+                resolution: "Backup job re-ran successfully".to_string(),
+            }),
+        )
+        .await;
+
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM shift_queue WHERE resolved = false")
+                .fetch_one(pool)
+                .await
+                .expect("count after");
+
+        // Verify DB row state.
+        let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
+            "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+
+        cleanup_item(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["status"], "resolved");
+        assert_eq!(body["source"], "database");
+        assert_eq!(
+            after,
+            before - 1,
+            "open count must decrease by 1 after resolve"
+        );
+
+        let row = row.expect("row must still exist (just marked resolved)");
+        assert!(row.resolved, "resolved flag must be true");
+        assert_eq!(
+            row.resolution.as_deref(),
+            Some("Backup job re-ran successfully")
+        );
+        assert!(row.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_already_resolved_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000006";
+        seed_item(pool, id, "expiring-cert", "P2", Some("sec-team")).await;
+
+        let _ = shift_resolve(
+            Path(id.to_string()),
+            Json(ShiftResolveRequest {
+                resolution: "First resolution".to_string(),
+            }),
+        )
+        .await
+        .expect("first resolve must succeed");
+
+        let result = shift_resolve(
+            Path(id.to_string()),
+            Json(ShiftResolveRequest {
+                resolution: "Second resolution".to_string(),
+            }),
+        )
+        .await;
+
+        cleanup_item(pool, id).await;
+
+        let Err((status, _)) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── DB-gated: summary returns source=database ──
+
+    #[tokio::test]
+    async fn test_summary_returns_database_source() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let Json(body) = shift_summary().await;
+        assert_eq!(
+            body["source"], "database",
+            "summary must report source=database when pool is set"
+        );
+        assert!(body["total_open"].as_u64().is_some());
+    }
+
+    // ── DB-gated: my-items returns only items for the given user ──
+
+    #[tokio::test]
+    async fn test_my_items_filters_by_user_in_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id_a = "e0000291-0000-0000-0000-000000000007";
+        let id_b = "e0000291-0000-0000-0000-000000000008";
+        seed_item(pool, id_a, "blocked-request", "P3", Some("db-user-alice")).await;
+        seed_item(pool, id_b, "pending-approval", "P3", Some("db-user-bob")).await;
+
+        let Json(alice) = shift_my_items(Query(ShiftMyItemsQuery {
+            user: Some("db-user-alice".to_string()),
+        }))
+        .await;
+
+        cleanup_item(pool, id_a).await;
+        cleanup_item(pool, id_b).await;
+
+        assert_eq!(alice["source"], "database");
+        let items = alice["items"].as_array().expect("items array");
+        assert!(
+            items.iter().any(|i| i["id"] == id_a),
+            "alice's item must appear"
+        );
+        assert!(
+            !items.iter().any(|i| i["id"] == id_b),
+            "bob's item must not appear in alice's list"
+        );
+    }
+
+    // ── DB-gated: stale returns items older than 4 hours that are unacknowledged ──
+
+    #[tokio::test]
+    async fn test_stale_returns_old_unacknowledged_items() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000009";
+        // Insert an item with a created_at 5 hours ago so it qualifies as stale.
+        sqlx::query(
+            "INSERT INTO shift_queue \
+             (id, item_type, title, description, priority, created_at) \
+             VALUES ($1::uuid, 'blocked-request', 'Stale DB test', 'desc', 'P3', \
+                     NOW() - INTERVAL '5 hours') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed stale item");
+
+        let Json(body) = shift_stale().await;
+
+        cleanup_item(pool, id).await;
+
+        assert_eq!(body["source"], "database");
+        let items = body["items"].as_array().expect("items array");
+        assert!(
+            items.iter().any(|i| i["id"] == id),
+            "stale item must appear in stale list: {items:?}"
+        );
+    }
+
+    // ── Unit (no-DB): in-memory fallback still works ──
+    //
+    // These tests do NOT set RYUKI_DATABASE_URL so they run even in `make test-unit`.
+    // They run as part of the shift_queue_db_tests module for colocation, but
+    // exercise the engine fallback path exclusively.
+
+    #[tokio::test]
+    async fn test_summary_fallback_no_db() {
+        // No pool init → get_db() must return None → engine path.
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_summary_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Json(body) = shift_summary().await;
+        // Engine returns source=static-dry-run.
+        assert_eq!(body["source"], "static-dry-run");
+        assert!(body["total_open"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_my_items_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_my_items_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Json(body) = shift_my_items(Query(ShiftMyItemsQuery {
+            user: Some("ops-lead".to_string()),
+        }))
+        .await;
+        assert_eq!(body["source"], "static-dry-run");
+        assert!(body["count"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_stale_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_stale_fallback_no_db: running in DB mode");
+            return;
+        }
+        let Json(body) = shift_stale().await;
+        assert_eq!(body["source"], "static-dry-run");
+        assert_eq!(body["stale_threshold_hours"].as_u64().unwrap(), 4);
     }
 }
