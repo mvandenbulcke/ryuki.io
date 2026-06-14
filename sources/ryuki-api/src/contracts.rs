@@ -12530,11 +12530,102 @@ async fn network_contract() -> Json<Value> {
     }))
 }
 
+// ─── OOB Access — persistence layer ───────────────────────────────────────────
+
+/// One persisted `oob_endpoints` row (migration 027).
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct OobEndpointRow {
+    id: sqlx::types::Uuid,
+    endpoint_type: String,
+    hostname: String,
+    ip_address: String,
+    site: String,
+    firmware_version: String,
+    certificate_valid: bool,
+    cert_expiry: chrono::DateTime<chrono::Utc>,
+    last_tested: chrono::DateTime<chrono::Utc>,
+    reachable: bool,
+    default_credentials_changed: bool,
+}
+
+const OOB_COLUMNS: &str = "id, endpoint_type, hostname, ip_address, site, firmware_version, \
+     certificate_valid, cert_expiry, last_tested, reachable, default_credentials_changed";
+
+/// Renders the full endpoint object used by `get_inventory` (all fields).
+fn oob_row_to_full_json(r: &OobEndpointRow) -> Value {
+    json!({
+        "id": r.id.to_string(),
+        "endpoint_type": r.endpoint_type,
+        "hostname": r.hostname,
+        "ip_address": r.ip_address,
+        "site": r.site,
+        "firmware_version": r.firmware_version,
+        "certificate_valid": r.certificate_valid,
+        "cert_expiry": r.cert_expiry.to_rfc3339(),
+        "last_tested": r.last_tested.to_rfc3339(),
+        "reachable": r.reachable,
+        "default_credentials_changed": r.default_credentials_changed,
+    })
+}
+
 // ─── OOB Access Validation handlers ───
+
+/// Parse a path id as a UUID for the DB path. A malformed id is treated as a
+/// missing endpoint (404) — matching the engine fallback, which finds no match
+/// for an arbitrary string — rather than letting Postgres reject the cast and
+/// surface a 500 with raw DB text.
+fn parse_oob_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value>)> {
+    sqlx::types::Uuid::parse_str(id).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("OOB endpoint {} not found", id) })),
+        )
+    })
+}
 
 async fn oob_test_endpoint(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let endpoint_uuid = parse_oob_id(&id)?;
+        let now = chrono::Utc::now();
+        let result = sqlx::query(
+            "UPDATE oob_endpoints \
+             SET last_tested = $1, reachable = true, updated_at = $1 \
+             WHERE id = $2",
+        )
+        .bind(now)
+        .bind(endpoint_uuid)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+            ));
+        }
+
+        let row: OobEndpointRow = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1"
+        ))
+        .bind(endpoint_uuid)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "endpoint_id": id,
+            "endpoint_type": row.endpoint_type,
+            "hostname": row.hostname,
+            "reachable": true,
+            "tested_at": now.to_rfc3339(),
+            "dry_run": true,
+        })));
+    }
     match oob_access::test_endpoint(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -12544,6 +12635,37 @@ async fn oob_test_endpoint(
 async fn oob_validate_cert(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let endpoint_uuid = parse_oob_id(&id)?;
+        let row: Option<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1"
+        ))
+        .bind(endpoint_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+            )
+        })?;
+
+        let now = chrono::Utc::now();
+        let days_remaining = (row.cert_expiry - now).num_days();
+        let valid = row.certificate_valid && days_remaining > 0;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "endpoint_id": id,
+            "hostname": row.hostname,
+            "certificate_valid": valid,
+            "cert_expiry": row.cert_expiry.to_rfc3339(),
+            "days_remaining": days_remaining.max(0),
+            "dry_run": true,
+        })));
+    }
     match oob_access::validate_certificate(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -12553,6 +12675,32 @@ async fn oob_validate_cert(
 async fn oob_check_defaults(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let endpoint_uuid = parse_oob_id(&id)?;
+        let row: Option<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1"
+        ))
+        .bind(endpoint_uuid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let row = row.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+            )
+        })?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "endpoint_id": id,
+            "hostname": row.hostname,
+            "default_credentials_changed": row.default_credentials_changed,
+            "status": if row.default_credentials_changed { "compliant" } else { "non_compliant" },
+            "dry_run": true,
+        })));
+    }
     match oob_access::check_default_credentials(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -12563,6 +12711,34 @@ async fn oob_inventory(
     Query(query): Query<OobInventoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = query.site.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<OobEndpointRow> = if site.is_empty() {
+            sqlx::query_as(&format!(
+                "SELECT {OOB_COLUMNS} FROM oob_endpoints ORDER BY site, hostname"
+            ))
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?
+        } else {
+            sqlx::query_as(&format!(
+                "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE site = $1 ORDER BY hostname"
+            ))
+            .bind(&site)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?
+        };
+
+        let endpoints: Vec<Value> = rows.iter().map(oob_row_to_full_json).collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "site": if site.is_empty() { "all" } else { &*site },
+            "total": endpoints.len(),
+            "endpoints": endpoints,
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_inventory(&site) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -12573,6 +12749,48 @@ async fn oob_failing(
     Query(query): Query<OobFailingQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = query.site.unwrap_or_default();
+    if let Some(pool) = get_db() {
+        let rows: Vec<OobEndpointRow> = if site.is_empty() {
+            sqlx::query_as(&format!(
+                "SELECT {OOB_COLUMNS} FROM oob_endpoints \
+                 WHERE reachable = false ORDER BY site, hostname"
+            ))
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?
+        } else {
+            sqlx::query_as(&format!(
+                "SELECT {OOB_COLUMNS} FROM oob_endpoints \
+                 WHERE reachable = false AND site = $1 ORDER BY hostname"
+            ))
+            .bind(&site)
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?
+        };
+
+        let endpoints: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id.to_string(),
+                    "endpoint_type": r.endpoint_type,
+                    "hostname": r.hostname,
+                    "site": r.site,
+                    "last_tested": r.last_tested.to_rfc3339(),
+                    "reachable": r.reachable,
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "site": if site.is_empty() { "all" } else { &*site },
+            "failing_count": endpoints.len(),
+            "endpoints": endpoints,
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_failing(&site) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -12580,6 +12798,45 @@ async fn oob_failing(
 }
 
 async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+        let threshold = now + chrono::Duration::days(30);
+
+        // Mirrors engine logic: invalid cert OR expiry within 30-day window.
+        let rows: Vec<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints \
+             WHERE certificate_valid = false OR cert_expiry <= $1 \
+             ORDER BY cert_expiry"
+        ))
+        .bind(threshold)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        let endpoints: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                let days_remaining = (r.cert_expiry - now).num_days().max(0);
+                json!({
+                    "id": r.id.to_string(),
+                    "endpoint_type": r.endpoint_type,
+                    "hostname": r.hostname,
+                    "site": r.site,
+                    "certificate_valid": r.certificate_valid,
+                    "cert_expiry": r.cert_expiry.to_rfc3339(),
+                    "days_remaining": days_remaining,
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "threshold_days": 30,
+            "expiring_count": endpoints.len(),
+            "endpoints": endpoints,
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_cert_expiring() {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -12587,6 +12844,50 @@ async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 }
 
 async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        // Mirrors the engine baseline map exactly.
+        let baseline: std::collections::HashMap<&str, &str> = std::collections::HashMap::from([
+            ("iLO", "2.80"),
+            ("iDRAC", "6.10.30.00"),
+            ("XCC", "4.21"),
+            ("IPMI", "2.00"),
+        ]);
+
+        let rows: Vec<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints ORDER BY site, hostname"
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        let outdated: Vec<Value> = rows
+            .iter()
+            .filter(|r| {
+                baseline
+                    .get(r.endpoint_type.as_str())
+                    .map(|&bv| r.firmware_version != bv)
+                    .unwrap_or(false)
+            })
+            .map(|r| {
+                json!({
+                    "id": r.id.to_string(),
+                    "endpoint_type": r.endpoint_type,
+                    "hostname": r.hostname,
+                    "site": r.site,
+                    "firmware_version": r.firmware_version,
+                    "baseline": baseline.get(r.endpoint_type.as_str()),
+                })
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "source": "database",
+            "firmware_baseline": baseline,
+            "outdated_count": outdated.len(),
+            "endpoints": outdated,
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_firmware_outdated() {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -12596,6 +12897,54 @@ async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>
 async fn oob_validate_site(
     Path(site): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Some(pool) = get_db() {
+        let now = chrono::Utc::now();
+
+        let rows: Vec<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE site = $1"
+        ))
+        .bind(&site)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        if rows.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("No OOB endpoints found for site {}", site)})),
+            ));
+        }
+
+        let total = rows.len();
+        let reachable = rows.iter().filter(|r| r.reachable).count();
+        let cert_valid = rows.iter().filter(|r| r.certificate_valid).count();
+        let defaults_changed = rows
+            .iter()
+            .filter(|r| r.default_credentials_changed)
+            .count();
+
+        // Update last_tested for all site endpoints (mirrors engine behaviour).
+        sqlx::query("UPDATE oob_endpoints SET last_tested = $1, updated_at = $1 WHERE site = $2")
+            .bind(now)
+            .bind(&site)
+            .execute(pool)
+            .await
+            .map_err(db_error)?;
+
+        return Ok(Json(json!({
+            "source": "database",
+            "site": site,
+            "validated_at": now.to_rfc3339(),
+            "total_endpoints": total,
+            "reachable": reachable,
+            "unreachable": total - reachable,
+            "certificates_valid": cert_valid,
+            "certificates_invalid": total - cert_valid,
+            "defaults_changed": defaults_changed,
+            "defaults_unchanged": total - defaults_changed,
+            "dry_run": true,
+        })));
+    }
     match oob_access::run_site_validation(&site) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -21440,5 +21789,509 @@ mod emergency_change_db_tests {
         assert!(body["top_initiators"].is_array());
 
         cleanup_change(pool, id).await;
+    }
+}
+
+// ─── Unit (no-DB) fallback tests for OOB access handlers ─────────────────────
+//
+// These run without Postgres and exercise the in-memory engine fallback.
+#[cfg(test)]
+mod oob_access_unit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_inventory_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_inventory_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_inventory(Query(OobInventoryQuery { site: None })).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert_eq!(body["site"], "all");
+        assert!(body["total"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_failing_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_failing_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_failing(Query(OobFailingQuery { site: None })).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert!(body["failing_count"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_test_endpoint_not_found_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_test_endpoint_not_found_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_test_endpoint(Path("nonexistent-id".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cert_expiring_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_cert_expiring_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_cert_expiring().await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert_eq!(body["threshold_days"], 30);
+    }
+
+    #[tokio::test]
+    async fn test_firmware_outdated_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_firmware_outdated_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_firmware_outdated().await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "dry-run");
+        assert!(body["outdated_count"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_validate_site_unknown_fallback_no_db() {
+        if crate::database::get_db().is_some() {
+            eprintln!("SKIP test_validate_site_unknown_fallback_no_db: running in DB mode");
+            return;
+        }
+        let result = oob_validate_site(Path("UNKNOWN".into())).await;
+        assert!(result.is_err(), "unknown site must return Err");
+    }
+}
+
+// ─── DB-gated integration tests for OOB access persistence ───────────────────
+//
+// Each test SKIPS when RYUKI_DATABASE_URL is unset.
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api oob_access_db_tests
+#[cfg(test)]
+mod oob_access_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Initialises the process-global DB pool so handler calls via get_db() hit
+    /// the real Postgres instance.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// Insert a test endpoint and return its UUID string.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_endpoint(
+        pool: &PgPool,
+        id: &str,
+        site: &str,
+        hostname: &str,
+        reachable: bool,
+        cert_valid: bool,
+        cert_expiry_offset_days: i64,
+        defaults_changed: bool,
+        firmware: &str,
+        endpoint_type: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO oob_endpoints \
+             (id, endpoint_type, hostname, ip_address, site, firmware_version, \
+              certificate_valid, cert_expiry, last_tested, reachable, default_credentials_changed) \
+             VALUES ($1::uuid, $2, $3, '10.99.99.99', $4, $5, $6, \
+                     NOW() + ($7 || ' days')::interval, NOW(), $8, $9) \
+             ON CONFLICT (site, hostname) DO NOTHING",
+        )
+        .bind(id)
+        .bind(endpoint_type)
+        .bind(hostname)
+        .bind(site)
+        .bind(firmware)
+        .bind(cert_valid)
+        .bind(cert_expiry_offset_days.to_string())
+        .bind(reachable)
+        .bind(defaults_changed)
+        .execute(pool)
+        .await
+        .expect("seed oob_endpoint");
+    }
+
+    async fn cleanup_endpoint(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM oob_endpoints WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ── test_endpoint persists last_tested + reachable ──
+
+    #[tokio::test]
+    async fn test_test_endpoint_persists_to_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "c0000100-9000-9000-9000-000000000001";
+        seed_endpoint(
+            pool,
+            id,
+            "TSTOOB",
+            "oob-test-01.test.local",
+            false,
+            true,
+            90,
+            true,
+            "2.78",
+            "iLO",
+        )
+        .await;
+
+        let result = oob_test_endpoint(Path(id.into())).await;
+
+        let row: Option<OobEndpointRow> = sqlx::query_as(&format!(
+            "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1::uuid"
+        ))
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read row");
+
+        cleanup_endpoint(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["endpoint_id"], id);
+        assert_eq!(body["reachable"], true);
+        assert!(body["tested_at"].as_str().is_some());
+
+        let row = row.expect("row must exist after test_endpoint");
+        assert!(row.reachable, "reachable must be persisted as true");
+    }
+
+    // ── test_endpoint on missing id returns 404 ──
+
+    #[tokio::test]
+    async fn test_test_endpoint_missing_returns_not_found() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = oob_test_endpoint(Path("c0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // ── malformed (non-UUID) id returns 404, not a DB-cast 500 ──
+
+    #[tokio::test]
+    async fn test_test_endpoint_malformed_id_returns_not_found() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // A non-UUID path id must be treated as missing (404) — parity with the
+        // engine fallback — rather than reaching Postgres and raising a 500 on
+        // the uuid cast.
+        let result = oob_test_endpoint(Path("not-a-uuid".into())).await;
+        let Err((status, Json(body))) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    // ── inventory reads seeded rows ──
+
+    #[tokio::test]
+    async fn test_inventory_reads_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // The migration already seeds 6 rows for DEFRA and GBLON.
+        let result = oob_inventory(Query(OobInventoryQuery { site: None })).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["site"], "all");
+        assert!(
+            body["total"].as_u64().unwrap() >= 6,
+            "expected at least 6 seeded rows, got: {body}"
+        );
+        let endpoints = body["endpoints"].as_array().unwrap();
+        let first = &endpoints[0];
+        // Verify full field set is present.
+        assert!(first["id"].as_str().is_some());
+        assert!(first["hostname"].as_str().is_some());
+        assert!(first["ip_address"].as_str().is_some());
+        assert!(first["firmware_version"].as_str().is_some());
+        assert!(first["cert_expiry"].as_str().is_some());
+    }
+
+    // ── inventory filtered by site ──
+
+    #[tokio::test]
+    async fn test_inventory_filtered_by_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = oob_inventory(Query(OobInventoryQuery {
+            site: Some("DEFRA".into()),
+        }))
+        .await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["site"], "DEFRA");
+        let endpoints = body["endpoints"].as_array().unwrap();
+        assert!(!endpoints.is_empty(), "DEFRA must have endpoints from seed");
+        for ep in endpoints {
+            assert_eq!(ep["site"], "DEFRA");
+        }
+    }
+
+    // ── failing reads unreachable endpoints ──
+
+    #[tokio::test]
+    async fn test_failing_reads_unreachable_endpoints() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Migration seeds at least two unreachable endpoints.
+        let result = oob_failing(Query(OobFailingQuery { site: None })).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        let count = body["failing_count"].as_u64().unwrap();
+        assert!(count >= 1, "expected at least 1 failing endpoint from seed");
+        let endpoints = body["endpoints"].as_array().unwrap();
+        for ep in endpoints {
+            assert_eq!(ep["reachable"], false);
+        }
+    }
+
+    // ── cert_expiring returns endpoints with invalid/near-expiry certs ──
+
+    #[tokio::test]
+    async fn test_cert_expiring_returns_expiring_endpoints() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Seeded data has endpoints with expired certs (idrac02, idracgblon03) and
+        // near-expiry certs (ipmi03 +20d, xccgblon02 +10d).
+        let result = oob_cert_expiring().await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["threshold_days"], 30);
+        let count = body["expiring_count"].as_u64().unwrap();
+        assert!(
+            count >= 4,
+            "expected >=4 expiring/invalid from seed, got {count}"
+        );
+        let endpoints = body["endpoints"].as_array().unwrap();
+        for ep in endpoints {
+            assert!(ep["days_remaining"].as_i64().is_some());
+        }
+    }
+
+    // ── validate_certificate returns correct derived values ──
+
+    #[tokio::test]
+    async fn test_validate_certificate_known_endpoint() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "c0000100-9000-9000-9000-000000000002";
+        seed_endpoint(
+            pool,
+            id,
+            "TSTOOB",
+            "oob-cert-01.test.local",
+            true,
+            true,
+            60,
+            true,
+            "2.80",
+            "iLO",
+        )
+        .await;
+
+        let result = oob_validate_cert(Path(id.into())).await;
+        cleanup_endpoint(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["endpoint_id"], id);
+        assert_eq!(body["certificate_valid"], true);
+        let days = body["days_remaining"].as_i64().unwrap();
+        assert!(days > 0, "days_remaining must be positive for +60d cert");
+    }
+
+    // ── check_default_credentials returns correct compliance status ──
+
+    #[tokio::test]
+    async fn test_check_default_credentials_compliant() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "c0000100-9000-9000-9000-000000000003";
+        seed_endpoint(
+            pool,
+            id,
+            "TSTOOB",
+            "oob-creds-01.test.local",
+            true,
+            true,
+            90,
+            true,
+            "2.80",
+            "iLO",
+        )
+        .await;
+
+        let result = oob_check_defaults(Path(id.into())).await;
+        cleanup_endpoint(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["default_credentials_changed"], true);
+        assert_eq!(body["status"], "compliant");
+    }
+
+    #[tokio::test]
+    async fn test_check_default_credentials_non_compliant() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = "c0000100-9000-9000-9000-000000000004";
+        seed_endpoint(
+            pool,
+            id,
+            "TSTOOB",
+            "oob-creds-02.test.local",
+            true,
+            true,
+            90,
+            false,
+            "2.80",
+            "iLO",
+        )
+        .await;
+
+        let result = oob_check_defaults(Path(id.into())).await;
+        cleanup_endpoint(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["default_credentials_changed"], false);
+        assert_eq!(body["status"], "non_compliant");
+    }
+
+    // ── validate_site aggregates correctly and updates last_tested ──
+
+    #[tokio::test]
+    async fn test_validate_site_aggregates_correctly() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Use the seeded DEFRA site (3 endpoints from migration 027).
+        // pool is initialised above for migrations; not used directly in this test.
+        let _ = pool;
+        let result = oob_validate_site(Path("DEFRA".into())).await;
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        assert_eq!(body["site"], "DEFRA");
+        assert!(body["total_endpoints"].as_u64().unwrap() >= 3);
+        assert!(body["validated_at"].as_str().is_some());
+        // Structural checks.
+        assert!(body["reachable"].as_u64().is_some());
+        assert!(body["unreachable"].as_u64().is_some());
+        assert!(body["certificates_valid"].as_u64().is_some());
+        assert!(body["defaults_changed"].as_u64().is_some());
+    }
+
+    // ── validate_site on unknown site returns 400 ──
+
+    #[tokio::test]
+    async fn test_validate_site_unknown_returns_bad_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = oob_validate_site(Path("NOSUCHSITE".into())).await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
