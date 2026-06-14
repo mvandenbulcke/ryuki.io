@@ -78,12 +78,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path() -> String {
+        // A process-global atomic counter guarantees a distinct path per call
+        // even when parallel tests hit the same clock tick (macOS SystemTime
+        // resolution is coarser than nanoseconds, so `as_nanos()` alone collides
+        // under concurrency — two tests then share a file and clobber each
+        // other's contents, making the invalid-config test read valid JSON).
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after unix epoch")
             .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
-            .join(format!("ryuki-platform-config-{nanos}.json"))
+            .join(format!("ryuki-platform-config-{nanos}-{seq}.json"))
             .to_string_lossy()
             .to_string()
     }
