@@ -6713,6 +6713,10 @@ struct LocalLoginFailureEntry {
 /// rate limiting is a separate, later wave.
 #[derive(Default)]
 pub struct LocalLoginThrottle {
+    // Lock acquisitions below recover from poisoning via
+    // `unwrap_or_else(|e| e.into_inner())`: a panic in another thread's
+    // critical section must not turn every subsequent login into a panic
+    // (an auth-path DoS). Mirrors the metrics-mutex recovery in main.rs.
     entries: std::sync::Mutex<std::collections::HashMap<String, LocalLoginFailureEntry>>,
 }
 
@@ -6727,7 +6731,7 @@ impl LocalLoginThrottle {
     }
 
     fn is_locked_out_at(&self, username: &str, now: std::time::Instant) -> bool {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune(&mut entries, now);
         entries
             .get(username)
@@ -6735,7 +6739,7 @@ impl LocalLoginThrottle {
     }
 
     fn record_failure_at(&self, username: &str, now: std::time::Instant) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         Self::prune(&mut entries, now);
         if !entries.contains_key(username) && entries.len() >= LOCAL_LOGIN_TRACKER_MAX_ENTRIES {
             // Evict the stalest entry so the tracker stays bounded.
@@ -6766,7 +6770,10 @@ impl LocalLoginThrottle {
     }
 
     fn record_success(&self, username: &str) {
-        self.entries.lock().unwrap().remove(username);
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(username);
     }
 }
 
@@ -16135,6 +16142,29 @@ mod unit_tests {
         assert_eq!(entries.len(), LOCAL_LOGIN_TRACKER_MAX_ENTRIES);
         assert!(!entries.contains_key("user-0"));
         assert!(entries.contains_key("one-more"));
+    }
+
+    #[test]
+    fn test_local_login_throttle_recovers_from_poisoned_mutex() {
+        // A panic while holding the throttle lock poisons the mutex. The
+        // throttle must keep working (recover via into_inner) rather than
+        // turning every subsequent login into a panic — an auth-path DoS.
+        let throttle = std::sync::Arc::new(LocalLoginThrottle::default());
+        let now = std::time::Instant::now();
+        throttle.record_failure_at("admin", now);
+
+        let poisoner = std::sync::Arc::clone(&throttle);
+        let handle = std::thread::spawn(move || {
+            let _guard = poisoner.entries.lock().unwrap();
+            panic!("intentional panic while holding the throttle lock");
+        });
+        assert!(handle.join().is_err(), "poisoning thread must panic");
+
+        // None of these may panic on the now-poisoned mutex.
+        assert!(!throttle.is_locked_out_at("operator", now));
+        throttle.record_failure_at("admin", now);
+        throttle.record_success("admin");
+        assert!(!throttle.is_locked_out_at("admin", now));
     }
 
     #[test]
