@@ -396,6 +396,49 @@ pub fn request_verify_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("verify"))
 }
 
+const INTEGRATIONS_PATH: &str = "/api/integrations";
+
+pub fn integrations_path() -> &'static str {
+    INTEGRATIONS_PATH
+}
+
+fn safe_integration_id(integration_id: &str) -> Result<&str, ApiPathError> {
+    let integration_id = integration_id.trim();
+    if integration_id.is_empty() {
+        return Err(ApiPathError::Empty);
+    }
+    if integration_id.contains("://")
+        || integration_id.starts_with("//")
+        || integration_id.contains('/')
+        || integration_id.contains('\\')
+        || integration_id.contains('?')
+        || integration_id.contains('#')
+        || integration_id == "."
+        || integration_id == ".."
+        || integration_id.contains("..")
+        || !integration_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return Err(ApiPathError::UnsafePathSegment);
+    }
+    Ok(integration_id)
+}
+
+pub fn integration_id_path(id: &str) -> Result<String, ApiPathError> {
+    let id = safe_integration_id(id)?;
+    let path = format!("/api/integrations/{id}");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
+pub fn integration_test_path(id: &str) -> Result<String, ApiPathError> {
+    let id = safe_integration_id(id)?;
+    let path = format!("/api/integrations/{id}/test");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 /// Read path for the persisted audit trail of a single request
 /// (`GET /api/requests/{id}/audit`). Gated server-side on the `audit`
 /// permission; carries no mutation.
@@ -532,6 +575,39 @@ mod tests {
             assert!(
                 admin_session_revoke_path(id).is_err(),
                 "{id} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn integrations_path_value_is_correct() {
+        assert_eq!(integrations_path(), "/api/integrations");
+    }
+
+    #[test]
+    fn safe_integration_id_rejects_unsafe() {
+        // T6 from the test plan — valid ic-* style id is accepted
+        assert!(
+            integration_id_path("ic-vmware-abc123").is_ok(),
+            "ic-vmware-abc123 must be accepted"
+        );
+        assert_eq!(
+            integration_id_path("ic-vmware-abc123"),
+            Ok("/api/integrations/ic-vmware-abc123".to_string())
+        );
+        assert_eq!(
+            integration_test_path("ic-vmware-abc123"),
+            Ok("/api/integrations/ic-vmware-abc123/test".to_string())
+        );
+        // Unsafe ids must be rejected
+        for id in ["", "../admin", "a/b", "a?b=c", "a#b", "a\\b", ".."] {
+            assert!(
+                integration_id_path(id).is_err(),
+                "{id:?} must be rejected by integration_id_path"
+            );
+            assert!(
+                integration_test_path(id).is_err(),
+                "{id:?} must be rejected by integration_test_path"
             );
         }
     }

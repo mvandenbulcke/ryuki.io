@@ -4,9 +4,9 @@ use crate::shell::Shell;
 use crate::views::login::LoginView;
 use crate::views::workspaces::{
     ActivityWorkspaceView, AdminWorkspaceView, ApprovalsWorkspaceView, CatalogWorkspaceView,
-    CmdbWorkspaceView, DashboardWorkspaceView, EvidenceWorkspaceView, InventoryWorkspaceView,
-    OperationsWorkspaceView, RequestDetailWorkspaceView, RequestNewWorkspaceView,
-    RequestsWorkspaceView,
+    CmdbWorkspaceView, DashboardWorkspaceView, EvidenceWorkspaceView, IntegrationsWorkspaceView,
+    InventoryWorkspaceView, OperationsWorkspaceView, RequestDetailWorkspaceView,
+    RequestNewWorkspaceView, RequestsWorkspaceView,
 };
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Link, MetaTags, Stylesheet, Title};
@@ -69,6 +69,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("evidence") view=EvidenceWorkspaceView/>
                     <Route path=path!("operations") view=OperationsWorkspaceView/>
                     <Route path=path!("admin") view=AdminWorkspaceView/>
+                    <Route path=path!("integrations") view=IntegrationsWorkspaceView/>
                 </ParentRoute>
             </Routes>
         </Router>

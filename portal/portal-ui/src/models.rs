@@ -1063,6 +1063,115 @@ pub struct RequestSummary {
     pub created: String,
 }
 
+// ── Integration types ─────────────────────────────────────────────────────
+//
+// These types mirror the Slice-1 API shape (`/api/integrations`). The
+// `credential_ref` field in `IntegrationSummary` is `Option<String>`: for
+// `db-encrypted` connections the server fn sets it to `None` (the opaque FK
+// `is-{uuid}` is never useful to display and must not be exposed). For
+// `vault` and `env-var` connections it carries the non-secret reference (path
+// / key name) and may be shown.
+
+/// Portal-facing view of one vendor integration connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationSummary {
+    pub id: String,
+    pub vendor_type: String,
+    pub name: String,
+    pub endpoint_url: String,
+    pub site_scope: Option<String>,
+    /// `"vault"` | `"db-encrypted"` | `"env-var"`
+    pub credential_source: String,
+    /// Non-secret reference (vault path or env key names). Always `None`
+    /// for `db-encrypted` — the opaque FK is redacted by the server fn and
+    /// never sent to the browser.
+    pub credential_ref: Option<String>,
+    pub status: String,
+    pub readiness: String,
+    pub execution_mode: String,
+    pub last_test_at: Option<String>,
+    pub last_test_result: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Result of a POST `/api/integrations/{id}/test` probe.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntegrationTestResult {
+    pub connection_id: String,
+    pub endpoint_status: String,
+    pub endpoint_message: String,
+    pub credential_status: String,
+    pub credential_message: String,
+    pub tested_at: String,
+}
+
+/// Request body for `POST /api/integrations`.
+///
+/// `inline_secret` is write-only and MUST NOT be logged. `Debug` is
+/// implemented manually to redact it, mirroring `CreateConnectionRequest`
+/// (FIX-5 in integration.rs).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreateIntegrationPayload {
+    pub vendor_type: String,
+    pub name: String,
+    pub endpoint_url: String,
+    pub site_scope: Option<String>,
+    /// `"vault"` | `"db-encrypted"` | `"env-var"`
+    pub credential_source: String,
+    /// Vault path or env key names. Empty string for `db-encrypted`.
+    pub credential_ref: String,
+    /// Write-only. `db-encrypted` secret value. REDACTED in `Debug`.
+    pub inline_secret: String,
+}
+
+impl std::fmt::Debug for CreateIntegrationPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateIntegrationPayload")
+            .field("vendor_type", &self.vendor_type)
+            .field("name", &self.name)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("site_scope", &self.site_scope)
+            .field("credential_source", &self.credential_source)
+            .field("credential_ref", &self.credential_ref)
+            .field("inline_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Request body for `PUT /api/integrations/{id}`.
+///
+/// `credential_source` is intentionally absent — Slice-1 `HARDENING-1`
+/// forbids changing the source on update. `inline_secret` is write-only and
+/// MUST NOT be logged. `Debug` is implemented manually to redact it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UpdateIntegrationPayload {
+    pub vendor_type: Option<String>,
+    pub name: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub site_scope: Option<String>,
+    /// Vault path or env key names only. `None`/empty for `db-encrypted`.
+    pub credential_ref: Option<String>,
+    /// Write-only. Empty = keep existing secret (no re-encryption).
+    pub inline_secret: String,
+}
+
+impl std::fmt::Debug for UpdateIntegrationPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateIntegrationPayload")
+            .field("vendor_type", &self.vendor_type)
+            .field("name", &self.name)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("site_scope", &self.site_scope)
+            .field("credential_ref", &self.credential_ref)
+            .field("inline_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Mirrors one element of the `GET /api/requests` list JSON. The list DTO
 /// omits `stage` and `environment`, so both are defaulted.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

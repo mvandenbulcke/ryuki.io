@@ -12,10 +12,10 @@ use crate::api::{
     datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
     datacenter_sites_path, dry_run_plan_path, emergency_change_path,
     evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
-    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
-    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
-    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
-    request_intake_form_preview_path, request_intake_path, request_list_path,
+    integrations_path, inventory_ownership_risk_path, inventory_resource_overview_path,
+    operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
+    platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
+    request_create_path, request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
 };
@@ -26,6 +26,8 @@ use crate::api::{
     request_lock_path, request_plan_path, request_reject_path, request_validate_path,
     request_verify_path,
 };
+#[cfg(any(feature = "ssr", test))]
+use crate::api::{integration_id_path, integration_test_path};
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
     cmdb_relationship_graph_resource, dry_run_plan_resource, evidence_summary_resource,
@@ -54,14 +56,15 @@ use crate::models::{
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
     AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
-    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateRequestPayload, CreateTokenPayload,
-    CreateTokenResult, DatacenterFailingChecksSummary, DatacenterFullReadiness,
-    DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog,
-    DryRunPlanSummary, EvidencePackExport, EvidenceSummary, InventoryResourceSummary,
-    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
-    PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail,
-    RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
-    StageActionResponse,
+    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateIntegrationPayload,
+    CreateRequestPayload, CreateTokenPayload, CreateTokenResult, DatacenterFailingChecksSummary,
+    DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
+    DatacenterSitesCatalog, DryRunPlanSummary, EvidencePackExport, EvidenceSummary,
+    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, OperationRunSummary,
+    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
+    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
+    RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
+    StageActionResponse, UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -124,6 +127,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     admin_platform_settings_reset_path,
     admin_tokens_path,
     admin_sessions_path,
+    integrations_path,
     secret_references_path,
     policy_outcomes_path,
     evidence_summary_path,
@@ -2421,6 +2425,444 @@ fn static_preview_audit_trail(request_id: &str) -> Vec<AuditEventRow> {
     }]
 }
 
+// ── Integration server functions ──────────────────────────────────────────
+//
+// The static collection path (`/api/integrations`) is in `ALLOWED_PORTAL_API_PATHS`.
+// Dynamic id paths (`/api/integrations/{id}` and `/api/integrations/{id}/test`)
+// are NOT in the static list — they are validated inline via
+// `same_origin_api_path()` + `safe_integration_id()` inside each server fn,
+// mirroring the request lifecycle path pattern exactly.
+
+#[server(prefix = "/portal/api", endpoint = "integrations-list")]
+pub async fn list_integrations() -> Result<Vec<IntegrationSummary>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(integrations_path())
+        .map_err(|_| ServerFnError::new("integrations API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // Honest empty list in static/no-DB mode — same pattern as
+        // `get_approvals_pending` and the Slice-1 empty-list behavior.
+        return Ok(Vec::new());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream
+        .get(integrations_path(), session_id.as_deref())
+        .await
+    {
+        Ok(response) if response.is_success() => {
+            let raw: serde_json::Value = response
+                .json()
+                .map_err(|_| ServerFnError::new("integrations list response was malformed"))?;
+            let connections = raw
+                .get("connections")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let summaries = connections
+                .into_iter()
+                .filter_map(|item| {
+                    let id = item.get("id")?.as_str()?.to_string();
+                    let vendor_type = item.get("vendor_type")?.as_str()?.to_string();
+                    let name = item.get("name")?.as_str()?.to_string();
+                    let endpoint_url = item.get("endpoint_url")?.as_str()?.to_string();
+                    let site_scope = item
+                        .get("site_scope")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string);
+                    let credential_source = item.get("credential_source")?.as_str()?.to_string();
+                    // Redact the opaque FK for db-encrypted: never expose it.
+                    let credential_ref = if credential_source == "db-encrypted" {
+                        None
+                    } else {
+                        item.get("credential_ref")
+                            .and_then(|r| r.as_str())
+                            .map(str::to_string)
+                    };
+                    let status = item.get("status")?.as_str()?.to_string();
+                    let readiness = item
+                        .get("readiness")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let execution_mode = item
+                        .get("execution_mode")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("static-dry-run")
+                        .to_string();
+                    let last_test_at = item
+                        .get("last_test_at")
+                        .and_then(|t| t.as_str())
+                        .map(str::to_string);
+                    let last_test_result = item
+                        .get("last_test_result")
+                        .and_then(|r| r.as_str())
+                        .map(str::to_string);
+                    let created_by = item
+                        .get("created_by")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let created_at = item.get("created_at")?.as_str()?.to_string();
+                    let updated_at = item.get("updated_at")?.as_str()?.to_string();
+                    Some(IntegrationSummary {
+                        id,
+                        vendor_type,
+                        name,
+                        endpoint_url,
+                        site_scope,
+                        credential_source,
+                        credential_ref,
+                        status,
+                        readiness,
+                        execution_mode,
+                        last_test_at,
+                        last_test_result,
+                        created_by,
+                        created_at,
+                        updated_at,
+                    })
+                })
+                .collect();
+            Ok(summaries)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "integrations list fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+#[server(prefix = "/portal/api", endpoint = "integration-create")]
+pub async fn create_integration(
+    payload: CreateIntegrationPayload,
+) -> Result<IntegrationSummary, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(integrations_path())
+        .map_err(|_| ServerFnError::new("integrations API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    // `inline_secret` is sent in the body but NEVER logged (no Debug derive
+    // on the payload struct; the custom Debug impl redacts it).
+    let body = serde_json::json!({
+        "vendor_type": payload.vendor_type,
+        "name": payload.name,
+        "endpoint_url": payload.endpoint_url,
+        "site_scope": payload.site_scope,
+        "credential_source": payload.credential_source,
+        "credential_ref": payload.credential_ref,
+        "inline_secret": payload.inline_secret,
+    });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(integrations_path(), Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "integration create was rejected by the API",
+        )));
+    }
+    let raw: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("integration create response was malformed"))?;
+    let credential_source = raw
+        .get("credential_source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    // Redact opaque FK for db-encrypted even from the create response.
+    let credential_ref = if credential_source == "db-encrypted" {
+        None
+    } else {
+        raw.get("credential_ref")
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+    };
+    Ok(IntegrationSummary {
+        id: raw
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        vendor_type: raw
+            .get("vendor_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        name: raw
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        endpoint_url: raw
+            .get("endpoint_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        site_scope: raw
+            .get("site_scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        credential_source,
+        credential_ref,
+        status: raw
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        readiness: raw
+            .get("readiness")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        execution_mode: raw
+            .get("execution_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("static-dry-run")
+            .to_string(),
+        last_test_at: raw
+            .get("last_test_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        last_test_result: raw
+            .get("last_test_result")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created_by: raw
+            .get("created_by")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        created_at: raw
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        updated_at: raw
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+#[server(prefix = "/portal/api", endpoint = "integration-update")]
+pub async fn update_integration(
+    id: String,
+    payload: UpdateIntegrationPayload,
+) -> Result<IntegrationSummary, ServerFnError> {
+    // Dynamic path validated inline via safe_integration_id — not in the
+    // static allowlist, mirroring the request lifecycle path pattern.
+    let path = integration_id_path(&id)
+        .map_err(|_| ServerFnError::new("integration id path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    let body = serde_json::json!({
+        "vendor_type": payload.vendor_type,
+        "name": payload.name,
+        "endpoint_url": payload.endpoint_url,
+        "site_scope": payload.site_scope,
+        "credential_ref": payload.credential_ref,
+        // Empty inline_secret = keep existing (no re-encryption, per Slice-1).
+        "inline_secret": payload.inline_secret,
+    });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .put(&path, &body, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "integration update was rejected by the API",
+        )));
+    }
+    let raw: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("integration update response was malformed"))?;
+    let credential_source = raw
+        .get("credential_source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let credential_ref = if credential_source == "db-encrypted" {
+        None
+    } else {
+        raw.get("credential_ref")
+            .and_then(|r| r.as_str())
+            .map(str::to_string)
+    };
+    Ok(IntegrationSummary {
+        id: raw
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        vendor_type: raw
+            .get("vendor_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        name: raw
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        endpoint_url: raw
+            .get("endpoint_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        site_scope: raw
+            .get("site_scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        credential_source,
+        credential_ref,
+        status: raw
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        readiness: raw
+            .get("readiness")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        execution_mode: raw
+            .get("execution_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("static-dry-run")
+            .to_string(),
+        last_test_at: raw
+            .get("last_test_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        last_test_result: raw
+            .get("last_test_result")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created_by: raw
+            .get("created_by")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        created_at: raw
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        updated_at: raw
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+#[server(prefix = "/portal/api", endpoint = "integration-delete")]
+pub async fn delete_integration(id: String) -> Result<String, ServerFnError> {
+    // Dynamic path validated inline.
+    let path = integration_id_path(&id)
+        .map_err(|_| ServerFnError::new("integration id path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .delete(&path, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "integration delete was rejected by the API",
+        )));
+    }
+    Ok(id)
+}
+
+#[server(prefix = "/portal/api", endpoint = "integration-test")]
+pub async fn test_integration(id: String) -> Result<IntegrationTestResult, ServerFnError> {
+    // Dynamic path validated inline.
+    let path = integration_test_path(&id)
+        .map_err(|_| ServerFnError::new("integration test path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // Honest "blocked" result in static mode — not an error, because
+        // testing is a read-only probe. The operator sees what the result
+        // means rather than a generic failure.
+        return Ok(IntegrationTestResult {
+            connection_id: id,
+            endpoint_status: "blocked".to_string(),
+            endpoint_message:
+                "Portal is in static/no-DB mode — live connectivity test not available.".to_string(),
+            credential_status: "blocked".to_string(),
+            credential_message:
+                "Portal is in static/no-DB mode — credential verification not available."
+                    .to_string(),
+            tested_at: String::new(),
+        });
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(&path, None, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new("API unreachable"))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "integration test failed",
+        )));
+    }
+    let raw: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("integration test response was malformed"))?;
+    Ok(IntegrationTestResult {
+        connection_id: raw
+            .get("connection_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string(),
+        endpoint_status: raw
+            .get("endpoint_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        endpoint_message: raw
+            .get("endpoint_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        credential_status: raw
+            .get("credential_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        credential_message: raw
+            .get("credential_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tested_at: raw
+            .get("tested_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3242,6 +3684,35 @@ mod tests {
                 "{endpoint} must register under the portal-owned route"
             );
         }
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn integration_server_functions_register_portal_routes() {
+        let registered: Vec<&str> = leptos::server_fn::axum::server_fn_paths()
+            .map(|(path, _)| path)
+            .collect();
+        for endpoint in [
+            "/portal/api/integrations-list",
+            "/portal/api/integration-create",
+            "/portal/api/integration-update",
+            "/portal/api/integration-delete",
+            "/portal/api/integration-test",
+        ] {
+            assert!(
+                registered.contains(&endpoint),
+                "{endpoint} must register under the portal-owned route"
+            );
+        }
+    }
+
+    #[test]
+    fn integrations_path_is_in_allowlist() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        assert_eq!(
+            boundary.validate_platform_api_path(integrations_path()),
+            Ok(integrations_path())
+        );
     }
 
     #[cfg(feature = "ssr")]
