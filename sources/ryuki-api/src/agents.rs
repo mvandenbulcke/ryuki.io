@@ -20,13 +20,14 @@
 //!   LiveApply → ReconcileRequired (never auto-redispatched).
 
 use axum::{
-    extract::Path,
+    extract::{Extension, Path},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use chrono::{Duration, Utc};
+use ryuki_engine::auth::{check_permission, AuthSession};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -171,6 +172,13 @@ fn forbidden(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
 
 fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({"error": msg.into()})))
+}
+
+fn service_unavailable(msg: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": msg.into()})),
+    )
 }
 
 fn parse_agent_job_id(id: &str) -> ApiResult<Uuid> {
@@ -1519,15 +1527,126 @@ pub fn agent_routes() -> Router {
         .route("/api/agents/{agent_id}/heartbeat", post(heartbeat))
 }
 
+// ---------------------------------------------------------------------------
+// POST /api/admin/agents/live-apply-jobs — operator live-apply approval
+// ---------------------------------------------------------------------------
+
+/// Request body for the operator live-apply approval endpoint.
+///
+/// The `approver` identity is always taken from the verified session — it MUST
+/// NOT appear in this body so that a caller cannot forge the approving principal.
+#[derive(Debug, Deserialize)]
+pub struct ApproveLiveApplyBody {
+    pub request_id: Uuid,
+    pub platform: String,
+    pub spec: JobSpec,
+    pub approved_plan_digest: String,
+    /// Requested grant lifetime in seconds. Must be > 0 and ≤ MAX_GRANT_TTL_HOURS * 3600.
+    pub expiry_seconds: u64,
+}
+
+/// Testable core for live-apply approval (no axum Extension — takes primitives).
+///
+/// Validates `expiry_seconds`, computes the absolute expiry, then delegates to
+/// [`create_live_apply_job`] which performs the remaining invariant checks
+/// (digest format, approver emptiness, spec.mode, request_id binding) before
+/// signing the grant and inserting the job row.
+///
+/// Returns the job id and associated metadata as a JSON response.
+pub async fn approve_live_apply_with(
+    pool: &PgPool,
+    cp_key: &ed25519_dalek::SigningKey,
+    approver: &str,
+    body: &ApproveLiveApplyBody,
+) -> ApiResult<Json<Value>> {
+    // Validate expiry bounds here for a clean 400 before we reach create_live_apply_job.
+    if body.expiry_seconds == 0 {
+        return Err(bad_request("expiry_seconds must be greater than zero"));
+    }
+    let max_seconds = (MAX_GRANT_TTL_HOURS as u64) * 3600;
+    if body.expiry_seconds > max_seconds {
+        return Err(bad_request(format!(
+            "expiry_seconds exceeds the maximum allowed TTL ({} seconds)",
+            max_seconds
+        )));
+    }
+
+    let expiry = Utc::now() + Duration::seconds(body.expiry_seconds as i64);
+
+    let job_id = create_live_apply_job(
+        pool,
+        body.request_id,
+        &body.platform,
+        &body.spec,
+        &body.approved_plan_digest,
+        approver,
+        expiry,
+        cp_key,
+    )
+    .await
+    .map_err(|e| match e {
+        CreateLiveApplyJobError::Invalid(msg) => bad_request(msg),
+        CreateLiveApplyJobError::Db(db_e) => db_err(db_e),
+    })?;
+
+    Ok(Json(json!({
+        "job_id": job_id,
+        "approver": approver,
+        "status": "Pending",
+        "mode": "LiveApply"
+    })))
+}
+
+/// POST /api/admin/agents/live-apply-jobs
+///
+/// Operator-gated endpoint that mints a CP-signed LiveApply grant and enqueues
+/// the job for dispatch. The approver identity is taken exclusively from the
+/// verified session — the request body cannot override it.
+///
+/// ## Auth posture
+///
+/// The route sits under `/api/admin/` so the human RBAC middleware already
+/// enforces `admin` permission at the routing layer. The `check_permission`
+/// call below is defense-in-depth: it fires if the middleware assumption ever
+/// changes or the handler is composed without it.
+///
+/// Returns 503 if the database pool or CP signing key was not initialised
+/// at startup (degraded mode).
+pub async fn admin_approve_live_apply_job(
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<ApproveLiveApplyBody>,
+) -> ApiResult<Json<Value>> {
+    // Defense-in-depth: the /api/admin RBAC middleware already blocks non-admins,
+    // but we re-check here so a future re-mount cannot bypass the gate.
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission required"));
+    }
+
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+
+    let cp_key = cp_identity::cp_signing_key()
+        .ok_or_else(|| service_unavailable("control plane not configured to sign grants"))?;
+
+    // The approver MUST come from the verified session — never from the request body.
+    let approver = session.user_id.as_str();
+
+    approve_live_apply_with(pool, cp_key, approver, &body).await
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
 /// does not match `/api/admin/`.
 pub fn admin_routes() -> Router {
-    Router::new().route(
-        "/api/admin/agents/{agent_id}/approve",
-        post(admin_approve_agent),
-    )
+    Router::new()
+        .route(
+            "/api/admin/agents/{agent_id}/approve",
+            post(admin_approve_agent),
+        )
+        .route(
+            "/api/admin/agents/live-apply-jobs",
+            post(admin_approve_live_apply_job),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -5236,6 +5355,325 @@ mod tests {
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S5c tests — approve_live_apply_with (operator endpoint core) ──────────
+    //
+    // All tests call `approve_live_apply_with` directly (no Extension / no HTTP
+    // layer) so they need only a PgPool and a SigningKey.  The admin/403 path is
+    // enforced by the /api/admin RBAC middleware and the in-handler
+    // `check_permission` defense-in-depth guard; both are unit-tested by
+    // ryuki-engine's own tests and by the RBAC middleware tests in main.rs.  A
+    // note instead of a duplicate integration test is sufficient here.
+    //
+    // The handler itself is thin: it unwraps pool/cp_key (503) and delegates.
+    // Covered by: service_unavailable path is trivially visible from the code;
+    // the admin permission check calls `check_permission(session, "admin")` from
+    // ryuki_engine::auth, whose own test suite asserts false for non-admin roles.
+
+    /// A valid LiveApply body produces a job whose stored grant verifies
+    /// cryptographically and carries the correct fields.
+    #[tokio::test]
+    async fn db_t1_approve_creates_valid_signed_job() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use ryuki_protocol::crypto::{sha256_hex as proto_sha256, verify_vlc};
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let cp_vk = cp_key.verifying_key();
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5c-t1-{suffix}");
+        let request_id = Uuid::new_v4();
+        let digest = proto_sha256(b"approved-plan-s5c");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: platform.clone(),
+            spec,
+            approved_plan_digest: digest.clone(),
+            expiry_seconds: 3600,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, "sentinel-approver", &body).await;
+        assert!(
+            result.is_ok(),
+            "approve_live_apply_with must succeed for valid input: {:?}",
+            result.err()
+        );
+
+        let json_val = result.unwrap().0;
+        let job_id: Uuid =
+            serde_json::from_value(json_val["job_id"].clone()).expect("job_id must be a UUID");
+        assert_eq!(json_val["status"], "Pending");
+        assert_eq!(json_val["mode"], "LiveApply");
+        assert_eq!(json_val["approver"], "sentinel-approver");
+
+        // Read stored live_context and verify the grant.
+        #[derive(sqlx::FromRow)]
+        struct LiveContextRow {
+            live_context: Option<sqlx::types::Json<serde_json::Value>>,
+            mode: String,
+            status: String,
+        }
+        let row = sqlx::query_as::<_, LiveContextRow>(
+            "SELECT live_context, mode, status FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch job row");
+
+        assert_eq!(row.mode, "LiveApply");
+        assert_eq!(row.status, "Pending");
+
+        let grant_json = row.live_context.expect("live_context must be set");
+        let grant: VerifiedLiveContext =
+            serde_json::from_value(grant_json.0).expect("grant must deserialise");
+
+        assert!(
+            verify_vlc(&grant, &cp_vk).is_ok(),
+            "stored grant must verify with the CP public key"
+        );
+        assert_eq!(grant.approved_plan_digest, digest);
+        assert_eq!(grant.approver, "sentinel-approver");
+        assert_eq!(grant.request_id, request_id);
+
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+    }
+
+    /// A non-hex approved_plan_digest is rejected with 400.
+    #[tokio::test]
+    async fn db_t1_bad_plan_digest_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: "any".into(),
+            spec,
+            approved_plan_digest: "not-hex".into(),
+            expiry_seconds: 3600,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        assert!(result.is_err(), "non-hex digest must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        pool.close().await;
+    }
+
+    /// expiry_seconds = 0 is rejected with 400.
+    #[tokio::test]
+    async fn db_t1_expiry_zero_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use ryuki_protocol::crypto::sha256_hex as proto_sha256;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: "any".into(),
+            spec,
+            approved_plan_digest: proto_sha256(b"plan"),
+            expiry_seconds: 0,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        assert!(result.is_err(), "zero expiry must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        pool.close().await;
+    }
+
+    /// expiry_seconds > MAX_GRANT_TTL_HOURS * 3600 is rejected with 400.
+    #[tokio::test]
+    async fn db_t1_expiry_over_max_ttl_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use ryuki_protocol::crypto::sha256_hex as proto_sha256;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: "any".into(),
+            spec,
+            approved_plan_digest: proto_sha256(b"plan"),
+            expiry_seconds: (MAX_GRANT_TTL_HOURS as u64) * 3600 + 1,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        assert!(result.is_err(), "over-max TTL must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        pool.close().await;
+    }
+
+    /// spec.mode != LiveApply is rejected with 400.
+    #[tokio::test]
+    async fn db_t1_non_live_apply_mode_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use ryuki_protocol::crypto::sha256_hex as proto_sha256;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::OfflineDryRun,
+        };
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: "any".into(),
+            spec,
+            approved_plan_digest: proto_sha256(b"plan"),
+            expiry_seconds: 3600,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, "ops-test", &body).await;
+        assert!(result.is_err(), "OfflineDryRun spec must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        pool.close().await;
+    }
+
+    /// The approver stored in the grant is the one passed as the `approver` argument
+    /// (simulating session.user_id), NOT any value that could come from the body.
+    /// This test uses a sentinel string to prove provenance.
+    #[tokio::test]
+    async fn db_t1_approver_is_from_param_not_body() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use ryuki_protocol::crypto::{sha256_hex as proto_sha256, verify_vlc};
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let cp_vk = cp_key.verifying_key();
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5c-t6-{suffix}");
+        let request_id = Uuid::new_v4();
+        let digest = proto_sha256(b"plan-for-approver-test");
+        let sentinel_approver = "session-derived-approver-not-from-body";
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let body = ApproveLiveApplyBody {
+            request_id,
+            platform: platform.clone(),
+            spec,
+            approved_plan_digest: digest.clone(),
+            expiry_seconds: 3600,
+        };
+
+        let result = approve_live_apply_with(&pool, &cp_key, sentinel_approver, &body).await;
+        assert!(result.is_ok(), "approve must succeed: {:?}", result.err());
+
+        let json_val = result.unwrap().0;
+        let job_id: Uuid = serde_json::from_value(json_val["job_id"].clone()).expect("UUID");
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            live_context: Option<sqlx::types::Json<serde_json::Value>>,
+        }
+        let row = sqlx::query_as::<_, Row>("SELECT live_context FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch");
+
+        let grant: VerifiedLiveContext =
+            serde_json::from_value(row.live_context.expect("live_context").0).expect("deserialise");
+
+        // The grant's approver must equal the sentinel passed as the argument,
+        // proving the body cannot influence it.
+        assert_eq!(
+            grant.approver, sentinel_approver,
+            "grant.approver must come from the approver param (session), not the body"
+        );
+        assert!(verify_vlc(&grant, &cp_vk).is_ok(), "grant must verify");
+
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
         pool.close().await;
     }
 }
