@@ -37,6 +37,7 @@ use crate::database::get_db;
 use crate::sha256_hex;
 use ryuki_protocol::{
     Capabilities, Job, JobLease, JobMode, JobResult, JobResultStatus, JobSpec, JobStatus,
+    VerifiedLiveContext,
 };
 
 // ---------------------------------------------------------------------------
@@ -715,6 +716,8 @@ async fn post_job_result_with_pool(
         // Fix 3: platform and request_id loaded from DB to bind signed context.
         platform: String,
         request_id: uuid::Uuid,
+        // S5: the CP-signed approval grant for LiveApply jobs (NULL otherwise).
+        live_context: Option<sqlx::types::Json<serde_json::Value>>,
         result_id: Option<uuid::Uuid>,
         result_status: Option<String>,
         evidence_digest: Option<String>,
@@ -723,7 +726,7 @@ async fn post_job_result_with_pool(
 
     let row = sqlx::query_as::<_, JobForResult>(
         "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
-         platform, request_id, \
+         platform, request_id, live_context, \
          result_id, result_status, evidence_digest, completed_at \
          FROM agent_jobs WHERE id = $1",
     )
@@ -906,26 +909,80 @@ async fn post_job_result_with_pool(
         ));
     }
 
-    // ── Step 8: mode rules + LiveApply rejection ─────────────────────────────
+    // ── Step 8: mode rules + LiveApply approved-plan grant check (S5) ─────────
     //
-    // Fix 2: LiveApply results are rejected until the approved-plan grant
-    // equality check is implemented (S5 — requires the live_context column and
-    // VerifiedLiveContext.approved_plan_digest equality against the envelope).
-    // Accepting LiveApply results with only a presence check (no equality) allows
-    // an agent to forge any plan digest and have it recorded as authoritative.
-    // The safe default is a hard reject.
+    // LiveApply is the only mutating mode. A live result is accepted ONLY if the
+    // plan digest the agent signed EQUALS the approved-plan digest in the
+    // control-plane-issued grant (`live_context`), and the grant has not expired.
+    // This is the core live-apply gate: an agent can never apply (or report
+    // applying) a plan other than the one an operator reviewed and the CP granted
+    // — closing the S3b deferral where only presence was (not) checked.
     //
     // Non-live modes (OfflineDryRun / LivePlan) must NOT carry approved_plan_digest.
     // `stored_mode` was parsed in Fix 3 above (no second parse needed).
     match stored_mode {
         JobMode::LiveApply => {
-            return Err((
-                axum::http::StatusCode::NOT_IMPLEMENTED,
-                axum::Json(json!({
-                    "error": "LiveApply result verification is not yet enabled — \
-                              requires the approved-plan grant equality check (S5)"
-                })),
-            ));
+            // The job must carry the CP-signed grant. Job creation (S5a-2) is
+            // responsible for attaching it; this runtime check is the fail-closed
+            // enforcement of that invariant (migration 056 deliberately uses no
+            // DB CHECK — see its comment).
+            let grant_json = row.live_context.as_ref().ok_or_else(|| {
+                conflict(
+                    "LiveApply job has no approval grant (live_context) — refusing a live result",
+                )
+            })?;
+            let grant: VerifiedLiveContext =
+                serde_json::from_value(grant_json.0.clone()).map_err(|e| {
+                    tracing::error!(job_id = %job_id, error = %e, "stored live_context is malformed");
+                    db_err("stored live_context is malformed")
+                })?;
+
+            // The agent's signed envelope MUST carry the applied plan digest.
+            let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
+                bad_request(
+                    "LiveApply result must include approved_plan_digest in the signed envelope",
+                )
+            })?;
+
+            // EQUALITY: the applied plan digest must match the APPROVED plan
+            // digest. The digest is a public hash (not a secret), so a plain
+            // comparison is appropriate.
+            if env_digest != grant.approved_plan_digest {
+                return Err(bad_request(
+                    "approved_plan_digest does not match the approved grant — \
+                     refusing to record an unapproved plan",
+                ));
+            }
+
+            // The grant must be for THIS job's request (defends against a grant
+            // mistakenly attached to a different request at job-creation time).
+            // stored_spec was deserialised in step 7.
+            if grant.request_id != stored_spec.request_id {
+                return Err(bad_request(
+                    "approval grant request_id does not match the job's request",
+                ));
+            }
+
+            // The grant must not be expired AT APPLY TIME. Expiry gates the
+            // actual application, which only happens while the job is still
+            // Leased/Running (the atomic UPDATE below records the result exactly
+            // once from that state). A later idempotent REPLAY of an
+            // already-recorded result (job already terminal) must NOT be
+            // re-gated on expiry — the result was validated and applied within
+            // the grant window, and the agent's durable outbox may retry the
+            // POST after the grant has since expired. So only enforce expiry on
+            // the first-apply path. The control plane is the authority on time
+            // here (it issued the grant); the agent also independently rejects
+            // an expired grant before applying.
+            let first_apply = matches!(row.status.as_str(), "Leased" | "Running");
+            if first_apply && grant.expiry < Utc::now() {
+                return Err((
+                    axum::http::StatusCode::CONFLICT,
+                    axum::Json(json!({
+                        "error": "the approval grant has expired — re-approval is required"
+                    })),
+                ));
+            }
         }
         JobMode::OfflineDryRun | JobMode::LivePlan => {
             // Non-live modes must NOT include approved_plan_digest.
@@ -2692,16 +2749,16 @@ mod tests {
         pool.close().await;
     }
 
-    // ── S3b: LiveApply → rejected (Fix 2) ────────────────────────────────
-    // S3b: non-live with plan digest present → reject
+    // ── S5: LiveApply WITHOUT a grant → rejected (409) ───────────────────
     //
-    // Fix 2: LiveApply results are rejected entirely until the approved-plan
-    // grant equality check is implemented (S5). Both sub-cases (with and
-    // without approved_plan_digest) must be rejected — the mode gate fires
-    // before any digest check.
+    // A LiveApply job that carries no approval grant (live_context) can never
+    // produce an accepted result: the verifier rejects it with 409 before any
+    // digest comparison, regardless of whether the envelope carries an
+    // approved_plan_digest. (The accept path + grant equality/expiry cases are
+    // covered by the db_s5_live_apply_* tests.)
 
     #[tokio::test]
-    async fn db_s3b_live_apply_is_rejected() {
+    async fn db_live_apply_without_grant_is_rejected() {
         let Some(pool) = test_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
@@ -2790,13 +2847,13 @@ mod tests {
         .await;
         assert!(
             resp_a.is_err(),
-            "LiveApply without plan digest must be rejected"
+            "LiveApply without a grant must be rejected"
         );
         let (status_a, _) = resp_a.unwrap_err();
         assert_eq!(
             status_a,
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            "LiveApply rejection must return 501"
+            axum::http::StatusCode::CONFLICT,
+            "a LiveApply job with no approval grant must be rejected with 409"
         );
         let db = read_job_result_row(&pool, job_row.id).await;
         assert_eq!(
@@ -2804,8 +2861,9 @@ mod tests {
             "job must remain Running after rejection"
         );
 
-        // Sub-case B: LiveApply WITH approved_plan_digest → still rejected (Fix 2).
-        // The mode gate fires before any digest check; presence alone is not safe.
+        // Sub-case B: LiveApply WITH approved_plan_digest but still NO grant on
+        // the job → rejected with 409 (the missing-grant check fires before any
+        // digest comparison; a forged digest cannot manufacture authorisation).
         let resp_b = post_job_result_with_pool(
             agent_id.clone(),
             job_row.id.to_string(),
@@ -2816,13 +2874,13 @@ mod tests {
         .await;
         assert!(
             resp_b.is_err(),
-            "LiveApply with plan digest must also be rejected until S5"
+            "LiveApply with a forged plan digest but no grant must be rejected"
         );
         let (status_b, _) = resp_b.unwrap_err();
         assert_eq!(
             status_b,
-            axum::http::StatusCode::NOT_IMPLEMENTED,
-            "LiveApply rejection must return 501"
+            axum::http::StatusCode::CONFLICT,
+            "no-grant LiveApply must be rejected with 409 regardless of envelope digest"
         );
         let db = read_job_result_row(&pool, job_row.id).await;
         assert_eq!(db.status, "Running", "job must remain Running");
@@ -3646,6 +3704,385 @@ mod tests {
             db_row.result_id.is_none(),
             "result_id must not be recorded after tamper rejection"
         );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // S5a-1: LiveApply approved-plan grant verification (the deferred S3b check)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Seed a Pending LiveApply job carrying a CP grant (live_context). The
+    /// grant's `request_id` is bound to the job spec by default; pass a different
+    /// `grant_request_id` to exercise the mismatch path. Direct INSERT because
+    /// `create_agent_job` does not attach a grant (and the DB CHECK requires one
+    /// for LiveApply).
+    async fn seed_live_apply_job(
+        pool: &PgPool,
+        platform: &str,
+        approved_plan_digest: &str,
+        grant_expiry: chrono::DateTime<Utc>,
+        grant_request_id: Option<Uuid>,
+    ) -> Uuid {
+        use std::collections::BTreeMap;
+        let request_id = Uuid::new_v4();
+        let spec = ryuki_protocol::JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: ryuki_protocol::JobMode::LiveApply,
+        };
+        let grant = VerifiedLiveContext {
+            request_id: grant_request_id.unwrap_or(request_id),
+            approved_plan_digest: approved_plan_digest.to_string(),
+            approver: "ops-test".to_string(),
+            expiry: grant_expiry,
+            // The CP trusts its own stored grant; the AGENT verifies this
+            // signature (S5b). S5a-1 enforces digest equality + expiry only.
+            signature: String::new(),
+        };
+        let spec_json = serde_json::to_value(&spec).expect("spec json");
+        let grant_json = serde_json::to_value(&grant).expect("grant json");
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, live_context) \
+             VALUES ($1, $2, $3::jsonb, 'LiveApply', 'Pending', $4::jsonb) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(&spec_json)
+        .bind(&grant_json)
+        .fetch_one(pool)
+        .await
+        .expect("seed live apply job")
+    }
+
+    /// Build a signed LiveApply `JobResult` (status Applied) carrying the given
+    /// `approved_plan_digest` in the envelope.
+    #[allow(clippy::too_many_arguments)]
+    fn make_live_apply_result(
+        agent_id: &str,
+        platform: &str,
+        job_row: &AgentJobRow,
+        attempt_id: Uuid,
+        cp_nonce: &str,
+        lease_gen: u64,
+        key: &ed25519_dalek::SigningKey,
+        spec: &JobSpec,
+        evidence: &[u8],
+        approved_plan_digest: Option<String>,
+    ) -> (JobResult, Vec<u8>) {
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = job_spec_digest(spec);
+        let status = JobResultStatus::Applied;
+        let unsigned_env = SignedEnvelope {
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: lease_gen,
+            request_id: spec.request_id,
+            result_id,
+            mode: spec.mode.clone(),
+            status: status.clone(),
+            job_spec_digest: spec_digest,
+            approved_plan_digest,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: cp_nonce.to_string(),
+            signature: String::new(),
+        };
+        let signed_env = sign(unsigned_env, key);
+        let job_result = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status,
+            evidence_digest,
+            signed_envelope: signed_env,
+        };
+        (job_result, evidence.to_vec())
+    }
+
+    /// Drive a leased LiveApply job to a result POST with the given envelope
+    /// digest + grant. Returns the verifier response. `grant_digest` is what the
+    /// CP stored; `envelope_digest` is what the agent signs.
+    async fn run_live_apply_case(
+        pool: &PgPool,
+        grant_digest: &str,
+        envelope_digest: Option<String>,
+        grant_expiry: chrono::DateTime<Utc>,
+        grant_request_id: Option<Uuid>,
+    ) -> (ApiResult<Json<serde_json::Value>>, Uuid, String) {
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-plt-{suffix}");
+        let agent_id = format!("s5-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(pool, &agent_id, &platform).await;
+
+        let _job_id = seed_live_apply_job(
+            pool,
+            &platform,
+            grant_digest,
+            grant_expiry,
+            grant_request_id,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(pool, &platform, &agent_id).await;
+        ack_to_running(pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence_bytes) = make_live_apply_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"live apply evidence",
+            envelope_digest,
+        );
+        let body = ResultBody {
+            job_result,
+            evidence: evidence_bytes,
+            evidence_json: None,
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp =
+            post_job_result_with_pool(agent_id.clone(), job_row.id.to_string(), hdrs, body, pool)
+                .await;
+        (resp, job_row.id, platform)
+    }
+
+    #[tokio::test]
+    async fn db_s5_live_apply_matching_digest_accepted() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let digest = proto_sha256(b"the-approved-plan");
+        let (resp, job_id, platform) = run_live_apply_case(
+            &pool,
+            &digest,
+            Some(digest.clone()),
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "LiveApply with a matching approved_plan_digest + valid grant must be accepted: {:?}",
+            resp.err()
+        );
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Succeeded", "applied job must be terminal");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_s5_live_apply_mismatched_digest_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let grant_digest = proto_sha256(b"the-approved-plan");
+        let forged_digest = proto_sha256(b"a-different-unapproved-plan");
+        let (resp, job_id, platform) = run_live_apply_case(
+            &pool,
+            &grant_digest,
+            Some(forged_digest),
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (status, _) = resp.expect_err("mismatched plan digest must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Running", "rejected result must not go terminal");
+        assert!(db.result_id.is_none());
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_s5_live_apply_missing_envelope_digest_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let grant_digest = proto_sha256(b"the-approved-plan");
+        let (resp, job_id, platform) = run_live_apply_case(
+            &pool,
+            &grant_digest,
+            None, // envelope omits approved_plan_digest
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (status, _) =
+            resp.expect_err("LiveApply without approved_plan_digest must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Running");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_s5_live_apply_expired_grant_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let digest = proto_sha256(b"the-approved-plan");
+        let (resp, job_id, platform) = run_live_apply_case(
+            &pool,
+            &digest,
+            Some(digest.clone()),
+            Utc::now() - Duration::minutes(1), // already expired
+            None,
+        )
+        .await;
+        let (status, _) = resp.expect_err("an expired grant must be rejected");
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Running");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_s5_live_apply_grant_request_id_mismatch_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let digest = proto_sha256(b"the-approved-plan");
+        // Grant carries a request_id that does NOT match the job spec's.
+        let (resp, job_id, platform) = run_live_apply_case(
+            &pool,
+            &digest,
+            Some(digest.clone()),
+            Utc::now() + Duration::hours(1),
+            Some(Uuid::new_v4()),
+        )
+        .await;
+        let (status, _) = resp.expect_err("grant for a different request must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Running");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// A LiveApply result applied within the grant window, then REPLAYED after
+    /// the grant expires (e.g. the durable outbox retries the POST much later),
+    /// must return idempotent 200 — NOT a 409 "grant expired". Expiry gates the
+    /// first apply only; a replay of an already-recorded result is not re-gated.
+    #[tokio::test]
+    async fn db_s5_live_apply_replay_after_grant_expiry_is_idempotent() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-rexp-{suffix}");
+        let agent_id = format!("s5-rexp-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+
+        let digest = proto_sha256(b"the-approved-plan");
+        let job_id = seed_live_apply_job(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence_bytes) = make_live_apply_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"live apply evidence",
+            Some(digest.clone()),
+        );
+        let result_id = job_result.result_id;
+        // Two bodies sharing the SAME signed result (same result_id) — one for the
+        // first apply, one for the post-expiry replay.
+        let make_body = || ResultBody {
+            job_result: job_result.clone(),
+            evidence: evidence_bytes.clone(),
+            evidence_json: None,
+        };
+        let hdrs = || {
+            let mut h = HeaderMap::new();
+            h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            h
+        };
+
+        // First apply — within the grant window → accepted + terminal.
+        let _accepted = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs(),
+            make_body(),
+            &pool,
+        )
+        .await
+        .expect("first live apply must be accepted");
+
+        // Simulate the grant expiring after the apply was recorded.
+        sqlx::query(
+            "UPDATE agent_jobs \
+             SET live_context = jsonb_set(live_context, '{expiry}', to_jsonb($2::text)) \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind((Utc::now() - Duration::hours(1)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("expire the stored grant");
+
+        // Replay the SAME signed result — the job is terminal, so expiry is not
+        // re-checked; the idempotency branch returns 200.
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs(),
+            make_body(),
+            &pool,
+        )
+        .await;
+        let out = resp.expect("replay after expiry must be idempotent 200, not 409");
+        assert_eq!(
+            out.0.get("idempotent").and_then(|v| v.as_bool()),
+            Some(true),
+            "replay must be flagged idempotent"
+        );
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Succeeded", "job stays terminal");
+        assert_eq!(db.result_id, Some(result_id), "recorded result unchanged");
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
