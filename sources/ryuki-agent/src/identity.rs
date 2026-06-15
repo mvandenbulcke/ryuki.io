@@ -161,8 +161,7 @@ impl AgentIdentity {
         encode_verifying_key(&self.signing_key.verifying_key())
     }
 
-    /// Borrow the raw `SigningKey` — used by S4b to sign result envelopes.
-    #[allow(dead_code)]
+    /// Borrow the raw `SigningKey` — used to sign result envelopes.
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
     }

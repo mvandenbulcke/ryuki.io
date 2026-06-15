@@ -1,30 +1,22 @@
-//! ryuki-agent — per-platform execution agent binary.
+//! ryuki-agent binary — entry point.
 //!
-//! ## S4a scope (this file)
+//! Loads configuration, resolves the Ed25519 identity, then enters the
+//! pull-loop via [`ryuki_agent::run::run_loop`].
 //!
-//! - Init structured logging.
-//! - Load `AgentConfig` from environment.
-//! - Load or generate `AgentIdentity` (Ed25519 key).
-//! - Build an `AgentRegistration` ready to post.
-//! - Log what would happen next (register / poll).
+//! ## Registration (TODO S5)
 //!
-//! ## TODO S4b
-//!
-//! - Pull-loop: `CpClient::poll()` → `CpClient::ack()` → run via `ryuki-runner`
-//!   → sign result envelope → `CpClient::post_result()`.
-//! - Durable outbox: write signed result before posting; retry until CP acks.
-//! - Heartbeat ticker (parallel to pull-loop).
-//! - Graceful shutdown on SIGTERM.
-//! - `--allow-live` flag for `LivePlan`/`LiveApply` modes (S5).
+//! Self-registration via `CpClient::register_new` is a later slice.  For now
+//! the agent MUST already be enrolled and approved in the CP; the token is
+//! supplied via `RYUKI_AGENT_TOKEN`.  Leave a clear marker here so S5 can slot
+//! registration in before the `run_loop` call.
 
-mod client;
-mod config;
-mod executor;
-mod identity;
-mod outbox;
-mod result;
+use std::sync::Arc;
+use std::time::Duration;
 
-use ryuki_protocol::AgentRegistration;
+use ryuki_agent::{
+    client::CpClient, config::AgentConfig, executor::RunnerExecutor, identity::AgentIdentity,
+    outbox::Outbox, run::run_loop,
+};
 use tracing::info;
 
 #[tokio::main]
@@ -38,7 +30,7 @@ async fn main() {
         .init();
 
     // Load configuration from RYUKI_AGENT_* env vars.
-    let cfg = match config::AgentConfig::from_env() {
+    let cfg = match AgentConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "configuration error");
@@ -66,7 +58,7 @@ async fn main() {
 
     // Load or generate the Ed25519 identity.
     let identity = if cfg.key_path.exists() {
-        match identity::AgentIdentity::load(&cfg.key_path) {
+        match AgentIdentity::load(&cfg.key_path) {
             Ok(id) => {
                 info!(key_id = %id.public_key_b64(), "loaded existing agent identity");
                 id
@@ -77,7 +69,7 @@ async fn main() {
             }
         }
     } else {
-        let id = identity::AgentIdentity::generate();
+        let id = AgentIdentity::generate();
         if let Err(e) = id.save(&cfg.key_path) {
             tracing::error!(error = %e, path = %cfg.key_path.display(), "failed to save identity");
             std::process::exit(1);
@@ -86,35 +78,41 @@ async fn main() {
         id
     };
 
-    // Build the registration payload (sent to POST /api/agents/register on first run).
-    // In S4b this is wired to CpClient::register_new when no token exists yet,
-    // or skipped when the agent is already enrolled.
-    let registration = AgentRegistration {
-        agent_id: cfg.platform.clone(), // S4b: make agent_id separately configurable
-        platform: cfg.platform.clone(),
-        capabilities: cfg.capabilities.clone(),
-        public_key: identity.public_key_b64(),
-    };
+    let identity = Arc::new(identity);
+
+    // TODO S5: self-registration via CpClient::register_new when no token exists.
+    // For now the agent MUST be pre-enrolled + approved; the token comes from
+    // RYUKI_AGENT_TOKEN.  The agent_id is the platform string for now (S4c);
+    // make it separately configurable in S5.
+    let agent_id = cfg.platform.clone();
 
     info!(
-        agent_id   = %registration.agent_id,
-        public_key = %registration.public_key,
-        "agent identity ready (S4b: will register if not yet enrolled)"
+        agent_id   = %agent_id,
+        public_key = %identity.public_key_b64(),
+        "agent identity ready — entering pull-loop"
     );
 
-    // TODO S4b: pull-loop + execute + sign + outbox
-    // The skeleton below shows the intended S4b structure:
-    //
-    //   let cp = client::CpClient::new(&cfg.cp_base_url, &registration.agent_id, &cfg.token);
-    //   loop {
-    //       match cp.poll().await {
-    //           Ok(Some(job)) => {
-    //               // ack → run via ryuki-runner → sign → outbox → post_result
-    //           }
-    //           Ok(None) => tokio::time::sleep(Duration::from_secs(cfg.poll_interval_secs)).await,
-    //           Err(e) => { tracing::warn!(error = %e, "poll error"); /* backoff */ }
-    //       }
-    //   }
+    // Build dependencies.
+    let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &cfg.token);
+    let executor = RunnerExecutor::new(Arc::clone(&identity));
 
-    info!("S4a foundation ready — S4b will wire the pull-loop");
+    // Outbox lives next to the key file (same directory) or falls back to cwd/outbox.
+    let outbox_dir = cfg
+        .key_path
+        .parent()
+        .map(|p| p.join("outbox"))
+        .unwrap_or_else(|| std::path::PathBuf::from("outbox"));
+
+    let outbox = match Outbox::create_dir(&outbox_dir) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(error = %e, path = %outbox_dir.display(), "failed to create outbox directory");
+            std::process::exit(1);
+        }
+    };
+
+    let poll_interval = Duration::from_secs(cfg.poll_interval_secs);
+
+    // Enter the pull-loop. This never returns under normal operation.
+    run_loop(&cp, &executor, &identity, &agent_id, &outbox, poll_interval).await;
 }

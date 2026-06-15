@@ -16,10 +16,6 @@
 //! `Evidence.evidence_json` is an optional structured view (stored as JSONB on
 //! the CP) — never used for auth decisions, only for human-readable queries.
 
-// S4c wires all pub items in this module into the pull-loop.  Suppress
-// dead-code warnings for the binary target until that wiring lands.
-#![allow(dead_code)]
-
 use ryuki_engine::runners::{RunMode, RunStatus, RunnerKind};
 use ryuki_protocol::{JobMode, JobSpec};
 use serde_json::Value;
@@ -94,6 +90,9 @@ pub trait JobExecutor: Send + Sync {
 /// `@`.  `JobSpec.offering_id` is a `Uuid` that identifies the catalog entry;
 /// the human-readable slug that the runner needs comes from `iac_ref`.
 pub struct RunnerExecutor {
+    // Retained for S5: live-mode credential injection will use the identity
+    // to sign credential requests or decrypt vault tokens.
+    #[allow(dead_code)]
     identity: std::sync::Arc<AgentIdentity>,
 }
 

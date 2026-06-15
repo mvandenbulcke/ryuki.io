@@ -158,6 +158,15 @@ impl AgentConfig {
         let key_path = PathBuf::from(key_path);
 
         let poll_interval_secs = optional_u64(&get, "RYUKI_AGENT_POLL_INTERVAL_SECS", 10)?;
+        // A zero poll interval would busy-loop the pull-loop (heartbeat + poll
+        // with no sleep), hammering the control plane. Reject it explicitly.
+        if poll_interval_secs == 0 {
+            return Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_POLL_INTERVAL_SECS",
+                value: "0".to_owned(),
+                reason: "must be >= 1 second (0 would busy-loop the control plane)".to_owned(),
+            });
+        }
         let lease_secs = optional_u64(&get, "RYUKI_AGENT_LEASE_SECS", 300)?;
 
         Ok(Self {
@@ -397,6 +406,26 @@ mod tests {
                 })
             ),
             "token without rya_ prefix must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_poll_interval() {
+        let result = AgentConfig::from_source(src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+            ("RYUKI_AGENT_POLL_INTERVAL_SECS", "0"),
+        ]));
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidEnv {
+                    var: "RYUKI_AGENT_POLL_INTERVAL_SECS",
+                    ..
+                })
+            ),
+            "a zero poll interval must be rejected (would busy-loop)"
         );
     }
 

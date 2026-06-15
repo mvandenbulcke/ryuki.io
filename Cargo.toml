@@ -56,6 +56,7 @@ ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 ryuki-runner = { path = "sources/ryuki-runner" }
 ryuki-protocol = { path = "sources/ryuki-protocol" }
+ryuki-agent = { path = "sources/ryuki-agent" }
 
 [profile.wasm-release]
 codegen-units = 1

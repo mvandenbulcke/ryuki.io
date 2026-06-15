@@ -2940,6 +2940,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rsa",
+ "ryuki-agent",
  "ryuki-core",
  "ryuki-engine",
  "ryuki-protocol",

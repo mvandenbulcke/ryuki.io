@@ -1,6 +1,4 @@
 //! Durable at-least-once delivery outbox.
-// S4c wires Outbox into the pull-loop.  Suppress dead-code warnings until then.
-#![allow(dead_code)]
 //!
 //! ## At-least-once delivery contract
 //!

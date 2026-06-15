@@ -34,3 +34,4 @@ thiserror = "2"
 [dev-dependencies]
 rsa = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+ryuki-agent = { workspace = true }

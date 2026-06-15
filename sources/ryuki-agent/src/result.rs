@@ -1,6 +1,4 @@
-//! Signed result production — the security core of S4b.
-// S4c wires these functions into the pull-loop.  Suppress dead-code warnings until then.
-#![allow(dead_code)]
+//! Signed result production — the security core of the agent.
 //!
 //! `build_signed_result` constructs a `ResultBody` whose `SignedEnvelope` passes
 //! ALL 9 steps of the CP verifier (`post_job_result_with_pool` in

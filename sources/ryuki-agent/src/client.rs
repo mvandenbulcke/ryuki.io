@@ -40,7 +40,6 @@ use ryuki_protocol::{AgentRegistration, Job};
 ///
 /// `Debug` is manual to REDACT the one-time token — a derived `Debug` would leak
 /// the bearer token into any trace that formats the response.
-#[allow(dead_code)] // consumed by S4b (register_new + poll-loop)
 #[derive(Clone, Deserialize, Serialize)]
 pub struct RegisterResponse {
     pub agent_id: String,
@@ -57,7 +56,6 @@ impl std::fmt::Debug for RegisterResponse {
 }
 
 /// Mirrors `agents::AckBody` exactly.
-#[allow(dead_code)] // consumed by S4b ack()
 #[derive(Debug, Serialize)]
 struct AckBody {
     pub attempt_id: Uuid,
@@ -65,7 +63,6 @@ struct AckBody {
 }
 
 /// Mirrors `agents::HeartbeatBody` exactly.
-#[allow(dead_code)] // consumed by S4b heartbeat()
 #[derive(Debug, Serialize)]
 struct HeartbeatBody {
     pub running_job_id: Option<Uuid>,
@@ -75,7 +72,6 @@ struct HeartbeatBody {
 // ClientError
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // consumed by S4b pull-loop
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("HTTP request failed: {0}")]
@@ -90,7 +86,6 @@ pub enum ClientError {
 
 /// Consume a `reqwest::Response`, asserting 2xx.
 /// On non-2xx: read the body text and return `ClientError::ErrorStatus`.
-#[allow(dead_code)] // consumed by S4b pull-loop methods
 async fn require_2xx(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
     let status = resp.status();
     if status.is_success() {
@@ -111,7 +106,6 @@ async fn require_2xx(resp: reqwest::Response) -> Result<reqwest::Response, Clien
 /// Authenticated control-plane HTTP client.
 ///
 /// All methods append to `base_url`; the URL is stored without a trailing slash.
-#[allow(dead_code)] // S4b wires main.rs → CpClient; S4a only uses it in tests
 pub struct CpClient {
     http: Client,
     base_url: String,
@@ -121,7 +115,6 @@ pub struct CpClient {
     token: String,
 }
 
-#[allow(dead_code)] // all methods consumed by S4b pull-loop
 impl CpClient {
     /// Construct an authenticated client.
     ///

@@ -3406,4 +3406,249 @@ mod tests {
         cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }
+
+    // ── S4c: end-to-end dry-run contract ─────────────────────────────────────
+    //
+    // These tests prove that the AGENT code (ryuki-agent lib) and the CP verifier
+    // (post_job_result_with_pool) agree against a real Postgres database.
+    //
+    // The agent identity is generated fresh; its public_key is enrolled in the
+    // agents table so the CP's key_id check + Ed25519 verify pass.
+    //
+    // Positive: agent produces a ResultBody that passes ALL 9 verifier steps.
+    // Negative (tamper): mutating one evidence byte after signing → CP rejects
+    //   with 4xx, proving the evidence digest is bound end-to-end.
+
+    // Import the trait so .execute() is callable on StubExecutor.
+    use ryuki_agent::executor::JobExecutor as AgentJobExecutor;
+
+    /// Seed an approved agent whose enrolled public_key equals the given
+    /// agent identity's public_key_b64().  Returns the plaintext bearer token.
+    async fn seed_agent_from_identity(
+        pool: &PgPool,
+        agent_id: &str,
+        platform: &str,
+        identity: &ryuki_agent::identity::AgentIdentity,
+    ) -> String {
+        let pubkey_b64 = identity.public_key_b64();
+        let token = format!(
+            "{AGENT_TOKEN_PREFIX}s4c{}",
+            Uuid::new_v4().to_string().replace('-', "")
+        );
+        let hash = sha256_hex(&token);
+        sqlx::query(
+            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
+             ON CONFLICT (agent_id) DO UPDATE \
+             SET token_hash = $4, status = 'approved', public_key = $3, updated_at = NOW()",
+        )
+        .bind(agent_id)
+        .bind(platform)
+        .bind(&pubkey_b64)
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("seed agent from identity");
+        token
+    }
+
+    /// Build the `ryuki_protocol::Job` struct that the agent would receive after
+    /// leasing and acking, from the leased row's fields.
+    fn build_protocol_job(
+        job_row: &AgentJobRow,
+        attempt_id: Uuid,
+        fencing_token: String,
+        cp_nonce: String,
+        lease_generation: i64,
+    ) -> ryuki_protocol::Job {
+        use ryuki_protocol::{Job, JobLease, JobSpec, JobStatus};
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let lease = JobLease {
+            attempt_id,
+            lease_generation: lease_generation as u64,
+            fencing_token,
+            deadline: Utc::now() + Duration::seconds(LEASE_TTL_SECS),
+            cp_nonce,
+        };
+        Job {
+            id: job_row.id,
+            platform: job_row.platform.clone(),
+            spec,
+            status: JobStatus::Running,
+            lease: Some(lease),
+            live_context: None,
+        }
+    }
+
+    /// S4c positive: agent identity → execute → build_signed_result → CP verifier.
+    /// The full 9-step verifier must accept the agent-produced envelope.
+    #[tokio::test]
+    async fn db_s4c_agent_to_cp_positive_e2e() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s4c-plt-{suffix}");
+        let agent_id = format!("s4c-agent-{suffix}");
+
+        // Generate the agent identity — this is what the production agent does at startup.
+        let identity = ryuki_agent::identity::AgentIdentity::generate();
+
+        // Enroll the agent with this identity's public key.
+        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+
+        // Seed a pending OfflineDryRun job and lease + ack it.
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        // Build the Job struct as the agent would see it after poll() + ack().
+        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+
+        // RUN AGENT CODE — execute + sign, exactly as process_job does.
+        let executor = ryuki_agent::executor::StubExecutor::check_ok();
+        let evidence = executor
+            .execute(&job.spec)
+            .expect("StubExecutor must succeed");
+        let agent_body =
+            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence)
+                .expect("build_signed_result must succeed");
+
+        let agent_result_id = agent_body.job_result.result_id;
+
+        // Cross the crate boundary: convert agent ResultBody → CP ResultBody.
+        // The shapes are identical (same JSON); serde is the bridge.
+        let cp_body: ResultBody = serde_json::from_value(
+            serde_json::to_value(&agent_body).expect("agent body serialises"),
+        )
+        .expect("CP must deserialise the agent ResultBody");
+
+        // Build the bearer-token header (agent's token).
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        // FEED TO CP VERIFIER — must pass all 9 steps.
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            cp_body,
+            &pool,
+        )
+        .await;
+
+        assert!(
+            resp.is_ok(),
+            "agent-produced envelope must pass all CP verifier steps: {:?}",
+            resp.err()
+        );
+
+        // Verify DB state.
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db_row.status, "Succeeded",
+            "job must be terminal after CP verification"
+        );
+        assert_eq!(
+            db_row.result_id,
+            Some(agent_result_id),
+            "DB result_id must match the agent's result_id"
+        );
+        assert!(db_row.completed_at.is_some(), "completed_at must be set");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// S4c negative (tamper): mutate one evidence byte in the agent's body
+    /// AFTER signing → CP must reject with 4xx.
+    /// This proves the evidence digest is cryptographically bound end-to-end.
+    #[tokio::test]
+    async fn db_s4c_tampered_evidence_is_rejected_by_cp() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s4c-tamp-{suffix}");
+        let agent_id = format!("s4c-tagent-{suffix}");
+
+        let identity = ryuki_agent::identity::AgentIdentity::generate();
+        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+
+        // Execute + sign (normal path).
+        let executor = ryuki_agent::executor::StubExecutor::check_ok();
+        let evidence = executor
+            .execute(&job.spec)
+            .expect("StubExecutor must succeed");
+        let mut agent_body =
+            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence)
+                .expect("build_signed_result must succeed");
+
+        // TAMPER: flip one byte of evidence AFTER signing.
+        // The signed envelope's evidence_digest remains the pre-tamper hash;
+        // the CP's recompute-and-compare at step 6 must catch the mismatch.
+        if !agent_body.evidence.is_empty() {
+            agent_body.evidence[0] ^= 0xFF;
+        } else {
+            // Should never happen for StubExecutor, but fail clearly if it does.
+            panic!("evidence must not be empty for this test");
+        }
+
+        // Cross the crate boundary.
+        let cp_body: ResultBody = serde_json::from_value(
+            serde_json::to_value(&agent_body).expect("agent body serialises"),
+        )
+        .expect("CP deserialises the tampered body");
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        // CP VERIFIER must reject — step 6 (evidence_digest recompute) fails.
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            cp_body,
+            &pool,
+        )
+        .await;
+
+        assert!(
+            resp.is_err(),
+            "tampered evidence must be rejected by the CP verifier"
+        );
+        let (status, _) = resp.unwrap_err();
+        assert!(
+            status.is_client_error(),
+            "tampered evidence must produce a 4xx, got {status}"
+        );
+
+        // Job must remain Running — no result was recorded.
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db_row.status, "Running",
+            "job must remain Running after tamper rejection"
+        );
+        assert!(
+            db_row.result_id.is_none(),
+            "result_id must not be recorded after tamper rejection"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
 }
