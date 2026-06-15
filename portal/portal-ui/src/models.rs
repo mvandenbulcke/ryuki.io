@@ -1063,6 +1063,39 @@ pub struct RequestSummary {
     pub created: String,
 }
 
+// ── Agent types ───────────────────────────────────────────────────────────
+//
+// These types mirror the `GET /api/admin/agents` API shape. The endpoint is
+// admin-only (PlatformAdmin gate) and returns the {agents:[...], capped:bool}
+// envelope. `last_seen_at` is nullable (agents that registered but have not
+// checked in yet). `result_status` and `completed_at` on each job are also
+// nullable (jobs still in-flight).
+//
+// Static/degraded mode returns an empty Vec — no synthetic agent rows are
+// fabricated because synthetic agents with fake platforms or statuses would
+// mislead operators about what is actually enrolled.
+
+/// Portal-facing summary of one registered execution agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSummary {
+    pub agent_id: String,
+    pub platform: String,
+    pub status: String,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+    pub jobs: Vec<AgentJobSummary>,
+}
+
+/// Portal-facing summary of one job associated with an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentJobSummary {
+    pub id: String,
+    pub mode: String,
+    pub status: String,
+    pub result_status: Option<String>,
+    pub completed_at: Option<String>,
+}
+
 // ── Integration types ─────────────────────────────────────────────────────
 //
 // These types mirror the Slice-1 API shape (`/api/integrations`). The

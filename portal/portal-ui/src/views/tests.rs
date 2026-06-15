@@ -373,4 +373,131 @@ mod tests {
         assert_eq!(lower.len(), upper.len(), "case must not affect match count");
         assert_eq!(lower.len(), mixed.len(), "case must not affect match count");
     }
+
+    // ── Agent view tests ──────────────────────────────────────────────────────
+
+    use super::super::agents::status_badge_class as agent_status_badge_class;
+    use crate::models::{AgentJobSummary, AgentSummary};
+
+    /// `status_badge_class` must map all three canonical enrollment statuses and
+    /// fall back to neutral for unknown values.
+    #[test]
+    fn agent_status_badge_class_maps_all_statuses() {
+        assert_eq!(
+            agent_status_badge_class("approved"),
+            "badge good",
+            "approved must be badge good"
+        );
+        assert_eq!(
+            agent_status_badge_class("pending"),
+            "badge neutral",
+            "pending must be badge neutral"
+        );
+        assert_eq!(
+            agent_status_badge_class("revoked"),
+            "badge bad",
+            "revoked must be badge bad"
+        );
+        // Unknown/empty falls back to neutral.
+        assert_eq!(
+            agent_status_badge_class("unknown"),
+            "badge neutral",
+            "unknown must fall back to badge neutral"
+        );
+        assert_eq!(
+            agent_status_badge_class(""),
+            "badge neutral",
+            "empty must fall back to badge neutral"
+        );
+    }
+
+    /// Round-trip deserialize a sample API JSON fragment (the {agents:[...]} envelope
+    /// element) into `AgentSummary`, assert every field including nested jobs and
+    /// nullable `last_seen_at` / `result_status` / `completed_at`.
+    #[test]
+    fn agent_summary_serde_round_trip() {
+        let json = r#"{
+            "agent_id": "agt-abc123",
+            "platform": "vmware",
+            "status": "approved",
+            "last_seen_at": null,
+            "created_at": "2026-06-01T00:00:00Z",
+            "jobs": [
+                {
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "mode": "LiveApply",
+                    "status": "completed",
+                    "result_status": "LiveApplied",
+                    "completed_at": "2026-06-10T12:34:56Z"
+                },
+                {
+                    "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                    "mode": "OfflineDryRun",
+                    "status": "completed",
+                    "result_status": null,
+                    "completed_at": null
+                }
+            ]
+        }"#;
+
+        let agent: AgentSummary =
+            serde_json::from_str(json).expect("AgentSummary must deserialize from sample JSON");
+
+        assert_eq!(agent.agent_id, "agt-abc123");
+        assert_eq!(agent.platform, "vmware");
+        assert_eq!(agent.status, "approved");
+        assert!(agent.last_seen_at.is_none(), "last_seen_at must be None");
+        assert_eq!(agent.created_at, "2026-06-01T00:00:00Z");
+        assert_eq!(agent.jobs.len(), 2, "must have exactly 2 jobs");
+
+        let job0 = &agent.jobs[0];
+        assert_eq!(job0.id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(job0.mode, "LiveApply");
+        assert_eq!(job0.status, "completed");
+        assert_eq!(
+            job0.result_status.as_deref(),
+            Some("LiveApplied"),
+            "result_status must be Some(LiveApplied)"
+        );
+        assert_eq!(
+            job0.completed_at.as_deref(),
+            Some("2026-06-10T12:34:56Z"),
+            "completed_at must be Some"
+        );
+
+        let job1 = &agent.jobs[1];
+        assert_eq!(job1.mode, "OfflineDryRun");
+        assert!(
+            job1.result_status.is_none(),
+            "result_status must be None for in-flight job"
+        );
+        assert!(
+            job1.completed_at.is_none(),
+            "completed_at must be None for in-flight job"
+        );
+
+        // Verify serde round-trip (serialize back and re-parse).
+        let serialized =
+            serde_json::to_string(&agent).expect("AgentSummary must serialize to JSON");
+        let agent2: AgentSummary =
+            serde_json::from_str(&serialized).expect("re-parse must succeed");
+        assert_eq!(agent, agent2, "round-trip must be lossless");
+    }
+
+    /// `AgentJobSummary` struct construction and field access.
+    #[test]
+    fn agent_job_summary_construction() {
+        let job = AgentJobSummary {
+            id: "job-uuid-1234".to_string(),
+            mode: "LivePlan".to_string(),
+            status: "running".to_string(),
+            result_status: None,
+            completed_at: None,
+        };
+        assert_eq!(job.id, "job-uuid-1234");
+        assert_eq!(job.mode, "LivePlan");
+        assert_eq!(job.status, "running");
+        assert!(job.result_status.is_none());
+        assert!(job.completed_at.is_none());
+    }
 }

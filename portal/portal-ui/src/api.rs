@@ -402,6 +402,12 @@ pub fn integrations_path() -> &'static str {
     INTEGRATIONS_PATH
 }
 
+const ADMIN_AGENTS_PATH: &str = "/api/admin/agents";
+
+pub fn admin_agents_path() -> &'static str {
+    ADMIN_AGENTS_PATH
+}
+
 fn safe_integration_id(integration_id: &str) -> Result<&str, ApiPathError> {
     let integration_id = integration_id.trim();
     if integration_id.is_empty() {

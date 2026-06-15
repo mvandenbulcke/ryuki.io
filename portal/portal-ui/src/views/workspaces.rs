@@ -31,6 +31,7 @@ use crate::server_boundary::{
     PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
     PortalServerBoundary,
 };
+use crate::views::agents::AgentListView;
 use crate::views::approvals::ApprovalsList;
 use crate::views::dashboard::DashboardView;
 use crate::views::integrations::IntegrationsList;
@@ -357,6 +358,35 @@ pub fn IntegrationsWorkspaceView() -> impl IntoView {
                     }
                 >
                     <IntegrationsList/>
+                </Show>
+            </section>
+        </div>
+    }
+}
+
+/// `/agents` — enrolled execution agents and their recent jobs.
+///
+/// Admin-gated (PlatformAdmin only), mirroring `IntegrationsWorkspaceView`.
+#[component]
+pub fn AgentsWorkspaceView() -> impl IntoView {
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let is_admin = session_can(&auth_session, "admin");
+
+    view! {
+        <div class="workspace-area">
+            <WorkspaceSummaryCards only="agents"/>
+            <section class="workspace-detail-grid" aria-label="Agents workspace details">
+                <Show
+                    when=move || is_admin
+                    fallback=|| {
+                        view! {
+                            <div class="request-list-empty" aria-label="No admin access">
+                                <p>"You do not have admin permissions."</p>
+                            </div>
+                        }
+                    }
+                >
+                    <AgentListView/>
                 </Show>
             </section>
         </div>

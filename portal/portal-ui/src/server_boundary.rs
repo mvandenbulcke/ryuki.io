@@ -1,21 +1,22 @@
 use crate::api::{
-    activity_audit_feed_path, activity_operation_queue_path, admin_feature_flag_governance_path,
-    admin_platform_settings_path, admin_platform_settings_reset_path, admin_rbac_roles_path,
-    admin_sessions_path, admin_tokens_path, admin_worker_capability_path,
-    approval_decision_readiness_path, approvals_pending_path, auth_local_login_path,
-    auth_local_logout_path, auth_login_path, auth_logout_path, auth_session_path, auth_status_path,
-    boundary_status_path, catalog_offerings_path, catalog_recommendations_path,
-    catalog_request_form_path, cluster_capacity_admission_path, cmdb_file_exchange_path,
-    cmdb_reconciliation_path, cmdb_relationship_graph_path, datacenter_check_cooling_path,
-    datacenter_check_power_path, datacenter_check_rack_space_path,
-    datacenter_check_switchports_path, datacenter_failing_checks_path,
-    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
-    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
-    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
-    integrations_path, inventory_ownership_risk_path, inventory_resource_overview_path,
-    operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
-    platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
-    request_create_path, request_intake_form_preview_path, request_intake_path, request_list_path,
+    activity_audit_feed_path, activity_operation_queue_path, admin_agents_path,
+    admin_feature_flag_governance_path, admin_platform_settings_path,
+    admin_platform_settings_reset_path, admin_rbac_roles_path, admin_sessions_path,
+    admin_tokens_path, admin_worker_capability_path, approval_decision_readiness_path,
+    approvals_pending_path, auth_local_login_path, auth_local_logout_path, auth_login_path,
+    auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
+    catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
+    cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
+    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
+    datacenter_check_rack_space_path, datacenter_check_switchports_path,
+    datacenter_failing_checks_path, datacenter_full_readiness_path,
+    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
+    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
+    evidence_export_retention_path, evidence_summary_path, integrations_path,
+    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
+    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
+    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
+    request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
 };
@@ -38,6 +39,8 @@ use crate::api_client::{
 use crate::models::platform_settings_summary_fallback;
 #[cfg(feature = "ssr")]
 use crate::models::request_intake_form_fallback;
+#[cfg(feature = "ssr")]
+use crate::models::AgentJobSummary;
 #[cfg(any(feature = "ssr", test))]
 use crate::models::ALL_APP_ROLES;
 #[cfg(feature = "ssr")]
@@ -55,7 +58,7 @@ use crate::models::{
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
-    AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
+    AgentSummary, AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
     CmdbReconciliationSummary, CmdbRelationshipSummary, CreateIntegrationPayload,
     CreateRequestPayload, CreateTokenPayload, CreateTokenResult, DatacenterFailingChecksSummary,
     DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
@@ -127,6 +130,7 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     admin_platform_settings_reset_path,
     admin_tokens_path,
     admin_sessions_path,
+    admin_agents_path,
     integrations_path,
     secret_references_path,
     policy_outcomes_path,
@@ -2531,6 +2535,94 @@ pub async fn list_integrations() -> Result<Vec<IntegrationSummary>, ServerFnErro
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
             "integrations list fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+// ── Agent server functions ────────────────────────────────────────────────
+
+#[server(prefix = "/portal/api", endpoint = "admin-agents-list")]
+pub async fn get_admin_agents() -> Result<Vec<AgentSummary>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(admin_agents_path())
+        .map_err(|_| ServerFnError::new("admin agents API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        // Honest empty list in static/degraded mode — no synthetic agent rows.
+        // Fabricating agents with fake platforms or statuses would mislead
+        // operators about what is actually enrolled.
+        return Ok(Vec::new());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream
+        .get(admin_agents_path(), session_id.as_deref())
+        .await
+    {
+        Ok(response) if response.is_success() => {
+            let raw: serde_json::Value = response
+                .json()
+                .map_err(|_| ServerFnError::new("admin agents response was malformed"))?;
+            let agent_values = raw
+                .get("agents")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let agents = agent_values
+                .into_iter()
+                .filter_map(|item| {
+                    let agent_id = item.get("agent_id")?.as_str()?.to_string();
+                    let platform = item.get("platform")?.as_str()?.to_string();
+                    let status = item.get("status")?.as_str()?.to_string();
+                    let last_seen_at = item
+                        .get("last_seen_at")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let created_at = item.get("created_at")?.as_str()?.to_string();
+                    let jobs = item
+                        .get("jobs")
+                        .and_then(|j| j.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|j| {
+                                    let id = j.get("id")?.as_str()?.to_string();
+                                    let mode = j.get("mode")?.as_str()?.to_string();
+                                    let status = j.get("status")?.as_str()?.to_string();
+                                    let result_status = j
+                                        .get("result_status")
+                                        .and_then(|r| r.as_str())
+                                        .map(str::to_string);
+                                    let completed_at = j
+                                        .get("completed_at")
+                                        .and_then(|c| c.as_str())
+                                        .map(str::to_string);
+                                    Some(AgentJobSummary {
+                                        id,
+                                        mode,
+                                        status,
+                                        result_status,
+                                        completed_at,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    Some(AgentSummary {
+                        agent_id,
+                        platform,
+                        status,
+                        last_seen_at,
+                        created_at,
+                        jobs,
+                    })
+                })
+                .collect();
+            Ok(agents)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "admin agents fetch failed",
         ))),
         Err(_) => Err(ServerFnError::new("API unreachable")),
     }

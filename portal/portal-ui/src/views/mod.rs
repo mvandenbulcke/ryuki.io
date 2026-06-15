@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod approvals;
 pub mod dashboard;
 pub mod integrations;
