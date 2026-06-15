@@ -10,6 +10,7 @@
 //! The binary (`main.rs`) re-exports via this lib rather than declaring its
 //! own `mod` statements, keeping the two compilation units in sync.
 
+pub mod classify;
 pub mod client;
 pub mod config;
 pub mod executor;

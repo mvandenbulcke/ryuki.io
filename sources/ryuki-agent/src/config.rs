@@ -10,12 +10,26 @@
 //!
 //! ## Optional variables (defaults shown)
 //!
-//! | Env var                         | Field               | Default |
-//! |---------------------------------|---------------------|---------|
-//! | `RYUKI_AGENT_KEY_PATH`          | `key_path`          | `agent.key` (cwd) |
-//! | `RYUKI_AGENT_POLL_INTERVAL_SECS`| `poll_interval_secs`| 10      |
-//! | `RYUKI_AGENT_LEASE_SECS`        | `lease_secs`        | 300     |
-//! | `RYUKI_AGENT_ALLOW_LIVE`        | `allow_live`        | `false` |
+//! | Env var                                | Field                      | Default |
+//! |----------------------------------------|----------------------------|---------|
+//! | `RYUKI_AGENT_KEY_PATH`                 | `key_path`                 | `agent.key` (cwd) |
+//! | `RYUKI_AGENT_POLL_INTERVAL_SECS`       | `poll_interval_secs`       | 10      |
+//! | `RYUKI_AGENT_LEASE_SECS`               | `lease_secs`               | 300     |
+//! | `RYUKI_AGENT_ALLOW_LIVE`               | `allow_live`               | `false` |
+//! | `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`      | `max_outbox_attempts`      | 10      |
+//! | `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS` | `outbox_drain_interval_secs` | 60  |
+//!
+//! ### `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS`
+//!
+//! Maximum number of transient-failure delivery attempts before an outbox entry
+//! is moved to the dead-letter directory (`<outbox_dir>/dead/`).  `OperatorAlert`
+//! entries (401/403) do NOT count toward this limit.  Must be >= 1.
+//!
+//! ### `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS`
+//!
+//! How often the agent drains the outbox during the poll loop (in seconds).
+//! Must be >= 1 (0 would drain on every poll tick, hammering the CP).
+//! The outbox is always drained once at startup regardless of this setting.
 //!
 //! ### `RYUKI_AGENT_ALLOW_LIVE`
 //!
@@ -102,6 +116,19 @@ pub struct AgentConfig {
     ///
     /// See the module-level doc comment for the full opt-in semantics.
     pub allow_live: bool,
+
+    /// Maximum number of transient-failure delivery attempts before an outbox
+    /// entry is quarantined to `<outbox_dir>/dead/`.
+    ///
+    /// `OperatorAlert` entries (401/403) do NOT count toward this limit.
+    /// Set via `RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS` (default 10, must be >= 1).
+    pub max_outbox_attempts: u32,
+
+    /// How often (in seconds) the poll loop drains the outbox while idle.
+    ///
+    /// Set via `RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS` (default 60).
+    /// Must be >= 1; 0 is rejected (would drain on every tick).
+    pub outbox_drain_interval_secs: u64,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -115,6 +142,11 @@ impl std::fmt::Debug for AgentConfig {
             .field("lease_secs", &self.lease_secs)
             .field("capabilities", &self.capabilities)
             .field("allow_live", &self.allow_live)
+            .field("max_outbox_attempts", &self.max_outbox_attempts)
+            .field(
+                "outbox_drain_interval_secs",
+                &self.outbox_drain_interval_secs,
+            )
             .finish()
     }
 }
@@ -222,6 +254,25 @@ impl AgentConfig {
             });
         }
 
+        let max_outbox_attempts = optional_u32(&get, "RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS", 10)?;
+        if max_outbox_attempts == 0 {
+            return Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS",
+                value: "0".to_owned(),
+                reason: "must be >= 1 (0 would never quarantine, retrying forever)".to_owned(),
+            });
+        }
+
+        let outbox_drain_interval_secs =
+            optional_u64(&get, "RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS", 60)?;
+        if outbox_drain_interval_secs == 0 {
+            return Err(ConfigError::InvalidEnv {
+                var: "RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS",
+                value: "0".to_owned(),
+                reason: "must be >= 1 second (0 would drain on every poll tick)".to_owned(),
+            });
+        }
+
         Ok(Self {
             cp_base_url,
             platform,
@@ -231,6 +282,8 @@ impl AgentConfig {
             lease_secs,
             capabilities: Capabilities::default(),
             allow_live,
+            max_outbox_attempts,
+            outbox_drain_interval_secs,
         })
     }
 }
@@ -282,6 +335,21 @@ fn optional_u64(
     match get(var) {
         None => Ok(default),
         Some(val) => val.parse::<u64>().map_err(|e| ConfigError::InvalidEnv {
+            var,
+            value: val,
+            reason: e.to_string(),
+        }),
+    }
+}
+
+fn optional_u32(
+    get: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match get(var) {
+        None => Ok(default),
+        Some(val) => val.parse::<u32>().map_err(|e| ConfigError::InvalidEnv {
             var,
             value: val,
             reason: e.to_string(),
@@ -654,5 +722,95 @@ mod tests {
                 "RYUKI_AGENT_ALLOW_LIVE={garbage:?} must be treated as false (fail-safe)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // max_outbox_attempts + outbox_drain_interval_secs
+    // -----------------------------------------------------------------------
+
+    fn base_src() -> impl Fn(&str) -> Option<String> {
+        src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+        ])
+    }
+
+    #[test]
+    fn max_outbox_attempts_default_is_10() {
+        let cfg = AgentConfig::from_source(base_src()).expect("must parse");
+        assert_eq!(cfg.max_outbox_attempts, 10);
+    }
+
+    #[test]
+    fn max_outbox_attempts_custom_parses() {
+        let s = src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+            ("RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS", "5"),
+        ]);
+        let cfg = AgentConfig::from_source(s).expect("must parse");
+        assert_eq!(cfg.max_outbox_attempts, 5);
+    }
+
+    #[test]
+    fn max_outbox_attempts_rejects_zero() {
+        let s = src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+            ("RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS", "0"),
+        ]);
+        let result = AgentConfig::from_source(s);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidEnv {
+                    var: "RYUKI_AGENT_MAX_OUTBOX_ATTEMPTS",
+                    ..
+                })
+            ),
+            "zero max_outbox_attempts must be rejected"
+        );
+    }
+
+    #[test]
+    fn outbox_drain_interval_default_is_60() {
+        let cfg = AgentConfig::from_source(base_src()).expect("must parse");
+        assert_eq!(cfg.outbox_drain_interval_secs, 60);
+    }
+
+    #[test]
+    fn outbox_drain_interval_custom_parses() {
+        let s = src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+            ("RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS", "120"),
+        ]);
+        let cfg = AgentConfig::from_source(s).expect("must parse");
+        assert_eq!(cfg.outbox_drain_interval_secs, 120);
+    }
+
+    #[test]
+    fn outbox_drain_interval_rejects_zero() {
+        let s = src(&[
+            ("RYUKI_AGENT_CP_URL", "https://cp.example.com"),
+            ("RYUKI_AGENT_PLATFORM", "defra"),
+            ("RYUKI_AGENT_TOKEN", "rya_tok"),
+            ("RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS", "0"),
+        ]);
+        let result = AgentConfig::from_source(s);
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::InvalidEnv {
+                    var: "RYUKI_AGENT_OUTBOX_DRAIN_INTERVAL_SECS",
+                    ..
+                })
+            ),
+            "zero drain interval must be rejected"
+        );
     }
 }

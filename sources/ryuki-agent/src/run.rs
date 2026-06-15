@@ -38,14 +38,16 @@
 //! and `replay_outbox` return `Result`; `run_loop` logs errors and backs off —
 //! it never panics.
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use ed25519_dalek::VerifyingKey;
+use serde_json::Value;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    classify::{classify_client_error, RetryClass},
     client::{ClientError, CpClient},
     executor::{ExecError, JobExecutor},
     identity::AgentIdentity,
@@ -366,27 +368,94 @@ async fn enqueue_and_post(
 }
 
 // ---------------------------------------------------------------------------
-// replay_outbox
+// ResultPoster trait — testable abstraction over CpClient::post_result
 // ---------------------------------------------------------------------------
 
-/// On startup: iterate every pending outbox entry and attempt to re-POST it.
+/// Abstraction over the network POST so `drain_outbox` is unit-testable
+/// without any HTTP infrastructure.
 ///
-/// Each successful POST is followed by `mark_delivered`. Failed POSTs are
-/// left in the outbox for the next startup cycle. Returns the counts for
-/// logging / testing.
-pub async fn replay_outbox(
-    client: &CpClient,
-    outbox: &Outbox,
-) -> Result<(usize, usize), AgentError> {
-    let pending = outbox.list_pending()?;
-    let total = pending.len();
+/// The only production implementation is [`CpClient`]; tests inject a
+/// `StubPoster` that returns scripted results.
+pub trait ResultPoster {
+    /// Post a single result body for `job_id`.
+    ///
+    /// Returns `Ok(Value)` on 2xx, `Err(ClientError)` on network or HTTP error.
+    fn post(
+        &self,
+        job_id: Uuid,
+        body: Value,
+    ) -> impl Future<Output = Result<Value, ClientError>> + Send;
+}
 
-    if total > 0 {
-        info!(count = total, "outbox replay: re-posting pending results");
+impl ResultPoster for CpClient {
+    fn post(
+        &self,
+        job_id: Uuid,
+        body: Value,
+    ) -> impl Future<Output = Result<Value, ClientError>> + Send {
+        self.post_result(job_id, body)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DrainStats — returned by drain_outbox
+// ---------------------------------------------------------------------------
+
+/// Counters returned by a single `drain_outbox` pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DrainStats {
+    /// Successfully delivered and removed from the outbox.
+    pub delivered: usize,
+    /// Moved to the dead-letter directory (permanent failure or max-attempts reached).
+    pub quarantined: usize,
+    /// Left in the outbox — transient failure, will be retried next cycle.
+    pub retry_later: usize,
+    /// Left in the outbox — operator alert (401/403), attempt counter NOT incremented.
+    pub operator_alert: usize,
+}
+
+// ---------------------------------------------------------------------------
+// drain_outbox
+// ---------------------------------------------------------------------------
+
+/// Drain all pending outbox entries with classification, backoff, and quarantine.
+///
+/// For each pending `ResultBody`:
+///
+/// - **Success** → `mark_delivered` + `clear_attempts`; `stats.delivered++`.
+/// - **Transient error** → `record_attempt`:
+///   - If new count >= `max_attempts` → `quarantine`; `stats.quarantined++`.
+///   - Otherwise leave in outbox; `stats.retry_later++`.
+/// - **Permanent error** → `quarantine` immediately; `stats.quarantined++`.
+/// - **OperatorAlert** → leave in outbox, do NOT increment attempt counter,
+///   emit `tracing::error!` ONCE per cycle (not per entry); `stats.operator_alert++`.
+///
+/// The signed `ResultBody` JSON is NEVER mutated — the Ed25519 signature
+/// remains valid for manual replay from `dead/`.
+pub async fn drain_outbox(
+    poster: &impl ResultPoster,
+    outbox: &Outbox,
+    max_attempts: u32,
+) -> DrainStats {
+    let pending = match outbox.list_pending() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "drain_outbox: failed to list pending — skipping cycle");
+            return DrainStats::default();
+        }
+    };
+
+    if pending.is_empty() {
+        return DrainStats::default();
     }
 
-    let mut delivered = 0usize;
-    let mut failed = 0usize;
+    info!(
+        count = pending.len(),
+        "drain_outbox: draining pending results"
+    );
+
+    let mut stats = DrainStats::default();
+    let mut has_operator_alert = false;
 
     for body in &pending {
         let job_id = body.job_result.job_id;
@@ -399,42 +468,117 @@ pub async fn replay_outbox(
                     job_id = %job_id,
                     result_id = %result_id,
                     error = %e,
-                    "outbox replay: serialisation failed — skipping"
+                    "drain_outbox: serialisation failed — treating as permanent, quarantining"
                 );
-                failed += 1;
+                let _ = outbox.quarantine(result_id);
+                stats.quarantined += 1;
                 continue;
             }
         };
 
-        match client.post_result(job_id, post_body).await {
+        match poster.post(job_id, post_body).await {
             Ok(_) => {
                 if let Err(e) = outbox.mark_delivered(result_id) {
                     warn!(
                         result_id = %result_id,
                         error = %e,
-                        "outbox replay: delivered but failed to remove file"
+                        "drain_outbox: delivered but failed to remove file"
                     );
                 }
-                delivered += 1;
-                info!(job_id = %job_id, result_id = %result_id, "outbox replay: delivered");
+                stats.delivered += 1;
+                info!(job_id = %job_id, result_id = %result_id, "drain_outbox: delivered");
             }
-            Err(e) => {
-                warn!(
-                    job_id = %job_id,
-                    result_id = %result_id,
-                    error = %e,
-                    "outbox replay: POST failed — will retry on next startup"
-                );
-                failed += 1;
-            }
+
+            Err(ref e) => match classify_client_error(e) {
+                RetryClass::Permanent => {
+                    warn!(
+                        job_id = %job_id,
+                        result_id = %result_id,
+                        error = %e,
+                        "drain_outbox: permanent failure — quarantining"
+                    );
+                    let _ = outbox.quarantine(result_id);
+                    stats.quarantined += 1;
+                }
+
+                RetryClass::Transient => {
+                    let n = match outbox.record_attempt(result_id) {
+                        Ok(n) => n,
+                        Err(ie) => {
+                            warn!(
+                                result_id = %result_id,
+                                error = %ie,
+                                "drain_outbox: failed to record attempt — leaving for next cycle"
+                            );
+                            stats.retry_later += 1;
+                            continue;
+                        }
+                    };
+
+                    if n >= max_attempts {
+                        warn!(
+                            job_id = %job_id,
+                            result_id = %result_id,
+                            attempts = n,
+                            max_attempts,
+                            "drain_outbox: max attempts reached — quarantining"
+                        );
+                        let _ = outbox.quarantine(result_id);
+                        stats.quarantined += 1;
+                    } else {
+                        warn!(
+                            job_id = %job_id,
+                            result_id = %result_id,
+                            attempts = n,
+                            max_attempts,
+                            error = %e,
+                            "drain_outbox: transient failure — will retry"
+                        );
+                        stats.retry_later += 1;
+                    }
+                }
+
+                RetryClass::OperatorAlert => {
+                    // Do NOT increment attempt counter — this needs human resolution.
+                    // Emit one error per drain cycle, not per entry (rate-limited).
+                    has_operator_alert = true;
+                    stats.operator_alert += 1;
+                }
+            },
         }
     }
 
-    if total > 0 {
-        info!(delivered, failed, "outbox replay complete");
+    if has_operator_alert {
+        error!(
+            count = stats.operator_alert,
+            "drain_outbox: {} outbox entries have auth errors (401/403) — \
+             token may be revoked or agent not yet approved; operator intervention required",
+            stats.operator_alert
+        );
     }
 
-    Ok((delivered, failed))
+    info!(
+        delivered = stats.delivered,
+        quarantined = stats.quarantined,
+        retry_later = stats.retry_later,
+        operator_alert = stats.operator_alert,
+        "drain_outbox: cycle complete"
+    );
+
+    stats
+}
+
+// ---------------------------------------------------------------------------
+// replay_outbox (startup alias — delegates to drain_outbox)
+// ---------------------------------------------------------------------------
+
+/// On startup: drain the outbox with full classification/quarantine semantics.
+///
+/// Delegates to [`drain_outbox`] with the provided `max_attempts`.  Returns
+/// `(delivered, failed_or_quarantined)` for backwards-compatible logging in
+/// `run_loop`.
+pub async fn replay_outbox(client: &CpClient, outbox: &Outbox, max_attempts: u32) -> DrainStats {
+    drain_outbox(client, outbox, max_attempts).await
 }
 
 // ---------------------------------------------------------------------------
@@ -443,14 +587,21 @@ pub async fn replay_outbox(
 
 /// Main agent pull-loop.
 ///
-/// 1. Replay the outbox (at-least-once delivery of prior results).
+/// 1. Replay the outbox at startup (with full classification/quarantine).
 /// 2. Loop:
 ///    - Send a heartbeat (idle or with running job id).
 ///    - Poll for a job.
 ///    - `Some(job)` with `OfflineDryRun` → `process_job`.
 ///    - `Some(job)` with `LivePlan` / `LiveApply` → `process_job_live`.
-///    - `None` → sleep `poll_interval`.
+///    - `None` → sleep `poll_interval`, then drain outbox if `drain_interval` elapsed.
 ///    - Errors → `warn` + sleep `poll_interval` (never panic).
+///
+/// ## Outbox draining
+///
+/// The outbox is drained once at startup, and then periodically during idle
+/// ticks (no job received).  The drain fires when at least
+/// `outbox_drain_interval` has elapsed since the last drain.  The hot path
+/// (while a job is being processed) is not interrupted.
 ///
 /// ## CP key pin (`cp_verifying_key`)
 ///
@@ -472,20 +623,28 @@ pub async fn run_loop(
     poll_interval: Duration,
     cp_verifying_key: Option<&VerifyingKey>,
     allow_live: bool,
+    max_outbox_attempts: u32,
+    outbox_drain_interval: Duration,
 ) {
-    // Replay any results left over from a prior run.
-    match replay_outbox(client, outbox).await {
-        Ok((delivered, failed)) => {
-            if delivered > 0 || failed > 0 {
-                info!(delivered, failed, "startup outbox replay finished");
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, "startup outbox replay failed — continuing");
-        }
+    // Drain any results left over from a prior run (startup replay).
+    let startup_stats = replay_outbox(client, outbox, max_outbox_attempts).await;
+    if startup_stats.delivered > 0
+        || startup_stats.quarantined > 0
+        || startup_stats.retry_later > 0
+        || startup_stats.operator_alert > 0
+    {
+        info!(
+            delivered = startup_stats.delivered,
+            quarantined = startup_stats.quarantined,
+            retry_later = startup_stats.retry_later,
+            operator_alert = startup_stats.operator_alert,
+            "startup outbox replay finished"
+        );
     }
 
     info!("entering poll loop");
+
+    let mut last_drain = tokio::time::Instant::now();
 
     loop {
         // Heartbeat — send while idle (no running job in this loop tick).
@@ -529,14 +688,41 @@ pub async fn run_loop(
                         "process_job failed — job may be retried by the CP lease expiry sweep"
                     );
                 }
+                // Do NOT drain the outbox while a job is actively being processed —
+                // drain only happens on idle ticks (Ok(None) or Err below).
             }
             Ok(None) => {
                 // No work available — wait before polling again.
                 tokio::time::sleep(poll_interval).await;
+
+                // Periodic outbox drain on idle ticks.
+                if last_drain.elapsed() >= outbox_drain_interval {
+                    let stats = drain_outbox(client, outbox, max_outbox_attempts).await;
+                    if stats.delivered > 0
+                        || stats.quarantined > 0
+                        || stats.retry_later > 0
+                        || stats.operator_alert > 0
+                    {
+                        info!(
+                            delivered = stats.delivered,
+                            quarantined = stats.quarantined,
+                            retry_later = stats.retry_later,
+                            operator_alert = stats.operator_alert,
+                            "periodic outbox drain complete"
+                        );
+                    }
+                    last_drain = tokio::time::Instant::now();
+                }
             }
             Err(e) => {
                 warn!(error = %e, "poll failed — backing off");
                 tokio::time::sleep(poll_interval).await;
+
+                // Also drain on poll-error idle ticks.
+                if last_drain.elapsed() >= outbox_drain_interval {
+                    drain_outbox(client, outbox, max_outbox_attempts).await;
+                    last_drain = tokio::time::Instant::now();
+                }
             }
         }
     }
@@ -555,7 +741,10 @@ mod tests {
         crypto::{generate_keypair, sha256_hex, sign_vlc},
         JobLease, JobMode, JobSpec, JobStatus, VerifiedLiveContext,
     };
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+    };
     use uuid::Uuid;
 
     use crate::{
@@ -563,6 +752,298 @@ mod tests {
         outbox::Outbox,
     };
     use ryuki_engine::runners::RunStatus;
+
+    // -----------------------------------------------------------------------
+    // StubPoster — injectable ResultPoster for drain_outbox tests
+    // -----------------------------------------------------------------------
+
+    /// Scripted `ResultPoster` for unit tests.  Each call pops one result from
+    /// the front of `responses`.  If the queue is exhausted, returns `Ok(json!({}))`.
+    struct StubPoster {
+        /// Pre-scripted results in call order.
+        responses: Mutex<Vec<Result<Value, ClientError>>>,
+        /// Records (job_id) for each call received.
+        calls: Mutex<Vec<Uuid>>,
+    }
+
+    impl StubPoster {
+        fn new(responses: Vec<Result<Value, ClientError>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    impl ResultPoster for Arc<StubPoster> {
+        fn post(
+            &self,
+            job_id: Uuid,
+            _body: Value,
+        ) -> impl Future<Output = Result<Value, ClientError>> + Send {
+            self.calls.lock().unwrap().push(job_id);
+            let result = self
+                .responses
+                .lock()
+                .unwrap()
+                .drain(..1)
+                .next()
+                .unwrap_or(Ok(serde_json::json!({})));
+            std::future::ready(result)
+        }
+    }
+
+    /// Build a `ClientError::ErrorStatus` with the given status code.
+    fn status_err(status: u16) -> ClientError {
+        ClientError::ErrorStatus {
+            status,
+            body: "test body".to_owned(),
+        }
+    }
+
+    /// Build a transient-looking `ClientError` (uses a 503 status for simplicity
+    /// since we can't easily construct a `reqwest::Error` in unit tests).
+    fn transient_err() -> ClientError {
+        status_err(503)
+    }
+
+    /// Build the outbox + enqueue one result body, return the result_id.
+    fn setup_one_pending(outbox: &Outbox) -> Uuid {
+        use crate::result::ResultBody;
+        use chrono::Utc;
+        use ryuki_protocol::{
+            job_spec_digest, sha256_hex, sign, JobMode, JobResult, JobResultStatus, JobSpec,
+            SignedEnvelope,
+        };
+
+        let identity = AgentIdentity::generate();
+        let result_id = Uuid::new_v4();
+        let spec = JobSpec {
+            request_id: Uuid::new_v4(),
+            offering_id: Uuid::new_v4(),
+            iac_ref: "test@v1".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::OfflineDryRun,
+        };
+        let spec_digest = job_spec_digest(&spec);
+        let evidence = b"test".to_vec();
+        let evidence_digest = sha256_hex(&evidence);
+
+        let unsigned = SignedEnvelope {
+            agent_id: "test-agent".to_string(),
+            platform: "test".to_string(),
+            job_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "ryuki-redaction-v1".to_string(),
+            timestamp: Utc::now(),
+            key_id: identity.public_key_b64(),
+            cp_nonce: Uuid::new_v4().to_string(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, identity.signing_key());
+        let job_result = JobResult {
+            job_id: signed.job_id,
+            attempt_id: signed.attempt_id,
+            result_id: signed.result_id,
+            status: signed.status.clone(),
+            evidence_digest: signed.evidence_digest.clone(),
+            signed_envelope: signed,
+        };
+        let body = ResultBody {
+            job_result,
+            evidence,
+            evidence_json: None,
+        };
+        outbox.enqueue(&body).expect("enqueue");
+        result_id
+    }
+
+    // -----------------------------------------------------------------------
+    // drain_outbox tests
+    // -----------------------------------------------------------------------
+
+    /// Transient failure on first drain, success on second → delivered on cycle 2.
+    #[tokio::test]
+    async fn drain_transient_then_success_delivers() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let result_id = setup_one_pending(&outbox);
+
+        // First call: transient 503. Second call: success.
+        let poster = StubPoster::new(vec![
+            Err(transient_err()),
+            Ok(serde_json::json!({"ok": true})),
+        ]);
+
+        // Cycle 1: transient — left in outbox.
+        let stats = drain_outbox(&poster, &outbox, 10).await;
+        assert_eq!(stats.retry_later, 1, "must be left for retry");
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.quarantined, 0);
+
+        // attempt sidecar must exist with count=1.
+        let sidecar = dir.path().join(format!("{}.attempts", result_id));
+        assert!(
+            sidecar.exists(),
+            "sidecar must exist after transient failure"
+        );
+
+        // Cycle 2: success.
+        let stats2 = drain_outbox(&poster, &outbox, 10).await;
+        assert_eq!(stats2.delivered, 1, "must be delivered on second cycle");
+        assert_eq!(stats2.retry_later, 0);
+
+        // Outbox must be empty; sidecar must be gone.
+        assert!(
+            outbox.list_pending().expect("list").is_empty(),
+            "outbox must be empty after delivery"
+        );
+        assert!(
+            !sidecar.exists(),
+            "attempts sidecar must be cleared after delivery"
+        );
+
+        // Total poster calls: 2.
+        assert_eq!(poster.call_count(), 2);
+    }
+
+    /// Permanent failure → quarantined on first drain, not retried.
+    #[tokio::test]
+    async fn drain_permanent_quarantines_immediately() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let result_id = setup_one_pending(&outbox);
+
+        // 409 = Permanent.
+        let poster = StubPoster::new(vec![Err(status_err(409))]);
+
+        let stats = drain_outbox(&poster, &outbox, 10).await;
+        assert_eq!(stats.quarantined, 1);
+        assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.retry_later, 0);
+
+        // Entry is in dead/, not in list_pending.
+        let dead_path = dir.path().join("dead").join(format!("{}.json", result_id));
+        assert!(
+            dead_path.exists(),
+            "json must be in dead/ after permanent failure"
+        );
+        assert!(
+            outbox.list_pending().expect("list").is_empty(),
+            "list_pending must be empty after quarantine"
+        );
+
+        // Second drain: poster must NOT be called again (nothing pending).
+        let stats2 = drain_outbox(&poster, &outbox, 10).await;
+        assert_eq!(stats2.quarantined, 0, "second drain must not re-quarantine");
+        assert_eq!(
+            poster.call_count(),
+            1,
+            "poster called exactly once (not retried)"
+        );
+    }
+
+    /// OperatorAlert (401) → kept, NOT quarantined, attempt counter NOT incremented.
+    #[tokio::test]
+    async fn drain_operator_alert_kept_not_quarantined_no_attempt_increment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let result_id = setup_one_pending(&outbox);
+
+        // 401 = OperatorAlert.
+        let poster = StubPoster::new(vec![
+            Err(status_err(401)),
+            Err(status_err(401)),
+            Err(status_err(401)),
+        ]);
+
+        // Run 3 drain cycles.
+        for _ in 0..3 {
+            let stats = drain_outbox(&poster, &outbox, 3).await;
+            assert_eq!(stats.operator_alert, 1, "must be operator_alert");
+            assert_eq!(stats.quarantined, 0, "must NOT be quarantined");
+            assert_eq!(stats.delivered, 0);
+        }
+
+        // Entry is still pending (not quarantined even after 3 cycles at max_attempts=3).
+        assert!(
+            outbox.list_pending().expect("list").len() == 1,
+            "entry must still be pending after operator-alert cycles"
+        );
+
+        // The attempts sidecar must NOT have been created (no record_attempt calls).
+        let sidecar = dir.path().join(format!("{}.attempts", result_id));
+        assert!(
+            !sidecar.exists(),
+            "attempts sidecar must NOT exist for OperatorAlert entries"
+        );
+
+        // Poster was called 3 times.
+        assert_eq!(poster.call_count(), 3);
+    }
+
+    /// max_attempts: a transient that fails max_attempts times → quarantined at threshold.
+    #[tokio::test]
+    async fn drain_max_attempts_quarantines_after_threshold() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let result_id = setup_one_pending(&outbox);
+        let max_attempts = 3u32;
+
+        // All transient 503 responses.
+        let poster = StubPoster::new(vec![
+            Err(transient_err()),
+            Err(transient_err()),
+            Err(transient_err()),
+            // This 4th one should never be called — entry must be quarantined after 3.
+            Err(transient_err()),
+        ]);
+
+        // Cycle 1: attempts=1, retry_later.
+        let s1 = drain_outbox(&poster, &outbox, max_attempts).await;
+        assert_eq!(s1.retry_later, 1);
+        assert_eq!(s1.quarantined, 0);
+
+        // Cycle 2: attempts=2, retry_later.
+        let s2 = drain_outbox(&poster, &outbox, max_attempts).await;
+        assert_eq!(s2.retry_later, 1);
+        assert_eq!(s2.quarantined, 0);
+
+        // Cycle 3: attempts=3 = max_attempts → quarantined.
+        let s3 = drain_outbox(&poster, &outbox, max_attempts).await;
+        assert_eq!(s3.quarantined, 1, "must be quarantined at threshold");
+        assert_eq!(s3.retry_later, 0);
+
+        // Entry is in dead/, nothing pending.
+        let dead_path = dir.path().join("dead").join(format!("{}.json", result_id));
+        assert!(dead_path.exists(), "must be in dead/ after max-attempts");
+        assert!(
+            outbox.list_pending().expect("list").is_empty(),
+            "must be empty after quarantine"
+        );
+
+        // Cycle 4: nothing pending, poster NOT called.
+        let s4 = drain_outbox(&poster, &outbox, max_attempts).await;
+        assert_eq!(s4.quarantined, 0);
+        assert_eq!(
+            poster.call_count(),
+            3,
+            "poster called exactly max_attempts times"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Fixtures

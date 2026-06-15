@@ -159,6 +159,7 @@ async fn main() {
     };
 
     let poll_interval = Duration::from_secs(cfg.poll_interval_secs);
+    let outbox_drain_interval = Duration::from_secs(cfg.outbox_drain_interval_secs);
 
     // Enter the pull-loop. This never returns under normal operation.
     run_loop(
@@ -171,6 +172,8 @@ async fn main() {
         poll_interval,
         cp_verifying_key.as_ref(),
         cfg.allow_live,
+        cfg.max_outbox_attempts,
+        outbox_drain_interval,
     )
     .await;
 }

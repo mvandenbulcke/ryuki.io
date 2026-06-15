@@ -17,6 +17,27 @@
 //! of an already-recorded result.  The outbox therefore delivers exactly-once
 //! semantics via at-least-once HTTP + CP-side idempotency.
 //!
+//! ## Attempt tracking and quarantine
+//!
+//! A sidecar file `<dir>/<result_id>.attempts` (plain u32 text) tracks how many
+//! transient-failure attempts have been made.  This persists across restarts.
+//! When the count reaches the configured `max_attempts`, the entry is
+//! **quarantined**: the JSON file is moved to `<dir>/dead/<result_id>.json` and
+//! the sidecar is removed.  Quarantined files are never re-posted.
+//!
+//! The signed `ResultBody` JSON is **never mutated** — the attempt counter lives
+//! only in the sidecar so the Ed25519 signature remains valid for potential
+//! manual replay.
+//!
+//! `OperatorAlert` errors (401, 403) are kept in the outbox without incrementing
+//! the attempt counter — they must be resolved by a human, not retried to death.
+//!
+//! ## list_pending filtering
+//!
+//! `list_pending` reads only top-level `*.json` files.  It skips:
+//! - Subdirectories (including `dead/`).
+//! - Files whose extension is not exactly `.json` (including `*.attempts`).
+//!
 //! ## Security note
 //!
 //! Evidence is scrubbed before it reaches the outbox (the runner applies
@@ -67,6 +88,8 @@ pub enum OutboxError {
 /// One file per pending result: `<dir>/<result_id>.json`.
 /// The `result_id` in the filename is the canonical idempotency key; the file
 /// is removed by `mark_delivered` after a successful HTTP 2xx response.
+///
+/// See the module-level doc for attempt-tracking and quarantine semantics.
 pub struct Outbox {
     dir: PathBuf,
 }
@@ -157,9 +180,10 @@ impl Outbox {
 
     /// Return all pending (un-delivered) `ResultBody` values.
     ///
-    /// Reads every `*.json` file in `dir`.  Non-`*.json` files are ignored.
-    /// Files that fail to deserialise are skipped with a logged warning (they
-    /// could be corrupt partial writes — the caller should alert an operator).
+    /// Reads only top-level `*.json` files in `dir`.  Subdirectories (including
+    /// `dead/`) and non-`.json` files (including `.attempts` sidecars) are
+    /// silently skipped.  Files that fail to deserialise are skipped with a
+    /// logged warning (they could be corrupt partial writes).
     ///
     /// The order of returned results is filesystem-dependent (not guaranteed).
     pub fn list_pending(&self) -> Result<Vec<ResultBody>, OutboxError> {
@@ -177,6 +201,13 @@ impl Outbox {
             })?;
 
             let path = entry.path();
+
+            // Skip subdirectories (this is how we exclude dead/).
+            if path.is_dir() {
+                continue;
+            }
+
+            // Only read files with the exact extension ".json".
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -214,21 +245,110 @@ impl Outbox {
 
     /// Remove `<dir>/<result_id>.json` after a successful HTTP 2xx response.
     ///
+    /// Also removes the `.attempts` sidecar if present (idempotent).
+    ///
     /// Idempotent: if the file has already been removed (e.g. a duplicate
     /// mark_delivered call), this returns `Ok(())`.
     pub fn mark_delivered(&self, result_id: Uuid) -> Result<(), OutboxError> {
         let path = self.file_path(result_id);
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Already removed — idempotent.
-                Ok(())
             }
-            Err(e) => Err(OutboxError::Io {
-                path: path.display().to_string(),
-                source: e,
-            }),
+            Err(e) => {
+                return Err(OutboxError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                })
+            }
         }
+        // Best-effort: clean up the sidecar even if the main file was already gone.
+        self.clear_attempts(result_id)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Attempt tracking (sidecar)
+    // ------------------------------------------------------------------
+
+    /// Increment the persistent attempt counter for `result_id`.
+    ///
+    /// Reads `<dir>/<result_id>.attempts`, increments, writes back.  Returns
+    /// the new (post-increment) count.  If the sidecar does not exist, the
+    /// count starts at 0 before increment (first call returns 1).
+    pub fn record_attempt(&self, result_id: Uuid) -> Result<u32, OutboxError> {
+        let path = self.attempts_path(result_id);
+        let current = self.read_attempts_raw(&path)?;
+        let next = current.saturating_add(1);
+        self.write_attempts_raw(&path, next)?;
+        Ok(next)
+    }
+
+    /// Remove the `.attempts` sidecar for `result_id` (idempotent).
+    ///
+    /// Called after `mark_delivered` or after quarantine (the file has already
+    /// been moved to `dead/` so the sidecar in the main dir must be removed).
+    pub fn clear_attempts(&self, result_id: Uuid) -> Result<(), OutboxError> {
+        let path = self.attempts_path(result_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) | Err(_) => Ok(()), // NotFound or any other error: ignore.
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Quarantine
+    // ------------------------------------------------------------------
+
+    /// Move `<dir>/<result_id>.json` to `<dir>/dead/<result_id>.json`.
+    ///
+    /// Creates `<dir>/dead/` on first use.  Also removes the `.attempts`
+    /// sidecar in the main directory.
+    ///
+    /// The signed `ResultBody` JSON is copied byte-for-byte — it is NEVER
+    /// mutated (the Ed25519 signature must remain valid for manual replay).
+    ///
+    /// If the source file does not exist (e.g. already quarantined), returns
+    /// `Ok(())` (idempotent).
+    pub fn quarantine(&self, result_id: Uuid) -> Result<(), OutboxError> {
+        let dead_dir = self.dead_dir();
+        std::fs::create_dir_all(&dead_dir).map_err(|e| OutboxError::Io {
+            path: dead_dir.display().to_string(),
+            source: e,
+        })?;
+
+        let src = self.file_path(result_id);
+        let dst = dead_dir.join(format!("{}.json", result_id));
+
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Source already gone — idempotent.
+            }
+            Err(e) => {
+                // rename(2) can fail across filesystems (EXDEV). Fall back to
+                // copy + remove so tempdir-based tests and cross-fs setups work.
+                if e.raw_os_error() == Some(libc_exdev()) {
+                    std::fs::copy(&src, &dst).map_err(|ce| OutboxError::Io {
+                        path: dst.display().to_string(),
+                        source: ce,
+                    })?;
+                    std::fs::remove_file(&src).map_err(|re| OutboxError::Io {
+                        path: src.display().to_string(),
+                        source: re,
+                    })?;
+                } else {
+                    return Err(OutboxError::Io {
+                        path: src.display().to_string(),
+                        source: e,
+                    });
+                }
+            }
+        }
+
+        // Remove the attempts sidecar from the main dir.
+        self.clear_attempts(result_id)?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -238,6 +358,49 @@ impl Outbox {
     fn file_path(&self, result_id: Uuid) -> PathBuf {
         self.dir.join(format!("{}.json", result_id))
     }
+
+    fn attempts_path(&self, result_id: Uuid) -> PathBuf {
+        self.dir.join(format!("{}.attempts", result_id))
+    }
+
+    fn dead_dir(&self) -> PathBuf {
+        self.dir.join("dead")
+    }
+
+    fn read_attempts_raw(&self, path: &std::path::Path) -> Result<u32, OutboxError> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => s.trim().parse::<u32>().map_err(|_| OutboxError::Io {
+                path: path.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "attempts file contains non-numeric data",
+                ),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(OutboxError::Io {
+                path: path.display().to_string(),
+                source: e,
+            }),
+        }
+    }
+
+    fn write_attempts_raw(&self, path: &std::path::Path, count: u32) -> Result<(), OutboxError> {
+        std::fs::write(path, count.to_string()).map_err(|e| OutboxError::Io {
+            path: path.display().to_string(),
+            source: e,
+        })
+    }
+}
+
+/// Cross-platform EXDEV constant (rename across filesystems).
+/// On non-Unix platforms this returns a sentinel that will never match.
+fn libc_exdev() -> i32 {
+    #[cfg(target_os = "linux")]
+    return 18; // EXDEV on Linux
+    #[cfg(target_os = "macos")]
+    return 18; // EXDEV on macOS
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return -1; // Sentinel — will never match a real OS error code.
 }
 
 // ---------------------------------------------------------------------------
@@ -476,5 +639,177 @@ mod tests {
             .expect("enqueue in new dir");
         let pending = outbox.list_pending().expect("list_pending");
         assert_eq!(pending.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Attempt tracking: record_attempt increments + persists
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_attempt_increments_and_persists() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+
+        // First call: sidecar does not exist yet → starts at 0, increments to 1.
+        let n = outbox.record_attempt(id).expect("record_attempt 1");
+        assert_eq!(n, 1, "first attempt must return 1");
+
+        // Second call: sidecar now contains 1 → increments to 2.
+        let n = outbox.record_attempt(id).expect("record_attempt 2");
+        assert_eq!(n, 2, "second attempt must return 2");
+
+        // Third call: increments to 3.
+        let n = outbox.record_attempt(id).expect("record_attempt 3");
+        assert_eq!(n, 3, "third attempt must return 3");
+
+        // Verify the sidecar file exists on disk.
+        let sidecar = dir.path().join(format!("{}.attempts", id));
+        assert!(sidecar.exists(), "sidecar must exist after record_attempt");
+    }
+
+    // -----------------------------------------------------------------------
+    // Attempt tracking: clear_attempts removes the sidecar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_attempts_removes_sidecar() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+
+        outbox.record_attempt(id).expect("record_attempt");
+        let sidecar = dir.path().join(format!("{}.attempts", id));
+        assert!(sidecar.exists(), "sidecar must exist before clear");
+
+        outbox.clear_attempts(id).expect("clear_attempts");
+        assert!(
+            !sidecar.exists(),
+            "sidecar must be gone after clear_attempts"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // clear_attempts is idempotent (sidecar already gone)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clear_attempts_is_idempotent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+
+        // No sidecar exists — clear_attempts must not error.
+        assert!(
+            outbox.clear_attempts(id).is_ok(),
+            "clear_attempts on nonexistent sidecar must be Ok"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // mark_delivered also clears the attempts sidecar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mark_delivered_clears_attempts_sidecar() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+        let body = make_result_body(id);
+
+        outbox.enqueue(&body).expect("enqueue");
+        outbox.record_attempt(id).expect("record_attempt");
+
+        let sidecar = dir.path().join(format!("{}.attempts", id));
+        assert!(sidecar.exists(), "sidecar must exist before mark_delivered");
+
+        outbox.mark_delivered(id).expect("mark_delivered");
+
+        assert!(
+            !sidecar.exists(),
+            "mark_delivered must remove the attempts sidecar"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Quarantine: moves json to dead/, removes sidecar, list_pending ignores dead/
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quarantine_moves_json_to_dead_dir() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+        let body = make_result_body(id);
+
+        outbox.enqueue(&body).expect("enqueue");
+        outbox.record_attempt(id).expect("record_attempt");
+
+        outbox.quarantine(id).expect("quarantine");
+
+        // Main dir: JSON gone, sidecar gone.
+        let json_path = dir.path().join(format!("{}.json", id));
+        let sidecar = dir.path().join(format!("{}.attempts", id));
+        assert!(
+            !json_path.exists(),
+            "json must be gone from main dir after quarantine"
+        );
+        assert!(!sidecar.exists(), "sidecar must be gone after quarantine");
+
+        // dead/ dir: JSON present.
+        let dead_path = dir.path().join("dead").join(format!("{}.json", id));
+        assert!(dead_path.exists(), "json must be in dead/ after quarantine");
+
+        // list_pending must return empty (dead/ is excluded).
+        let pending = outbox.list_pending().expect("list_pending");
+        assert!(
+            pending.is_empty(),
+            "list_pending must be empty after quarantine (dead/ excluded)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_pending ignores .attempts sidecars in the main dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn list_pending_ignores_attempts_sidecars() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+        let body = make_result_body(id);
+
+        outbox.enqueue(&body).expect("enqueue");
+        outbox.record_attempt(id).expect("record_attempt");
+
+        // The sidecar must NOT appear in list_pending.
+        let pending = outbox.list_pending().expect("list_pending");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only the json file must appear, not the .attempts sidecar"
+        );
+        assert_eq!(pending[0].job_result.result_id, id);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarantine is idempotent (source already gone)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quarantine_is_idempotent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+        let id = Uuid::new_v4();
+        let body = make_result_body(id);
+
+        outbox.enqueue(&body).expect("enqueue");
+        outbox.quarantine(id).expect("first quarantine");
+
+        // Second quarantine: source is gone — must be Ok.
+        assert!(
+            outbox.quarantine(id).is_ok(),
+            "second quarantine on already-quarantined id must be Ok"
+        );
     }
 }
