@@ -946,88 +946,101 @@ async fn post_job_result_with_pool(
     // `stored_mode` was parsed in Fix 3 above (no second parse needed).
     match stored_mode {
         JobMode::LiveApply => {
-            // The job must carry the CP-signed grant. Job creation (S5a-2) is
-            // responsible for attaching it; this runtime check is the fail-closed
-            // enforcement of that invariant (migration 056 deliberately uses no
-            // DB CHECK — see its comment).
-            let grant_json = row.live_context.as_ref().ok_or_else(|| {
-                conflict(
+            // A LiveRefused result is the agent reporting it DECLINED to apply
+            // (missing/invalid grant, plan divergence, or no --allow-live). Record
+            // the refusal WITHOUT the grant checks — the refusal may be BECAUSE the
+            // grant was unusable, and declining is always safe (no mutation
+            // happened). It must carry no approved_plan_digest (no plan applied).
+            if env.status == JobResultStatus::LiveRefused {
+                if env.approved_plan_digest.is_some() {
+                    return Err(bad_request(
+                        "LiveRefused result must not carry approved_plan_digest",
+                    ));
+                }
+            } else {
+                // The job must carry the CP-signed grant. Job creation (S5a-2) is
+                // responsible for attaching it; this runtime check is the fail-closed
+                // enforcement of that invariant (migration 056 deliberately uses no
+                // DB CHECK — see its comment).
+                let grant_json = row.live_context.as_ref().ok_or_else(|| {
+                    conflict(
                     "LiveApply job has no approval grant (live_context) — refusing a live result",
                 )
-            })?;
-            let grant: VerifiedLiveContext =
+                })?;
+                let grant: VerifiedLiveContext =
                 serde_json::from_value(grant_json.0.clone()).map_err(|e| {
                     tracing::error!(job_id = %job_id, error = %e, "stored live_context is malformed");
                     db_err("stored live_context is malformed")
                 })?;
 
-            // The grant MUST be genuinely CP-signed. Verifying the Ed25519
-            // signature against the CP's own public key defends against a
-            // tampered stored grant (e.g. a DB-write attacker who alters
-            // approved_plan_digest but cannot forge the CP signature). The agent
-            // also independently verifies this signature before applying (S5b).
-            let cp_vk = cp_identity::cp_signing_key()
-                .ok_or_else(|| {
-                    tracing::error!(
-                        "CP signing key is not initialised — cannot verify LiveApply grant"
-                    );
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        axum::Json(json!({
-                            "error": "control plane is not configured to verify live grants"
-                        })),
+                // The grant MUST be genuinely CP-signed. Verifying the Ed25519
+                // signature against the CP's own public key defends against a
+                // tampered stored grant (e.g. a DB-write attacker who alters
+                // approved_plan_digest but cannot forge the CP signature). The agent
+                // also independently verifies this signature before applying (S5b).
+                let cp_vk = cp_identity::cp_signing_key()
+                    .ok_or_else(|| {
+                        tracing::error!(
+                            "CP signing key is not initialised — cannot verify LiveApply grant"
+                        );
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({
+                                "error": "control plane is not configured to verify live grants"
+                            })),
+                        )
+                    })?
+                    .verifying_key();
+                verify_vlc(&grant, &cp_vk)
+                    .map_err(|_| bad_request("approval grant signature is invalid"))?;
+
+                // The agent's signed envelope MUST carry the applied plan digest.
+                let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
+                    bad_request(
+                        "LiveApply result must include approved_plan_digest in the signed envelope",
                     )
-                })?
-                .verifying_key();
-            verify_vlc(&grant, &cp_vk)
-                .map_err(|_| bad_request("approval grant signature is invalid"))?;
+                })?;
 
-            // The agent's signed envelope MUST carry the applied plan digest.
-            let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
-                bad_request(
-                    "LiveApply result must include approved_plan_digest in the signed envelope",
-                )
-            })?;
-
-            // EQUALITY: the applied plan digest must match the APPROVED plan
-            // digest. The digest is a public hash (not a secret), so a plain
-            // comparison is appropriate.
-            if env_digest != grant.approved_plan_digest {
-                return Err(bad_request(
-                    "approved_plan_digest does not match the approved grant — \
+                // EQUALITY: the applied plan digest must match the APPROVED plan
+                // digest. The digest is a public hash (not a secret), so a plain
+                // comparison is appropriate.
+                if env_digest != grant.approved_plan_digest {
+                    return Err(bad_request(
+                        "approved_plan_digest does not match the approved grant — \
                      refusing to record an unapproved plan",
-                ));
-            }
+                    ));
+                }
 
-            // The grant must be for THIS job's request (defends against a grant
-            // mistakenly attached to a different request at job-creation time).
-            // stored_spec was deserialised in step 7.
-            if grant.request_id != stored_spec.request_id {
-                return Err(bad_request(
-                    "approval grant request_id does not match the job's request",
-                ));
-            }
+                // The grant must be for THIS job's request (defends against a grant
+                // mistakenly attached to a different request at job-creation time).
+                // stored_spec was deserialised in step 7.
+                if grant.request_id != stored_spec.request_id {
+                    return Err(bad_request(
+                        "approval grant request_id does not match the job's request",
+                    ));
+                }
 
-            // The grant must not be expired AT APPLY TIME. Expiry gates the
-            // actual application, which only happens while the job is still
-            // Leased/Running (the atomic UPDATE below records the result exactly
-            // once from that state). A later idempotent REPLAY of an
-            // already-recorded result (job already terminal) must NOT be
-            // re-gated on expiry — the result was validated and applied within
-            // the grant window, and the agent's durable outbox may retry the
-            // POST after the grant has since expired. So only enforce expiry on
-            // the first-apply path. The control plane is the authority on time
-            // here (it issued the grant); the agent also independently rejects
-            // an expired grant before applying.
-            let first_apply = matches!(row.status.as_str(), "Leased" | "Running");
-            if first_apply && grant.expiry < Utc::now() {
-                return Err((
-                    axum::http::StatusCode::CONFLICT,
-                    axum::Json(json!({
-                        "error": "the approval grant has expired — re-approval is required"
-                    })),
-                ));
-            }
+                // The grant must not be expired AT APPLY TIME. Expiry gates the
+                // actual application, which only happens while the job is still
+                // Leased/Running (the atomic UPDATE below records the result exactly
+                // once from that state). A later idempotent REPLAY of an
+                // already-recorded result (job already terminal) must NOT be
+                // re-gated on expiry — the result was validated and applied within
+                // the grant window, and the agent's durable outbox may retry the
+                // POST after the grant has since expired. So only enforce expiry on
+                // the first-apply path. The control plane is the authority on time
+                // here (it issued the grant); the agent also independently rejects
+                // an expired grant before applying.
+                let first_apply = matches!(row.status.as_str(), "Leased" | "Running");
+                if first_apply && grant.expiry < Utc::now() {
+                    return Err((
+                        axum::http::StatusCode::CONFLICT,
+                        axum::Json(json!({
+                            "error": "the approval grant has expired — re-approval is required"
+                        })),
+                    ));
+                }
+            } // end else (non-refusal LiveApply grant checks)
         }
         JobMode::OfflineDryRun | JobMode::LivePlan => {
             // Non-live modes must NOT include approved_plan_digest.
@@ -4898,6 +4911,259 @@ mod tests {
 
         // No row should have been created by any rejected call.
         cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // S5b-2a: LiveRefused result acceptance (agent declined to apply)
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// Build a signed result with status `LiveRefused` (the agent declined to
+    /// apply). Mode stays `LiveApply` (the job's mode); the refusal carries no
+    /// approved_plan_digest unless `approved_plan_digest` is passed (to exercise
+    /// the must-not-carry-digest rejection).
+    #[allow(clippy::too_many_arguments)]
+    fn make_live_refused_result(
+        agent_id: &str,
+        platform: &str,
+        job_row: &AgentJobRow,
+        attempt_id: Uuid,
+        cp_nonce: &str,
+        lease_gen: u64,
+        key: &ed25519_dalek::SigningKey,
+        spec: &JobSpec,
+        evidence: &[u8],
+        approved_plan_digest: Option<String>,
+    ) -> (JobResult, Vec<u8>) {
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = job_spec_digest(spec);
+        let status = JobResultStatus::LiveRefused;
+        let unsigned_env = SignedEnvelope {
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: lease_gen,
+            request_id: spec.request_id,
+            result_id,
+            mode: spec.mode.clone(),
+            status: status.clone(),
+            job_spec_digest: spec_digest,
+            approved_plan_digest,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: cp_nonce.to_string(),
+            signature: String::new(),
+        };
+        let signed_env = sign(unsigned_env, key);
+        let job_result = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status,
+            evidence_digest,
+            signed_envelope: signed_env,
+        };
+        (job_result, evidence.to_vec())
+    }
+
+    /// A signed LiveRefused result is recorded (terminal LiveRefused) WITHOUT the
+    /// grant equality/expiry checks — the refusal may itself be because the grant
+    /// was unusable. The job still carries a valid grant here, but the refusal
+    /// path must not depend on it.
+    #[tokio::test]
+    async fn db_s5_live_apply_refusal_is_recorded() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-ref-{suffix}");
+        let agent_id = format!("s5-ref-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let digest = proto_sha256(b"the-approved-plan");
+        let job_id = seed_live_apply_job(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence) = make_live_refused_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"refused: replanned plan diverged from the approved plan",
+            None,
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "a signed LiveRefused result must be recorded: {:?}",
+            resp.err()
+        );
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "LiveRefused", "job must be terminal LiveRefused");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// A LiveRefused result MUST NOT carry approved_plan_digest (nothing was
+    /// applied) — the CP rejects it.
+    #[tokio::test]
+    async fn db_s5_live_refused_with_plan_digest_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-refd-{suffix}");
+        let agent_id = format!("s5-refd-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let digest = proto_sha256(b"the-approved-plan");
+        let job_id = seed_live_apply_job(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence) = make_live_refused_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"refused",
+            Some(digest.clone()), // a refusal must NOT carry a plan digest
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        let (status, _) = resp.expect_err("LiveRefused carrying a plan digest must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(
+            db.status, "Running",
+            "rejected refusal must not change status"
+        );
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// The realistic refusal case: the job's grant is UNUSABLE (signed by a
+    /// non-CP key), the agent refuses, and the CP records the refusal anyway —
+    /// the refusal path must not depend on grant validity.
+    #[tokio::test]
+    async fn db_s5_live_apply_refusal_recorded_even_with_bad_grant() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _global = ensure_test_cp_key();
+        let attacker_key = generate_keypair(&mut OsRng);
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-refbad-{suffix}");
+        let agent_id = format!("s5-refbad-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let digest = proto_sha256(b"the-approved-plan");
+        // Grant signed by a NON-CP key → verify_vlc would fail, so the agent
+        // refused. The CP must still record the refusal.
+        let job_id = seed_live_apply_job_signed(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+            &attacker_key,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence) = make_live_refused_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"refused: grant signature did not verify against the pinned CP key",
+            None,
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        assert!(
+            resp.is_ok(),
+            "a refusal must be recorded even when the grant is unusable: {:?}",
+            resp.err()
+        );
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "LiveRefused");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
 }
