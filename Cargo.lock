@@ -2920,6 +2920,7 @@ dependencies = [
  "rsa",
  "ryuki-core",
  "ryuki-engine",
+ "ryuki-protocol",
  "ryuki-runner",
  "serde",
  "serde_json",

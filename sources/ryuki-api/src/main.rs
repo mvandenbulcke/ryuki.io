@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod agents;
 mod audit;
 mod boundary;
 mod config;
@@ -1372,6 +1373,14 @@ async fn main() {
     .await;
     database::migrate_if_connected().await;
 
+    // Spawn background lease-expiry sweep (Fix 4: DB-time deadlines + periodic
+    // expiry). Only spawns when a DB pool is available. The task is idempotent
+    // and cancelled automatically when the tokio runtime shuts down.
+    if let Some(pool) = crate::database::get_db() {
+        agents::spawn_lease_expiry_sweep(pool.clone(), 30);
+        tracing::info!("agent lease expiry sweep started (interval: 30s)");
+    }
+
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
     // Per-username failed-login throttle for POST /api/auth/local/login,
     // shared with the handler through an Extension (no global mutable state).
@@ -1415,16 +1424,55 @@ async fn main() {
     let body_limit = app_config.server.max_body_size_bytes;
     let timeout_secs = app_config.server.request_timeout_secs;
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
+    // ── Route composition (Fix 2: agent-token vs human auth separation) ──────
+    //
+    // Agent endpoints (register, poll, ack, heartbeat) must NOT pass through the
+    // human `auth_middleware`. `register` is the open enrollment endpoint — it
+    // MINTS the "rya_" token and creates a `pending` agent (no token yet, admin
+    // must approve before it can pull). poll/ack/heartbeat carry that "rya_"
+    // bearer token, validated inside each handler by `authenticate_agent`.
+    //
+    // admin_approve sits under /api/admin/agents/ and IS gated by the human
+    // auth_middleware (which enforces `admin` RBAC for any /api/admin prefix
+    // via the fail-closed DEFAULT_ROUTE_PERMISSION = "admin").
+    //
+    // The structure is:
+    //   outer_app = human_gated_app   (auth + RBAC)
+    //             + agent_token_app   (bypasses human auth — own bearer gate)
+    //             + infra routes      (health/ready/metrics — also bypass auth)
+    //
+    // Axum applies layers only to the sub-router they wrap, so
+    // agent_routes() and infra routes merged at the outer level never see
+    // auth_middleware.
+
+    // Inner router: everything that must go through human session auth. These
+    // /metrics + /api/platform/* + /api/validation/run endpoints were auth-gated
+    // before the agent-router split (auth_middleware ran on them; they are NOT in
+    // is_auth_exempt_path) — they expose metrics and config/status that must
+    // require a session, so they stay inside the human-gated router.
+    let human_gated_app = Router::new()
         .route("/metrics", get(metrics))
         .route("/api/validation/run", get(validation_run))
         .route("/api/platform/status", get(platform_status))
         .route("/api/platform/uptime", get(uptime))
+        .merge(agents::admin_routes())
         .merge(contracts::routes())
         .merge(boundary::routes())
         .merge(integration::routes())
+        .layer(middleware::from_fn_with_state(
+            entra_validator.clone(),
+            auth_middleware,
+        ));
+
+    let app = Router::new()
+        // Infra probes only — must never 401 (were exempt via is_auth_exempt_path).
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        // Agent-token endpoints bypass human auth_middleware entirely (they
+        // authenticate via authenticate_agent / the rya_ bearer token).
+        .merge(agents::agent_routes())
+        // Human-session routes (includes admin_approve + all existing routes).
+        .merge(human_gated_app)
         .fallback(not_found)
         .layer(Extension(local_login_throttle))
         .layer(ConcurrencyLimitLayer::new(
@@ -1438,10 +1486,6 @@ async fn main() {
                 let limiter = rate_limiter.clone();
                 async move { rate_limit_middleware(limiter, req, next).await }
             },
-        ))
-        .layer(middleware::from_fn_with_state(
-            entra_validator.clone(),
-            auth_middleware,
         ))
         .layer(middleware::from_fn(
             move |req: HttpRequest<Body>, next: middleware::Next| async move {
