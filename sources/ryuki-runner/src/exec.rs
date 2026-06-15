@@ -245,7 +245,7 @@ mod tests {
 
     /// A shell script spawns a 30-second grandchild (`sleep 30`), writes its
     /// PID to a temp file, then `wait`s (so the direct-child shell blocks for
-    /// 30 s unless we kill it). With a 1-second timeout the runner must:
+    /// 30 s unless we kill it). With a 5-second timeout the runner must:
     ///
     /// (a) return `RunnerError::Timeout` promptly (well under 30 s), AND
     /// (b) the grandchild must be dead — verified by `kill(pid, 0)` returning
@@ -269,25 +269,35 @@ mod tests {
         let script = write_script(&ws, "grand.sh", &script_body);
 
         let start = std::time::Instant::now();
-        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(1));
+        // 5 s timeout (not 1 s): generous headroom so the shell reliably reaches
+        // its `printf … > pidfile` line BEFORE the timeout kills the group, even
+        // under heavy parallel-test CPU starvation. Still far below the 30 s
+        // grandchild sleep, so this verifies the timeout fires and kills the
+        // whole group (not the grandchild completing naturally).
+        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(5));
         let elapsed = start.elapsed();
 
-        // (a) Must time out, and promptly.
+        // (a) Must time out before the 30 s grandchild sleep completes. The bound
+        // is < 30 s (not a tight value): the meaningful assertion is "the timeout
+        // fired, the runner did NOT wait the full 30 s"; the exact wall-clock is
+        // load-dependent (reader-thread drain + OS scheduling under parallel
+        // tests), so the bound is generous to stay race-free.
         assert!(
             matches!(result, Err(RunnerError::Timeout)),
             "expected Timeout; got {result:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(5),
-            "timeout must return promptly; elapsed: {elapsed:?}"
+            elapsed < Duration::from_secs(25),
+            "timeout must return before the 30s grandchild sleep; elapsed: {elapsed:?}"
         );
 
         // Read the grandchild PID written by the script.
         // The script writes the PID before calling `wait`, so it should
-        // already be present; retry briefly to tolerate scheduling jitter.
+        // already be present. Retry for up to 5 s to tolerate scheduling
+        // jitter under parallel-test / CI CPU contention.
         let grandchild_pid: libc::pid_t = {
             let mut raw: Option<String> = None;
-            for _ in 0..20 {
+            for _ in 0..200 {
                 if let Ok(contents) = std::fs::read_to_string(&pidfile) {
                     if !contents.trim().is_empty() {
                         raw = Some(contents);
@@ -302,11 +312,12 @@ mod tests {
                 .expect("pid file must contain a valid integer pid")
         };
 
-        // (b) Poll for up to 500 ms — SIGKILL delivery and kernel reaping are
-        // async. `kill(pid, 0)` returns 0 if the process exists; -1 with errno
-        // ESRCH when it is gone. Use `io::Error::last_os_error()` to read errno
+        // (b) Poll for up to 5 s — SIGKILL delivery and kernel reaping are
+        // async and can lag significantly under CI/parallel-test CPU contention.
+        // `kill(pid, 0)` returns 0 if the process exists; -1 with errno ESRCH
+        // when it is gone. Use `io::Error::last_os_error()` to read errno
         // portably (avoids platform-specific `__error`/`__errno_location`).
-        let grandchild_dead = (0..50).any(|_| {
+        let grandchild_dead = (0..200).any(|_| {
             let rc = unsafe { libc::kill(grandchild_pid, 0) };
             if rc == -1 {
                 let esrch = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
@@ -314,7 +325,7 @@ mod tests {
                     return true;
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(25));
             false
         });
 

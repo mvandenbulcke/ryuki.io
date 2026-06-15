@@ -540,6 +540,18 @@ pub fn get_calendar_contract() -> Value {
 mod tests {
     use super::*;
     use chrono::Duration;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    // Serial guard — taken at the top of every test that reads or mutates
+    // WINDOW_STORE. This prevents concurrent tests from racing on the
+    // shared in-process store (OnceLock<Mutex<Vec<...>>>).
+    static MAINT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn fresh_store() -> MutexGuard<'static, ()> {
+        let guard = MAINT_TEST_LOCK.lock().unwrap();
+        window_store().lock().unwrap().clear();
+        guard
+    }
 
     fn future_time(days: i64, hours: i64) -> String {
         (Utc::now() + Days::new(days as u64) + Duration::hours(hours)).to_rfc3339()
@@ -554,10 +566,13 @@ mod tests {
     /// in-memory store.
     #[test]
     fn test_validate_window_inputs_no_side_effects() {
+        let _guard = fresh_store();
         let start = future_time(50, 0);
         let end = future_time(50, 4);
 
         // Valid inputs — should return Ok without mutating the store.
+        // We hold `_guard` (MAINT_TEST_LOCK) so no concurrent test can mutate
+        // WINDOW_STORE between the two len() reads.
         let store_before = window_store().lock().unwrap().len();
         let result = validate_window_inputs("DEFRA", &start, &end, "pure validate", make_cis());
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
@@ -590,6 +605,7 @@ mod tests {
 
     #[test]
     fn test_schedule_window_creates_window() {
+        let _guard = fresh_store();
         let start = future_time(10, 0);
         let end = future_time(10, 4);
         let window =
@@ -604,6 +620,7 @@ mod tests {
 
     #[test]
     fn test_schedule_window_conflict_detected() {
+        let _guard = fresh_store();
         let start = future_time(20, 0);
         let end = future_time(20, 4);
 
@@ -616,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_schedule_window_invalid_site() {
+        let _guard = fresh_store();
         let result = schedule_window(
             "MARS",
             &future_time(10, 0),
@@ -629,6 +647,7 @@ mod tests {
 
     #[test]
     fn test_schedule_window_invalid_time_range() {
+        let _guard = fresh_store();
         let result = schedule_window(
             "DEFRA",
             &future_time(10, 4),
@@ -642,6 +661,7 @@ mod tests {
 
     #[test]
     fn test_check_conflicts_detects_overlap() {
+        let _guard = fresh_store();
         let start_a = future_time(15, 0);
         let end_a = future_time(15, 6);
         let start_b = future_time(15, 3);
@@ -656,6 +676,7 @@ mod tests {
 
     #[test]
     fn test_check_conflicts_no_overlap() {
+        let _guard = fresh_store();
         let start_a = future_time(12, 0);
         let end_a = future_time(12, 4);
         let start_b = future_time(12, 5);
@@ -669,6 +690,7 @@ mod tests {
 
     #[test]
     fn test_cancel_window() {
+        let _guard = fresh_store();
         let start = future_time(30, 0);
         let end = future_time(30, 4);
         let window = schedule_window("FRPAR", &start, &end, "To be cancelled", make_cis()).unwrap();
@@ -680,11 +702,13 @@ mod tests {
 
     #[test]
     fn test_cancel_window_not_found() {
+        let _guard = fresh_store();
         assert!(cancel_window("mw-nonexistent").is_err());
     }
 
     #[test]
     fn test_get_upcoming_filters_correctly() {
+        let _guard = fresh_store();
         let near_start = future_time(2, 0);
         let near_end = future_time(2, 2);
         let far_start = future_time(40, 0);
@@ -700,6 +724,7 @@ mod tests {
 
     #[test]
     fn test_get_active_returns_currently_active() {
+        let _guard = fresh_store();
         let now = Utc::now();
         let start = (now - Duration::hours(1)).to_rfc3339();
         let end = (now + Duration::hours(1)).to_rfc3339();
@@ -713,6 +738,7 @@ mod tests {
 
     #[test]
     fn test_get_calendar_returns_monthly_windows() {
+        let _guard = fresh_store();
         let now = Utc::now();
         let month = now.format("%Y-%m").to_string();
         let start = format!("{}-01T10:00:00Z", month);
@@ -730,6 +756,7 @@ mod tests {
 
     #[test]
     fn test_get_dependency_warnings_patch_wave_overlap() {
+        let _guard = fresh_store();
         crate::patch_engine::plan_patch_wave("NLAMS", "windows", "high").unwrap();
 
         let window = schedule_window(
@@ -748,6 +775,7 @@ mod tests {
 
     #[test]
     fn test_seed_example_windows_creates_data() {
+        let _guard = fresh_store();
         seed_example_windows();
         let store = window_store().lock().unwrap();
         for id in [
@@ -762,6 +790,7 @@ mod tests {
 
     #[test]
     fn test_get_calendar_contract_returns_valid_structure() {
+        let _guard = fresh_store();
         let contract = get_calendar_contract();
         assert_eq!(contract["source"], "static-seed");
         assert_eq!(contract["dryRunRequired"], true);
