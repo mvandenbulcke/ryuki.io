@@ -6693,8 +6693,8 @@ async fn software_verify(Path(id): Path<String>) -> ApiResult {
                 "source": "database",
             }))),
             None => {
-                // Idempotent: already Verified/Completed → 200.
-                // Wrong state or missing → 404/409.
+                // Idempotent: already Verified → 200.
+                // Wrong state (incl. Completed) or missing → 409/404.
                 let exists: Option<(String,)> =
                     sqlx::query_as("SELECT status FROM software_deployments WHERE id = $1")
                         .bind(&id)
@@ -6703,7 +6703,7 @@ async fn software_verify(Path(id): Path<String>) -> ApiResult {
                         .map_err(db_error)?;
                 match exists {
                     None => Err(status_404(&id)),
-                    Some((ref s,)) if s == "Verified" || s == "Completed" => Ok(Json(json!({
+                    Some((ref s,)) if s == "Verified" => Ok(Json(json!({
                         "passed": true,
                         "status": s,
                         "note": "already verified",
@@ -7217,20 +7217,41 @@ async fn legal_hold_validate(
                 Json(json!({"error": format!("Legal hold {} not found", id)})),
             ));
         };
-        // Validate inline from the DB row (do NOT call validate_hold(&id) which
-        // looks up the static HOLD_STORE — absent for DB-seeded/restarted holds).
-        let is_active = hold.status == "Active";
-        let errors: Vec<&str> = if is_active {
-            vec![]
-        } else {
-            vec!["Hold is not in Active status"]
-        };
+        // Validate the DB row with parity to legal_hold::validate_hold (do NOT
+        // call validate_hold(&id) — it looks up the static HOLD_STORE, absent
+        // for DB-seeded/restarted holds). expiry_date is a NOT NULL TIMESTAMPTZ
+        // in the DB so the engine's "no expiry" warning cannot apply here.
+        let mut errors: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut failed_rules: Vec<String> = Vec::new();
+        let mut remediation: Vec<String> = Vec::new();
+        if hold.server_or_app_name.is_empty() {
+            errors.push("Missing server or application name".into());
+            failed_rules.push("p0-target-required".into());
+            remediation.push("Provide a valid target name.".into());
+        }
+        if hold.reason.is_empty() {
+            errors.push("Missing hold reason".into());
+            failed_rules.push("p0-reason-required".into());
+            remediation.push("Provide a business reason for the hold.".into());
+        }
+        let backups_empty = serde_json::from_str::<Vec<serde_json::Value>>(&hold.affected_backups)
+            .map(|v| v.is_empty())
+            .unwrap_or(true);
+        if backups_empty {
+            warnings.push("No affected backups documented".into());
+        }
+        warnings.push("DRY-RUN: Backup integrity check simulated".into());
+        warnings.push("DRY-RUN: Provider hold state verification simulated".into());
+        let passed = errors.is_empty();
         return Ok(Json(json!({
             "hold": hold.to_json(),
             "validation": {
-                "passed": is_active,
+                "passed": passed,
                 "errors": errors,
-                "warnings": [],
+                "warnings": warnings,
+                "failed_rules": failed_rules,
+                "remediation": remediation,
                 "source": "database",
             },
         })));
@@ -7298,6 +7319,10 @@ async fn legal_hold_release(
     Json(req): Json<LegalHoldReleaseRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // Releasing a hold must record who released it (parity with the engine).
+        if req.released_by.trim().is_empty() {
+            return Err(status_400("releasedBy must not be empty"));
+        }
         // DB path: CAS-UPDATE directly.  Do NOT call release_hold() which
         // mutates HOLD_STORE — absent for DB-seeded/restarted holds.
         let now = chrono::Utc::now().to_rfc3339();
@@ -7419,7 +7444,7 @@ async fn legal_hold_compliance(Path(server): Path<String>) -> ApiResult {
         let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
             "SELECT {LEGAL_HOLD_COLUMNS} FROM legal_holds \
              WHERE status = 'Active' \
-               AND LOWER(server_or_app_name) LIKE '%' || LOWER($1) || '%' \
+               AND strpos(LOWER(server_or_app_name), LOWER($1)) > 0 \
              ORDER BY expiry_date, id"
         ))
         .bind(&server)
@@ -13275,6 +13300,20 @@ async fn alert_routes_update(
                     "Invalid priority '{}'. Must be one of: {:?}",
                     pri, VALID_PRIORITIES
                 )));
+            }
+        }
+        // A provided text field must not be blank (parity with engine validation).
+        for (field, val) in [
+            ("triggerName", &body.trigger_name),
+            ("hostGroup", &body.host_group),
+            ("supportGroup", &body.support_group),
+        ] {
+            if let Some(v) = val {
+                if v.trim().is_empty() {
+                    return Err(status_400(&format!(
+                        "{field} must not be empty when provided"
+                    )));
+                }
             }
         }
 
