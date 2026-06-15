@@ -4634,7 +4634,7 @@ struct ShiftQueueRow {
 }
 
 const SHIFT_QUEUE_COLUMNS: &str =
-    "id, item_type, title, description, priority, assigned_to, created_at, \
+    "id::text AS id, item_type, title, description, priority, assigned_to, created_at, \
      acknowledged, acknowledged_by, acknowledged_at, resolved, resolution, resolved_at, \
      escalated, escalation_reason, escalated_at, metadata::text AS metadata, updated_at";
 
@@ -4704,12 +4704,15 @@ async fn shift_acknowledge(
     Json(body): Json<ShiftActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // The shift_queue.id column is UUID; bind a parsed Uuid (not the raw
+        // path String) or Postgres rejects the comparison with `uuid = text`.
+        let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
         // Validate against DB state (not in-memory) — the row must exist and
         // must not already be acknowledged or resolved.
         let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
             "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
         ))
-        .bind(&id)
+        .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -4741,7 +4744,7 @@ async fn shift_acknowledge(
         )
         .bind(&body.user)
         .bind(now)
-        .bind(&id)
+        .bind(uid)
         .execute(pool)
         .await
         .map_err(db_error)?;
@@ -4764,10 +4767,12 @@ async fn shift_assign(
     Json(body): Json<ShiftActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
+        let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
         let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
             "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
         ))
-        .bind(&id)
+        .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -4790,7 +4795,7 @@ async fn shift_assign(
         sqlx::query("UPDATE shift_queue SET assigned_to = $1, updated_at = $2 WHERE id = $3")
             .bind(&body.user)
             .bind(now)
-            .bind(&id)
+            .bind(uid)
             .execute(pool)
             .await
             .map_err(db_error)?;
@@ -4812,10 +4817,12 @@ async fn shift_escalate(
     Json(body): Json<ShiftEscalateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
+        let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
         let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
             "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
         ))
-        .bind(&id)
+        .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -4847,7 +4854,7 @@ async fn shift_escalate(
         )
         .bind(&body.reason)
         .bind(now)
-        .bind(&id)
+        .bind(uid)
         .execute(pool)
         .await
         .map_err(db_error)?;
@@ -4870,10 +4877,12 @@ async fn shift_resolve(
     Json(body): Json<ShiftResolveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
+        let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
         let row: Option<ShiftQueueRow> = sqlx::query_as(&format!(
             "SELECT {SHIFT_QUEUE_COLUMNS} FROM shift_queue WHERE id = $1"
         ))
-        .bind(&id)
+        .bind(uid)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -4899,7 +4908,7 @@ async fn shift_resolve(
         )
         .bind(&body.resolution)
         .bind(now)
-        .bind(&id)
+        .bind(uid)
         .execute(pool)
         .await
         .map_err(db_error)?;
@@ -16258,12 +16267,12 @@ async fn firewall_rule_update(
     Path(id): Path<String>,
     Json(b): Json<FwUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Validate via engine first (action vocab enforced there).
-    let engine_result = firewall_rules::update_rule(&id, &b.action)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
-
     if let Some(pool) = get_db() {
-        // The engine accepted the action; now determine which column to mutate.
+        // DB mode: the rule lives in Postgres, NOT the in-memory engine store
+        // (create persists to the DB only). So validate the action vocab inline
+        // and mutate the row directly — calling the engine's update_rule here
+        // would 404 because the rule is absent from the static store.
+        //
         // action = Allow/Deny → update `action` column.
         // action = Enable/Active → set status = 'active'.
         // action = Disable/Disabled → set status = 'disabled'.
@@ -16297,7 +16306,11 @@ async fn firewall_rule_update(
             )),
         };
     }
-    Ok(Json(engine_result))
+    // No-DB mode: the engine static store is authoritative; it both validates
+    // the action vocab and looks the rule up by id.
+    firewall_rules::update_rule(&id, &b.action)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn firewall_rule_validate(
     Json(b): Json<FwValidateRequest>,

@@ -16,13 +16,25 @@ test-unit:
 	cargo test -p ryuki-engine
 
 # Run DB integration tests only (requires a live Postgres instance).
-# Filtered by module name so only DB tests run in this process — no in-memory
+# Filtered by name so only DB tests run in this process — no in-memory
 # unit_tests are executed, and the global pool contamination cannot occur.
-# Filters: db_lifecycle_tests (request lifecycle), maint_calendar_db_tests
-# (maintenance windows), integration_db_tests (vendor integration connections).
+#
+# Convention (DO NOT hand-maintain a per-module allowlist — it silently drifts
+# and hid real bugs in untested modules): every DB-backed test module is named
+# `*_db_tests` (or the foundational `db_tests` migration suite), so the
+# `db_tests` substring filter auto-includes new modules.  `db_lifecycle_tests`
+# is the one DB module whose name lacks the `db_tests` substring, so it is
+# listed explicitly.  Run single-threaded: these tests share one physical
+# database, so parallel execution causes cross-test contention/flakes.
+#
+# `test_migrations_run_against_pg18` is skipped here: it is a CLEAN-database
+# migration smoke test (asserts the fresh-seed row counts) and so cannot pass
+# against the shared, already-seeded dev database — it belongs to `make test`
+# run against a throwaway Postgres.
 test-db:
 	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
-	  cargo test -p ryuki-api -- db_lifecycle_tests maint_calendar_db_tests integration_db_tests approved_packages_db_tests
+	  cargo test -p ryuki-api -- --test-threads=1 \
+	    --skip test_migrations_run_against_pg18 db_tests db_lifecycle_tests
 
 test:
 	cargo test --workspace

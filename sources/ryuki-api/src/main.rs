@@ -3319,11 +3319,16 @@ mod db_tests {
     #[tokio::test]
     async fn test_migrations_run_against_pg18() {
         let _serial = crate::database::DB_TEST_SERIAL.lock().await;
-        if std::env::var("RYUKI_DATABASE_URL").is_err() {
-            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
-            return;
-        }
-        let url = std::env::var("RYUKI_DATABASE_URL").unwrap();
+        // Skip when unset OR empty: `make test-unit` runs with
+        // `RYUKI_DATABASE_URL=` (empty string, not unset), so an `.is_err()`
+        // check alone would not skip and the empty-URL connect would panic.
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+                return;
+            }
+        };
         crate::database::try_connect_with_url(&url, 5, 2, 300, 30, 1800).await;
         let db = crate::database::get_db().expect("database should be available");
         crate::database::run_migrations(db)
