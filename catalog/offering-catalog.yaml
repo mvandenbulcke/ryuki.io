@@ -60,7 +60,7 @@ offerings:
       - ServiceNow CMDB export
       - Site catalog
       - Policy catalog
-    status: planned
+    status: active
   - id: linux-server-deployment
     title: Linux server deployment
     category: Build
@@ -113,7 +113,7 @@ offerings:
       - ServiceNow CMDB export
       - Site catalog
       - Policy catalog
-    status: planned
+    status: active
   - id: request-preflight
     title: Request preflight and readiness gate
     category: Build
@@ -160,7 +160,7 @@ offerings:
       - AD OU map
       - Site catalog
       - Policy catalog
-    status: planned
+    status: active
   - id: patch-wave-planning
     title: Patch wave planning
     category: Maintain
@@ -244,7 +244,7 @@ offerings:
       - Target VM or network
       - Application owner catalog
       - Evidence service
-    status: planned
+    status: active
   - id: zabbix-onboarding
     title: Zabbix onboarding
     category: Observe
@@ -287,7 +287,7 @@ offerings:
       - CMDB export
       - ServiceNow ticket context
       - Policy catalog
-    status: planned
+    status: active
   - id: cmdb-import
     title: CMDB Excel import
     category: Operate
