@@ -87,7 +87,11 @@ pub async fn process_job(
     let evidence = executor.execute(&job.spec)?;
 
     // Step 3: build once. result_id is the idempotency key for the outbox.
-    let body = build_signed_result(identity, agent_id, job, &evidence)?;
+    // OfflineDryRun is the only mode supported by the current executor.
+    // Live modes (LivePlan / LiveApply) are S5b — pass None for the
+    // approved_plan_digest; the live executor (S5b-2b-ii) will supply
+    // the real digest when it builds LiveApply+Applied results.
+    let body = build_signed_result(identity, agent_id, job, &evidence, None)?;
     let result_id: Uuid = body.job_result.result_id;
 
     // Step 4: enqueue BEFORE the network POST (durable-first).
@@ -322,7 +326,8 @@ mod tests {
         // Jobwith no lease: build_signed_result must return ResultError::NoLease.
         let mut job = make_leased_job();
         job.lease = None;
-        let result = crate::result::build_signed_result(&identity, "test-agent", &job, &evidence);
+        let result =
+            crate::result::build_signed_result(&identity, "test-agent", &job, &evidence, None);
         assert!(
             matches!(result, Err(crate::result::ResultError::NoLease)),
             "missing lease must return NoLease"
@@ -340,8 +345,9 @@ mod tests {
         let job = make_leased_job();
         let executor = StubExecutor::check_ok();
         let evidence = executor.execute(&job.spec).expect("execute");
-        let body = crate::result::build_signed_result(&identity, "test-agent", &job, &evidence)
-            .expect("build");
+        let body =
+            crate::result::build_signed_result(&identity, "test-agent", &job, &evidence, None)
+                .expect("build");
 
         outbox.enqueue(&body).expect("enqueue");
         let pending = outbox.list_pending().expect("list");

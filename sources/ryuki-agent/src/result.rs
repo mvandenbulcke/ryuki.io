@@ -6,25 +6,25 @@
 //!
 //! ## Field-source table (mirror of verifier checks)
 //!
-//! | Envelope field          | Source                                         | Verifier step |
-//! |-------------------------|------------------------------------------------|---------------|
-//! | `agent_id`              | `agent_id` arg (== token identity)             | Step 1        |
-//! | `platform`              | `job.platform`                                 | Fix 3a        |
-//! | `job_id`                | `job.id`                                       | Step 4        |
-//! | `attempt_id`            | `job.lease.attempt_id`                         | Step 4        |
-//! | `lease_generation`      | `job.lease.lease_generation`                   | Step 4        |
-//! | `cp_nonce`              | `job.lease.cp_nonce`                           | Step 4 (CT)   |
-//! | `request_id`            | `job.spec.request_id`                          | Fix 3b        |
-//! | `result_id`             | `Uuid::new_v4()` — generated once, outbox-stable | Step 5      |
-//! | `mode`                  | `job.spec.mode`                                | Fix 3a        |
-//! | `status`                | mapped from `RunStatus` → `JobResultStatus`    | Step 5        |
-//! | `job_spec_digest`       | `ryuki_protocol::job_spec_digest(&job.spec)`   | Step 7        |
-//! | `approved_plan_digest`  | `None` — OfflineDryRun must NOT carry it       | Step 8        |
-//! | `evidence_digest`       | `sha256_hex(&evidence.evidence_bytes)`         | Step 6        |
-//! | `redaction_policy_version` | `REDACTION_POLICY_VERSION` constant         | Stored        |
-//! | `timestamp`             | `Utc::now()`                                   | Stored        |
-//! | `key_id`                | `identity.public_key_b64()`                    | Step 3        |
-//! | `signature`             | `ryuki_protocol::sign(envelope, signing_key)`  | Step 3        |
+//! | Envelope field          | Source                                                         | Verifier step |
+//! |-------------------------|----------------------------------------------------------------|---------------|
+//! | `agent_id`              | `agent_id` arg (== token identity)                             | Step 1        |
+//! | `platform`              | `job.platform`                                                 | Fix 3a        |
+//! | `job_id`                | `job.id`                                                       | Step 4        |
+//! | `attempt_id`            | `job.lease.attempt_id`                                         | Step 4        |
+//! | `lease_generation`      | `job.lease.lease_generation`                                   | Step 4        |
+//! | `cp_nonce`              | `job.lease.cp_nonce`                                           | Step 4 (CT)   |
+//! | `request_id`            | `job.spec.request_id`                                          | Fix 3b        |
+//! | `result_id`             | `Uuid::new_v4()` — generated once, outbox-stable               | Step 5        |
+//! | `mode`                  | `job.spec.mode`                                                | Fix 3a        |
+//! | `status`                | mapped from `RunStatus` → `JobResultStatus`                    | Step 5        |
+//! | `job_spec_digest`       | `ryuki_protocol::job_spec_digest(&job.spec)`                   | Step 7        |
+//! | `approved_plan_digest`  | `None` for non-LiveApply; `Some(d)` for LiveApply+Applied      | Step 8        |
+//! | `evidence_digest`       | `sha256_hex(&evidence.evidence_bytes)`                         | Step 6        |
+//! | `redaction_policy_version` | `REDACTION_POLICY_VERSION` constant                         | Stored        |
+//! | `timestamp`             | `Utc::now()`                                                   | Stored        |
+//! | `key_id`                | `identity.public_key_b64()`                                    | Step 3        |
+//! | `signature`             | `ryuki_protocol::sign(envelope, signing_key)`                  | Step 3        |
 //!
 //! The `JobResult` outer fields are then set to EQUAL the signed envelope fields
 //! (verifier step 5 checks all five equality constraints).
@@ -80,7 +80,7 @@ pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
 
 /// Map a runner `RunStatus` to the `JobResultStatus` the agent may report.
 ///
-/// Mapping table (S4b scope — OfflineDryRun only):
+/// Mapping table:
 ///
 /// | RunStatus            | JobResultStatus |
 /// |----------------------|-----------------|
@@ -90,8 +90,8 @@ pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
 /// | Failed               | Failed          |
 /// | RunnerUnavailable    | Failed          |
 /// | WorkspaceError       | Failed          |
-/// | Applied (live, S5)   | not produced    |
-/// | Changed  (live, S5)  | not produced    |
+/// | Applied (live, S5b)  | Applied         |
+/// | Changed  (live, S5b) | Applied         |
 pub fn map_run_status(status: &RunStatus) -> JobResultStatus {
     match status {
         RunStatus::Validated | RunStatus::CheckOk => JobResultStatus::CheckOk,
@@ -121,6 +121,17 @@ pub enum ResultError {
         mode: JobMode,
         status: JobResultStatus,
     },
+    #[error(
+        "approved_plan_digest must be None for non-LiveApply mode ({mode:?}) — \
+         the CP rejects non-live results that carry a plan digest"
+    )]
+    PlanDigestOnNonLive { mode: JobMode },
+    #[error(
+        "LiveApply result MUST carry approved_plan_digest — the CP live-apply gate \
+         requires the digest to check equality with the grant (a refusal uses \
+         build_refused_result instead)"
+    )]
+    MissingPlanDigestForLiveApply,
     #[error("serialisation error: {0}")]
     Serialise(String),
 }
@@ -130,6 +141,18 @@ pub enum ResultError {
 // ---------------------------------------------------------------------------
 
 /// Construct a fully-signed `ResultBody` ready to POST to the CP.
+///
+/// ## `approved_plan_digest` rules (fail-closed)
+///
+/// - `OfflineDryRun` or `LivePlan`: MUST be `None` — else `PlanDigestOnNonLive`.
+/// - `LiveApply` (ANY status — Applied or Failed): MUST be `Some(d)` — else
+///   `MissingPlanDigestForLiveApply`.  `d` is the SHA-256 hex of the plan the
+///   agent re-ran and confirmed matches the grant's `approved_plan_digest`. Every
+///   non-refusal LiveApply result goes through the CP's grant-checked branch,
+///   which requires the digest; a refusal uses `build_refused_result` instead.
+///
+/// The mode/status consistency guard (non-live mode producing `Applied` →
+/// `LiveStatusInNonLiveMode`) runs BEFORE the digest checks.
 ///
 /// ## Idempotency
 /// `result_id` is generated with `Uuid::new_v4()` INSIDE this function.  The
@@ -143,6 +166,7 @@ pub fn build_signed_result(
     agent_id: &str,
     job: &Job,
     evidence: &Evidence,
+    approved_plan_digest: Option<String>,
 ) -> Result<ResultBody, ResultError> {
     // Require an active lease — cannot sign without attempt_id and cp_nonce.
     let lease = job.lease.as_ref().ok_or(ResultError::NoLease)?;
@@ -157,7 +181,7 @@ pub fn build_signed_result(
     // FAIL CLOSED: a non-live job (OfflineDryRun / LivePlan) must NEVER report a
     // live-mutation status. Applied/Changed from a dry-run means the runner
     // mutated something it must not have — refuse to sign rather than let the CP
-    // record it as Succeeded. (LiveApply is rejected earlier in the pipeline.)
+    // record it as Succeeded.
     if matches!(job.spec.mode, JobMode::OfflineDryRun | JobMode::LivePlan)
         && matches!(result_status, JobResultStatus::Applied)
     {
@@ -166,6 +190,37 @@ pub fn build_signed_result(
             status: result_status,
         });
     }
+
+    // FAIL CLOSED: validate the approved_plan_digest caller contract.
+    //
+    // Non-live modes (OfflineDryRun / LivePlan) must NOT carry a plan digest.
+    // The CP step 8 rejects non-LiveApply results that include this field.
+    //
+    // LiveApply + Applied MUST carry a plan digest: the CP equality-checks it
+    // against the grant's approved_plan_digest (step 8 live-apply gate).
+    let envelope_plan_digest = match &job.spec.mode {
+        JobMode::OfflineDryRun | JobMode::LivePlan => {
+            if approved_plan_digest.is_some() {
+                return Err(ResultError::PlanDigestOnNonLive {
+                    mode: job.spec.mode.clone(),
+                });
+            }
+            None
+        }
+        JobMode::LiveApply => {
+            // EVERY non-refusal LiveApply result (Applied, or Failed after a
+            // matching-plan apply) goes through the CP's grant-checked branch,
+            // which REQUIRES approved_plan_digest and equality with the grant.
+            // build_signed_result never produces a refusal (that is
+            // build_refused_result), and a LiveApply only reaches this point
+            // AFTER the agent's gate matched the plan digest — so the digest is
+            // always available. Require it.
+            match approved_plan_digest {
+                Some(d) => Some(d),
+                None => return Err(ResultError::MissingPlanDigestForLiveApply),
+            }
+        }
+    };
 
     // Compute the two digests that the CP will recompute and check.
     let evidence_digest = sha256_hex(&evidence.evidence_bytes);
@@ -184,16 +239,7 @@ pub fn build_signed_result(
         mode: job.spec.mode.clone(),
         status: result_status.clone(),
         job_spec_digest: spec_digest,
-        // OfflineDryRun and LivePlan MUST NOT carry approved_plan_digest.
-        // The CP rejects non-LiveApply results that include this field (step 8).
-        approved_plan_digest: match &job.spec.mode {
-            JobMode::LiveApply => {
-                // S5: approved_plan_digest comes from VerifiedLiveContext.
-                // For now we never reach this path (executor rejects LiveApply).
-                None
-            }
-            _ => None,
-        },
+        approved_plan_digest: envelope_plan_digest,
         evidence_digest: evidence_digest.clone(),
         redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
         timestamp: Utc::now(),
@@ -221,6 +267,92 @@ pub fn build_signed_result(
         job_result,
         evidence: evidence.evidence_bytes.clone(),
         evidence_json: evidence.evidence_json.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// build_refused_result — the LiveRefused path
+// ---------------------------------------------------------------------------
+
+/// Construct a signed `ResultBody` for a `LiveRefused` outcome.
+///
+/// Used when the agent declines to execute a `LiveApply` (missing or invalid
+/// grant, plan divergence, missing `--allow-live` flag, etc.).  The CP records
+/// this WITHOUT running the grant equality checks (the refusal may be *because*
+/// the grant was invalid), and transitions the job to `LiveRefused` status.
+///
+/// ## Contract
+///
+/// - `status` = `JobResultStatus::LiveRefused`.
+/// - `approved_plan_digest` = `None` — a refusal applied nothing; the CP step 8
+///   rejects a `LiveRefused` result that carries a digest.
+/// - `evidence_bytes` = `reason.as_bytes()` (the human-readable refusal reason;
+///   MUST be scrubbed — no secret material).
+/// - `evidence_digest` = `sha256_hex(reason.as_bytes())`.
+/// - All lease fields, `request_id`, `job_spec_digest`, `key_id`, `cp_nonce`,
+///   and signature follow exactly the same rules as `build_signed_result`.
+///
+/// ## Works for any leased mode
+///
+/// A refusal can occur for `LivePlan` OR `LiveApply` — both can be leased
+/// before the agent discovers a problem.  The CP records `LiveRefused`
+/// terminally for both.
+///
+/// ## Panics
+/// None — fail-closed via `Result`.
+pub fn build_refused_result(
+    identity: &AgentIdentity,
+    agent_id: &str,
+    job: &Job,
+    reason: &str,
+) -> Result<ResultBody, ResultError> {
+    // Require an active lease — cannot sign without attempt_id and cp_nonce.
+    let lease = job.lease.as_ref().ok_or(ResultError::NoLease)?;
+
+    let result_id = Uuid::new_v4();
+
+    // Evidence is the scrubbed refusal reason (plain text, no secrets).
+    let evidence_bytes = reason.as_bytes().to_vec();
+    let evidence_json = Some(serde_json::json!({"refused": reason}));
+    let evidence_digest = sha256_hex(&evidence_bytes);
+    let spec_digest = job_spec_digest(&job.spec);
+
+    let unsigned_envelope = SignedEnvelope {
+        agent_id: agent_id.to_string(),
+        platform: job.platform.clone(),
+        job_id: job.id,
+        attempt_id: lease.attempt_id,
+        lease_generation: lease.lease_generation,
+        request_id: job.spec.request_id,
+        result_id,
+        mode: job.spec.mode.clone(),
+        status: JobResultStatus::LiveRefused,
+        job_spec_digest: spec_digest,
+        // A refusal applied nothing — the CP rejects LiveRefused with a digest.
+        approved_plan_digest: None,
+        evidence_digest: evidence_digest.clone(),
+        redaction_policy_version: REDACTION_POLICY_VERSION.to_string(),
+        timestamp: Utc::now(),
+        key_id: identity.public_key_b64(),
+        cp_nonce: lease.cp_nonce.clone(),
+        signature: String::new(), // filled by sign()
+    };
+
+    let signed_envelope = sign(unsigned_envelope, identity.signing_key());
+
+    let job_result = JobResult {
+        job_id: signed_envelope.job_id,
+        attempt_id: signed_envelope.attempt_id,
+        result_id: signed_envelope.result_id,
+        status: signed_envelope.status.clone(),
+        evidence_digest: signed_envelope.evidence_digest.clone(),
+        signed_envelope,
+    };
+
+    Ok(ResultBody {
+        job_result,
+        evidence: evidence_bytes,
+        evidence_json,
     })
 }
 
@@ -293,7 +425,7 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body = build_signed_result(&identity, "defra-agent-01", &job, &evidence)
+        let body = build_signed_result(&identity, "defra-agent-01", &job, &evidence, None)
             .expect("build_signed_result must succeed");
 
         // Decode the enrolled verifying key from the identity.
@@ -313,8 +445,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         let result = &body.job_result;
         let env = &result.signed_envelope;
@@ -345,8 +477,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         let expected_digest = sha256_hex(&body.evidence);
         assert_eq!(
@@ -369,8 +501,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         assert!(
             body.job_result
@@ -391,8 +523,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         let expected = job_spec_digest(&job.spec);
         assert_eq!(
@@ -412,8 +544,8 @@ mod tests {
         let lease = job.lease.as_ref().unwrap();
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         let env = &body.job_result.signed_envelope;
         assert_eq!(env.attempt_id, lease.attempt_id, "attempt_id from lease");
@@ -434,8 +566,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         assert_eq!(
             body.job_result.signed_envelope.key_id,
@@ -455,7 +587,7 @@ mod tests {
         job.lease = None; // strip the lease
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let result = build_signed_result(&identity, "test-agent", &job, &evidence);
+        let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
         assert!(
             matches!(result, Err(ResultError::NoLease)),
             "missing lease must return ResultError::NoLease"
@@ -474,7 +606,7 @@ mod tests {
         // must NOT be signed — the agent fails closed.
         let evidence = make_evidence(RunStatus::Applied);
 
-        let result = build_signed_result(&identity, "test-agent", &job, &evidence);
+        let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
         assert!(
             matches!(
                 result,
@@ -497,8 +629,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let mut body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let mut body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         // Tamper one byte of the evidence.
         body.evidence[0] ^= 0xFF;
@@ -554,8 +686,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let mut body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let mut body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         // Tamper the envelope's evidence_digest field.
         body.job_result.signed_envelope.evidence_digest =
@@ -578,8 +710,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "my-agent-01", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "my-agent-01", &job, &evidence, None)
+            .expect("must succeed");
 
         let env = &body.job_result.signed_envelope;
         assert_eq!(env.agent_id, "my-agent-01");
@@ -596,8 +728,8 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         let result_id = body.job_result.signed_envelope.result_id;
         assert_ne!(result_id, Uuid::nil(), "result_id must not be nil");
@@ -614,10 +746,10 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body1 =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("first call");
-        let body2 =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("second call");
+        let body1 = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("first call");
+        let body2 = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("second call");
 
         assert_ne!(
             body1.job_result.result_id, body2.job_result.result_id,
@@ -635,12 +767,292 @@ mod tests {
         let job = make_leased_job(JobMode::OfflineDryRun);
         let evidence = make_evidence(RunStatus::CheckOk);
 
-        let body =
-            build_signed_result(&identity, "test-agent", &job, &evidence).expect("must succeed");
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("must succeed");
 
         assert_eq!(
             body.job_result.signed_envelope.request_id, job.spec.request_id,
             "envelope.request_id must come from spec.request_id (Fix 3b)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: LiveApply + Applied + Some(digest) → Ok; digest propagated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_applied_with_digest_succeeds() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let evidence = make_evidence(RunStatus::Applied);
+        let plan_digest = sha256_hex(b"canonical-plan-bytes");
+
+        let body = build_signed_result(
+            &identity,
+            "test-agent",
+            &job,
+            &evidence,
+            Some(plan_digest.clone()),
+        )
+        .expect("LiveApply + Applied + Some(digest) must succeed");
+
+        let env = &body.job_result.signed_envelope;
+
+        // approved_plan_digest must equal what was passed in.
+        assert_eq!(
+            env.approved_plan_digest,
+            Some(plan_digest),
+            "envelope must carry the approved_plan_digest"
+        );
+
+        // Status must be Applied.
+        assert_eq!(env.status, JobResultStatus::Applied);
+
+        // Outer must equal envelope (step 5).
+        assert_eq!(body.job_result.status, env.status);
+        assert_eq!(body.job_result.result_id, env.result_id);
+        assert_eq!(body.job_result.evidence_digest, env.evidence_digest);
+
+        // evidence_digest = sha256(evidence_bytes).
+        let expected = sha256_hex(&body.evidence);
+        assert_eq!(
+            env.evidence_digest, expected,
+            "evidence_digest must equal sha256(evidence_bytes)"
+        );
+
+        // Sign → verify must pass.
+        let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
+        verify(env, &vk).expect("Ed25519 signature on LiveApply+Applied must verify");
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i negative: any non-refusal LiveApply result with None →
+    // MissingPlanDigestForLiveApply (the CP requires the digest for both
+    // Applied and Failed — a refusal uses build_refused_result instead).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_applied_without_digest_is_rejected() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let evidence = make_evidence(RunStatus::Applied);
+
+        let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
+        assert!(
+            matches!(result, Err(ResultError::MissingPlanDigestForLiveApply)),
+            "LiveApply + Applied + None must return MissingPlanDigestForLiveApply, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn live_apply_failed_without_digest_is_rejected() {
+        // A LiveApply that ran the approved plan then failed still goes through
+        // the CP's grant-checked branch, so it MUST carry the digest.
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let evidence = make_evidence(RunStatus::Failed);
+
+        let result = build_signed_result(&identity, "test-agent", &job, &evidence, None);
+        assert!(
+            matches!(result, Err(ResultError::MissingPlanDigestForLiveApply)),
+            "LiveApply + Failed + None must also require the digest, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn live_apply_failed_with_digest_carries_it() {
+        // A failed LiveApply with the matching digest is a valid report (the CP
+        // records it Failed after the verify_vlc + equality checks pass).
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let evidence = make_evidence(RunStatus::Failed);
+        let digest = sha256_hex(b"the-approved-plan");
+
+        let body = build_signed_result(
+            &identity,
+            "test-agent",
+            &job,
+            &evidence,
+            Some(digest.clone()),
+        )
+        .expect("LiveApply + Failed + Some(digest) must succeed");
+        assert_eq!(
+            body.job_result.signed_envelope.approved_plan_digest,
+            Some(digest),
+            "a failed LiveApply must still carry the approved plan digest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i negative: OfflineDryRun + Some(digest) → PlanDigestOnNonLive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn offline_dry_run_with_digest_is_rejected() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::OfflineDryRun);
+        let evidence = make_evidence(RunStatus::CheckOk);
+        let plan_digest = sha256_hex(b"some-plan");
+
+        let result =
+            build_signed_result(&identity, "test-agent", &job, &evidence, Some(plan_digest));
+        assert!(
+            matches!(
+                result,
+                Err(ResultError::PlanDigestOnNonLive {
+                    mode: JobMode::OfflineDryRun
+                })
+            ),
+            "OfflineDryRun + Some(digest) must return PlanDigestOnNonLive, got {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: LivePlan + Planned + None → Ok, no approved_plan_digest
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_plan_planned_no_digest_succeeds() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LivePlan);
+        let evidence = make_evidence(RunStatus::Planned);
+
+        let body = build_signed_result(&identity, "test-agent", &job, &evidence, None)
+            .expect("LivePlan + Planned + None must succeed");
+
+        let env = &body.job_result.signed_envelope;
+        assert_eq!(env.status, JobResultStatus::Planned);
+        assert!(
+            env.approved_plan_digest.is_none(),
+            "LivePlan must NOT carry approved_plan_digest"
+        );
+
+        // Sign → verify passes.
+        let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
+        verify(env, &vk).expect("signature must verify for LivePlan+Planned");
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: LivePlan + Some(digest) → PlanDigestOnNonLive
+    //
+    // LivePlan is NOT LiveApply — the CP step 8 rejects non-LiveApply results
+    // that carry approved_plan_digest.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_plan_with_digest_is_rejected() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LivePlan);
+        let evidence = make_evidence(RunStatus::Planned);
+        let plan_digest = sha256_hex(b"plan-bytes");
+
+        let result =
+            build_signed_result(&identity, "test-agent", &job, &evidence, Some(plan_digest));
+        assert!(
+            matches!(
+                result,
+                Err(ResultError::PlanDigestOnNonLive {
+                    mode: JobMode::LivePlan
+                })
+            ),
+            "LivePlan + Some(digest) must return PlanDigestOnNonLive, got {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: build_refused_result — positive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_refused_result_positive() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LiveApply);
+        let reason = "grant expired before apply could start";
+
+        let body = build_refused_result(&identity, "test-agent", &job, reason)
+            .expect("build_refused_result must succeed");
+
+        let env = &body.job_result.signed_envelope;
+
+        // Status must be LiveRefused.
+        assert_eq!(env.status, JobResultStatus::LiveRefused);
+        assert_eq!(body.job_result.status, JobResultStatus::LiveRefused);
+
+        // No approved_plan_digest — a refusal applied nothing.
+        assert!(
+            env.approved_plan_digest.is_none(),
+            "LiveRefused must NOT carry approved_plan_digest"
+        );
+
+        // evidence_digest = sha256(reason bytes).
+        let expected_digest = sha256_hex(reason.as_bytes());
+        assert_eq!(
+            env.evidence_digest, expected_digest,
+            "evidence_digest must equal sha256(reason bytes)"
+        );
+        assert_eq!(
+            body.job_result.evidence_digest, expected_digest,
+            "outer evidence_digest must equal sha256(reason bytes)"
+        );
+        assert_eq!(
+            body.evidence,
+            reason.as_bytes(),
+            "evidence bytes must equal reason bytes"
+        );
+
+        // Outer must equal envelope (step 5).
+        assert_eq!(body.job_result.job_id, env.job_id);
+        assert_eq!(body.job_result.attempt_id, env.attempt_id);
+        assert_eq!(body.job_result.result_id, env.result_id);
+
+        // Sign → verify must pass.
+        let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
+        verify(env, &vk).expect("Ed25519 signature on LiveRefused must verify");
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: build_refused_result — NoLease when lease absent
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_refused_result_no_lease() {
+        let identity = make_identity();
+        let mut job = make_leased_job(JobMode::LiveApply);
+        job.lease = None;
+
+        let result = build_refused_result(&identity, "test-agent", &job, "no grant");
+        assert!(
+            matches!(result, Err(ResultError::NoLease)),
+            "build_refused_result without lease must return NoLease"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // S5b-2b-i: build_refused_result works for LivePlan too
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_refused_result_for_live_plan() {
+        let identity = make_identity();
+        let job = make_leased_job(JobMode::LivePlan);
+        let reason = "live credentials unavailable";
+
+        let body = build_refused_result(&identity, "test-agent", &job, reason)
+            .expect("refused result for LivePlan must succeed");
+
+        assert_eq!(body.job_result.status, JobResultStatus::LiveRefused);
+        assert!(body
+            .job_result
+            .signed_envelope
+            .approved_plan_digest
+            .is_none());
+
+        let vk = decode_verifying_key(&identity.public_key_b64()).expect("decode vk");
+        verify(&body.job_result.signed_envelope, &vk)
+            .expect("signature must verify for LivePlan refused result");
     }
 }

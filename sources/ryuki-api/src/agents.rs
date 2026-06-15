@@ -3807,7 +3807,7 @@ mod tests {
             .execute(&job.spec)
             .expect("StubExecutor must succeed");
         let agent_body =
-            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence)
+            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence, None)
                 .expect("build_signed_result must succeed");
 
         let agent_result_id = agent_body.job_result.result_id;
@@ -3887,7 +3887,7 @@ mod tests {
             .execute(&job.spec)
             .expect("StubExecutor must succeed");
         let mut agent_body =
-            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence)
+            ryuki_agent::result::build_signed_result(&identity, &agent_id, &job, &evidence, None)
                 .expect("build_signed_result must succeed");
 
         // TAMPER: flip one byte of evidence AFTER signing.
@@ -5162,6 +5162,78 @@ mod tests {
         );
         let db = read_job_result_row(&pool, job_id).await;
         assert_eq!(db.status, "LiveRefused");
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// Definitive cross-crate proof: the agent's REAL `build_signed_result`
+    /// (S5b-2b-i) output for a LiveApply Applied result passes the REAL CP
+    /// verifier (verify_vlc + digest equality + everything) against live PG.
+    #[tokio::test]
+    async fn db_s5b2_agent_live_apply_builder_accepted_by_verifier() {
+        use ryuki_agent::executor::JobExecutor;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // The agent's identity is enrolled; the grant is signed by the shared CP
+        // key (installed as the global via seed_live_apply_job → ensure_test_cp_key).
+        let identity = ryuki_agent::identity::AgentIdentity::generate();
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5b2-{suffix}");
+        let agent_id = format!("s5b2-agent-{suffix}");
+        let token = seed_agent_from_identity(&pool, &agent_id, &platform, &identity).await;
+
+        let digest = proto_sha256(b"the-approved-plan");
+        let job_id = seed_live_apply_job(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+        let job = build_protocol_job(&job_row, attempt_id, fencing.clone(), nonce.clone(), gen);
+
+        // Agent code: a stub Applied execution → the REAL build_signed_result with
+        // the matching plan digest (what S5b-2b-ii's loop will do after the gate).
+        let evidence = ryuki_agent::executor::StubExecutor::new(
+            ryuki_engine::runners::RunStatus::Applied,
+            b"terraform apply output (scrubbed)".to_vec(),
+            None,
+        )
+        .execute(&job.spec)
+        .expect("stub execute");
+        let agent_body = ryuki_agent::result::build_signed_result(
+            &identity,
+            &agent_id,
+            &job,
+            &evidence,
+            Some(digest.clone()),
+        )
+        .expect("build_signed_result for LiveApply Applied must succeed");
+
+        let cp_body: ResultBody =
+            serde_json::from_value(serde_json::to_value(&agent_body).expect("serialise"))
+                .expect("CP deserialises agent body");
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp =
+            post_job_result_with_pool(agent_id.clone(), job_id.to_string(), hdrs, cp_body, &pool)
+                .await;
+        assert!(
+            resp.is_ok(),
+            "agent-built LiveApply result must pass the CP verifier: {:?}",
+            resp.err()
+        );
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Succeeded", "applied live job must be terminal");
+
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
