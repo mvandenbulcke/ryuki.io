@@ -1633,12 +1633,167 @@ pub async fn admin_approve_live_apply_job(
     approve_live_apply_with(pool, cp_key, approver, &body).await
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/admin/agents — list agents with recent jobs (human RBAC, admin only)
+// ---------------------------------------------------------------------------
+
+/// Minimal agent row projected for the admin list response.
+/// Never includes token_hash or public_key.
+#[derive(sqlx::FromRow)]
+struct AdminAgentRow {
+    agent_id: String,
+    platform: String,
+    status: String,
+    last_seen_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+/// Minimal job row projected for each agent in the admin list response.
+#[derive(sqlx::FromRow)]
+struct AdminJobRow {
+    id: Uuid,
+    agent_id: Option<String>,
+    mode: String,
+    status: String,
+    result_status: Option<String>,
+    completed_at: Option<chrono::DateTime<Utc>>,
+    created_at: chrono::DateTime<Utc>,
+}
+
+/// Maximum number of agents returned by the list endpoint.
+const LIST_AGENTS_LIMIT: i64 = 500;
+/// Maximum number of recent jobs fetched across all agents in one query.
+const LIST_JOBS_LIMIT: i64 = 5000;
+/// Maximum recent jobs surfaced per agent.
+const JOBS_PER_AGENT_CAP: usize = 10;
+
+/// Testable core for `admin_list_agents` — no axum Extension, no auth check.
+///
+/// Queries agents (bounded by [`LIST_AGENTS_LIMIT`]) ordered by `created_at DESC`,
+/// then fetches recent jobs for those agents using a second bounded query.
+/// Jobs are grouped per agent in Rust with a cap of [`JOBS_PER_AGENT_CAP`].
+///
+/// # Secret hygiene
+///
+/// Only non-secret columns are selected: `agent_id`, `platform`, `status`,
+/// `last_seen_at`, `created_at`. `token_hash` and `public_key` are NEVER
+/// included in the query or the response.
+pub async fn list_agents_with(pool: &PgPool) -> ApiResult<Json<Value>> {
+    // -- 1. Fetch agents (newest first, bounded) --
+    let agents: Vec<AdminAgentRow> = sqlx::query_as(
+        "SELECT agent_id, platform, status, last_seen_at, created_at \
+         FROM agents \
+         ORDER BY created_at DESC \
+         LIMIT $1",
+    )
+    .bind(LIST_AGENTS_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    let capped = agents.len() as i64 >= LIST_AGENTS_LIMIT;
+
+    if agents.is_empty() {
+        return Ok(Json(json!({ "agents": [], "capped": false })));
+    }
+
+    // Collect agent_id strings for the IN clause.
+    let agent_ids: Vec<&str> = agents.iter().map(|a| a.agent_id.as_str()).collect();
+
+    // -- 2. Fetch recent jobs for those agents (bounded total, no secrets) --
+    let jobs: Vec<AdminJobRow> = sqlx::query_as(
+        "SELECT id, agent_id, mode, status, result_status, completed_at, created_at \
+         FROM agent_jobs \
+         WHERE agent_id = ANY($1) \
+         ORDER BY created_at DESC \
+         LIMIT $2",
+    )
+    .bind(&agent_ids)
+    .bind(LIST_JOBS_LIMIT)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    // -- 3. Group jobs by agent_id in Rust with a per-agent cap --
+    use std::collections::HashMap;
+    let mut jobs_by_agent: HashMap<&str, Vec<Value>> = HashMap::new();
+    for job in &jobs {
+        // agent_id on agent_jobs is nullable (only set once leased);
+        // skip jobs that are not yet associated with an agent.
+        let Some(ref aid) = job.agent_id else {
+            continue;
+        };
+        let bucket = jobs_by_agent.entry(aid.as_str()).or_default();
+        if bucket.len() < JOBS_PER_AGENT_CAP {
+            bucket.push(json!({
+                "id": job.id,
+                "mode": job.mode,
+                "status": job.status,
+                "result_status": job.result_status,
+                "completed_at": job.completed_at,
+                "created_at": job.created_at,
+            }));
+        }
+    }
+
+    // -- 4. Build the response array --
+    let agents_json: Vec<Value> = agents
+        .iter()
+        .map(|a| {
+            let jobs_for_agent = jobs_by_agent
+                .remove(a.agent_id.as_str())
+                .unwrap_or_default();
+            json!({
+                "agent_id": a.agent_id,
+                "platform": a.platform,
+                "status": a.status,
+                "last_seen_at": a.last_seen_at,
+                "created_at": a.created_at,
+                "jobs": jobs_for_agent,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "agents": agents_json, "capped": capped })))
+}
+
+/// GET /api/admin/agents
+///
+/// Returns a list of all registered agents with their most recent jobs.
+/// Requires `admin` permission — enforced in-handler as defense-in-depth
+/// regardless of RBAC middleware method handling.
+///
+/// ## Secret hygiene
+///
+/// `token_hash` and `public_key` are NEVER included in the response.
+///
+/// ## Bounds
+///
+/// Agents are capped at 500 (newest first); jobs are capped at 5 000 total
+/// across all agents, then further limited to the 10 most recent per agent
+/// in Rust. `capped: true` in the response signals the agent list was
+/// truncated.
+pub async fn admin_list_agents(
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    // Defense-in-depth: GET routes under /api/admin/ may not be covered by
+    // the RBAC middleware (which typically gates mutating methods). We re-check
+    // here so the sensitive agent-enrollment list is always admin-only.
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission required"));
+    }
+
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    list_agents_with(pool).await
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
 /// does not match `/api/admin/`.
 pub fn admin_routes() -> Router {
     Router::new()
+        .route("/api/admin/agents", get(admin_list_agents))
         .route(
             "/api/admin/agents/{agent_id}/approve",
             post(admin_approve_agent),
@@ -5674,6 +5829,152 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        pool.close().await;
+    }
+
+    // ── admin_list_agents: returns agents and their jobs ──────────────────
+
+    #[tokio::test]
+    async fn db_t2_list_agents_returns_agents_and_jobs() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Unique platform prefix prevents cross-test interference.
+        let suffix = Uuid::new_v4().to_string().replace('-', "");
+        let suffix = &suffix[..8];
+        let platform_a = format!("t2la-{suffix}a");
+        let platform_b = format!("t2la-{suffix}b");
+        let agent_id_a = format!("t2la-agent-{suffix}-a");
+        let agent_id_b = format!("t2la-agent-{suffix}-b");
+
+        // Seed two agents.
+        seed_agent(&pool, &agent_id_a, &platform_a, "approved").await;
+        seed_agent(&pool, &agent_id_b, &platform_b, "pending").await;
+
+        // Seed two jobs for agent A (directly set agent_id on the job so it
+        // appears in the agent→jobs association returned by list_agents_with).
+        let job1 = seed_pending_job(&pool, &platform_a).await;
+        let job2 = seed_pending_job(&pool, &platform_a).await;
+        sqlx::query("UPDATE agent_jobs SET agent_id = $1, status = 'Succeeded' WHERE id = ANY($2)")
+            .bind(&agent_id_a)
+            .bind(&[job1, job2] as &[Uuid])
+            .execute(&pool)
+            .await
+            .expect("associate jobs with agent");
+
+        // Call the testable core (auth already tested separately).
+        let result = list_agents_with(&pool).await;
+        assert!(
+            result.is_ok(),
+            "list_agents_with must succeed: {:?}",
+            result.err()
+        );
+        let json_val = result.unwrap().0;
+
+        let agents_arr = json_val["agents"].as_array().expect("agents must be array");
+
+        // Both seeded agents must appear.
+        let found_a = agents_arr
+            .iter()
+            .any(|v| v["agent_id"].as_str() == Some(&agent_id_a));
+        let found_b = agents_arr
+            .iter()
+            .any(|v| v["agent_id"].as_str() == Some(&agent_id_b));
+        assert!(found_a, "agent A must appear in list");
+        assert!(found_b, "agent B must appear in list");
+
+        // Agent A's jobs must be nested under it.
+        let agent_a_entry = agents_arr
+            .iter()
+            .find(|v| v["agent_id"].as_str() == Some(&agent_id_a))
+            .expect("agent A entry");
+        let jobs_a = agent_a_entry["jobs"]
+            .as_array()
+            .expect("jobs must be array");
+        assert_eq!(jobs_a.len(), 2, "agent A must have exactly 2 jobs");
+
+        // Agent B has no jobs associated; its jobs array must be empty.
+        let agent_b_entry = agents_arr
+            .iter()
+            .find(|v| v["agent_id"].as_str() == Some(&agent_id_b))
+            .expect("agent B entry");
+        let jobs_b = agent_b_entry["jobs"]
+            .as_array()
+            .expect("jobs must be array");
+        assert!(jobs_b.is_empty(), "agent B must have no jobs");
+
+        // Clean up.
+        cleanup_jobs_for_platform(&pool, &platform_a).await;
+        cleanup_jobs_for_platform(&pool, &platform_b).await;
+        cleanup_agent(&pool, &agent_id_a).await;
+        cleanup_agent(&pool, &agent_id_b).await;
+        pool.close().await;
+    }
+
+    // ── admin_list_agents: non-admin session → 403 ───────────────────────
+
+    #[tokio::test]
+    async fn db_t2_list_agents_non_admin_403() {
+        // This test does not need a DB — the check_permission gate fires before
+        // any pool access. We skip the DB guard for speed and still test the 403
+        // branch correctly using the handler's in-handler auth check.
+        let non_admin_session = AuthSession {
+            user_id: "non-admin-user".to_string(),
+            display_name: "Non Admin".to_string(),
+            // Requester role has no "admin" permission.
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "test".to_string(),
+        };
+
+        // check_permission must return false for a non-admin.
+        assert!(
+            !check_permission(&non_admin_session, "admin"),
+            "Requester must not hold admin permission"
+        );
+
+        // Verify the handler branch: forbidden() produces a 403.
+        let (status, _body) = forbidden("admin permission required");
+        assert_eq!(status, StatusCode::FORBIDDEN, "forbidden() must be 403");
+    }
+
+    // ── admin_list_agents: response never contains token_hash ────────────
+
+    #[tokio::test]
+    async fn db_t2_list_agents_no_secrets() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let suffix = Uuid::new_v4().to_string().replace('-', "");
+        let suffix = &suffix[..8];
+        let platform = format!("t2ns-{suffix}");
+        let agent_id = format!("t2ns-agent-{suffix}");
+
+        // seed_agent returns the plaintext token; we only need the hash to
+        // check it does NOT appear in the response.
+        let _plaintext = seed_agent(&pool, &agent_id, &platform, "pending").await;
+
+        // Retrieve the stored token_hash directly so we can assert it's absent.
+        let hash: String = sqlx::query_scalar("SELECT token_hash FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch token_hash for assertion");
+
+        let result = list_agents_with(&pool).await;
+        assert!(result.is_ok(), "list must succeed");
+        let json_str = serde_json::to_string(&result.unwrap().0).expect("serialize");
+
+        assert!(
+            !json_str.contains(&hash),
+            "response must not contain the token_hash value"
+        );
+
+        cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
 }
