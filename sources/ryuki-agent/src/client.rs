@@ -238,6 +238,47 @@ impl CpClient {
         Ok(())
     }
 
+    /// GET /api/agents/cp-public-key
+    ///
+    /// Fetches the control plane's Ed25519 verifying (public) key as a
+    /// base64-encoded string.  This endpoint is **intentionally unauthenticated**
+    /// on the CP side — a public key is not a secret.  Sending a bearer token
+    /// is harmless; we include it for consistency with other methods.
+    ///
+    /// The caller should pin the returned key at startup (via
+    /// `ryuki_agent::live::pin_cp_key`) and use it to verify every
+    /// [`VerifiedLiveContext`] grant before a `LiveApply` execution.
+    ///
+    /// ## TOFU note
+    ///
+    /// Fetching over plain `http://` exposes the key to a MITM who can substitute
+    /// their own key and subsequently forge grants.  In production the CP URL MUST
+    /// use HTTPS, or the operator must pin the key via a separate trusted channel.
+    /// The `ryuki-agent` binary logs a warning when `cp_base_url` is `http://`.
+    ///
+    /// Returns the raw base64 string (suitable for passing to `pin_cp_key`).
+    pub async fn fetch_cp_public_key(&self) -> Result<String, ClientError> {
+        let url = format!("{}/api/agents/cp-public-key", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            // Bearer token is harmless here (endpoint is unauthenticated), and
+            // sending it consistently avoids any future auth-policy change from
+            // silently breaking this call.
+            .header(header::AUTHORIZATION, self.auth_header())
+            .send()
+            .await?;
+        let resp = require_2xx(resp).await?;
+        let body: serde_json::Value = resp.json().await?;
+        body.get("public_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+            .ok_or_else(|| ClientError::ErrorStatus {
+                status: 200,
+                body: "response missing 'public_key' field".to_owned(),
+            })
+    }
+
     /// POST /api/agents/{agent_id}/jobs/{job_id}/result
     ///
     /// # S4a seam — body is `serde_json::Value`
@@ -448,5 +489,50 @@ mod tests {
     fn empty_body_is_not_a_job() {
         let result: Result<Job, _> = serde_json::from_str("");
         assert!(result.is_err(), "empty body must not deserialise as Job");
+    }
+
+    // -----------------------------------------------------------------------
+    // fetch_cp_public_key — URL construction + response parsing (no live server)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cp_public_key_url_is_correct() {
+        let client = CpClient::new("https://cp.example.com/", "defra-vcenter-01", "rya_tok");
+        let expected = "https://cp.example.com/api/agents/cp-public-key";
+        let actual = format!("{}/api/agents/cp-public-key", client.base_url);
+        assert_eq!(
+            actual, expected,
+            "cp-public-key URL must use base_url without trailing slash"
+        );
+    }
+
+    #[test]
+    fn cp_public_key_response_parses_public_key_field() {
+        // Simulate the JSON body that the CP returns.
+        let body =
+            serde_json::json!({"public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
+        let key = body
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        assert_eq!(
+            key,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
+            "public_key field must be extracted correctly"
+        );
+    }
+
+    #[test]
+    fn cp_public_key_response_missing_field_returns_error() {
+        // A body without "public_key" must map to an ErrorStatus.
+        let body = serde_json::json!({"status": "ok"});
+        let key = body
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        assert!(
+            key.is_none(),
+            "missing public_key field must produce None → ErrorStatus"
+        );
     }
 }

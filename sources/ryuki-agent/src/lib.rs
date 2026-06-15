@@ -14,6 +14,7 @@ pub mod client;
 pub mod config;
 pub mod executor;
 pub mod identity;
+pub mod live;
 pub mod outbox;
 pub mod result;
 pub mod run;
