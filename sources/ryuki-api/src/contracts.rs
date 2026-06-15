@@ -4738,9 +4738,13 @@ async fn shift_acknowledge(
         }
 
         let now = chrono::Utc::now();
-        sqlx::query(
+        // CAS: include state guard in WHERE so a concurrent resolve or
+        // double-acknowledge between the pre-read and this UPDATE cannot
+        // both succeed.  rows_affected == 0 means the state changed under us.
+        let result = sqlx::query(
             "UPDATE shift_queue SET acknowledged = true, acknowledged_by = $1, \
-             acknowledged_at = $2, updated_at = $2 WHERE id = $3",
+             acknowledged_at = $2, updated_at = $2 \
+             WHERE id = $3 AND resolved = false AND acknowledged = false",
         )
         .bind(&body.user)
         .bind(now)
@@ -4748,6 +4752,13 @@ async fn shift_acknowledge(
         .execute(pool)
         .await
         .map_err(db_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "state changed concurrently; reload and retry"})),
+            ));
+        }
 
         return Ok(Json(json!({
             "status": "acknowledged",
@@ -4792,13 +4803,22 @@ async fn shift_assign(
         }
 
         let now = chrono::Utc::now();
-        sqlx::query("UPDATE shift_queue SET assigned_to = $1, updated_at = $2 WHERE id = $3")
-            .bind(&body.user)
-            .bind(now)
-            .bind(uid)
-            .execute(pool)
-            .await
-            .map_err(db_error)?;
+        // CAS: only assign if still unresolved.
+        let result =
+            sqlx::query("UPDATE shift_queue SET assigned_to = $1, updated_at = $2 WHERE id = $3 AND resolved = false")
+                .bind(&body.user)
+                .bind(now)
+                .bind(uid)
+                .execute(pool)
+                .await
+                .map_err(db_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "state changed concurrently; reload and retry"})),
+            ));
+        }
 
         return Ok(Json(json!({
             "status": "assigned",
@@ -4848,9 +4868,11 @@ async fn shift_escalate(
         }
 
         let now = chrono::Utc::now();
-        sqlx::query(
+        // CAS: only escalate if still unresolved and not already escalated.
+        let result = sqlx::query(
             "UPDATE shift_queue SET escalated = true, escalation_reason = $1, \
-             escalated_at = $2, updated_at = $2 WHERE id = $3",
+             escalated_at = $2, updated_at = $2 \
+             WHERE id = $3 AND resolved = false AND escalated = false",
         )
         .bind(&body.reason)
         .bind(now)
@@ -4858,6 +4880,13 @@ async fn shift_escalate(
         .execute(pool)
         .await
         .map_err(db_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "state changed concurrently; reload and retry"})),
+            ));
+        }
 
         return Ok(Json(json!({
             "status": "escalated",
@@ -4902,9 +4931,10 @@ async fn shift_resolve(
         }
 
         let now = chrono::Utc::now();
-        sqlx::query(
+        // CAS: only resolve if still unresolved.
+        let result = sqlx::query(
             "UPDATE shift_queue SET resolved = true, resolution = $1, \
-             resolved_at = $2, updated_at = $2 WHERE id = $3",
+             resolved_at = $2, updated_at = $2 WHERE id = $3 AND resolved = false",
         )
         .bind(&body.resolution)
         .bind(now)
@@ -4912,6 +4942,13 @@ async fn shift_resolve(
         .execute(pool)
         .await
         .map_err(db_error)?;
+
+        if result.rows_affected() == 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "state changed concurrently; reload and retry"})),
+            ));
+        }
 
         return Ok(Json(json!({
             "status": "resolved",
@@ -6433,6 +6470,57 @@ async fn software_packages_list(Query(query): Query<SoftwarePackagesQuery>) -> A
 }
 
 async fn software_validate(Json(body): Json<software_deployment::DeploymentRequest>) -> ApiResult {
+    // DB path: check required fields inline, then query approved_packages to
+    // validate the package_id exists. PACKAGE_STORE is not populated from DB rows
+    // after restart, so calling validate_deployment() here would false-fail on
+    // database-seeded packages.
+    if let Some(pool) = get_db() {
+        let mut errors: Vec<&str> = Vec::new();
+        if body.server_name.is_empty() {
+            errors.push("Server name is required");
+        }
+        if body.package_id.is_empty() {
+            errors.push("Package ID is required");
+        }
+        if body.target_version.is_empty() {
+            errors.push("Target version is required");
+        }
+        if body.requester.is_empty() {
+            errors.push("Requester is required");
+        }
+
+        // Validate package_id against approved_packages table.
+        let pkg_exists: bool = if body.package_id.is_empty() {
+            false
+        } else {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM approved_packages WHERE id = $1)",
+            )
+            .bind(&body.package_id)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?
+        };
+
+        if !body.package_id.is_empty() && !pkg_exists {
+            errors.push("Package is not in the approved catalog");
+        }
+
+        let mut warnings = vec!["DRY-RUN: Server online status verified (simulated)"];
+        if body.scheduled_time.is_empty() {
+            warnings.push("No scheduled time provided — deployment will be immediate (dry-run)");
+        }
+
+        return Ok(Json(json!({
+            "passed": errors.is_empty(),
+            "errors": errors,
+            "warnings": warnings,
+            "failed_rules": [],
+            "remediation": [],
+            "source": "database",
+        })));
+    }
+    // No-DB fallback: engine validates against PACKAGE_STORE (current-process only).
     match software_deployment::validate_deployment(&body) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -6484,14 +6572,11 @@ async fn software_approve(
     Json(body): Json<SoftwareActionRequest>,
 ) -> ApiResult {
     let approver = body.approver.unwrap_or_else(|| "admin".into());
-    // Engine validates the Planned→Approved transition.
-    match software_deployment::approve_deployment(&id, &approver) {
-        Ok(_) => {}
-        Err(e) => return Err(status_400(&e)),
-    };
 
     if let Some(pool) = get_db() {
-        // CAS: only advance if still Planned.
+        // DB path: validate inline against the DB row, then CAS UPDATE.
+        // Do NOT call approve_deployment() here — it mutates DEPLOYMENT_STORE,
+        // which is not populated from DB rows after a restart.
         let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
             "UPDATE software_deployments \
              SET status = 'Approved', approved_by = $2, updated_at = NOW() \
@@ -6505,32 +6590,44 @@ async fn software_approve(
         .map_err(db_error)?;
         return match row {
             Some(updated) => Ok(Json(updated.to_json())),
-            None => Err(status_409(&format!(
-                "Deployment {} not found or not in Planned status",
-                id
-            ))),
+            None => {
+                // Distinguish 404 from wrong-state 409.
+                let exists: Option<(String,)> =
+                    sqlx::query_as("SELECT status FROM software_deployments WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_error)?;
+                match exists {
+                    None => Err(status_404(&id)),
+                    Some((status,)) => Err(status_409(&format!(
+                        "Deployment {} is in status '{}', expected 'Planned'",
+                        id, status
+                    ))),
+                }
+            }
         };
     }
-    // Engine already applied the transition above.
-    let records = software_deployment::get_deployment_history("__all__");
-    let record = records.iter().find(|r| r.id == id);
-    match record {
-        Some(r) => Ok(Json(serde_json::to_value(r).unwrap())),
-        None => Err(status_404(&id)),
+    // No-DB fallback: engine validates + mutates in-memory store.
+    match software_deployment::approve_deployment(&id, &approver) {
+        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
+        Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn software_execute(Path(id): Path<String>) -> ApiResult {
-    // Engine validates Approved→Executed and builds evidence.
-    let evidence = match software_deployment::execute_deployment(&id) {
-        Ok(e) => e,
-        Err(e) => return Err(status_400(&e)),
-    };
-
     if let Some(pool) = get_db() {
-        let evidence_json = serde_json::to_string(&evidence).unwrap_or_else(|_| "[]".into());
+        // DB path: do NOT call execute_deployment() — it requires the row in
+        // DEPLOYMENT_STORE which is not populated from DB after restart.
+        // Build a minimal evidence payload inline and CAS-update the row.
         let now = chrono::Utc::now();
-        // CAS: only advance if still Approved.
+        let evidence_json = serde_json::to_string(&serde_json::json!([{
+            "step": "execute",
+            "result": "success",
+            "timestamp": now.to_rfc3339(),
+            "source": "database",
+        }]))
+        .unwrap_or_else(|_| "[]".into());
         let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
             "UPDATE software_deployments \
              SET status = 'Executed', executed_at = $2, \
@@ -6546,27 +6643,36 @@ async fn software_execute(Path(id): Path<String>) -> ApiResult {
         .map_err(db_error)?;
         return match row {
             Some(updated) => Ok(Json(updated.to_json())),
-            None => Err(status_409(&format!(
-                "Deployment {} not found or not in Approved status",
-                id
-            ))),
+            None => {
+                let exists: Option<(String,)> =
+                    sqlx::query_as("SELECT status FROM software_deployments WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_error)?;
+                match exists {
+                    None => Err(status_404(&id)),
+                    Some((status,)) => Err(status_409(&format!(
+                        "Deployment {} is in status '{}', expected 'Approved'",
+                        id, status
+                    ))),
+                }
+            }
         };
     }
-    Ok(Json(serde_json::to_value(evidence).unwrap()))
+    // No-DB fallback: engine validates Approved→Executed and builds evidence.
+    match software_deployment::execute_deployment(&id) {
+        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
 }
 
 async fn software_verify(Path(id): Path<String>) -> ApiResult {
-    // Engine validates Executed→Verified and returns validation result.
-    let result = match software_deployment::verify_deployment(&id) {
-        Ok(r) => r,
-        Err(e) => return Err(status_400(&e)),
-    };
-
     if let Some(pool) = get_db() {
+        // DB path: do NOT call verify_deployment() — it requires the row in
+        // DEPLOYMENT_STORE which is not populated from DB after restart.
+        // CAS-update the row; handle None by checking current state.
         let now = chrono::Utc::now();
-        // CAS: only advance if still Executed (engine allows Verified/Completed too
-        // but the first verify call transitions Executed→Verified; subsequent calls
-        // on an already-Verified row are idempotent).
         let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
             "UPDATE software_deployments \
              SET status = 'Verified', verified_at = $2, updated_at = NOW() \
@@ -6578,12 +6684,44 @@ async fn software_verify(Path(id): Path<String>) -> ApiResult {
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
-        // If row is None the deployment was already Verified/Completed — that is
-        // fine (idempotent verify); return the validation result regardless.
-        let _ = row;
-        return Ok(Json(serde_json::to_value(result).unwrap()));
+
+        return match row {
+            Some(updated) => Ok(Json(json!({
+                "passed": true,
+                "status": "Verified",
+                "deployment": updated.to_json(),
+                "source": "database",
+            }))),
+            None => {
+                // Idempotent: already Verified/Completed → 200.
+                // Wrong state or missing → 404/409.
+                let exists: Option<(String,)> =
+                    sqlx::query_as("SELECT status FROM software_deployments WHERE id = $1")
+                        .bind(&id)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_error)?;
+                match exists {
+                    None => Err(status_404(&id)),
+                    Some((ref s,)) if s == "Verified" || s == "Completed" => Ok(Json(json!({
+                        "passed": true,
+                        "status": s,
+                        "note": "already verified",
+                        "source": "database",
+                    }))),
+                    Some((status,)) => Err(status_409(&format!(
+                        "Deployment {} is in status '{}', expected 'Executed'",
+                        id, status
+                    ))),
+                }
+            }
+        };
     }
-    Ok(Json(serde_json::to_value(result).unwrap()))
+    // No-DB fallback: engine validates Executed→Verified and returns result.
+    match software_deployment::verify_deployment(&id) {
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Err(e) => Err(status_400(&e)),
+    }
 }
 
 async fn software_history(Path(server): Path<String>) -> ApiResult {
@@ -6604,6 +6742,82 @@ async fn software_history(Path(server): Path<String>) -> ApiResult {
 }
 
 async fn software_compliance(Query(query): Query<SoftwareComplianceQuery>) -> ApiResult {
+    const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
+    if !VALID_SITES.contains(&query.site.as_str()) {
+        return Err(status_400(&format!("Unknown site: {}", query.site)));
+    }
+
+    // DB path: query software_deployments for completed deployments at this site.
+    // DEPLOYMENT_STORE / PACKAGE_STORE are not populated from DB rows after restart,
+    // so calling get_package_compliance() here would miss persisted data.
+    if let Some(pool) = get_db() {
+        // Approximate the same fixed server list the engine uses.
+        let site_lc = query.site.to_lowercase();
+        let servers = vec![
+            format!("w-{}-srv-01", site_lc),
+            format!("w-{}-srv-02", site_lc),
+            format!("l-{}-srv-01", site_lc),
+        ];
+
+        // Fetch all approved packages that cover this site.
+        let pkgs: Vec<ApprovedPackageRow> = sqlx::query_as(&format!(
+            "SELECT {PACKAGE_COLUMNS} FROM approved_packages \
+             WHERE site_scope = 'all' \
+                OR (site_scope = 'specific' AND $1 = ANY(site_scope_list))"
+        ))
+        .bind(&query.site)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        // For each package, determine which servers have a Completed deployment.
+        let mut package_status: Vec<Value> = Vec::new();
+        for pkg in &pkgs {
+            let mut compliant: Vec<String> = Vec::new();
+            let mut outdated: Vec<String> = Vec::new();
+            for server in &servers {
+                let done: bool = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM software_deployments \
+                         WHERE server_name = $1 AND package_id = $2 AND status = 'Completed' \
+                     )",
+                )
+                .bind(server)
+                .bind(&pkg.id)
+                .fetch_one(pool)
+                .await
+                .map_err(db_error)?;
+                if done {
+                    compliant.push(server.clone());
+                } else {
+                    outdated.push(server.clone());
+                }
+            }
+            let pct = if servers.is_empty() {
+                100.0_f64
+            } else {
+                (compliant.len() as f64 / servers.len() as f64) * 100.0
+            };
+            package_status.push(json!({
+                "package_id": pkg.id,
+                "package_name": pkg.name,
+                "required_version": pkg.version,
+                "compliant_servers": compliant,
+                "outdated_servers": outdated,
+                "compliance_percentage": pct,
+            }));
+        }
+
+        return Ok(Json(json!({
+            "source": "database",
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "site": query.site,
+            "servers": servers,
+            "packages": package_status,
+            "dry_run": true,
+        })));
+    }
+    // No-DB fallback: engine uses PACKAGE_STORE + DEPLOYMENT_STORE (current-process only).
     match software_deployment::get_package_compliance(&query.site) {
         Ok(compliance) => Ok(Json(compliance)),
         Err(e) => Err(status_400(&e)),
@@ -7003,14 +7217,23 @@ async fn legal_hold_validate(
                 Json(json!({"error": format!("Legal hold {} not found", id)})),
             ));
         };
-        // Run engine validation against the DB-backed hold.
-        return match legal_hold::validate_hold(&id) {
-            Ok(result) => Ok(Json(json!({
-                "hold": hold.to_json(),
-                "validation": serde_json::to_value(result).unwrap_or_default(),
-            }))),
-            Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+        // Validate inline from the DB row (do NOT call validate_hold(&id) which
+        // looks up the static HOLD_STORE — absent for DB-seeded/restarted holds).
+        let is_active = hold.status == "Active";
+        let errors: Vec<&str> = if is_active {
+            vec![]
+        } else {
+            vec!["Hold is not in Active status"]
         };
+        return Ok(Json(json!({
+            "hold": hold.to_json(),
+            "validation": {
+                "passed": is_active,
+                "errors": errors,
+                "warnings": [],
+                "source": "database",
+            },
+        })));
     }
     match legal_hold::validate_hold(&id) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
@@ -7022,24 +7245,36 @@ async fn legal_hold_extend(
     Path(id): Path<String>,
     Json(req): Json<LegalHoldExtendRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Engine validates status=Active and parses the new_expiry string.
-    let hold = match legal_hold::extend_hold(&id, &req.new_expiry) {
-        Ok(h) => h,
-        Err(e) => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    };
-
     if let Some(pool) = get_db() {
-        // Atomic conditional UPDATE: only extend if still Active to avoid race.
-        let audit_json = serde_json::to_string(&hold.audit_trail).unwrap_or_else(|_| "[]".into());
+        // DB path: validate new_expiry parses (basic sanity) then CAS-UPDATE
+        // directly against the DB row.  Do NOT call extend_hold() which mutates
+        // HOLD_STORE — absent for DB-seeded/restarted holds.
+        if req.new_expiry.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "new_expiry is required"})),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let audit_entry = serde_json::to_string(&serde_json::json!([{
+            "timestamp": now,
+            "action": "hold_extended",
+            "detail": format!("Expiry extended to {}", req.new_expiry),
+        }]))
+        .unwrap_or_else(|_| "[]".into());
+
+        // Append new audit entry to existing trail via jsonb concatenation.
         let row: Option<LegalHoldRow> = sqlx::query_as(&format!(
             "UPDATE legal_holds \
-             SET expiry_date = $2::timestamptz, audit_trail = $3::jsonb, updated_at = NOW() \
+             SET expiry_date = $2::timestamptz, \
+                 audit_trail = audit_trail || $3::jsonb, \
+                 updated_at = NOW() \
              WHERE id = $1 AND status = 'Active' \
              RETURNING {LEGAL_HOLD_COLUMNS}"
         ))
         .bind(&id)
         .bind(&req.new_expiry)
-        .bind(audit_json)
+        .bind(audit_entry)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -7051,34 +7286,40 @@ async fn legal_hold_extend(
             )),
         };
     }
-    Ok(Json(serde_json::to_value(hold).unwrap()))
+    // No-DB fallback: engine validates status=Active and parses new_expiry.
+    match legal_hold::extend_hold(&id, &req.new_expiry) {
+        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
 }
 
 async fn legal_hold_release(
     Path(id): Path<String>,
     Json(req): Json<LegalHoldReleaseRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Engine validates status=Active and records audit entry.
-    let hold = match legal_hold::release_hold(&id, &req.released_by) {
-        Ok(h) => h,
-        Err(e) => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    };
-
     if let Some(pool) = get_db() {
+        // DB path: CAS-UPDATE directly.  Do NOT call release_hold() which
+        // mutates HOLD_STORE — absent for DB-seeded/restarted holds.
         let now = chrono::Utc::now().to_rfc3339();
-        let audit_json = serde_json::to_string(&hold.audit_trail).unwrap_or_else(|_| "[]".into());
-        // Atomic CAS: only release if still Active.
+        let audit_entry = serde_json::to_string(&serde_json::json!([{
+            "timestamp": now,
+            "action": "hold_released",
+            "by": req.released_by,
+            "detail": "Hold released",
+        }]))
+        .unwrap_or_else(|_| "[]".into());
+
         let row: Option<LegalHoldRow> = sqlx::query_as(&format!(
             "UPDATE legal_holds \
              SET status = 'Released', released_by = $2, released_date = $3::timestamptz, \
-                 audit_trail = $4::jsonb, updated_at = NOW() \
+                 audit_trail = audit_trail || $4::jsonb, updated_at = NOW() \
              WHERE id = $1 AND status = 'Active' \
              RETURNING {LEGAL_HOLD_COLUMNS}"
         ))
         .bind(&id)
         .bind(&req.released_by)
         .bind(&now)
-        .bind(audit_json)
+        .bind(audit_entry)
         .fetch_optional(pool)
         .await
         .map_err(db_error)?;
@@ -7090,10 +7331,14 @@ async fn legal_hold_release(
             )),
         };
     }
-    Ok(Json(serde_json::to_value(hold).unwrap()))
+    // No-DB fallback: engine validates status=Active and records audit entry.
+    match legal_hold::release_hold(&id, &req.released_by) {
+        Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    }
 }
 
-async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> Json<Value> {
+async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> ApiResult {
     let site = q.site.unwrap_or_default();
     if let Some(pool) = get_db() {
         let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
@@ -7103,17 +7348,17 @@ async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> Json<Value>
         .bind(&site)
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
-        return Json(json!(rows
+        .map_err(db_error)?;
+        return Ok(Json(json!(rows
             .iter()
             .map(LegalHoldRow::to_json)
-            .collect::<Vec<_>>()));
+            .collect::<Vec<_>>())));
     }
     let holds = legal_hold::get_active_holds(&site);
-    Json(serde_json::to_value(holds).unwrap())
+    Ok(Json(serde_json::to_value(holds).unwrap()))
 }
 
-async fn legal_hold_expiring() -> Json<Value> {
+async fn legal_hold_expiring() -> ApiResult {
     if let Some(pool) = get_db() {
         // Same predicate as the engine: Active holds expiring within 30 days.
         let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
@@ -7123,14 +7368,14 @@ async fn legal_hold_expiring() -> Json<Value> {
         ))
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
-        return Json(json!(rows
+        .map_err(db_error)?;
+        return Ok(Json(json!(rows
             .iter()
             .map(LegalHoldRow::to_json)
-            .collect::<Vec<_>>()));
+            .collect::<Vec<_>>())));
     }
     let holds = legal_hold::get_expiring_holds();
-    Json(serde_json::to_value(holds).unwrap())
+    Ok(Json(serde_json::to_value(holds).unwrap()))
 }
 
 async fn legal_hold_evidence(
@@ -7163,12 +7408,52 @@ async fn legal_hold_evidence(
     }
 }
 
-async fn legal_hold_compliance(
-    Path(server): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn legal_hold_compliance(Path(server): Path<String>) -> ApiResult {
+    if server.is_empty() {
+        return Err(status_400("server_name cannot be empty"));
+    }
+
+    // DB path: query legal_holds directly. HOLD_STORE is not populated from DB
+    // rows after restart, so check_compliance() would miss persisted holds.
+    if let Some(pool) = get_db() {
+        let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
+            "SELECT {LEGAL_HOLD_COLUMNS} FROM legal_holds \
+             WHERE status = 'Active' \
+               AND LOWER(server_or_app_name) LIKE '%' || LOWER($1) || '%' \
+             ORDER BY expiry_date, id"
+        ))
+        .bind(&server)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+
+        let under_hold = !rows.is_empty();
+        let holds: Vec<Value> = rows.iter().map(LegalHoldRow::to_json).collect();
+        let message = if under_hold {
+            format!(
+                "DRY-RUN: {} is under {} active legal hold(s). Backup deletion blocked. Decommission suspended. No provider calls made.",
+                server,
+                holds.len()
+            )
+        } else {
+            format!(
+                "DRY-RUN: No active legal holds found for {}. Normal operations permitted.",
+                server
+            )
+        };
+
+        return Ok(Json(json!({
+            "server_name": server,
+            "under_hold": under_hold,
+            "active_holds": holds,
+            "message": message,
+            "source": "database",
+        })));
+    }
+    // No-DB fallback: engine uses HOLD_STORE (current-process only).
     match legal_hold::check_compliance(&server) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+        Err(e) => Err(status_400(&e)),
     }
 }
 
@@ -12927,19 +13212,19 @@ async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiRe
     Ok(Json(serde_json::to_value(route).unwrap()))
 }
 
-async fn alert_routes_list() -> Json<Value> {
+async fn alert_routes_list() -> ApiResult {
     if let Some(pool) = get_db() {
         let rows: Vec<AlertRouteRow> = sqlx::query_as(&format!(
             "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes ORDER BY created_at, id"
         ))
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        .map_err(db_error)?;
         let routes: Vec<Value> = rows.iter().map(AlertRouteRow::to_json).collect();
-        return Json(json!(routes));
+        return Ok(Json(json!(routes)));
     }
     let routes = alert_routing_engine::list_routes();
-    Json(serde_json::to_value(routes).unwrap())
+    Ok(Json(serde_json::to_value(routes).unwrap()))
 }
 
 async fn alert_routes_get(Path(id): Path<String>) -> ApiResult {
@@ -12969,7 +13254,62 @@ async fn alert_routes_update(
     Path(id): Path<String>,
     Json(body): Json<AlertRouteUpdateRequest>,
 ) -> ApiResult {
-    // Validate + mutate the engine first (enforces severity/priority vocab).
+    // DB path: validate severity/priority vocab inline (no ROUTE_STORE mutation),
+    // then UPDATE the row directly. ROUTE_STORE is not populated from DB rows after
+    // restart, so calling update_route() here would corrupt or 404 on DB-seeded routes.
+    if let Some(pool) = get_db() {
+        const VALID_SEVERITIES: &[&str] = &["info", "warning", "average", "high", "disaster"];
+        const VALID_PRIORITIES: &[&str] = &["P1", "P2", "P3", "P4"];
+
+        if let Some(ref sev) = body.severity {
+            if !VALID_SEVERITIES.contains(&sev.as_str()) {
+                return Err(status_400(&format!(
+                    "Invalid severity '{}'. Must be one of: {:?}",
+                    sev, VALID_SEVERITIES
+                )));
+            }
+        }
+        if let Some(ref pri) = body.priority {
+            if !VALID_PRIORITIES.contains(&pri.as_str()) {
+                return Err(status_400(&format!(
+                    "Invalid priority '{}'. Must be one of: {:?}",
+                    pri, VALID_PRIORITIES
+                )));
+            }
+        }
+
+        let Ok(uid) = uuid::Uuid::parse_str(&id) else {
+            return Err(status_404(&id));
+        };
+        // Coalesce — keep the existing value for any field not supplied.
+        let row: Option<AlertRouteRow> = sqlx::query_as(&format!(
+            "UPDATE alert_routes \
+             SET trigger_name  = COALESCE($2, trigger_name), \
+                 severity      = COALESCE($3, severity), \
+                 host_group    = COALESCE($4, host_group), \
+                 support_group = COALESCE($5, support_group), \
+                 priority      = COALESCE($6, priority), \
+                 enabled       = COALESCE($7, enabled), \
+                 updated_at    = NOW() \
+             WHERE id = $1 \
+             RETURNING {ALERT_ROUTE_COLUMNS}"
+        ))
+        .bind(uid)
+        .bind(body.trigger_name.as_deref())
+        .bind(body.severity.as_deref())
+        .bind(body.host_group.as_deref())
+        .bind(body.support_group.as_deref())
+        .bind(body.priority.as_deref())
+        .bind(body.enabled)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        return match row {
+            Some(updated) => Ok(Json(updated.to_json())),
+            None => Err(status_404(&id)),
+        };
+    }
+    // No-DB fallback: engine handles vocab validation + ROUTE_STORE mutation.
     let route = match alert_routing_engine::update_route(
         &id,
         body.trigger_name.as_deref(),
@@ -12982,34 +13322,6 @@ async fn alert_routes_update(
         Ok(r) => r,
         Err(e) => return Err(status_400(&e)),
     };
-
-    if let Some(pool) = get_db() {
-        let Ok(uid) = uuid::Uuid::parse_str(&route.id) else {
-            return Err(status_404(&route.id));
-        };
-        let row: Option<AlertRouteRow> = sqlx::query_as(&format!(
-            "UPDATE alert_routes \
-             SET trigger_name = $2, severity = $3, host_group = $4, \
-                 support_group = $5, priority = $6, enabled = $7, \
-                 updated_at = NOW() \
-             WHERE id = $1 \
-             RETURNING {ALERT_ROUTE_COLUMNS}"
-        ))
-        .bind(uid)
-        .bind(&route.trigger_name)
-        .bind(&route.severity)
-        .bind(&route.host_group)
-        .bind(&route.support_group)
-        .bind(&route.priority)
-        .bind(route.enabled)
-        .fetch_optional(pool)
-        .await
-        .map_err(db_error)?;
-        return match row {
-            Some(updated) => Ok(Json(updated.to_json())),
-            None => Err(status_404(&id)),
-        };
-    }
     Ok(Json(serde_json::to_value(route).unwrap()))
 }
 
@@ -13037,6 +13349,63 @@ async fn alert_routes_delete(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn alert_resolve(Json(body): Json<AlertResolveRequest>) -> ApiResult {
+    // DB path: query alert_routes directly. ROUTE_STORE is not populated from DB
+    // rows after restart, so using the engine here would silently miss all
+    // database-seeded or persisted routes.
+    if let Some(pool) = get_db() {
+        let row: Option<AlertRouteRow> = sqlx::query_as(&format!(
+            "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes \
+             WHERE enabled = true \
+               AND trigger_name = $1 \
+               AND severity     = $2 \
+               AND host_group   = $3 \
+             LIMIT 1"
+        ))
+        .bind(&body.trigger_name)
+        .bind(&body.severity)
+        .bind(&body.host_group)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+
+        let alert_id = format!(
+            "alert-{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let decision = match row {
+            Some(route) => json!({
+                "alert_id": alert_id,
+                "route_id": route.id.to_string(),
+                "support_group": route.support_group,
+                "escalated": route.severity == "disaster",
+                "timestamp": now,
+                "evidence": format!(
+                    "DRY-RUN: Alert '{}' (severity={}, host_group={}) matched route {} -> support group '{}' (priority={}). No live Zabbix or ServiceNow calls.",
+                    body.trigger_name, body.severity, body.host_group,
+                    route.id, route.support_group, route.priority
+                ),
+            }),
+            None => json!({
+                "alert_id": alert_id,
+                "route_id": null,
+                "support_group": "Unrouted",
+                "escalated": body.severity == "disaster",
+                "timestamp": now,
+                "evidence": format!(
+                    "DRY-RUN: No matching route found for alert '{}' (severity={}, host_group={}). Alert is unrouted. Configure a route or review coverage.",
+                    body.trigger_name, body.severity, body.host_group
+                ),
+            }),
+        };
+        return Ok(Json(decision));
+    }
+    // No-DB fallback: engine uses ROUTE_STORE (only populated in the current process).
     match alert_routing_engine::resolve_alert_route(
         &body.trigger_name,
         &body.severity,
@@ -22457,6 +22826,121 @@ mod shift_queue_db_tests {
         assert_eq!(body["source"], "static-dry-run");
         assert_eq!(body["stale_threshold_hours"].as_u64().unwrap(), 4);
     }
+
+    // ── CAS guard: resolving a row then trying to acknowledge it → 409 ──
+    //
+    // This verifies the WHERE-clause state guard added to shift_acknowledge.
+    // A resolved item has resolved=true, so `AND resolved = false` fails and
+    // rows_affected() == 0, which must return 409 CONFLICT.
+
+    #[tokio::test]
+    async fn test_acknowledge_after_resolve_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000010";
+        seed_item(pool, id, "blocked-request", "P2", None).await;
+
+        // Resolve the item first.
+        let _ = shift_resolve(
+            Path(id.to_string()),
+            Json(ShiftResolveRequest {
+                resolution: "Resolved before acknowledge".to_string(),
+            }),
+        )
+        .await
+        .expect("resolve must succeed");
+
+        // Now try to acknowledge the resolved item — must hit the CAS guard.
+        let result = shift_acknowledge(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "late-user".to_string(),
+            }),
+        )
+        .await;
+
+        cleanup_item(pool, id).await;
+
+        let Err((status, Json(err))) = result else {
+            panic!("expected Err, got Ok — CAS guard not firing");
+        };
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "resolved item must return 409: {err}"
+        );
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("state changed concurrently"),
+            "error message must mention concurrent state change: {err}"
+        );
+    }
+
+    // ── CAS guard: direct-SQL-insert row then drive through full lifecycle ──
+    //
+    // Inserts a row using raw SQL (bypassing the create handler) to confirm that
+    // DB-seeded rows work end-to-end through all transition handlers.
+
+    #[tokio::test]
+    async fn test_full_lifecycle_on_direct_sql_insert() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "e0000291-0000-0000-0000-000000000011";
+        // Insert directly via SQL — not via the create handler.
+        sqlx::query(
+            "INSERT INTO shift_queue \
+             (id, item_type, title, description, priority) \
+             VALUES ($1::uuid, 'active-incident', 'Direct SQL insert', 'desc', 'P1') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        // Assign → Escalate → Resolve.
+        let _ = shift_assign(
+            Path(id.to_string()),
+            Json(ShiftActionRequest {
+                user: "ops-a".to_string(),
+            }),
+        )
+        .await
+        .expect("assign must succeed on direct-insert row");
+
+        let _ = shift_escalate(
+            Path(id.to_string()),
+            Json(ShiftEscalateRequest {
+                reason: "Needs manager review".to_string(),
+            }),
+        )
+        .await
+        .expect("escalate must succeed on direct-insert row");
+
+        let resolve_result = shift_resolve(
+            Path(id.to_string()),
+            Json(ShiftResolveRequest {
+                resolution: "Issue resolved via direct-insert test".to_string(),
+            }),
+        )
+        .await;
+
+        cleanup_item(pool, id).await;
+
+        let Ok(Json(body)) = resolve_result else {
+            panic!("resolve must succeed: {resolve_result:?}");
+        };
+        assert_eq!(body["status"], "resolved");
+        assert_eq!(body["source"], "database");
+    }
 }
 
 // ─── Unit (no-DB) fallback tests for emergency change handlers ───────────────
@@ -25144,6 +25628,176 @@ mod alert_routes_db_tests {
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// Direct-SQL-insert a route (bypassing create handler), then update it via
+    /// the handler. Verifies the DB path handles rows not seeded through the engine.
+    #[tokio::test]
+    async fn test_update_direct_sql_insert_route() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4();
+        let trigger = format!("direct-sql-{}", uid);
+        sqlx::query(
+            "INSERT INTO alert_routes \
+             (id, trigger_name, severity, host_group, support_group, priority, enabled) \
+             VALUES ($1, $2, 'high', 'Windows Servers', 'Wintel Operations', 'P2', true)",
+        )
+        .bind(uid)
+        .bind(&trigger)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        // Update severity via handler — must hit the DB COALESCE path.
+        let update = AlertRouteUpdateRequest {
+            trigger_name: None,
+            severity: Some("warning".into()),
+            host_group: None,
+            support_group: None,
+            priority: None,
+            enabled: None,
+        };
+        let result = alert_routes_update(Path(uid.to_string()), Json(update)).await;
+
+        sqlx::query("DELETE FROM alert_routes WHERE id = $1")
+            .bind(uid)
+            .execute(pool)
+            .await
+            .ok();
+
+        let Ok(Json(body)) = result else {
+            panic!("update of direct-SQL-inserted route must succeed");
+        };
+        assert_eq!(body["severity"], "warning", "severity must be updated");
+        assert_eq!(
+            body["host_group"], "Windows Servers",
+            "unchanged fields must persist"
+        );
+    }
+
+    /// Update with an invalid severity must return 400 (vocab guard applied inline).
+    #[tokio::test]
+    async fn test_update_invalid_severity_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4();
+        let trigger = format!("bad-sev-{}", uid);
+        sqlx::query(
+            "INSERT INTO alert_routes \
+             (id, trigger_name, severity, host_group, support_group, priority, enabled) \
+             VALUES ($1, $2, 'high', 'Linux Servers', 'Unix Operations', 'P3', true)",
+        )
+        .bind(uid)
+        .bind(&trigger)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        let update = AlertRouteUpdateRequest {
+            trigger_name: None,
+            severity: Some("critical".into()), // not a valid severity
+            host_group: None,
+            support_group: None,
+            priority: None,
+            enabled: None,
+        };
+        let result = alert_routes_update(Path(uid.to_string()), Json(update)).await;
+
+        sqlx::query("DELETE FROM alert_routes WHERE id = $1")
+            .bind(uid)
+            .execute(pool)
+            .await
+            .ok();
+
+        let Err((status, _)) = result else {
+            panic!("invalid severity must fail");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// alert_resolve DB path: insert a route via SQL, then resolve an alert
+    /// matching it — must return the route's support_group.
+    #[tokio::test]
+    async fn test_alert_resolve_matches_db_route() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4();
+        let trigger = format!("resolve-test-{}", uid);
+        sqlx::query(
+            "INSERT INTO alert_routes \
+             (id, trigger_name, severity, host_group, support_group, priority, enabled) \
+             VALUES ($1, $2, 'high', 'VMware Servers', 'VMware Operations', 'P2', true)",
+        )
+        .bind(uid)
+        .bind(&trigger)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        let result = alert_resolve(Json(AlertResolveRequest {
+            trigger_name: trigger.clone(),
+            severity: "high".into(),
+            host_group: "VMware Servers".into(),
+        }))
+        .await;
+
+        sqlx::query("DELETE FROM alert_routes WHERE id = $1")
+            .bind(uid)
+            .execute(pool)
+            .await
+            .ok();
+
+        let Ok(Json(body)) = result else {
+            panic!("alert_resolve on DB-seeded route must succeed: {result:?}");
+        };
+        assert_eq!(
+            body["support_group"], "VMware Operations",
+            "must route to seeded support_group"
+        );
+        assert_eq!(
+            body["escalated"], false,
+            "high != disaster, must not escalate"
+        );
+        assert!(body["route_id"].as_str().is_some(), "route_id must be set");
+    }
+
+    /// alert_resolve with no matching route must return Unrouted (not an error).
+    #[tokio::test]
+    async fn test_alert_resolve_unrouted_when_no_match() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = alert_resolve(Json(AlertResolveRequest {
+            trigger_name: "no-such-trigger".into(),
+            severity: "info".into(),
+            host_group: "NoGroup".into(),
+        }))
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("unrouted resolve must not error: {result:?}");
+        };
+        assert_eq!(body["support_group"], "Unrouted");
+        assert!(
+            body["route_id"].is_null(),
+            "route_id must be null for unrouted"
+        );
+    }
 }
 
 // ─── P2-12 persistence: firewall_rules DB tests ─────────────────────────────
@@ -25343,11 +25997,14 @@ mod legal_hold_db_tests {
         );
 
         // Active query must include the hold with the new expiry.
-        let active_json = legal_hold_active(Query(LegalHoldActiveQuery {
+        let Ok(Json(active)) = legal_hold_active(Query(LegalHoldActiveQuery {
             site: Some("DEFRA".into()),
         }))
-        .await;
-        let Json(active) = active_json;
+        .await
+        else {
+            cleanup_hold(pool, &id).await;
+            panic!("legal_hold_active failed");
+        };
         let found =
             active.as_array().unwrap_or(&vec![]).iter().any(|h| {
                 h["id"] == id && h["expiry_date"].as_str().unwrap_or("").starts_with("2099")
@@ -25390,10 +26047,14 @@ mod legal_hold_db_tests {
         assert_eq!(released["released_by"], "test-releaser");
 
         // Active query must NOT include the released hold.
-        let Json(active) = legal_hold_active(Query(LegalHoldActiveQuery {
+        let Ok(Json(active)) = legal_hold_active(Query(LegalHoldActiveQuery {
             site: Some("DEFRA".into()),
         }))
-        .await;
+        .await
+        else {
+            cleanup_hold(pool, &id).await;
+            panic!("legal_hold_active failed");
+        };
         let still_active = active
             .as_array()
             .unwrap_or(&vec![])
@@ -25481,6 +26142,150 @@ mod legal_hold_db_tests {
         );
 
         cleanup_hold(pool, &id).await;
+    }
+
+    /// Direct-SQL-insert a hold (bypassing the place handler), then drive it
+    /// through extend → release via handlers. Proves DB-seeded rows work.
+    #[tokio::test]
+    async fn test_direct_sql_insert_hold_extend_and_release() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = format!("lh-direct-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO legal_holds \
+             (id, server_or_app_name, hold_type, reason, initiated_by, \
+              initiated_date, expiry_date, status, affected_backups, site, audit_trail) \
+             VALUES ($1, 'db-test-srv.example.local', 'Litigation', 'Direct SQL test', \
+                     'test-user', NOW(), NOW() + INTERVAL '90 days', 'Active', \
+                     '[\"bkp-001\"]'::jsonb, 'DEFRA', '[]'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        // Extend via handler.
+        let Ok(Json(extended)) = legal_hold_extend(
+            Path(id.clone()),
+            Json(LegalHoldExtendRequest {
+                new_expiry: "2098-01-01T00:00:00Z".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup_hold(pool, &id).await;
+            panic!("extend on direct-insert hold must succeed");
+        };
+        assert!(
+            extended["expiry_date"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("2098"),
+            "expiry must be updated to 2098"
+        );
+
+        // Release via handler.
+        let Ok(Json(released)) = legal_hold_release(
+            Path(id.clone()),
+            Json(LegalHoldReleaseRequest {
+                released_by: "direct-test-releaser".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup_hold(pool, &id).await;
+            panic!("release on direct-insert hold must succeed");
+        };
+        assert_eq!(released["status"], "Released");
+        assert_eq!(released["released_by"], "direct-test-releaser");
+
+        cleanup_hold(pool, &id).await;
+    }
+
+    /// Direct-SQL-insert a hold, then validate it — must reflect DB state.
+    #[tokio::test]
+    async fn test_direct_sql_insert_hold_validate() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = format!("lh-val-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO legal_holds \
+             (id, server_or_app_name, hold_type, reason, initiated_by, \
+              initiated_date, expiry_date, status, affected_backups, site, audit_trail) \
+             VALUES ($1, 'val-test-srv.example.local', 'Compliance', 'Validate test', \
+                     'tester', NOW(), NOW() + INTERVAL '30 days', 'Active', \
+                     '[\"bkp-002\"]'::jsonb, 'GBLON', '[]'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert for validate test");
+
+        let Ok(Json(result)) = legal_hold_validate(Path(id.clone())).await else {
+            cleanup_hold(pool, &id).await;
+            panic!("validate on direct-insert Active hold must succeed");
+        };
+        assert_eq!(
+            result["validation"]["passed"], true,
+            "Active hold must pass validation"
+        );
+        assert_eq!(result["validation"]["source"], "database");
+
+        cleanup_hold(pool, &id).await;
+    }
+
+    /// compliance check on direct-SQL-insert hold returns under_hold=true.
+    #[tokio::test]
+    async fn test_compliance_check_db_path() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = format!("lh-comp-{}", uuid::Uuid::new_v4());
+        let srv = format!("compliance-test-{}.local", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO legal_holds \
+             (id, server_or_app_name, hold_type, reason, initiated_by, \
+              initiated_date, expiry_date, status, affected_backups, site, audit_trail) \
+             VALUES ($1, $2, 'Litigation', 'Compliance check test', \
+                     'tester', NOW(), NOW() + INTERVAL '60 days', 'Active', \
+                     '[\"bkp-003\"]'::jsonb, 'DEFRA', '[]'::jsonb)",
+        )
+        .bind(&id)
+        .bind(&srv)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert for compliance test");
+
+        let Ok(Json(result)) = legal_hold_compliance(Path(srv.clone())).await else {
+            cleanup_hold(pool, &id).await;
+            panic!("compliance check must succeed");
+        };
+
+        cleanup_hold(pool, &id).await;
+
+        assert_eq!(
+            result["under_hold"], true,
+            "server under active hold must report under_hold=true"
+        );
+        assert_eq!(result["source"], "database");
+        let holds = result["active_holds"]
+            .as_array()
+            .expect("active_holds array");
+        assert!(
+            holds.iter().any(|h| h["id"] == id),
+            "hold must appear in active_holds"
+        );
     }
 }
 
@@ -25658,6 +26463,175 @@ mod software_deployment_db_tests {
         };
 
         cleanup_deployment(pool, &id).await;
+    }
+
+    /// Direct-SQL-insert a deployment in 'Planned' status, then approve → execute
+    /// → verify via handlers. Validates DB-seeded rows are not blocked by engine
+    /// store absence after restart.
+    #[tokio::test]
+    async fn test_direct_sql_insert_deployment_full_lifecycle() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = format!("dep-direct-{}", uuid::Uuid::new_v4());
+        // pkg-zabbix-agent is seeded in migration 032.
+        sqlx::query(
+            "INSERT INTO software_deployments \
+             (id, server_name, package_id, package_name, target_version, \
+              scheduled_time, requester, status, plan_json, evidence_json) \
+             VALUES ($1, 'db-srv-01.example.local', 'pkg-zabbix-agent', \
+                     'Zabbix Agent', '7.0.4', '2099-12-31T22:00:00Z', \
+                     'db-tester', 'Planned', NULL, '[]'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert");
+
+        // Approve.
+        let Ok(Json(approved)) = software_approve(
+            Path(id.clone()),
+            Json(SoftwareActionRequest {
+                request_id: id.clone(),
+                approver: Some("db-approver".into()),
+            }),
+        )
+        .await
+        else {
+            cleanup_deployment(pool, &id).await;
+            panic!("approve on direct-insert row must succeed");
+        };
+        assert_eq!(approved["status"], "Approved");
+        assert_eq!(approved["approved_by"], "db-approver");
+
+        // Execute.
+        let Ok(Json(_executed)) = software_execute(Path(id.clone())).await else {
+            cleanup_deployment(pool, &id).await;
+            panic!("execute on direct-insert row must succeed");
+        };
+
+        // Verify.
+        let Ok(Json(verified)) = software_verify(Path(id.clone())).await else {
+            cleanup_deployment(pool, &id).await;
+            panic!("verify on direct-insert row must succeed");
+        };
+        assert_eq!(verified["passed"], true, "verify must pass");
+
+        // DB row must reflect Verified status.
+        let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
+            "SELECT {DEPLOYMENT_COLUMNS} FROM software_deployments WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .expect("db read");
+        cleanup_deployment(pool, &id).await;
+        assert_eq!(
+            row.expect("row must exist").status,
+            "Verified",
+            "DB status must be Verified"
+        );
+    }
+
+    /// approve on a row not in 'Planned' status → 409 CONFLICT (CAS guard).
+    #[tokio::test]
+    async fn test_approve_wrong_state_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let id = format!("dep-cas-{}", uuid::Uuid::new_v4());
+        // Insert with status='Approved' — not Planned.
+        sqlx::query(
+            "INSERT INTO software_deployments \
+             (id, server_name, package_id, package_name, target_version, \
+              scheduled_time, requester, status, evidence_json) \
+             VALUES ($1, 'db-srv-02.example.local', 'pkg-zabbix-agent', \
+                     'Zabbix Agent', '7.0.4', '2099-12-31T22:00:00Z', \
+                     'db-tester', 'Approved', '[]'::jsonb)",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("direct SQL insert in Approved state");
+
+        let result = software_approve(
+            Path(id.clone()),
+            Json(SoftwareActionRequest {
+                request_id: id.clone(),
+                approver: Some("late-approver".into()),
+            }),
+        )
+        .await;
+
+        cleanup_deployment(pool, &id).await;
+
+        let Err((status, _)) = result else {
+            panic!("approving an Approved row must fail");
+        };
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "wrong-state approve must return 409"
+        );
+    }
+
+    /// software_validate DB path: unknown package_id → passed=false.
+    #[tokio::test]
+    async fn test_software_validate_unknown_package_fails() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = software_validate(Json(software_deployment::DeploymentRequest {
+            server_name: "db-validate-srv".into(),
+            package_id: "pkg-does-not-exist-xyz".into(),
+            target_version: "1.0.0".into(),
+            scheduled_time: "2099-01-01T00:00:00Z".into(),
+            requester: "db-tester".into(),
+        }))
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("validate handler must not error: {result:?}");
+        };
+        assert_eq!(
+            body["passed"], false,
+            "unknown package must fail validation"
+        );
+        assert_eq!(body["source"], "database");
+    }
+
+    /// software_validate DB path: known package_id (seeded by migration 032) → passed=true.
+    #[tokio::test]
+    async fn test_software_validate_known_package_passes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let result = software_validate(Json(software_deployment::DeploymentRequest {
+            server_name: "db-validate-srv".into(),
+            package_id: "pkg-zabbix-agent".into(), // seeded by migration 032
+            target_version: "7.0.4".into(),
+            scheduled_time: "2099-01-01T00:00:00Z".into(),
+            requester: "db-tester".into(),
+        }))
+        .await;
+
+        let Ok(Json(body)) = result else {
+            panic!("validate handler must not error: {result:?}");
+        };
+        assert_eq!(body["passed"], true, "seeded package must pass validation");
+        assert_eq!(body["source"], "database");
     }
 }
 
