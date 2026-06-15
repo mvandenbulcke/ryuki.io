@@ -1,0 +1,38 @@
+[package]
+name = "ryuki-agent"
+version = "0.1.0"
+# Edition 2021 intentionally matches ryuki-api and ryuki-runner.
+# On edition 2024, std::env::set_var/remove_var in tests become unsafe and
+# clippy's `collapsible_if` let-chain lint fires — both are edition artifacts,
+# not behaviour changes. Keep 2021 for consistency and to avoid the lint churn
+# that stalled S1.
+edition = "2021"
+
+[[bin]]
+name = "ryuki-agent"
+path = "src/main.rs"
+
+[dependencies]
+ryuki-protocol = { workspace = true }
+ryuki-runner    = { workspace = true }
+ryuki-engine    = { workspace = true }
+
+reqwest         = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio           = { version = "1", features = ["full"] }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+thiserror       = "2"
+
+# ed25519-dalek v2 — needed to persist/load SigningKey from its 32-byte secret seed.
+# `rand_core` feature exposes the CryptoRngCore bound used by generate_keypair.
+ed25519-dalek   = { version = "2", features = ["rand_core"] }
+rand            = "0.8"
+
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+
+uuid    = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+chrono   = { version = "0.4", features = ["serde"] }
+tempfile = "3"

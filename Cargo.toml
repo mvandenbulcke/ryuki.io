@@ -6,6 +6,7 @@ members = [
     "sources/ryuki-engine",
     "sources/ryuki-runner",
     "sources/ryuki-protocol",
+    "sources/ryuki-agent",
     "portal/portal-ui",
     "scripts/validator-rs",
 ]
