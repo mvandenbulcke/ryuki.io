@@ -6,6 +6,7 @@ mod boundary;
 mod config;
 mod config_store;
 mod contracts;
+pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod integration;
@@ -1372,6 +1373,38 @@ async fn main() {
     )
     .await;
     database::migrate_if_connected().await;
+
+    // ── CP signing identity ───────────────────────────────────────────────────
+    //
+    // The control plane's Ed25519 keypair is used to sign `VerifiedLiveContext`
+    // grants that authorise `LiveApply` jobs (S5a-2). The 32-byte raw seed is
+    // persisted create-only at mode 0600; the public key is logged at startup
+    // (NOT the secret) so operators can confirm the key fingerprint.
+    {
+        let key_path_str = std::env::var("RYUKI_CP_SIGNING_KEY_PATH")
+            .unwrap_or_else(|_| "cp-signing.key".to_string());
+        let key_path = std::path::Path::new(&key_path_str);
+        match cp_identity::load_or_generate_cp_key(key_path) {
+            Ok(key) => {
+                let pubkey_b64 = ryuki_protocol::encode_verifying_key(&key.verifying_key());
+                tracing::info!(
+                    cp_pubkey = %pubkey_b64,
+                    key_path = %key_path_str,
+                    "CP signing key loaded (public key fingerprint logged; secret NOT logged)"
+                );
+                cp_identity::init_cp_key(key);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    key_path = %key_path_str,
+                    "failed to load or generate CP signing key — LiveApply grants will be unavailable"
+                );
+                // Non-fatal: the server continues; LiveApply jobs that require a
+                // CP-signed grant will return 503 from the grant endpoint.
+            }
+        }
+    }
 
     // Spawn background lease-expiry sweep (Fix 4: DB-time deadlines + periodic
     // expiry). Only spawns when a DB pool is available. The task is idempotent

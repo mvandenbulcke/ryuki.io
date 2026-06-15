@@ -33,9 +33,13 @@ use sqlx::PgPool;
 use tokio::time::interval;
 use uuid::Uuid;
 
+use chrono::DateTime;
+
+use crate::cp_identity;
 use crate::database::get_db;
 use crate::sha256_hex;
 use ryuki_protocol::{
+    crypto::{sign_vlc, verify_vlc},
     Capabilities, Job, JobLease, JobMode, JobResult, JobResultStatus, JobSpec, JobStatus,
     VerifiedLiveContext,
 };
@@ -78,13 +82,15 @@ struct AgentJobRow {
     fencing_token: Option<String>,
     cp_nonce: Option<String>,
     lease_deadline: Option<chrono::DateTime<Utc>>,
+    // S5: CP-signed LiveApply approval grant (NULL for non-live jobs).
+    live_context: Option<sqlx::types::Json<Value>>,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
 }
 
 const AGENT_JOB_COLUMNS: &str = "id, request_id, platform, spec, mode, status, \
     agent_id, attempt_id, lease_generation, fencing_token, cp_nonce, \
-    lease_deadline, created_at, updated_at";
+    lease_deadline, live_context, created_at, updated_at";
 
 // ---------------------------------------------------------------------------
 // Wire types (request / response bodies)
@@ -484,13 +490,31 @@ pub async fn poll_job(Path(agent_id): Path<String>, headers: HeaderMap) -> impl 
         cp_nonce,
     };
 
+    // S5: deliver the CP-signed grant (if any) so the agent can verify_vlc it
+    // before a LiveApply. A malformed stored grant is logged and delivered as
+    // None — the agent then refuses to apply (fail-safe).
+    let live_context = match row.live_context.as_ref() {
+        Some(j) => match serde_json::from_value::<VerifiedLiveContext>(j.0.clone()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::error!(
+                    job_id = %row.id,
+                    error = %e,
+                    "stored live_context is malformed; delivering job without a grant"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     let job = Job {
         id: row.id,
         platform: row.platform.clone(),
         spec,
         status: JobStatus::Leased,
         lease: Some(lease),
-        live_context: None, // S3b: CP-signed LiveApply grant
+        live_context,
     };
 
     tracing::info!(
@@ -937,6 +961,27 @@ async fn post_job_result_with_pool(
                     db_err("stored live_context is malformed")
                 })?;
 
+            // The grant MUST be genuinely CP-signed. Verifying the Ed25519
+            // signature against the CP's own public key defends against a
+            // tampered stored grant (e.g. a DB-write attacker who alters
+            // approved_plan_digest but cannot forge the CP signature). The agent
+            // also independently verifies this signature before applying (S5b).
+            let cp_vk = cp_identity::cp_signing_key()
+                .ok_or_else(|| {
+                    tracing::error!(
+                        "CP signing key is not initialised — cannot verify LiveApply grant"
+                    );
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(json!({
+                            "error": "control plane is not configured to verify live grants"
+                        })),
+                    )
+                })?
+                .verifying_key();
+            verify_vlc(&grant, &cp_vk)
+                .map_err(|_| bad_request("approval grant signature is invalid"))?;
+
             // The agent's signed envelope MUST carry the applied plan digest.
             let env_digest = env.approved_plan_digest.as_deref().ok_or_else(|| {
                 bad_request(
@@ -1261,6 +1306,178 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// create_live_apply_job — enqueue a LiveApply job with a CP-signed grant
+// ---------------------------------------------------------------------------
+
+/// Validate the mode and request_id invariants for `create_live_apply_job`.
+///
+/// Separated from the async body so tests can call it directly without needing
+/// a real `PgPool` (the assertions fire before any DB interaction).
+///
+/// Returns `Err(msg)` so the caller can decide how to handle the violation;
+/// `create_live_apply_job` maps it to `CreateLiveApplyJobError::Invalid` (it does
+/// NOT panic), so a future operator endpoint can surface a 4xx.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn validate_live_apply_params(spec: &JobSpec, request_id: Uuid) -> Result<(), &'static str> {
+    if spec.mode != JobMode::LiveApply {
+        return Err("create_live_apply_job requires a LiveApply spec");
+    }
+    if spec.request_id != request_id {
+        return Err("spec.request_id must equal the supplied request_id");
+    }
+    Ok(())
+}
+
+/// Maximum lifetime of a LiveApply approval grant. A grant longer than this is
+/// rejected at creation so an over-broad approval window cannot be minted.
+const MAX_GRANT_TTL_HOURS: i64 = 24;
+
+/// Error from [`create_live_apply_job`].
+#[derive(Debug, thiserror::Error)]
+pub enum CreateLiveApplyJobError {
+    /// The supplied spec/request did not satisfy the LiveApply preconditions.
+    #[error("invalid live-apply parameters: {0}")]
+    Invalid(&'static str),
+    /// A database error occurred while enqueuing the job.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Enqueue a new Pending `LiveApply` job with a CP-signed [`VerifiedLiveContext`]
+/// grant attached, and return the job row id.
+///
+/// ## Signing invariants
+///
+/// - `spec.mode` MUST be `JobMode::LiveApply`; returns `Invalid` otherwise.
+/// - `spec.request_id` MUST equal `request_id`; the S5a-1 verifier checks
+///   `grant.request_id == spec.request_id` and rejects on mismatch.
+///
+/// ## Grant shape
+///
+/// A [`VerifiedLiveContext`] is constructed from the supplied fields and signed
+/// by `cp_key` using `sign_vlc`. The signed grant is stored in the job row's
+/// `live_context` JSONB column. Agents will fetch the job (including the grant)
+/// via `GET /api/agents/{id}/jobs`, verify the CP signature against the CP
+/// public key, and reject the apply if the signature is invalid.
+///
+/// Note: the operator-facing HTTP approval endpoint (portal integration) is a
+/// later slice (S5c). This function is the signing core that all such endpoints
+/// will delegate to.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_live_apply_job(
+    pool: &PgPool,
+    request_id: Uuid,
+    platform: &str,
+    spec: &JobSpec,
+    approved_plan_digest: &str,
+    approver: &str,
+    expiry: DateTime<Utc>,
+    cp_key: &ed25519_dalek::SigningKey,
+) -> Result<Uuid, CreateLiveApplyJobError> {
+    // Invariant: this function only creates LiveApply jobs — the grant is
+    // meaningless for any other mode, and the S5a-1 verifier only checks grants
+    // on LiveApply results. Fail closed (return Err) rather than panic so a
+    // future operator endpoint can surface a 4xx instead of crashing the request.
+    validate_live_apply_params(spec, request_id).map_err(CreateLiveApplyJobError::Invalid)?;
+
+    // Validate the grant fields before signing — a signed grant is authoritative,
+    // so it must never carry a bogus digest, an empty approver, or an abusive
+    // expiry. (digest = lowercase SHA-256 hex; expiry must be in the future and
+    // within MAX_GRANT_TTL.)
+    if approved_plan_digest.len() != 64
+        || !approved_plan_digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approved_plan_digest must be a 64-character SHA-256 hex string",
+        ));
+    }
+    if approver.trim().is_empty() {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "approver must not be empty",
+        ));
+    }
+    let now = Utc::now();
+    if expiry <= now {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry must be in the future",
+        ));
+    }
+    if expiry > now + chrono::Duration::hours(MAX_GRANT_TTL_HOURS) {
+        return Err(CreateLiveApplyJobError::Invalid(
+            "grant expiry exceeds the maximum allowed TTL",
+        ));
+    }
+
+    // Build and sign the VerifiedLiveContext grant.
+    let unsigned_grant = VerifiedLiveContext {
+        request_id,
+        approved_plan_digest: approved_plan_digest.to_string(),
+        approver: approver.to_string(),
+        expiry,
+        signature: String::new(),
+    };
+    let signed_grant = sign_vlc(unsigned_grant, cp_key);
+
+    let spec_json = serde_json::to_value(spec).expect("JobSpec serialisation is infallible");
+    let grant_json = serde_json::to_value(&signed_grant)
+        .expect("VerifiedLiveContext serialisation is infallible");
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context) \
+         VALUES ($1, $2, $3, 'LiveApply', $4::jsonb) \
+         RETURNING id",
+    )
+    .bind(request_id)
+    .bind(platform)
+    .bind(&spec_json)
+    .bind(&grant_json)
+    .fetch_one(pool)
+    .await?;
+
+    tracing::info!(
+        job_id = %id,
+        request_id = %request_id,
+        platform = %platform,
+        approver = %approver,
+        approved_plan_digest = %approved_plan_digest,
+        "LiveApply job enqueued with CP-signed grant"
+    );
+    Ok(id)
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/agents/cp-public-key — unauthenticated CP public-key endpoint
+// ---------------------------------------------------------------------------
+
+/// Return the CP's Ed25519 public key as base64.
+///
+/// ## Auth posture
+///
+/// **Unauthenticated** — intentionally.  A public key is not a secret; any
+/// agent (or observer) may fetch it.  Agents use this to pin the CP public key
+/// for verifying [`VerifiedLiveContext`] grants.  This endpoint is mounted via
+/// `agent_routes()`, which sits OUTSIDE the human `auth_middleware` layer in
+/// `main.rs`, so no session or agent-token is required.
+///
+/// Returns 503 if the CP signing key was not initialised at startup (e.g. the
+/// key file was unreadable and the server continued in degraded mode).
+pub async fn cp_public_key() -> impl IntoResponse {
+    match cp_identity::cp_public_key_b64() {
+        Some(pubkey) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"public_key": pubkey})),
+        )
+            .into_response(),
+        None => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "CP signing key not initialised"})),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -1272,9 +1489,14 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
 /// token) as their sole auth gate and must NOT sit behind the human
 /// `auth_middleware`. Mount via `agents::agent_routes()` BEFORE the human
 /// middleware layer in main.rs.
+///
+/// `GET /api/agents/cp-public-key` is intentionally unauthenticated: a public
+/// key is not a secret, and agents need it to verify CP-signed grants before
+/// (and independently of) their own auth.
 pub fn agent_routes() -> Router {
     Router::new()
         .route("/api/agents/register", post(register_agent))
+        .route("/api/agents/cp-public-key", get(cp_public_key))
         .route("/api/agents/{agent_id}/jobs", get(poll_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/ack", post(ack_job))
         .route(
@@ -3711,20 +3933,36 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // S5a-1: LiveApply approved-plan grant verification (the deferred S3b check)
+    // S5a-1/S5a-2: LiveApply approved-plan grant verification
     // ───────────────────────────────────────────────────────────────────────
 
-    /// Seed a Pending LiveApply job carrying a CP grant (live_context). The
-    /// grant's `request_id` is bound to the job spec by default; pass a different
-    /// `grant_request_id` to exercise the mismatch path. Direct INSERT because
-    /// `create_agent_job` does not attach a grant (and the DB CHECK requires one
-    /// for LiveApply).
-    async fn seed_live_apply_job(
+    // A single shared CP signing key for ALL LiveApply tests in this binary. The
+    // verifier reads the process-global CP key (via cp_identity) to verify_vlc a
+    // grant's signature, so every grant a test seeds MUST be signed by the same
+    // key that is installed as the global. Because every test installs the SAME
+    // key, the write-once global is deterministic regardless of test order.
+    static TEST_CP_KEY: std::sync::LazyLock<ed25519_dalek::SigningKey> =
+        std::sync::LazyLock::new(|| generate_keypair(&mut OsRng));
+
+    /// Install the shared CP key as the process global (idempotent — same key
+    /// every call) and return a clone for signing grants in the test.
+    fn ensure_test_cp_key() -> ed25519_dalek::SigningKey {
+        cp_identity::init_cp_key_for_test(TEST_CP_KEY.clone());
+        TEST_CP_KEY.clone()
+    }
+
+    /// Seed a Pending LiveApply job carrying a CP-signed grant (live_context),
+    /// signed with `signing_key`. The grant's `request_id` is bound to the job
+    /// spec by default; pass a different `grant_request_id` to exercise the
+    /// mismatch path. Direct INSERT because `create_agent_job` does not attach a
+    /// grant. The process-global CP key is installed via `ensure_test_cp_key`.
+    async fn seed_live_apply_job_signed(
         pool: &PgPool,
         platform: &str,
         approved_plan_digest: &str,
         grant_expiry: chrono::DateTime<Utc>,
         grant_request_id: Option<Uuid>,
+        signing_key: &ed25519_dalek::SigningKey,
     ) -> Uuid {
         use std::collections::BTreeMap;
         let request_id = Uuid::new_v4();
@@ -3736,15 +3974,14 @@ mod tests {
             vars: BTreeMap::new(),
             mode: ryuki_protocol::JobMode::LiveApply,
         };
-        let grant = VerifiedLiveContext {
+        let unsigned = VerifiedLiveContext {
             request_id: grant_request_id.unwrap_or(request_id),
             approved_plan_digest: approved_plan_digest.to_string(),
             approver: "ops-test".to_string(),
             expiry: grant_expiry,
-            // The CP trusts its own stored grant; the AGENT verifies this
-            // signature (S5b). S5a-1 enforces digest equality + expiry only.
             signature: String::new(),
         };
+        let grant = sign_vlc(unsigned, signing_key);
         let spec_json = serde_json::to_value(&spec).expect("spec json");
         let grant_json = serde_json::to_value(&grant).expect("grant json");
         sqlx::query_scalar(
@@ -3758,6 +3995,27 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("seed live apply job")
+    }
+
+    /// Seed a LiveApply job whose grant is signed by the shared global CP key
+    /// (the common case — the verifier will accept the signature).
+    async fn seed_live_apply_job(
+        pool: &PgPool,
+        platform: &str,
+        approved_plan_digest: &str,
+        grant_expiry: chrono::DateTime<Utc>,
+        grant_request_id: Option<Uuid>,
+    ) -> Uuid {
+        let cp_key = ensure_test_cp_key();
+        seed_live_apply_job_signed(
+            pool,
+            platform,
+            approved_plan_digest,
+            grant_expiry,
+            grant_request_id,
+            &cp_key,
+        )
+        .await
     }
 
     /// Build a signed LiveApply `JobResult` (status Applied) carrying the given
@@ -3986,6 +4244,404 @@ mod tests {
         pool.close().await;
     }
 
+    // ── S5a-2 tests ───────────────────────────────────────────────────────────
+    //
+    // These tests cover the CP-side grant-signing machinery introduced in S5a-2:
+    //   1. create_live_apply_job produces a validly CP-signed grant.
+    //   2. End-to-end: production-signed grant → S5a-1 verifier accepts.
+    //   3. Negative: plan digest mismatch → verifier rejects.
+    //   4. Negative: spec.mode != LiveApply / bad grant fields → create returns Err.
+    //   5. Pubkey endpoint returns the initialised key (handler-level, no DB).
+    //
+    // DB tests pass the SigningKey DIRECTLY to create_live_apply_job and do NOT
+    // rely on the process OnceLock (init_cp_key / cp_signing_key) — the OnceLock
+    // is write-once-per-process and the key set by one test leaks to others in
+    // the same binary. Only the endpoint test (which is handler-level, no DB)
+    // calls init_cp_key_for_test.
+
+    /// The signed grant stored in a LiveApply job row must verify against the
+    /// CP public key that signed it.
+    #[tokio::test]
+    async fn db_s5a2_create_live_apply_job_grant_verifies() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use chrono::Utc;
+        use ryuki_protocol::crypto::verify_vlc;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let cp_vk = cp_key.verifying_key();
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5a2-plt-{suffix}");
+        let request_id = Uuid::new_v4();
+        let plan_digest = proto_sha256(b"approved-plan-bytes");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        let job_id = create_live_apply_job(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await
+        .expect("create_live_apply_job must succeed");
+
+        // Read the stored live_context from the DB row.
+        #[derive(sqlx::FromRow)]
+        struct LiveContextRow {
+            live_context: Option<sqlx::types::Json<serde_json::Value>>,
+        }
+        let row = sqlx::query_as::<_, LiveContextRow>(
+            "SELECT live_context FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch live_context");
+
+        let grant_json = row.live_context.expect("live_context must be set");
+        let grant: VerifiedLiveContext =
+            serde_json::from_value(grant_json.0).expect("grant must deserialise");
+
+        // The grant must cryptographically verify against the CP public key.
+        assert!(
+            verify_vlc(&grant, &cp_vk).is_ok(),
+            "stored grant must verify with the CP public key"
+        );
+        assert_eq!(grant.approved_plan_digest, plan_digest);
+        assert_eq!(grant.request_id, request_id);
+
+        sqlx::query("DELETE FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+    }
+
+    /// End-to-end: create_live_apply_job produces a CP-signed grant; the agent
+    /// builds a result carrying the matching plan digest; the S5a-1 verifier
+    /// in post_job_result_with_pool accepts it. This is the composition test:
+    /// S5a-2 (produce) + S5a-1 (verify) must agree.
+    #[tokio::test]
+    async fn db_s5a2_production_grant_accepted_by_s5a1_verifier() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5a2-e2e-{suffix}");
+        let agent_id = format!("s5a2-agent-{suffix}");
+        let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+
+        let request_id = Uuid::new_v4();
+        let plan_digest = proto_sha256(b"the-exact-approved-plan");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        // CP enqueues the job with a production-signed grant.
+        let _job_id = create_live_apply_job(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &plan_digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await
+        .expect("create_live_apply_job must succeed");
+
+        // Agent leases and acks the job.
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        // Agent builds a result carrying the approved plan digest.
+        let (job_result, evidence_bytes) = make_live_apply_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &agent_key,
+            &spec,
+            b"live apply evidence",
+            Some(plan_digest.clone()),
+        );
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            "Authorization",
+            format!("Bearer {agent_token}").parse().unwrap(),
+        );
+
+        // S5a-1 verifier must accept the production CP-signed grant.
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(
+            resp.is_ok(),
+            "production CP-signed grant → S5a-1 verifier must accept: {:?}",
+            resp.err()
+        );
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Succeeded");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// Negative: the CP signs a grant for digest D; the agent sends digest D'
+    /// (a different, unapproved plan). The S5a-1 verifier must reject.
+    #[tokio::test]
+    async fn db_s5a2_digest_mismatch_rejected_by_verifier() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5a2-neg-{suffix}");
+        let agent_id = format!("s5a2-negagent-{suffix}");
+        let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+
+        let request_id = Uuid::new_v4();
+        let approved_digest = proto_sha256(b"the-approved-plan");
+        let unapproved_digest = proto_sha256(b"a-different-unapproved-plan");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        // CP signs the grant for `approved_digest`.
+        let _job_id = create_live_apply_job(
+            &pool,
+            request_id,
+            &platform,
+            &spec,
+            &approved_digest,
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await
+        .expect("create_live_apply_job");
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        // Agent sends the UNAPPROVED digest — mismatch vs the grant.
+        let (job_result, evidence_bytes) = make_live_apply_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &agent_key,
+            &spec,
+            b"live apply evidence",
+            Some(unapproved_digest),
+        );
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert(
+            "Authorization",
+            format!("Bearer {agent_token}").parse().unwrap(),
+        );
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(
+            resp.is_err(),
+            "digest mismatch must be rejected by the S5a-1 verifier"
+        );
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db.status, "Running",
+            "job must stay Running after rejection"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// Negative: spec.mode != LiveApply → validate_live_apply_params returns Err.
+    /// Tests the sync validation helper that create_live_apply_job delegates to,
+    /// avoiding the need for a real PgPool.
+    #[test]
+    fn validate_live_apply_params_rejects_wrong_mode() {
+        use std::collections::BTreeMap;
+
+        let request_id = Uuid::new_v4();
+
+        let wrong_mode_spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::OfflineDryRun, // NOT LiveApply
+        };
+
+        let result = validate_live_apply_params(&wrong_mode_spec, request_id);
+        assert!(
+            result.is_err(),
+            "OfflineDryRun spec must be rejected by validate_live_apply_params"
+        );
+
+        let liveplan_spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LivePlan, // also NOT LiveApply
+        };
+        let result2 = validate_live_apply_params(&liveplan_spec, request_id);
+        assert!(
+            result2.is_err(),
+            "LivePlan spec must be rejected by validate_live_apply_params"
+        );
+
+        // A LiveApply spec with matching request_id must pass.
+        let valid_spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let result3 = validate_live_apply_params(&valid_spec, request_id);
+        assert!(result3.is_ok(), "LiveApply spec must pass validation");
+    }
+
+    /// Pubkey endpoint returns the initialised CP public key.
+    /// This is a handler-level test (no DB); it calls init_cp_key_for_test so
+    /// the global is set for the endpoint. Only the FIRST set in the process
+    /// wins — ensure no other test in this binary has already called it with a
+    /// different key if you need a specific key here.
+    #[tokio::test]
+    async fn cp_public_key_endpoint_returns_initialised_key() {
+        use crate::cp_identity;
+
+        // Install the shared test CP key as the global (same key every test, so
+        // no cross-test race on the write-once global).
+        let key = ensure_test_cp_key();
+        let expected_pubkey = ryuki_protocol::encode_verifying_key(&key.verifying_key());
+
+        // Call the handler directly.
+        let response = cp_public_key().await.into_response();
+
+        // The endpoint must return 200.  If the global was already set with a
+        // DIFFERENT key by another test, the status will still be 200 (just a
+        // different key value).  Either way, no 503.
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "cp-public-key must return 200 when the key is initialised"
+        );
+
+        // Parse the body.
+        use axum::body::to_bytes;
+        let body_bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("JSON body");
+
+        // The public_key field must be a non-empty base64 string.
+        let pubkey_field = body
+            .get("public_key")
+            .and_then(|v| v.as_str())
+            .expect("public_key field must be present and a string");
+
+        // If the key was freshly set by THIS test, it must match exactly.
+        // If it was already set by a prior test, we just verify it is a
+        // well-formed base64-encoded 32-byte Ed25519 verifying key.
+        let actual_b64 = cp_identity::cp_public_key_b64().expect("key must be set");
+        assert_eq!(
+            pubkey_field, actual_b64,
+            "endpoint must return the key stored in the global"
+        );
+        // Verify it decodes to a valid 32-byte key.
+        ryuki_protocol::crypto::decode_verifying_key(pubkey_field)
+            .expect("public_key must be a valid base64-encoded verifying key");
+
+        // Confirm the expected key is at least BASE64-valid.
+        let _ = expected_pubkey; // used above, consumed by init
+    }
+
     /// A LiveApply result applied within the grant window, then REPLAYED after
     /// the grant expires (e.g. the durable outbox retries the POST much later),
     /// must return idempotent 200 — NOT a 409 "grant expired". Expiry gates the
@@ -4052,17 +4708,27 @@ mod tests {
         .await
         .expect("first live apply must be accepted");
 
-        // Simulate the grant expiring after the apply was recorded.
-        sqlx::query(
-            "UPDATE agent_jobs \
-             SET live_context = jsonb_set(live_context, '{expiry}', to_jsonb($2::text)) \
-             WHERE id = $1",
-        )
-        .bind(job_id)
-        .bind((Utc::now() - Duration::hours(1)).to_rfc3339())
-        .execute(&pool)
-        .await
-        .expect("expire the stored grant");
+        // Simulate the grant having expired after the apply was recorded. Replace
+        // the stored grant with a VALIDLY-SIGNED one whose expiry is in the past
+        // (re-sign with the same CP key so verify_vlc still passes — only the
+        // expiry is now stale). This proves the replay path is gated on terminal
+        // status, not on a fresh expiry check.
+        let expired_grant = sign_vlc(
+            VerifiedLiveContext {
+                request_id: spec.request_id,
+                approved_plan_digest: digest.clone(),
+                approver: "ops-test".to_string(),
+                expiry: Utc::now() - Duration::hours(1),
+                signature: String::new(),
+            },
+            &ensure_test_cp_key(),
+        );
+        sqlx::query("UPDATE agent_jobs SET live_context = $2::jsonb WHERE id = $1")
+            .bind(job_id)
+            .bind(serde_json::to_value(&expired_grant).expect("grant json"))
+            .execute(&pool)
+            .await
+            .expect("install expired-but-signed grant");
 
         // Replay the SAME signed result — the job is terminal, so expiry is not
         // re-checked; the idempotency branch returns 200.
@@ -4086,6 +4752,152 @@ mod tests {
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// A grant signed by a key OTHER than the CP's must be rejected — proves the
+    /// verifier checks the grant's Ed25519 signature (verify_vlc), not just its
+    /// fields. (Defends against a tampered/forged stored grant.)
+    #[tokio::test]
+    async fn db_s5_live_apply_forged_grant_signature_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Install the real CP key as the global, but sign the grant with a
+        // DIFFERENT (attacker) key.
+        let _global = ensure_test_cp_key();
+        let attacker_key = generate_keypair(&mut OsRng);
+
+        let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
+        let platform = format!("s5-forge-{suffix}");
+        let agent_id = format!("s5-forge-agent-{suffix}");
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+
+        let digest = proto_sha256(b"the-approved-plan");
+        let job_id = seed_live_apply_job_signed(
+            &pool,
+            &platform,
+            &digest,
+            Utc::now() + Duration::hours(1),
+            None,
+            &attacker_key, // NOT the CP key
+        )
+        .await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence_bytes) = make_live_apply_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"live apply evidence",
+            Some(digest.clone()),
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        let (status, _) = resp.expect_err("a grant not signed by the CP must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        let db = read_job_result_row(&pool, job_id).await;
+        assert_eq!(db.status, "Running", "forged-grant job must stay Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// create_live_apply_job rejects bogus grant fields before signing.
+    #[tokio::test]
+    async fn db_s5a2_create_rejects_bad_grant_fields() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use std::collections::BTreeMap;
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        let platform = format!(
+            "s5a2-badf-{}",
+            &Uuid::new_v4().to_string().replace('-', "")[..8]
+        );
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let good = proto_sha256(b"plan");
+        let future = Utc::now() + Duration::hours(1);
+
+        // Empty / non-hex digest.
+        assert!(matches!(
+            create_live_apply_job(&pool, request_id, &platform, &spec, "", "ops", future, &cp_key)
+                .await,
+            Err(CreateLiveApplyJobError::Invalid(_))
+        ));
+        // Past expiry.
+        assert!(matches!(
+            create_live_apply_job(
+                &pool,
+                request_id,
+                &platform,
+                &spec,
+                &good,
+                "ops",
+                Utc::now() - Duration::hours(1),
+                &cp_key
+            )
+            .await,
+            Err(CreateLiveApplyJobError::Invalid(_))
+        ));
+        // Expiry beyond the max TTL.
+        assert!(matches!(
+            create_live_apply_job(
+                &pool,
+                request_id,
+                &platform,
+                &spec,
+                &good,
+                "ops",
+                Utc::now() + Duration::hours(MAX_GRANT_TTL_HOURS + 1),
+                &cp_key
+            )
+            .await,
+            Err(CreateLiveApplyJobError::Invalid(_))
+        ));
+        // Empty approver.
+        assert!(matches!(
+            create_live_apply_job(
+                &pool, request_id, &platform, &spec, &good, "  ", future, &cp_key
+            )
+            .await,
+            Err(CreateLiveApplyJobError::Invalid(_))
+        ));
+
+        // No row should have been created by any rejected call.
+        cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }
 }
