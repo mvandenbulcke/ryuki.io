@@ -166,7 +166,7 @@ pub(crate) fn validate_offering_slug(offering_id: &str) -> Result<(), RunnerErro
 ///
 /// Calls `env_clear()` first so no other parent vars are inherited,
 /// then re-injects each key from `ENV_ALLOWLIST` if it exists in the parent.
-fn apply_env_allowlist(cmd: &mut Command) {
+pub(crate) fn apply_env_allowlist(cmd: &mut Command) {
     cmd.env_clear();
     for key in ENV_ALLOWLIST {
         if let Ok(val) = std::env::var(key) {
@@ -472,7 +472,7 @@ impl Runner for TerraformRunner {
 // ---------------------------------------------------------------------------
 
 /// Combine stdout and stderr into a single string for scrubbing.
-fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
+pub(crate) fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
     let mut s = String::new();
     if !stdout.is_empty() {
         s.push_str(&String::from_utf8_lossy(stdout));

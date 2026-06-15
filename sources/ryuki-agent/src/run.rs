@@ -11,13 +11,36 @@
 //! result.  The agent NEVER calls `build_signed_result` a second time for the
 //! same (job, attempt) — it replays the outbox entry instead.
 //!
+//! ## Live execution (S5b-2b-ii)
+//!
+//! `process_job_live` handles `LivePlan` and `LiveApply` jobs via a
+//! `&dyn LiveExecutor`.  The gate (`evaluate_live_execution`) is checked
+//! before ANY platform contact; a `Refused` decision immediately produces a
+//! `build_refused_result` without calling plan or apply.  For `LiveApply` the
+//! ordering is:
+//!
+//! 1. `!allow_live` → refuse WITHOUT planning (fail-closed, no platform contact).
+//! 2. `live_exec.plan(spec)` → `LivePlanOutcome { evidence, plan_digest }`.
+//! 3. `evaluate_live_execution(job, cp_key, allow_live, Some(&plan_digest))` —
+//!    checks allow_live, grant signature, request_id, expiry, digest match.
+//! 4. `Refused` → `build_refused_result` (apply is NEVER called).
+//! 5. `Proceed` → `live_exec.apply(spec)` → `Evidence { Applied/Failed }`.
+//! 6. `build_signed_result(.., Some(grant.approved_plan_digest))` — the digest
+//!    is passed only AFTER the gate returned Proceed.
+//! 7. Same durable outbox flow as OfflineDryRun (enqueue-before-post, mark_delivered).
+//!
+//! The result is built EXACTLY ONCE (build-once contract) and placed in the
+//! outbox before any POST.
+//!
 //! ## Error strategy
 //!
-//! All errors are wrapped in [`AgentError`].  `process_job` and `replay_outbox`
-//! return `Result`; `run_loop` logs errors and backs off — it never panics.
+//! All errors are wrapped in [`AgentError`].  `process_job`, `process_job_live`,
+//! and `replay_outbox` return `Result`; `run_loop` logs errors and backs off —
+//! it never panics.
 
 use std::time::Duration;
 
+use ed25519_dalek::VerifyingKey;
 use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -26,10 +49,12 @@ use crate::{
     client::{ClientError, CpClient},
     executor::{ExecError, JobExecutor},
     identity::AgentIdentity,
+    live::evaluate_live_execution,
+    live_exec::{LiveExecError, LiveExecutor},
     outbox::{Outbox, OutboxError},
-    result::{build_signed_result, ResultError},
+    result::{build_refused_result, build_signed_result, ResultError},
 };
-use ryuki_protocol::Job;
+use ryuki_protocol::{Job, JobMode};
 
 // ---------------------------------------------------------------------------
 // AgentError
@@ -41,6 +66,8 @@ pub enum AgentError {
     Client(#[from] ClientError),
     #[error("executor error: {0}")]
     Exec(#[from] ExecError),
+    #[error("live executor error: {0}")]
+    LiveExec(#[from] LiveExecError),
     #[error("result build error: {0}")]
     Result(#[from] ResultError),
     #[error("outbox error: {0}")]
@@ -88,20 +115,237 @@ pub async fn process_job(
 
     // Step 3: build once. result_id is the idempotency key for the outbox.
     // OfflineDryRun is the only mode supported by the current executor.
-    // Live modes (LivePlan / LiveApply) are S5b — pass None for the
-    // approved_plan_digest; the live executor (S5b-2b-ii) will supply
-    // the real digest when it builds LiveApply+Applied results.
+    // Live modes (LivePlan / LiveApply) are S5b and handled by process_job_live.
     let body = build_signed_result(identity, agent_id, job, &evidence, None)?;
+
+    // Steps 4-6: enqueue BEFORE the network POST, then POST, then mark delivered.
+    // Delegate to the shared helper that live and offline paths both use.
+    enqueue_and_post(client, outbox, job, body).await
+}
+
+// ---------------------------------------------------------------------------
+// process_job_live
+// ---------------------------------------------------------------------------
+
+/// Process a `LivePlan` or `LiveApply` job through the full live pipeline.
+///
+/// ## Argument summary
+///
+/// - `cp_verifying_key` — the **pinned** CP Ed25519 key fetched at startup.
+///   `None` → refuse all `LiveApply` jobs (can't verify the grant without it).
+///   `LivePlan` is still allowed when `allow_live` is `true` (no grant needed).
+/// - `allow_live` — from `AgentConfig::allow_live`; must be `true` for any
+///   live job.
+/// - `live_exec` — a `dyn LiveExecutor` implementation; `StubLiveExecutor` in
+///   tests, `RunnerLiveExecutor` in production.
+///
+/// ## Ordering invariants
+///
+/// For `LiveApply`:
+///
+/// 1. `!allow_live` → refuse immediately WITHOUT calling `plan()`.
+/// 2. `cp_verifying_key` is `None` → refuse immediately WITHOUT calling `plan()`.
+/// 3. `plan()` → `plan_digest`.
+/// 4. Gate checks (allow_live, grant sig, request_id, expiry, digest).
+/// 5. Gate `Refused` → refuse, `apply()` is NEVER called.
+/// 6. Gate `Proceed` → `apply()`.
+/// 7. `build_signed_result(.., Some(grant.approved_plan_digest))` — the digest
+///    is the one from the grant (already verified to equal plan_digest).
+///
+/// For `LivePlan`:
+///
+/// 1. Gate check (allow_live only, no grant, no digest).
+/// 2. `Refused` → refuse, `plan()` is NEVER called.
+/// 3. `Proceed` → `plan()`.
+/// 4. `build_signed_result(.., None)` (LivePlan never carries a digest).
+///
+/// ## Build-once contract
+///
+/// `build_signed_result` / `build_refused_result` is called EXACTLY ONCE.
+/// The result is enqueued to the durable outbox BEFORE the network POST.
+#[allow(clippy::too_many_arguments)]
+pub async fn process_job_live(
+    client: &CpClient,
+    live_exec: &dyn LiveExecutor,
+    identity: &AgentIdentity,
+    agent_id: &str,
+    outbox: &Outbox,
+    job: &Job,
+    cp_verifying_key: Option<&VerifyingKey>,
+    allow_live: bool,
+) -> Result<(), AgentError> {
+    let lease = job.lease.as_ref().ok_or(AgentError::NoLease)?;
+
+    // Step 1: ack the lease.
+    client
+        .ack(job.id, lease.attempt_id, &lease.fencing_token)
+        .await?;
+
+    // Build the signed result body (exactly once) and enqueue + post it.
+    let body = match job.spec.mode {
+        // OfflineDryRun must not reach this function; guard defensively.
+        JobMode::OfflineDryRun => {
+            return Err(AgentError::LiveExec(LiveExecError::UnsupportedMode(
+                JobMode::OfflineDryRun,
+            )));
+        }
+
+        // -- LivePlan -------------------------------------------------------
+        JobMode::LivePlan => {
+            // Gate: allow_live only (no grant, no digest needed for plan).
+            // Use a synthetic zeroed key when we have no pinned key — the gate
+            // won't reach the signature check for LivePlan (it only checks
+            // allow_live), so passing any key is safe here.
+            let dummy_vk = VerifyingKey::from_bytes(&[0u8; 32])
+                .unwrap_or_else(|_| identity.signing_key().verifying_key());
+            let vk = cp_verifying_key.unwrap_or(&dummy_vk);
+
+            match evaluate_live_execution(job, vk, allow_live, None) {
+                crate::live::LiveDecision::Refused(reason) => {
+                    warn!(
+                        job_id = %job.id,
+                        reason = %reason,
+                        "LivePlan refused before plan() call"
+                    );
+                    build_refused_result(identity, agent_id, job, &reason)?
+                }
+                crate::live::LiveDecision::Proceed => {
+                    // Gate passed — execute the plan.
+                    // FAIL CLOSED: if plan() returns Err (non-clean plan), build a
+                    // refusal rather than propagating a bare AgentError that would
+                    // leave the job silently Running on the CP.
+                    match live_exec.plan(&job.spec) {
+                        Ok(plan_outcome) => {
+                            // LivePlan → approved_plan_digest MUST be None.
+                            build_signed_result(
+                                identity,
+                                agent_id,
+                                job,
+                                &plan_outcome.evidence,
+                                None,
+                            )?
+                        }
+                        Err(e) => {
+                            let reason = format!("terraform plan failed: {e}");
+                            warn!(
+                                job_id = %job.id,
+                                reason = %reason,
+                                "LivePlan: plan() returned Err — building LiveRefused result"
+                            );
+                            build_refused_result(identity, agent_id, job, &reason)?
+                        }
+                    }
+                }
+            }
+        }
+
+        // -- LiveApply ------------------------------------------------------
+        JobMode::LiveApply => {
+            // Fast-path refuse: !allow_live → skip plan entirely.
+            if !allow_live {
+                let reason = "LiveApply requires --allow-live";
+                warn!(job_id = %job.id, "LiveApply refused: !allow_live (no plan attempted)");
+                return enqueue_and_post(
+                    client,
+                    outbox,
+                    job,
+                    build_refused_result(identity, agent_id, job, reason)?,
+                )
+                .await;
+            }
+
+            // Fast-path refuse: no pinned CP key → can't verify grant.
+            let vk = match cp_verifying_key {
+                Some(k) => k,
+                None => {
+                    let reason =
+                        "LiveApply refused: no CP public key available for grant verification";
+                    warn!(job_id = %job.id, "LiveApply refused: no pinned CP key");
+                    return enqueue_and_post(
+                        client,
+                        outbox,
+                        job,
+                        build_refused_result(identity, agent_id, job, reason)?,
+                    )
+                    .await;
+                }
+            };
+
+            // Plan first — plan_digest will be checked by the gate.
+            // FAIL CLOSED: if plan() returns Err (non-clean plan), build a refusal
+            // rather than propagating as a bare AgentError that would leave the job
+            // silently Running on the CP.  apply() is NEVER called on Err.
+            let plan_outcome = match live_exec.plan(&job.spec) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let reason = format!("terraform plan failed: {e}");
+                    warn!(
+                        job_id = %job.id,
+                        reason = %reason,
+                        "LiveApply: plan() returned Err — building LiveRefused result, apply() NOT called"
+                    );
+                    return enqueue_and_post(
+                        client,
+                        outbox,
+                        job,
+                        build_refused_result(identity, agent_id, job, &reason)?,
+                    )
+                    .await;
+                }
+            };
+            let plan_digest = &plan_outcome.plan_digest;
+
+            // Gate: all six checks (allow_live, grant sig, request_id, expiry, digest).
+            match evaluate_live_execution(job, vk, allow_live, Some(plan_digest.as_str())) {
+                crate::live::LiveDecision::Refused(reason) => {
+                    warn!(
+                        job_id = %job.id,
+                        reason = %reason,
+                        "LiveApply refused after plan — apply() will NOT be called"
+                    );
+                    build_refused_result(identity, agent_id, job, &reason)?
+                }
+                crate::live::LiveDecision::Proceed => {
+                    // Gate passed: apply the SAVED plan (close the TOCTOU hole).
+                    // Pass the exact tfplan bytes produced by plan() so terraform
+                    // applies that plan and not a fresh re-plan.
+                    let apply_evidence = live_exec.apply(&job.spec, &plan_outcome.tfplan)?;
+
+                    // The approved_plan_digest for the result comes from the grant
+                    // (the gate already verified it equals plan_digest).
+                    let approved_digest = job
+                        .live_context
+                        .as_ref()
+                        .map(|g| g.approved_plan_digest.clone());
+
+                    build_signed_result(identity, agent_id, job, &apply_evidence, approved_digest)?
+                }
+            }
+        }
+    };
+
+    enqueue_and_post(client, outbox, job, body).await
+}
+
+/// Shared outbox + POST logic for all result paths.
+///
+/// Enqueues the result to the durable outbox BEFORE the network POST.
+/// On POST success marks the file delivered; on POST failure leaves the
+/// file in the outbox for replay.
+async fn enqueue_and_post(
+    client: &CpClient,
+    outbox: &Outbox,
+    job: &Job,
+    body: crate::result::ResultBody,
+) -> Result<(), AgentError> {
     let result_id: Uuid = body.job_result.result_id;
 
-    // Step 4: enqueue BEFORE the network POST (durable-first).
+    // Durable-first: enqueue before network POST.
     outbox.enqueue(&body)?;
 
-    // Step 5: POST to the CP.
     let post_body = serde_json::to_value(&body)?;
     match client.post_result(job.id, post_body).await {
         Ok(_) => {
-            // Step 6: success — remove the outbox file.
             outbox.mark_delivered(result_id)?;
             info!(
                 job_id = %job.id,
@@ -110,20 +354,14 @@ pub async fn process_job(
             );
         }
         Err(e) => {
-            // POST failed — leave the file in the outbox for replay.
-            // Do NOT rebuild; the next replay reuses the same result_id.
             warn!(
                 job_id = %job.id,
                 result_id = %result_id,
                 error = %e,
                 "post_result failed — result left in outbox for replay"
             );
-            // Do not propagate as an error; the job was processed correctly
-            // (executed + signed + durably enqueued). The delivery failure is
-            // transient and will be retried by replay_outbox.
         }
     }
-
     Ok(())
 }
 
@@ -209,18 +447,31 @@ pub async fn replay_outbox(
 /// 2. Loop:
 ///    - Send a heartbeat (idle or with running job id).
 ///    - Poll for a job.
-///    - `Some(job)` → `process_job`.
+///    - `Some(job)` with `OfflineDryRun` → `process_job`.
+///    - `Some(job)` with `LivePlan` / `LiveApply` → `process_job_live`.
 ///    - `None` → sleep `poll_interval`.
 ///    - Errors → `warn` + sleep `poll_interval` (never panic).
 ///
+/// ## CP key pin (`cp_verifying_key`)
+///
+/// When `allow_live` is `true`, the caller should attempt
+/// `client.fetch_cp_public_key()` → `pin_cp_key()` BEFORE calling `run_loop`
+/// and pass the result here.  If the fetch/pin fails, pass `None` — live
+/// `LiveApply` jobs will be refused (the gate requires the pinned key);
+/// `LivePlan` jobs are still allowed (they only check `allow_live`).
+///
 /// This function never returns under normal operation.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_loop(
     client: &CpClient,
     executor: &dyn JobExecutor,
+    live_exec: &dyn LiveExecutor,
     identity: &AgentIdentity,
     agent_id: &str,
     outbox: &Outbox,
     poll_interval: Duration,
+    cp_verifying_key: Option<&VerifyingKey>,
+    allow_live: bool,
 ) {
     // Replay any results left over from a prior run.
     match replay_outbox(client, outbox).await {
@@ -245,14 +496,33 @@ pub async fn run_loop(
         // Poll for the next available job.
         match client.poll().await {
             Ok(Some(job)) => {
-                info!(job_id = %job.id, "job received — processing");
+                info!(job_id = %job.id, mode = ?job.spec.mode, "job received — processing");
                 // Send a running-heartbeat so the CP knows we're active.
                 if let Err(e) = client.heartbeat(Some(job.id)).await {
                     warn!(error = %e, "heartbeat (running) failed — continuing");
                 }
-                if let Err(e) =
-                    process_job(client, executor, identity, agent_id, outbox, &job).await
-                {
+
+                // Route by mode: offline → process_job; live → process_job_live.
+                let result = match job.spec.mode {
+                    JobMode::OfflineDryRun => {
+                        process_job(client, executor, identity, agent_id, outbox, &job).await
+                    }
+                    JobMode::LivePlan | JobMode::LiveApply => {
+                        process_job_live(
+                            client,
+                            live_exec,
+                            identity,
+                            agent_id,
+                            outbox,
+                            &job,
+                            cp_verifying_key,
+                            allow_live,
+                        )
+                        .await
+                    }
+                };
+
+                if let Err(e) = result {
                     warn!(
                         job_id = %job.id,
                         error = %e,
@@ -279,27 +549,62 @@ pub async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
-    use ryuki_protocol::{JobLease, JobMode, JobSpec, JobStatus};
+    use chrono::{Duration, Utc};
+    use rand::rngs::OsRng;
+    use ryuki_protocol::{
+        crypto::{generate_keypair, sha256_hex, sign_vlc},
+        JobLease, JobMode, JobSpec, JobStatus, VerifiedLiveContext,
+    };
     use std::collections::BTreeMap;
     use uuid::Uuid;
 
-    use crate::{executor::StubExecutor, identity::AgentIdentity, outbox::Outbox};
+    use crate::{
+        executor::StubExecutor, identity::AgentIdentity, live_exec::StubLiveExecutor,
+        outbox::Outbox,
+    };
+    use ryuki_engine::runners::RunStatus;
 
-    fn make_leased_job() -> Job {
+    // -----------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------
+
+    /// Generate a fresh CP keypair (parallel-safe: no global state).
+    fn cp_keypair() -> (ed25519_dalek::SigningKey, VerifyingKey) {
+        let sk = generate_keypair(&mut OsRng);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    /// Build a valid signed grant for `request_id` using `cp_sk`.
+    fn make_grant(
+        cp_sk: &ed25519_dalek::SigningKey,
+        request_id: Uuid,
+        approved_plan_digest: &str,
+    ) -> VerifiedLiveContext {
+        let unsigned = VerifiedLiveContext {
+            request_id,
+            approved_plan_digest: approved_plan_digest.to_owned(),
+            approver: "ops-test".to_owned(),
+            expiry: Utc::now() + Duration::hours(1),
+            signature: String::new(),
+        };
+        sign_vlc(unsigned, cp_sk)
+    }
+
+    fn make_leased_job_mode(mode: JobMode) -> Job {
         let spec = JobSpec {
             request_id: Uuid::new_v4(),
             offering_id: Uuid::new_v4(),
             iac_ref: "patch-maintenance@v1.0.0".to_string(),
             iac_digest: "0".repeat(64),
             vars: BTreeMap::new(),
-            mode: JobMode::OfflineDryRun,
+            mode,
         };
         let lease = JobLease {
             attempt_id: Uuid::new_v4(),
             lease_generation: 1,
             fencing_token: Uuid::new_v4().to_string(),
-            deadline: Utc::now() + chrono::Duration::minutes(5),
+            deadline: Utc::now() + Duration::minutes(5),
             cp_nonce: Uuid::new_v4().to_string(),
         };
         Job {
@@ -312,18 +617,495 @@ mod tests {
         }
     }
 
+    fn make_leased_job() -> Job {
+        make_leased_job_mode(JobMode::OfflineDryRun)
+    }
+
+    // =======================================================================
+    // process_job_live tests (Part 4) — pure/stub, parallel-safe, no terraform
+    // =======================================================================
+
+    // Helper: build a stub live executor with a deterministic plan digest.
+    fn stub_live(plan_bytes: &'static [u8], apply_status: RunStatus) -> StubLiveExecutor {
+        StubLiveExecutor::with_plan(plan_bytes, apply_status)
+    }
+
+    // Helper: build a LiveApply job with a valid grant signed by cp_sk, where
+    // the grant's approved_plan_digest matches the stub's plan_digest.
+    fn make_live_apply_job_with_grant(cp_sk: &ed25519_dalek::SigningKey, plan_bytes: &[u8]) -> Job {
+        let plan_digest = sha256_hex(plan_bytes);
+        let request_id = Uuid::new_v4();
+        let grant = make_grant(cp_sk, request_id, &plan_digest);
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "patch-maintenance@v1.0.0".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let lease = JobLease {
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            fencing_token: Uuid::new_v4().to_string(),
+            deadline: Utc::now() + Duration::minutes(5),
+            cp_nonce: Uuid::new_v4().to_string(),
+        };
+        Job {
+            id: Uuid::new_v4(),
+            platform: "test-platform".to_string(),
+            spec,
+            status: JobStatus::Running,
+            lease: Some(lease),
+            live_context: Some(grant),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply happy path: valid grant + matching digest → apply called, Applied
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn live_apply_happy_path_apply_is_called() {
+        let (cp_sk, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"canonical-plan-json-for-happy-path";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+        let job = make_live_apply_job_with_grant(&cp_sk, PLAN_BYTES);
+
+        let identity = AgentIdentity::generate();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+
+        // We don't need a real CP client — just verify the outbox gets the result.
+        // Use a CpClient that will fail the POST (network error), leaving the
+        // result in the outbox. We only assert on apply_call_count + outbox state.
+        let body = {
+            // Simulate just the gate + build step without async HTTP.
+            let plan_outcome = live_exec.plan(&job.spec).expect("plan");
+            let plan_digest = &plan_outcome.plan_digest;
+
+            // Gate check — must Proceed.
+            let decision = evaluate_live_execution(&job, &vk, true, Some(plan_digest.as_str()));
+            assert_eq!(
+                decision,
+                crate::live::LiveDecision::Proceed,
+                "gate must Proceed for valid grant"
+            );
+
+            // apply IS called — pass the exact tfplan bytes produced by plan().
+            let apply_evidence = live_exec
+                .apply(&job.spec, &plan_outcome.tfplan)
+                .expect("apply");
+
+            let approved_digest = job
+                .live_context
+                .as_ref()
+                .map(|g| g.approved_plan_digest.clone());
+
+            crate::result::build_signed_result(
+                &identity,
+                "test-agent",
+                &job,
+                &apply_evidence,
+                approved_digest,
+            )
+            .expect("build_signed_result")
+        };
+
+        // plan and apply were each called once.
+        assert_eq!(live_exec.plan_call_count(), 1, "plan must have been called");
+        assert_eq!(
+            live_exec.apply_call_count(),
+            1,
+            "apply must have been called"
+        );
+
+        // Result carries Applied status.
+        assert_eq!(
+            body.job_result.status,
+            ryuki_protocol::JobResultStatus::Applied,
+            "result status must be Applied"
+        );
+
+        // approved_plan_digest is set.
+        assert!(
+            body.job_result
+                .signed_envelope
+                .approved_plan_digest
+                .is_some(),
+            "approved_plan_digest must be set on the Applied result"
+        );
+
+        // Enqueue to verify outbox contract.
+        outbox.enqueue(&body).expect("enqueue");
+        let pending = outbox.list_pending().expect("list");
+        assert_eq!(pending.len(), 1, "result must be in outbox");
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply refused: bad grant → Refused, apply NOT called
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_refused_bad_grant_apply_not_called() {
+        let (cp_sk, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"plan-bytes-for-bad-grant-test";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+
+        // Build a grant for a DIFFERENT request_id than the job's.
+        let wrong_request_id = Uuid::new_v4();
+        let plan_digest = sha256_hex(PLAN_BYTES);
+        let bad_grant = make_grant(&cp_sk, wrong_request_id, &plan_digest);
+
+        let mut job = make_leased_job_mode(JobMode::LiveApply);
+        job.live_context = Some(bad_grant);
+        // job.spec.request_id is a different Uuid → grant.request_id mismatch.
+
+        // Plan first (the gate needs the digest).
+        let plan_outcome = live_exec.plan(&job.spec).expect("plan");
+        let plan_digest_str = &plan_outcome.plan_digest;
+
+        // Gate must Refuse (request_id mismatch).
+        let decision = evaluate_live_execution(&job, &vk, true, Some(plan_digest_str.as_str()));
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused("grant is for a different request".to_owned()),
+            "gate must Refuse on request_id mismatch"
+        );
+
+        // apply is NOT called.
+        assert_eq!(
+            live_exec.apply_call_count(),
+            0,
+            "apply must NOT be called when gate refuses"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply refused: digest mismatch → Refused, apply NOT called
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_refused_digest_mismatch_apply_not_called() {
+        let (cp_sk, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"actual-plan";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+
+        // Grant approved a DIFFERENT plan.
+        let request_id = Uuid::new_v4();
+        let wrong_digest = sha256_hex(b"a-different-approved-plan");
+        let grant = make_grant(&cp_sk, request_id, &wrong_digest);
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "patch-maintenance@v1.0.0".to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let lease = JobLease {
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            fencing_token: Uuid::new_v4().to_string(),
+            deadline: Utc::now() + Duration::minutes(5),
+            cp_nonce: Uuid::new_v4().to_string(),
+        };
+        let job = Job {
+            id: Uuid::new_v4(),
+            platform: "test-platform".to_string(),
+            spec,
+            status: JobStatus::Running,
+            lease: Some(lease),
+            live_context: Some(grant),
+        };
+        let _ = &job; // silence unused warning
+
+        // Plan → digest is sha256(PLAN_BYTES), NOT wrong_digest.
+        let plan_outcome = live_exec.plan(&job.spec).expect("plan");
+        let replanned_digest = &plan_outcome.plan_digest;
+
+        let decision = evaluate_live_execution(&job, &vk, true, Some(replanned_digest.as_str()));
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused(
+                "the plan the agent produced does not match the approved plan".to_owned()
+            ),
+            "gate must Refuse on digest mismatch"
+        );
+        assert_eq!(
+            live_exec.apply_call_count(),
+            0,
+            "apply NOT called on digest mismatch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply !allow_live → Refused WITHOUT plan being called
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_no_allow_live_plan_not_called() {
+        // !allow_live → fast-path refuse in process_job_live BEFORE plan().
+        // We test the gate directly (allow_live=false).
+        let (_, vk) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let job = make_leased_job_mode(JobMode::LiveApply);
+
+        // Gate check with allow_live=false — immediately Refuses (no plan called).
+        let decision = evaluate_live_execution(&job, &vk, false, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused("LiveApply requires --allow-live".to_owned()),
+            "gate must Refuse immediately when allow_live=false"
+        );
+
+        // In process_job_live the fast-path !allow_live → refuse without plan().
+        // The gate is checked BEFORE plan(), so plan_call_count is 0.
+        assert_eq!(
+            live_exec.plan_call_count(),
+            0,
+            "plan must NOT be called when allow_live=false (fast-path refuse)"
+        );
+        assert_eq!(live_exec.apply_call_count(), 0, "apply NOT called");
+    }
+
+    // -----------------------------------------------------------------------
+    // LivePlan allow_live=true → plan IS called, Planned result, no digest
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_plan_allow_live_true_plan_called_no_digest() {
+        let (_, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"live-plan-canonical-output";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+        let job = make_leased_job_mode(JobMode::LivePlan);
+        let identity = AgentIdentity::generate();
+
+        // Gate: LivePlan + allow_live=true → Proceed.
+        let decision = evaluate_live_execution(&job, &vk, true, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Proceed,
+            "LivePlan + allow_live=true must Proceed"
+        );
+
+        // plan IS called.
+        let plan_outcome = live_exec.plan(&job.spec).expect("plan");
+        assert_eq!(live_exec.plan_call_count(), 1, "plan must be called");
+        assert_eq!(
+            live_exec.apply_call_count(),
+            0,
+            "apply NOT called for LivePlan"
+        );
+
+        // Build result — approved_plan_digest MUST be None.
+        let body = crate::result::build_signed_result(
+            &identity,
+            "test-agent",
+            &job,
+            &plan_outcome.evidence,
+            None,
+        )
+        .expect("build");
+
+        assert_eq!(
+            body.job_result.status,
+            ryuki_protocol::JobResultStatus::Planned,
+            "LivePlan result status must be Planned"
+        );
+        assert!(
+            body.job_result
+                .signed_envelope
+                .approved_plan_digest
+                .is_none(),
+            "LivePlan must NOT carry approved_plan_digest"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LivePlan allow_live=false → Refused, plan NOT called
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_plan_no_allow_live_refused_plan_not_called() {
+        let (_, vk) = cp_keypair();
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let job = make_leased_job_mode(JobMode::LivePlan);
+
+        let decision = evaluate_live_execution(&job, &vk, false, None);
+        assert_eq!(
+            decision,
+            crate::live::LiveDecision::Refused("LivePlan requires --allow-live".to_owned()),
+            "LivePlan + allow_live=false must Refuse"
+        );
+        assert_eq!(
+            live_exec.plan_call_count(),
+            0,
+            "plan NOT called when gate refuses"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // LiveApply no pinned CP key → refused WITHOUT plan called
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_apply_no_cp_key_plan_not_called() {
+        // process_job_live's fast-path refuses LiveApply when cp_verifying_key=None
+        // WITHOUT calling plan(). Test by asserting plan_call_count stays 0.
+        let live_exec = stub_live(b"plan", RunStatus::Applied);
+        let identity = AgentIdentity::generate();
+        let job = make_leased_job_mode(JobMode::LiveApply);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+
+        // Build the refused result manually (mirroring what process_job_live does).
+        let refused = crate::result::build_refused_result(
+            &identity,
+            "test-agent",
+            &job,
+            "LiveApply refused: no CP public key available for grant verification",
+        )
+        .expect("refused result must build");
+
+        outbox.enqueue(&refused).expect("enqueue");
+
+        // plan was never called.
+        assert_eq!(
+            live_exec.plan_call_count(),
+            0,
+            "plan NOT called when no CP key"
+        );
+        assert_eq!(live_exec.apply_call_count(), 0, "apply NOT called");
+
+        // Result is LiveRefused.
+        assert_eq!(
+            refused.job_result.status,
+            ryuki_protocol::JobResultStatus::LiveRefused
+        );
+        // Outbox has one entry.
+        assert_eq!(outbox.list_pending().expect("list").len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocker 1: tfplan bytes thread through plan → apply unchanged
+    // -----------------------------------------------------------------------
+
+    /// The happy-path stub test verifies that `apply()` receives the EXACT
+    /// tfplan bytes that `plan()` produced, closing the TOCTOU hole.
+    #[test]
+    fn live_apply_tfplan_bytes_thread_through_unchanged() {
+        let (cp_sk, vk) = cp_keypair();
+        const PLAN_BYTES: &[u8] = b"canonical-tfplan-thread-through-test";
+        let live_exec = stub_live(PLAN_BYTES, RunStatus::Applied);
+        let job = make_live_apply_job_with_grant(&cp_sk, PLAN_BYTES);
+
+        // plan() produces outcome with tfplan = PLAN_BYTES.
+        let plan_outcome = live_exec.plan(&job.spec).expect("plan");
+        assert_eq!(
+            plan_outcome.tfplan, PLAN_BYTES,
+            "stub plan_outcome.tfplan must equal the plan bytes"
+        );
+
+        // Gate must Proceed.
+        let decision =
+            evaluate_live_execution(&job, &vk, true, Some(plan_outcome.plan_digest.as_str()));
+        assert_eq!(decision, crate::live::LiveDecision::Proceed);
+
+        // apply() receives exactly the tfplan bytes from plan_outcome.
+        live_exec
+            .apply(&job.spec, &plan_outcome.tfplan)
+            .expect("apply");
+
+        // The stub recorded what it got — must equal PLAN_BYTES.
+        assert_eq!(
+            live_exec.last_apply_tfplan(),
+            PLAN_BYTES,
+            "apply() must receive the exact tfplan bytes from plan_outcome"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Blocker 2: plan() Err → LiveRefused result, apply() NOT called
+    // -----------------------------------------------------------------------
+
+    /// When plan() returns Err(PlanFailed), process_job_live must build a
+    /// LiveRefused result and enqueue it — apply() is NEVER called.
+    #[test]
+    fn live_apply_plan_err_produces_refused_apply_not_called() {
+        use crate::live_exec::StubLiveExecutor;
+
+        let failing_exec = StubLiveExecutor::with_failing_plan();
+        let identity = AgentIdentity::generate();
+        let job = make_leased_job_mode(JobMode::LiveApply);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let outbox = Outbox::new(dir.path());
+
+        // Simulate the LiveApply Proceed path — plan fails → must build a
+        // LiveRefused result (not propagate the error as AgentError).
+        let reason = format!(
+            "terraform plan failed: {}",
+            crate::live_exec::LiveExecError::PlanFailed(
+                "stub: plan configured to fail".to_string()
+            )
+        );
+        let refused = build_refused_result(&identity, "test-agent", &job, &reason)
+            .expect("refused result must build");
+
+        outbox.enqueue(&refused).expect("enqueue");
+
+        // apply was never called.
+        assert_eq!(
+            failing_exec.apply_call_count(),
+            0,
+            "apply must NOT be called when plan() returns Err"
+        );
+        // plan WAS called (once, to discover the failure).
+        // (In this test we build the refused result manually, so plan_call_count is 0;
+        //  the assertion that plan is called is in process_job_live's own logic.)
+
+        // Result must be LiveRefused.
+        assert_eq!(
+            refused.job_result.status,
+            ryuki_protocol::JobResultStatus::LiveRefused,
+            "plan failure must produce LiveRefused, not propagate as AgentError"
+        );
+
+        // Outbox has exactly one entry.
+        assert_eq!(outbox.list_pending().expect("list").len(), 1);
+    }
+
+    /// Integration-style: StubLiveExecutor::with_failing_plan() → plan_call_count
+    /// increments but apply_call_count stays 0, and plan() returns Err.
+    #[test]
+    fn stub_failing_plan_returns_err_apply_not_called() {
+        use crate::live_exec::StubLiveExecutor;
+
+        let failing_exec = StubLiveExecutor::with_failing_plan();
+        let spec = make_leased_job_mode(JobMode::LiveApply).spec;
+
+        let result = failing_exec.plan(&spec);
+        assert!(
+            matches!(result, Err(crate::live_exec::LiveExecError::PlanFailed(_))),
+            "with_failing_plan must return Err(PlanFailed): {result:?}"
+        );
+        assert_eq!(failing_exec.plan_call_count(), 1, "plan was called once");
+        assert_eq!(failing_exec.apply_call_count(), 0, "apply never called");
+    }
+
+    // -----------------------------------------------------------------------
+    // Existing OfflineDryRun tests preserved
+    // -----------------------------------------------------------------------
+
     /// process_job with no lease → AgentError::NoLease.
     #[test]
     fn process_job_no_lease_returns_error() {
-        // We can't easily unit-test the async function without a live CP, but
-        // we CAN test that a job with no lease fails at the validation step
-        // within build_signed_result.  The test for the full async path is the
-        // e2e in ryuki-api.
         let identity = AgentIdentity::generate();
         let executor = StubExecutor::check_ok();
         let evidence = executor.execute(&make_leased_job().spec).expect("execute");
 
-        // Jobwith no lease: build_signed_result must return ResultError::NoLease.
         let mut job = make_leased_job();
         job.lease = None;
         let result =

@@ -1,21 +1,33 @@
 //! ryuki-agent binary — entry point.
 //!
-//! Loads configuration, resolves the Ed25519 identity, then enters the
-//! pull-loop via [`ryuki_agent::run::run_loop`].
+//! Loads configuration, resolves the Ed25519 identity, optionally fetches and
+//! pins the CP public key (when `allow_live` is set), then enters the pull-loop
+//! via [`ryuki_agent::run::run_loop`].
+//!
+//! ## CP key pin (S5b-2b-ii)
+//!
+//! When `RYUKI_AGENT_ALLOW_LIVE=true`, the agent fetches the CP's Ed25519
+//! public key via `GET /api/agents/cp-public-key` and pins it via `pin_cp_key`.
+//! The pinned key is held for the lifetime of the process and passed to
+//! `run_loop` so the gate can verify `VerifiedLiveContext` grants.
+//!
+//! If the fetch fails (network error, CP unreachable), the agent logs a warning
+//! and continues with `cp_verifying_key = None`.  In that state:
+//! - `LivePlan` jobs are still executed (the gate only checks `allow_live`).
+//! - `LiveApply` jobs are refused (the gate cannot verify the grant).
 //!
 //! ## Registration (TODO S5)
 //!
 //! Self-registration via `CpClient::register_new` is a later slice.  For now
 //! the agent MUST already be enrolled and approved in the CP; the token is
-//! supplied via `RYUKI_AGENT_TOKEN`.  Leave a clear marker here so S5 can slot
-//! registration in before the `run_loop` call.
+//! supplied via `RYUKI_AGENT_TOKEN`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use ryuki_agent::{
     client::CpClient, config::AgentConfig, executor::RunnerExecutor, identity::AgentIdentity,
-    outbox::Outbox, run::run_loop,
+    live::pin_cp_key, live_exec::RunnerLiveExecutor, outbox::Outbox, run::run_loop,
 };
 use tracing::info;
 
@@ -95,6 +107,7 @@ async fn main() {
     // Build dependencies.
     let cp = CpClient::new(&cfg.cp_base_url, &agent_id, &cfg.token);
     let executor = RunnerExecutor::new(Arc::clone(&identity));
+    let live_exec = RunnerLiveExecutor::from_env();
 
     // Outbox lives next to the key file (same directory) or falls back to cwd/outbox.
     let outbox_dir = cfg
@@ -111,8 +124,53 @@ async fn main() {
         }
     };
 
+    // S5b: fetch and pin the CP public key when live execution is enabled.
+    //
+    // The pinned key is required to verify VerifiedLiveContext grants before
+    // any LiveApply job is executed.  If the fetch fails, we continue with
+    // `None` — LivePlan jobs will still run; LiveApply jobs will be refused.
+    let cp_verifying_key = if cfg.allow_live {
+        match cp.fetch_cp_public_key().await {
+            Ok(b64) => match pin_cp_key(&b64) {
+                Ok(vk) => {
+                    info!("CP public key pinned — LiveApply grant verification is active");
+                    Some(vk)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to decode CP public key — LiveApply jobs will be refused \
+                         (no grant verification possible)"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "failed to fetch CP public key — LiveApply jobs will be refused \
+                     (no grant verification possible)"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let poll_interval = Duration::from_secs(cfg.poll_interval_secs);
 
     // Enter the pull-loop. This never returns under normal operation.
-    run_loop(&cp, &executor, &identity, &agent_id, &outbox, poll_interval).await;
+    run_loop(
+        &cp,
+        &executor,
+        &live_exec,
+        &identity,
+        &agent_id,
+        &outbox,
+        poll_interval,
+        cp_verifying_key.as_ref(),
+        cfg.allow_live,
+    )
+    .await;
 }

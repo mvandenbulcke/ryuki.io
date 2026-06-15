@@ -15,6 +15,7 @@ pub mod config;
 pub mod executor;
 pub mod identity;
 pub mod live;
+pub mod live_exec;
 pub mod outbox;
 pub mod result;
 pub mod run;
