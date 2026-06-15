@@ -1,0 +1,25 @@
+[package]
+name = "ryuki-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Wire contract and signature primitives for the Ryuki agent↔control-plane protocol. Pure types + crypto; no IO."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+# Ed25519 signatures — v2, the maintained pure-Rust implementation.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# rand_core is a direct dep so its traits are available in our public API
+# (generate_keypair takes `&mut impl rand_core::CryptoRngCore`).
+rand_core = "0.6"
+# SHA-256 for job-spec / evidence digests.
+sha2 = "0.10"
+# base64 for wire encoding of keys and signatures.
+base64 = "0.22"
+# Structured error type.
+thiserror = "2"
+
+[dev-dependencies]
+rand = "0.8"

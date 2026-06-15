@@ -5,6 +5,7 @@ members = [
     "sources/ryuki-api",
     "sources/ryuki-engine",
     "sources/ryuki-runner",
+    "sources/ryuki-protocol",
     "portal/portal-ui",
     "scripts/validator-rs",
 ]
@@ -53,6 +54,7 @@ tower = { version = "0.5", features = ["limit"] }
 ryuki-core = { path = "sources/ryuki-core" }
 ryuki-engine = { path = "sources/ryuki-engine" }
 ryuki-runner = { path = "sources/ryuki-runner" }
+ryuki-protocol = { path = "sources/ryuki-protocol" }
 
 [profile.wasm-release]
 codegen-units = 1
