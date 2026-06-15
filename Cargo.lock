@@ -2914,19 +2914,17 @@ dependencies = [
  "figment",
  "governor",
  "jsonwebtoken",
- "libc",
  "rand 0.8.6",
- "regex",
  "reqwest",
  "rsa",
  "ryuki-core",
  "ryuki-engine",
+ "ryuki-runner",
  "serde",
  "serde_json",
  "sha2",
  "sqlx",
  "subtle",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -2934,7 +2932,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "wait-timeout",
  "zeroize",
 ]
 
@@ -2959,6 +2956,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2989,6 +2987,18 @@ dependencies = [
  "tokio",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "ryuki-runner"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "ryuki-engine",
+ "serde_json",
+ "tempfile",
+ "wait-timeout",
 ]
 
 [[package]]

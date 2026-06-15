@@ -10549,10 +10549,10 @@ fn enrich_plan_stages_with_terraform_sync(
     stages: &mut [ryuki_engine::models::Stage],
 ) {
     use crate::integration::ResolvedCredentials;
-    use crate::runner::iac;
-    use crate::runner::terraform::TerraformRunner;
-    use crate::runner::Runner;
     use ryuki_engine::runners::{RunMode, RunPlan};
+    use ryuki_runner::iac;
+    use ryuki_runner::terraform::TerraformRunner;
+    use ryuki_runner::Runner;
 
     // Resolve the effective offering_id via the OS-discriminating resolver.
     // For server-deployment this maps to linux- or windows- by OS metadata;
@@ -10612,11 +10612,11 @@ async fn enrich_plan_stages_with_terraform(
     stages: &mut [ryuki_engine::models::Stage],
 ) {
     use crate::integration::ResolvedCredentials;
-    use crate::runner::iac;
-    use crate::runner::terraform::TerraformRunner;
-    use crate::runner::Runner;
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
     use ryuki_engine::runners::{RunMode, RunPlan};
+    use ryuki_runner::iac;
+    use ryuki_runner::terraform::TerraformRunner;
+    use ryuki_runner::Runner;
 
     // Resolve offering_id before entering spawn_blocking (cheap, borrows request).
     let offering_id = iac::resolve_offering_id(request);
@@ -10683,10 +10683,10 @@ fn enrich_verify_stages_with_ansible_sync(
     stages: &mut [ryuki_engine::models::Stage],
 ) {
     use crate::integration::ResolvedCredentials;
-    use crate::runner::ansible::AnsibleRunner;
-    use crate::runner::iac;
-    use crate::runner::Runner;
     use ryuki_engine::runners::{RunMode, RunPlan, RunnerKind};
+    use ryuki_runner::ansible::AnsibleRunner;
+    use ryuki_runner::iac;
+    use ryuki_runner::Runner;
 
     // Resolve the effective offering_id via the OS-discriminating resolver.
     let offering_id = iac::resolve_offering_id(request);
@@ -10736,11 +10736,11 @@ async fn enrich_verify_stages_with_ansible(
     stages: &mut [ryuki_engine::models::Stage],
 ) {
     use crate::integration::ResolvedCredentials;
-    use crate::runner::ansible::AnsibleRunner;
-    use crate::runner::iac;
-    use crate::runner::Runner;
     use ryuki_engine::models::{EvidenceItem, EvidenceType};
     use ryuki_engine::runners::{RunMode, RunPlan, RunnerKind};
+    use ryuki_runner::ansible::AnsibleRunner;
+    use ryuki_runner::iac;
+    use ryuki_runner::Runner;
 
     let offering_id = iac::resolve_offering_id(request);
     let offering_id_str = offering_id.clone();
@@ -20499,7 +20499,7 @@ mod maint_calendar_db_tests {
     /// Unit test: resolver returns Some for patch-maintenance, None for others.
     #[test]
     fn terraform_iac_resolver_known_and_unknown_offerings() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         let bundle = iac::resolve("patch-maintenance");
         assert!(bundle.is_some(), "patch-maintenance must have wired IaC");
         assert!(
@@ -20519,9 +20519,9 @@ mod maint_calendar_db_tests {
     /// (note item present, no panic, transition succeeds).
     #[test]
     fn plan_stages_enriched_with_terraform_evidence_for_patch_maintenance() {
-        use crate::runner::terraform::TerraformRunner;
-        use crate::runner::Runner;
         use ryuki_engine::models::EvidenceType;
+        use ryuki_runner::terraform::TerraformRunner;
+        use ryuki_runner::Runner;
 
         let request = make_validated_patch_maintenance_request();
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
@@ -20633,8 +20633,8 @@ mod maint_calendar_db_tests {
     /// evidence when terraform is available, not just the in-memory stages.
     #[test]
     fn plan_json_for_db_write_contains_terraform_evidence_when_available() {
-        use crate::runner::terraform::TerraformRunner;
-        use crate::runner::Runner;
+        use ryuki_runner::terraform::TerraformRunner;
+        use ryuki_runner::Runner;
 
         let request = make_validated_patch_maintenance_request();
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
@@ -20701,7 +20701,7 @@ mod maint_calendar_db_tests {
     /// Unit test: ansible resolver returns Some for patch-maintenance, None for others.
     #[test]
     fn ansible_iac_resolver_known_and_unknown_offerings() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         let bundle = iac::resolve_ansible("patch-maintenance");
         assert!(
             bundle.is_some(),
@@ -20724,9 +20724,9 @@ mod maint_calendar_db_tests {
     /// no panic, transition succeeds).
     #[test]
     fn verify_stages_enriched_with_ansible_evidence_for_patch_maintenance() {
-        use crate::runner::ansible::AnsibleRunner;
-        use crate::runner::Runner;
         use ryuki_engine::models::EvidenceType;
+        use ryuki_runner::ansible::AnsibleRunner;
+        use ryuki_runner::Runner;
 
         let request = make_verifying_patch_maintenance_request();
         let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
@@ -20847,8 +20847,8 @@ mod maint_calendar_db_tests {
     /// ansible evidence when ansible-playbook is available.
     #[test]
     fn verify_stages_json_for_db_write_contains_ansible_evidence_when_available() {
-        use crate::runner::ansible::AnsibleRunner;
-        use crate::runner::Runner;
+        use ryuki_runner::ansible::AnsibleRunner;
+        use ryuki_runner::Runner;
 
         let request = make_verifying_patch_maintenance_request();
         let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
@@ -20907,9 +20907,9 @@ mod maint_calendar_db_tests {
     /// end-to-end for patch-maintenance.
     #[tokio::test]
     async fn async_enrich_plan_stages_terraform_smoke_patch_maintenance() {
-        use crate::runner::terraform::TerraformRunner;
-        use crate::runner::Runner;
         use ryuki_engine::models::EvidenceType;
+        use ryuki_runner::terraform::TerraformRunner;
+        use ryuki_runner::Runner;
 
         let request = make_validated_patch_maintenance_request();
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&request)
@@ -20968,9 +20968,9 @@ mod maint_calendar_db_tests {
     /// end-to-end for patch-maintenance.
     #[tokio::test]
     async fn async_enrich_verify_stages_ansible_smoke_patch_maintenance() {
-        use crate::runner::ansible::AnsibleRunner;
-        use crate::runner::Runner;
         use ryuki_engine::models::EvidenceType;
+        use ryuki_runner::ansible::AnsibleRunner;
+        use ryuki_runner::Runner;
 
         let request = make_verifying_patch_maintenance_request();
         let evidence = ryuki_engine::request_lifecycle::verify_request(&request)
@@ -21053,7 +21053,7 @@ mod maint_calendar_db_tests {
     /// discriminates Windows vs Linux for server-deployment.
     #[test]
     fn resolve_offering_id_windows_routes_to_windows_offering() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         let req = make_server_deployment_request_with_os(Some("Windows Server 2022"));
         assert_eq!(
             iac::resolve_offering_id(&req),
@@ -21064,7 +21064,7 @@ mod maint_calendar_db_tests {
 
     #[test]
     fn resolve_offering_id_linux_routes_to_linux_offering() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         let req = make_server_deployment_request_with_os(Some("RHEL 9"));
         assert_eq!(
             iac::resolve_offering_id(&req),
@@ -21075,7 +21075,7 @@ mod maint_calendar_db_tests {
 
     #[test]
     fn resolve_offering_id_absent_os_stays_unmapped() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         let req = make_server_deployment_request_with_os(None);
         assert_eq!(
             iac::resolve_offering_id(&req),
@@ -21096,8 +21096,8 @@ mod maint_calendar_db_tests {
     /// When terraform is absent (CI without binary): graceful-degradation note.
     #[test]
     fn plan_stages_enriched_with_windows_terraform_for_windows_os() {
-        use crate::runner::terraform::TerraformRunner;
-        use crate::runner::Runner;
+        use ryuki_runner::terraform::TerraformRunner;
+        use ryuki_runner::Runner;
 
         let req = make_server_deployment_request_with_os(Some("Windows Server 2022"));
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
@@ -21157,8 +21157,8 @@ mod maint_calendar_db_tests {
     /// confirms schema correctness offline; live plan requires vCenter.
     #[test]
     fn plan_stages_enriched_with_linux_terraform_for_linux_os() {
-        use crate::runner::terraform::TerraformRunner;
-        use crate::runner::Runner;
+        use ryuki_runner::terraform::TerraformRunner;
+        use ryuki_runner::Runner;
 
         let req = make_server_deployment_request_with_os(Some("Ubuntu 22.04 LTS"));
         let mut stages = ryuki_engine::request_lifecycle::plan_request(&req)
@@ -21257,7 +21257,7 @@ mod maint_calendar_db_tests {
     /// TDD — new resolve() arms return Some for linux- and windows-server-deployment.
     #[test]
     fn terraform_iac_resolver_wires_server_deployment_offerings() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         assert!(
             iac::resolve("linux-server-deployment").is_some(),
             "linux-server-deployment must now have wired terraform IaC"
@@ -21272,7 +21272,7 @@ mod maint_calendar_db_tests {
     /// and controlled-restore-request.
     #[test]
     fn ansible_iac_resolver_wires_new_offerings() {
-        use crate::runner::iac;
+        use ryuki_runner::iac;
         assert!(
             iac::resolve_ansible("linux-server-deployment").is_some(),
             "linux-server-deployment must now have wired ansible IaC"

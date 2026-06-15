@@ -1,0 +1,16 @@
+[package]
+name = "ryuki-runner"
+version = "0.1.0"
+# Matches ryuki-api (the crate this code was extracted from). The runner is
+# 2021 code: on 2024, std::env::set_var/remove_var in the tests become unsafe
+# and clippy's let-chain collapsible_if fires — both pure edition artifacts, not
+# behavior changes. Keep 2021 so the extraction is byte-for-byte behavior-stable.
+edition = "2021"
+
+[dependencies]
+ryuki-engine = { workspace = true }
+serde_json = { workspace = true }
+regex = "1"
+tempfile = "3"
+wait-timeout = "0.2"
+libc = "0.2"

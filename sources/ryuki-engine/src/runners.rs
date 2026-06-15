@@ -7,6 +7,41 @@
 use crate::models::AdapterType;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+// ---------------------------------------------------------------------------
+// ResolvedCredentials — resolved secret material (zeroized on drop)
+// ---------------------------------------------------------------------------
+
+/// Resolved credential material for a single runner invocation.
+///
+/// # Security
+/// - Does NOT implement Serialize — cannot be accidentally written to an HTTP response.
+/// - Debug output is REDACTED — safe to include in trace logs without leaking secrets.
+/// - MUST be kept short-lived. Never stored in a static or long-lived structure.
+/// - Material is zeroized on drop so secrets do not linger in heap memory.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct ResolvedCredentials {
+    /// Opaque resolved material — interpretation depends on CredentialSource.
+    /// For DbEncrypted: the decrypted plaintext (zeroized on drop).
+    /// For EnvVar: the concatenated env var values.
+    /// For Vault/MockVault: an opaque marker (real client is a later slice).
+    pub material: Vec<u8>,
+    /// Human-readable descriptor for tracing (MUST NOT contain secret material).
+    pub descriptor: String,
+}
+
+// Custom Debug: ALWAYS redacted — never print the material.
+impl std::fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ResolvedCredentials {{ descriptor: {:?}, material: [REDACTED {} bytes] }}",
+            self.descriptor,
+            self.material.len()
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RunnerKind — which tool executes this run

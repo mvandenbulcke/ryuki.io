@@ -161,7 +161,7 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::workspace::Workspace;
+    use crate::workspace::Workspace;
     use std::os::unix::fs::PermissionsExt;
 
     fn write_script(ws: &Workspace, name: &str, content: &str) -> std::path::PathBuf {

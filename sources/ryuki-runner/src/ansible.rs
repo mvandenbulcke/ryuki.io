@@ -24,7 +24,9 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
-use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind};
+use ryuki_engine::runners::{
+    ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
+};
 
 use super::{
     exec::run_command_with_timeout,
@@ -36,7 +38,6 @@ use super::{
     workspace::Workspace,
     Runner,
 };
-use crate::integration::ResolvedCredentials;
 
 /// Per-subprocess timeout for ansible-playbook --check.
 /// A hung ansible (e.g. waiting for an unreachable host) is killed after this.
@@ -485,7 +486,7 @@ mod tests {
         // the secrets file is NOT echoed, but if the binary ever leaked the
         // file path that contains the secret, scrubbing must still redact it.
         //
-        // We construct a shim that cats the secrets file to stdout (simulating
+        // We construct a shim that cats the secrets file (simulating
         // a misbehaving playbook) and verify the output is scrubbed.
         let ws_shim = Workspace::new().expect("ws");
         let shim = ws_shim.path().join("fake-ansible-scrub");

@@ -1,6 +1,6 @@
 //! Runner module — process spawning for Terraform and Ansible.
 //!
-//! This module implements the I/O side of the runner abstraction defined in
+//! This crate implements the I/O side of the runner abstraction defined in
 //! `ryuki_engine::runners`. It is responsible for:
 //! - Creating and managing an isolated per-run workspace (RAII TempDir).
 //! - Writing non-secret input files into the workspace.
@@ -33,6 +33,8 @@ pub mod workspace;
 
 use ryuki_engine::runners::{RunOutcome, RunPlan, RunnerError};
 
+pub use ryuki_engine::runners::ResolvedCredentials;
+
 /// The `Runner` trait defines the interface that both `TerraformRunner` and
 /// `AnsibleRunner` implement.
 ///
@@ -61,6 +63,6 @@ pub trait Runner {
     fn run_dry(
         &self,
         plan: &RunPlan,
-        creds: &crate::integration::ResolvedCredentials,
+        creds: &ResolvedCredentials,
     ) -> Result<RunOutcome, RunnerError>;
 }

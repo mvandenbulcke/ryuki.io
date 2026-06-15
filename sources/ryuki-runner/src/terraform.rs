@@ -21,10 +21,11 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
-use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind};
+use ryuki_engine::runners::{
+    ResolvedCredentials, RunMode, RunOutcome, RunPlan, RunStatus, RunnerError, RunnerKind,
+};
 
 use super::{exec::run_command_with_timeout, scrub::scrub_output, workspace::Workspace, Runner};
-use crate::integration::ResolvedCredentials;
 
 /// Per-subprocess timeout for terraform init and terraform plan.
 /// A hung terraform (e.g. waiting for a remote backend) is killed after this.

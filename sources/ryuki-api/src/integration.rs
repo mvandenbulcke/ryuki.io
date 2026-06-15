@@ -22,7 +22,6 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::database::get_db;
 use ryuki_engine::integration_connections::{
@@ -173,35 +172,11 @@ pub enum CredError {
     Vault(String),
 }
 
-/// Resolved credentials.
-///
-/// # Security properties
-/// - Zeroized on drop via ZeroizeOnDrop (memory is wiped when this struct is dropped).
-/// - Does NOT implement Serialize — cannot be accidentally written to an HTTP response.
-/// - Debug output is REDACTED — safe to include in trace logs without leaking secrets.
-/// - MUST be kept short-lived. Never stored in a static or long-lived structure.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct ResolvedCredentials {
-    /// Opaque resolved material — interpretation depends on CredentialSource.
-    /// For Vault/MockVault: an opaque marker (real client is a later slice).
-    /// For DbEncrypted: the decrypted plaintext (zeroized on drop).
-    /// For EnvVar: the concatenated env var values.
-    pub material: Vec<u8>,
-    /// Human-readable descriptor for tracing (MUST NOT contain secret material).
-    pub descriptor: String,
-}
-
-// Custom Debug: ALWAYS redacted — never print the material.
-impl std::fmt::Debug for ResolvedCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ResolvedCredentials {{ descriptor: {:?}, material: [REDACTED {} bytes] }}",
-            self.descriptor,
-            self.material.len()
-        )
-    }
-}
+/// Resolved credentials — re-exported from `ryuki_engine::runners` so that
+/// `ryuki-api` callers continue to use `crate::integration::ResolvedCredentials`
+/// without changes. The type is defined in `ryuki-engine` so that `ryuki-runner`
+/// can depend on it without creating a circular dependency.
+pub use ryuki_engine::runners::ResolvedCredentials;
 
 // ---------------------------------------------------------------------------
 // Vault resolver trait (real HTTP client is a later slice)
