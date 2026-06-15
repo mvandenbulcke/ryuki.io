@@ -12249,24 +12249,25 @@ struct DecommissionApproveRequest {
     approver: String,
 }
 
-// ─── Server Decommission store (in-memory) ───
-
-static DECOMMISSION_STORE: OnceLock<Mutex<Vec<ryuki_engine::models::DecommissionRequest>>> =
-    OnceLock::new();
-
-fn decommission_store() -> &'static Mutex<Vec<ryuki_engine::models::DecommissionRequest>> {
-    DECOMMISSION_STORE.get_or_init(|| Mutex::new(Vec::new()))
-}
-
 // ─── Server Decommission handlers ───
 
+/// 503 returned by handlers that require a database when no pool is available.
+fn status_503_no_db() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "persistence required: decommission requires a database"})),
+    )
+}
+
 async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
     let server_type = match body.server_type.as_str() {
         "VM" => ryuki_engine::models::ServerType::VM,
         "Physical" => ryuki_engine::models::ServerType::Physical,
         _ => return Err(status_400("Invalid server type. Use VM or Physical.")),
     };
-    match server_decommission::plan_decommission(
+    let mut req = server_decommission::plan_decommission(
         &body.server_name,
         &body.site,
         &body.os_family,
@@ -12274,15 +12275,19 @@ async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResu
         &body.reason,
         body.final_backup_required,
         body.quarantine_days,
-    ) {
-        Ok(req) => {
-            let json = serde_json::to_value(&req).unwrap();
-            let mut store = decommission_store().lock().await;
-            store.push(req);
-            Ok(Json(json))
-        }
-        Err(e) => Err(status_400(&e)),
-    }
+    )
+    .map_err(|e| status_400(&e))?;
+
+    // The engine generates a non-UUID id (e.g. "decom-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    req.id = Uuid::new_v4().to_string();
+
+    crate::repos::decommissions::insert(pool, &req)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&req).unwrap_or_default()))
 }
 
 async fn decommission_validate(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
@@ -12301,100 +12306,144 @@ async fn decommission_validate(Json(body): Json<DecommissionPlanRequest>) -> Api
         body.quarantine_days,
     )
     .map_err(|e| status_400(&e))?;
-    match server_decommission::validate_decommission(&req) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    server_decommission::validate_decommission(&req)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
 async fn decommission_approve(
     Path(id): Path<String>,
     Json(body): Json<DecommissionApproveRequest>,
 ) -> ApiResult {
-    let mut store = decommission_store().lock().await;
-    let idx = store
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    let mut req = store[idx].clone();
-    req.approvals_collected.push(body.approver);
-    req.status = ryuki_engine::models::DecommissionStatus::Approved;
-    req.updated_at = chrono::Utc::now().to_rfc3339();
-    store[idx] = req.clone();
-    Ok(Json(serde_json::to_value(req).unwrap()))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::decommissions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::decommissions::status_str(&req.status);
+
+    let approved = server_decommission::approve_decommission(&req, &body.approver)
+        .map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::decommissions::transition(pool, before, &approved, None)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
 async fn decommission_quarantine(Path(id): Path<String>) -> ApiResult {
-    let mut store = decommission_store().lock().await;
-    let idx = store
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    match server_decommission::quarantine_server(&store[idx]) {
-        Ok(quarantined) => {
-            store[idx] = quarantined.clone();
-            Ok(Json(serde_json::to_value(quarantined).unwrap()))
-        }
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::decommissions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::decommissions::status_str(&req.status);
+
+    let quarantined = server_decommission::quarantine_server(&req).map_err(|e| status_409(&e))?;
+
+    let ok =
+        crate::repos::decommissions::transition(pool, before, &quarantined, Some("quarantine"))
+            .await
+            .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&quarantined).unwrap_or_default()))
 }
 
 async fn decommission_execute(Path(id): Path<String>) -> ApiResult {
-    let mut store = decommission_store().lock().await;
-    let idx = store
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    match server_decommission::execute_decommission(&store[idx]) {
-        Ok(executed) => {
-            store[idx] = executed.clone();
-            Ok(Json(serde_json::to_value(executed).unwrap()))
-        }
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::decommissions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::decommissions::status_str(&req.status);
+
+    let executed = server_decommission::execute_decommission(&req).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::decommissions::transition(pool, before, &executed, Some("execute"))
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
 
 async fn decommission_verify(Path(id): Path<String>) -> ApiResult {
-    let store = decommission_store().lock().await;
-    let req = store
-        .iter()
-        .find(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    match server_decommission::verify_decommission(req) {
-        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::decommissions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    // verify_decommission is evidence-only by engine design: it does not
+    // transition status. The evidence collection is stateless and idempotent.
+    server_decommission::verify_decommission(&req)
+        .map(|evidence| Json(serde_json::to_value(evidence).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
 async fn decommission_rollback(Path(id): Path<String>) -> ApiResult {
-    let mut store = decommission_store().lock().await;
-    let idx = store
-        .iter()
-        .position(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    match server_decommission::rollback_decommission(&store[idx]) {
-        Ok(rolled_back) => {
-            store[idx] = rolled_back.clone();
-            Ok(Json(serde_json::to_value(rolled_back).unwrap()))
-        }
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::decommissions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::decommissions::status_str(&req.status);
+
+    let rolled_back =
+        server_decommission::rollback_decommission(&req).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::decommissions::transition(pool, before, &rolled_back, Some("rollback"))
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&rolled_back).unwrap_or_default()))
 }
 
 async fn decommission_quarantine_inventory() -> ApiResult {
-    let store = decommission_store().lock().await;
-    let requests: Vec<_> = store.clone();
-    let inventory = server_decommission::get_quarantine_inventory(&requests);
-    Ok(Json(serde_json::to_value(inventory).unwrap()))
+    if let Some(pool) = get_db() {
+        let requests = crate::repos::decommissions::list_quarantine(pool)
+            .await
+            .map_err(db_error)?;
+        let inventory = server_decommission::get_quarantine_inventory(&requests);
+        return Ok(Json(serde_json::to_value(inventory).unwrap_or_default()));
+    }
+    // No DB: return empty inventory
+    Ok(Json(
+        serde_json::to_value(Vec::<ryuki_engine::models::QuarantineEntry>::new())
+            .unwrap_or_default(),
+    ))
 }
 
 async fn decommission_get(Path(id): Path<String>) -> ApiResult {
-    let store = decommission_store().lock().await;
-    let req = store
-        .iter()
-        .find(|r| r.id == id)
-        .ok_or_else(|| status_400("Decommission request not found"))?;
-    Ok(Json(serde_json::to_value(req).unwrap()))
+    if let Some(pool) = get_db() {
+        return match crate::repos::decommissions::get(pool, &id).await {
+            Ok(Some(req)) => Ok(Json(serde_json::to_value(&req).unwrap_or_default())),
+            Ok(None) => Err(status_404(&id)),
+            Err(e) => Err(db_error(e)),
+        };
+    }
+    Err(status_404(&id))
 }
 
 async fn decommission_contract() -> Json<Value> {
@@ -25609,5 +25658,457 @@ mod software_deployment_db_tests {
         };
 
         cleanup_deployment(pool, &id).await;
+    }
+}
+
+// ─── Server Decommission DB integration tests ─────────────────────────────────
+
+#[cfg(test)]
+mod server_decommission_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn plan_body(suffix: &str) -> DecommissionPlanRequest {
+        DecommissionPlanRequest {
+            server_name: format!("srv-{suffix}"),
+            site: "DEFRA".into(),
+            os_family: "Windows".into(),
+            server_type: "VM".into(),
+            reason: "decommission test".into(),
+            // final_backup_required is false so the engine's validate_decommission
+            // rule "backup not confirmed" does not block the quarantine transition.
+            final_backup_required: false,
+            quarantine_days: 30,
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        // parse to UUID; ignore errors (row may not exist)
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM decommission_requests WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// plan → GET round-trip: persists correctly and reads back with a valid UUID id.
+    #[tokio::test]
+    async fn test_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let body = plan_body(&suffix);
+
+        let Ok(Json(created)) = decommission_plan(Json(body)).await else {
+            panic!("plan failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        // id must be parseable as a UUID
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("get after plan failed");
+        };
+
+        assert_eq!(
+            got["server_name"].as_str().unwrap_or(""),
+            format!("srv-{suffix}"),
+            "server_name must round-trip"
+        );
+        assert_eq!(
+            got["status"].as_str().unwrap_or(""),
+            "Planned",
+            "status after plan must be Planned"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Full lifecycle: plan → approve → quarantine → execute → verify.
+    /// Each step must persist the new status.
+    #[tokio::test]
+    async fn test_full_lifecycle_status_transitions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // 1. plan
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // 2. approve
+        let Ok(Json(approved)) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "test-approver".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("approve failed");
+        };
+        assert_eq!(approved["status"].as_str().unwrap_or(""), "Approved");
+
+        // verify persisted
+        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("get after approve failed");
+        };
+        assert_eq!(got["status"].as_str().unwrap_or(""), "Approved");
+
+        // 3. quarantine
+        let Ok(Json(quarantined)) = decommission_quarantine(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("quarantine failed");
+        };
+        assert_eq!(quarantined["status"].as_str().unwrap_or(""), "Quarantined");
+
+        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("get after quarantine failed");
+        };
+        assert_eq!(got["status"].as_str().unwrap_or(""), "Quarantined");
+
+        // 4. execute
+        let Ok(Json(executed)) = decommission_execute(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("execute failed");
+        };
+        assert_eq!(executed["status"].as_str().unwrap_or(""), "Executed");
+
+        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("get after execute failed");
+        };
+        assert_eq!(got["status"].as_str().unwrap_or(""), "Executed");
+
+        // 5. verify
+        let Ok(Json(_evidence)) = decommission_verify(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("verify failed");
+        };
+
+        cleanup(pool, &id).await;
+    }
+
+    /// GET with a well-formed but non-existent UUID → 404.
+    #[tokio::test]
+    async fn test_get_nonexistent_uuid_is_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let random_id = uuid::Uuid::new_v4().to_string();
+        let Err((status, _)) = decommission_get(Path(random_id)).await else {
+            panic!("expected 404 for non-existent UUID");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// GET with a malformed (non-UUID) id → 404.
+    #[tokio::test]
+    async fn test_get_malformed_id_is_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Err((status, _)) = decommission_get(Path("not-a-uuid".to_string())).await else {
+            panic!("expected 404 for malformed id");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// quarantine_inventory reflects a request that has been quarantined.
+    #[tokio::test]
+    async fn test_quarantine_inventory_reflects_quarantined_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let server_name = format!("srv-{suffix}");
+
+        // plan
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // approve
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "inv-tester".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("approve failed");
+        };
+
+        // quarantine
+        let Ok(_) = decommission_quarantine(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("quarantine failed");
+        };
+
+        // inventory must include our server
+        let Ok(Json(inventory)) = decommission_quarantine_inventory().await else {
+            cleanup(pool, &id).await;
+            panic!("inventory call failed");
+        };
+        let entries = inventory.as_array().expect("inventory is array");
+        let found = entries
+            .iter()
+            .any(|e| e["server_name"].as_str() == Some(&server_name));
+
+        cleanup(pool, &id).await;
+        assert!(found, "quarantined server must appear in inventory");
+    }
+
+    /// Audit log persisted: after quarantine, quarantine_log must have >= 1 row
+    /// for that server_name.
+    #[tokio::test]
+    async fn test_quarantine_audit_log_persisted() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let server_name = format!("srv-{suffix}");
+
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "audit-tester".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("approve failed");
+        };
+
+        let Ok(_) = decommission_quarantine(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("quarantine failed");
+        };
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM quarantine_log WHERE server_name = $1")
+                .bind(&server_name)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(0);
+
+        // Cleanup quarantine_log rows for this server before asserting, to keep
+        // the DB tidy even if the assert fails.
+        sqlx::query("DELETE FROM quarantine_log WHERE server_name = $1")
+            .bind(&server_name)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup(pool, &id).await;
+
+        assert!(
+            count >= 1,
+            "quarantine_log must have at least one entry for {server_name}, got {count}"
+        );
+    }
+
+    /// quarantine on a Planned (non-Approved) request must return 409 (engine
+    /// rejects the transition before any DB write).
+    #[tokio::test]
+    async fn test_quarantine_from_planned_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Attempt quarantine without approve — must fail 409
+        let Err((status, _)) = decommission_quarantine(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("expected 409 but quarantine succeeded on a Planned request");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "wrong-state quarantine must be 409"
+        );
+    }
+
+    /// execute before quarantine must return 409.
+    #[tokio::test]
+    async fn test_execute_before_quarantine_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Approve so status = Approved, then try execute (skipping quarantine)
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "exec-tester".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("approve failed");
+        };
+
+        let Err((status, _)) = decommission_execute(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("expected 409 but execute succeeded before quarantine");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "execute before quarantine must be 409"
+        );
+    }
+
+    /// approve with empty approver must return 409 (engine error propagated as 409).
+    #[tokio::test]
+    async fn test_approve_empty_approver_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Err((status, _)) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("expected error for empty approver but got Ok");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(status, StatusCode::CONFLICT, "empty approver must be 409");
+    }
+
+    /// approve from wrong state (already Approved) must return 409.
+    #[tokio::test]
+    async fn test_approve_from_wrong_state_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // First approve — should succeed
+        let Ok(_) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "first-approver".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("first approve failed");
+        };
+
+        // Second approve from Approved state — must return 409
+        let Err((status, _)) = decommission_approve(
+            Path(id.clone()),
+            Json(DecommissionApproveRequest {
+                approver: "second-approver".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("expected 409 on second approve but got Ok");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "approve from already-Approved state must be 409"
+        );
     }
 }

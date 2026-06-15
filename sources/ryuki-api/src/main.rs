@@ -10,6 +10,7 @@ pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod integration;
+mod repos;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;

@@ -148,6 +148,34 @@ pub fn validate_decommission(request: &DecommissionRequest) -> Result<Validation
     })
 }
 
+/// Approve a decommission request. Only valid from Planned or Validated status.
+/// Deduplicates the approver entry. Returns Err when the approver is empty or
+/// the current status does not permit approval.
+pub fn approve_decommission(
+    request: &DecommissionRequest,
+    approver: &str,
+) -> Result<DecommissionRequest, String> {
+    if approver.trim().is_empty() {
+        return Err("Approver must not be empty".into());
+    }
+    if !matches!(
+        request.status,
+        DecommissionStatus::Planned | DecommissionStatus::Validated
+    ) {
+        return Err(format!(
+            "Cannot approve decommission in status {:?}. Must be Planned or Validated.",
+            request.status
+        ));
+    }
+    let mut approved = request.clone();
+    if !approved.approvals_collected.iter().any(|a| a == approver) {
+        approved.approvals_collected.push(approver.to_string());
+    }
+    approved.status = DecommissionStatus::Approved;
+    approved.updated_at = chrono::Utc::now().to_rfc3339();
+    Ok(approved)
+}
+
 pub fn quarantine_server(request: &DecommissionRequest) -> Result<DecommissionRequest, String> {
     if request.status == DecommissionStatus::Executed
         || request.status == DecommissionStatus::Completed
@@ -689,6 +717,65 @@ mod tests {
         assert_eq!(inventory.len(), 2);
         assert_eq!(inventory[0].server_name, "srv-app-01");
         assert_eq!(inventory[1].server_name, "srv-web-01");
+    }
+
+    #[test]
+    fn test_approve_decommission_from_planned() {
+        let req = make_test_request(); // status = Planned
+        let approved = approve_decommission(&req, "datacenter-approver").unwrap();
+        assert_eq!(approved.status, DecommissionStatus::Approved);
+        assert!(
+            approved
+                .approvals_collected
+                .contains(&"datacenter-approver".to_string())
+        );
+    }
+
+    #[test]
+    fn test_approve_decommission_empty_approver_returns_err() {
+        let req = make_test_request();
+        let err = approve_decommission(&req, "  ").unwrap_err();
+        assert!(err.contains("Approver must not be empty"));
+    }
+
+    #[test]
+    fn test_approve_decommission_wrong_state_returns_err() {
+        let mut req = make_test_request();
+        // First approve to reach Approved state
+        req.status = DecommissionStatus::Approved;
+        let err = approve_decommission(&req, "some-approver").unwrap_err();
+        assert!(err.contains("Cannot approve decommission in status"));
+        assert!(err.contains("Must be Planned or Validated"));
+    }
+
+    #[test]
+    fn test_approve_decommission_from_validated() {
+        let mut req = make_test_request();
+        req.status = DecommissionStatus::Validated;
+        let approved = approve_decommission(&req, "app-owner").unwrap();
+        assert_eq!(approved.status, DecommissionStatus::Approved);
+    }
+
+    #[test]
+    fn test_approve_decommission_deduplicates_approver() {
+        let mut req = make_test_request();
+        req.approvals_collected = vec!["existing-approver".to_string()];
+        let approved = approve_decommission(&req, "existing-approver").unwrap();
+        assert_eq!(
+            approved
+                .approvals_collected
+                .iter()
+                .filter(|a| *a == "existing-approver")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_approve_decommission_from_executed_returns_err() {
+        let mut req = make_test_request();
+        req.status = DecommissionStatus::Executed;
+        assert!(approve_decommission(&req, "some-approver").is_err());
     }
 
     #[test]
