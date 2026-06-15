@@ -1,8 +1,9 @@
-//! Execution-agent dispatch plumbing — S3a (control-plane side).
+//! Execution-agent dispatch plumbing — S3a + S3b (control-plane side).
 //!
-//! Slice scope: agent registry + job queue + lease mechanics.
-//! Out of scope (S3b): result endpoint, per-request signature verification,
-//! admin approval UI, signed grant issuance.
+//! Slice scope: agent registry + job queue + lease mechanics (S3a);
+//! signed result verification + recording (S3b).
+//! Out of scope: per-request lifecycle wiring (S4), admin approval UI,
+//! signed grant issuance.
 //!
 //! # Auth model
 //!
@@ -34,7 +35,9 @@ use uuid::Uuid;
 
 use crate::database::get_db;
 use crate::sha256_hex;
-use ryuki_protocol::{Capabilities, Job, JobLease, JobSpec, JobStatus};
+use ryuki_protocol::{
+    Capabilities, Job, JobLease, JobMode, JobResult, JobResultStatus, JobSpec, JobStatus,
+};
 
 // ---------------------------------------------------------------------------
 // Lease TTL (seconds)
@@ -585,6 +588,475 @@ pub async fn ack_job(
     Err(conflict(reason))
 }
 
+// ---------------------------------------------------------------------------
+// Result body — submitted by the agent
+// ---------------------------------------------------------------------------
+
+/// Body for POST /api/agents/{agent_id}/jobs/{job_id}/result.
+///
+/// The outer `JobResult` fields are untrusted; only the embedded
+/// `SignedEnvelope` is authoritative. The handler equality-checks every outer
+/// field against the signed envelope before persisting anything.
+#[derive(Debug, Deserialize)]
+pub struct ResultBody {
+    pub job_result: JobResult,
+    /// Raw evidence bytes (the payload whose SHA-256 is `evidence_digest`).
+    /// May be empty for modes that produce no evidence (e.g. OfflineDryRun
+    /// without a plan artifact), but the digest must still match.
+    #[serde(default)]
+    pub evidence: Vec<u8>,
+    /// Optional structured evidence parsed from the evidence bytes.
+    /// Stored as JSONB for query convenience; never trusted for authz.
+    #[serde(default)]
+    pub evidence_json: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal DB row for the terminal result read-back (idempotency)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct TerminalResultRow {
+    status: String,
+    result_id: Option<uuid::Uuid>,
+    result_status: Option<String>,
+    evidence_digest: Option<String>,
+    completed_at: Option<chrono::DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
+// JobResultStatus wire label → DB TEXT
+// ---------------------------------------------------------------------------
+
+fn result_status_label(s: &JobResultStatus) -> &'static str {
+    match s {
+        JobResultStatus::CheckOk => "check_ok",
+        JobResultStatus::Planned => "planned",
+        JobResultStatus::Applied => "applied",
+        JobResultStatus::Verified => "verified",
+        JobResultStatus::Failed => "failed",
+        JobResultStatus::LiveRefused => "live_refused",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JobResultStatus → terminal agent_jobs.status
+// ---------------------------------------------------------------------------
+
+fn map_result_status_to_job_status(s: &JobResultStatus) -> &'static str {
+    match s {
+        JobResultStatus::CheckOk
+        | JobResultStatus::Planned
+        | JobResultStatus::Applied
+        | JobResultStatus::Verified => "Succeeded",
+        JobResultStatus::Failed => "Failed",
+        JobResultStatus::LiveRefused => "LiveRefused",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/agents/{agent_id}/jobs/{job_id}/result
+// ---------------------------------------------------------------------------
+
+/// Verifies and records the signed `JobResult` from an agent.
+///
+/// The full 9-step verifier runs FAIL-CLOSED: every check that fails returns
+/// 4xx and mutates nothing. The terminal UPDATE is a single atomic conditional
+/// statement guarded on (id, attempt_id, lease_generation, status IN
+/// ('Leased','Running')). A repeat POST with the same (job_id, attempt_id,
+/// result_id) returns idempotent 200.
+pub async fn post_job_result(
+    Path((agent_id, job_id_str)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<ResultBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
+    post_job_result_with_pool(agent_id, job_id_str, headers, body, pool).await
+}
+
+/// Inner implementation that accepts an explicit pool — used by integration
+/// tests that cannot rely on the global `get_db()` singleton.
+async fn post_job_result_with_pool(
+    agent_id: String,
+    job_id_str: String,
+    headers: HeaderMap,
+    body: ResultBody,
+    pool: &PgPool,
+) -> ApiResult<Json<serde_json::Value>> {
+    // ── Step 1: authenticate + agent_id match ────────────────────────────────
+    let agent = authenticate_agent(&headers, pool).await?;
+
+    if agent.agent_id != agent_id {
+        return Err(forbidden("token does not match path agent_id"));
+    }
+
+    let result = &body.job_result;
+    let env = &result.signed_envelope;
+
+    if agent.agent_id != env.agent_id {
+        return Err(forbidden("token agent_id does not match envelope.agent_id"));
+    }
+
+    // ── Step 2: load the job row ──────────────────────────────────────────────
+    let job_id = parse_agent_job_id(&job_id_str)?;
+
+    #[derive(sqlx::FromRow)]
+    #[allow(dead_code)]
+    struct JobForResult {
+        id: uuid::Uuid,
+        status: String,
+        agent_id: Option<String>,
+        attempt_id: Option<uuid::Uuid>,
+        lease_generation: i64,
+        cp_nonce: Option<String>,
+        spec: sqlx::types::Json<serde_json::Value>,
+        mode: String,
+        // Fix 3: platform and request_id loaded from DB to bind signed context.
+        platform: String,
+        request_id: uuid::Uuid,
+        result_id: Option<uuid::Uuid>,
+        result_status: Option<String>,
+        evidence_digest: Option<String>,
+        completed_at: Option<chrono::DateTime<Utc>>,
+    }
+
+    let row = sqlx::query_as::<_, JobForResult>(
+        "SELECT id, status, agent_id, attempt_id, lease_generation, cp_nonce, spec, mode, \
+         platform, request_id, \
+         result_id, result_status, evidence_digest, completed_at \
+         FROM agent_jobs WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?
+    .ok_or_else(|| not_found(format!("job {} not found", job_id)))?;
+
+    // ── Authorization BEFORE any status disclosure ───────────────────────────
+    //
+    // The agent must be the assignee. This runs before any status-dependent
+    // branch so the endpoint never leaks job state (active vs terminal) to a
+    // token holder who is not the assignee. An unassigned/Pending job has
+    // agent_id = NULL → this rejects with 403 before any state is observable.
+    if row.agent_id.as_deref() != Some(&agent.agent_id) {
+        return Err(forbidden("job is not assigned to this agent"));
+    }
+
+    // FAIL-CLOSED: no early status gate and no idempotency fast-path here. Every
+    // request — including a replay against an already-terminal row — runs the
+    // FULL verification (steps 3-8) before any decision is made. The atomic
+    // terminal UPDATE (step 9) is conditioned on status IN ('Leased','Running'),
+    // so the result commits exactly once. A VALID signed replay of an
+    // already-recorded result re-verifies, the UPDATE matches 0 rows, and the
+    // post-UPDATE idempotency branch returns 200 ("already recorded") — which the
+    // agent's at-least-once durable outbox relies on for a lost-ack retry. An
+    // unsigned/forged replay FAILS verification above and NEVER reaches that
+    // branch. The lease fields (attempt_id, lease_generation, cp_nonce) persist
+    // on terminal rows, so re-verification of a legitimate replay still works.
+
+    // ── Step 3: verify Ed25519 signature against enrolled public key ──────────
+    //
+    // key_id in the envelope must match the enrolled public_key fingerprint.
+    // The enrolled public_key is stored as base64 (the raw VerifyingKey bytes);
+    // key_id in the envelope is also base64 of the VerifyingKey — they must be
+    // equal.
+    use ryuki_protocol::{decode_verifying_key, verify as verify_envelope};
+
+    let vk = decode_verifying_key(&agent.public_key)
+        .map_err(|e| bad_request(format!("enrolled public key is malformed: {}", e)))?;
+
+    // key_id must equal the enrolled public key fingerprint.
+    let enrolled_key_id = ryuki_protocol::encode_verifying_key(&vk);
+    if env.key_id != enrolled_key_id {
+        return Err(bad_request(
+            "envelope.key_id does not identify the enrolled key",
+        ));
+    }
+
+    verify_envelope(env, &vk)
+        .map_err(|_| bad_request("signature verification failed — envelope has been tampered"))?;
+
+    // ── Step 4: lease / fencing match ────────────────────────────────────────
+    let stored_attempt_id = row
+        .attempt_id
+        .ok_or_else(|| conflict("job has no active attempt — lease may have expired"))?;
+    let stored_cp_nonce = row
+        .cp_nonce
+        .as_deref()
+        .ok_or_else(|| conflict("job has no cp_nonce — lease may have expired"))?;
+
+    if env.job_id != job_id {
+        return Err(bad_request("envelope.job_id does not match path job_id"));
+    }
+    if env.attempt_id != stored_attempt_id {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "envelope.attempt_id does not match active attempt — stale or superseded attempt"
+            })),
+        ));
+    }
+    if env.lease_generation != row.lease_generation as u64 {
+        return Err((
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(json!({
+                "error": "envelope.lease_generation does not match — stale attempt"
+            })),
+        ));
+    }
+    // cp_nonce is the one-time binding: constant-time compare.
+    {
+        use subtle::ConstantTimeEq;
+        let nonce_ok: bool = env
+            .cp_nonce
+            .as_bytes()
+            .ct_eq(stored_cp_nonce.as_bytes())
+            .into();
+        if !nonce_ok {
+            return Err(bad_request(
+                "envelope.cp_nonce does not match stored lease nonce",
+            ));
+        }
+    }
+
+    // ── Fix 3 (part A): signed platform + mode binding ───────────────────────
+    //
+    // platform and mode are DB columns — bind them against the envelope here,
+    // before step 5. request_id is bound in Fix 3 part B (after step 7) using
+    // stored_spec.request_id, because that is the authoritative value the agent
+    // received in the dispatched JobSpec (the column and spec field may differ
+    // in the test harness, but the agent always signs spec.request_id).
+    // Parse mode once here; reused in step 8 so no second parse is needed.
+    let stored_mode = parse_job_mode(&row.mode)?;
+    if env.platform != row.platform {
+        return Err(bad_request(
+            "envelope.platform does not match the dispatched job's platform",
+        ));
+    }
+    if env.mode != stored_mode {
+        return Err(bad_request(
+            "envelope.mode does not match the dispatched job's mode",
+        ));
+    }
+
+    // ── Step 5: outer JobResult fields must EQUAL the signed envelope ─────────
+    if result.job_id != env.job_id {
+        return Err(bad_request(
+            "outer result.job_id does not match envelope.job_id",
+        ));
+    }
+    if result.attempt_id != env.attempt_id {
+        return Err(bad_request(
+            "outer result.attempt_id does not match envelope.attempt_id",
+        ));
+    }
+    if result.result_id != env.result_id {
+        return Err(bad_request(
+            "outer result.result_id does not match envelope.result_id",
+        ));
+    }
+    if result.status != env.status {
+        return Err(bad_request(
+            "outer result.status does not match envelope.status",
+        ));
+    }
+    if result.evidence_digest != env.evidence_digest {
+        return Err(bad_request(
+            "outer result.evidence_digest does not match envelope.evidence_digest",
+        ));
+    }
+
+    // ── Step 6: evidence_digest recompute ────────────────────────────────────
+    //
+    // Recompute SHA-256 over the evidence bytes the CP will store. Uses the
+    // same sha256_hex from ryuki_protocol::crypto — byte-level, not JSON.
+    let recomputed_evidence_digest = ryuki_protocol::sha256_hex(&body.evidence);
+    if recomputed_evidence_digest != env.evidence_digest {
+        return Err(bad_request(
+            "evidence_digest mismatch — recomputed digest does not match signed envelope",
+        ));
+    }
+
+    // ── Step 7: job_spec_digest recompute ────────────────────────────────────
+    //
+    // Recompute over the stored dispatched JobSpec (from the agent_jobs.spec
+    // column). Uses ryuki_protocol::job_spec_digest (SHA-256 of the JSON
+    // serialisation — deterministic because JobSpec uses BTreeMap for vars).
+    let stored_spec: JobSpec = serde_json::from_value(row.spec.0.clone()).map_err(|e| {
+        tracing::error!(job_id = %job_id, error = %e, "stored spec is malformed");
+        db_err("stored job spec is malformed")
+    })?;
+    let recomputed_spec_digest = ryuki_protocol::job_spec_digest(&stored_spec);
+    if recomputed_spec_digest != env.job_spec_digest {
+        return Err(bad_request(
+            "job_spec_digest mismatch — does not match stored dispatched spec",
+        ));
+    }
+
+    // ── Fix 3 (part B): signed request_id binding ────────────────────────────
+    //
+    // request_id is included in signing_bytes; bind it against stored_spec.request_id
+    // (the value embedded in the dispatched JobSpec JSONB — what the agent received
+    // and signed). The agent_jobs.request_id column is the canonical upstream
+    // reference but the agent always copies request_id from the spec it received.
+    if env.request_id != stored_spec.request_id {
+        return Err(bad_request(
+            "envelope.request_id does not match the dispatched job spec's request_id",
+        ));
+    }
+
+    // ── Step 8: mode rules + LiveApply rejection ─────────────────────────────
+    //
+    // Fix 2: LiveApply results are rejected until the approved-plan grant
+    // equality check is implemented (S5 — requires the live_context column and
+    // VerifiedLiveContext.approved_plan_digest equality against the envelope).
+    // Accepting LiveApply results with only a presence check (no equality) allows
+    // an agent to forge any plan digest and have it recorded as authoritative.
+    // The safe default is a hard reject.
+    //
+    // Non-live modes (OfflineDryRun / LivePlan) must NOT carry approved_plan_digest.
+    // `stored_mode` was parsed in Fix 3 above (no second parse needed).
+    match stored_mode {
+        JobMode::LiveApply => {
+            return Err((
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                axum::Json(json!({
+                    "error": "LiveApply result verification is not yet enabled — \
+                              requires the approved-plan grant equality check (S5)"
+                })),
+            ));
+        }
+        JobMode::OfflineDryRun | JobMode::LivePlan => {
+            // Non-live modes must NOT include approved_plan_digest.
+            if env.approved_plan_digest.is_some() {
+                return Err(bad_request(
+                    "non-LiveApply result must not include approved_plan_digest",
+                ));
+            }
+        }
+    }
+
+    // ── Step 9: atomic terminal UPDATE ───────────────────────────────────────
+    //
+    // Single UPDATE conditioned on (id, attempt_id, lease_generation, status IN
+    // ('Leased','Running')). rows_affected == 0 means the attempt was superseded,
+    // expired, or already terminal.
+    let new_job_status = map_result_status_to_job_status(&env.status);
+    let result_status_str = result_status_label(&env.status);
+    let envelope_json = serde_json::to_value(env).map_err(db_err)?;
+
+    let updated = sqlx::query_scalar::<_, uuid::Uuid>(
+        "UPDATE agent_jobs \
+         SET status = $1, \
+             result_id = $2, \
+             result_status = $3, \
+             evidence_digest = $4, \
+             evidence_json = $5::jsonb, \
+             signed_envelope = $6::jsonb, \
+             completed_at = NOW(), \
+             updated_at = NOW() \
+         WHERE id = $7 \
+           AND attempt_id = $8 \
+           AND lease_generation = $9 \
+           AND status IN ('Leased', 'Running') \
+         RETURNING id",
+    )
+    .bind(new_job_status)
+    .bind(result.result_id)
+    .bind(result_status_str)
+    .bind(&env.evidence_digest)
+    .bind(&body.evidence_json)
+    .bind(&envelope_json)
+    .bind(job_id)
+    .bind(result.attempt_id)
+    .bind(row.lease_generation)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    if updated.is_some() {
+        tracing::info!(
+            job_id = %job_id,
+            agent_id = %agent_id,
+            result_id = %result.result_id,
+            result_status = result_status_str,
+            job_status = new_job_status,
+            "job result recorded — terminal"
+        );
+        return Ok(Json(json!({
+            "job_id": job_id,
+            "result_id": result.result_id,
+            "result_status": result_status_str,
+            "job_status": new_job_status,
+        })));
+    }
+
+    // rows_affected == 0: the attempt was superseded/expired/already terminal.
+    // Check idempotency: if this (attempt_id, result_id) is already recorded
+    // in a terminal row, return 200. Otherwise 409.
+    #[derive(sqlx::FromRow)]
+    struct IdempotencyCheck {
+        status: String,
+        attempt_id: Option<uuid::Uuid>,
+        result_id: Option<uuid::Uuid>,
+        result_status: Option<String>,
+    }
+    let existing = sqlx::query_as::<_, IdempotencyCheck>(
+        "SELECT status, attempt_id, result_id, result_status \
+         FROM agent_jobs WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    let existing = match existing {
+        None => return Err(not_found(format!("job {} not found", job_id))),
+        Some(r) => r,
+    };
+
+    if let (Some(stored_result_id), Some(stored_attempt_id)) =
+        (existing.result_id, existing.attempt_id)
+    {
+        if stored_result_id == result.result_id && stored_attempt_id == result.attempt_id {
+            tracing::info!(
+                job_id = %job_id,
+                result_id = %result.result_id,
+                "idempotent result POST — already recorded (concurrent path)"
+            );
+            return Ok(Json(json!({
+                "job_id": job_id,
+                "result_id": stored_result_id,
+                "result_status": existing.result_status,
+                "job_status": existing.status,
+                "idempotent": true,
+            })));
+        }
+    }
+
+    Err(conflict(format!(
+        "job {} attempt/lease has been superseded or already reached a terminal state",
+        job_id
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// parse_job_mode: TEXT stored in DB → JobMode
+// ---------------------------------------------------------------------------
+
+fn parse_job_mode(mode_str: &str) -> ApiResult<JobMode> {
+    match mode_str {
+        "OfflineDryRun" => Ok(JobMode::OfflineDryRun),
+        "LivePlan" => Ok(JobMode::LivePlan),
+        "LiveApply" => Ok(JobMode::LiveApply),
+        other => Err(bad_request(format!(
+            "unknown job mode in database: {}",
+            other
+        ))),
+    }
+}
+
 /// POST /api/agents/{agent_id}/heartbeat
 ///
 /// Updates last_seen_at on the agent row. Optionally records the running job.
@@ -748,6 +1220,10 @@ pub fn agent_routes() -> Router {
         .route("/api/agents/register", post(register_agent))
         .route("/api/agents/{agent_id}/jobs", get(poll_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/ack", post(ack_job))
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/result",
+            post(post_job_result),
+        )
         .route("/api/agents/{agent_id}/heartbeat", post(heartbeat))
 }
 
@@ -806,6 +1282,16 @@ mod tests {
     //           cargo test -p ryuki-api agents::tests::db_
     // Each test SKIPS when RYUKI_DATABASE_URL is unset.
     // -----------------------------------------------------------------------
+
+    // Serializes tests that depend on expired-lease state. `expire_leases` is a
+    // GLOBAL sweep (UPDATE ... WHERE status = 'Leased' AND lease_deadline < NOW())
+    // with no platform/agent scope, so a test that calls it would flip another
+    // test's expired-Leased fixture out from under it (the cause of the flaky
+    // db_ack_expired_lease_returns_409). Any test that calls expire_leases OR
+    // seeds an expired-deadline Leased job acquires this lock for its duration.
+    // tokio::sync::Mutex (not std) so the guard is safely held across .await.
+    static EXPIRE_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     async fn test_pool() -> Option<PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
@@ -1201,6 +1687,8 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        // Holds the global-sweep serial lock: this test calls expire_leases.
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
         let platform = format!(
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
@@ -1252,6 +1740,8 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        // Holds the global-sweep serial lock: this test calls expire_leases.
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
         let platform = format!(
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
@@ -1308,6 +1798,9 @@ mod tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
+        // Holds the global-sweep serial lock: this test seeds an expired-Leased
+        // job that MUST stay Leased, so no concurrent expire_leases may run.
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
         let platform = format!(
             "plt-{}",
             Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
@@ -1508,6 +2001,1355 @@ mod tests {
         );
         assert_eq!(row.status, "approved");
 
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b helpers ───────────────────────────────────────────────────────
+
+    use rand::rngs::OsRng;
+    use ryuki_protocol::{
+        crypto::{
+            encode_verifying_key, generate_keypair, job_spec_digest, sha256_hex as proto_sha256,
+            sign,
+        },
+        JobMode, JobResult, JobResultStatus, SignedEnvelope,
+    };
+
+    /// Insert an approved agent with a generated Ed25519 keypair.
+    /// Returns (plaintext token, signing_key).
+    async fn seed_agent_with_key(
+        pool: &PgPool,
+        agent_id: &str,
+        platform: &str,
+    ) -> (String, ed25519_dalek::SigningKey) {
+        let key = generate_keypair(&mut OsRng);
+        let pubkey_b64 = encode_verifying_key(&key.verifying_key());
+        let token = format!(
+            "{AGENT_TOKEN_PREFIX}key{}",
+            Uuid::new_v4().to_string().replace('-', "")
+        );
+        let hash = sha256_hex(&token);
+        sqlx::query(
+            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
+             ON CONFLICT (agent_id) DO UPDATE \
+             SET token_hash = $4, status = 'approved', public_key = $3, updated_at = NOW()",
+        )
+        .bind(agent_id)
+        .bind(platform)
+        .bind(&pubkey_b64)
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("seed agent with key");
+        (token, key)
+    }
+
+    /// Lease a pending job atomically and return the leased row (attempt_id,
+    /// fencing_token, cp_nonce, lease_generation).
+    async fn lease_job(
+        pool: &PgPool,
+        platform: &str,
+        agent_id: &str,
+    ) -> (Uuid, String, String, i64, AgentJobRow) {
+        let attempt = Uuid::new_v4();
+        let fencing = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        let row = sqlx::query_as::<_, AgentJobRow>(&format!(
+            "UPDATE agent_jobs \
+             SET status = 'Leased', agent_id = $1, attempt_id = $2, \
+                 lease_generation = lease_generation + 1, fencing_token = $3, \
+                 cp_nonce = $4, \
+                 lease_deadline = NOW() + make_interval(secs => $5), \
+                 updated_at = NOW() \
+             WHERE id = ( \
+                 SELECT id FROM agent_jobs WHERE platform = $6 AND status = 'Pending' \
+                 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1 \
+             ) RETURNING {AGENT_JOB_COLUMNS}"
+        ))
+        .bind(agent_id)
+        .bind(attempt)
+        .bind(&fencing)
+        .bind(&nonce)
+        .bind(LEASE_TTL_SECS as f64)
+        .bind(platform)
+        .fetch_one(pool)
+        .await
+        .expect("lease job");
+
+        let gen = row.lease_generation;
+        (attempt, fencing, nonce, gen, row)
+    }
+
+    /// Ack a leased job to Running.
+    async fn ack_to_running(pool: &PgPool, job_id: Uuid, attempt: Uuid, fencing: &str) {
+        sqlx::query(
+            "UPDATE agent_jobs SET status = 'Running', updated_at = NOW() \
+             WHERE id = $1 AND attempt_id = $2 AND fencing_token = $3 AND status = 'Leased'",
+        )
+        .bind(job_id)
+        .bind(attempt)
+        .bind(fencing)
+        .execute(pool)
+        .await
+        .expect("ack to running");
+    }
+
+    /// Build a valid signed `JobResult` for `job_row` using the given signing key.
+    #[allow(clippy::too_many_arguments)]
+    fn make_job_result(
+        agent_id: &str,
+        platform: &str,
+        job_row: &AgentJobRow,
+        attempt_id: Uuid,
+        cp_nonce: &str,
+        lease_gen: u64,
+        key: &ed25519_dalek::SigningKey,
+        spec: &JobSpec,
+        evidence: &[u8],
+        status: JobResultStatus,
+    ) -> (JobResult, Vec<u8>) {
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = job_spec_digest(spec);
+
+        let unsigned_env = SignedEnvelope {
+            agent_id: agent_id.to_string(),
+            platform: platform.to_string(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: lease_gen,
+            request_id: spec.request_id,
+            result_id,
+            mode: spec.mode.clone(),
+            status: status.clone(),
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: cp_nonce.to_string(),
+            signature: String::new(),
+        };
+        let signed_env = sign(unsigned_env, key);
+
+        let job_result = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status,
+            evidence_digest,
+            signed_envelope: signed_env,
+        };
+        (job_result, evidence.to_vec())
+    }
+
+    // ── Helper: read job status + result fields ────────────────────────────
+
+    #[derive(sqlx::FromRow)]
+    #[allow(dead_code)]
+    struct JobResultDbRow {
+        status: String,
+        result_id: Option<Uuid>,
+        result_status: Option<String>,
+        evidence_digest: Option<String>,
+        completed_at: Option<chrono::DateTime<Utc>>,
+        attempt_id: Option<Uuid>,
+        lease_generation: i64,
+    }
+
+    async fn read_job_result_row(pool: &PgPool, job_id: Uuid) -> JobResultDbRow {
+        sqlx::query_as::<_, JobResultDbRow>(
+            "SELECT status, result_id, result_status, evidence_digest, \
+             completed_at, attempt_id, lease_generation \
+             FROM agent_jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .expect("read job result row")
+    }
+
+    // ── S3b: happy path ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_happy_path_records_terminal_result() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"check output here";
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        // Build the ResultBody and call post_job_result via direct handler invocation.
+        let result_body = ResultBody {
+            job_result,
+            evidence: evidence_bytes,
+            evidence_json: None,
+        };
+
+        // Build headers
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            result_body,
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_ok(), "happy path must succeed: {:?}", resp.err());
+
+        // Verify DB state.
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Succeeded");
+        assert_eq!(db_row.result_status.as_deref(), Some("check_ok"));
+        assert!(db_row.result_id.is_some());
+        assert!(db_row.evidence_digest.is_some());
+        assert!(db_row.completed_at.is_some());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: VALID signed sequential replay → idempotent 200 ────────────
+    //
+    // A valid signed replay of an already-recorded result re-runs the FULL
+    // verification (the early status gate was removed), the atomic terminal
+    // UPDATE matches 0 rows (job already terminal), and the post-UPDATE
+    // idempotency branch returns 200 with `idempotent: true`. This is the
+    // contract the agent's at-least-once durable outbox depends on: a lost-ack
+    // retry must get "already recorded", not a 409 conflict. (A FORGED/unsigned
+    // replay is covered separately by db_s3b_unsigned_forged_replay_is_rejected,
+    // which fails verification before ever reaching this branch.)
+
+    #[tokio::test]
+    async fn db_s3b_sequential_valid_replay_is_idempotent() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"idempotent evidence";
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        let make_body = || ResultBody {
+            job_result: job_result.clone(),
+            evidence: evidence_bytes.clone(),
+            evidence_json: None,
+        };
+        let make_hdrs = || {
+            let mut h = HeaderMap::new();
+            h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            h
+        };
+
+        // First POST — must succeed.
+        let r1 = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            make_hdrs(),
+            make_body(),
+            &pool,
+        )
+        .await;
+        assert!(r1.is_ok(), "first POST must succeed");
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db.status, "Succeeded",
+            "job must be terminal after first POST"
+        );
+
+        // Second sequential POST — job is now terminal (Succeeded). The same
+        // valid signed result re-verifies, the terminal UPDATE matches 0 rows,
+        // and the idempotency branch returns 200 with `idempotent: true`.
+        let r2 = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            make_hdrs(),
+            make_body(),
+            &pool,
+        )
+        .await;
+        let body = r2.expect("valid signed replay must be idempotent 200, not an error");
+        assert_eq!(
+            body.0.get("idempotent").and_then(|v| v.as_bool()),
+            Some(true),
+            "replay must be flagged idempotent"
+        );
+        assert_eq!(
+            body.0.get("result_id").and_then(|v| v.as_str()),
+            Some(job_result.result_id.to_string().as_str()),
+            "idempotent response must echo the recorded result_id"
+        );
+
+        // The stored row must be unchanged by the replay (still the first
+        // result, still terminal — exactly once).
+        let db2 = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db2.status, "Succeeded", "replay must not change job status");
+        assert_eq!(
+            db2.result_id,
+            Some(job_result.result_id),
+            "replay must not change the recorded result_id"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: bad signature → 4xx, job unchanged ───────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_bad_signature_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"evidence";
+        let (mut job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        // Tamper the signed envelope — change a field after signing.
+        job_result.signed_envelope.evidence_digest = proto_sha256(b"forged");
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "tampered envelope must be rejected");
+
+        // Job must still be Running, not terminal.
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Running");
+        assert!(db_row.result_id.is_none());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: wrong enrolled key → reject ─────────────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_wrong_enrolled_key_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+
+        // Enrolled with key_a; signs with key_b.
+        let key_a = generate_keypair(&mut OsRng);
+        let key_b = generate_keypair(&mut OsRng);
+
+        // Enroll with key_a's public key.
+        let token = format!(
+            "{AGENT_TOKEN_PREFIX}wk{}",
+            Uuid::new_v4().to_string().replace('-', "")
+        );
+        let hash = sha256_hex(&token);
+        let pubkey_a = encode_verifying_key(&key_a.verifying_key());
+        sqlx::query(
+            "INSERT INTO agents (agent_id, platform, capabilities, public_key, token_hash, status) \
+             VALUES ($1, $2, '{}'::jsonb, $3, $4, 'approved') \
+             ON CONFLICT (agent_id) DO UPDATE SET token_hash=$4, status='approved', public_key=$3",
+        )
+        .bind(&agent_id)
+        .bind(&platform)
+        .bind(&pubkey_a)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("enroll key_a");
+
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        // Sign with key_b but use key_b's key_id (so the key_id check passes
+        // against key_b, but enrolled key is key_a → verification fails).
+        let evidence = b"evidence";
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key_b,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "wrong enrolled key must be rejected");
+
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: stale attempt → rejected ────────────────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_stale_attempt_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        // First lease.
+        let (old_attempt, _fencing, old_nonce, old_gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"stale evidence";
+        let (old_job_result, old_evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            old_attempt,
+            &old_nonce,
+            old_gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        // Re-lease (new attempt, new nonce, new generation) — simulates the
+        // first lease expiring and the job being re-dispatched.
+        sqlx::query(
+            "UPDATE agent_jobs SET status = 'Pending', agent_id = NULL, attempt_id = NULL, \
+             fencing_token = NULL, cp_nonce = NULL, lease_deadline = NULL, updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_row.id)
+        .execute(&pool)
+        .await
+        .expect("reset to pending");
+
+        let (_new_attempt, new_fencing, _new_nonce, _new_gen, new_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, new_row.id, _new_attempt, &new_fencing).await;
+
+        // Try to post with the OLD attempt's signed result.
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: old_job_result,
+                evidence: old_evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "stale attempt result must be rejected");
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+
+        // Job must still be Running (new attempt, no result recorded).
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Running");
+        assert!(db_row.result_id.is_none());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: outer != signed field → reject ──────────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_outer_status_mismatch_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"ev";
+        let (mut job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+        // Outer status differs from signed envelope.
+        job_result.status = JobResultStatus::Failed;
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "outer/signed mismatch must be rejected");
+
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: evidence_digest mismatch → reject ────────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_evidence_digest_mismatch_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let real_evidence = b"real evidence";
+        let (job_result, _) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            real_evidence,
+            JobResultStatus::CheckOk,
+        );
+
+        // Send different evidence bytes — digest will not match.
+        let tampered_evidence = b"different evidence bytes".to_vec();
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: tampered_evidence,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "evidence_digest mismatch must be rejected");
+
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db_row.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: LiveApply → rejected (Fix 2) ────────────────────────────────
+    // S3b: non-live with plan digest present → reject
+    //
+    // Fix 2: LiveApply results are rejected entirely until the approved-plan
+    // grant equality check is implemented (S5). Both sub-cases (with and
+    // without approved_plan_digest) must be rejected — the mode gate fires
+    // before any digest check.
+
+    #[tokio::test]
+    async fn db_s3b_live_apply_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-la-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+
+        // ── seed a LiveApply job ───────────────────────────────────────────
+        use std::collections::BTreeMap;
+        let spec_la = JobSpec {
+            request_id: Uuid::new_v4(),
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let live_job_id = create_agent_job(&pool, Uuid::new_v4(), &platform, &spec_la, "LiveApply")
+            .await
+            .expect("seed LiveApply job");
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        assert_eq!(job_row.id, live_job_id);
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let evidence = b"live apply output";
+        let plan_digest = proto_sha256(b"approved plan");
+
+        // Helper: build result with optional plan digest override.
+        let make_live_result = |plan: Option<String>| {
+            let result_id = Uuid::new_v4();
+            let evidence_digest_str = proto_sha256(evidence);
+            let spec_digest = ryuki_protocol::job_spec_digest(&spec_la);
+
+            let unsigned = SignedEnvelope {
+                agent_id: agent_id.clone(),
+                platform: platform.clone(),
+                job_id: job_row.id,
+                attempt_id,
+                lease_generation: gen as u64,
+                request_id: spec_la.request_id,
+                result_id,
+                mode: JobMode::LiveApply,
+                status: JobResultStatus::Applied,
+                job_spec_digest: spec_digest,
+                approved_plan_digest: plan.clone(),
+                evidence_digest: evidence_digest_str.clone(),
+                redaction_policy_version: "1.0.0".to_string(),
+                timestamp: Utc::now(),
+                key_id: encode_verifying_key(&key.verifying_key()),
+                cp_nonce: nonce.clone(),
+                signature: String::new(),
+            };
+            let signed = sign(unsigned, &key);
+            let outer = JobResult {
+                job_id: job_row.id,
+                attempt_id,
+                result_id,
+                status: JobResultStatus::Applied,
+                evidence_digest: evidence_digest_str,
+                signed_envelope: signed,
+            };
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            }
+        };
+
+        let hdrs = || {
+            let mut h = HeaderMap::new();
+            h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+            h
+        };
+
+        // Sub-case A: LiveApply WITHOUT approved_plan_digest → must be rejected.
+        let resp_a = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs(),
+            make_live_result(None),
+            &pool,
+        )
+        .await;
+        assert!(
+            resp_a.is_err(),
+            "LiveApply without plan digest must be rejected"
+        );
+        let (status_a, _) = resp_a.unwrap_err();
+        assert_eq!(
+            status_a,
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "LiveApply rejection must return 501"
+        );
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db.status, "Running",
+            "job must remain Running after rejection"
+        );
+
+        // Sub-case B: LiveApply WITH approved_plan_digest → still rejected (Fix 2).
+        // The mode gate fires before any digest check; presence alone is not safe.
+        let resp_b = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs(),
+            make_live_result(Some(plan_digest.clone())),
+            &pool,
+        )
+        .await;
+        assert!(
+            resp_b.is_err(),
+            "LiveApply with plan digest must also be rejected until S5"
+        );
+        let (status_b, _) = resp_b.unwrap_err();
+        assert_eq!(
+            status_b,
+            axum::http::StatusCode::NOT_IMPLEMENTED,
+            "LiveApply rejection must return 501"
+        );
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Running", "job must remain Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn db_s3b_non_live_with_plan_digest_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"ev";
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = ryuki_protocol::job_spec_digest(&spec);
+
+        // Non-live envelope WITH approved_plan_digest → must be rejected.
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            platform: platform.clone(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: Some(proto_sha256(b"bad plan")),
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        let outer = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::CheckOk,
+            evidence_digest,
+            signed_envelope: signed,
+        };
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(
+            resp.is_err(),
+            "non-live with approved_plan_digest must be rejected"
+        );
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── S3b: agent mismatch (token agent != envelope.agent_id) → 403 ─────
+
+    #[tokio::test]
+    async fn db_s3b_agent_mismatch_returns_403() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let other_agent_id = format!("s3b-other-{}", Uuid::new_v4());
+
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let (_tok2, _key2) = seed_agent_with_key(&pool, &other_agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"mismatch";
+
+        // Sign with correct agent's key but claim OTHER agent's id in the envelope.
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = ryuki_protocol::job_spec_digest(&spec);
+        let unsigned = SignedEnvelope {
+            agent_id: other_agent_id.clone(),
+            platform: platform.clone(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        let outer = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::CheckOk,
+            evidence_digest,
+            signed_envelope: signed,
+        };
+
+        // Token belongs to `agent_id`; envelope claims `other_agent_id`.
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "agent mismatch must be rejected");
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        cleanup_agent(&pool, &other_agent_id).await;
+        pool.close().await;
+    }
+
+    // ── Fix 1: unsigned/forged replay on terminal job → rejected (not 200) ──
+    //
+    // An attacker with a valid agent token and knowledge of a terminal
+    // (job_id, attempt_id, result_id) must NOT get an idempotent 200 by
+    // posting a body with an invalid/absent signature. The early fast-path that
+    // allowed this was removed; now full verification runs for every request.
+    // A forged replay must fail at step 3 (signature verification) → 4xx.
+
+    #[tokio::test]
+    async fn db_s3b_unsigned_forged_replay_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"legit evidence";
+
+        // First: POST a valid signed result to make the job terminal.
+        let (good_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            evidence,
+            JobResultStatus::CheckOk,
+        );
+        let good_result_id = good_result.result_id;
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let r1 = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: good_result.clone(),
+                evidence: evidence_bytes.clone(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+        assert!(r1.is_ok(), "initial valid POST must succeed");
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Succeeded", "job must be terminal");
+
+        // Now forge a body: reuse the known (job_id, attempt_id, result_id) but
+        // invalidate the signature by tampering the envelope after signing.
+        let mut forged_result = good_result.clone();
+        // Corrupt the signature — the envelope fields are otherwise valid.
+        forged_result.signed_envelope.signature = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+
+        let mut hdrs2 = HeaderMap::new();
+        hdrs2.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let r2 = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs2,
+            ResultBody {
+                job_result: forged_result,
+                evidence: evidence_bytes.clone(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        // Must be rejected. There is no early status gate: the forged body runs
+        // the full verification and FAILS at the signature check, so it never
+        // reaches the post-UPDATE idempotency branch. This confirms a forged
+        // body with a matching (result_id, attempt_id) cannot get idempotent 200,
+        // even though a VALID signed replay of the same identifiers would.
+        assert!(
+            r2.is_err(),
+            "forged replay on terminal job must be rejected, not idempotent 200"
+        );
+        let (status, _) = r2.unwrap_err();
+        assert_ne!(
+            status,
+            axum::http::StatusCode::OK,
+            "forged replay must never return 200"
+        );
+
+        // The result_id from the valid first POST must be unchanged.
+        let db2 = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db2.result_id,
+            Some(good_result_id),
+            "result_id must not change"
+        );
+        assert_eq!(db2.status, "Succeeded", "terminal status must not change");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── Fix 3: envelope.platform mismatch → rejected ──────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_platform_mismatch_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"evidence";
+
+        // Build a result with a mismatched platform in the envelope.
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = ryuki_protocol::job_spec_digest(&spec);
+
+        let wrong_platform = format!("wrong-{}", Uuid::new_v4());
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            platform: wrong_platform, // mismatch
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        let outer = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::CheckOk,
+            evidence_digest,
+            signed_envelope: signed,
+        };
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "platform mismatch must be rejected");
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── Fix 3: envelope.request_id mismatch → rejected ───────────────────
+
+    #[tokio::test]
+    async fn db_s3b_request_id_mismatch_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"evidence";
+
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = ryuki_protocol::job_spec_digest(&spec);
+
+        let wrong_request_id = Uuid::new_v4(); // not spec.request_id
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            platform: platform.clone(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: wrong_request_id, // mismatch
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        let outer = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::CheckOk,
+            evidence_digest,
+            signed_envelope: signed,
+        };
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "request_id mismatch must be rejected");
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── Fix 3: envelope.mode mismatch → rejected ──────────────────────────
+
+    #[tokio::test]
+    async fn db_s3b_mode_mismatch_is_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await; // OfflineDryRun
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"evidence";
+
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = ryuki_protocol::job_spec_digest(&spec);
+
+        // Claim LivePlan in the envelope — job is OfflineDryRun.
+        let unsigned = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            platform: platform.clone(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: spec.request_id,
+            result_id,
+            mode: JobMode::LivePlan, // mismatch — job is OfflineDryRun
+            status: JobResultStatus::Planned,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "1.0.0".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed = sign(unsigned, &key);
+        let outer = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::Planned,
+            evidence_digest,
+            signed_envelope: signed,
+        };
+
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result: outer,
+                evidence: evidence.to_vec(),
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(resp.is_err(), "mode mismatch must be rejected");
+        let (status, _) = resp.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        let db = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(db.status, "Running");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
         pool.close().await;
     }
