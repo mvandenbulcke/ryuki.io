@@ -19,7 +19,10 @@
 
 mod client;
 mod config;
+mod executor;
 mod identity;
+mod outbox;
+mod result;
 
 use ryuki_protocol::AgentRegistration;
 use tracing::info;
