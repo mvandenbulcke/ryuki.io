@@ -120,6 +120,10 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/verify", post(requests_verify))
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
+        .route(
+            "/api/requests/{id}/execution-job",
+            get(requests_execution_job),
+        )
         .route("/api/requests/{id}/audit", get(requests_audit))
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
@@ -10754,6 +10758,62 @@ fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(sanitized)
 }
 
+/// GET /api/requests/{id}/execution-job — the execution-agent job dispatched
+/// for this request (AWX bridge slice 3). Read-only AWX-style "job" view:
+/// which agent ran it, the mode (dry-run/live), job + result status, the
+/// evidence digest, and timestamps. The full (sanitized) evidence lives on the
+/// request's stages via GET /api/requests/{id}; this surfaces the job itself.
+/// 404 when no job has been dispatched (e.g. request not yet executed).
+async fn requests_execution_job(Path(request_id): Path<String>) -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Err(status_404(&request_id));
+    };
+    let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+
+    #[derive(sqlx::FromRow)]
+    struct ExecJobRow {
+        id: Uuid,
+        mode: String,
+        status: String,
+        result_status: Option<String>,
+        evidence_digest: Option<String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    // JOIN requests so a synthetic/orphan agent_jobs.request_id (the column is
+    // not FK-constrained and migrations seed fixtures) cannot surface job
+    // metadata for a request that does not exist — match requests_get's 404.
+    // Latest job wins (a re-dispatch supersedes), deterministic on (created_at,
+    // id). agent_id is intentionally NOT exposed: it is self-declared fleet
+    // identity, surfaced only via the admin-gated agents view.
+    let row: Option<ExecJobRow> = sqlx::query_as(
+        "SELECT j.id, j.mode, j.status, j.result_status, j.evidence_digest, \
+         j.created_at, j.completed_at \
+         FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
+         WHERE j.request_id = $1 \
+         ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+
+    let Some(j) = row else {
+        return Err(status_404(&request_id));
+    };
+    Ok(Json(json!({
+        "request_id": request_id,
+        "agent_job_id": j.id.to_string(),
+        "mode": j.mode,
+        "status": j.status,
+        "result_status": j.result_status,
+        "evidence_digest": j.evidence_digest,
+        "created_at": j.created_at.to_rfc3339(),
+        "completed_at": j.completed_at.map(|t| t.to_rfc3339()),
+        "source": "database",
+    })))
+}
+
 async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
@@ -20546,6 +20606,20 @@ mod db_lifecycle_tests {
             job_count, 1,
             "exactly one OfflineDryRun job dispatched for the request"
         );
+
+        // Slice 3: the execution-job endpoint surfaces the dispatched job (the
+        // AWX-style "job" view the portal renders).
+        let Json(exec_job) = requests_execution_job(p(&id_str))
+            .await
+            .expect("execution-job endpoint");
+        assert_eq!(exec_job["agent_job_id"].as_str(), Some(job_id));
+        assert_eq!(exec_job["mode"].as_str(), Some("OfflineDryRun"));
+        assert_eq!(exec_job["status"].as_str(), Some("Pending"));
+        // Unknown request -> 404.
+        let Err((st, _)) = requests_execution_job(Path(Uuid::new_v4().to_string())).await else {
+            panic!("expected 404 for unknown request");
+        };
+        assert_eq!(st, StatusCode::NOT_FOUND);
 
         let rehydrated = db_row_to_request(&row, &id_str);
         let stage_names: Vec<&str> = rehydrated.stages.iter().map(|s| s.name.as_str()).collect();
