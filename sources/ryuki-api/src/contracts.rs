@@ -11684,25 +11684,95 @@ async fn requests_execute(
         .ok_or_else(|| status_404(&request_id))?;
 
         let request = db_row_to_request(&current, &request_id);
-        let executed = request_lifecycle::execute_request(&request).map_err(map_engine_error)?;
 
-        let stages_json = serde_json::to_value(&executed.stages).unwrap_or_else(|_| json!([]));
-        let db_status = request_status_to_db(&executed.status);
-        apply_transition_audited(
-            pool,
-            &session,
-            uid,
-            &current,
-            "request.execute",
-            &current.status,
-            db_status,
-            "execute",
-            json!({}),
-            TransitionArtifacts::stages_only(stages_json),
+        // AWX-style dispatch: transition Locked -> Executing (execute stage
+        // In-Progress) and enqueue an OfflineDryRun agent_job that an execution
+        // agent will run. The agent's signed result later completes the stage
+        // and advances the request (see the post_job_result backlink). The
+        // status CAS, the agent_jobs INSERT, and the audit row are written in
+        // ONE transaction, so a dispatched request always has its job and a
+        // job always has a dispatched request.
+        let executing = request_lifecycle::begin_execution(&request).map_err(map_engine_error)?;
+        let stages_json = serde_json::to_value(&executing.stages).unwrap_or_else(|_| json!([]));
+
+        // Dry-run job spec from the request. iac_digest is a stub here; a real
+        // content digest is produced once a live IaC resolver computes it
+        // (operator-owned). vars carry the request's non-secret metadata.
+        let offering = ryuki_runner::iac::resolve_offering_id(&request);
+        let spec = ryuki_protocol::JobSpec {
+            request_id: uid,
+            offering_id: Uuid::new_v4(),
+            iac_ref: offering,
+            iac_digest: "0".repeat(64),
+            vars: request
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            mode: ryuki_protocol::JobMode::OfflineDryRun,
+        };
+        let spec_json = serde_json::to_value(&spec).unwrap_or_default();
+        let platform = request.site.clone();
+
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let updated: Option<DbRequestRow> = sqlx::query_as(&format!(
+            "UPDATE requests SET status = 'executing', stage = 'execute', \
+             stages = $2::jsonb, updated_at = NOW() \
+             WHERE id = $1 AND status = 'locked' RETURNING {REQUEST_COLUMNS}"
+        ))
+        .bind(uid)
+        .bind(&stages_json)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = updated else {
+            // Concurrent transition won the CAS (status was no longer Locked).
+            tx.rollback().await.ok();
+            return Err(transition_conflict_409(&request_id));
+        };
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode) \
+             VALUES ($1, $2, $3, $4) RETURNING id",
         )
-        .await?;
+        .bind(uid)
+        .bind(&platform)
+        .bind(&spec_json)
+        .bind("OfflineDryRun")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &AuditRecord {
+                action: "request.execute",
+                request_id: Some(&request_id),
+                from_status: Some(&current.status),
+                to_status: &row.status,
+                from_stage: Some(&current.stage),
+                to_stage: "execute",
+                detail: json!({
+                    "agent_job_id": job_id,
+                    "mode": "OfflineDryRun",
+                    "platform": platform.clone(),
+                }),
+                outcome: "dispatched",
+            },
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
-        return Ok(Json(serde_json::to_value(&executed).unwrap_or_default()));
+        return Ok(Json(json!({
+            "request_id": request_id,
+            "agent_job_id": job_id,
+            "status": row.status,
+            "stage": "execute",
+            "mode": "OfflineDryRun",
+            "platform": platform,
+            "source": "database",
+            "note": "dispatched to execution agent (offline dry-run)",
+        })));
     }
 
     let mut store = request_store().lock().await;
@@ -20442,26 +20512,47 @@ mod db_lifecycle_tests {
         let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
             .await
             .expect("lock");
-        let _ = requests_execute(p(&id_str), AuthExtractor(session.clone()))
+        // Execute now DISPATCHES an OfflineDryRun agent_job (AWX-style) instead
+        // of simulating completion in-process. The request sits in Executing
+        // with the execute stage In-Progress until an execution agent posts its
+        // signed result (the result -> request backlink, a later slice, drives
+        // Executing -> Verifying -> Completed).
+        let Json(dispatch) = requests_execute(p(&id_str), AuthExtractor(session.clone()))
             .await
-            .expect("execute");
-        let _ = requests_verify(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("verify");
+            .expect("execute dispatch");
+        assert_eq!(dispatch["status"].as_str(), Some("executing"));
+        let job_id = dispatch["agent_job_id"]
+            .as_str()
+            .expect("agent_job_id in dispatch response");
+        uuid::Uuid::parse_str(job_id).expect("agent_job_id is a uuid");
 
         // Simulate a RESTART: re-read the persisted row and hydrate fresh — this
         // is exactly what a cold-started API does. No in-memory state.
         let row = read_global_row(pool, id).await;
-        assert_eq!(row.status, "completed", "lifecycle reaches completed");
+        assert_eq!(
+            row.status, "executing",
+            "request is dispatched (Executing), awaiting the agent result"
+        );
+
+        // A durable agent_job was enqueued for this request in the same tx.
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'OfflineDryRun'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count agent_jobs");
+        assert_eq!(
+            job_count, 1,
+            "exactly one OfflineDryRun job dispatched for the request"
+        );
 
         let rehydrated = db_row_to_request(&row, &id_str);
         let stage_names: Vec<&str> = rehydrated.stages.iter().map(|s| s.name.as_str()).collect();
         // REAL persisted history: the engine's plan_request rebuilds the full
-        // stage list (validate..publish) and each later transition appends its
-        // own completed stage, so the cumulative history rehydrates faithfully.
-        // The old code FABRICATED only a validate (+ plan) stage from row.stage;
-        // here every executed transition's stage is genuinely persisted.
-        for expected in ["validate", "plan", "approve", "lock", "execute", "verify"] {
+        // stage list and each transition appends its own stage, so the
+        // cumulative history rehydrates faithfully through execute (In-Progress).
+        for expected in ["validate", "plan", "approve", "lock", "execute"] {
             assert!(
                 stage_names.contains(&expected),
                 "rehydrated stages must include {expected}; got {stage_names:?}"

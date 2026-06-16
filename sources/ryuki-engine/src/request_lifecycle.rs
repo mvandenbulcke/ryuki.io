@@ -496,6 +496,46 @@ pub fn lock_request(request: &Request) -> Result<Request, String> {
     Ok(locked)
 }
 
+/// Begin asynchronous execution: transition a Locked request to Executing and
+/// mark the `execute` stage In-Progress, WITHOUT producing any simulated
+/// evidence. Real execution is performed out-of-process by an execution agent
+/// (terraform/ansible); the agent's signed result later completes the stage and
+/// advances the request (the request -> agent_job bridge). Pure: no I/O, no
+/// store. Use this instead of `execute_request` whenever a dispatch backend is
+/// available; `execute_request` remains the in-process dry-run fallback.
+pub fn begin_execution(request: &Request) -> Result<Request, String> {
+    if request.status != RequestStatus::Locked {
+        return Err(format!(
+            "Cannot execute request in status {:?}. Request must be Locked first.",
+            request.status
+        ));
+    }
+
+    let mut executing = request.clone();
+    executing.status = RequestStatus::Executing;
+    executing.updated_at = Utc::now().to_rfc3339();
+
+    if let Some(stage) = executing.stages.iter_mut().find(|s| s.name == "execute") {
+        stage.status = StageStatus::InProgress;
+        stage.started_at = Some(Utc::now().to_rfc3339());
+        stage.completed_at = None;
+        // Fresh execution attempt: drop any pre-seeded/simulated evidence so the
+        // stage carries only the real evidence the agent will report.
+        stage.evidence.clear();
+    } else {
+        executing.stages.push(Stage {
+            name: "execute".into(),
+            status: StageStatus::InProgress,
+            started_at: Some(Utc::now().to_rfc3339()),
+            completed_at: None,
+            evidence: vec![],
+            metadata: HashMap::new(),
+        });
+    }
+
+    Ok(executing)
+}
+
 pub fn execute_request(request: &Request) -> Result<Request, String> {
     if request.status != RequestStatus::Locked {
         return Err(format!(
@@ -899,6 +939,35 @@ mod tests {
             log_item.redacted_value,
             Some("***DRY-RUN SIMULATION***".into())
         );
+    }
+
+    #[test]
+    fn test_begin_execution_dispatches_in_progress() {
+        let req = make_planned_request();
+        let approved = approve_request(&req, "Datacenter Approver").unwrap();
+        let locked = lock_request(&approved).unwrap();
+        let dispatched = begin_execution(&locked).unwrap();
+        // Async dispatch: Executing with the execute stage In-Progress and NO
+        // simulated evidence — the agent supplies the real evidence later.
+        assert_eq!(dispatched.status, RequestStatus::Executing);
+        let exec = dispatched
+            .stages
+            .iter()
+            .find(|s| s.name == "execute")
+            .expect("execute stage present");
+        assert_eq!(exec.status, StageStatus::InProgress);
+        assert!(exec.completed_at.is_none());
+        assert!(
+            exec.evidence.is_empty(),
+            "begin_execution must not fabricate evidence"
+        );
+    }
+
+    #[test]
+    fn test_begin_execution_requires_locked() {
+        // A Planned (not Locked) request cannot be dispatched.
+        let req = make_planned_request();
+        assert!(begin_execution(&req).is_err());
     }
 
     #[test]
