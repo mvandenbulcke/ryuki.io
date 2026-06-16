@@ -708,6 +708,83 @@ pub async fn post_job_result(
     post_job_result_with_pool(agent_id, job_id_str, headers, body, pool).await
 }
 
+/// Backlink an agent's terminal result onto the parent request (AWX bridge
+/// slice 2). When a dispatched request is still `executing`, mark its execute
+/// stage Completed (success) or Failed, record a pointer to the agent job, and
+/// advance the request (`executing` -> `verifying` on success, otherwise
+/// `-> failed`) — in the SAME transaction as the job's terminal record.
+///
+/// Best-effort and CAS-guarded: a request that is missing (e.g. synthetic test
+/// jobs) or no longer `executing` is left untouched, so this never fails the
+/// result POST.
+async fn backlink_request_execution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: uuid::Uuid,
+    status: &JobResultStatus,
+    result_status_str: &str,
+    evidence_digest: &str,
+    job_id: uuid::Uuid,
+) -> Result<(), sqlx::Error> {
+    let row: Option<(String, serde_json::Value)> =
+        sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((req_status, stages_val)) = row else {
+        return Ok(());
+    };
+    if req_status != "executing" {
+        return Ok(());
+    }
+
+    let success = matches!(
+        status,
+        JobResultStatus::CheckOk
+            | JobResultStatus::Planned
+            | JobResultStatus::Applied
+            | JobResultStatus::Verified
+    );
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let mut stages: Vec<ryuki_engine::models::Stage> =
+        serde_json::from_value(stages_val).unwrap_or_default();
+    if let Some(st) = stages.iter_mut().find(|s| s.name == "execute") {
+        st.status = if success {
+            ryuki_engine::models::StageStatus::Completed
+        } else {
+            ryuki_engine::models::StageStatus::Failed
+        };
+        st.completed_at = Some(now);
+        st.metadata
+            .insert("agent_job_id".into(), job_id.to_string());
+        st.metadata
+            .insert("result_status".into(), result_status_str.to_string());
+        st.metadata
+            .insert("evidence_digest".into(), evidence_digest.to_string());
+    }
+    let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
+    let (new_status, new_stage) = if success {
+        ("verifying", "verify")
+    } else {
+        ("failed", "execute")
+    };
+
+    // CAS: only advance if still `executing` (a concurrent transition wins
+    // harmlessly — the job result is already durably recorded).
+    sqlx::query(
+        "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, updated_at = NOW() \
+         WHERE id = $4 AND status = 'executing'",
+    )
+    .bind(new_status)
+    .bind(new_stage)
+    .bind(&stages_json)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 /// Inner implementation that accepts an explicit pool — used by integration
 /// tests that cannot rely on the global `get_db()` singleton.
 async fn post_job_result_with_pool(
@@ -1069,6 +1146,10 @@ async fn post_job_result_with_pool(
     let result_status_str = result_status_label(&env.status);
     let envelope_json = serde_json::to_value(env).map_err(db_err)?;
 
+    // The terminal record and the parent-request backlink (slice 2) share ONE
+    // transaction: a job that records its result also advances its request, and
+    // vice versa — never one without the other.
+    let mut tx = pool.begin().await.map_err(db_err)?;
     let updated = sqlx::query_scalar::<_, uuid::Uuid>(
         "UPDATE agent_jobs \
          SET status = $1, \
@@ -1094,11 +1175,27 @@ async fn post_job_result_with_pool(
     .bind(job_id)
     .bind(result.attempt_id)
     .bind(row.lease_generation)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
 
     if updated.is_some() {
+        // Advance the request the signed result is cryptographically BOUND to —
+        // stored_spec.request_id (verified == env.request_id above), not the
+        // raw agent_jobs.request_id column, which create_agent_job does not pin
+        // to the spec. This prevents a result from advancing the wrong request
+        // if the column and the dispatched spec ever diverge.
+        backlink_request_execution(
+            &mut tx,
+            stored_spec.request_id,
+            &env.status,
+            result_status_str,
+            &env.evidence_digest,
+            job_id,
+        )
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         tracing::info!(
             job_id = %job_id,
             agent_id = %agent_id,
@@ -1114,6 +1211,10 @@ async fn post_job_result_with_pool(
             "job_status": new_job_status,
         })));
     }
+
+    // Nothing updated in this tx (superseded/expired/already terminal): roll it
+    // back, then run the read-only idempotency check on the pool below.
+    tx.rollback().await.ok();
 
     // rows_affected == 0: the attempt was superseded/expired/already terminal.
     // Check idempotency: if this (attempt_id, result_id) is already recorded
@@ -5975,6 +6076,97 @@ mod tests {
         );
 
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// AWX bridge slice 2: a successful agent result advances the dispatched
+    /// (Executing) parent request to Verifying with the execute stage Completed;
+    /// a non-executing request is left untouched (synthetic/test jobs).
+    #[tokio::test]
+    async fn db_backlink_advances_executing_request() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = Uuid::new_v4();
+        let stages = serde_json::json!([{
+            "name": "execute", "status": "InProgress",
+            "started_at": null, "completed_at": null,
+            "evidence": [], "metadata": {}
+        }]);
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-test', 'executing', 'execute', $2::jsonb)",
+        )
+        .bind(req_id)
+        .bind(&stages)
+        .execute(&pool)
+        .await
+        .expect("insert executing request");
+
+        // Success result: executing -> verifying, execute stage Completed.
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("backlink");
+        tx.commit().await.unwrap();
+
+        let (status, stages_after): (String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back");
+        assert_eq!(status, "verifying", "executing -> verifying on success");
+        let execute = stages_after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "execute")
+            .expect("execute stage");
+        assert_eq!(execute["status"], "Completed", "execute stage completed");
+        assert!(
+            execute["metadata"]["agent_job_id"].is_string(),
+            "execute stage records the agent job id"
+        );
+
+        // A non-executing request is left untouched (CAS guard / skip path).
+        sqlx::query("UPDATE requests SET status = 'completed' WHERE id = $1")
+            .bind(req_id)
+            .execute(&pool)
+            .await
+            .ok();
+        let mut tx2 = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx2,
+            req_id,
+            &JobResultStatus::Failed,
+            "failed",
+            "x",
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("backlink no-op");
+        tx2.commit().await.unwrap();
+        let status2: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status2, "completed", "non-executing request is not mutated");
+
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(req_id)
+            .execute(&pool)
+            .await
+            .ok();
         pool.close().await;
     }
 }

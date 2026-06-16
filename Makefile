@@ -23,7 +23,8 @@ test-unit:
 # and hid real bugs in untested modules): every DB-backed test module is named
 # `*_db_tests` (or the foundational `db_tests` migration suite), so the
 # `db_tests` substring filter auto-includes new modules.  `db_lifecycle_tests`
-# is the one DB module whose name lacks the `db_tests` substring, so it is
+# and `agents::tests::db_` are the DB suites whose names lack the `db_tests`
+# substring (agents uses `mod tests` with `db_*`-prefixed fns), so they are
 # listed explicitly.  Run single-threaded: these tests share one physical
 # database, so parallel execution causes cross-test contention/flakes.
 #
@@ -34,7 +35,8 @@ test-unit:
 test-db:
 	RYUKI_DATABASE_URL=postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform \
 	  cargo test -p ryuki-api -- --test-threads=1 \
-	    --skip test_migrations_run_against_pg18 db_tests db_lifecycle_tests
+	    --skip test_migrations_run_against_pg18 \
+	    db_tests db_lifecycle_tests agents::tests::db_
 
 test:
 	cargo test --workspace
