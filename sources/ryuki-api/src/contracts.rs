@@ -11724,14 +11724,48 @@ async fn requests_lock(
     Ok(Json(serde_json::to_value(&locked).unwrap_or_default()))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct ExecuteParams {
+    /// Requested execution mode: omitted / "offline-dry-run" / "dry-run"
+    /// (default), "live-plan" (privileged), or "live-apply" (rejected here —
+    /// requires a CP-signed approval grant).
+    mode: Option<String>,
+}
+
 async fn requests_execute(
     Path(request_id): Path<String>,
+    Query(params): Query<ExecuteParams>,
     AuthExtractor(session): AuthExtractor,
 ) -> ApiResult {
     if !check_permission(&session, "execute") {
         record_transition_denied(&session, &request_id, "request.execute").await;
         return Err(status_403());
     }
+    // Resolve the requested execution mode (default: offline dry-run — the safe
+    // AWX "check" equivalent). LivePlan (a real terraform plan / ansible --check
+    // against a backend; NO mutation) additionally requires the `admin`
+    // permission. LiveApply mutates and is NOT dispatchable here: it requires a
+    // CP-signed approval grant minted via the dedicated operator endpoint, so
+    // the caller is routed there rather than silently dispatching a mutation.
+    let (mode, mode_label) = match params.mode.as_deref() {
+        None | Some("") | Some("offline-dry-run") | Some("dry-run") | Some("offline") => {
+            (ryuki_protocol::JobMode::OfflineDryRun, "OfflineDryRun")
+        }
+        Some("live-plan") => {
+            if !check_permission(&session, "admin") {
+                record_transition_denied(&session, &request_id, "request.execute.live-plan").await;
+                return Err(status_403());
+            }
+            (ryuki_protocol::JobMode::LivePlan, "LivePlan")
+        }
+        Some("live-apply") => {
+            return Err(status_400(
+                "live-apply is not dispatchable via execute; an operator must mint a \
+                 CP-signed approval grant via POST /api/admin/agents/live-apply-jobs",
+            ));
+        }
+        Some(other) => return Err(status_400(&format!("unknown execution mode: {other}"))),
+    };
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
@@ -11746,8 +11780,8 @@ async fn requests_execute(
         let request = db_row_to_request(&current, &request_id);
 
         // AWX-style dispatch: transition Locked -> Executing (execute stage
-        // In-Progress) and enqueue an OfflineDryRun agent_job that an execution
-        // agent will run. The agent's signed result later completes the stage
+        // In-Progress) and enqueue an agent_job (in the resolved mode) that an
+        // execution agent will run. The agent's signed result completes the stage
         // and advances the request (see the post_job_result backlink). The
         // status CAS, the agent_jobs INSERT, and the audit row are written in
         // ONE transaction, so a dispatched request always has its job and a
@@ -11769,7 +11803,7 @@ async fn requests_execute(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            mode: ryuki_protocol::JobMode::OfflineDryRun,
+            mode,
         };
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
         let platform = request.site.clone();
@@ -11797,7 +11831,7 @@ async fn requests_execute(
         .bind(uid)
         .bind(&platform)
         .bind(&spec_json)
-        .bind("OfflineDryRun")
+        .bind(mode_label)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -11813,7 +11847,7 @@ async fn requests_execute(
                 to_stage: "execute",
                 detail: json!({
                     "agent_job_id": job_id,
-                    "mode": "OfflineDryRun",
+                    "mode": mode_label,
                     "platform": platform.clone(),
                 }),
                 outcome: "dispatched",
@@ -11828,10 +11862,10 @@ async fn requests_execute(
             "agent_job_id": job_id,
             "status": row.status,
             "stage": "execute",
-            "mode": "OfflineDryRun",
+            "mode": mode_label,
             "platform": platform,
             "source": "database",
-            "note": "dispatched to execution agent (offline dry-run)",
+            "note": "dispatched to execution agent",
         })));
     }
 
@@ -18649,6 +18683,7 @@ mod unit_tests {
 
         let Json(executed) = requests_execute(
             Path(id.clone()),
+            Query(ExecuteParams::default()),
             AuthExtractor(static_admin_operator_session()),
         )
         .await
@@ -20577,9 +20612,13 @@ mod db_lifecycle_tests {
         // with the execute stage In-Progress until an execution agent posts its
         // signed result (the result -> request backlink, a later slice, drives
         // Executing -> Verifying -> Completed).
-        let Json(dispatch) = requests_execute(p(&id_str), AuthExtractor(session.clone()))
-            .await
-            .expect("execute dispatch");
+        let Json(dispatch) = requests_execute(
+            p(&id_str),
+            Query(ExecuteParams::default()),
+            AuthExtractor(session.clone()),
+        )
+        .await
+        .expect("execute dispatch");
         assert_eq!(dispatch["status"].as_str(), Some("executing"));
         let job_id = dispatch["agent_job_id"]
             .as_str()
@@ -20673,6 +20712,81 @@ mod db_lifecycle_tests {
             !fabricated,
             "no fabricated validate stage (None timestamps + empty evidence) may appear"
         );
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// AWX bridge slice 5a: an admin can dispatch a LivePlan job (a real
+    /// terraform plan / ansible --check against a backend — no mutation);
+    /// live-apply is refused via execute (it requires a CP-signed grant).
+    #[tokio::test]
+    async fn test_execute_live_plan_dispatch_and_live_apply_refused() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let session = admin_session("approver-lp");
+        let p = |s: &str| Path(s.to_string());
+
+        // live-apply is never dispatchable via execute -> 400 (mode resolution
+        // happens before the request is even loaded).
+        let Err((st, _)) = requests_execute(
+            p("any-id"),
+            Query(ExecuteParams {
+                mode: Some("live-apply".into()),
+            }),
+            AuthExtractor(session.clone()),
+        )
+        .await
+        else {
+            panic!("live-apply must be refused via execute");
+        };
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Drive a request to Locked, then dispatch a LivePlan as admin.
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(session.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("plan");
+        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("approve");
+        let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("lock");
+
+        let Json(dispatch) = requests_execute(
+            p(&id_str),
+            Query(ExecuteParams {
+                mode: Some("live-plan".into()),
+            }),
+            AuthExtractor(session.clone()),
+        )
+        .await
+        .expect("live-plan dispatch");
+        assert_eq!(dispatch["mode"].as_str(), Some("LivePlan"));
+
+        let job_mode: String = sqlx::query_scalar(
+            "SELECT mode FROM agent_jobs WHERE request_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("job mode");
+        assert_eq!(job_mode, "LivePlan", "a LivePlan agent_job was dispatched");
 
         cleanup_request(pool, id).await;
     }
