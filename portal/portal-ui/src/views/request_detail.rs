@@ -2,8 +2,8 @@ use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
     approve_request, cancel_request, execute_request, get_request_audit, get_request_detail,
-    get_request_evidence, lock_request, plan_request, reject_request, validate_request,
-    verify_request,
+    get_request_evidence, get_request_execution_job, lock_request, plan_request, reject_request,
+    validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -242,6 +242,8 @@ pub fn RequestDetail() -> impl IntoView {
     // The real, persisted audit trail is fetched separately and refetched
     // after every successful transition so the timeline stays live.
     let audit_resource = Resource::new(move || request_id.get(), get_request_audit);
+    // Execution-agent job for this request (None when not yet dispatched).
+    let execution_job_resource = Resource::new(move || request_id.get(), get_request_execution_job);
 
     #[allow(deprecated)]
     let (action_feedback, set_action_feedback) = create_signal(String::new());
@@ -490,6 +492,11 @@ pub fn RequestDetail() -> impl IntoView {
                         // fall back to the clearly-labeled synthetic single
                         // entry carried on the detail so the panel still renders.
                         let audit_rows = audit_resource.await.unwrap_or_default();
+                        // Execution-agent job — None when not yet dispatched or
+                        // in static dry-run mode; errors degrade to None so the
+                        // panel renders a "not dispatched" note rather than
+                        // blocking the whole detail view.
+                        let execution_job = execution_job_resource.await.unwrap_or(None);
                         let synthetic_timeline = detail.timeline.clone();
 
                         let status_class = status_badge_class(&detail.status);
@@ -747,6 +754,78 @@ pub fn RequestDetail() -> impl IntoView {
                                             .collect_view()}
                                     </div>
                                 </Show>
+
+                                // Execution-agent job dispatched for this request.
+                                // Hidden when no job has been dispatched yet.
+                                {match execution_job {
+                                    Some(job) => {
+                                        let result_status_display = if job.result_status.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            job.result_status.clone()
+                                        };
+                                        let digest_display =
+                                            if job.evidence_digest_short.is_empty() {
+                                                "—".to_string()
+                                            } else {
+                                                format!("{}…", job.evidence_digest_short)
+                                            };
+                                        let completed_display = if job.completed_at.is_empty() {
+                                            "—".to_string()
+                                        } else {
+                                            job.completed_at.clone()
+                                        };
+                                        view! {
+                                            <div
+                                                class="execution-job-panel"
+                                                aria-label="Execution job"
+                                            >
+                                                <h3>"Execution Job"</h3>
+                                                <div class="request-info-grid">
+                                                    <div class="request-info-item">
+                                                        <strong>"Mode"</strong>
+                                                        <span>{job.mode.clone()}</span>
+                                                    </div>
+                                                    <div class="request-info-item">
+                                                        <strong>"Job status"</strong>
+                                                        <span>{job.status.clone()}</span>
+                                                    </div>
+                                                    <div class="request-info-item">
+                                                        <strong>"Result"</strong>
+                                                        <span>{result_status_display}</span>
+                                                    </div>
+                                                    <div class="request-info-item">
+                                                        <strong>"Evidence digest"</strong>
+                                                        <code class="evidence-item-key">
+                                                            {digest_display}
+                                                        </code>
+                                                    </div>
+                                                    <div class="request-info-item">
+                                                        <strong>"Dispatched"</strong>
+                                                        <span>{job.created_at.clone()}</span>
+                                                    </div>
+                                                    <div class="request-info-item">
+                                                        <strong>"Completed"</strong>
+                                                        <span>{completed_display}</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        }
+                                            .into_any()
+                                    }
+                                    None => view! {
+                                        <div
+                                            class="execution-job-panel"
+                                            aria-label="Execution job"
+                                        >
+                                            <h3>"Execution Job"</h3>
+                                            <p class="table-note">
+                                                "No execution job dispatched yet."
+                                            </p>
+                                        </div>
+                                    }
+                                        .into_any(),
+                                }}
 
                                 // The persisted approval route (ordered).
                                 <Show when=move || has_approval_route>

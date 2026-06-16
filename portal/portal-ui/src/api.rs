@@ -456,6 +456,12 @@ pub fn request_evidence_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("evidence"))
 }
 
+/// Builds `/api/requests/{id}/execution-job` — the read endpoint for the
+/// execution-agent job dispatched for a request.
+pub fn request_execution_job_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("execution-job"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +518,10 @@ mod tests {
         assert_eq!(
             request_evidence_path(request_id),
             Ok("/api/requests/REQ-123/evidence".to_string())
+        );
+        assert_eq!(
+            request_execution_job_path(request_id),
+            Ok("/api/requests/REQ-123/execution-job".to_string())
         );
     }
 

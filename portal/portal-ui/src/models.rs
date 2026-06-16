@@ -1636,6 +1636,71 @@ pub struct StageEvent {
     pub description: String,
 }
 
+/// Mirrors `GET /api/requests/{id}/execution-job` JSON. All optional fields
+/// default so the portal decodes cleanly if the API evolves.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ApiExecutionJob {
+    pub request_id: String,
+    pub agent_job_id: String,
+    pub mode: String,
+    pub status: String,
+    #[serde(default)]
+    pub result_status: Option<String>,
+    #[serde(default)]
+    pub evidence_digest: Option<String>,
+    pub created_at: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+/// Portal-facing projection of an execution-agent job — display-ready fields
+/// only. `agent_job_id` is intentionally omitted (the API returns it as an
+/// internal handle; the portal has no UI action that needs it).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExecutionJob {
+    pub request_id: String,
+    /// Execution mode label (`OfflineDryRun`, `LivePlan`, `LiveApply`).
+    pub mode: String,
+    /// Agent-side job status (`Pending`, `Leased`, `Running`, `Succeeded`,
+    /// `Failed`, `Expired`, `ReconcileRequired`, `LiveRefused`).
+    pub status: String,
+    /// Result status when the job has completed (`check_ok`, `planned`,
+    /// `applied`, `verified`, `failed`, `live_refused`). Empty string when
+    /// the job is still running or the API returned null.
+    pub result_status: String,
+    /// First 16 hex chars of the evidence digest — enough to spot divergence
+    /// without filling the panel. Empty when no digest has been produced yet.
+    pub evidence_digest_short: String,
+    /// RFC 3339 creation timestamp, condensed to `YYYY-MM-DD HH:MM`.
+    pub created_at: String,
+    /// RFC 3339 completion timestamp, condensed to `YYYY-MM-DD HH:MM`, or
+    /// an empty string when the job has not yet completed.
+    pub completed_at: String,
+}
+
+impl From<ApiExecutionJob> for ExecutionJob {
+    fn from(api: ApiExecutionJob) -> Self {
+        let evidence_digest_short = api
+            .evidence_digest
+            .as_deref()
+            .map(|d| d.chars().take(16).collect())
+            .unwrap_or_default();
+        ExecutionJob {
+            request_id: api.request_id,
+            mode: api.mode,
+            status: api.status,
+            result_status: api.result_status.unwrap_or_default(),
+            evidence_digest_short,
+            created_at: condense_timestamp(&api.created_at),
+            completed_at: api
+                .completed_at
+                .as_deref()
+                .map(condense_timestamp)
+                .unwrap_or_default(),
+        }
+    }
+}
+
 /// One row of the durable who-did-what-when trail, mirroring an `audit_log`
 /// row as served by `GET /api/requests/{id}/audit`. The portal renders the
 /// verified actor identity, the action, the resulting status, the
@@ -3233,5 +3298,49 @@ mod tests {
         }]);
         let result = plan_summary_text(&plan);
         assert_eq!(result, "Simulated plan output.");
+    }
+
+    /// `ExecutionJob::from(ApiExecutionJob)` maps all fields correctly and
+    /// truncates the evidence digest to the first 16 hex characters.
+    #[test]
+    fn execution_job_from_api_maps_fields() {
+        let api = ApiExecutionJob {
+            request_id: "REQ-42".to_string(),
+            agent_job_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            mode: "LiveApply".to_string(),
+            status: "Succeeded".to_string(),
+            result_status: Some("applied".to_string()),
+            evidence_digest: Some("abcdef1234567890aabbccddeeff0011".to_string()),
+            created_at: "2026-06-15T10:00:00+00:00".to_string(),
+            completed_at: Some("2026-06-15T10:05:30+00:00".to_string()),
+        };
+        let job = ExecutionJob::from(api);
+        assert_eq!(job.request_id, "REQ-42");
+        assert_eq!(job.mode, "LiveApply");
+        assert_eq!(job.status, "Succeeded");
+        assert_eq!(job.result_status, "applied");
+        // Digest is truncated to 16 chars.
+        assert_eq!(job.evidence_digest_short, "abcdef1234567890");
+        assert_eq!(job.created_at, "2026-06-15 10:00");
+        assert_eq!(job.completed_at, "2026-06-15 10:05");
+    }
+
+    /// `ExecutionJob::from` handles null/absent optional fields gracefully.
+    #[test]
+    fn execution_job_from_api_handles_missing_optionals() {
+        let api = ApiExecutionJob {
+            request_id: "REQ-1".to_string(),
+            agent_job_id: "some-uuid".to_string(),
+            mode: "OfflineDryRun".to_string(),
+            status: "Pending".to_string(),
+            result_status: None,
+            evidence_digest: None,
+            created_at: "2026-06-15T08:00:00+00:00".to_string(),
+            completed_at: None,
+        };
+        let job = ExecutionJob::from(api);
+        assert_eq!(job.result_status, "");
+        assert_eq!(job.evidence_digest_short, "");
+        assert_eq!(job.completed_at, "");
     }
 }

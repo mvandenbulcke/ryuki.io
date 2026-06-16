@@ -24,8 +24,8 @@ use crate::api::{
 use crate::api::{
     admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
     request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
-    request_lock_path, request_plan_path, request_reject_path, request_validate_path,
-    request_verify_path,
+    request_execution_job_path, request_lock_path, request_plan_path, request_reject_path,
+    request_validate_path, request_verify_path,
 };
 #[cfg(feature = "ssr")]
 use crate::api::{integration_id_path, integration_test_path};
@@ -47,7 +47,7 @@ use crate::models::ALL_APP_ROLES;
 use crate::models::{
     actions_for_stage, auth_session_fallback, platform_health_fallback, platform_status_fallback,
     platform_summary_context_fallback, rbac_role_summary_fallbacks, ApiAuditTrail, ApiEvidencePack,
-    ApiLoginSession, ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
+    ApiExecutionJob, ApiLoginSession, ApiPlatformSummary, ApiRequestDetail, ApiRequestSummary,
 };
 use crate::models::{
     activity_queue_fallbacks, capacity_admission_fallbacks, cmdb_file_exchange_fallbacks,
@@ -62,7 +62,7 @@ use crate::models::{
     CmdbReconciliationSummary, CmdbRelationshipSummary, CreateIntegrationPayload,
     CreateRequestPayload, CreateTokenPayload, CreateTokenResult, DatacenterFailingChecksSummary,
     DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
-    DatacenterSitesCatalog, DryRunPlanSummary, EvidencePackExport, EvidenceSummary,
+    DatacenterSitesCatalog, DryRunPlanSummary, EvidencePackExport, EvidenceSummary, ExecutionJob,
     IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, OperationRunSummary,
     PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
     PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
@@ -273,6 +273,7 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("verify"), None)
             | (Some("audit"), None)
             | (Some("evidence"), None)
+            | (Some("execution-job"), None)
     )
 }
 
@@ -1871,6 +1872,46 @@ pub async fn get_request_detail(request_id: String) -> Result<RequestDetail, Ser
         // API; the detail view renders an explicit unreachable state.
         Err(_) => Err(ServerFnError::new("API unreachable")),
     }
+}
+
+/// Returns the execution-agent job for a request, or `None` when no job has
+/// been dispatched yet (the API returns 404 in that case — not an error).
+///
+/// In static dry-run mode the upstream is not live so the function returns
+/// `Ok(None)` immediately rather than attempting a real HTTP call.
+#[server(prefix = "/portal/api", endpoint = "request-execution-job")]
+pub async fn get_request_execution_job(
+    request_id: String,
+) -> Result<Option<ExecutionJob>, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_execution_job_path(&request_id)
+        .map_err(|_| ServerFnError::new("execution-job API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("execution-job API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(None);
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .get(&path, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new("API unreachable"))?;
+    if response.status == 404 {
+        // No job dispatched for this request yet — not an error.
+        return Ok(None);
+    }
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "execution-job fetch failed",
+        )));
+    }
+    let api_job: ApiExecutionJob = response
+        .json()
+        .map_err(|_| ServerFnError::new("execution-job response was malformed"))?;
+    Ok(Some(ExecutionJob::from(api_job)))
 }
 
 #[cfg(any(feature = "ssr", test))]
