@@ -78,9 +78,10 @@ pub enum LiveExecError {
     PlanBuild(String),
     #[error("credential resolution error: {0}")]
     CredResolution(String),
-    /// The terraform plan step did not complete cleanly (non-zero exit or
-    /// timeout).  A digest MUST NOT be computed or exposed for a non-clean plan.
-    #[error("terraform plan did not complete cleanly: {0}")]
+    /// The plan step did not complete cleanly (non-zero exit or timeout).
+    /// A digest MUST NOT be computed or exposed for a non-clean plan.
+    /// Applies to both Terraform (`terraform plan`) and Ansible (`--check`).
+    #[error("plan step did not complete cleanly: {0}")]
     PlanFailed(String),
 }
 
@@ -211,6 +212,12 @@ impl RunnerLiveExecutor {
     }
 
     /// Build a `RunPlan` from a `JobSpec` with `RunMode::Live`.
+    ///
+    /// The `runner_kind` is derived from the offering slug via
+    /// `crate::executor::offering_kind_from_slug` — the same classification
+    /// used by the offline dry-run path.  Ansible offerings (patch-maintenance,
+    /// zabbix-onboarding, …) get `RunnerKind::Ansible`; everything else gets
+    /// `RunnerKind::Terraform`.
     fn make_run_plan(spec: &JobSpec) -> Result<RunPlan, LiveExecError> {
         // Derive the offering slug from iac_ref: strip the `@<version>` suffix.
         let offering_slug = spec
@@ -226,17 +233,19 @@ impl RunnerLiveExecutor {
             })?
             .to_string();
 
-        // All live offerings default to Terraform in this slice.
-        // Extend `offering_kind_from_slug` from executor.rs if Ansible live is needed.
+        // Classify runner kind from the offering slug — Ansible keywords resolve
+        // to RunnerKind::Ansible, everything else to RunnerKind::Terraform.
+        let runner_kind = crate::executor::offering_kind_from_slug(&offering_slug);
+
         Ok(RunPlan {
-            runner_kind: RunnerKind::Terraform,
+            runner_kind,
             mode: RunMode::Live,
             offering_id: offering_slug,
             vars: spec.vars.clone(),
             // Secret var names come from spec.vars keys that match the cred-naming
             // convention.  In this slice we use an empty list; the operator
-            // configures TF_VAR_* directly via the RYUKI_LIVE_CRED_* mechanism
-            // and the runner's env-injection path.
+            // configures TF_VAR_* / extra-vars files directly via the
+            // RYUKI_LIVE_CRED_* mechanism and the runner's env-injection path.
             secret_var_names: vec![],
         })
     }
@@ -252,42 +261,88 @@ impl LiveExecutor for RunnerLiveExecutor {
         let run_plan = Self::make_run_plan(spec)?;
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
-        let artifacts =
-            ryuki_runner::run_live_plan(&run_plan, &creds, self.backend_config.as_deref())?;
+        match run_plan.runner_kind {
+            RunnerKind::Terraform => {
+                let artifacts =
+                    ryuki_runner::run_live_plan(&run_plan, &creds, self.backend_config.as_deref())?;
 
-        // FAIL CLOSED: return Err when the plan is not clean.
-        // A non-Planned status means a step failed — do NOT compute a digest.
-        if artifacts.outcome.status != ryuki_engine::runners::RunStatus::Planned {
-            return Err(LiveExecError::PlanFailed(format!(
-                "terraform plan step returned {:?}: {}",
-                artifacts.outcome.status, artifacts.outcome.summary
-            )));
+                // FAIL CLOSED: return Err when the plan is not clean.
+                // A non-Planned status means a step failed — do NOT compute a digest.
+                if artifacts.outcome.status != ryuki_engine::runners::RunStatus::Planned {
+                    return Err(LiveExecError::PlanFailed(format!(
+                        "terraform plan step returned {:?}: {}",
+                        artifacts.outcome.status, artifacts.outcome.summary
+                    )));
+                }
+
+                // Digest = sha256(scrubbed canonical plan JSON from `terraform show -json`).
+                let evidence_bytes = artifacts.outcome.log.as_bytes().to_vec();
+                let plan_digest = sha256_hex(&evidence_bytes);
+
+                let evidence_json = serde_json::to_value(&artifacts.outcome)
+                    .ok()
+                    .filter(|v| !v.is_null());
+
+                Ok(LivePlanOutcome {
+                    evidence: Evidence {
+                        status: artifacts.outcome.status,
+                        evidence_bytes,
+                        evidence_json,
+                    },
+                    plan_digest,
+                    // Raw tfplan bytes passed to apply() unchanged — closes TOCTOU hole.
+                    tfplan: artifacts.tfplan,
+                })
+            }
+
+            RunnerKind::Ansible => {
+                // Ansible plan = `ansible-playbook --check --diff`.
+                // No saved plan artifact — see live_ansible.rs module docs.
+                let outcome = ryuki_runner::run_ansible_live_plan(&run_plan, &creds)?;
+
+                // FAIL CLOSED: only Planned is acceptable.
+                if outcome.status != ryuki_engine::runners::RunStatus::Planned {
+                    return Err(LiveExecError::PlanFailed(format!(
+                        "ansible --check step returned {:?}: {}",
+                        outcome.status, outcome.summary
+                    )));
+                }
+
+                // Digest = sha256(scrubbed --check --diff output).
+                // This is NOT byte-locked like a tfplan, but the gate still requires
+                // the CP-signed grant to carry `approved_plan_digest == sha256(check_output)`.
+                let evidence_bytes = outcome.log.as_bytes().to_vec();
+                let plan_digest = sha256_hex(&evidence_bytes);
+
+                let evidence_json = serde_json::to_value(&outcome).ok().filter(|v| !v.is_null());
+
+                Ok(LivePlanOutcome {
+                    evidence: Evidence {
+                        status: outcome.status,
+                        evidence_bytes,
+                        evidence_json,
+                    },
+                    plan_digest,
+                    // Ansible has no saved plan artifact — tfplan is empty.
+                    // apply() re-runs the same playbook + vars (AWX model).
+                    tfplan: vec![],
+                })
+            }
         }
-
-        // Serialize the outcome to bytes for signing (plan JSON is in outcome.log).
-        let evidence_bytes = artifacts.outcome.log.as_bytes().to_vec();
-        let plan_digest = sha256_hex(&evidence_bytes);
-
-        let evidence_json = serde_json::to_value(&artifacts.outcome)
-            .ok()
-            .filter(|v| !v.is_null());
-
-        Ok(LivePlanOutcome {
-            evidence: Evidence {
-                status: artifacts.outcome.status,
-                evidence_bytes,
-                evidence_json,
-            },
-            plan_digest,
-            tfplan: artifacts.tfplan,
-        })
     }
 
-    /// Apply the SAVED plan produced by `plan()`.
+    /// Apply the plan produced by `plan()`.
     ///
-    /// `tfplan` MUST be the exact bytes from the `LivePlanOutcome.tfplan`
-    /// field returned by the preceding `plan()` call.  They are written into
-    /// a fresh workspace and passed to `terraform apply -input=false tfplan`.
+    /// For **Terraform**: `tfplan` MUST be the exact bytes from `LivePlanOutcome.tfplan`.
+    /// They are written into a fresh workspace and passed to `terraform apply
+    /// -input=false tfplan` — applies EXACTLY the plan the gate approved.
+    ///
+    /// For **Ansible**: `tfplan` is IGNORED (it will be an empty `Vec` from
+    /// `plan()`).  Ansible is not plan-byte-locked; the apply step re-runs
+    /// `ansible-playbook --diff` against live infrastructure.  This is the
+    /// correct AWX model: Ansible playbooks are idempotent by design and
+    /// `--check` is a best-effort preview, not a cryptographic commitment to
+    /// exact mutations.
     fn apply(&self, spec: &JobSpec, tfplan: &[u8]) -> Result<Evidence, LiveExecError> {
         if spec.mode != JobMode::LiveApply {
             return Err(LiveExecError::UnsupportedMode(spec.mode.clone()));
@@ -296,12 +351,22 @@ impl LiveExecutor for RunnerLiveExecutor {
         let run_plan = Self::make_run_plan(spec)?;
         let creds = Self::resolve_creds(&run_plan.secret_var_names)?;
 
-        let outcome = ryuki_runner::run_live_apply(
-            &run_plan,
-            &creds,
-            self.backend_config.as_deref(),
-            tfplan,
-        )?;
+        let outcome = match run_plan.runner_kind {
+            RunnerKind::Terraform => ryuki_runner::run_live_apply(
+                &run_plan,
+                &creds,
+                self.backend_config.as_deref(),
+                tfplan,
+            )?,
+
+            RunnerKind::Ansible => {
+                // Ansible is not plan-byte-locked — the tfplan arg is intentionally
+                // ignored here.  Apply re-runs the same playbook + vars (AWX model).
+                // The gate integrity is provided by the CP-signed grant whose
+                // approved_plan_digest was verified against the --check output.
+                ryuki_runner::run_ansible_live_apply(&run_plan, &creds)?
+            }
+        };
 
         let evidence_bytes =
             serde_json::to_vec(&outcome).map_err(|e| LiveExecError::PlanBuild(e.to_string()))?;
@@ -632,6 +697,93 @@ mod tests {
         assert!(
             !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
             "valid mode must not return UnsupportedMode"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // make_run_plan — offering_kind_from_slug routing (S6)
+    // -----------------------------------------------------------------------
+
+    fn make_spec_with_iac_ref(mode: JobMode, iac_ref: &str) -> JobSpec {
+        JobSpec {
+            request_id: Uuid::new_v4(),
+            offering_id: Uuid::new_v4(),
+            iac_ref: iac_ref.to_string(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode,
+        }
+    }
+
+    /// Ansible slugs must produce RunnerKind::Ansible in the built RunPlan.
+    #[test]
+    fn make_run_plan_ansible_slug_yields_ansible_runner_kind() {
+        let spec = make_spec_with_iac_ref(JobMode::LivePlan, "patch-maintenance@v1.0.0");
+        let run_plan = RunnerLiveExecutor::make_run_plan(&spec).expect("must build");
+        assert_eq!(
+            run_plan.runner_kind,
+            RunnerKind::Ansible,
+            "patch-maintenance slug must produce RunnerKind::Ansible; got {:?}",
+            run_plan.runner_kind
+        );
+    }
+
+    /// Non-ansible slugs must produce RunnerKind::Terraform in the built RunPlan.
+    #[test]
+    fn make_run_plan_terraform_slug_yields_terraform_runner_kind() {
+        // request-preflight is NOT in ANSIBLE_KEYWORDS → Terraform.
+        let tf_spec = make_spec_with_iac_ref(JobMode::LivePlan, "request-preflight@v1.0.0");
+        let tf_plan = RunnerLiveExecutor::make_run_plan(&tf_spec).expect("must build");
+        assert_eq!(
+            tf_plan.runner_kind,
+            RunnerKind::Terraform,
+            "request-preflight must produce RunnerKind::Terraform; got {:?}",
+            tf_plan.runner_kind
+        );
+
+        // linux-server-deployment is NOT in ANSIBLE_KEYWORDS (the keyword is
+        // linux-server-deployment-playbook) → Terraform.
+        let lsd_spec = make_spec_with_iac_ref(JobMode::LivePlan, "linux-server-deployment@v1.0.0");
+        let lsd_plan = RunnerLiveExecutor::make_run_plan(&lsd_spec).expect("must build");
+        assert_eq!(
+            lsd_plan.runner_kind,
+            RunnerKind::Terraform,
+            "linux-server-deployment must produce RunnerKind::Terraform (keyword is linux-server-deployment-playbook); got {:?}",
+            lsd_plan.runner_kind
+        );
+    }
+
+    /// plan() for an Ansible offering routes to ansible live plan (absent binary
+    /// → RunnerUnavailable wrapped in PlanFailed, not UnsupportedMode, not panic).
+    #[test]
+    fn runner_live_executor_plan_routes_ansible_offering_to_ansible_path() {
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        // patch-maintenance is an Ansible offering.
+        let spec = make_spec_with_iac_ref(JobMode::LivePlan, "patch-maintenance@v1.0.0");
+        let result = exec.plan(&spec);
+        // ansible-playbook is likely absent in CI → RunnerUnavailable → PlanFailed.
+        // The important assertions: not UnsupportedMode, not panic.
+        assert!(
+            !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
+            "ansible offering must not return UnsupportedMode: {result:?}"
+        );
+    }
+
+    /// apply() for an Ansible offering routes to ansible live apply (absent binary
+    /// → RunnerUnavailable mapped to Failed outcome with no Err, no panic).
+    #[test]
+    fn runner_live_executor_apply_routes_ansible_offering_to_ansible_path() {
+        let exec = RunnerLiveExecutor {
+            backend_config: None,
+        };
+        let spec = make_spec_with_iac_ref(JobMode::LiveApply, "patch-maintenance@v1.0.0");
+        // Pass an empty tfplan — Ansible ignores it.
+        let result = exec.apply(&spec, &[]);
+        assert!(
+            !matches!(result, Err(LiveExecError::UnsupportedMode(_))),
+            "ansible offering apply must not return UnsupportedMode: {result:?}"
         );
     }
 }

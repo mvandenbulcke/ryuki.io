@@ -222,7 +222,7 @@ impl JobExecutor for StubExecutor {
 /// ITSM playbooks use Ansible; everything else uses Terraform.
 /// This mirrors `ryuki_engine::runners::classify` but operates on a slug string
 /// rather than an `AdapterType`, since the agent only sees the slug from `iac_ref`.
-fn offering_kind_from_slug(slug: &str) -> RunnerKind {
+pub(crate) fn offering_kind_from_slug(slug: &str) -> RunnerKind {
     // Ansible offerings: known by slug keyword patterns.
     const ANSIBLE_KEYWORDS: &[&str] = &[
         "patch-maintenance",

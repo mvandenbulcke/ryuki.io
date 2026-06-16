@@ -28,6 +28,7 @@ pub mod ansible;
 pub mod exec;
 pub mod iac;
 pub mod live;
+pub mod live_ansible;
 pub mod scrub;
 pub mod terraform;
 pub mod workspace;
@@ -35,6 +36,7 @@ pub mod workspace;
 use ryuki_engine::runners::{RunMode, RunOutcome, RunPlan, RunnerError, RunnerKind};
 
 pub use live::{run_live_apply, run_live_plan, LivePlanArtifacts};
+pub use live_ansible::{run_ansible_live_apply, run_ansible_live_plan};
 pub use ryuki_engine::runners::ResolvedCredentials;
 
 /// The `Runner` trait defines the interface that both `TerraformRunner` and
