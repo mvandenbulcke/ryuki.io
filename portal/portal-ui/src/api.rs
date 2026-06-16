@@ -462,6 +462,12 @@ pub fn request_execution_job_path(request_id: &str) -> Result<String, ApiPathErr
     request_lifecycle_path(request_id, Some("execution-job"))
 }
 
+/// Builds `/api/requests/{id}/approve-live-apply` — the admin-gated endpoint
+/// that mints a CP-signed LiveApply grant from the request's completed LivePlan.
+pub fn request_approve_live_apply_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("approve-live-apply"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +528,10 @@ mod tests {
         assert_eq!(
             request_execution_job_path(request_id),
             Ok("/api/requests/REQ-123/execution-job".to_string())
+        );
+        assert_eq!(
+            request_approve_live_apply_path(request_id),
+            Ok("/api/requests/REQ-123/approve-live-apply".to_string())
         );
     }
 

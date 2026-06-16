@@ -1,9 +1,10 @@
 use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
-    approve_request, cancel_request, execute_request, execute_request_live_plan, get_request_audit,
-    get_request_detail, get_request_evidence, get_request_execution_job, lock_request,
-    plan_request, reject_request, validate_request, verify_request,
+    approve_live_apply_request, approve_request, cancel_request, execute_request,
+    execute_request_live_plan, get_request_audit, get_request_detail, get_request_evidence,
+    get_request_execution_job, lock_request, plan_request, reject_request, validate_request,
+    verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -35,6 +36,9 @@ fn action_capability(action: &str) -> &'static str {
         // run-live-plan is an admin-only synthetic action (real terraform plan,
         // no mutation); only PlatformAdmin / BreakGlassAdmin roles see it.
         "run-live-plan" => "admin",
+        // approve-live-apply is an admin-only action: mints a CP-signed
+        // LiveApply grant from the request's completed LivePlan.
+        "approve-live-apply" => "admin",
         // validate, plan, lock, execute, verify are operator-tier mechanics.
         _ => "execute",
     }
@@ -195,6 +199,7 @@ fn action_label(action: &str) -> &'static str {
         "lock" => "Lock",
         "execute" => "Execute",
         "run-live-plan" => "Run live plan",
+        "approve-live-apply" => "Approve & apply",
         "verify" => "Verify",
         &_ => "Unknown",
     }
@@ -400,6 +405,29 @@ pub fn RequestDetail() -> impl IntoView {
         }
     });
 
+    let approve_live_apply_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        set_action_feedback.set("Approving & applying...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match approve_live_apply_request(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
     let verify_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Verifying...".to_string());
@@ -548,6 +576,18 @@ pub fn RequestDetail() -> impl IntoView {
                         // "execute" is available (request is Locked) and the session
                         // holds the "admin" capability (PlatformAdmin / BreakGlassAdmin).
                         let show_live_plan = detail
+                            .actions_available
+                            .iter()
+                            .any(|a| a == "execute")
+                            && session_can(&session, "admin");
+                        // "Approve & apply" is an admin-only action that mints a
+                        // CP-signed LiveApply grant from the request's completed
+                        // LivePlan. The API endpoint itself 409s if no live plan
+                        // has been completed yet, so we use the same gate as
+                        // show_live_plan for portal-side visibility: execute
+                        // available (request is Locked) and admin session. The
+                        // API enforces state correctness.
+                        let show_approve_apply = detail
                             .actions_available
                             .iter()
                             .any(|a| a == "execute")
@@ -924,7 +964,7 @@ pub fn RequestDetail() -> impl IntoView {
                                         // a real terraform plan / ansible --check with no
                                         // mutation (POST .../execute?mode=live-plan).
                                         // Clone the id here so `request_id_for_action` remains
-                                        // available for the reason-panel `Show` below.
+                                        // available for subsequent buttons and the reason-panel.
                                         {
                                             let live_plan_id = request_id_for_action.clone();
                                             view! {
@@ -939,6 +979,32 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 }
                                                             >
                                                                 "Run live plan"
+                                                            </button>
+                                                        }
+                                                    }
+                                                </Show>
+                                            }
+                                        }
+                                        // "Approve & apply" — admin-only, shown when the
+                                        // request is Locked (same gate as "Run live plan").
+                                        // Mints a CP-signed LiveApply grant from the
+                                        // request's completed LivePlan. The API 409s if no
+                                        // live plan has been completed yet.
+                                        {
+                                            let approve_apply_id = request_id_for_action.clone();
+                                            view! {
+                                                <Show when=move || show_approve_apply>
+                                                    {
+                                                        let id = approve_apply_id.clone();
+                                                        view! {
+                                                            <button
+                                                                class="btn btn-secondary"
+                                                                on:click=move |_| {
+                                                                    approve_live_apply_action
+                                                                        .dispatch(id.clone());
+                                                                }
+                                                            >
+                                                                "Approve & apply"
                                                             </button>
                                                         }
                                                     }
@@ -1272,6 +1338,16 @@ mod tests {
             "admin",
             "run-live-plan must require the admin capability so only PlatformAdmin \
              and BreakGlassAdmin see the button"
+        );
+    }
+
+    #[test]
+    fn approve_live_apply_requires_admin_capability() {
+        assert_eq!(
+            action_capability("approve-live-apply"),
+            "admin",
+            "approve-live-apply must require the admin capability so only PlatformAdmin \
+             and BreakGlassAdmin can mint a LiveApply grant"
         );
     }
 

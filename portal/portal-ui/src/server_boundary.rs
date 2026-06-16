@@ -22,10 +22,10 @@ use crate::api::{
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
-    request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
-    request_execution_job_path, request_lock_path, request_plan_path, request_reject_path,
-    request_validate_path, request_verify_path,
+    admin_session_revoke_path, admin_token_revoke_path, request_approve_live_apply_path,
+    request_approve_path, request_audit_path, request_cancel_path, request_detail_path,
+    request_evidence_path, request_execute_path, request_execution_job_path, request_lock_path,
+    request_plan_path, request_reject_path, request_validate_path, request_verify_path,
 };
 #[cfg(feature = "ssr")]
 use crate::api::{integration_id_path, integration_test_path};
@@ -274,6 +274,7 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("audit"), None)
             | (Some("evidence"), None)
             | (Some("execution-job"), None)
+            | (Some("approve-live-apply"), None)
     )
 }
 
@@ -2142,6 +2143,31 @@ pub async fn execute_request_live_plan(
     // is a static string literal — no user input is interpolated here.
     let live_plan_path = format!("{base_path}?mode=live-plan");
     dispatch_stage_action_live(request_id, "live plan", &live_plan_path).await
+}
+
+/// Admin-gated action that mints a CP-signed LiveApply grant from the
+/// request's completed LivePlan. Mirrors `execute_request_live_plan` exactly:
+/// the allowlist sees the plain ".../approve-live-apply" suffix, which is
+/// already registered in `is_allowed_request_lifecycle_path`. Static dry-run
+/// mode rejects the action so no lifecycle state is changed in preview.
+#[server(prefix = "/portal/api", endpoint = "request-approve-live-apply")]
+pub async fn approve_live_apply_request(
+    request_id: String,
+) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_approve_live_apply_path(&request_id).map_err(|_| {
+        ServerFnError::new("request approve-live-apply API path failed same-origin guard")
+    })?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| {
+            ServerFnError::new("request approve-live-apply API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "live apply");
+    }
+    dispatch_stage_action_live(request_id, "live apply", &path).await
 }
 
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
