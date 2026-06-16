@@ -3940,60 +3940,158 @@ async fn ad_computer_contract() -> Json<Value> {
 // ─── gMSA lifecycle handlers ───
 
 async fn gmsa_create(Json(body): Json<GmsaCreateRequest>) -> ApiResult {
-    match gmsa_lifecycle::create_gmsa(&body.name, body.hosts, body.spns, &body.site) {
-        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let account = gmsa_lifecycle::create_gmsa(&body.name, body.hosts, body.spns, &body.site)
+        .map_err(|e| status_400(&e))?;
+
+    let persisted = crate::repos::gmsa_accounts::insert(pool, &account)
+        .await
+        .map_err(|e| {
+            // Only the account-name UNIQUE constraint is a "duplicate name". The
+            // child-host UNIQUE can't be hit here (the repo dedups + ON CONFLICTs
+            // the host inserts), but checking the constraint name keeps the 409
+            // honest if that ever changes.
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation() && d.constraint() == Some("gmsa_accounts_name_key") {
+                    return status_409("a gMSA with that name already exists");
+                }
+            }
+            db_error(e)
+        })?;
+
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn gmsa_validate(Json(body): Json<GmsaValidateRequest>) -> ApiResult {
+    // Pure naming-convention check — no DB interaction.
     match gmsa_lifecycle::validate_gmsa(&body.name) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn gmsa_assign(Path((name, host)): Path<(String, String)>) -> ApiResult {
-    match gmsa_lifecycle::assign_to_host(&name, &host) {
-        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // add_host enforces the revoked guard under a row lock (concurrency-safe);
+    // the engine assign_to_host is the pure spec of the same rule.
+    use crate::repos::gmsa_accounts::HostOpOutcome;
+    match crate::repos::gmsa_accounts::add_host(pool, &name, &host)
+        .await
+        .map_err(db_error)?
+    {
+        HostOpOutcome::AccountNotFound => Err(status_404(&name)),
+        HostOpOutcome::AccountRevoked => Err(status_409(&format!(
+            "Cannot assign hosts to revoked gMSA {name}"
+        ))),
+        HostOpOutcome::Applied => {
+            let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+                .await
+                .map_err(db_error)?
+                .ok_or_else(|| status_404(&name))?;
+            Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
+        }
+        other => Err(db_error(sqlx::Error::Protocol(format!(
+            "add_host returned unexpected outcome {other:?}"
+        )))),
     }
 }
 
 async fn gmsa_remove(Path((name, host)): Path<(String, String)>) -> ApiResult {
-    match gmsa_lifecycle::remove_from_host(&name, &host) {
-        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // remove_host enforces the host-present and last-host invariants under a row
+    // lock, so two concurrent removes cannot both drain the account to zero
+    // hosts; the engine remove_from_host is the pure spec of the same rules.
+    use crate::repos::gmsa_accounts::HostOpOutcome;
+    match crate::repos::gmsa_accounts::remove_host(pool, &name, &host)
+        .await
+        .map_err(db_error)?
+    {
+        HostOpOutcome::AccountNotFound => Err(status_404(&name)),
+        HostOpOutcome::HostNotPresent => Err(status_409(&format!(
+            "Host {host} is not in the authorized list for {name}"
+        ))),
+        HostOpOutcome::LastHost => Err(status_409(&format!(
+            "Cannot remove last host from {name}. At least one authorized host required."
+        ))),
+        HostOpOutcome::Applied => {
+            let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+                .await
+                .map_err(db_error)?
+                .ok_or_else(|| status_404(&name))?;
+            Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
+        }
+        other => Err(db_error(sqlx::Error::Protocol(format!(
+            "remove_host returned unexpected outcome {other:?}"
+        )))),
     }
 }
 
 async fn gmsa_rotate(Path(name): Path<String>) -> ApiResult {
-    match gmsa_lifecycle::rotate_password(&name) {
-        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let account = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+
+    // Fast revoked pre-check (the repo CAS below is the authoritative guard).
+    if account.status == gmsa_lifecycle::GMSAStatus::Revoked {
+        return Err(status_409(&format!(
+            "Cannot rotate password for revoked gMSA {name}"
+        )));
     }
+
+    // CAS on the loaded status so a concurrent revoke (or other status change)
+    // is not silently overwritten; rotate only touches last_rotation_at + status.
+    let before = crate::repos::gmsa_accounts::status_str(&account.status);
+    let persisted = crate::repos::gmsa_accounts::rotate(pool, &name, before)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn gmsa_test(Path((name, host)): Path<(String, String)>) -> ApiResult {
-    match gmsa_lifecycle::test_retrieval(&name, &host) {
-        Ok(account) => Ok(Json(serde_json::to_value(account).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let account = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+
+    // Read-only: engine validates revoked guard and host authorization.
+    let result = gmsa_lifecycle::test_retrieval(&account, &host).map_err(|e| status_409(&e))?;
+
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn gmsa_inventory(Query(query): Query<GmsaInventoryQuery>) -> Json<Value> {
+async fn gmsa_inventory(Query(query): Query<GmsaInventoryQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let inventory = gmsa_lifecycle::get_gmsa_inventory(site);
-    Json(serde_json::to_value(inventory).unwrap())
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+    let accounts = crate::repos::gmsa_accounts::list(pool, site)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(accounts).unwrap_or_default()))
 }
 
-async fn gmsa_expiring() -> Json<Value> {
-    let expiring = gmsa_lifecycle::get_expiring();
-    Json(serde_json::to_value(expiring).unwrap())
+async fn gmsa_expiring() -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+    let all = crate::repos::gmsa_accounts::list(pool, "")
+        .await
+        .map_err(db_error)?;
+    let expiring = gmsa_lifecycle::get_expiring(&all);
+    Ok(Json(serde_json::to_value(expiring).unwrap_or_default()))
 }
 
 async fn gmsa_contract() -> Json<Value> {
-    let examples = gmsa_lifecycle::seed_examples();
     Json(json!({
         "source": "static-seed",
         "providerCallsEnabled": false,
@@ -4003,8 +4101,7 @@ async fn gmsa_contract() -> Json<Value> {
         "validStatuses": ["Active", "Expiring", "Expired", "Revoked"],
         "namingConvention": "svc-PURPOSE-SITE (e.g. svc-webappool-gblon)",
         "requiredInputs": ["name", "hosts", "spns", "site"],
-        "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "live-directory-changes-disabled", "raw-service-account-data-disabled"],
-        "examples": serde_json::to_value(examples).unwrap()
+        "blockedReasons": ["provider-calls-disabled", "live-execution-disabled", "live-directory-changes-disabled", "raw-service-account-data-disabled"]
     }))
 }
 
@@ -29272,5 +29369,503 @@ mod certificates_db_tests {
             !arr.is_empty(),
             "expiring endpoint must return at least the seeded Expiring row for GBLON"
         );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api gmsa_db_tests
+#[cfg(test)]
+mod gmsa_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// Delete only the rows we created in a test — never touch the 3 seed rows
+    /// from migration 020. Child rows cascade via ON DELETE CASCADE.
+    async fn cleanup(pool: &PgPool, name: &str) {
+        sqlx::query("DELETE FROM gmsa_accounts WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Build a unique gMSA name for a test run: prefixed with "svc-" (required
+    /// by the engine) and a UUID suffix so parallel runs never collide.
+    fn test_name(suffix: &str) -> String {
+        format!("svc-{suffix}")
+    }
+
+    // ─── create → get_by_name round-trip ───────────────────────────────────────
+
+    /// Insert a gMSA with SPNs (TEXT[] column) and authorized hosts (child
+    /// table). Verify that `get_by_name` returns the exact model back.
+    #[tokio::test]
+    async fn test_create_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("testcrt-{uid}")[..20]);
+
+        let Ok(Json(created)) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+            .await
+            .expect("get_by_name failed")
+            .expect("account not found after insert");
+
+        assert_eq!(record.name, name, "name must round-trip");
+        assert_eq!(record.site, "GBLON", "site must round-trip");
+        assert_eq!(
+            record.service_principal_names,
+            vec!["HTTP/host1.corp.local"],
+            "SPNs (TEXT[] column) must round-trip"
+        );
+        assert!(
+            record
+                .authorized_hosts
+                .contains(&"host1.corp.local".to_string()),
+            "host1 must be in authorized_hosts from child table"
+        );
+        assert!(
+            record
+                .authorized_hosts
+                .contains(&"host2.corp.local".to_string()),
+            "host2 must be in authorized_hosts from child table"
+        );
+        assert_eq!(
+            record.status,
+            ryuki_engine::gmsa_lifecycle::GMSAStatus::Active,
+            "status after create must be Active"
+        );
+
+        cleanup(pool, &name).await;
+    }
+
+    // ─── assign adds a host ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_assign_adds_host() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstasgn-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        // Assign a second host.
+        let Ok(Json(assigned)) = gmsa_assign(Path((name.clone(), "host2.corp.local".into()))).await
+        else {
+            cleanup(pool, &name).await;
+            panic!("gmsa_assign failed");
+        };
+
+        let hosts = assigned["authorized_hosts"]
+            .as_array()
+            .expect("authorized_hosts must be array");
+        let host_strings: Vec<&str> = hosts
+            .iter()
+            .map(|v| v.as_str().expect("host must be string"))
+            .collect();
+        assert!(
+            host_strings.contains(&"host2.corp.local"),
+            "host2 must appear in authorized_hosts after assign"
+        );
+
+        // Verify the child table in the DB.
+        let db_hosts = crate::repos::gmsa_accounts::fetch_hosts(pool, &name)
+            .await
+            .expect("fetch_hosts failed");
+        assert!(
+            db_hosts.contains(&"host2.corp.local".to_string()),
+            "host2 must be in gmsa_host_assignments"
+        );
+
+        cleanup(pool, &name).await;
+    }
+
+    // ─── remove deletes a host ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_deletes_host() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstrmv-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        let Ok(Json(removed)) = gmsa_remove(Path((name.clone(), "host2.corp.local".into()))).await
+        else {
+            cleanup(pool, &name).await;
+            panic!("gmsa_remove failed");
+        };
+
+        let hosts = removed["authorized_hosts"]
+            .as_array()
+            .expect("authorized_hosts must be array");
+        let host_strings: Vec<&str> = hosts
+            .iter()
+            .map(|v| v.as_str().expect("host must be string"))
+            .collect();
+        assert!(
+            !host_strings.contains(&"host2.corp.local"),
+            "host2 must be absent after remove"
+        );
+
+        let db_hosts = crate::repos::gmsa_accounts::fetch_hosts(pool, &name)
+            .await
+            .expect("fetch_hosts failed");
+        assert!(
+            !db_hosts.contains(&"host2.corp.local".to_string()),
+            "host2 must be removed from gmsa_host_assignments"
+        );
+
+        cleanup(pool, &name).await;
+    }
+
+    // ─── remove last host → 409 ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remove_last_host_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstlast-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        let Err((status, _)) = gmsa_remove(Path((name.clone(), "host1.corp.local".into()))).await
+        else {
+            cleanup(pool, &name).await;
+            panic!("expected remove of last host to fail");
+        };
+
+        cleanup(pool, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "removing last host must return 409"
+        );
+    }
+
+    // ─── rotate updates last_rotation_at and status → Active ──────────────────
+
+    #[tokio::test]
+    async fn test_rotate_updates_db() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstrot-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        // Capture last_rotation_at before rotate.
+        let before = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+            .await
+            .expect("get_by_name failed")
+            .expect("account not found");
+        let before_rotation = before.last_rotation_at.clone();
+
+        // Small delay to ensure last_rotation_at advances.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let Ok(Json(rotated)) = gmsa_rotate(Path(name.clone())).await else {
+            cleanup(pool, &name).await;
+            panic!("gmsa_rotate failed");
+        };
+
+        assert_eq!(
+            rotated["status"], "Active",
+            "status after rotate must be Active"
+        );
+
+        let after = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+            .await
+            .expect("get_by_name failed")
+            .expect("account not found after rotate");
+
+        assert_eq!(
+            after.status,
+            ryuki_engine::gmsa_lifecycle::GMSAStatus::Active,
+            "DB status after rotate must be Active"
+        );
+        assert_ne!(
+            after.last_rotation_at, before_rotation,
+            "last_rotation_at must advance after rotate"
+        );
+
+        cleanup(pool, &name).await;
+    }
+
+    // ─── duplicate name → 409 ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_create_duplicate_name_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstdup-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("first gmsa_create failed");
+        };
+
+        let Err((status, _)) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host2.corp.local".into()],
+            spns: vec!["HTTP/host2.corp.local".into()],
+            site: "DEFRA".into(),
+        }))
+        .await
+        else {
+            cleanup(pool, &name).await;
+            panic!("expected duplicate create to fail");
+        };
+
+        cleanup(pool, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "duplicate name must return 409"
+        );
+    }
+
+    // ─── assign on a revoked account → 409 ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_assign_revoked_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstarvk-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        // Force the account to Revoked status directly in the DB.
+        sqlx::query("UPDATE gmsa_accounts SET status = 'Revoked' WHERE name = $1")
+            .bind(&name)
+            .execute(pool)
+            .await
+            .expect("status update failed");
+
+        let Err((status, _)) = gmsa_assign(Path((name.clone(), "host2.corp.local".into()))).await
+        else {
+            cleanup(pool, &name).await;
+            panic!("expected assign on revoked account to fail");
+        };
+
+        cleanup(pool, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "assign on a revoked account must return 409"
+        );
+    }
+
+    // ─── rotate on a revoked account → 409 ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_rotate_revoked_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstrotvk-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["host1.corp.local".into()],
+            spns: vec!["HTTP/host1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        // Force the account to Revoked status.
+        sqlx::query("UPDATE gmsa_accounts SET status = 'Revoked' WHERE name = $1")
+            .bind(&name)
+            .execute(pool)
+            .await
+            .expect("status update failed");
+
+        let Err((status, _)) = gmsa_rotate(Path(name.clone())).await else {
+            cleanup(pool, &name).await;
+            panic!("expected rotate on revoked account to fail");
+        };
+
+        cleanup(pool, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "rotate on a revoked account must return 409"
+        );
+    }
+
+    // ─── repo-level last-host guard (the concurrency-safe path) ───────────────
+
+    /// The last-host invariant must be enforced by the REPO under its row lock,
+    /// not only by the engine pre-check on a stale read — otherwise two
+    /// concurrent removes could both pass and drain the account to zero hosts.
+    /// Drive `remove_host` directly: removing down to one host succeeds, and the
+    /// final remove is rejected with `LastHost` at the DB layer.
+    #[tokio::test]
+    async fn test_remove_host_repo_enforces_last_host() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        use crate::repos::gmsa_accounts::HostOpOutcome;
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let name = test_name(&format!("tstrepo-{uid}")[..20]);
+
+        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
+            name: name.clone(),
+            hosts: vec!["h1.corp.local".into(), "h2.corp.local".into()],
+            spns: vec!["HTTP/h1.corp.local".into()],
+            site: "GBLON".into(),
+        }))
+        .await
+        else {
+            panic!("gmsa_create failed");
+        };
+
+        // First remove (2 -> 1) applies.
+        let first = crate::repos::gmsa_accounts::remove_host(pool, &name, "h1.corp.local")
+            .await
+            .expect("remove_host failed");
+        assert_eq!(
+            first,
+            HostOpOutcome::Applied,
+            "removing down to 1 host applies"
+        );
+
+        // Second remove must be rejected by the repo's locked last-host guard.
+        let second = crate::repos::gmsa_accounts::remove_host(pool, &name, "h2.corp.local")
+            .await
+            .expect("remove_host failed");
+        assert_eq!(
+            second,
+            HostOpOutcome::LastHost,
+            "the repo must reject removing the last host"
+        );
+
+        // Removing a host that is not present is reported distinctly.
+        let absent = crate::repos::gmsa_accounts::remove_host(pool, &name, "nope.corp.local")
+            .await
+            .expect("remove_host failed");
+        assert_eq!(absent, HostOpOutcome::HostNotPresent);
+
+        cleanup(pool, &name).await;
     }
 }

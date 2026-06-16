@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,61 +35,13 @@ pub struct GMSAAccount {
     pub last_rotation_at: String,
 }
 
-fn seed_gmsa_accounts() -> Vec<GMSAAccount> {
-    let now = chrono::Utc::now();
-    vec![
-        GMSAAccount {
-            id: Uuid::new_v4().to_string(),
-            name: "svc-webappool-gblon".into(),
-            sam_account_name: "svc-webappool-gblon$".into(),
-            dns_host_name: "svc-webappool-gblon.corp.local".into(),
-            service_principal_names: vec![
-                "HTTP/webapp01.corp.local".into(),
-                "HTTP/webapp02.corp.local".into(),
-            ],
-            authorized_hosts: vec!["webapp01.corp.local".into(), "webapp02.corp.local".into()],
-            site: "GBLON".into(),
-            status: GMSAStatus::Active,
-            managed_password_interval_days: 30,
-            created_at: now.to_rfc3339(),
-            last_rotation_at: (now - chrono::Duration::days(15)).to_rfc3339(),
-        },
-        GMSAAccount {
-            id: Uuid::new_v4().to_string(),
-            name: "svc-sqlagent-defra".into(),
-            sam_account_name: "svc-sqlagent-defra$".into(),
-            dns_host_name: "svc-sqlagent-defra.corp.local".into(),
-            service_principal_names: vec!["MSSQLSvc/sql01.corp.local:1433".into()],
-            authorized_hosts: vec!["sql01.corp.local".into()],
-            site: "DEFRA".into(),
-            status: GMSAStatus::Expiring,
-            managed_password_interval_days: 60,
-            created_at: (now - chrono::Duration::days(180)).to_rfc3339(),
-            last_rotation_at: (now - chrono::Duration::days(55)).to_rfc3339(),
-        },
-        GMSAAccount {
-            id: Uuid::new_v4().to_string(),
-            name: "svc-iisworker-frpar".into(),
-            sam_account_name: "svc-iisworker-frpar$".into(),
-            dns_host_name: "svc-iisworker-frpar.corp.local".into(),
-            service_principal_names: vec!["HTTP/iis-frpar.corp.local".into()],
-            authorized_hosts: vec!["iis-frpar.corp.local".into()],
-            site: "FRPAR".into(),
-            status: GMSAStatus::Expired,
-            managed_password_interval_days: 30,
-            created_at: (now - chrono::Duration::days(400)).to_rfc3339(),
-            last_rotation_at: (now - chrono::Duration::days(35)).to_rfc3339(),
-        },
-    ]
-}
-
-static GMSA_STORE: std::sync::LazyLock<Mutex<Vec<GMSAAccount>>> =
-    std::sync::LazyLock::new(|| Mutex::new(seed_gmsa_accounts()));
-
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// Create a new gMSA account in memory (pure — no store). The caller is
+/// responsible for persisting the returned record. A fresh UUID is minted
+/// on each call.
 pub fn create_gmsa(
     name: &str,
     hosts: Vec<String>,
@@ -113,7 +64,7 @@ pub fn create_gmsa(
         return Err("At least one SPN is required".into());
     }
 
-    let account = GMSAAccount {
+    Ok(GMSAAccount {
         id: Uuid::new_v4().to_string(),
         name: name.to_string(),
         sam_account_name: format!("{name}$"),
@@ -125,12 +76,13 @@ pub fn create_gmsa(
         managed_password_interval_days: 30,
         created_at: now_iso(),
         last_rotation_at: now_iso(),
-    };
-
-    GMSA_STORE.lock().unwrap().push(account.clone());
-    Ok(account)
+    })
 }
 
+/// Validate a gMSA name for naming-convention compliance (pure — no store
+/// lookup). The naming check is always applied; in-DB cross-reference
+/// validation (SPN present, host assigned) is the responsibility of the
+/// caller after loading the record from the repo.
 pub fn validate_gmsa(name: &str) -> Result<crate::models::ValidationResult, String> {
     if name.is_empty() {
         return Err("gMSA name cannot be empty".into());
@@ -156,21 +108,6 @@ pub fn validate_gmsa(name: &str) -> Result<crate::models::ValidationResult, Stri
         remediation.push("Use format svc-PURPOSE-SITE".into());
     }
 
-    let store = GMSA_STORE.lock().unwrap();
-    let existing = store.iter().find(|a| a.name == name);
-    if let Some(account) = existing {
-        if account.service_principal_names.is_empty() {
-            errors.push("gMSA has no SPNs configured".into());
-            failed_rules.push("gmsa-spn-required".into());
-            remediation.push("Configure at least one valid SPN".into());
-        }
-        if account.authorized_hosts.is_empty() {
-            errors.push("gMSA has no authorized hosts".into());
-            failed_rules.push("gmsa-host-membership".into());
-            remediation.push("Assign at least one host as authorized retrieval principal".into());
-        }
-    }
-
     warnings.push("DRY-RUN: No live AD gMSA validation performed".into());
     warnings.push("DRY-RUN: KDS root key readiness not verified".into());
 
@@ -183,116 +120,117 @@ pub fn validate_gmsa(name: &str) -> Result<crate::models::ValidationResult, Stri
     })
 }
 
-pub fn assign_to_host(gmsa_name: &str, host: &str) -> Result<GMSAAccount, String> {
+/// Add `host` to the account's authorized_hosts list. Returns a clone with
+/// the host appended; a no-op (returns the same clone) if the host is already
+/// present — idempotent to match the `ON CONFLICT DO NOTHING` repo behaviour.
+///
+/// Guards: revoked accounts cannot have hosts assigned.
+pub fn assign_to_host(account: &GMSAAccount, host: &str) -> Result<GMSAAccount, String> {
     if host.is_empty() {
         return Err("Host cannot be empty".into());
     }
 
-    let mut store = GMSA_STORE.lock().unwrap();
-    let account = store
-        .iter_mut()
-        .find(|a| a.name == gmsa_name)
-        .ok_or_else(|| format!("gMSA {gmsa_name} not found"))?;
-
     if account.status == GMSAStatus::Revoked {
-        return Err(format!("Cannot assign hosts to revoked gMSA {gmsa_name}"));
+        return Err(format!(
+            "Cannot assign hosts to revoked gMSA {}",
+            account.name
+        ));
+    }
+
+    let mut updated = account.clone();
+    if !updated.authorized_hosts.contains(&host.to_string()) {
+        updated.authorized_hosts.push(host.to_string());
+    }
+
+    Ok(updated)
+}
+
+/// Remove `host` from the account's authorized_hosts list. Returns a clone
+/// with the host removed.
+///
+/// Guards: host must be present in the list; at least one host must remain
+/// after removal.
+pub fn remove_from_host(account: &GMSAAccount, host: &str) -> Result<GMSAAccount, String> {
+    if host.is_empty() {
+        return Err("Host cannot be empty".into());
     }
 
     if !account.authorized_hosts.contains(&host.to_string()) {
-        account.authorized_hosts.push(host.to_string());
-    }
-
-    Ok(account.clone())
-}
-
-pub fn remove_from_host(gmsa_name: &str, host: &str) -> Result<GMSAAccount, String> {
-    if host.is_empty() {
-        return Err("Host cannot be empty".into());
-    }
-
-    let mut store = GMSA_STORE.lock().unwrap();
-    let account = store
-        .iter_mut()
-        .find(|a| a.name == gmsa_name)
-        .ok_or_else(|| format!("gMSA {gmsa_name} not found"))?;
-
-    let before = account.authorized_hosts.len();
-    account.authorized_hosts.retain(|h| h != host);
-
-    if account.authorized_hosts.len() == before {
         return Err(format!(
-            "Host {host} is not in the authorized list for {gmsa_name}"
+            "Host {host} is not in the authorized list for {}",
+            account.name
         ));
     }
 
-    if account.authorized_hosts.is_empty() {
-        return Err(format!(
-            "Cannot remove last host from {gmsa_name}. At least one authorized host required."
-        ));
-    }
-
-    Ok(account.clone())
-}
-
-pub fn rotate_password(gmsa_name: &str) -> Result<GMSAAccount, String> {
-    let mut store = GMSA_STORE.lock().unwrap();
-    let account = store
-        .iter_mut()
-        .find(|a| a.name == gmsa_name)
-        .ok_or_else(|| format!("gMSA {gmsa_name} not found"))?;
-
-    if account.status == GMSAStatus::Revoked {
-        return Err(format!(
-            "Cannot rotate password for revoked gMSA {gmsa_name}"
-        ));
-    }
-
-    account.last_rotation_at = now_iso();
-    account.status = GMSAStatus::Active;
-
-    Ok(account.clone())
-}
-
-pub fn test_retrieval(gmsa_name: &str, host: &str) -> Result<GMSAAccount, String> {
-    if host.is_empty() {
-        return Err("Host cannot be empty".into());
-    }
-
-    let store = GMSA_STORE.lock().unwrap();
-    let account = store
+    let remaining: Vec<String> = account
+        .authorized_hosts
         .iter()
-        .find(|a| a.name == gmsa_name)
-        .ok_or_else(|| format!("gMSA {gmsa_name} not found"))?;
+        .filter(|h| *h != host)
+        .cloned()
+        .collect();
+
+    if remaining.is_empty() {
+        return Err(format!(
+            "Cannot remove last host from {}. At least one authorized host required.",
+            account.name
+        ));
+    }
+
+    let mut updated = account.clone();
+    updated.authorized_hosts = remaining;
+    Ok(updated)
+}
+
+/// Rotate the managed password: sets `last_rotation_at` to now and status to
+/// Active. Returns a clone with the updated fields.
+///
+/// Guard: revoked accounts cannot have their password rotated.
+pub fn rotate_password(account: &GMSAAccount) -> Result<GMSAAccount, String> {
+    if account.status == GMSAStatus::Revoked {
+        return Err(format!(
+            "Cannot rotate password for revoked gMSA {}",
+            account.name
+        ));
+    }
+
+    let mut updated = account.clone();
+    updated.last_rotation_at = now_iso();
+    updated.status = GMSAStatus::Active;
+    Ok(updated)
+}
+
+/// Verify that `host` is authorized to retrieve the managed password. Returns
+/// a clone of the account (read-only — no mutations).
+///
+/// Guards: revoked accounts and unauthorized hosts are both rejected.
+pub fn test_retrieval(account: &GMSAAccount, host: &str) -> Result<GMSAAccount, String> {
+    if host.is_empty() {
+        return Err("Host cannot be empty".into());
+    }
 
     if account.status == GMSAStatus::Revoked {
         return Err(format!(
-            "Cannot test retrieval for revoked gMSA {gmsa_name}"
+            "Cannot test retrieval for revoked gMSA {}",
+            account.name
         ));
     }
 
     if !account.authorized_hosts.contains(&host.to_string()) {
         return Err(format!(
-            "Host {host} is not authorized to retrieve password for {gmsa_name}"
+            "Host {host} is not authorized to retrieve password for {}",
+            account.name
         ));
     }
 
     Ok(account.clone())
 }
 
-pub fn get_gmsa_inventory(site: &str) -> Vec<GMSAAccount> {
-    let store = GMSA_STORE.lock().unwrap();
-    if site.is_empty() {
-        store.clone()
-    } else {
-        store.iter().filter(|a| a.site == site).cloned().collect()
-    }
-}
-
-pub fn get_expiring() -> Vec<GMSAAccount> {
+/// Filter a slice of accounts to those that are expiring or expired, or whose
+/// next rotation falls within 7 days. Pure over the provided slice — no I/O.
+pub fn get_expiring(accounts: &[GMSAAccount]) -> Vec<GMSAAccount> {
     let now = chrono::Utc::now();
     let threshold = now + chrono::Duration::days(7);
-    let store = GMSA_STORE.lock().unwrap();
-    store
+    accounts
         .iter()
         .filter(|a| {
             if a.status == GMSAStatus::Expiring || a.status == GMSAStatus::Expired {
@@ -311,34 +249,27 @@ pub fn get_expiring() -> Vec<GMSAAccount> {
         .collect()
 }
 
-pub fn get_gmsa(name: &str) -> Option<GMSAAccount> {
-    GMSA_STORE
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|a| a.name == name)
-        .cloned()
-}
-
-pub fn seed_examples() -> Vec<GMSAAccount> {
-    GMSA_STORE.lock().unwrap().clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Tests below mutate the shared `svc-webappool-gblon` account in the
-    /// process-global GMSA_STORE; without serialization their interleaving
-    /// is racy under the parallel test runner (observed as a CI-only flake).
-    /// Poisoning is tolerated so one failing test cannot cascade.
-    static SHARED_ACCOUNT_GUARD: Mutex<()> = Mutex::new(());
-
-    fn lock_shared_account() -> std::sync::MutexGuard<'static, ()> {
-        SHARED_ACCOUNT_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn make_account(status: GMSAStatus, hosts: Vec<String>) -> GMSAAccount {
+        GMSAAccount {
+            id: Uuid::new_v4().to_string(),
+            name: "svc-testapp-gblon".into(),
+            sam_account_name: "svc-testapp-gblon$".into(),
+            dns_host_name: "svc-testapp-gblon.corp.local".into(),
+            service_principal_names: vec!["HTTP/test.corp.local".into()],
+            authorized_hosts: hosts,
+            site: "GBLON".into(),
+            status,
+            managed_password_interval_days: 30,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            last_rotation_at: chrono::Utc::now().to_rfc3339(),
+        }
     }
+
+    // ─── create_gmsa ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_create_gmsa_succeeds() {
@@ -380,8 +311,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ─── validate_gmsa ──────────────────────────────────────────────────────────
+
     #[test]
-    fn test_validate_gmsa_valid() {
+    fn test_validate_gmsa_valid_name() {
         let result = validate_gmsa("svc-webappool-gblon").unwrap();
         assert!(result.passed);
     }
@@ -393,120 +326,140 @@ mod tests {
         assert!(result.errors.iter().any(|e| e.contains("svc-")));
     }
 
+    // ─── assign_to_host ─────────────────────────────────────────────────────────
+
     #[test]
     fn test_assign_to_host_succeeds() {
-        let _guard = lock_shared_account();
-        let result = assign_to_host("svc-webappool-gblon", "new-host.corp.local");
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = assign_to_host(&account, "host2.corp.local");
         assert!(result.is_ok());
-        let account = result.unwrap();
+        let updated = result.unwrap();
         assert!(
-            account
+            updated
                 .authorized_hosts
-                .contains(&"new-host.corp.local".to_string())
+                .contains(&"host2.corp.local".to_string())
         );
+        assert_eq!(updated.authorized_hosts.len(), 2);
     }
 
     #[test]
-    fn test_assign_to_host_revoked_fails() {
-        let _guard = lock_shared_account();
-        let mut store = GMSA_STORE.lock().unwrap();
-        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-gblon") {
-            account.status = GMSAStatus::Revoked;
-        }
-        drop(store);
-
-        let result = assign_to_host("svc-webappool-gblon", "new-host.corp.local");
-        assert!(result.is_err());
-
-        let mut store = GMSA_STORE.lock().unwrap();
-        if let Some(account) = store.iter_mut().find(|a| a.name == "svc-webappool-gblon") {
-            account.status = GMSAStatus::Active;
-        }
+    fn test_assign_already_present_is_idempotent() {
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = assign_to_host(&account, "host1.corp.local");
+        assert!(result.is_ok());
+        // No duplicate added.
+        assert_eq!(result.unwrap().authorized_hosts.len(), 1);
     }
+
+    #[test]
+    fn test_assign_revoked_fails() {
+        let account = make_account(GMSAStatus::Revoked, vec!["host1.corp.local".into()]);
+        let result = assign_to_host(&account, "host2.corp.local");
+        assert!(result.is_err());
+    }
+
+    // ─── remove_from_host ───────────────────────────────────────────────────────
 
     #[test]
     fn test_remove_from_host_succeeds() {
-        let _guard = lock_shared_account();
-        let result = remove_from_host("svc-webappool-gblon", "webapp01.corp.local");
-        assert!(result.is_ok());
-        let account = result.unwrap();
-        assert!(
-            !account
-                .authorized_hosts
-                .contains(&"webapp01.corp.local".to_string())
+        let account = make_account(
+            GMSAStatus::Active,
+            vec!["host1.corp.local".into(), "host2.corp.local".into()],
         );
-
-        let _ = assign_to_host("svc-webappool-gblon", "webapp01.corp.local");
+        let result = remove_from_host(&account, "host1.corp.local");
+        assert!(result.is_ok());
+        let updated = result.unwrap();
+        assert!(
+            !updated
+                .authorized_hosts
+                .contains(&"host1.corp.local".to_string())
+        );
+        assert_eq!(updated.authorized_hosts.len(), 1);
     }
+
+    #[test]
+    fn test_remove_last_host_fails() {
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = remove_from_host(&account, "host1.corp.local");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("last host"),
+            "expected last-host error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_remove_not_present_fails() {
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = remove_from_host(&account, "absent.corp.local");
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("not in the authorized list"),
+            "expected not-in-list error, got: {msg}"
+        );
+    }
+
+    // ─── rotate_password ────────────────────────────────────────────────────────
 
     #[test]
     fn test_rotate_password_succeeds() {
-        let _guard = lock_shared_account();
-        let result = rotate_password("svc-webappool-gblon");
+        let account = make_account(GMSAStatus::Expiring, vec!["host1.corp.local".into()]);
+        let result = rotate_password(&account);
         assert!(result.is_ok());
-        let account = result.unwrap();
-        assert_eq!(account.status, GMSAStatus::Active);
+        let updated = result.unwrap();
+        assert_eq!(updated.status, GMSAStatus::Active);
     }
 
     #[test]
+    fn test_rotate_revoked_fails() {
+        let account = make_account(GMSAStatus::Revoked, vec!["host1.corp.local".into()]);
+        let result = rotate_password(&account);
+        assert!(result.is_err());
+    }
+
+    // ─── test_retrieval ─────────────────────────────────────────────────────────
+
+    #[test]
     fn test_test_retrieval_succeeds() {
-        let result = test_retrieval("svc-webappool-gblon", "webapp01.corp.local");
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = test_retrieval(&account, "host1.corp.local");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_test_retrieval_unauthorized_host() {
-        let result = test_retrieval("svc-webappool-gblon", "evil-host.corp.local");
+        let account = make_account(GMSAStatus::Active, vec!["host1.corp.local".into()]);
+        let result = test_retrieval(&account, "evil-host.corp.local");
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_get_gmsa_inventory_seeded() {
-        let inventory = get_gmsa_inventory("");
-        assert!(inventory.len() >= 3);
-        let names: Vec<&str> = inventory.iter().map(|a| a.name.as_str()).collect();
-        assert!(names.contains(&"svc-webappool-gblon"));
-        assert!(names.contains(&"svc-sqlagent-defra"));
-        assert!(names.contains(&"svc-iisworker-frpar"));
+    fn test_test_retrieval_revoked_fails() {
+        let account = make_account(GMSAStatus::Revoked, vec!["host1.corp.local".into()]);
+        let result = test_retrieval(&account, "host1.corp.local");
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn test_get_gmsa_inventory_by_site() {
-        let gblon = get_gmsa_inventory("GBLON");
-        assert!(!gblon.is_empty());
-        assert!(gblon.iter().all(|a| a.site == "GBLON"));
-
-        let defra = get_gmsa_inventory("DEFRA");
-        assert!(!defra.is_empty());
-        assert!(defra.iter().all(|a| a.site == "DEFRA"));
-    }
+    // ─── get_expiring ───────────────────────────────────────────────────────────
 
     #[test]
-    fn test_get_expiring_finds_expiring() {
-        let results = get_expiring();
-        let has_expiring = results
+    fn test_get_expiring_finds_expiring_status() {
+        let accounts = vec![
+            make_account(GMSAStatus::Active, vec!["h.local".into()]),
+            make_account(GMSAStatus::Expiring, vec!["h.local".into()]),
+            make_account(GMSAStatus::Expired, vec!["h.local".into()]),
+        ];
+        let expiring = get_expiring(&accounts);
+        assert!(expiring.len() >= 2);
+        let has_expiring = expiring
             .iter()
             .any(|a| a.status == GMSAStatus::Expiring || a.status == GMSAStatus::Expired);
         assert!(has_expiring);
     }
 
-    #[test]
-    fn test_get_gmsa_not_found() {
-        assert!(get_gmsa("nonexistent-gmsa").is_none());
-    }
-
-    #[test]
-    fn test_get_gmsa_found() {
-        let found = get_gmsa("svc-webappool-gblon");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().name, "svc-webappool-gblon");
-    }
-
-    #[test]
-    fn test_seed_examples() {
-        let examples = seed_examples();
-        assert!(examples.len() >= 3);
-    }
+    // ─── GMSAStatus Display ─────────────────────────────────────────────────────
 
     #[test]
     fn test_gmsa_status_display() {
