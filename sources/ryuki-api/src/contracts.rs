@@ -121,6 +121,10 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route(
+            "/api/requests/{id}/approve-live-apply",
+            post(requests_approve_live_apply),
+        )
+        .route(
             "/api/requests/{id}/execution-job",
             get(requests_execution_job),
         )
@@ -10758,6 +10762,135 @@ fn sanitize_stages_for_portal(stages: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Array(sanitized)
 }
 
+/// POST /api/requests/{id}/approve-live-apply — admin approves the completed
+/// LivePlan for this request and mints a CP-signed LiveApply grant (AWX bridge
+/// slice 5c). It RECONSTRUCTS the LiveApply job from the latest SUCCEEDED
+/// LivePlan agent_job's spec + evidence_digest, so the approver never
+/// hand-builds the spec or the digest. The agent then INDEPENDENTLY verifies
+/// the grant (digest match, request binding, expiry) before applying with
+/// operator-provided creds. Admin-gated and mutation-authorizing — fail closed.
+async fn requests_approve_live_apply(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "admin") {
+        record_transition_denied(&session, &request_id, "request.approve-live-apply").await;
+        return Err(status_403());
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+
+    // No-double-apply: at most ONE LiveApply may ever be approved per request.
+    // This pre-check returns a friendly 409 if ANY LiveApply already exists for
+    // it — active (Pending/Leased/Running), already-applied (Succeeded), or
+    // stuck (ReconcileRequired/Failed). A failed or lease-expired apply must be
+    // handled by the operator reconcile flow, NOT re-approved here. The
+    // authoritative, concurrency-safe guard is in create_live_apply_job (an
+    // ON CONFLICT against the partial unique index from migration 057), so even
+    // a concurrent double-submit that races past this pre-check cannot mint a
+    // second grant.
+    let prior_apply: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+    )
+    .bind(uid)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    if prior_apply > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "a live-apply has already been approved for this request; \
+                          a failed or expired apply must be reconciled by an operator, \
+                          not re-approved here"
+            })),
+        ));
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct PlanJobRow {
+        platform: String,
+        spec: serde_json::Value,
+        evidence_digest: Option<String>,
+        req_status: String,
+    }
+    // The latest TERMINAL, genuinely-successful LivePlan is what gets approved:
+    // result_status 'planned' (terraform plan) or 'check_ok' (ansible --check),
+    // with completed_at set — NOT merely job.status='Succeeded' (which also
+    // maps from applied/verified results). JOIN requests both to prove
+    // existence and to read the request's own status. Newest by COMPLETION.
+    let plan: Option<PlanJobRow> = sqlx::query_as(
+        "SELECT j.platform, j.spec, j.evidence_digest, r.status AS req_status \
+         FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
+         WHERE j.request_id = $1 AND j.mode = 'LivePlan' \
+           AND j.result_status IN ('planned', 'check_ok') \
+           AND j.completed_at IS NOT NULL \
+           AND j.evidence_digest IS NOT NULL \
+         ORDER BY j.completed_at DESC, j.id DESC LIMIT 1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+
+    let Some(plan) = plan else {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "no completed live plan to approve; run a live plan (mode=live-plan) first"
+            })),
+        ));
+    };
+
+    // A live apply must never be authorised once the request itself is terminal
+    // (a stale plan must not re-open a cancelled/rejected/completed/failed
+    // request — its result backlink would no-op anyway).
+    if matches!(
+        plan.req_status.as_str(),
+        "completed" | "failed" | "cancelled" | "rejected"
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "request is in terminal state '{}'; cannot approve a live apply",
+                    plan.req_status
+                )
+            })),
+        ));
+    }
+
+    let digest = plan.evidence_digest.unwrap_or_default();
+
+    // Reconstruct the spec from the approved plan, switching the mode to
+    // LiveApply. approve_live_apply_with / create_live_apply_job re-validate
+    // spec.mode == LiveApply, the 64-hex digest, the request_id binding, and
+    // the expiry before signing the grant.
+    let mut spec: ryuki_protocol::JobSpec = serde_json::from_value(plan.spec)
+        .map_err(|e| status_400(&format!("stored plan spec is malformed: {e}")))?;
+    spec.mode = ryuki_protocol::JobMode::LiveApply;
+
+    let cp_key = crate::cp_identity::cp_signing_key().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "control plane is not configured to sign grants"})),
+        )
+    })?;
+
+    let body = crate::agents::ApproveLiveApplyBody {
+        request_id: uid,
+        platform: plan.platform,
+        spec,
+        approved_plan_digest: digest,
+        // 1-hour grant TTL — the operator must apply within this window.
+        expiry_seconds: 3600,
+    };
+    // Approver = the verified session principal (never the request body). Mints
+    // the CP-signed grant + inserts the LiveApply job; the agent verifies the
+    // grant independently before applying.
+    crate::agents::approve_live_apply_with(pool, cp_key, session.user_id.as_str(), &body).await
+}
+
 /// GET /api/requests/{id}/execution-job — the execution-agent job dispatched
 /// for this request (AWX bridge slice 3). Read-only AWX-style "job" view:
 /// which agent ran it, the mode (dry-run/live), job + result status, the
@@ -20788,6 +20921,104 @@ mod db_lifecycle_tests {
         .expect("job mode");
         assert_eq!(job_mode, "LivePlan", "a LivePlan agent_job was dispatched");
 
+        cleanup_request(pool, id).await;
+    }
+
+    /// AWX bridge slice 5c: an admin approves a request's completed LivePlan,
+    /// minting a CP-signed LiveApply job reconstructed from that plan. No
+    /// completed plan -> 409; non-admin -> 403.
+    #[tokio::test]
+    async fn test_approve_live_apply_mints_grant_from_completed_plan() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Idempotent test init of the process-global CP signing key.
+        crate::cp_identity::init_cp_key_for_test(ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]));
+        let admin = admin_session("approver-la");
+        let p = |s: &str| Path(s.to_string());
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        // No completed live plan yet -> 409.
+        let Err((st, _)) =
+            requests_approve_live_apply(p(&id_str), AuthExtractor(admin.clone())).await
+        else {
+            panic!("expected 409 without a completed live plan");
+        };
+        assert_eq!(st, StatusCode::CONFLICT);
+
+        // Seed a SUCCEEDED LivePlan job: spec.request_id == uid, mode serializes
+        // snake_case ("live_plan"), 64-hex evidence digest (the plan digest).
+        let digest = "a".repeat(64);
+        let spec = json!({
+            "request_id": id_str,
+            "offering_id": Uuid::new_v4().to_string(),
+            "iac_ref": "linux-server-deployment@v1",
+            "iac_digest": "0".repeat(64),
+            "vars": {},
+            "mode": "live_plan"
+        });
+        sqlx::query(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, result_status, evidence_digest, completed_at) \
+             VALUES ($1, 'DEFRA', $2::jsonb, 'LivePlan', 'Succeeded', 'planned', $3, NOW())",
+        )
+        .bind(id)
+        .bind(&spec)
+        .bind(&digest)
+        .execute(pool)
+        .await
+        .expect("seed LivePlan job");
+
+        // Admin approve -> mints exactly one LiveApply job (signed grant).
+        let _ = requests_approve_live_apply(p(&id_str), AuthExtractor(admin.clone()))
+            .await
+            .expect("approve-live-apply");
+        let la_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count LiveApply");
+        assert_eq!(
+            la_count, 1,
+            "a LiveApply job was minted from the approved plan"
+        );
+
+        // Idempotency: a second approve while a LiveApply is active -> 409, and
+        // NO second job is minted (no double-apply).
+        let Err((st_dup, _)) =
+            requests_approve_live_apply(p(&id_str), AuthExtractor(admin.clone())).await
+        else {
+            panic!("expected 409 — a live-apply is already active");
+        };
+        assert_eq!(st_dup, StatusCode::CONFLICT);
+        let la_count2: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count LiveApply after dup");
+        assert_eq!(la_count2, 1, "no second LiveApply job is minted on retry");
+
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
         cleanup_request(pool, id).await;
     }
 

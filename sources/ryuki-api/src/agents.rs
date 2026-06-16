@@ -1545,17 +1545,30 @@ pub async fn create_live_apply_job(
     let grant_json = serde_json::to_value(&signed_grant)
         .expect("VerifiedLiveContext serialisation is infallible");
 
-    let id: Uuid = sqlx::query_scalar(
+    // Atomic, CONCURRENCY-SAFE no-double-apply invariant (enforced for EVERY
+    // caller — the request-scoped approval AND the operator endpoint): insert
+    // the LiveApply job only if none already exists for this request. ON
+    // CONFLICT against the partial unique index `idx_agent_jobs_unique_live_apply`
+    // (migration 057, `(request_id) WHERE mode='LiveApply'`) makes two
+    // simultaneous approvals safe — the loser inserts nothing and gets None.
+    // A grant authorising infrastructure mutation can therefore never be minted
+    // twice; a failed/expired apply goes through operator reconcile, not a
+    // re-mint.
+    let id: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context) \
          VALUES ($1, $2, $3, 'LiveApply', $4::jsonb) \
+         ON CONFLICT (request_id) WHERE mode = 'LiveApply' DO NOTHING \
          RETURNING id",
     )
     .bind(request_id)
     .bind(platform)
     .bind(&spec_json)
     .bind(&grant_json)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
+    let id = id.ok_or(CreateLiveApplyJobError::Invalid(
+        "a live-apply has already been approved for this request",
+    ))?;
 
     tracing::info!(
         job_id = %id,

@@ -565,6 +565,9 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
         // check runs against the row's created_by (the route table cannot
         // evaluate it). Admin passes via the superuser model.
         Some("cancel") => Some("request"),
+        // live-apply approval mints a CP-signed grant authorising infrastructure
+        // mutation — admin-tier (the handler re-checks admin as defence-in-depth).
+        Some("approve-live-apply") => Some("admin"),
         // every other request-family mutation is operator-tier
         _ => Some("execute"),
     }
