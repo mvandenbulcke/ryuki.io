@@ -12,6 +12,7 @@
 //!   On writes they are serialized to JSON strings and bound as TEXT.
 
 pub mod backup_coverage_reports;
+pub mod certificates;
 pub mod decommissions;
 pub mod patch_waves;
 pub mod restore_requests;

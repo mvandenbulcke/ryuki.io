@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,72 +44,7 @@ pub struct CertificateRequest {
     pub validity_days: u32,
 }
 
-fn seed_certificates() -> Vec<CertificateRecord> {
-    let now = chrono::Utc::now();
-    vec![
-        CertificateRecord {
-            id: Uuid::new_v4().to_string(),
-            common_name: "*.corp.local".into(),
-            subject: "CN=*.corp.local".into(),
-            valid_from: (now - chrono::Duration::days(30)).to_rfc3339(),
-            valid_to: (now + chrono::Duration::days(60)).to_rfc3339(),
-            service_type: "IIS".into(),
-            hostname: "web01.corp.local".into(),
-            site: "GBLON".into(),
-            status: CertificateStatus::Expiring,
-            created_at: now.to_rfc3339(),
-        },
-        CertificateRecord {
-            id: Uuid::new_v4().to_string(),
-            common_name: "vcenter.corp.local".into(),
-            subject: "CN=vcenter.corp.local".into(),
-            valid_from: (now - chrono::Duration::days(180)).to_rfc3339(),
-            valid_to: (now + chrono::Duration::days(185)).to_rfc3339(),
-            service_type: "VMware".into(),
-            hostname: "vcenter.corp.local".into(),
-            site: "GBLON".into(),
-            status: CertificateStatus::Active,
-            created_at: now.to_rfc3339(),
-        },
-        CertificateRecord {
-            id: Uuid::new_v4().to_string(),
-            common_name: "esxi01.corp.local".into(),
-            subject: "CN=esxi01.corp.local".into(),
-            valid_from: (now - chrono::Duration::days(400)).to_rfc3339(),
-            valid_to: (now - chrono::Duration::days(30)).to_rfc3339(),
-            service_type: "ESXi".into(),
-            hostname: "esxi01.corp.local".into(),
-            site: "FRPAR".into(),
-            status: CertificateStatus::Expired,
-            created_at: now.to_rfc3339(),
-        },
-    ]
-}
-
-static CERTIFICATE_STORE: std::sync::LazyLock<Mutex<Vec<CertificateRecord>>> =
-    std::sync::LazyLock::new(|| Mutex::new(seed_certificates()));
-
-pub fn request_certificate(req: &CertificateRequest) -> Result<CertificateRecord, String> {
-    validate_certificate_request(req)?;
-
-    let now = chrono::Utc::now();
-    let record = CertificateRecord {
-        id: Uuid::new_v4().to_string(),
-        common_name: req.common_name.clone(),
-        subject: req.subject.clone(),
-        valid_from: now.to_rfc3339(),
-        valid_to: (now + chrono::Duration::days(req.validity_days as i64)).to_rfc3339(),
-        service_type: req.service_type.clone(),
-        hostname: req.hostname.clone(),
-        site: req.site.clone(),
-        status: CertificateStatus::Active,
-        created_at: now.to_rfc3339(),
-    };
-
-    CERTIFICATE_STORE.lock().unwrap().push(record.clone());
-    Ok(record)
-}
-
+/// Validate the fields of a certificate request. Pure; no I/O.
 pub fn validate_certificate_request(req: &CertificateRequest) -> Result<(), String> {
     if req.common_name.is_empty() {
         return Err("common_name cannot be empty".into());
@@ -133,40 +67,73 @@ pub fn validate_certificate_request(req: &CertificateRequest) -> Result<(), Stri
     Ok(())
 }
 
-pub fn approve_certificate(id: &str) -> Result<CertificateRecord, String> {
-    let mut store = CERTIFICATE_STORE.lock().unwrap();
-    let cert = store
-        .iter_mut()
-        .find(|c| c.id == id)
-        .ok_or_else(|| format!("Certificate {id} not found"))?;
-    Ok(cert.clone())
+/// Build a new `CertificateRecord` from a validated request. Pure; no I/O.
+/// The caller (handler) inserts the returned record into the DB.
+pub fn request_certificate(req: &CertificateRequest) -> Result<CertificateRecord, String> {
+    validate_certificate_request(req)?;
+
+    let now = chrono::Utc::now();
+    let record = CertificateRecord {
+        id: Uuid::new_v4().to_string(),
+        common_name: req.common_name.clone(),
+        subject: req.subject.clone(),
+        valid_from: now.to_rfc3339(),
+        valid_to: (now + chrono::Duration::days(req.validity_days as i64)).to_rfc3339(),
+        service_type: req.service_type.clone(),
+        hostname: req.hostname.clone(),
+        site: req.site.clone(),
+        status: CertificateStatus::Active,
+        created_at: now.to_rfc3339(),
+    };
+
+    Ok(record)
 }
 
-pub fn install_certificate(id: &str) -> Result<CertificateRecord, String> {
-    let store = CERTIFICATE_STORE.lock().unwrap();
-    let cert = store
-        .iter()
-        .find(|c| c.id == id)
-        .cloned()
-        .ok_or_else(|| format!("Certificate {id} not found"))?;
-    Ok(cert)
+/// Produce a renewed copy of an existing certificate. Pure; no I/O.
+/// The caller loads the record from the DB, passes it here, then persists the
+/// returned record via a CAS transition.
+pub fn renew_certificate(
+    cert: &CertificateRecord,
+    validity_days: u32,
+) -> Result<CertificateRecord, String> {
+    if validity_days == 0 {
+        return Err("validity_days must be greater than 0".into());
+    }
+    if cert.status == CertificateStatus::Revoked {
+        return Err("Cannot renew a revoked certificate".into());
+    }
+
+    let now = chrono::Utc::now();
+    let mut renewed = cert.clone();
+    renewed.valid_from = now.to_rfc3339();
+    renewed.valid_to = (now + chrono::Duration::days(validity_days as i64)).to_rfc3339();
+    renewed.status = CertificateStatus::Active;
+    // created_at is immutable — it records when the certificate record was first
+    // created, not when it was last renewed.
+
+    Ok(renewed)
 }
 
-pub fn verify_certificate(id: &str) -> Result<CertificateRecord, String> {
-    let store = CERTIFICATE_STORE.lock().unwrap();
-    let cert = store
-        .iter()
-        .find(|c| c.id == id)
-        .cloned()
-        .ok_or_else(|| format!("Certificate {id} not found"))?;
-    Ok(cert)
+/// Produce a revoked copy of an existing certificate. Pure; no I/O.
+/// The caller loads the record from the DB, passes it here, then persists the
+/// returned record via a CAS transition.
+pub fn revoke_certificate(cert: &CertificateRecord) -> Result<CertificateRecord, String> {
+    if cert.status == CertificateStatus::Revoked {
+        return Err("Certificate is already revoked".into());
+    }
+
+    let mut revoked = cert.clone();
+    revoked.status = CertificateStatus::Revoked;
+
+    Ok(revoked)
 }
 
-pub fn check_expiry(site: &str, days: i64) -> Vec<CertificateRecord> {
+/// Return all certificates from `certs` that expire within `days` days for the
+/// given `site` (empty string = all sites). Pure; no I/O.
+pub fn check_expiry(certs: &[CertificateRecord], site: &str, days: i64) -> Vec<CertificateRecord> {
     let now = chrono::Utc::now();
     let threshold = now + chrono::Duration::days(days);
-    let store = CERTIFICATE_STORE.lock().unwrap();
-    store
+    certs
         .iter()
         .filter(|c| {
             if !site.is_empty() && c.site != site {
@@ -183,60 +150,9 @@ pub fn check_expiry(site: &str, days: i64) -> Vec<CertificateRecord> {
         .collect()
 }
 
-pub fn renew_certificate(id: &str, validity_days: u32) -> Result<CertificateRecord, String> {
-    if validity_days == 0 {
-        return Err("validity_days must be greater than 0".into());
-    }
-    let mut store = CERTIFICATE_STORE.lock().unwrap();
-    let cert = store
-        .iter_mut()
-        .find(|c| c.id == id)
-        .ok_or_else(|| format!("Certificate {id} not found"))?;
-
-    let now = chrono::Utc::now();
-    cert.valid_from = now.to_rfc3339();
-    cert.valid_to = (now + chrono::Duration::days(validity_days as i64)).to_rfc3339();
-    cert.status = CertificateStatus::Active;
-    cert.created_at = now.to_rfc3339();
-
-    Ok(cert.clone())
-}
-
-pub fn revoke_certificate(id: &str) -> Result<CertificateRecord, String> {
-    let mut store = CERTIFICATE_STORE.lock().unwrap();
-    let cert = store
-        .iter_mut()
-        .find(|c| c.id == id)
-        .ok_or_else(|| format!("Certificate {id} not found"))?;
-    cert.status = CertificateStatus::Revoked;
-    Ok(cert.clone())
-}
-
-pub fn get_inventory() -> Vec<CertificateRecord> {
-    CERTIFICATE_STORE.lock().unwrap().clone()
-}
-
-pub fn get_certificate(id: &str) -> Option<CertificateRecord> {
-    CERTIFICATE_STORE
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|c| c.id == id)
-        .cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex, MutexGuard};
-
-    static CERTIFICATE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    fn fresh_certificate_store() -> MutexGuard<'static, ()> {
-        let guard = CERTIFICATE_TEST_LOCK.lock().unwrap();
-        *CERTIFICATE_STORE.lock().unwrap() = seed_certificates();
-        guard
-    }
 
     fn valid_request() -> CertificateRequest {
         CertificateRequest {
@@ -246,6 +162,29 @@ mod tests {
             hostname: "web02.corp.local".into(),
             site: "GBLON".into(),
             validity_days: 365,
+        }
+    }
+
+    fn active_cert() -> CertificateRecord {
+        let now = chrono::Utc::now();
+        CertificateRecord {
+            id: Uuid::new_v4().to_string(),
+            common_name: "test.local".into(),
+            subject: "CN=test.local".into(),
+            valid_from: now.to_rfc3339(),
+            valid_to: (now + chrono::Duration::days(90)).to_rfc3339(),
+            service_type: "IIS".into(),
+            hostname: "web02.corp.local".into(),
+            site: "GBLON".into(),
+            status: CertificateStatus::Active,
+            created_at: now.to_rfc3339(),
+        }
+    }
+
+    fn revoked_cert() -> CertificateRecord {
+        CertificateRecord {
+            status: CertificateStatus::Revoked,
+            ..active_cert()
         }
     }
 
@@ -278,7 +217,6 @@ mod tests {
 
     #[test]
     fn test_request_certificate_creates_record() {
-        let _guard = fresh_certificate_store();
         let req = valid_request();
         let result = request_certificate(&req);
         assert!(result.is_ok());
@@ -289,69 +227,98 @@ mod tests {
     }
 
     #[test]
-    fn test_get_inventory_returns_seeded_certs() {
-        let _guard = fresh_certificate_store();
-        let inventory = get_inventory();
-        assert!(inventory.len() >= 3);
-        let names: Vec<&str> = inventory.iter().map(|c| c.common_name.as_str()).collect();
-        assert!(names.contains(&"*.corp.local"));
-        assert!(names.contains(&"vcenter.corp.local"));
-        assert!(names.contains(&"esxi01.corp.local"));
-    }
-
-    #[test]
     fn test_check_expiry_finds_expiring() {
-        let _guard = fresh_certificate_store();
-        let results = check_expiry("GBLON", 90);
-        assert!(!results.is_empty());
-        let expiring: Vec<&CertificateRecord> = results
-            .iter()
-            .filter(|c| c.status == CertificateStatus::Expiring)
-            .collect();
-        assert!(!expiring.is_empty());
+        let now = chrono::Utc::now();
+        let expiring = CertificateRecord {
+            id: Uuid::new_v4().to_string(),
+            common_name: "*.corp.local".into(),
+            subject: "CN=*.corp.local".into(),
+            valid_from: (now - chrono::Duration::days(30)).to_rfc3339(),
+            valid_to: (now + chrono::Duration::days(60)).to_rfc3339(),
+            service_type: "IIS".into(),
+            hostname: "web01.corp.local".into(),
+            site: "GBLON".into(),
+            status: CertificateStatus::Expiring,
+            created_at: now.to_rfc3339(),
+        };
+        let not_expiring = CertificateRecord {
+            id: Uuid::new_v4().to_string(),
+            valid_to: (now + chrono::Duration::days(200)).to_rfc3339(),
+            site: "GBLON".into(),
+            ..expiring.clone()
+        };
+        let certs = vec![expiring.clone(), not_expiring];
+
+        let results = check_expiry(&certs, "GBLON", 90);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, expiring.id);
     }
 
     #[test]
-    fn test_check_expiry_empty_site_returns_all() {
-        let _guard = fresh_certificate_store();
-        let results = check_expiry("", 365);
-        assert!(!results.is_empty());
+    fn test_check_expiry_empty_site_returns_matching() {
+        let now = chrono::Utc::now();
+        let cert_a = CertificateRecord {
+            id: Uuid::new_v4().to_string(),
+            common_name: "a.local".into(),
+            subject: "CN=a.local".into(),
+            valid_from: now.to_rfc3339(),
+            valid_to: (now + chrono::Duration::days(30)).to_rfc3339(),
+            service_type: "IIS".into(),
+            hostname: "host-a".into(),
+            site: "GBLON".into(),
+            status: CertificateStatus::Expiring,
+            created_at: now.to_rfc3339(),
+        };
+        let cert_b = CertificateRecord {
+            id: Uuid::new_v4().to_string(),
+            site: "FRPAR".into(),
+            ..cert_a.clone()
+        };
+        let certs = vec![cert_a, cert_b];
+
+        let results = check_expiry(&certs, "", 365);
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
     fn test_renew_certificate_updates_dates() {
-        let _guard = fresh_certificate_store();
-        let inventory = get_inventory();
-        let cert = inventory.first().unwrap();
-        let result = renew_certificate(&cert.id, 180);
+        let cert = active_cert();
+        let result = renew_certificate(&cert, 180);
         assert!(result.is_ok());
         let renewed = result.unwrap();
         assert_eq!(renewed.status, CertificateStatus::Active);
+        assert_ne!(renewed.valid_to, cert.valid_to);
+    }
+
+    #[test]
+    fn test_renew_certificate_rejects_zero_days() {
+        let cert = active_cert();
+        let result = renew_certificate(&cert, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_renew_rejects_revoked() {
+        let cert = revoked_cert();
+        let result = renew_certificate(&cert, 180);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("revoked"));
     }
 
     #[test]
     fn test_revoke_certificate_sets_status() {
-        let _guard = fresh_certificate_store();
-        let inventory = get_inventory();
-        let cert = inventory.first().unwrap();
-        let result = revoke_certificate(&cert.id);
+        let cert = active_cert();
+        let result = revoke_certificate(&cert);
         assert!(result.is_ok());
         let revoked = result.unwrap();
         assert_eq!(revoked.status, CertificateStatus::Revoked);
     }
 
     #[test]
-    fn test_get_certificate_not_found() {
-        assert!(get_certificate("nonexistent-id").is_none());
-    }
-
-    #[test]
-    fn test_get_certificate_found() {
-        let _guard = fresh_certificate_store();
-        let inventory = get_inventory();
-        let cert = inventory.first().unwrap();
-        let found = get_certificate(&cert.id);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().common_name, cert.common_name);
+    fn test_revoke_rejects_already_revoked() {
+        let cert = revoked_cert();
+        let result = revoke_certificate(&cert);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already revoked"));
     }
 }

@@ -13592,6 +13592,8 @@ async fn app_env_contract() -> Json<Value> {
 // ─── Certificate lifecycle handlers ───
 
 async fn certificates_request(Json(body): Json<CertificateRequestRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
     let req = certificate_lifecycle::CertificateRequest {
         common_name: body.common_name,
         subject: body.subject,
@@ -13600,13 +13602,20 @@ async fn certificates_request(Json(body): Json<CertificateRequestRequest>) -> Ap
         site: body.site,
         validity_days: body.validity_days,
     };
-    match certificate_lifecycle::request_certificate(&req) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+
+    let record = certificate_lifecycle::request_certificate(&req).map_err(|e| status_400(&e))?;
+
+    // The engine already mints a valid UUID (Uuid::new_v4().to_string()), so no
+    // id replacement is needed here (unlike engines that use human-readable ids).
+    let persisted = crate::repos::certificates::insert(pool, &record)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn certificates_validate(Json(body): Json<CertificateValidateRequest>) -> ApiResult {
+    // Pure input validation — no DB interaction.
     let req = certificate_lifecycle::CertificateRequest {
         common_name: body.common_name,
         subject: body.subject,
@@ -13624,60 +13633,127 @@ async fn certificates_validate(Json(body): Json<CertificateValidateRequest>) -> 
 }
 
 async fn certificates_approve(Path(id): Path<String>) -> ApiResult {
-    match certificate_lifecycle::approve_certificate(&id) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    // No state transition: CertificateStatus has no Approved variant.
+    // This is an acknowledgement read — load and return the current record.
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let record = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn certificates_install(Path(id): Path<String>) -> ApiResult {
-    match certificate_lifecycle::install_certificate(&id) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    // No state transition: CertificateStatus has no Installed variant.
+    // This is an acknowledgement read — load and return the current record.
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let record = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn certificates_verify(Path(id): Path<String>) -> ApiResult {
-    match certificate_lifecycle::verify_certificate(&id) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    // No state transition: CertificateStatus has no Verified variant.
+    // This is an acknowledgement read — load and return the current record.
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let record = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn certificates_renew(
     Path(id): Path<String>,
     Json(body): Json<CertificateRenewRequest>,
 ) -> ApiResult {
-    match certificate_lifecycle::renew_certificate(&id, body.validity_days) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let cert = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    // A revoked certificate is a state conflict (409), not malformed input (400).
+    if cert.status == certificate_lifecycle::CertificateStatus::Revoked {
+        return Err(status_409("Cannot renew a revoked certificate"));
     }
+
+    let before = crate::repos::certificates::status_str(&cert.status);
+
+    // renew is a same-status transition (Active -> Active); the CAS guards on the
+    // prior valid_to so two concurrent renews cannot both win.
+    let renewed = certificate_lifecycle::renew_certificate(&cert, body.validity_days)
+        .map_err(|e| status_400(&e))?;
+
+    let persisted =
+        crate::repos::certificates::transition(pool, before, &cert.valid_to, &renewed, None)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn certificates_revoke(Path(id): Path<String>) -> ApiResult {
-    match certificate_lifecycle::revoke_certificate(&id) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let cert = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::certificates::status_str(&cert.status);
+
+    // Engine guard: returns Err if already revoked → 409.
+    let revoked = certificate_lifecycle::revoke_certificate(&cert).map_err(|e| status_409(&e))?;
+
+    let persisted =
+        crate::repos::certificates::transition(pool, before, &cert.valid_to, &revoked, None)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn certificates_expiring(Query(query): Query<CertificateExpiringQuery>) -> Json<Value> {
+async fn certificates_expiring(Query(query): Query<CertificateExpiringQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
     let days = query.days.unwrap_or(90);
-    let results = certificate_lifecycle::check_expiry(site, days);
-    Json(serde_json::to_value(results).unwrap())
+
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+
+    let all = crate::repos::certificates::list(pool)
+        .await
+        .map_err(db_error)?;
+
+    let results = certificate_lifecycle::check_expiry(&all, site, days);
+    Ok(Json(serde_json::to_value(results).unwrap_or_default()))
 }
 
-async fn certificates_inventory() -> Json<Value> {
-    let inventory = certificate_lifecycle::get_inventory();
-    Json(serde_json::to_value(inventory).unwrap())
+async fn certificates_inventory() -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+    let records = crate::repos::certificates::list(pool)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
 }
 
 async fn certificates_get(Path(id): Path<String>) -> ApiResult {
-    match certificate_lifecycle::get_certificate(&id) {
-        Some(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        None => Err(status_404(&id)),
-    }
+    let Some(pool) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let record = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn certificate_lifecycle_contract() -> Json<Value> {
@@ -28818,6 +28894,383 @@ mod backup_restore_db_tests {
         assert!(
             applied.is_none(),
             "transition with stale expected status must return None (CAS mismatch)"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api certificates_db_tests
+#[cfg(test)]
+mod certificates_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn request_body(suffix: &str) -> CertificateRequestRequest {
+        CertificateRequestRequest {
+            common_name: format!("test-{suffix}.local"),
+            subject: format!("CN=test-{suffix}.local"),
+            service_type: "IIS".into(),
+            hostname: format!("web-{suffix}.corp.local"),
+            site: "GBLON".into(),
+            validity_days: 365,
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        // Only delete rows we created — do NOT touch the 3 seed rows from
+        // migration 011 (which have no test-suffix in their common_name).
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM certificates WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// request → insert → get round-trip: certificate is persisted with a valid
+    /// UUID id and the expected field values.
+    #[tokio::test]
+    async fn test_request_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::certificates::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("certificate not found after insert");
+
+        assert_eq!(record.id, id, "id must round-trip");
+        assert_eq!(
+            record.common_name,
+            format!("test-{suffix}.local"),
+            "common_name must round-trip"
+        );
+        assert_eq!(
+            record.status,
+            ryuki_engine::certificate_lifecycle::CertificateStatus::Active,
+            "status after request must be Active"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// renew transition: DB row must show updated valid_to and status Active
+    /// after certificates_renew.
+    #[tokio::test]
+    async fn test_renew_persists_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+        let original_valid_to = created["valid_to"].as_str().expect("valid_to").to_string();
+
+        let Ok(Json(renewed)) = certificates_renew(
+            Path(id.clone()),
+            Json(CertificateRenewRequest { validity_days: 730 }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("certificates_renew failed");
+        };
+        assert_eq!(renewed["status"], "Active");
+
+        let record = crate::repos::certificates::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("certificate not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::certificate_lifecycle::CertificateStatus::Active,
+            "status after renew must be Active in DB"
+        );
+        assert_ne!(
+            record.valid_to, original_valid_to,
+            "valid_to must be updated after renew"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// revoke transition: DB row must show status Revoked after
+    /// certificates_revoke.
+    #[tokio::test]
+    async fn test_revoke_persists_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Ok(Json(revoked)) = certificates_revoke(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("certificates_revoke failed");
+        };
+        assert_eq!(revoked["status"], "Revoked");
+
+        let record = crate::repos::certificates::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("certificate not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::certificate_lifecycle::CertificateStatus::Revoked,
+            "status after revoke must be Revoked in DB"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// revoke on an already-revoked certificate must return 409.
+    #[tokio::test]
+    async fn test_revoke_already_revoked_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // First revoke — must succeed.
+        if certificates_revoke(Path(id.clone())).await.is_err() {
+            cleanup(pool, &id).await;
+            panic!("first revoke failed");
+        }
+
+        // Second revoke — must be 409.
+        let Err((status, _)) = certificates_revoke(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("expected second revoke to be rejected");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "revoking an already-revoked certificate must be 409"
+        );
+    }
+
+    /// CAS false: `transition` must return None when the row's DB status no
+    /// longer matches `expected_status`.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the record while Active.
+        let stale_active = crate::repos::certificates::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("certificate not found");
+        assert_eq!(
+            stale_active.status,
+            ryuki_engine::certificate_lifecycle::CertificateStatus::Active
+        );
+
+        // Advance it to Revoked through the normal path.
+        if certificates_revoke(Path(id.clone())).await.is_err() {
+            cleanup(pool, &id).await;
+            panic!("certificates_revoke failed");
+        }
+
+        // A transition that still expects Active (with the stale valid_to) must
+        // NOT apply — the status guard catches the concurrent revoke.
+        let applied = crate::repos::certificates::transition(
+            pool,
+            "Active",
+            &stale_active.valid_to,
+            &stale_active,
+            None,
+        )
+        .await
+        .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            applied.is_none(),
+            "transition with stale expected status must return None (CAS mismatch)"
+        );
+    }
+
+    /// Same-status CAS: two renews of an Active cert. `renew` keeps status
+    /// Active, so the status-only guard would NOT catch a concurrent renew —
+    /// the valid_to guard must. Capture the cert while Active, renew it once
+    /// (advancing valid_to), then a transition that still expects the OLD
+    /// valid_to must return None even though status is still Active.
+    #[tokio::test]
+    async fn test_renew_same_status_cas_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the cert while Active (valid_to = V0).
+        let stale = crate::repos::certificates::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("certificate not found");
+        assert_eq!(
+            stale.status,
+            ryuki_engine::certificate_lifecycle::CertificateStatus::Active
+        );
+
+        // Renew once through the normal path — advances valid_to to V1, status
+        // stays Active.
+        if certificates_renew(
+            Path(id.clone()),
+            Json(CertificateRenewRequest { validity_days: 730 }),
+        )
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("certificates_renew failed");
+        }
+
+        // A transition expecting the OLD valid_to must NOT apply, even though the
+        // status is still Active.
+        let applied =
+            crate::repos::certificates::transition(pool, "Active", &stale.valid_to, &stale, None)
+                .await
+                .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            applied.is_none(),
+            "same-status transition with stale valid_to must return None"
+        );
+    }
+
+    /// renewing a revoked certificate is a state conflict → 409 (not 400).
+    #[tokio::test]
+    async fn test_renew_revoked_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+            panic!("certificates_request failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        if certificates_revoke(Path(id.clone())).await.is_err() {
+            cleanup(pool, &id).await;
+            panic!("revoke failed");
+        }
+
+        let Err((status, _)) = certificates_renew(
+            Path(id.clone()),
+            Json(CertificateRenewRequest { validity_days: 365 }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("expected renew of a revoked cert to be rejected");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "renewing a revoked certificate must be 409"
+        );
+    }
+
+    /// check_expiry via the repo: the 3 seed rows from migration 011 include
+    /// one with status 'Expiring' (valid_to ≈ NOW+60d) and one with status
+    /// 'Expired' (valid_to ≈ NOW-30d). Both fall within a 90-day window so
+    /// certificates_expiring should return at least 2 rows.
+    #[tokio::test]
+    async fn test_expiring_returns_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Use a site filter that matches the seeded GBLON row only.
+        let Ok(Json(result)) = certificates_expiring(Query(CertificateExpiringQuery {
+            site: Some("GBLON".into()),
+            days: Some(90),
+        }))
+        .await
+        else {
+            panic!("certificates_expiring failed");
+        };
+
+        let arr = result.as_array().expect("expected array");
+        // The seeded 'Expiring' cert has valid_to ≈ NOW+60d which is within 90d.
+        assert!(
+            !arr.is_empty(),
+            "expiring endpoint must return at least the seeded Expiring row for GBLON"
         );
     }
 }
