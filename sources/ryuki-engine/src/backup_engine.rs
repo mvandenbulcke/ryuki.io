@@ -90,6 +90,13 @@ pub fn plan_restore(
     if owner.is_empty() {
         return Err("owner cannot be empty".into());
     }
+    // restore_point is a required p0 field (validate_restore_request enforces it
+    // too). Rejecting it here means a Planned restore always satisfies every p0
+    // validation rule, so approving a Planned restore can never bless an
+    // incomplete request.
+    if restore_point.is_empty() {
+        return Err("restore_point cannot be empty".into());
+    }
     if !VALID_SITES.contains(&target_site) {
         return Err(format!("Unknown site: {}", target_site));
     }
@@ -166,9 +173,9 @@ pub fn validate_restore_request(restore: &RestoreRequest) -> Result<ValidationRe
 }
 
 pub fn approve_restore(restore: &RestoreRequest, approver: &str) -> Result<RestoreRequest, String> {
-    if restore.status == RestoreStatus::Completed || restore.status == RestoreStatus::Failed {
+    if restore.status != RestoreStatus::Planned {
         return Err(format!(
-            "Cannot approve restore in terminal status: {:?}",
+            "Cannot approve restore in status {:?}. Must be Planned first.",
             restore.status
         ));
     }
@@ -364,5 +371,44 @@ mod tests {
         )
         .unwrap();
         assert!(execute_restore(&restore).is_err());
+    }
+
+    /// approve_restore must reject any record that is not in Planned status.
+    /// A Draft record has never gone through plan_restore so it is not Planned.
+    #[test]
+    fn test_approve_rejects_non_planned() {
+        let mut restore = plan_restore(
+            "ci-srv-001",
+            RestoreType::FullVm,
+            "2026-06-10T02:00:00Z",
+            "DEFRA",
+            "production",
+            "backup-team",
+        )
+        .unwrap();
+        // Manually set status to Draft to simulate a non-Planned record.
+        restore.status = RestoreStatus::Draft;
+        let result = approve_restore(&restore, "approver");
+        assert!(result.is_err(), "approve must reject a non-Planned restore");
+        assert!(
+            result.unwrap_err().contains("Must be Planned first"),
+            "error message must mention Planned"
+        );
+    }
+
+    #[test]
+    fn test_plan_restore_empty_restore_point_fails() {
+        // restore_point is a required p0 field; plan must reject an empty one so
+        // an incomplete restore can never reach Planned (and thus never be
+        // approved).
+        let result = plan_restore(
+            "ci-srv-001",
+            RestoreType::FullVm,
+            "",
+            "DEFRA",
+            "production",
+            "backup-team",
+        );
+        assert!(result.is_err(), "plan must reject an empty restore_point");
     }
 }

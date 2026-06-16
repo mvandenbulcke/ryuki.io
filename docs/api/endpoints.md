@@ -533,10 +533,14 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/protect/backup-coverage-gap-contract` |
 | GET | `/api/protect/backup-dr-assignment-contract` |
 | POST | `/api/protect/backup/coverage-report` |
+| GET | `/api/protect/backup/coverage-reports` |
+| GET | `/api/protect/backup/coverage-reports/{id}` |
 | POST | `/api/protect/backup/restore-approve` |
 | POST | `/api/protect/backup/restore-execute` |
 | POST | `/api/protect/backup/restore-plan` |
 | POST | `/api/protect/backup/restore-validate` |
+| GET | `/api/protect/backup/restores` |
+| GET | `/api/protect/backup/restores/{id}` |
 | GET | `/api/protect/controlled-restore-contract` |
 | GET | `/api/protect/dr-contract` |
 | GET | `/api/protect/dr/due-tests` |

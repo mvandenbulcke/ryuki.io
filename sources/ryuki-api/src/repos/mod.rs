@@ -11,6 +11,8 @@
 //! - JSONB columns are cast to `TEXT` in SELECT and deserialized by the repo.
 //!   On writes they are serialized to JSON strings and bound as TEXT.
 
+pub mod backup_coverage_reports;
 pub mod decommissions;
 pub mod patch_waves;
+pub mod restore_requests;
 pub mod snapshots;

@@ -1353,6 +1353,16 @@ pub fn routes() -> Router {
             "/api/protect/backup/restore-execute",
             post(backup_restore_execute),
         )
+        .route("/api/protect/backup/restores", get(backup_restores_list))
+        .route("/api/protect/backup/restores/{id}", get(backup_restore_get))
+        .route(
+            "/api/protect/backup/coverage-reports",
+            get(backup_coverage_reports_list),
+        )
+        .route(
+            "/api/protect/backup/coverage-reports/{id}",
+            get(backup_coverage_report_get),
+        )
         .route(
             "/api/protect/backup-coverage-contract",
             get(backup_coverage_contract),
@@ -12881,35 +12891,27 @@ async fn snapshot_governance_contract() -> Json<Value> {
 // ─── Backup Coverage & Restore handlers ───
 
 async fn backup_coverage_report(Json(body): Json<CoverageReportRequest>) -> ApiResult {
-    match backup_engine::generate_backup_coverage_report(&body.site_scope, &body.environment_scope)
-    {
-        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let mut report =
+        backup_engine::generate_backup_coverage_report(&body.site_scope, &body.environment_scope)
+            .map_err(|e| status_400(&e))?;
+
+    // The engine mints a non-UUID id (e.g. "bcr-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    report.id = Uuid::new_v4().to_string();
+
+    let persisted = crate::repos::backup_coverage_reports::insert(pool, &report)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn backup_restore_plan(Json(body): Json<RestorePlanRequest>) -> ApiResult {
-    let restore_type = match body.restore_type.as_str() {
-        "full-vm" => ryuki_engine::models::RestoreType::FullVm,
-        "file-level" => ryuki_engine::models::RestoreType::FileLevel,
-        "application-item" => ryuki_engine::models::RestoreType::ApplicationItem,
-        "instant-vm-recovery" => ryuki_engine::models::RestoreType::InstantVmRecovery,
-        _ => return Err(status_400("Invalid restore type")),
-    };
-    match backup_engine::plan_restore(
-        &body.source_ci_key,
-        restore_type,
-        &body.restore_point,
-        &body.target_site,
-        &body.target_environment,
-        &body.owner,
-    ) {
-        Ok(restore) => Ok(Json(serde_json::to_value(restore).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
+    let pool = get_db().ok_or_else(status_503_no_db)?;
 
-async fn backup_restore_validate(Json(body): Json<RestorePlanRequest>) -> ApiResult {
     let restore_type = match body.restore_type.as_str() {
         "full-vm" => ryuki_engine::models::RestoreType::FullVm,
         "file-level" => ryuki_engine::models::RestoreType::FileLevel,
@@ -12917,7 +12919,8 @@ async fn backup_restore_validate(Json(body): Json<RestorePlanRequest>) -> ApiRes
         "instant-vm-recovery" => ryuki_engine::models::RestoreType::InstantVmRecovery,
         _ => return Err(status_400("Invalid restore type")),
     };
-    let restore = backup_engine::plan_restore(
+
+    let mut restore = backup_engine::plan_restore(
         &body.source_ci_key,
         restore_type,
         &body.restore_point,
@@ -12926,55 +12929,133 @@ async fn backup_restore_validate(Json(body): Json<RestorePlanRequest>) -> ApiRes
         &body.owner,
     )
     .map_err(|e| status_400(&e))?;
-    match backup_engine::validate_restore_request(&restore) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+
+    // The engine mints a non-UUID id (e.g. "rest-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    restore.id = Uuid::new_v4().to_string();
+
+    let persisted = crate::repos::restore_requests::insert(pool, &restore)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+}
+
+/// Validate a persisted restore request (read-only — no state transition).
+async fn backup_restore_validate(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let r = crate::repos::restore_requests::get(pool, &body.restore_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.restore_id))?;
+
+    let result = backup_engine::validate_restore_request(&r).map_err(|e| status_400(&e))?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
 async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiResult {
-    let restore = ryuki_engine::models::RestoreRequest {
-        id: body.restore_id,
-        source_ci_key: "ci-001".to_string(),
-        restore_type: ryuki_engine::models::RestoreType::FullVm,
-        restore_point: "2026-06-10T02:00:00Z".to_string(),
-        target_site: "DEFRA".to_string(),
-        target_environment: "production".to_string(),
-        verification_plan: String::new(),
-        retention_need: String::new(),
-        owner: "backup-team".to_string(),
-        status: ryuki_engine::models::RestoreStatus::Planned,
-        dry_run_plan: None,
-        created_at: String::new(),
-        metadata: std::collections::HashMap::new(),
-    };
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let r = crate::repos::restore_requests::get(pool, &body.restore_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.restore_id))?;
+
+    let before = crate::repos::restore_requests::status_str(&r.status);
     let approver = body.approver.as_deref().unwrap_or("Backup Operator");
-    match backup_engine::approve_restore(&restore, approver) {
-        Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+
+    let approved = backup_engine::approve_restore(&r, approver).map_err(|e| status_409(&e))?;
+
+    let persisted = crate::repos::restore_requests::transition(pool, before, &approved, None)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
+/// Execute a persisted restore request (must be Approved) and record the
+/// execution by transitioning Approved -> Executed. The response is the evidence
+/// the engine produced. The CAS transition also makes execute non-idempotent in
+/// the safe direction: a second call finds the request Executed (not Approved),
+/// so the engine's Approved precondition rejects it (409) — a restore cannot be
+/// silently run twice, and list/get reflect that it ran.
 async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiResult {
-    let restore = ryuki_engine::models::RestoreRequest {
-        id: body.restore_id,
-        source_ci_key: "ci-001".to_string(),
-        restore_type: ryuki_engine::models::RestoreType::FullVm,
-        restore_point: "2026-06-10T02:00:00Z".to_string(),
-        target_site: "DEFRA".to_string(),
-        target_environment: "production".to_string(),
-        verification_plan: String::new(),
-        retention_need: String::new(),
-        owner: "backup-team".to_string(),
-        status: ryuki_engine::models::RestoreStatus::Approved,
-        dry_run_plan: None,
-        created_at: String::new(),
-        metadata: std::collections::HashMap::new(),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let r = crate::repos::restore_requests::get(pool, &body.restore_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.restore_id))?;
+
+    let before = crate::repos::restore_requests::status_str(&r.status);
+
+    // Engine requires Approved; produces evidence without changing status.
+    let evidence = backup_engine::execute_restore(&r).map_err(|e| status_409(&e))?;
+
+    // Record the execution durably: Approved -> Executed.
+    let mut executed = r.clone();
+    executed.status = ryuki_engine::models::RestoreStatus::Executed;
+    executed.metadata.insert(
+        "execution_evidence_count".into(),
+        evidence.len().to_string(),
+    );
+
+    crate::repos::restore_requests::transition(pool, before, &executed, None)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
+}
+
+/// GET /api/protect/backup/restores — list all persisted restore requests.
+/// Returns an empty array when no DB is available rather than an error.
+async fn backup_restores_list() -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
     };
-    match backup_engine::execute_restore(&restore) {
-        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let records = crate::repos::restore_requests::list(pool)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+}
+
+/// GET /api/protect/backup/restores/{id} — fetch a single restore request by id.
+/// Returns 404 when absent or when no DB is configured.
+async fn backup_restore_get(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(|| status_404(&id))?;
+    let record = crate::repos::restore_requests::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+}
+
+/// GET /api/protect/backup/coverage-reports — list all persisted coverage reports.
+/// Returns an empty array when no DB is available rather than an error.
+async fn backup_coverage_reports_list() -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+    let records = crate::repos::backup_coverage_reports::list(pool)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+}
+
+/// GET /api/protect/backup/coverage-reports/{id} — fetch a single coverage report by id.
+/// Returns 404 when absent or when no DB is configured.
+async fn backup_coverage_report_get(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(|| status_404(&id))?;
+    let record = crate::repos::backup_coverage_reports::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn backup_coverage_contract() -> Json<Value> {
@@ -28332,5 +28413,411 @@ mod snapshots_db_tests {
         );
 
         cleanup(pool, &id).await;
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api backup_restore_db_tests
+#[cfg(test)]
+mod backup_restore_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn cleanup_report(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM backup_coverage_reports WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    async fn cleanup_restore(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM restore_requests WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// coverage report: generate → insert → get round-trip.
+    #[tokio::test]
+    async fn test_coverage_report_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = backup_coverage_report(Json(CoverageReportRequest {
+            site_scope: vec!["GBLON".into()],
+            environment_scope: vec!["production".into()],
+        }))
+        .await
+        else {
+            panic!("backup_coverage_report handler failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::backup_coverage_reports::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("coverage report not found after insert");
+
+        assert_eq!(record.id, id, "id must round-trip");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::CoverageReportStatus::Generated,
+            "status after generation must be Generated"
+        );
+        assert!(!record.site_scope.is_empty(), "site_scope must round-trip");
+
+        cleanup_report(pool, &id).await;
+    }
+
+    /// restore request: plan → insert → get round-trip, status Planned.
+    #[tokio::test]
+    async fn test_restore_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-db-test-001".into(),
+            restore_type: "full-vm".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "GBLON".into(),
+            target_environment: "production".into(),
+            owner: "db-test-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan handler failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("restore request not found after insert");
+
+        assert_eq!(record.id, id, "id must round-trip");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::RestoreStatus::Planned,
+            "status after plan must be Planned"
+        );
+        assert_eq!(record.source_ci_key, "ci-db-test-001");
+
+        cleanup_restore(pool, &id).await;
+    }
+
+    /// restore approve transition: plan → approve → DB shows Approved + metadata.approver set.
+    #[tokio::test]
+    async fn test_restore_approve_transition() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan first.
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-approve-test".into(),
+            restore_type: "file-level".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "DEFRA".into(),
+            target_environment: "production".into(),
+            owner: "approve-test-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan handler failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Approve.
+        let Ok(Json(approved_resp)) = backup_restore_approve(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: Some("Datacenter Lead".into()),
+        }))
+        .await
+        else {
+            cleanup_restore(pool, &id).await;
+            panic!("backup_restore_approve failed");
+        };
+        assert_eq!(approved_resp["status"], "Approved");
+
+        // Verify DB row.
+        let record = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("restore request not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::RestoreStatus::Approved,
+            "DB row must be Approved after approve"
+        );
+        assert_eq!(
+            record.metadata.get("approver").map(String::as_str),
+            Some("Datacenter Lead"),
+            "approver must be in metadata"
+        );
+
+        cleanup_restore(pool, &id).await;
+    }
+
+    /// approve must reject a second approve attempt (already Approved, not Planned → 409).
+    #[tokio::test]
+    async fn test_restore_approve_rejects_already_approved() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan then approve once.
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-double-approve".into(),
+            restore_type: "full-vm".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "GBLON".into(),
+            target_environment: "production".into(),
+            owner: "double-approve-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan handler failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        if backup_restore_approve(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: Some("First Approver".into()),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup_restore(pool, &id).await;
+            panic!("first approve failed");
+        }
+
+        // Second approve must fail (Approved != Planned → engine guard → 409).
+        let Err((status, _)) = backup_restore_approve(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: Some("Second Approver".into()),
+        }))
+        .await
+        else {
+            cleanup_restore(pool, &id).await;
+            panic!("expected second approve to be rejected");
+        };
+
+        cleanup_restore(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "second approve on already-Approved restore must be 409"
+        );
+    }
+
+    /// execute requires Approved: plan → approve → execute returns evidence.
+    #[tokio::test]
+    async fn test_restore_execute_after_approve() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-execute-test".into(),
+            restore_type: "instant-vm-recovery".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "DEFRA".into(),
+            target_environment: "production".into(),
+            owner: "execute-test-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        if backup_restore_approve(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: Some("Exec Approver".into()),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup_restore(pool, &id).await;
+            panic!("approve failed");
+        }
+
+        let Ok(Json(evidence)) = backup_restore_execute(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: None,
+        }))
+        .await
+        else {
+            cleanup_restore(pool, &id).await;
+            panic!("execute failed");
+        };
+
+        let arr = evidence.as_array().expect("evidence is array");
+        assert!(!arr.is_empty(), "execute must return evidence items");
+        assert!(
+            arr.iter().any(|e| e["key"] == "restore-execution-log"),
+            "evidence must include restore-execution-log"
+        );
+
+        // execute must have recorded the run durably: Approved -> Executed.
+        let record = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("restore request not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::RestoreStatus::Executed,
+            "DB row must be Executed after execute"
+        );
+
+        // A second execute must be rejected — the request is no longer Approved.
+        let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: None,
+        }))
+        .await
+        else {
+            cleanup_restore(pool, &id).await;
+            panic!("expected a second execute to be rejected");
+        };
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-executing an already-Executed restore must be 409"
+        );
+
+        cleanup_restore(pool, &id).await;
+    }
+
+    /// execute must fail (409) when the restore is still Planned (not Approved).
+    #[tokio::test]
+    async fn test_restore_execute_without_approve_fails() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-no-approve-execute".into(),
+            restore_type: "full-vm".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "GBLON".into(),
+            target_environment: "production".into(),
+            owner: "no-approve-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: None,
+        }))
+        .await
+        else {
+            cleanup_restore(pool, &id).await;
+            panic!("expected execute without approve to fail");
+        };
+
+        cleanup_restore(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "execute on a non-Approved restore must be 409"
+        );
+    }
+
+    /// Direct CAS-false test on restore_requests::transition.
+    #[tokio::test]
+    async fn test_restore_cas_conflict_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
+            source_ci_key: "ci-cas-test".into(),
+            restore_type: "application-item".into(),
+            restore_point: "2026-06-10T02:00:00Z".into(),
+            target_site: "GBLON".into(),
+            target_environment: "staging".into(),
+            owner: "cas-test-owner".into(),
+        }))
+        .await
+        else {
+            panic!("backup_restore_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the record while it is still Planned.
+        let stale_planned = crate::repos::restore_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("restore request not found");
+        assert_eq!(
+            stale_planned.status,
+            ryuki_engine::models::RestoreStatus::Planned
+        );
+
+        // Advance it to Approved through the normal path.
+        if backup_restore_approve(Json(RestoreActionRequest {
+            restore_id: id.clone(),
+            approver: Some("CAS Approver".into()),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup_restore(pool, &id).await;
+            panic!("approve failed");
+        }
+
+        // A transition that still expects Planned must NOT apply.
+        let applied =
+            crate::repos::restore_requests::transition(pool, "Planned", &stale_planned, None)
+                .await
+                .expect("transition query failed");
+
+        cleanup_restore(pool, &id).await;
+        assert!(
+            applied.is_none(),
+            "transition with stale expected status must return None (CAS mismatch)"
+        );
     }
 }
