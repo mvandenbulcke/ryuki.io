@@ -22,13 +22,18 @@ use crate::api::{
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    admin_session_revoke_path, admin_token_revoke_path, request_approve_live_apply_path,
-    request_approve_path, request_audit_path, request_cancel_path, request_detail_path,
-    request_evidence_path, request_execute_path, request_execution_job_path, request_lock_path,
-    request_plan_path, request_reject_path, request_validate_path, request_verify_path,
+    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
+    request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
+    request_lock_path, request_plan_path, request_reject_path, request_validate_path,
+    request_verify_path,
 };
+// Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
+// `test` build (no ssr feature) free of unused-import warnings.
 #[cfg(feature = "ssr")]
-use crate::api::{integration_id_path, integration_test_path};
+use crate::api::{
+    integration_id_path, integration_test_path, request_approve_live_apply_path,
+    request_execution_job_path,
+};
 use crate::api_client::{
     capacity_admission_resource, cmdb_file_exchange_resource, cmdb_reconciliation_resource,
     cmdb_relationship_graph_resource, dry_run_plan_resource, evidence_summary_resource,
