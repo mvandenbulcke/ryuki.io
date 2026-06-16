@@ -1,4 +1,4 @@
-use crate::patch_engine::get_patch_waves;
+use crate::models::PatchWave;
 use chrono::{DateTime, Datelike, Days, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -258,7 +258,16 @@ pub fn cancel_window(window_id: &str) -> Result<MaintenanceWindow, String> {
     Ok(cancelled)
 }
 
-pub fn get_dependency_warnings(window_id: &str) -> Result<Vec<DependencyWarning>, String> {
+/// Cross-domain dependency warnings for a maintenance window.
+///
+/// `patch_waves` is supplied by the caller (the API handler loads them from the
+/// `patch_waves` repo) so this function stays I/O-free — patch waves live in
+/// Postgres now, and the engine never reaches into a shared store. Pass an empty
+/// slice when no patch-wave context is available.
+pub fn get_dependency_warnings(
+    window_id: &str,
+    patch_waves: &[PatchWave],
+) -> Result<Vec<DependencyWarning>, String> {
     let store = window_store().lock().unwrap();
     let window = store
         .iter()
@@ -301,8 +310,7 @@ pub fn get_dependency_warnings(window_id: &str) -> Result<Vec<DependencyWarning>
         });
     }
 
-    let patch_waves = get_patch_waves();
-    for pw in &patch_waves {
+    for pw in patch_waves {
         if pw.site_scope.contains(&window.site)
             && overlaps(
                 &pw.schedule.start,
@@ -757,7 +765,8 @@ mod tests {
     #[test]
     fn test_get_dependency_warnings_patch_wave_overlap() {
         let _guard = fresh_store();
-        crate::patch_engine::plan_patch_wave("NLAMS", "windows", "high").unwrap();
+        // plan_patch_wave is now pure (no store); pass the wave in explicitly.
+        let pw = crate::patch_engine::plan_patch_wave("NLAMS", "windows", "high").unwrap();
 
         let window = schedule_window(
             "NLAMS",
@@ -768,9 +777,26 @@ mod tests {
         )
         .unwrap();
 
-        let warnings = get_dependency_warnings(&window.id).unwrap();
+        let warnings = get_dependency_warnings(&window.id, std::slice::from_ref(&pw)).unwrap();
         let has_patch_warning = warnings.iter().any(|w| w.source_type == "patch-wave");
         assert!(has_patch_warning, "Expected patch wave dependency warning");
+    }
+
+    #[test]
+    fn test_get_dependency_warnings_no_patch_context() {
+        let _guard = fresh_store();
+        let window = schedule_window(
+            "NLAMS",
+            "2026-06-15T22:00:00Z",
+            "2026-06-16T06:00:00Z",
+            "Lonely window",
+            make_cis(),
+        )
+        .unwrap();
+
+        // With no patch waves supplied, there must be no patch-wave warnings.
+        let warnings = get_dependency_warnings(&window.id, &[]).unwrap();
+        assert!(warnings.iter().all(|w| w.source_type != "patch-wave"));
     }
 
     #[test]

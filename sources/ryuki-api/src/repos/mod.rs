@@ -12,3 +12,4 @@
 //!   On writes they are serialized to JSON strings and bound as TEXT.
 
 pub mod decommissions;
+pub mod patch_waves;

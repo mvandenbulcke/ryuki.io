@@ -1,20 +1,9 @@
 use crate::models::*;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
-
-static PATCH_WAVE_STORE: OnceLock<Mutex<Vec<PatchWave>>> = OnceLock::new();
-
-pub(crate) fn patch_wave_store() -> &'static Mutex<Vec<PatchWave>> {
-    PATCH_WAVE_STORE.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-pub fn get_patch_waves() -> Vec<PatchWave> {
-    patch_wave_store().lock().unwrap().clone()
-}
 
 pub fn plan_patch_wave_from_servers(servers: &[Server]) -> Result<PatchWave, String> {
     if servers.is_empty() {
@@ -255,6 +244,18 @@ impl PatchWave {
     }
 }
 
+// ─── Pure public transition functions ────────────────────────────────────────
+//
+// These replace the old store-mutating functions. Each takes the loaded wave by
+// reference and returns the updated wave (and any additional output) without
+// performing any I/O. The repository layer in ryuki-api owns persistence; the
+// handler owns the transition contract (404/409/503).
+
+/// Create a new Draft patch wave for the given site, os_family, and criticality.
+///
+/// The returned wave has a non-UUID id of the form "pw-<short>". Callers that
+/// persist the wave MUST replace the id with a UUID before inserting (exactly
+/// as the decommission handler does).
 pub fn plan_patch_wave(
     site: &str,
     os_family: &str,
@@ -294,7 +295,7 @@ pub fn plan_patch_wave(
         .collect();
 
     let wave = PatchWave {
-        id: id.clone(),
+        id,
         name: format!("Patch Wave - {} - {} ({})", site, os_family, criticality),
         servers: mock_servers,
         site_scope: vec![site.to_string()],
@@ -316,18 +317,17 @@ pub fn plan_patch_wave(
         ]),
     };
 
-    patch_wave_store().lock().unwrap().push(wave.clone());
     Ok(wave)
 }
 
-pub fn validate_patch_wave(wave_id: &str) -> Result<ValidationResult, String> {
-    let mut store = patch_wave_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|w| w.id == wave_id)
-        .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
-    let wave = &store[idx];
-
+/// Validate a patch wave that is in Draft status.
+///
+/// Returns the updated wave (with validation_errors and metadata written, and
+/// status advanced to Validated if validation passed) alongside the
+/// ValidationResult. If validation fails the returned wave remains in Draft
+/// status but carries the errors and metadata — the handler MUST still persist
+/// it via transition so that validation_errors are durable.
+pub fn validate_patch_wave(wave: &PatchWave) -> Result<(PatchWave, ValidationResult), String> {
     if wave.status != PatchWaveStatus::Draft {
         return Err(format!(
             "Cannot validate patch wave in status {:?}. Must be Draft first.",
@@ -382,25 +382,22 @@ pub fn validate_patch_wave(wave_id: &str) -> Result<ValidationResult, String> {
             .insert("validated_at".into(), chrono::Utc::now().to_rfc3339());
     }
 
-    store[idx] = validated;
-
-    Ok(ValidationResult {
+    let result = ValidationResult {
         passed,
         errors,
         warnings,
         failed_rules,
         remediation,
-    })
+    };
+
+    Ok((validated, result))
 }
 
-pub fn approve_patch_wave(wave_id: &str) -> Result<PatchWave, String> {
-    let mut store = patch_wave_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|w| w.id == wave_id)
-        .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
-
-    let wave = &store[idx];
+/// Approve a patch wave that is in Validated status.
+///
+/// Returns the updated wave with status Approved and approver/approved_at
+/// metadata set.
+pub fn approve_patch_wave(wave: &PatchWave) -> Result<PatchWave, String> {
     if wave.status != PatchWaveStatus::Validated {
         return Err(format!(
             "Cannot approve patch wave in status {:?}. Must pass validation first.",
@@ -417,19 +414,15 @@ pub fn approve_patch_wave(wave_id: &str) -> Result<PatchWave, String> {
         .metadata
         .insert("approved_at".into(), chrono::Utc::now().to_rfc3339());
 
-    store[idx] = approved.clone();
     Ok(approved)
 }
 
-pub fn execute_patch_wave(wave_id: &str) -> Result<Vec<EvidenceItem>, String> {
-    let mut store = patch_wave_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|w| w.id == wave_id)
-        .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
-
-    let wave = &store[idx];
-
+/// Execute a patch wave that is in Approved status.
+///
+/// Returns the updated wave (status Completed, with executed_at and
+/// execution_evidence_count metadata) and the evidence items collected during
+/// execution.
+pub fn execute_patch_wave(wave: &PatchWave) -> Result<(PatchWave, Vec<EvidenceItem>), String> {
     if wave.status != PatchWaveStatus::Approved {
         return Err(format!(
             "Cannot execute patch wave in status {:?}. Must be Approved first.",
@@ -508,18 +501,15 @@ pub fn execute_patch_wave(wave_id: &str) -> Result<Vec<EvidenceItem>, String> {
             completed.servers.len()
         ),
     );
-    store[idx] = completed;
 
-    Ok(evidence)
+    Ok((completed, evidence))
 }
 
-pub fn verify_patch_wave(wave_id: &str) -> Result<ValidationResult, String> {
-    let store = patch_wave_store().lock().unwrap();
-    let wave = store
-        .iter()
-        .find(|w| w.id == wave_id)
-        .ok_or_else(|| format!("Patch wave not found: {}", wave_id))?;
-
+/// Verify that a patch wave has been correctly executed (evidence-only check).
+///
+/// The wave must be in Completed status. Returns a ValidationResult; does NOT
+/// transition the wave — verification is read-only at this stage.
+pub fn verify_patch_wave(wave: &PatchWave) -> Result<ValidationResult, String> {
     if wave.status != PatchWaveStatus::Completed {
         return Err(format!(
             "Cannot verify patch wave in status {:?}. Must be Completed first.",
@@ -799,18 +789,13 @@ mod tests {
     #[test]
     fn test_validate_patch_wave_by_id() {
         let wave = plan_patch_wave("GBLON", "linux", "high").unwrap();
-        let result = validate_patch_wave(&wave.id).unwrap();
+        let (updated, result) = validate_patch_wave(&wave).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave.id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Validated);
-        assert_eq!(stored.metadata.get("validation_passed").unwrap(), "true");
-        assert_eq!(stored.metadata.get("validation_dry_run").unwrap(), "true");
-        assert!(stored.metadata.contains_key("validated_at"));
+        assert_eq!(updated.status, PatchWaveStatus::Validated);
+        assert_eq!(updated.metadata.get("validation_passed").unwrap(), "true");
+        assert_eq!(updated.metadata.get("validation_dry_run").unwrap(), "true");
+        assert!(updated.metadata.contains_key("validated_at"));
     }
 
     #[test]
@@ -833,77 +818,49 @@ mod tests {
             status: PatchWaveStatus::Draft,
             metadata: HashMap::from([("dry_run".into(), "true".into())]),
         };
-        let wave_id = wave.id.clone();
-        patch_wave_store().lock().unwrap().push(wave);
 
-        let result = validate_patch_wave(&wave_id).unwrap();
+        let (updated, result) = validate_patch_wave(&wave).unwrap();
         assert!(!result.passed);
         assert!(
             result
                 .failed_rules
                 .contains(&"p0-patch-servers-required".to_string())
         );
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave_id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Draft);
-        assert_eq!(stored.metadata.get("validation_passed").unwrap(), "false");
-        assert_eq!(stored.metadata.get("validation_dry_run").unwrap(), "true");
-        assert!(!stored.validation_errors.is_empty());
-        assert!(approve_patch_wave(&stored.id).is_err());
+        assert_eq!(updated.status, PatchWaveStatus::Draft);
+        assert_eq!(updated.metadata.get("validation_passed").unwrap(), "false");
+        assert_eq!(updated.metadata.get("validation_dry_run").unwrap(), "true");
+        assert!(!updated.validation_errors.is_empty());
+        // Approving a still-Draft wave must fail
+        assert!(approve_patch_wave(&updated).is_err());
     }
 
     #[test]
     fn test_validate_patch_wave_refuses_completed_wave() {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
-        validate_patch_wave(&wave.id).unwrap();
-        approve_patch_wave(&wave.id).unwrap();
-        execute_patch_wave(&wave.id).unwrap();
+        let (validated, _) = validate_patch_wave(&wave).unwrap();
+        let approved = approve_patch_wave(&validated).unwrap();
+        let (completed, _) = execute_patch_wave(&approved).unwrap();
 
-        let err = validate_patch_wave(&wave.id).unwrap_err();
+        let err = validate_patch_wave(&completed).unwrap_err();
         assert!(err.contains("Must be Draft first"));
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave.id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Completed);
+        assert_eq!(completed.status, PatchWaveStatus::Completed);
     }
 
     #[test]
     fn test_validate_patch_wave_refuses_failed_wave() {
         let mut wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
         wave.status = PatchWaveStatus::Failed;
-        let wave_id = wave.id.clone();
-        {
-            let mut store = patch_wave_store().lock().unwrap();
-            let idx = store.iter().position(|w| w.id == wave_id).unwrap();
-            store[idx] = wave;
-        }
-
-        let err = validate_patch_wave(&wave_id).unwrap_err();
+        let err = validate_patch_wave(&wave).unwrap_err();
         assert!(err.contains("Must be Draft first"));
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave_id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Failed);
-    }
-
-    #[test]
-    fn test_validate_patch_wave_not_found() {
-        assert!(validate_patch_wave("pw-nonexistent").is_err());
+        assert_eq!(wave.status, PatchWaveStatus::Failed);
     }
 
     #[test]
     fn test_approve_patch_wave() {
         let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
-        let validation = validate_patch_wave(&wave.id).unwrap();
+        let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&wave.id).unwrap();
+        let approved = approve_patch_wave(&validated).unwrap();
         assert_eq!(approved.status, PatchWaveStatus::Approved);
         assert_eq!(
             approved.metadata.get("approver").unwrap(),
@@ -914,70 +871,50 @@ mod tests {
     #[test]
     fn test_approve_patch_wave_draft_fails() {
         let wave = plan_patch_wave("NLAMS", "windows", "medium").unwrap();
-        let result = approve_patch_wave(&wave.id).unwrap_err();
+        let result = approve_patch_wave(&wave).unwrap_err();
         assert!(result.contains("Must pass validation first"));
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave.id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Draft);
-    }
-
-    #[test]
-    fn test_approve_patch_wave_not_found() {
-        assert!(approve_patch_wave("pw-nonexistent").is_err());
+        assert_eq!(wave.status, PatchWaveStatus::Draft);
     }
 
     #[test]
     fn test_execute_patch_wave() {
         let wave = plan_patch_wave("DEFRA", "windows", "high").unwrap();
-        let validation = validate_patch_wave(&wave.id).unwrap();
+        let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&wave.id).unwrap();
-        let evidence = execute_patch_wave(&approved.id).unwrap();
+        let approved = approve_patch_wave(&validated).unwrap();
+        let (completed, evidence) = execute_patch_wave(&approved).unwrap();
         assert!(evidence.len() >= 5);
         assert!(evidence.iter().any(|e| e.key == "pre-patch-backup-check"));
         assert!(evidence.iter().any(|e| e.key == "post-patch-reboot"));
         assert!(evidence.iter().any(|e| e.key == "post-patch-health-check"));
-
-        let stored = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == approved.id)
-            .unwrap();
-        assert_eq!(stored.status, PatchWaveStatus::Completed);
+        assert_eq!(completed.status, PatchWaveStatus::Completed);
         assert_eq!(
-            stored.metadata.get("execution_evidence_count").unwrap(),
+            completed.metadata.get("execution_evidence_count").unwrap(),
             &evidence.len().to_string()
         );
-        assert!(stored.metadata.contains_key("executed_at"));
+        assert!(completed.metadata.contains_key("executed_at"));
     }
 
     #[test]
     fn test_execute_patch_wave_not_approved_fails() {
         let wave = plan_patch_wave("GBLON", "linux", "low").unwrap();
-        assert!(execute_patch_wave(&wave.id).is_err());
-    }
-
-    #[test]
-    fn test_execute_patch_wave_not_found() {
-        assert!(execute_patch_wave("pw-nonexistent").is_err());
+        assert!(execute_patch_wave(&wave).is_err());
     }
 
     #[test]
     fn test_verify_patch_wave_requires_execution() {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
-        assert!(verify_patch_wave(&wave.id).is_err());
+        assert!(verify_patch_wave(&wave).is_err());
     }
 
     #[test]
     fn test_verify_patch_wave_after_execute() {
         let wave = plan_patch_wave("GBLON", "linux", "critical").unwrap();
-        let validation = validate_patch_wave(&wave.id).unwrap();
+        let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-        let approved = approve_patch_wave(&wave.id).unwrap();
-        execute_patch_wave(&approved.id).unwrap();
-        let result = verify_patch_wave(&wave.id).unwrap();
+        let approved = approve_patch_wave(&validated).unwrap();
+        let (completed, _) = execute_patch_wave(&approved).unwrap();
+        let result = verify_patch_wave(&completed).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());
     }
@@ -987,13 +924,8 @@ mod tests {
         let wave = plan_patch_wave("DEBER", "linux", "critical").unwrap();
         assert_eq!(wave.status, PatchWaveStatus::Draft);
 
-        let validation = validate_patch_wave(&wave.id).unwrap();
+        let (validated, validation) = validate_patch_wave(&wave).unwrap();
         assert!(validation.passed);
-
-        let validated = get_patch_waves()
-            .into_iter()
-            .find(|w| w.id == wave.id)
-            .unwrap();
         assert_eq!(validated.status, PatchWaveStatus::Validated);
         assert_eq!(validated.metadata.get("validation_passed").unwrap(), "true");
         assert_eq!(
@@ -1001,20 +933,15 @@ mod tests {
             "true"
         );
 
-        let approved = approve_patch_wave(&wave.id).unwrap();
+        let approved = approve_patch_wave(&validated).unwrap();
         assert_eq!(approved.status, PatchWaveStatus::Approved);
 
-        let evidence = execute_patch_wave(&wave.id).unwrap();
+        let (completed, evidence) = execute_patch_wave(&approved).unwrap();
         assert!(evidence.iter().all(|e| e.value.contains("DRY-RUN")));
 
-        let verification = verify_patch_wave(&wave.id).unwrap();
+        let verification = verify_patch_wave(&completed).unwrap();
         assert!(verification.passed);
         assert!(verification.warnings.iter().all(|w| w.contains("DRY-RUN")));
-    }
-
-    #[test]
-    fn test_verify_patch_wave_not_found() {
-        assert!(verify_patch_wave("pw-nonexistent").is_err());
     }
 
     #[test]

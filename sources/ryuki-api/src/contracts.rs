@@ -802,6 +802,8 @@ pub fn routes() -> Router {
         .route("/api/maintain/patch/approve", post(patch_approve))
         .route("/api/maintain/patch/execute", post(patch_execute))
         .route("/api/maintain/patch/verify", post(patch_verify))
+        .route("/api/maintain/patch/waves", get(patch_waves_list))
+        .route("/api/maintain/patch/waves/{id}", get(patch_wave_get))
         .route("/api/maintain/patch/compliance", get(patch_compliance))
         .route(
             "/api/maintain/patch/pending-reboots",
@@ -6268,38 +6270,129 @@ async fn maintenance_calendar_contract() -> Json<Value> {
 // ─── Patch wave orchestration handlers ───
 
 async fn patch_plan(Json(body): Json<PatchPlanRequest>) -> ApiResult {
-    match patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality) {
-        Ok(wave) => Ok(Json(serde_json::to_value(wave).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let mut wave = patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality)
+        .map_err(|e| status_400(&e))?;
+
+    // The engine generates a non-UUID id (e.g. "pw-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    wave.id = Uuid::new_v4().to_string();
+
+    crate::repos::patch_waves::insert(pool, &wave)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&wave).unwrap_or_default()))
 }
 
 async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
-    match patch_engine::validate_patch_wave(&body.wave_id) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.wave_id))?;
+
+    let before = crate::repos::patch_waves::status_str(&wave.status);
+
+    let (updated, result) = patch_engine::validate_patch_wave(&wave).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::patch_waves::transition(pool, before, &updated, None)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
 async fn patch_approve(Json(body): Json<PatchActionRequest>) -> ApiResult {
-    match patch_engine::approve_patch_wave(&body.wave_id) {
-        Ok(wave) => Ok(Json(serde_json::to_value(wave).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.wave_id))?;
+
+    let before = crate::repos::patch_waves::status_str(&wave.status);
+
+    let approved = patch_engine::approve_patch_wave(&wave).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::patch_waves::transition(pool, before, &approved, None)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
 async fn patch_execute(Json(body): Json<PatchActionRequest>) -> ApiResult {
-    match patch_engine::execute_patch_wave(&body.wave_id) {
-        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.wave_id))?;
+
+    let before = crate::repos::patch_waves::status_str(&wave.status);
+
+    let (completed, evidence) =
+        patch_engine::execute_patch_wave(&wave).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::patch_waves::transition(pool, before, &completed, None)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
     }
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
 async fn patch_verify(Json(body): Json<PatchActionRequest>) -> ApiResult {
-    match patch_engine::verify_patch_wave(&body.wave_id) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.wave_id))?;
+
+    // verify is evidence-only; it does NOT transition the wave.
+    let result = patch_engine::verify_patch_wave(&wave).map_err(|e| status_409(&e))?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// List all persisted patch waves (read surface). Returns an empty list when no
+/// database is configured (demo mode), matching the other read-only GETs.
+async fn patch_waves_list() -> ApiResult {
+    if let Some(pool) = get_db() {
+        let waves = crate::repos::patch_waves::list(pool)
+            .await
+            .map_err(db_error)?;
+        return Ok(Json(serde_json::to_value(&waves).unwrap_or_default()));
     }
+    Ok(Json(
+        serde_json::to_value(Vec::<serde_json::Value>::new()).unwrap_or_default(),
+    ))
+}
+
+/// Fetch a single persisted patch wave by id (read surface). 404 when absent or
+/// when no database is configured.
+async fn patch_wave_get(Path(id): Path<String>) -> ApiResult {
+    if let Some(pool) = get_db() {
+        return match crate::repos::patch_waves::get(pool, &id).await {
+            Ok(Some(wave)) => Ok(Json(serde_json::to_value(&wave).unwrap_or_default())),
+            Ok(None) => Err(status_404(&id)),
+            Err(e) => Err(db_error(e)),
+        };
+    }
+    Err(status_404(&id))
 }
 
 async fn patch_compliance() -> ApiResult {
@@ -12862,7 +12955,7 @@ struct DecommissionApproveRequest {
 fn status_503_no_db() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error": "persistence required: decommission requires a database"})),
+        Json(json!({"error": "persistence required: this operation requires a database"})),
     )
 }
 
@@ -27632,6 +27725,227 @@ mod server_decommission_db_tests {
             status,
             StatusCode::CONFLICT,
             "approve from already-Approved state must be 409"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api patch_waves_db_tests
+#[cfg(test)]
+mod patch_waves_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn plan_body(suffix: &str) -> PatchPlanRequest {
+        PatchPlanRequest {
+            site: "DEFRA".into(),
+            os_family: "linux".into(),
+            criticality: format!("test-{suffix}"),
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM patch_waves WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// plan → repo get round-trip: wave is persisted with a valid UUID id.
+    #[tokio::test]
+    async fn test_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+            panic!("patch_plan failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let wave = crate::repos::patch_waves::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("wave not found after insert");
+
+        assert_eq!(wave.id, id, "id must round-trip");
+        assert_eq!(wave.site_scope, vec!["DEFRA"], "site_scope must round-trip");
+        assert_eq!(
+            wave.status,
+            ryuki_engine::models::PatchWaveStatus::Draft,
+            "status after plan must be Draft"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Full lifecycle: plan → validate → approve → execute → verify.
+    /// Each transition must be persisted.
+    #[tokio::test]
+    async fn test_full_lifecycle_status_transitions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // 1. plan
+        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+            panic!("patch_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // 2. validate
+        let Ok(Json(vr)) = patch_validate(Json(PatchActionRequest {
+            wave_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("patch_validate failed");
+        };
+        assert_eq!(vr["passed"], true, "validation must pass for DEFRA/linux");
+
+        let wave = crate::repos::patch_waves::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("wave not found");
+        assert_eq!(
+            wave.status,
+            ryuki_engine::models::PatchWaveStatus::Validated,
+            "status after validate must be Validated"
+        );
+
+        // 3. approve
+        let Ok(Json(approved)) = patch_approve(Json(PatchActionRequest {
+            wave_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("patch_approve failed");
+        };
+        assert_eq!(approved["status"], "Approved");
+
+        let wave = crate::repos::patch_waves::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("wave not found");
+        assert_eq!(
+            wave.status,
+            ryuki_engine::models::PatchWaveStatus::Approved,
+            "status after approve must be Approved"
+        );
+
+        // 4. execute
+        let Ok(Json(evidence)) = patch_execute(Json(PatchActionRequest {
+            wave_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("patch_execute failed");
+        };
+        assert!(
+            evidence.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "evidence must be non-empty"
+        );
+
+        let wave = crate::repos::patch_waves::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("wave not found");
+        assert_eq!(
+            wave.status,
+            ryuki_engine::models::PatchWaveStatus::Completed,
+            "status after execute must be Completed"
+        );
+
+        // 5. verify (evidence-only, no transition)
+        let Ok(Json(verify_result)) = patch_verify(Json(PatchActionRequest {
+            wave_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("patch_verify failed");
+        };
+        assert_eq!(verify_result["passed"], true, "verify must pass");
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Optimistic-lock CAS: `transition` must return `Ok(false)` when the row's
+    /// DB status no longer matches the expected `before` value. We capture the
+    /// wave while Draft, advance it to Validated through the normal path, then
+    /// attempt a transition that still expects Draft — the CAS
+    /// `WHERE status = 'Draft'` then matches zero rows. This exercises the
+    /// repo's CAS-false branch directly (the engine status guard would otherwise
+    /// short-circuit a serial double-validate before the CAS is ever reached).
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+            panic!("patch_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the wave while it is still Draft.
+        let draft = crate::repos::patch_waves::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("wave not found");
+        assert_eq!(draft.status, ryuki_engine::models::PatchWaveStatus::Draft);
+
+        // Advance it to Validated through the normal path.
+        if patch_validate(Json(PatchActionRequest {
+            wave_id: id.clone(),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("validate failed");
+        }
+
+        // A transition that still expects the stale Draft status must NOT apply.
+        let applied = crate::repos::patch_waves::transition(pool, "Draft", &draft, None)
+            .await
+            .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with stale expected status must return false (CAS mismatch)"
         );
     }
 }
