@@ -1,9 +1,9 @@
 use crate::api::{platform_summary_path, request_detail_path};
 use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
-    approve_request, cancel_request, execute_request, get_request_audit, get_request_detail,
-    get_request_evidence, get_request_execution_job, lock_request, plan_request, reject_request,
-    validate_request, verify_request,
+    approve_request, cancel_request, execute_request, execute_request_live_plan, get_request_audit,
+    get_request_detail, get_request_evidence, get_request_execution_job, lock_request,
+    plan_request, reject_request, validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -32,6 +32,9 @@ fn action_capability(action: &str) -> &'static str {
         "approve" | "reject" => "approve",
         // cancel is a requester/admin act (withdraw the request).
         "cancel" => "request",
+        // run-live-plan is an admin-only synthetic action (real terraform plan,
+        // no mutation); only PlatformAdmin / BreakGlassAdmin roles see it.
+        "run-live-plan" => "admin",
         // validate, plan, lock, execute, verify are operator-tier mechanics.
         _ => "execute",
     }
@@ -191,6 +194,7 @@ fn action_label(action: &str) -> &'static str {
         "cancel" => "Cancel",
         "lock" => "Lock",
         "execute" => "Execute",
+        "run-live-plan" => "Run live plan",
         "verify" => "Verify",
         &_ => "Unknown",
     }
@@ -373,6 +377,29 @@ pub fn RequestDetail() -> impl IntoView {
         }
     });
 
+    let run_live_plan_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        set_action_feedback.set("Running live plan...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match execute_request_live_plan(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
     let verify_action = Action::new(move |id: &String| {
         let id = id.clone();
         set_action_feedback.set("Verifying...".to_string());
@@ -517,6 +544,14 @@ pub fn RequestDetail() -> impl IntoView {
                             .filter(|action| session_can(&session, action_capability(action)))
                             .cloned()
                             .collect();
+                        // "Run live plan" is a synthetic admin-only action: shown when
+                        // "execute" is available (request is Locked) and the session
+                        // holds the "admin" capability (PlatformAdmin / BreakGlassAdmin).
+                        let show_live_plan = detail
+                            .actions_available
+                            .iter()
+                            .any(|a| a == "execute")
+                            && session_can(&session, "admin");
                         let request_id_for_action = detail.id.clone();
 
                         // Persisted-state fields surfaced in the detail panel.
@@ -884,6 +919,32 @@ pub fn RequestDetail() -> impl IntoView {
                                                 }
                                             })
                                             .collect_view()}
+                                        // "Run live plan" — admin-only, shown alongside the
+                                        // "Execute" button when the request is Locked. Triggers
+                                        // a real terraform plan / ansible --check with no
+                                        // mutation (POST .../execute?mode=live-plan).
+                                        // Clone the id here so `request_id_for_action` remains
+                                        // available for the reason-panel `Show` below.
+                                        {
+                                            let live_plan_id = request_id_for_action.clone();
+                                            view! {
+                                                <Show when=move || show_live_plan>
+                                                    {
+                                                        let id = live_plan_id.clone();
+                                                        view! {
+                                                            <button
+                                                                class="btn btn-secondary"
+                                                                on:click=move |_| {
+                                                                    run_live_plan_action.dispatch(id.clone());
+                                                                }
+                                                            >
+                                                                "Run live plan"
+                                                            </button>
+                                                        }
+                                                    }
+                                                </Show>
+                                            }
+                                        }
                                     </div>
                                     <Show when=move || pending_reason_action.get().is_some()>
                                         {
@@ -1200,7 +1261,25 @@ fn RequestEvidencePanel() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_stage_for_rail, stage_step_state, STAGE_MILESTONES};
+    use super::{action_capability, effective_stage_for_rail, stage_step_state, STAGE_MILESTONES};
+
+    // ── action_capability ───────────────────────────────────────────────────
+
+    #[test]
+    fn run_live_plan_requires_admin_capability() {
+        assert_eq!(
+            action_capability("run-live-plan"),
+            "admin",
+            "run-live-plan must require the admin capability so only PlatformAdmin \
+             and BreakGlassAdmin see the button"
+        );
+    }
+
+    #[test]
+    fn execute_requires_execute_capability() {
+        // Regression guard: execute must NOT require admin (operator-tier mechanics).
+        assert_eq!(action_capability("execute"), "execute");
+    }
 
     // ── stage_step_state ────────────────────────────────────────────────────
 

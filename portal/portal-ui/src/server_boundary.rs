@@ -2120,6 +2120,30 @@ pub async fn execute_request(request_id: String) -> Result<StageActionResponse, 
     dispatch_stage_action_live(request_id, "execution", &path).await
 }
 
+#[server(prefix = "/portal/api", endpoint = "request-execute-live-plan")]
+pub async fn execute_request_live_plan(
+    request_id: String,
+) -> Result<StageActionResponse, ServerFnError> {
+    // Validate the BASE execute path through the same allowlist guards used by
+    // execute_request — the allowlist sees the plain ".../execute" suffix, not
+    // the query string appended below.
+    let boundary = PortalServerBoundary::static_dry_run();
+    let base_path = request_execute_path(&request_id)
+        .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&base_path)
+        .map_err(|_| ServerFnError::new("request execute API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "live plan");
+    }
+    // Append the static mode query string AFTER the allowlist guard so that
+    // the allowlist only ever sees the plain "/execute" suffix. The mode value
+    // is a static string literal — no user input is interpolated here.
+    let live_plan_path = format!("{base_path}?mode=live-plan");
+    dispatch_stage_action_live(request_id, "live plan", &live_plan_path).await
+}
+
 #[server(prefix = "/portal/api", endpoint = "request-verify-stage")]
 pub async fn verify_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
     let boundary = PortalServerBoundary::static_dry_run();
