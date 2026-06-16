@@ -13,3 +13,4 @@
 
 pub mod decommissions;
 pub mod patch_waves;
+pub mod snapshots;

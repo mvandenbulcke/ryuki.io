@@ -117,7 +117,17 @@ pub fn flag_stale_snapshots(records: &[SnapshotRecord]) -> Result<Vec<SnapshotRe
     let mut flagged: Vec<SnapshotRecord> = Vec::new();
 
     for record in records {
-        if record.status == SnapshotStatus::Expired || record.status == SnapshotStatus::Completed {
+        // Only live, not-yet-actioned states are eligible to be flagged stale.
+        // Excluding StaleFlagged (already flagged), RemediationPlanned (already
+        // being remediated), and the terminal Expired/Completed/Failed prevents
+        // a flag -> remediate -> re-flag loop and never re-opens terminal rows.
+        let eligible = matches!(
+            record.status,
+            SnapshotStatus::Draft
+                | SnapshotStatus::ReviewRequested
+                | SnapshotStatus::ExpiryApproved
+        );
+        if !eligible {
             continue;
         }
         if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(&record.requested_expiry)
@@ -138,6 +148,16 @@ pub fn flag_stale_snapshots(records: &[SnapshotRecord]) -> Result<Vec<SnapshotRe
 }
 
 pub fn plan_snapshot_remediation(record: &SnapshotRecord) -> Result<SnapshotRecord, String> {
+    // Remediation only applies to a snapshot that has been flagged stale.
+    // Without this guard a fresh Draft or a terminal (Completed/Expired/Failed)
+    // snapshot could be moved into RemediationPlanned, corrupting the lifecycle.
+    if record.status != SnapshotStatus::StaleFlagged {
+        return Err(format!(
+            "Cannot plan remediation for snapshot in status {:?}. Must be StaleFlagged first.",
+            record.status
+        ));
+    }
+
     let mut remediated = record.clone();
     remediated.status = SnapshotStatus::RemediationPlanned;
     remediated.updated_at = chrono::Utc::now().to_rfc3339();
@@ -234,5 +254,51 @@ mod tests {
         let remediated = plan_snapshot_remediation(&record).unwrap();
         assert_eq!(remediated.status, SnapshotStatus::RemediationPlanned);
         assert!(remediated.remediation_plan.is_some());
+    }
+
+    #[test]
+    fn test_plan_snapshot_remediation_rejects_non_stale() {
+        // Remediation must require StaleFlagged — a fresh Draft is rejected.
+        let record = make_test_snapshot();
+        assert_eq!(record.status, SnapshotStatus::Draft);
+        assert!(plan_snapshot_remediation(&record).is_err());
+
+        // Terminal states are rejected too.
+        for status in [
+            SnapshotStatus::Completed,
+            SnapshotStatus::Expired,
+            SnapshotStatus::Failed,
+            SnapshotStatus::RemediationPlanned,
+        ] {
+            let mut r = make_test_snapshot();
+            r.status = status.clone();
+            assert!(
+                plan_snapshot_remediation(&r).is_err(),
+                "remediation must reject status {:?}",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn test_flag_stale_skips_remediation_planned_and_failed() {
+        // Past-expiry records in non-eligible states must NOT be re-flagged,
+        // which would otherwise cause a flag -> remediate -> re-flag loop or
+        // re-open terminal rows.
+        for status in [
+            SnapshotStatus::RemediationPlanned,
+            SnapshotStatus::Failed,
+            SnapshotStatus::StaleFlagged,
+        ] {
+            let mut record = make_test_snapshot();
+            record.requested_expiry = "2020-01-01T00:00:00Z".into();
+            record.status = status.clone();
+            let flagged = flag_stale_snapshots(&[record]).unwrap();
+            assert!(
+                flagged.is_empty(),
+                "status {:?} must not be flagged stale",
+                status
+            );
+        }
     }
 }

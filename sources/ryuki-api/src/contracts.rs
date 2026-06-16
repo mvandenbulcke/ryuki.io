@@ -1323,6 +1323,11 @@ pub fn routes() -> Router {
             post(snapshot_flag_stale),
         )
         .route("/api/protect/snapshot/remediate", post(snapshot_remediate))
+        .route("/api/protect/snapshot/records", get(snapshot_records_list))
+        .route(
+            "/api/protect/snapshot/records/{id}",
+            get(snapshot_record_get),
+        )
         .route(
             "/api/protect/snapshot-governance-contract",
             get(snapshot_governance_contract),
@@ -1842,6 +1847,12 @@ struct SnapshotPlanRequest {
     support_group: String,
     #[serde(rename = "changeContext")]
     change_context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotActionRequest {
+    #[serde(rename = "snapshotId")]
+    snapshot_id: String,
 }
 
 // ─── Backup request types ───
@@ -12716,82 +12727,139 @@ async fn vm_day2_change_contract() -> Json<Value> {
 // ─── Snapshot Governance handlers ───
 
 async fn snapshot_plan(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
-    match snapshot_engine::plan_snapshot(
-        &body.platform_ci_key,
-        &body.snapshot_purpose,
-        &body.requested_expiry,
-        &body.owner,
-        &body.support_group,
-        &body.change_context,
-    ) {
-        Ok(record) => Ok(Json(serde_json::to_value(record).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
+    let pool = get_db().ok_or_else(status_503_no_db)?;
 
-async fn snapshot_validate(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
-    let record = snapshot_engine::plan_snapshot(
-        &body.platform_ci_key,
-        &body.snapshot_purpose,
-        &body.requested_expiry,
-        &body.owner,
-        &body.support_group,
-        &body.change_context,
-    )
-    .map_err(|e| status_400(&e))?;
-    match snapshot_engine::validate_snapshot(&record) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
-
-async fn snapshot_review(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
-    let record = snapshot_engine::plan_snapshot(
-        &body.platform_ci_key,
-        &body.snapshot_purpose,
-        &body.requested_expiry,
-        &body.owner,
-        &body.support_group,
-        &body.change_context,
-    )
-    .map_err(|e| status_400(&e))?;
-    match snapshot_engine::review_snapshot_policy(&record) {
-        Ok(reviewed) => Ok(Json(serde_json::to_value(reviewed).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
-
-async fn snapshot_flag_stale(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
-    let record = snapshot_engine::plan_snapshot(
-        &body.platform_ci_key,
-        &body.snapshot_purpose,
-        "2020-01-01T00:00:00Z",
-        &body.owner,
-        &body.support_group,
-        &body.change_context,
-    )
-    .map_err(|e| status_400(&e))?;
-    match snapshot_engine::flag_stale_snapshots(&[record]) {
-        Ok(flagged) => Ok(Json(serde_json::to_value(flagged).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
-
-async fn snapshot_remediate(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
     let mut record = snapshot_engine::plan_snapshot(
         &body.platform_ci_key,
         &body.snapshot_purpose,
-        "2020-01-01T00:00:00Z",
+        &body.requested_expiry,
         &body.owner,
         &body.support_group,
         &body.change_context,
     )
     .map_err(|e| status_400(&e))?;
-    record.status = ryuki_engine::models::SnapshotStatus::StaleFlagged;
-    match snapshot_engine::plan_snapshot_remediation(&record) {
-        Ok(remediated) => Ok(Json(serde_json::to_value(remediated).unwrap())),
-        Err(e) => Err(status_400(&e)),
+
+    // The engine mints a non-UUID id (e.g. "snap-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    record.id = Uuid::new_v4().to_string();
+
+    let persisted = crate::repos::snapshots::insert(pool, &record)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+}
+
+async fn snapshot_validate(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let record = crate::repos::snapshots::get(pool, &body.snapshot_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.snapshot_id))?;
+
+    // validate_snapshot is read-only: no state transition, no repo write.
+    let result = snapshot_engine::validate_snapshot(&record).map_err(|e| status_400(&e))?;
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+async fn snapshot_review(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let record = crate::repos::snapshots::get(pool, &body.snapshot_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.snapshot_id))?;
+
+    let before = crate::repos::snapshots::status_str(&record.status);
+
+    let reviewed = snapshot_engine::review_snapshot_policy(&record).map_err(|e| status_409(&e))?;
+
+    let persisted = crate::repos::snapshots::transition(pool, before, &reviewed, None)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+}
+
+async fn snapshot_flag_stale() -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // Load all snapshots and let the engine decide which are stale (past expiry,
+    // non-terminal). For each flagged record we find its prior status in the
+    // original list and CAS-update it. Records whose CAS fails (concurrent
+    // update) are silently skipped — the next poll will retry them.
+    let all = crate::repos::snapshots::list(pool)
+        .await
+        .map_err(db_error)?;
+
+    let flagged = snapshot_engine::flag_stale_snapshots(&all).map_err(|e| status_400(&e))?;
+
+    let mut persisted: Vec<ryuki_engine::models::SnapshotRecord> =
+        Vec::with_capacity(flagged.len());
+
+    for flagged_record in &flagged {
+        // Find the original record to obtain its pre-flag status for the CAS.
+        let Some(original) = all.iter().find(|r| r.id == flagged_record.id) else {
+            continue;
+        };
+        let before = crate::repos::snapshots::status_str(&original.status);
+        if let Some(saved) = crate::repos::snapshots::transition(pool, before, flagged_record, None)
+            .await
+            .map_err(db_error)?
+        {
+            persisted.push(saved);
+        }
     }
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+}
+
+async fn snapshot_remediate(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let record = crate::repos::snapshots::get(pool, &body.snapshot_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.snapshot_id))?;
+
+    let before = crate::repos::snapshots::status_str(&record.status);
+
+    let remediated =
+        snapshot_engine::plan_snapshot_remediation(&record).map_err(|e| status_409(&e))?;
+
+    let persisted = crate::repos::snapshots::transition(pool, before, &remediated, None)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
+}
+
+/// GET /api/protect/snapshot/records — list all persisted snapshots.
+/// Returns an empty array when no DB is available rather than an error.
+async fn snapshot_records_list() -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(serde_json::Value::Array(vec![])));
+    };
+    let records = crate::repos::snapshots::list(pool)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+}
+
+/// GET /api/protect/snapshot/records/{id} — fetch a single snapshot by id.
+/// Returns 404 when absent or when no DB is configured.
+async fn snapshot_record_get(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(|| status_404(&id))?;
+    let record = crate::repos::snapshots::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
 async fn snapshot_governance_contract() -> Json<Value> {
@@ -27947,5 +28015,322 @@ mod patch_waves_db_tests {
             !applied,
             "transition with stale expected status must return false (CAS mismatch)"
         );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api snapshots_db_tests
+#[cfg(test)]
+mod snapshots_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn plan_body(suffix: &str) -> SnapshotPlanRequest {
+        SnapshotPlanRequest {
+            platform_ci_key: format!("ci-test-{suffix}"),
+            snapshot_purpose: "db-test snapshot".into(),
+            requested_expiry: "2099-01-01T00:00:00Z".into(),
+            owner: format!("test-owner-{suffix}"),
+            support_group: "test-sg".into(),
+            change_context: "automated db test".into(),
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM snapshots WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// plan → insert → get round-trip: snapshot is persisted with a valid UUID id.
+    #[tokio::test]
+    async fn test_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+            panic!("snapshot_plan failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::snapshots::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("snapshot not found after insert");
+
+        assert_eq!(record.id, id, "id must round-trip");
+        assert_eq!(
+            record.platform_ci_key,
+            format!("ci-test-{suffix}"),
+            "platform_ci_key must round-trip"
+        );
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::SnapshotStatus::Draft,
+            "status after plan must be Draft"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// review transition: DB row must show ReviewRequested after snapshot_review.
+    #[tokio::test]
+    async fn test_review_persists_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+            panic!("snapshot_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Ok(Json(reviewed)) = snapshot_review(Json(SnapshotActionRequest {
+            snapshot_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("snapshot_review failed");
+        };
+        assert_eq!(reviewed["status"], "ReviewRequested");
+
+        let record = crate::repos::snapshots::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("snapshot not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::SnapshotStatus::ReviewRequested,
+            "status after review must be ReviewRequested in DB"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// remediate transition: a snapshot must be flagged stale first, then
+    /// remediate moves it to RemediationPlanned (persisted).
+    #[tokio::test]
+    async fn test_remediate_persists_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // Plan a past-expiry snapshot so the flag-stale sweep moves it to
+        // StaleFlagged — the only valid predecessor for remediation.
+        let past_body = SnapshotPlanRequest {
+            platform_ci_key: format!("ci-rem-{suffix}"),
+            snapshot_purpose: "remediate test".into(),
+            requested_expiry: "2020-01-01T00:00:00Z".into(),
+            owner: format!("owner-rem-{suffix}"),
+            support_group: "test-sg".into(),
+            change_context: "remediate test".into(),
+        };
+        let Ok(Json(created)) = snapshot_plan(Json(past_body)).await else {
+            panic!("snapshot_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        if snapshot_flag_stale().await.is_err() {
+            cleanup(pool, &id).await;
+            panic!("snapshot_flag_stale failed");
+        }
+
+        let Ok(Json(remediated)) = snapshot_remediate(Json(SnapshotActionRequest {
+            snapshot_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("snapshot_remediate failed");
+        };
+        assert_eq!(remediated["status"], "RemediationPlanned");
+
+        let record = crate::repos::snapshots::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("snapshot not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::SnapshotStatus::RemediationPlanned,
+            "status after remediate must be RemediationPlanned in DB"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// remediate must reject a snapshot that has not been flagged stale (e.g. a
+    /// fresh Draft) — the engine guard surfaces as a 409.
+    #[tokio::test]
+    async fn test_remediate_rejects_non_stale() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // Future expiry -> stays Draft (flag-stale would not touch it).
+        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+            panic!("snapshot_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Err((status, _)) = snapshot_remediate(Json(SnapshotActionRequest {
+            snapshot_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("expected remediate on Draft to be rejected");
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "remediate on a non-StaleFlagged snapshot must be 409"
+        );
+    }
+
+    /// Optimistic-lock CAS: `transition` must return `Ok(false)` when the row's
+    /// DB status no longer matches the expected `before` value. We capture the
+    /// snapshot while Draft, advance it to ReviewRequested through the normal
+    /// path, then attempt a transition that still expects Draft — the CAS
+    /// `WHERE status = 'Draft'` then matches zero rows.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+            panic!("snapshot_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the snapshot while it is still Draft.
+        let stale_draft = crate::repos::snapshots::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("snapshot not found");
+        assert_eq!(
+            stale_draft.status,
+            ryuki_engine::models::SnapshotStatus::Draft
+        );
+
+        // Advance it to ReviewRequested through the normal path.
+        if snapshot_review(Json(SnapshotActionRequest {
+            snapshot_id: id.clone(),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("snapshot_review failed");
+        }
+
+        // A transition that still expects the stale Draft status must NOT apply.
+        let applied = crate::repos::snapshots::transition(pool, "Draft", &stale_draft, None)
+            .await
+            .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            applied.is_none(),
+            "transition with stale expected status must return None (CAS mismatch)"
+        );
+    }
+
+    /// flag_stale: insert a snapshot with a past-expiry date, call
+    /// snapshot_flag_stale, assert the response contains it as StaleFlagged
+    /// and the DB row is also StaleFlagged.
+    #[tokio::test]
+    async fn test_flag_stale_persists_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // Insert a snapshot with a past expiry directly so it qualifies as stale.
+        let past_body = SnapshotPlanRequest {
+            platform_ci_key: format!("ci-stale-{suffix}"),
+            snapshot_purpose: "stale test".into(),
+            requested_expiry: "2020-01-01T00:00:00Z".into(),
+            owner: format!("owner-stale-{suffix}"),
+            support_group: "test-sg".into(),
+            change_context: "stale test".into(),
+        };
+
+        let Ok(Json(created)) = snapshot_plan(Json(past_body)).await else {
+            panic!("snapshot_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Call the no-body flag-stale endpoint.
+        let Ok(Json(flagged_list)) = snapshot_flag_stale().await else {
+            cleanup(pool, &id).await;
+            panic!("snapshot_flag_stale failed");
+        };
+
+        let flagged_arr = flagged_list.as_array().expect("response is array");
+        let our_record = flagged_arr
+            .iter()
+            .find(|v| v["id"].as_str() == Some(&id))
+            .expect("our snapshot must appear in flagged list");
+        assert_eq!(
+            our_record["status"], "StaleFlagged",
+            "flagged response status must be StaleFlagged"
+        );
+
+        let record = crate::repos::snapshots::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("snapshot not found");
+        assert_eq!(
+            record.status,
+            ryuki_engine::models::SnapshotStatus::StaleFlagged,
+            "DB row must be StaleFlagged after flag-stale"
+        );
+
+        cleanup(pool, &id).await;
     }
 }

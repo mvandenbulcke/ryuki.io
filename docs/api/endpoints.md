@@ -10,6 +10,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 
 | Method | Path |
 | --- | --- |
+| GET | `/api/activity/audit` |
 | GET | `/api/admin/approval-groups-contract` |
 | GET | `/api/admin/delegation-boundary-contract` |
 | GET | `/api/admin/feature-flag-governance-contract` |
@@ -17,6 +18,8 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | PUT | `/api/admin/platform-settings` |
 | POST | `/api/admin/platform-settings/reset` |
 | GET | `/api/admin/rbac-roles` |
+| GET | `/api/admin/sessions` |
+| DELETE | `/api/admin/sessions/{id}` |
 | GET | `/api/admin/site-registry-contract` |
 | GET | `/api/admin/sites` |
 | GET | `/api/admin/sites/countries` |
@@ -25,6 +28,9 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/admin/sites/{unlocode}` |
 | POST | `/api/admin/sites/{unlocode}/activate` |
 | POST | `/api/admin/sites/{unlocode}/deactivate` |
+| GET | `/api/admin/tokens` |
+| POST | `/api/admin/tokens` |
+| DELETE | `/api/admin/tokens/{id}` |
 | GET | `/api/admin/worker-capability-contract` |
 | GET | `/api/analytics/aiops-contract` |
 | POST | `/api/analytics/aiops/accept/{id}` |
@@ -45,6 +51,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/analytics/trend` |
 | GET | `/api/analytics/waste` |
 | GET | `/api/approvals/decision-readiness-contract` |
+| GET | `/api/approvals/pending` |
 | GET | `/api/audit/compliance-contract` |
 | GET | `/api/audit/compliance/controls` |
 | GET | `/api/audit/compliance/controls/{id}` |
@@ -330,6 +337,8 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | POST | `/api/maintain/patch/plan` |
 | POST | `/api/maintain/patch/validate` |
 | POST | `/api/maintain/patch/verify` |
+| GET | `/api/maintain/patch/waves` |
+| GET | `/api/maintain/patch/waves/{id}` |
 | GET | `/api/maintain/software-contract` |
 | POST | `/api/maintain/software/approve/{id}` |
 | GET | `/api/maintain/software/compliance` |
@@ -583,6 +592,8 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/protect/snapshot-governance-contract` |
 | POST | `/api/protect/snapshot/flag-stale` |
 | POST | `/api/protect/snapshot/plan` |
+| GET | `/api/protect/snapshot/records` |
+| GET | `/api/protect/snapshot/records/{id}` |
 | POST | `/api/protect/snapshot/remediate` |
 | POST | `/api/protect/snapshot/review` |
 | POST | `/api/protect/snapshot/validate` |
@@ -595,9 +606,15 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/requests/preflight-contract` |
 | GET | `/api/requests/{id}` |
 | POST | `/api/requests/{id}/approve` |
+| POST | `/api/requests/{id}/approve-live-apply` |
+| GET | `/api/requests/{id}/audit` |
+| POST | `/api/requests/{id}/cancel` |
+| GET | `/api/requests/{id}/evidence` |
 | POST | `/api/requests/{id}/execute` |
+| GET | `/api/requests/{id}/execution-job` |
 | POST | `/api/requests/{id}/lock` |
 | POST | `/api/requests/{id}/plan` |
+| POST | `/api/requests/{id}/reject` |
 | POST | `/api/requests/{id}/validate` |
 | POST | `/api/requests/{id}/verify` |
 | GET | `/api/retire/decommission-contract` |
