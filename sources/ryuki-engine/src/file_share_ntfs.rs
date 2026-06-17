@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +76,9 @@ pub struct PermissionReport {
     pub risk_level: String,
 }
 
-fn seed_shares() -> Vec<FileShare> {
+// ─── Seed helpers (used by the *-contract endpoint and db_tests fixtures) ─────
+
+pub fn seed_shares() -> Vec<FileShare> {
     let now = chrono::Utc::now();
     let future = now + chrono::Duration::days(180);
     let past_due = now - chrono::Duration::days(30);
@@ -119,7 +120,7 @@ fn seed_shares() -> Vec<FileShare> {
     ]
 }
 
-fn seed_permissions(shares: &[FileShare]) -> Vec<NTFSFolder> {
+pub fn seed_permissions(shares: &[FileShare]) -> Vec<NTFSFolder> {
     let now = chrono::Utc::now().to_rfc3339();
     vec![
         NTFSFolder {
@@ -185,112 +186,120 @@ fn seed_permissions(shares: &[FileShare]) -> Vec<NTFSFolder> {
     ]
 }
 
-static SHARE_STORE: std::sync::LazyLock<Mutex<(Vec<FileShare>, Vec<NTFSFolder>)>> =
-    std::sync::LazyLock::new(|| {
-        let shares = seed_shares();
-        let perms = seed_permissions(&shares);
-        Mutex::new((shares, perms))
-    });
+// ─── Pure engine functions ────────────────────────────────────────────────────
 
-pub fn get_shares(site: &str) -> Vec<FileShare> {
-    let store = SHARE_STORE.lock().unwrap();
+/// Filter shares by site. Empty `site` returns all.
+pub fn get_shares<'a>(shares: &'a [FileShare], site: &str) -> Vec<&'a FileShare> {
     if site.is_empty() {
-        store.0.clone()
+        shares.iter().collect()
     } else {
-        store.0.iter().filter(|s| s.site == site).cloned().collect()
+        shares.iter().filter(|s| s.site == site).collect()
     }
 }
 
-pub fn get_share_detail(share_id: &str) -> Option<ShareDetail> {
-    let store = SHARE_STORE.lock().unwrap();
-    let share = store.0.iter().find(|s| s.id == share_id).cloned()?;
-    let permissions: Vec<NTFSFolder> = store
-        .1
+/// Return the detail for a share plus all its NTFS permissions.
+/// Returns `None` if the share is not found.
+pub fn get_share_detail<'a>(
+    shares: &'a [FileShare],
+    permissions: &'a [NTFSFolder],
+    share_id: &str,
+) -> Option<ShareDetail> {
+    let share = shares.iter().find(|s| s.id == share_id)?.clone();
+    let perms: Vec<NTFSFolder> = permissions
         .iter()
         .filter(|p| p.file_share_id == share_id)
         .cloned()
         .collect();
-    Some(ShareDetail { share, permissions })
+    Some(ShareDetail {
+        share,
+        permissions: perms,
+    })
 }
 
-pub fn check_recertification_due(site: &str) -> Vec<FileShare> {
-    let now = chrono::Utc::now();
-    let store = SHARE_STORE.lock().unwrap();
-    store
-        .0
+/// Return shares whose `recertification_due` is at or before `now`.
+pub fn check_recertification_due<'a>(
+    shares: &'a [FileShare],
+    site: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<&'a FileShare> {
+    shares
         .iter()
         .filter(|s| {
             if !site.is_empty() && s.site != site {
                 return false;
             }
-            if let Ok(due) = chrono::DateTime::parse_from_rfc3339(&s.recertification_due) {
-                let due_utc = due.with_timezone(&chrono::Utc);
-                due_utc <= now
-            } else {
-                false
-            }
+            chrono::DateTime::parse_from_rfc3339(&s.recertification_due)
+                .map(|due| due.with_timezone(&chrono::Utc) <= now)
+                .unwrap_or(false)
         })
-        .cloned()
         .collect()
 }
 
-pub fn recertify_share(share_id: &str, _reviewer: &str) -> Result<FileShare, String> {
-    let mut store = SHARE_STORE.lock().unwrap();
-    let share = store
-        .0
-        .iter_mut()
+/// Return a new `FileShare` with `last_recertification = now`, `recertification_due =
+/// now + 365 days`, and `status = Compliant`. Returns `Err` if `share_id` is not found.
+pub fn recertify_share(
+    shares: &[FileShare],
+    share_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<FileShare, String> {
+    let share = shares
+        .iter()
         .find(|s| s.id == share_id)
         .ok_or_else(|| format!("Share {share_id} not found"))?;
-    let now = chrono::Utc::now();
-    share.last_recertification = now.to_rfc3339();
-    share.recertification_due = (now + chrono::Duration::days(365)).to_rfc3339();
-    share.status = ShareStatus::Compliant;
-    Ok(share.clone())
+    Ok(FileShare {
+        last_recertification: now.to_rfc3339(),
+        recertification_due: (now + chrono::Duration::days(365)).to_rfc3339(),
+        status: ShareStatus::Compliant,
+        ..share.clone()
+    })
 }
 
-pub fn detect_open_access(share_id: &str) -> Vec<NTFSFolder> {
-    let store = SHARE_STORE.lock().unwrap();
-    store
-        .1
+/// Return NTFS permissions for a share that grant FullControl to Everyone or Domain Users.
+pub fn detect_open_access<'a>(
+    permissions: &'a [NTFSFolder],
+    share_id: &str,
+) -> Vec<&'a NTFSFolder> {
+    permissions
         .iter()
         .filter(|p| {
             p.file_share_id == share_id
                 && p.permission_type == PermissionType::FullControl
                 && (p.ad_group == "Everyone" || p.ad_group == "Domain Users")
         })
-        .cloned()
         .collect()
 }
 
-pub fn get_owner_stale(site: &str) -> Vec<FileShare> {
-    let now = chrono::Utc::now();
+/// Return shares where `last_recertification` is older than 365 days before `now`.
+pub fn get_owner_stale<'a>(
+    shares: &'a [FileShare],
+    site: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<&'a FileShare> {
     let threshold = now - chrono::Duration::days(365);
-    let store = SHARE_STORE.lock().unwrap();
-    store
-        .0
+    shares
         .iter()
         .filter(|s| {
             if !site.is_empty() && s.site != site {
                 return false;
             }
-            if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&s.last_recertification) {
-                let last_utc = last.with_timezone(&chrono::Utc);
-                last_utc < threshold
-            } else {
-                false
-            }
+            chrono::DateTime::parse_from_rfc3339(&s.last_recertification)
+                .map(|last| last.with_timezone(&chrono::Utc) < threshold)
+                .unwrap_or(false)
         })
-        .cloned()
         .collect()
 }
 
-pub fn get_permission_report(share_id: &str) -> Result<Vec<PermissionReport>, String> {
-    let store = SHARE_STORE.lock().unwrap();
-    if !store.0.iter().any(|s| s.id == share_id) {
+/// Build a permission risk report for a share's NTFS folders.
+/// Returns `Err` if `share_id` is not found in `shares`.
+pub fn get_permission_report(
+    shares: &[FileShare],
+    permissions: &[NTFSFolder],
+    share_id: &str,
+) -> Result<Vec<PermissionReport>, String> {
+    if !shares.iter().any(|s| s.id == share_id) {
         return Err(format!("Share {share_id} not found"));
     }
-    let report: Vec<PermissionReport> = store
-        .1
+    let report: Vec<PermissionReport> = permissions
         .iter()
         .filter(|p| p.file_share_id == share_id)
         .map(|p| {
@@ -316,50 +325,62 @@ pub fn get_permission_report(share_id: &str) -> Result<Vec<PermissionReport>, St
     Ok(report)
 }
 
-pub fn revoke_permission(share_id: &str, ad_group: &str) -> Result<String, String> {
-    let mut store = SHARE_STORE.lock().unwrap();
-    let pos = store
-        .1
+/// Return a new permissions list with the entry for `(file_share_id, ad_group)` removed.
+/// Returns `Err` if no matching entry exists.
+pub fn revoke_permission(
+    permissions: &[NTFSFolder],
+    share_id: &str,
+    ad_group: &str,
+) -> Result<Vec<NTFSFolder>, String> {
+    let pos = permissions
         .iter()
         .position(|p| p.file_share_id == share_id && p.ad_group == ad_group)
         .ok_or_else(|| format!("Permission not found for share {share_id} and group {ad_group}"))?;
-    store.1.remove(pos);
-    Ok(format!(
-        "Revoked {ad_group} from share {share_id} (dry-run: no live AD changes)"
-    ))
+    let mut updated = permissions.to_vec();
+    updated.remove(pos);
+    Ok(updated)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn make_store() -> (Vec<FileShare>, Vec<NTFSFolder>) {
+        let shares = seed_shares();
+        let perms = seed_permissions(&shares);
+        (shares, perms)
+    }
+
     #[test]
     fn test_get_shares_returns_all_for_empty_site() {
-        let shares = get_shares("");
-        assert_eq!(shares.len(), 3);
+        let (shares, _) = make_store();
+        let result = get_shares(&shares, "");
+        assert_eq!(result.len(), 3);
     }
 
     #[test]
     fn test_get_shares_filters_by_site() {
-        let shares = get_shares("DEFRA");
-        assert_eq!(shares.len(), 2);
-        assert!(shares.iter().all(|s| s.site == "DEFRA"));
+        let (shares, _) = make_store();
+        let result = get_shares(&shares, "DEFRA");
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|s| s.site == "DEFRA"));
     }
 
     #[test]
     fn test_get_share_detail_includes_permissions() {
-        let all = get_shares("");
-        let detail = get_share_detail(&all[0].id);
+        let (shares, perms) = make_store();
+        let detail = get_share_detail(&shares, &perms, &shares[0].id);
         assert!(detail.is_some());
         let d = detail.unwrap();
-        assert_eq!(d.share.id, all[0].id);
+        assert_eq!(d.share.id, shares[0].id);
         assert!(!d.permissions.is_empty());
     }
 
     #[test]
     fn test_check_recertification_due_finds_overdue() {
-        let due = check_recertification_due("");
-        // At least one share is past its recertification date
+        let (shares, _) = make_store();
+        let now = chrono::Utc::now();
+        let due = check_recertification_due(&shares, "", now);
         assert!(!due.is_empty());
         let non_compliant: Vec<_> = due
             .iter()
@@ -370,13 +391,15 @@ mod tests {
 
     #[test]
     fn test_recertify_share_updates_status() {
-        let due = check_recertification_due("");
+        let (shares, _) = make_store();
+        let now = chrono::Utc::now();
+        let due = check_recertification_due(&shares, "", now);
         assert!(!due.is_empty());
         let share = due
             .iter()
             .find(|s| s.status == ShareStatus::Overdue)
             .unwrap();
-        let result = recertify_share(&share.id, "auditor");
+        let result = recertify_share(&shares, &share.id, now);
         assert!(result.is_ok());
         let updated = result.unwrap();
         assert_eq!(updated.status, ShareStatus::Compliant);
@@ -384,9 +407,9 @@ mod tests {
 
     #[test]
     fn test_detect_open_access_finds_everyone_fullcontrol() {
-        let all = get_shares("");
-        let eng = all.iter().find(|s| s.site == "GBLON").unwrap();
-        let open = detect_open_access(&eng.id);
+        let (shares, perms) = make_store();
+        let eng = shares.iter().find(|s| s.site == "GBLON").unwrap();
+        let open = detect_open_access(&perms, &eng.id);
         assert!(!open.is_empty());
         assert_eq!(open[0].ad_group, "Domain Users");
         assert_eq!(open[0].permission_type, PermissionType::FullControl);
@@ -394,15 +417,17 @@ mod tests {
 
     #[test]
     fn test_get_owner_stale_detects_old_recertifications() {
-        let stale = get_owner_stale("");
+        let (shares, _) = make_store();
+        let now = chrono::Utc::now();
+        let stale = get_owner_stale(&shares, "", now);
         assert!(!stale.is_empty());
     }
 
     #[test]
     fn test_get_permission_report_risk_critical() {
-        let all = get_shares("");
-        let eng = all.iter().find(|s| s.site == "GBLON").unwrap();
-        let report = get_permission_report(&eng.id);
+        let (shares, perms) = make_store();
+        let eng = shares.iter().find(|s| s.site == "GBLON").unwrap();
+        let report = get_permission_report(&shares, &perms, &eng.id);
         assert!(report.is_ok());
         let r = report.unwrap();
         let criticals: Vec<_> = r.iter().filter(|p| p.risk_level == "Critical").collect();
@@ -411,22 +436,28 @@ mod tests {
 
     #[test]
     fn test_revoke_permission_removes_entry() {
-        let all = get_shares("");
-        let defra = all.iter().find(|s| s.unc_path.contains("Finance")).unwrap();
-        let result = revoke_permission(&defra.id, "Everyone");
+        let (shares, perms) = make_store();
+        let defra = shares
+            .iter()
+            .find(|s| s.unc_path.contains("Finance"))
+            .unwrap();
+        let result = revoke_permission(&perms, &defra.id, "Everyone");
         assert!(result.is_ok());
-        let detail = get_share_detail(&defra.id).unwrap();
-        let everyone_left = detail.permissions.iter().any(|p| p.ad_group == "Everyone");
+        let updated_perms = result.unwrap();
+        let everyone_left = updated_perms.iter().any(|p| p.ad_group == "Everyone");
         assert!(!everyone_left);
     }
 
     #[test]
     fn test_get_permission_report_share_not_found() {
-        assert!(get_permission_report("nonexistent").is_err());
+        let (shares, perms) = make_store();
+        assert!(get_permission_report(&shares, &perms, "nonexistent").is_err());
     }
 
     #[test]
     fn test_recertify_share_not_found() {
-        assert!(recertify_share("nonexistent", "auditor").is_err());
+        let (shares, _) = make_store();
+        let now = chrono::Utc::now();
+        assert!(recertify_share(&shares, "nonexistent", now).is_err());
     }
 }

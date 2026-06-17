@@ -4220,66 +4220,143 @@ async fn identity_file_share_ntfs() -> Json<Value> {
 
 // ─── File Share NTFS recertification handlers ───
 
-async fn shares_list(Query(query): Query<SharesQuery>) -> Json<Value> {
+async fn shares_list(Query(query): Query<SharesQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let shares = file_share_ntfs::get_shares(site);
-    Json(serde_json::to_value(shares).unwrap())
+    let shares = match get_db() {
+        Some(pool) => crate::repos::file_share_ntfs::list_shares(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(shares).unwrap_or_default()))
 }
 
 async fn shares_get(Path(id): Path<String>) -> ApiResult {
-    match file_share_ntfs::get_share_detail(&id) {
-        Some(detail) => Ok(Json(serde_json::to_value(detail).unwrap())),
-        None => Err(status_404(&id)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let share = crate::repos::file_share_ntfs::get_share(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
+        .await
+        .map_err(db_error)?;
+    let detail = file_share_ntfs::ShareDetail { share, permissions };
+    Ok(Json(serde_json::to_value(detail).unwrap_or_default()))
 }
 
 async fn shares_recertification_due(
     Query(query): Query<SharesRecertificationDueQuery>,
-) -> Json<Value> {
+) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let due = file_share_ntfs::check_recertification_due(site);
-    Json(serde_json::to_value(due).unwrap())
+    let now = chrono::Utc::now();
+    let due = match get_db() {
+        Some(pool) => crate::repos::file_share_ntfs::list_recertification_due(pool, site, now)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(due).unwrap_or_default()))
 }
 
 async fn shares_recertify(
     Path(id): Path<String>,
-    Json(body): Json<RecertifyShareRequest>,
+    Json(_body): Json<RecertifyShareRequest>,
 ) -> ApiResult {
-    match file_share_ntfs::recertify_share(&id, &body.reviewer) {
-        Ok(share) => Ok(Json(serde_json::to_value(share).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let now = chrono::Utc::now();
+
+    // Load current state: 404 if absent, and `recertification_due` is the
+    // optimistic-lock token for the CAS below.
+    let current = crate::repos::file_share_ntfs::get_share(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    // The pure engine owns the recertification rule (new dates + Compliant).
+    let recertified = file_share_ntfs::recertify_share(std::slice::from_ref(&current), &id, now)
+        .map_err(|e| status_404(&e))?;
+
+    let expected_due = chrono::DateTime::parse_from_rfc3339(&current.recertification_due)
+        .map_err(|e| {
+            db_error(sqlx::Error::Decode(
+                format!("file_shares.recertification_due not RFC-3339: {e}").into(),
+            ))
+        })?
+        .with_timezone(&chrono::Utc);
+
+    // CAS on recertification_due: two concurrent recertifies can't both win.
+    match crate::repos::file_share_ntfs::recertify_share(pool, &id, &recertified, expected_due)
+        .await
+        .map_err(db_error)?
+    {
+        Some(share) => Ok(Json(serde_json::to_value(share).unwrap_or_default())),
+        None => Err(status_409("share was concurrently recertified; retry")),
     }
 }
 
-async fn shares_open_access(Path(id): Path<String>) -> Json<Value> {
-    let open = file_share_ntfs::detect_open_access(&id);
-    Json(serde_json::to_value(open).unwrap())
+async fn shares_open_access(Path(id): Path<String>) -> ApiResult {
+    let open = match get_db() {
+        Some(pool) => {
+            let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
+                .await
+                .map_err(db_error)?;
+            file_share_ntfs::detect_open_access(&permissions, &id)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        }
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(open).unwrap_or_default()))
 }
 
-async fn shares_stale_owners(Query(query): Query<SharesStaleOwnersQuery>) -> Json<Value> {
+async fn shares_stale_owners(Query(query): Query<SharesStaleOwnersQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let stale = file_share_ntfs::get_owner_stale(site);
-    Json(serde_json::to_value(stale).unwrap())
+    let now = chrono::Utc::now();
+    let threshold = now - chrono::Duration::days(365);
+    let stale = match get_db() {
+        Some(pool) => crate::repos::file_share_ntfs::list_stale_owners(pool, site, threshold)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(stale).unwrap_or_default()))
 }
 
 async fn shares_permission_report(Path(id): Path<String>) -> ApiResult {
-    match file_share_ntfs::get_permission_report(&id) {
-        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Verify the share exists first.
+    let share = crate::repos::file_share_ntfs::get_share(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
+        .await
+        .map_err(db_error)?;
+    let report =
+        file_share_ntfs::get_permission_report(std::slice::from_ref(&share), &permissions, &id)
+            .map_err(|e| status_404(&e))?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
 async fn shares_revoke(Path((id, group)): Path<(String, String)>) -> ApiResult {
-    match file_share_ntfs::revoke_permission(&id, &group) {
-        Ok(msg) => Ok(Json(
-            serde_json::json!({"message": msg, "share_id": id, "ad_group": group, "dry_run": true}),
-        )),
-        Err(e) => Err(status_404(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::file_share_ntfs::revoke_permission(pool, &id, &group)
+        .await
+        .map_err(db_error)?
+    {
+        Some(()) => Ok(Json(serde_json::json!({
+            "message": format!("Revoked {group} from share {id}"),
+            "share_id": id,
+            "ad_group": group,
+        }))),
+        None => Err(status_404(&format!("permission {group} on share {id}"))),
     }
 }
 
 async fn shares_contract() -> Json<Value> {
-    let shares = file_share_ntfs::get_shares("");
+    // Illustrative seed count — the contract endpoint is static and does not hit the DB.
+    let illustrative_shares = file_share_ntfs::seed_shares();
     Json(json!({
         "source": "static-seed",
         "providerCallsEnabled": false,
@@ -4287,7 +4364,7 @@ async fn shares_contract() -> Json<Value> {
         "liveShareChangesAllowed": false,
         "liveNtfsAclChangesAllowed": false,
         "dryRunRequired": true,
-        "totalShares": shares.len(),
+        "totalShares": illustrative_shares.len(),
         "endpoints": {
             "GET /api/identity/shares": "List file shares, optionally filtered by site",
             "GET /api/identity/shares/{id}": "Get share detail with NTFS permissions",
@@ -8346,8 +8423,16 @@ async fn observe_synthetic_health_check_contract() -> Json<Value> {
 }
 
 async fn synthetic_run_check(Path(check_id): Path<String>) -> ApiResult {
-    let result = synthetic_health::run_check(&check_id);
-    Ok(Json(serde_json::to_value(result).unwrap()))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let check = crate::repos::synthetic_health::get_check(pool, &check_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&check_id))?;
+    let result = synthetic_health::run_check(&check);
+    let persisted = crate::repos::synthetic_health::insert_result(pool, &result)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 #[derive(Deserialize)]
@@ -8357,13 +8442,34 @@ struct SyntheticRunAllQuery {
 
 async fn synthetic_run_all(Query(query): Query<SyntheticRunAllQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("DEFRA");
-    let results = synthetic_health::run_all_checks(site);
-    Ok(Json(serde_json::to_value(results).unwrap()))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let checks = crate::repos::synthetic_health::list_checks_for_site(pool, site)
+        .await
+        .map_err(db_error)?;
+    let mut persisted_results = Vec::with_capacity(checks.len());
+    for check in &checks {
+        let result = synthetic_health::run_check(check);
+        let persisted = crate::repos::synthetic_health::insert_result(pool, &result)
+            .await
+            .map_err(db_error)?;
+        persisted_results.push(persisted);
+    }
+    Ok(Json(
+        serde_json::to_value(persisted_results).unwrap_or_default(),
+    ))
 }
 
 async fn synthetic_status(Path(check_id): Path<String>) -> ApiResult {
-    match synthetic_health::get_check_status(&check_id) {
-        Some(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+    match get_db() {
+        Some(pool) => {
+            match crate::repos::synthetic_health::get_latest_result(pool, &check_id)
+                .await
+                .map_err(db_error)?
+            {
+                Some(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
+                None => Err(status_404(&check_id)),
+            }
+        }
         None => Err(status_404(&check_id)),
     }
 }
@@ -8373,16 +8479,39 @@ struct SyntheticDashboardQuery {
     site: Option<String>,
 }
 
-async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
+async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("DEFRA");
-    let dashboard = synthetic_health::get_dashboard(site);
-    Json(serde_json::to_value(dashboard).unwrap())
+    let Some(pool) = get_db() else {
+        let empty = synthetic_health::get_dashboard(&[], &[], site);
+        return Ok(Json(serde_json::to_value(empty).unwrap_or_default()));
+    };
+    let checks = crate::repos::synthetic_health::list_checks(pool, site)
+        .await
+        .map_err(db_error)?;
+    let latest_results = crate::repos::synthetic_health::get_latest_results_for_site(pool, site)
+        .await
+        .map_err(db_error)?;
+    let dashboard = synthetic_health::get_dashboard(&checks, &latest_results, site);
+    Ok(Json(serde_json::to_value(dashboard).unwrap_or_default()))
 }
 
-async fn synthetic_outages(Query(query): Query<SyntheticDashboardQuery>) -> Json<Value> {
+async fn synthetic_outages(Query(query): Query<SyntheticDashboardQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("DEFRA");
-    let outages = synthetic_health::get_outage_report(site);
-    Json(serde_json::to_value(outages).unwrap())
+    let Some(pool) = get_db() else {
+        return Ok(Json(
+            serde_json::to_value(Vec::<synthetic_health::OutageEntry>::new()).unwrap_or_default(),
+        ));
+    };
+    let checks = crate::repos::synthetic_health::list_checks(pool, site)
+        .await
+        .map_err(db_error)?;
+    // Outage detection needs the FULL result history (not just the latest result
+    // per check) to compute each check's current consecutive-failure streak.
+    let all_results = crate::repos::synthetic_health::list_results_for_site(pool, site)
+        .await
+        .map_err(db_error)?;
+    let outages = synthetic_health::get_outage_report(&checks, &all_results, site);
+    Ok(Json(serde_json::to_value(outages).unwrap_or_default()))
 }
 
 async fn observe_noise_flapping() -> Json<Value> {
@@ -31120,5 +31249,768 @@ mod log_forwarder_db_tests {
         );
 
         cleanup(pool, &first_id).await;
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api file_share_ntfs_db_tests
+#[cfg(test)]
+mod file_share_ntfs_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use ryuki_engine::file_share_ntfs::{FileShare, NTFSFolder, PermissionType, ShareStatus};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    // Create a FRESH owned pool per test (like the log_forwarder_db_tests) rather
+    // than reusing the process-wide `get_db()` static. The static pool is created
+    // inside the first #[tokio::test] runtime; reusing it from a later test's
+    // runtime yields stale connections and `PoolTimedOut`.
+    async fn global_pool() -> Option<PgPool> {
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("file_share_ntfs_db_tests: RYUKI_DATABASE_URL not set — skipping");
+                return None;
+            }
+        };
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("RYUKI_DATABASE_URL is set but connection failed");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply cleanly when RYUKI_DATABASE_URL is set");
+        Some(pool)
+    }
+
+    async fn cleanup_share(pool: &PgPool, id: &str) {
+        if let Ok(uid) = Uuid::parse_str(id) {
+            // Migration 023 has NO ON DELETE CASCADE on ntfs_permissions.file_share_id,
+            // so child permission rows must be deleted before the parent share or the
+            // parent DELETE silently fails on the FK and leaks rows.
+            sqlx::query("DELETE FROM ntfs_permissions WHERE file_share_id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM file_shares WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn cleanup_permission(pool: &PgPool, id: &str) {
+        if let Ok(uid) = Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM ntfs_permissions WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    fn make_share(suffix: &str, site: &str) -> FileShare {
+        let now = chrono::Utc::now();
+        FileShare {
+            id: Uuid::new_v4().to_string(),
+            unc_path: format!("\\\\fs-test-{}\\Share", suffix),
+            server_name: format!("fs-test-{}.example.local", suffix),
+            site: site.into(),
+            size_gb: 100.0,
+            owner: format!("owner-{}", suffix),
+            last_recertification: (now - chrono::Duration::days(10)).to_rfc3339(),
+            recertification_due: (now + chrono::Duration::days(355)).to_rfc3339(),
+            status: ShareStatus::Compliant,
+        }
+    }
+
+    fn make_permission(file_share_id: &str, suffix: &str) -> NTFSFolder {
+        NTFSFolder {
+            id: Uuid::new_v4().to_string(),
+            file_share_id: file_share_id.into(),
+            folder_path: format!("\\Share\\Folder-{}", suffix),
+            permission_type: PermissionType::Read,
+            ad_group: format!("GG-Test-{}", suffix),
+            principal: format!("GG-Test-{}@example.local", suffix),
+            inherited: false,
+            last_reviewed: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    // ─── insert share + get round-trip ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_insert_get_share_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let suffix = Uuid::new_v4().to_string();
+        let share = make_share(&suffix, "DEFRA");
+        let share_id = share.id.clone();
+
+        let inserted = crate::repos::file_share_ntfs::insert_share(pool, &share)
+            .await
+            .expect("insert_share failed");
+
+        assert_eq!(inserted.id, share_id, "id must round-trip");
+        assert_eq!(inserted.site, "DEFRA", "site must round-trip");
+        assert_eq!(inserted.size_gb, 100.0, "size_gb must round-trip");
+        assert_eq!(
+            inserted.status,
+            ShareStatus::Compliant,
+            "status must round-trip"
+        );
+
+        let fetched = crate::repos::file_share_ntfs::get_share(pool, &share_id)
+            .await
+            .expect("get_share failed")
+            .expect("row not found after insert");
+
+        assert_eq!(fetched.id, share_id, "get id must match");
+        assert_eq!(
+            fetched.status,
+            ShareStatus::Compliant,
+            "get status must match"
+        );
+        assert_eq!(fetched.size_gb, 100.0, "get size_gb must match");
+
+        cleanup_share(pool, &share_id).await;
+    }
+
+    // ─── insert permission + list round-trip ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_insert_list_permission_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let suffix = Uuid::new_v4().to_string();
+        let share = make_share(&suffix, "GBLON");
+        let share_id = share.id.clone();
+        crate::repos::file_share_ntfs::insert_share(pool, &share)
+            .await
+            .expect("insert_share failed");
+
+        let perm = make_permission(&share_id, &suffix);
+        let perm_id = perm.id.clone();
+
+        let inserted = crate::repos::file_share_ntfs::insert_permission(pool, &perm)
+            .await
+            .expect("insert_permission failed");
+
+        assert_eq!(inserted.id, perm_id, "perm id must round-trip");
+        assert_eq!(
+            inserted.file_share_id, share_id,
+            "file_share_id must round-trip"
+        );
+        assert_eq!(
+            inserted.permission_type,
+            PermissionType::Read,
+            "permission_type must round-trip"
+        );
+
+        let perms = crate::repos::file_share_ntfs::list_permissions(pool, &share_id)
+            .await
+            .expect("list_permissions failed");
+
+        assert!(
+            perms.iter().any(|p| p.id == perm_id),
+            "inserted permission must appear in list"
+        );
+
+        cleanup_share(pool, &share_id).await;
+    }
+
+    // ─── list_by_site ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_by_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let suffix = Uuid::new_v4().to_string();
+        let share_defra = make_share(&format!("defra-{}", suffix), "DEFRA");
+        let share_gblon = make_share(&format!("gblon-{}", suffix), "GBLON");
+
+        let id_defra = share_defra.id.clone();
+        let id_gblon = share_gblon.id.clone();
+
+        crate::repos::file_share_ntfs::insert_share(pool, &share_defra)
+            .await
+            .expect("insert DEFRA share failed");
+        crate::repos::file_share_ntfs::insert_share(pool, &share_gblon)
+            .await
+            .expect("insert GBLON share failed");
+
+        let defra_shares = crate::repos::file_share_ntfs::list_shares(pool, "DEFRA")
+            .await
+            .expect("list_shares DEFRA failed");
+        assert!(
+            defra_shares.iter().any(|s| s.id == id_defra),
+            "DEFRA share must appear in DEFRA filter"
+        );
+        assert!(
+            !defra_shares.iter().any(|s| s.id == id_gblon),
+            "GBLON share must not appear in DEFRA filter"
+        );
+
+        cleanup_share(pool, &id_defra).await;
+        cleanup_share(pool, &id_gblon).await;
+    }
+
+    // ─── recertify updates status and timestamps ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_recertify_updates_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let suffix = Uuid::new_v4().to_string();
+        let mut share = make_share(&suffix, "DEFRA");
+        share.status = ShareStatus::Overdue;
+        let share_id = share.id.clone();
+
+        // Use the DB-returned row (microsecond precision) so the CAS token below
+        // matches the persisted recertification_due exactly.
+        let inserted = crate::repos::file_share_ntfs::insert_share(pool, &share)
+            .await
+            .expect("insert failed");
+
+        let now = chrono::Utc::now();
+        // Mirror the handler: the engine computes the recertified state, the repo
+        // CAS-persists it against the loaded recertification_due.
+        let recertified = ryuki_engine::file_share_ntfs::recertify_share(
+            std::slice::from_ref(&inserted),
+            &share_id,
+            now,
+        )
+        .expect("engine recertify failed");
+        let expected_due = chrono::DateTime::parse_from_rfc3339(&inserted.recertification_due)
+            .expect("due parse")
+            .with_timezone(&chrono::Utc);
+
+        let updated = crate::repos::file_share_ntfs::recertify_share(
+            pool,
+            &share_id,
+            &recertified,
+            expected_due,
+        )
+        .await
+        .expect("recertify failed")
+        .expect("share not found / concurrent change");
+
+        assert_eq!(
+            updated.status,
+            ShareStatus::Compliant,
+            "status must be Compliant after recertify"
+        );
+
+        // Verify it persisted.
+        let fetched = crate::repos::file_share_ntfs::get_share(pool, &share_id)
+            .await
+            .expect("get failed")
+            .expect("row not found");
+        assert_eq!(
+            fetched.status,
+            ShareStatus::Compliant,
+            "DB status must be Compliant"
+        );
+
+        cleanup_share(pool, &share_id).await;
+    }
+
+    // ─── revoke deletes permission row ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_revoke_deletes_permission_and_returns_none_on_second() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let suffix = Uuid::new_v4().to_string();
+        let share = make_share(&suffix, "DEFRA");
+        let share_id = share.id.clone();
+        crate::repos::file_share_ntfs::insert_share(pool, &share)
+            .await
+            .expect("insert share failed");
+
+        let perm = make_permission(&share_id, &suffix);
+        let ad_group = perm.ad_group.clone();
+        let perm_id = perm.id.clone();
+        crate::repos::file_share_ntfs::insert_permission(pool, &perm)
+            .await
+            .expect("insert permission failed");
+
+        // First revoke must succeed.
+        let result = crate::repos::file_share_ntfs::revoke_permission(pool, &share_id, &ad_group)
+            .await
+            .expect("revoke failed");
+        assert!(result.is_some(), "first revoke must return Some(())");
+
+        // Verify the row is gone.
+        let perms = crate::repos::file_share_ntfs::list_permissions(pool, &share_id)
+            .await
+            .expect("list_permissions failed");
+        assert!(
+            !perms.iter().any(|p| p.id == perm_id),
+            "permission must be absent after revoke"
+        );
+
+        // Second revoke must return None (404).
+        let result2 = crate::repos::file_share_ntfs::revoke_permission(pool, &share_id, &ad_group)
+            .await
+            .expect("second revoke must not error");
+        assert!(result2.is_none(), "second revoke must return None");
+
+        cleanup_share(pool, &share_id).await;
+    }
+
+    // ─── get unknown uuid returns Ok(None) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_unknown_uuid_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let unknown = Uuid::new_v4().to_string();
+        let result = crate::repos::file_share_ntfs::get_share(pool, &unknown)
+            .await
+            .expect("get_share must not error for unknown uuid");
+        assert!(result.is_none(), "unknown uuid must return None");
+    }
+
+    // ─── malformed uuid returns Ok(None) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_malformed_uuid_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let result = crate::repos::file_share_ntfs::get_share(pool, "not-a-uuid")
+            .await
+            .expect("get_share must not error for malformed id");
+        assert!(result.is_none(), "malformed uuid must return None");
+
+        let perm_result =
+            crate::repos::file_share_ntfs::revoke_permission(pool, "not-a-uuid", "SomeGroup")
+                .await
+                .expect("revoke must not error for malformed id");
+        assert!(
+            perm_result.is_none(),
+            "revoke with malformed uuid must return None"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api synthetic_health_db_tests
+#[cfg(test)]
+mod synthetic_health_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use ryuki_engine::synthetic_health::{CheckResultStatus, CheckType, HealthCheck};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    // Create a FRESH owned pool per test (not the process-wide `get_db()` static).
+    // The static pool is created inside the first #[tokio::test] runtime; reusing it
+    // from a later test's runtime yields stale connections and `PoolTimedOut`.
+    // An owned per-test pool is created and dropped within the same runtime.
+    async fn global_pool() -> Option<PgPool> {
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("synthetic_health_db_tests: RYUKI_DATABASE_URL not set — skipping");
+                return None;
+            }
+        };
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("RYUKI_DATABASE_URL is set but connection failed");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply cleanly when RYUKI_DATABASE_URL is set");
+        Some(pool)
+    }
+
+    /// Delete a check_result by id (to clean up test rows).
+    async fn cleanup_result(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM check_results WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// Delete a health_check by id. Must delete check_results first (FK).
+    async fn cleanup_check(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            // FK: delete child rows first.
+            sqlx::query("DELETE FROM check_results WHERE check_id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM health_checks WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// Build a test HealthCheck that can be inserted via the repo.
+    /// Ids are UUID-suffixed to avoid collisions with migration seed rows.
+    fn make_check(name: &str, site: &str, check_type: CheckType) -> HealthCheck {
+        HealthCheck {
+            id: Uuid::new_v4().to_string(),
+            name: format!("{}-{}", name, Uuid::new_v4()),
+            check_type,
+            endpoint: "test.ryuki.internal".to_string(),
+            expected_status: 200,
+            expected_body_contains: None,
+            interval_seconds: 60,
+            site: site.to_string(),
+            enabled: true,
+        }
+    }
+
+    // ─── insert health_check + get round-trip ────────────────────────────────
+
+    /// Verifies that a health check inserted directly via SQL can be retrieved
+    /// via `get_check` with all fields intact, including enum decoding and int
+    /// coercion for expected_status and interval_seconds.
+    #[tokio::test]
+    async fn test_insert_get_health_check_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let check = make_check("roundtrip-hc", "DEFRA", CheckType::Http);
+        let id = &check.id;
+
+        // Insert directly via SQL (the repo has no insert_check fn — migration seeds them).
+        let uid = Uuid::parse_str(id).unwrap();
+        sqlx::query(
+            "INSERT INTO health_checks \
+             (id, name, check_type, endpoint, expected_status, interval_seconds, site, enabled) \
+             VALUES ($1, $2, 'http', $3, $4, $5, $6, $7)",
+        )
+        .bind(uid)
+        .bind(&check.name)
+        .bind(&check.endpoint)
+        .bind(check.expected_status as i32)
+        .bind(check.interval_seconds as i32)
+        .bind(&check.site)
+        .bind(check.enabled)
+        .execute(pool)
+        .await
+        .expect("insert health_check failed");
+
+        let fetched = crate::repos::synthetic_health::get_check(pool, id)
+            .await
+            .expect("get_check failed")
+            .expect("row not found after insert");
+
+        assert_eq!(fetched.id, *id, "id must round-trip");
+        assert_eq!(fetched.name, check.name, "name must round-trip");
+        assert_eq!(
+            fetched.check_type,
+            CheckType::Http,
+            "check_type must round-trip"
+        );
+        assert_eq!(
+            fetched.expected_status, 200u16,
+            "expected_status must round-trip"
+        );
+        assert_eq!(
+            fetched.interval_seconds, 60u32,
+            "interval_seconds must round-trip"
+        );
+        assert_eq!(fetched.site, "DEFRA", "site must round-trip");
+        assert!(fetched.enabled, "enabled must round-trip");
+
+        cleanup_check(pool, id).await;
+    }
+
+    // ─── list_by_site ────────────────────────────────────────────────────────
+
+    /// list_checks with a site filter returns only checks for that site.
+    /// Migration 016 seeds 3 DEFRA rows and 2 GBLON rows.
+    #[tokio::test]
+    async fn test_list_by_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let defra = crate::repos::synthetic_health::list_checks(pool, "DEFRA")
+            .await
+            .expect("list_checks DEFRA failed");
+        assert!(defra.len() >= 3, "expected at least 3 DEFRA seed rows");
+        assert!(
+            defra.iter().all(|c| c.site == "DEFRA"),
+            "all returned checks must be DEFRA"
+        );
+
+        let gblon = crate::repos::synthetic_health::list_checks(pool, "GBLON")
+            .await
+            .expect("list_checks GBLON failed");
+        assert!(gblon.len() >= 2, "expected at least 2 GBLON seed rows");
+        assert!(
+            gblon.iter().all(|c| c.site == "GBLON"),
+            "all returned checks must be GBLON"
+        );
+    }
+
+    // ─── insert check_result + get latest ────────────────────────────────────
+
+    /// Insert a check_result via `insert_result` and retrieve it via
+    /// `get_latest_result`. Verifies id, check_id, status, and latency_ms
+    /// all survive the round-trip including u64 coercion.
+    #[tokio::test]
+    async fn test_insert_and_get_latest_result() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        // Use one of the migration-016 seed health_checks (first DEFRA row).
+        let checks = crate::repos::synthetic_health::list_checks(pool, "DEFRA")
+            .await
+            .expect("list_checks failed");
+        let check = checks.first().expect("no DEFRA seed checks");
+
+        let result = ryuki_engine::synthetic_health::CheckResult {
+            id: Uuid::new_v4().to_string(),
+            check_id: check.id.clone(),
+            status: CheckResultStatus::Pass,
+            latency_ms: 42,
+            message: "test result".to_string(),
+            executed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let result_id = result.id.clone();
+
+        let inserted = crate::repos::synthetic_health::insert_result(pool, &result)
+            .await
+            .expect("insert_result failed");
+
+        assert_eq!(inserted.id, result.id, "id must round-trip");
+        assert_eq!(inserted.check_id, check.id, "check_id must round-trip");
+        assert_eq!(
+            inserted.status,
+            CheckResultStatus::Pass,
+            "status must round-trip"
+        );
+        assert_eq!(inserted.latency_ms, 42u64, "latency_ms must round-trip");
+
+        let latest = crate::repos::synthetic_health::get_latest_result(pool, &check.id)
+            .await
+            .expect("get_latest_result failed")
+            .expect("no result found after insert");
+        assert_eq!(
+            latest.id, result.id,
+            "get_latest must return the inserted row"
+        );
+
+        cleanup_result(pool, &result_id).await;
+    }
+
+    // ─── run_check appends a result ──────────────────────────────────────────
+
+    /// Simulate the full handler flow: load a check from DB, run the pure engine
+    /// fn, insert the result. Verifies the result is stored and retrievable.
+    #[tokio::test]
+    async fn test_run_check_appends_result() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let checks = crate::repos::synthetic_health::list_checks(pool, "DEFRA")
+            .await
+            .expect("list_checks failed");
+        let check = checks.first().expect("no DEFRA seed checks");
+
+        let sim_result = ryuki_engine::synthetic_health::run_check(check);
+        let result_id = sim_result.id.clone();
+
+        let persisted = crate::repos::synthetic_health::insert_result(pool, &sim_result)
+            .await
+            .expect("insert_result failed");
+
+        assert_eq!(persisted.check_id, check.id, "check_id must match");
+        assert!(!persisted.message.is_empty(), "message must not be empty");
+
+        let latest = crate::repos::synthetic_health::get_latest_result(pool, &check.id)
+            .await
+            .expect("get_latest_result failed")
+            .expect("latest result not found");
+        assert_eq!(
+            latest.id, persisted.id,
+            "latest must be the just-inserted row"
+        );
+
+        cleanup_result(pool, &result_id).await;
+    }
+
+    // ─── get unknown uuid → Ok(None) ─────────────────────────────────────────
+
+    /// A valid but non-existent UUID must return Ok(None), not an error.
+    #[tokio::test]
+    async fn test_get_unknown_uuid_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let unknown = Uuid::new_v4().to_string();
+
+        let check = crate::repos::synthetic_health::get_check(pool, &unknown)
+            .await
+            .expect("get_check must not error on unknown UUID");
+        assert!(
+            check.is_none(),
+            "unknown UUID must return None for get_check"
+        );
+
+        let result = crate::repos::synthetic_health::get_latest_result(pool, &unknown)
+            .await
+            .expect("get_latest_result must not error on unknown UUID");
+        assert!(
+            result.is_none(),
+            "unknown UUID must return None for get_latest_result"
+        );
+    }
+
+    // ─── malformed uuid → Ok(None) ───────────────────────────────────────────
+
+    /// A malformed (non-UUID) id must return Ok(None), not an error — consistent
+    /// with the 404 behaviour callers expect.
+    #[tokio::test]
+    async fn test_malformed_uuid_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let bad_id = "not-a-uuid-at-all";
+
+        let check = crate::repos::synthetic_health::get_check(pool, bad_id)
+            .await
+            .expect("get_check must not error on malformed id");
+        assert!(
+            check.is_none(),
+            "malformed id must return None for get_check"
+        );
+
+        let result = crate::repos::synthetic_health::get_latest_result(pool, bad_id)
+            .await
+            .expect("get_latest_result must not error on malformed id");
+        assert!(
+            result.is_none(),
+            "malformed id must return None for get_latest_result"
+        );
+    }
+
+    // ─── int coercion round-trips ─────────────────────────────────────────────
+
+    /// expected_status (u16 ↔ i32), interval_seconds (u32 ↔ i32), and
+    /// latency_ms (u64 ↔ i32) must all survive a DB round-trip without truncation
+    /// or sign errors.
+    #[tokio::test]
+    async fn test_int_coercion_roundtrips() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        // Insert a health_check with non-default expected_status and interval_seconds.
+        let check_id = Uuid::new_v4();
+        let check_id_str = check_id.to_string();
+        sqlx::query(
+            "INSERT INTO health_checks \
+             (id, name, check_type, endpoint, expected_status, interval_seconds, site, enabled) \
+             VALUES ($1, $2, 'tcp', 'coerce.ryuki.internal', $3, $4, 'DEFRA', true)",
+        )
+        .bind(check_id)
+        .bind(format!("coerce-test-{}", Uuid::new_v4()))
+        .bind(404i32) // u16::MAX would be 65535 — use 404 as a realistic non-200 value
+        .bind(3600i32) // u32 round-trip
+        .execute(pool)
+        .await
+        .expect("insert health_check for coercion test failed");
+
+        let fetched = crate::repos::synthetic_health::get_check(pool, &check_id_str)
+            .await
+            .expect("get_check failed")
+            .expect("check not found");
+
+        assert_eq!(fetched.expected_status, 404u16, "expected_status coercion");
+        assert_eq!(
+            fetched.interval_seconds, 3600u32,
+            "interval_seconds coercion"
+        );
+
+        // Now insert a check_result with a large-but-valid latency_ms.
+        let result_id = Uuid::new_v4().to_string();
+        let result = ryuki_engine::synthetic_health::CheckResult {
+            id: result_id.clone(),
+            check_id: check_id_str.clone(),
+            status: CheckResultStatus::Fail,
+            latency_ms: 999, // well within i32 range
+            message: "coercion test".to_string(),
+            executed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let inserted_result = crate::repos::synthetic_health::insert_result(pool, &result)
+            .await
+            .expect("insert_result for coercion test failed");
+        assert_eq!(inserted_result.latency_ms, 999u64, "latency_ms coercion");
+
+        cleanup_result(pool, &result_id).await;
+        cleanup_check(pool, &check_id_str).await;
     }
 }
