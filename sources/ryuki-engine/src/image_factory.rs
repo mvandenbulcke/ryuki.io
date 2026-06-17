@@ -1,10 +1,9 @@
-use serde::Serialize;
-use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum BuildStatus {
+pub enum BuildStatus {
     Building,
     Testing,
     Promoted,
@@ -12,342 +11,213 @@ enum BuildStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct GoldenImage {
-    id: String,
-    image_name: String,
-    os_family: String,
-    os_version: String,
-    distro: String,
-    build_date: String,
-    status: BuildStatus,
-    supersedes_image_id: Option<String>,
-    site_scope: String,
-    build_log: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoldenImage {
+    pub id: String,
+    pub image_name: String,
+    pub os_family: String,
+    pub os_version: String,
+    pub distro: String,
+    pub build_date: String,
+    pub status: BuildStatus,
+    pub supersedes_image_id: Option<String>,
+    pub site_scope: String,
+    pub build_log: String,
 }
 
-type ImageStore = Vec<GoldenImage>;
+// ─── Validation helpers ───────────────────────────────────────────────────────
 
-static IMAGE_STORE: OnceLock<Mutex<ImageStore>> = OnceLock::new();
-
-fn image_store() -> &'static Mutex<ImageStore> {
-    IMAGE_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
-
-fn seed_data() -> ImageStore {
-    vec![
-        GoldenImage {
-            id: "img-001".into(),
-            image_name: "win-svr-2022-defra-v1".into(),
-            os_family: "Windows".into(),
-            os_version: "2022".into(),
-            distro: "Windows Server 2022 Datacenter".into(),
-            build_date: "2026-05-01T06:00:00Z".into(),
-            status: BuildStatus::Promoted,
-            supersedes_image_id: None,
-            site_scope: "DEFRA".into(),
-            build_log: "Build completed: 2026-05-01T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.".into(),
-        },
-        GoldenImage {
-            id: "img-002".into(),
-            image_name: "ubuntu-2404-defra-v1".into(),
-            os_family: "Linux".into(),
-            os_version: "24.04".into(),
-            distro: "Ubuntu 24.04 LTS".into(),
-            build_date: "2026-05-02T06:00:00Z".into(),
-            status: BuildStatus::Promoted,
-            supersedes_image_id: None,
-            site_scope: "DEFRA".into(),
-            build_log: "Build completed: 2026-05-02T06:00:00Z. Tests: security scan passed, agent checks passed, baseline compliance passed.".into(),
-        },
-        GoldenImage {
-            id: "img-003".into(),
-            image_name: "win-svr-2025-gblon-v0".into(),
-            os_family: "Windows".into(),
-            os_version: "2025".into(),
-            distro: "Windows Server 2025 Datacenter".into(),
-            build_date: "2026-06-10T08:00:00Z".into(),
-            status: BuildStatus::Building,
-            supersedes_image_id: None,
-            site_scope: "GBLON".into(),
-            build_log: "Build started: 2026-06-10T08:00:00Z. Status: OS installation completed, agent installation in progress.".into(),
-        },
-        GoldenImage {
-            id: "img-004".into(),
-            image_name: "win-svr-2019-defra-v0".into(),
-            os_family: "Windows".into(),
-            os_version: "2019".into(),
-            distro: "Windows Server 2019 Datacenter".into(),
-            build_date: "2026-04-01T06:00:00Z".into(),
-            status: BuildStatus::Superseded,
-            supersedes_image_id: None,
-            site_scope: "DEFRA".into(),
-            build_log: "Superseded by img-001 (Windows Server 2022) on 2026-05-01. No further builds scheduled.".into(),
-        },
-    ]
-}
+const VALID_OS_FAMILIES: &[&str] = &["Windows", "Linux"];
+const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn next_id(store: &ImageStore) -> String {
-    let max_n = store
-        .iter()
-        .filter_map(|img| {
-            img.id
-                .strip_prefix("img-")
-                .and_then(|n| n.parse::<u32>().ok())
-        })
-        .max()
-        .unwrap_or(0);
-    format!("img-{:03}", max_n + 1)
-}
+// ─── Pure construction ────────────────────────────────────────────────────────
 
-fn image_to_json(img: &GoldenImage) -> Value {
-    json!({
-        "id": img.id,
-        "image_name": img.image_name,
-        "os_family": img.os_family,
-        "os_version": img.os_version,
-        "distro": img.distro,
-        "build_date": img.build_date,
-        "status": img.status,
-        "supersedes_image_id": img.supersedes_image_id,
-        "site_scope": img.site_scope,
-        "build_log": img.build_log
-    })
-}
-
+/// Construct a new `GoldenImage` in `Building` status. Returns an error on
+/// invalid `os_family` or `site`. The caller is responsible for persisting the
+/// result.
 pub fn initiate_build(
     image_name: &str,
     os_family: &str,
     distro: &str,
     version: &str,
     site: &str,
-) -> Result<Value, String> {
-    let mut store = image_store().lock().map_err(|e| e.to_string())?;
-    let id = next_id(&store);
-    let img = GoldenImage {
-        id,
+) -> Result<GoldenImage, String> {
+    if image_name.is_empty() {
+        return Err("image_name cannot be empty".into());
+    }
+    if !VALID_OS_FAMILIES.contains(&os_family) {
+        return Err(format!(
+            "Unknown os_family: {os_family}. Valid values: {}",
+            VALID_OS_FAMILIES.join(", ")
+        ));
+    }
+    if !VALID_SITES.contains(&site) {
+        return Err(format!(
+            "Unknown site: {site}. Valid values: {}",
+            VALID_SITES.join(", ")
+        ));
+    }
+    if distro.is_empty() {
+        return Err("distro cannot be empty".into());
+    }
+    if version.is_empty() {
+        return Err("version cannot be empty".into());
+    }
+
+    let ts = now_iso();
+    Ok(GoldenImage {
+        id: Uuid::new_v4().to_string(),
         image_name: image_name.to_string(),
         os_family: os_family.to_string(),
         os_version: version.to_string(),
         distro: distro.to_string(),
-        build_date: now_iso(),
+        build_date: ts.clone(),
         status: BuildStatus::Building,
         supersedes_image_id: None,
         site_scope: site.to_string(),
         build_log: format!(
-            "Build started: {}. OS installation queued for {} {}.",
-            now_iso(),
-            os_family,
-            version
+            "Build started: {ts}. OS installation queued for {os_family} {version}."
         ),
-    };
-    let json = image_to_json(&img);
-    store.push(img);
-    Ok(json!({
-        "source": "dry-run",
-        "image": json
-    }))
+    })
 }
 
-pub fn run_tests(image_id: &str) -> Result<Value, String> {
-    let mut store = image_store().lock().map_err(|e| e.to_string())?;
-    let img = store
-        .iter_mut()
-        .find(|i| i.id == image_id)
-        .ok_or_else(|| format!("Image '{}' not found", image_id))?;
-
+/// Transition a `Building` image to `Testing`. Returns an error when the image
+/// is not in `Building` status. The caller is responsible for persisting the
+/// transition.
+pub fn run_tests(img: &GoldenImage) -> Result<GoldenImage, String> {
     if img.status != BuildStatus::Building {
         return Err(format!(
             "Image '{}' is not in Building status (current: {:?})",
-            image_id, img.status
+            img.id, img.status
         ));
     }
-
-    img.status = BuildStatus::Testing;
-    img.build_log.push_str(&format!(
-        "\nTesting started: {}. Security scan queued, agent checks queued, baseline compliance queued.",
-        now_iso()
+    let ts = now_iso();
+    let mut updated = img.clone();
+    updated.status = BuildStatus::Testing;
+    updated.build_log.push_str(&format!(
+        "\nTesting started: {ts}. Security scan queued, agent checks queued, baseline compliance queued."
     ));
-
-    Ok(json!({
-        "source": "dry-run",
-        "image": image_to_json(img),
-        "test_phases": ["security-scan", "agent-checks", "baseline-compliance"]
-    }))
+    Ok(updated)
 }
 
-pub fn promote_image(image_id: &str) -> Result<Value, String> {
-    let mut store = image_store().lock().map_err(|e| e.to_string())?;
-
-    let current_status = store
-        .iter()
-        .find(|i| i.id == image_id)
-        .map(|i| i.status.clone());
-    let current_status = current_status.ok_or_else(|| format!("Image '{}' not found", image_id))?;
-    if current_status != BuildStatus::Testing {
+/// Transition a `Testing` image to `Promoted`. Returns an error when the image
+/// is not in `Testing` status. The caller is responsible for persisting the
+/// transition AND for superseding previously-promoted images for the same
+/// `site_scope + os_family` (the repo `promote` function performs both
+/// operations in one transaction).
+pub fn promote_image(img: &GoldenImage) -> Result<GoldenImage, String> {
+    if img.status != BuildStatus::Testing {
         return Err(format!(
             "Image '{}' is not in Testing status (current: {:?})",
-            image_id, current_status
+            img.id, img.status
         ));
     }
-
-    let (site, os_family) = {
-        let img = store.iter().find(|i| i.id == image_id).unwrap();
-        (img.site_scope.clone(), img.os_family.clone())
-    };
-
-    // Supersede previously promoted images for the same site + os_family
-    let mut superseded_ids: Vec<String> = Vec::new();
-    for img in store.iter_mut() {
-        if img.site_scope == site
-            && img.os_family == os_family
-            && img.status == BuildStatus::Promoted
-        {
-            img.status = BuildStatus::Superseded;
-            superseded_ids.push(img.id.clone());
-        }
-    }
-
-    let img = store.iter_mut().find(|i| i.id == image_id).unwrap();
-    img.status = BuildStatus::Promoted;
-    img.build_log.push_str(&format!(
-        "\nPromoted: {}. Tests passed: security scan clear, agent checks passed, baseline compliance met.",
-        now_iso()
+    let ts = now_iso();
+    let mut updated = img.clone();
+    updated.status = BuildStatus::Promoted;
+    updated.build_log.push_str(&format!(
+        "\nPromoted: {ts}. Tests passed: security scan clear, agent checks passed, baseline compliance met."
     ));
-
-    Ok(json!({
-        "source": "dry-run",
-        "image": image_to_json(img),
-        "superseded": superseded_ids
-    }))
+    Ok(updated)
 }
 
-pub fn reject_image(image_id: &str, reason: &str) -> Result<Value, String> {
-    let mut store = image_store().lock().map_err(|e| e.to_string())?;
-    let img = store
-        .iter_mut()
-        .find(|i| i.id == image_id)
-        .ok_or_else(|| format!("Image '{}' not found", image_id))?;
-
+/// Transition an image to `Failed`. Images already in a terminal state
+/// (`Promoted` or `Superseded`) cannot be rejected. The caller is responsible
+/// for persisting the transition.
+pub fn reject_image(img: &GoldenImage, reason: &str) -> Result<GoldenImage, String> {
     if img.status == BuildStatus::Promoted || img.status == BuildStatus::Superseded {
         return Err(format!(
             "Image '{}' is in terminal status {:?} and cannot be rejected",
-            image_id, img.status
+            img.id, img.status
         ));
     }
-
-    img.status = BuildStatus::Failed;
-    img.build_log
-        .push_str(&format!("\nRejected: {}. Reason: {}", now_iso(), reason));
-
-    Ok(json!({
-        "source": "dry-run",
-        "image": image_to_json(img),
-        "rejection_reason": reason
-    }))
-}
-
-pub fn get_active_images(site: &str) -> Result<Value, String> {
-    let store = image_store().lock().map_err(|e| e.to_string())?;
-    let images: Vec<&GoldenImage> = store
-        .iter()
-        .filter(|i| i.site_scope == site && i.status == BuildStatus::Promoted)
-        .collect();
-
-    if images.is_empty() {
-        return Err(format!("No active images found for site '{}'", site));
+    if reason.is_empty() {
+        return Err("rejection reason cannot be empty".into());
     }
+    let ts = now_iso();
+    let mut updated = img.clone();
+    updated.status = BuildStatus::Failed;
+    updated
+        .build_log
+        .push_str(&format!("\nRejected: {ts}. Reason: {reason}"));
+    Ok(updated)
+}
 
-    let mut by_os: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
-    for img in &images {
-        by_os
-            .entry(img.os_family.clone())
-            .or_default()
-            .push(image_to_json(img));
+/// Construct a new `GoldenImage` for a scheduled monthly build. Returns an
+/// error on invalid inputs.
+pub fn schedule_monthly_build(
+    site: &str,
+    os_family: &str,
+    distro: &str,
+) -> Result<GoldenImage, String> {
+    if !VALID_SITES.contains(&site) {
+        return Err(format!(
+            "Unknown site: {site}. Valid values: {}",
+            VALID_SITES.join(", ")
+        ));
     }
-
-    Ok(json!({
-        "source": "dry-run",
-        "site": site,
-        "active_count": images.len(),
-        "active_by_os": by_os
-    }))
-}
-
-pub fn get_build_history(site: &str) -> Result<Value, String> {
-    let store = image_store().lock().map_err(|e| e.to_string())?;
-    let images: Vec<&GoldenImage> = store.iter().filter(|i| i.site_scope == site).collect();
-
-    if images.is_empty() {
-        return Err(format!("No build history found for site '{}'", site));
+    if !VALID_OS_FAMILIES.contains(&os_family) {
+        return Err(format!(
+            "Unknown os_family: {os_family}. Valid values: {}",
+            VALID_OS_FAMILIES.join(", ")
+        ));
     }
-
-    let list: Vec<Value> = images.iter().map(|i| image_to_json(i)).collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "site": site,
-        "build_count": list.len(),
-        "builds": list
-    }))
-}
-
-pub fn get_superseded() -> Result<Value, String> {
-    let store = image_store().lock().map_err(|e| e.to_string())?;
-    let superseded: Vec<Value> = store
-        .iter()
-        .filter(|i| i.status == BuildStatus::Superseded)
-        .map(image_to_json)
-        .collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "superseded_count": superseded.len(),
-        "images": superseded
-    }))
-}
-
-pub fn schedule_monthly_build(site: &str, os_family: &str, distro: &str) -> Result<Value, String> {
-    let mut store = image_store().lock().map_err(|e| e.to_string())?;
-    let id = next_id(&store);
+    if distro.is_empty() {
+        return Err("distro cannot be empty".into());
+    }
+    let ts = now_iso();
     let image_name = format!(
         "{}-{}-{}-{}",
         distro.to_lowercase().replace(' ', "-"),
         site.to_lowercase(),
         chrono::Utc::now().format("%Y%m"),
-        id
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
     );
-
-    let img = GoldenImage {
-        id,
+    Ok(GoldenImage {
+        id: Uuid::new_v4().to_string(),
         image_name,
         os_family: os_family.to_string(),
         os_version: "latest".into(),
         distro: distro.to_string(),
-        build_date: now_iso(),
+        build_date: ts.clone(),
         status: BuildStatus::Building,
         supersedes_image_id: None,
         site_scope: site.to_string(),
         build_log: format!(
-            "Scheduled monthly build started: {}. OS: {} {}. Automated monthly security baseline update.",
-            now_iso(),
-            os_family,
-            distro
+            "Scheduled monthly build started: {ts}. OS: {os_family} {distro}. Automated monthly security baseline update."
         ),
-    };
+    })
+}
 
-    let json = image_to_json(&img);
-    store.push(img);
-    Ok(json!({
-        "source": "dry-run",
-        "scheduled": true,
-        "cadence": "monthly",
-        "image": json
-    }))
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub fn seed_image(id: &str, status: BuildStatus, site: &str, os_family: &str) -> GoldenImage {
+    GoldenImage {
+        id: id.to_string(),
+        image_name: format!(
+            "test-{}-{}-{}",
+            os_family.to_lowercase(),
+            site.to_lowercase(),
+            id
+        ),
+        os_family: os_family.to_string(),
+        os_version: "1.0".into(),
+        distro: format!("Test {os_family}"),
+        build_date: "2026-01-01T00:00:00Z".into(),
+        status,
+        supersedes_image_id: None,
+        site_scope: site.to_string(),
+        build_log: "seed".into(),
+    }
 }
 
 #[cfg(test)]
@@ -356,105 +226,89 @@ mod tests {
 
     #[test]
     fn test_initiate_build() {
-        let result = initiate_build("rhel-9-test", "Linux", "RHEL 9", "9.3", "DEFRA").unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["image"]["os_family"], "Linux");
-        assert_eq!(result["image"]["status"], "building");
-        assert_eq!(result["image"]["site_scope"], "DEFRA");
+        let img = initiate_build("rhel-9-test", "Linux", "RHEL 9", "9.3", "DEFRA").unwrap();
+        assert_eq!(img.os_family, "Linux");
+        assert_eq!(img.status, BuildStatus::Building);
+        assert_eq!(img.site_scope, "DEFRA");
+    }
+
+    #[test]
+    fn test_initiate_build_invalid_os() {
+        assert!(initiate_build("test", "DOS", "DOS 6", "6", "DEFRA").is_err());
+    }
+
+    #[test]
+    fn test_initiate_build_invalid_site() {
+        assert!(initiate_build("test", "Linux", "Ubuntu", "24.04", "MARS").is_err());
     }
 
     #[test]
     fn test_run_tests() {
-        let build = initiate_build("test-img", "Linux", "Ubuntu", "24.04", "DEFRA").unwrap();
-        let image_id = build["image"]["id"].as_str().unwrap();
-        let result = run_tests(image_id).unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["image"]["status"], "testing");
+        let building = initiate_build("test-img", "Linux", "Ubuntu", "24.04", "DEFRA").unwrap();
+        let testing = run_tests(&building).unwrap();
+        assert_eq!(testing.status, BuildStatus::Testing);
+        assert!(testing.build_log.contains("Testing started"));
+    }
+
+    #[test]
+    fn test_run_tests_wrong_status() {
+        let img = seed_image("x", BuildStatus::Testing, "DEFRA", "Linux");
+        assert!(run_tests(&img).is_err());
     }
 
     #[test]
     fn test_promote_image() {
-        let build =
-            initiate_build("test-promote", "Windows", "WinSvr2025", "2025", "GBLON").unwrap();
-        let image_id = build["image"]["id"].as_str().unwrap();
-        run_tests(image_id).unwrap();
-        let result = promote_image(image_id).unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["image"]["status"], "promoted");
-
-        // Verify the previously promoted win-svr-2022-defra-v1 is NOT superseded (different site/os)
-        let defra_active = get_active_images("DEFRA").unwrap();
-        let win_images = defra_active["active_by_os"]["Windows"].as_array().unwrap();
-        assert!(win_images.iter().any(|i| i["id"] == "img-001"));
+        let testing = seed_image("x", BuildStatus::Testing, "GBLON", "Windows");
+        let promoted = promote_image(&testing).unwrap();
+        assert_eq!(promoted.status, BuildStatus::Promoted);
+        assert!(promoted.build_log.contains("Promoted"));
     }
 
     #[test]
-    fn test_promote_supersedes_previous() {
-        // img-002 is Ubuntu promoted at DEFRA. Build a new Ubuntu, test, and promote it.
-        let build =
-            initiate_build("ubuntu-2404-v2", "Linux", "Ubuntu 24.04", "24.04", "DEFRA").unwrap();
-        let image_id = build["image"]["id"].as_str().unwrap();
-        run_tests(image_id).unwrap();
-        let result = promote_image(image_id).unwrap();
-        let superseded = result["superseded"].as_array().unwrap();
-        assert!(
-            !superseded.is_empty(),
-            "should supersede the existing Ubuntu image at DEFRA"
-        );
-        assert!(superseded.iter().any(|s| s.as_str() == Some("img-002")));
+    fn test_promote_wrong_status() {
+        let img = seed_image("x", BuildStatus::Building, "DEFRA", "Linux");
+        assert!(promote_image(&img).is_err());
     }
 
     #[test]
     fn test_reject_image() {
-        let build = initiate_build("test-reject", "Linux", "Ubuntu", "24.04", "DEFRA").unwrap();
-        let image_id = build["image"]["id"].as_str().unwrap();
-        let result = reject_image(image_id, "Security scan failed: CVE-2026-1234").unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["image"]["status"], "failed");
-        assert!(result["rejection_reason"].as_str().unwrap().contains("CVE"));
+        let building = seed_image("x", BuildStatus::Building, "DEFRA", "Linux");
+        let failed = reject_image(&building, "Security scan failed: CVE-2026-1234").unwrap();
+        assert_eq!(failed.status, BuildStatus::Failed);
+        assert!(failed.build_log.contains("CVE"));
     }
 
     #[test]
-    fn test_get_active_images() {
-        let result = get_active_images("DEFRA").unwrap();
-        assert_eq!(result["site"], "DEFRA");
-        assert!(result["active_count"].as_u64().unwrap() >= 1);
-        let win_images = result["active_by_os"]["Windows"].as_array().unwrap();
-        assert!(win_images.iter().any(|i| i["id"] == "img-001"));
+    fn test_reject_terminal_status() {
+        let promoted = seed_image("x", BuildStatus::Promoted, "DEFRA", "Linux");
+        assert!(reject_image(&promoted, "reason").is_err());
+        let superseded = seed_image("x", BuildStatus::Superseded, "DEFRA", "Linux");
+        assert!(reject_image(&superseded, "reason").is_err());
     }
 
     #[test]
-    fn test_get_build_history() {
-        let result = get_build_history("DEFRA").unwrap();
-        assert_eq!(result["site"], "DEFRA");
-        assert!(result["build_count"].as_u64().unwrap() >= 2);
-    }
-
-    #[test]
-    fn test_get_superseded() {
-        let result = get_superseded().unwrap();
-        assert!(result["superseded_count"].as_u64().unwrap() >= 1);
+    fn test_reject_empty_reason() {
+        let building = seed_image("x", BuildStatus::Building, "DEFRA", "Linux");
+        assert!(reject_image(&building, "").is_err());
     }
 
     #[test]
     fn test_schedule_monthly_build() {
-        let result = schedule_monthly_build("GBLON", "Linux", "Ubuntu 24.04").unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["scheduled"], true);
-        assert_eq!(result["cadence"], "monthly");
-        assert_eq!(result["image"]["status"], "building");
+        let img = schedule_monthly_build("GBLON", "Linux", "Ubuntu 24.04").unwrap();
+        assert_eq!(img.status, BuildStatus::Building);
+        assert_eq!(img.site_scope, "GBLON");
+        assert!(img.build_log.contains("monthly"));
     }
 
     #[test]
-    fn test_image_not_found() {
-        assert!(run_tests("img-999").is_err());
-        assert!(promote_image("img-999").is_err());
-        assert!(reject_image("img-999", "test").is_err());
+    fn test_schedule_monthly_invalid_site() {
+        assert!(schedule_monthly_build("MARS", "Linux", "Ubuntu").is_err());
     }
 
     #[test]
-    fn test_site_not_found() {
-        assert!(get_active_images("NONEXISTENT").is_err());
-        assert!(get_build_history("NONEXISTENT").is_err());
+    fn test_image_not_found_guard() {
+        let img = seed_image("x", BuildStatus::Promoted, "DEFRA", "Linux");
+        // Promoted → run_tests should fail
+        assert!(run_tests(&img).is_err());
     }
 }

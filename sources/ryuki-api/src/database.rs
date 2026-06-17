@@ -94,6 +94,13 @@ pub async fn try_connect_with_url(
     acquire_timeout_secs: u64,
     max_lifetime_secs: u64,
 ) {
+    // Set-once: `POOL` is a `OnceLock`, so once it has been initialized a second
+    // call could neither replace it nor store its pool — it would just open a
+    // throwaway connection and drop it. Skip entirely when already initialized.
+    // (Matters under test, where global_pool() calls this once per test.)
+    if POOL.get().is_some() {
+        return;
+    }
     let pool = match PgPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(min_connections)

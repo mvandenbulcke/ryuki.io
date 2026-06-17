@@ -141,7 +141,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
     vec![
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000001".into(),
-            hostname: "srv-defra-01.ryuki.local".into(),
+            hostname: "srv-defra-01.example.local".into(),
             source_type: LogSourceType::WindowsEventLog,
             site: "DEFRA".into(),
             status: ForwardingStatus::Active,
@@ -150,7 +150,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000002".into(),
-            hostname: "srv-defra-02.ryuki.local".into(),
+            hostname: "srv-defra-02.example.local".into(),
             source_type: LogSourceType::Syslog,
             site: "DEFRA".into(),
             status: ForwardingStatus::Active,
@@ -159,7 +159,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000003".into(),
-            hostname: "srv-gblon-01.ryuki.local".into(),
+            hostname: "srv-gblon-01.example.local".into(),
             source_type: LogSourceType::WindowsEventLog,
             site: "GBLON".into(),
             status: ForwardingStatus::Configured,
@@ -168,7 +168,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000004".into(),
-            hostname: "srv-frpar-web.ryuki.local".into(),
+            hostname: "srv-frpar-web.example.local".into(),
             source_type: LogSourceType::IIS,
             site: "FRPAR".into(),
             status: ForwardingStatus::Failed,
@@ -177,7 +177,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000005".into(),
-            hostname: "srv-nlams-lnx.ryuki.local".into(),
+            hostname: "srv-nlams-lnx.example.local".into(),
             source_type: LogSourceType::Auditd,
             site: "NLAMS".into(),
             status: ForwardingStatus::NotConfigured,
@@ -186,7 +186,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000006".into(),
-            hostname: "srv-defra-web.ryuki.local".into(),
+            hostname: "srv-defra-web.example.local".into(),
             source_type: LogSourceType::IIS,
             site: "DEFRA".into(),
             status: ForwardingStatus::Active,
@@ -195,7 +195,7 @@ pub fn seed_hosts() -> Vec<LogSource> {
         },
         LogSource {
             id: "ls-00000000-0000-0000-0000-000000000007".into(),
-            hostname: "srv-gblon-lnx.ryuki.local".into(),
+            hostname: "srv-gblon-lnx.example.local".into(),
             source_type: LogSourceType::Syslog,
             site: "GBLON".into(),
             status: ForwardingStatus::Active,
@@ -205,6 +205,10 @@ pub fn seed_hosts() -> Vec<LogSource> {
     ]
 }
 
+/// Validate inputs for onboarding a host and return the planned result.
+///
+/// This function is PURE — it performs no I/O. The handler is responsible for
+/// generating an id and persisting a `LogSource` via the repo after calling this.
 pub fn onboard_host(
     hostname: &str,
     source_types: &[LogSourceType],
@@ -235,13 +239,19 @@ pub fn onboard_host(
     })
 }
 
-pub fn validate_config(hostname: &str) -> Result<ConfigValidationResult, String> {
+/// Validate the forwarding config for a hostname against the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn validate_config(
+    hostname: &str,
+    hosts: &[LogSource],
+) -> Result<ConfigValidationResult, String> {
     if hostname.is_empty() {
         return Err("hostname cannot be empty".into());
     }
 
-    let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
+    let host_sources: Vec<&LogSource> = hosts.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(ConfigValidationResult {
@@ -307,13 +317,19 @@ pub fn validate_config(hostname: &str) -> Result<ConfigValidationResult, String>
     })
 }
 
-pub fn verify_forwarding(hostname: &str) -> Result<VerificationResult, String> {
+/// Verify that a hostname is actively forwarding logs, using the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn verify_forwarding(
+    hostname: &str,
+    hosts: &[LogSource],
+) -> Result<VerificationResult, String> {
     if hostname.is_empty() {
         return Err("hostname cannot be empty".into());
     }
 
-    let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
+    let host_sources: Vec<&LogSource> = hosts.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(VerificationResult {
@@ -344,13 +360,16 @@ pub fn verify_forwarding(hostname: &str) -> Result<VerificationResult, String> {
     })
 }
 
-pub fn get_coverage_report(site: &str) -> Result<CoverageReport, String> {
+/// Compute the coverage report for a site from the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn get_coverage_report(site: &str, hosts: &[LogSource]) -> Result<CoverageReport, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
 
-    let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds.into_iter().filter(|hs| hs.site == site).collect();
+    let site_hosts: Vec<LogSource> = hosts.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let total_hosts = site_hosts.len();
     let hosts_with_forwarding: Vec<&LogSource> = site_hosts
@@ -378,13 +397,16 @@ pub fn get_coverage_report(site: &str) -> Result<CoverageReport, String> {
     })
 }
 
-pub fn get_gap_report(site: &str) -> Result<GapReport, String> {
+/// Compute the gap report for a site from the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn get_gap_report(site: &str, hosts: &[LogSource]) -> Result<GapReport, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
 
-    let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds.iter().filter(|hs| hs.site == site).cloned().collect();
+    let site_hosts: Vec<LogSource> = hosts.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let required_sources = vec![
         LogSourceType::WindowsEventLog,
@@ -425,13 +447,16 @@ pub fn get_gap_report(site: &str) -> Result<GapReport, String> {
     })
 }
 
-pub fn get_volume_report(site: &str) -> Result<VolumeReport, String> {
+/// Compute the volume report for a site from the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn get_volume_report(site: &str, hosts: &[LogSource]) -> Result<VolumeReport, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
 
-    let seeds = seed_hosts();
-    let site_hosts: Vec<LogSource> = seeds.iter().filter(|hs| hs.site == site).cloned().collect();
+    let site_hosts: Vec<LogSource> = hosts.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let mut host_map: HashMap<String, HostVolume> = HashMap::new();
     for hs in &site_hosts {
@@ -458,18 +483,21 @@ pub fn get_volume_report(site: &str) -> Result<VolumeReport, String> {
     })
 }
 
-pub fn get_retention_status(site: &str) -> Result<RetentionStatus, String> {
+/// Compute the retention status for a site from the provided host list.
+///
+/// Callers supply `hosts` (loaded from the DB or from `seed_hosts()` as a
+/// fallback). This function is PURE — it performs no I/O.
+pub fn get_retention_status(site: &str, hosts: &[LogSource]) -> Result<RetentionStatus, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
 
-    let seeds = seed_hosts();
     let retention_limit_days: u32 = 90;
 
     let mut hosts_at_risk: Vec<RetentionHost> = Vec::new();
     let mut hosts_approaching_limit: Vec<RetentionHost> = Vec::new();
 
-    let site_hosts: Vec<LogSource> = seeds.into_iter().filter(|hs| hs.site == site).collect();
+    let site_hosts: Vec<LogSource> = hosts.iter().filter(|hs| hs.site == site).cloned().collect();
 
     let mut host_retention: HashMap<String, u32> = HashMap::new();
     for hs in &site_hosts {
@@ -513,13 +541,17 @@ pub fn get_retention_status(site: &str) -> Result<RetentionStatus, String> {
     })
 }
 
-pub fn disable_forwarding(hostname: &str) -> Result<DisableResult, String> {
+/// Compute the disable result for a hostname from the provided host list.
+///
+/// Returns a `DisableResult` describing what would be disabled. The caller is
+/// responsible for persisting status changes via the repo.
+/// This function is PURE — it performs no I/O.
+pub fn disable_forwarding(hostname: &str, hosts: &[LogSource]) -> Result<DisableResult, String> {
     if hostname.is_empty() {
         return Err("hostname cannot be empty".into());
     }
 
-    let seeds = seed_hosts();
-    let host_sources: Vec<&LogSource> = seeds.iter().filter(|hs| hs.hostname == hostname).collect();
+    let host_sources: Vec<&LogSource> = hosts.iter().filter(|hs| hs.hostname == hostname).collect();
 
     if host_sources.is_empty() {
         return Ok(DisableResult {
@@ -557,13 +589,13 @@ mod tests {
     #[test]
     fn test_onboard_host_success() {
         let result = onboard_host(
-            "srv-new.ryuki.local",
+            "srv-new.example.local",
             &[LogSourceType::WindowsEventLog, LogSourceType::Syslog],
             "DEFRA",
         )
         .expect("onboard should succeed");
         assert!(result.success);
-        assert_eq!(result.hostname, "srv-new.ryuki.local");
+        assert_eq!(result.hostname, "srv-new.example.local");
         assert_eq!(result.site, "DEFRA");
         assert_eq!(result.configured_sources.len(), 2);
         assert!(result.message.contains("DRY-RUN"));
@@ -578,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_onboard_host_empty_sources() {
-        let result = onboard_host("srv-test.ryuki.local", &[], "DEFRA");
+        let result = onboard_host("srv-test.example.local", &[], "DEFRA");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("source_types"));
     }
@@ -586,7 +618,7 @@ mod tests {
     #[test]
     fn test_onboard_host_invalid_site() {
         let result = onboard_host(
-            "srv-test.ryuki.local",
+            "srv-test.example.local",
             &[LogSourceType::WindowsEventLog],
             "INVALID",
         );
@@ -596,16 +628,18 @@ mod tests {
 
     #[test]
     fn test_validate_config_known_host() {
-        let result = validate_config("srv-defra-01.ryuki.local")
+        let hosts = seed_hosts();
+        let result = validate_config("srv-defra-01.example.local", &hosts)
             .expect("validate should succeed for known host");
         assert!(result.valid);
-        assert_eq!(result.hostname, "srv-defra-01.ryuki.local");
+        assert_eq!(result.hostname, "srv-defra-01.example.local");
         assert!(!result.configured_sources.is_empty());
     }
 
     #[test]
     fn test_validate_config_unknown_host() {
-        let result = validate_config("srv-unknown.ryuki.local")
+        let hosts = seed_hosts();
+        let result = validate_config("srv-unknown.example.local", &hosts)
             .expect("validate should succeed for unknown host");
         assert!(!result.valid);
         assert!(!result.errors.is_empty());
@@ -613,7 +647,9 @@ mod tests {
 
     #[test]
     fn test_verify_forwarding_active_host() {
-        let result = verify_forwarding("srv-defra-01.ryuki.local").expect("verify should succeed");
+        let hosts = seed_hosts();
+        let result =
+            verify_forwarding("srv-defra-01.example.local", &hosts).expect("verify should succeed");
         assert!(result.verified);
         assert!(result.siem_received);
         assert!(result.message.contains("DRY-RUN"));
@@ -621,34 +657,40 @@ mod tests {
 
     #[test]
     fn test_verify_forwarding_unknown_host() {
-        let result = verify_forwarding("srv-unknown.ryuki.local").expect("verify should succeed");
+        let hosts = seed_hosts();
+        let result =
+            verify_forwarding("srv-unknown.example.local", &hosts).expect("verify should succeed");
         assert!(!result.verified);
         assert!(!result.siem_received);
     }
 
     #[test]
     fn test_get_coverage_report_valid_site() {
-        let result = get_coverage_report("DEFRA").expect("coverage report should succeed");
+        let hosts = seed_hosts();
+        let result = get_coverage_report("DEFRA", &hosts).expect("coverage report should succeed");
         assert_eq!(result.site, "DEFRA");
         assert!(result.total_hosts > 0);
     }
 
     #[test]
     fn test_get_coverage_report_invalid_site() {
-        let result = get_coverage_report("INVALID");
+        let hosts = seed_hosts();
+        let result = get_coverage_report("INVALID", &hosts);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_gap_report() {
-        let result = get_gap_report("FRPAR").expect("gap report should succeed");
+        let hosts = seed_hosts();
+        let result = get_gap_report("FRPAR", &hosts).expect("gap report should succeed");
         assert_eq!(result.site, "FRPAR");
         assert!(!result.required_sources.is_empty());
     }
 
     #[test]
     fn test_get_volume_report() {
-        let result = get_volume_report("DEFRA").expect("volume report should succeed");
+        let hosts = seed_hosts();
+        let result = get_volume_report("DEFRA", &hosts).expect("volume report should succeed");
         assert_eq!(result.site, "DEFRA");
         assert!(result.total_volume_mb_per_day > 0);
         assert!(!result.top_talkers.is_empty());
@@ -656,21 +698,26 @@ mod tests {
 
     #[test]
     fn test_get_retention_status() {
-        let result = get_retention_status("GBLON").expect("retention status should succeed");
+        let hosts = seed_hosts();
+        let result =
+            get_retention_status("GBLON", &hosts).expect("retention status should succeed");
         assert_eq!(result.site, "GBLON");
     }
 
     #[test]
     fn test_disable_forwarding_known_host() {
-        let result =
-            disable_forwarding("srv-defra-01.ryuki.local").expect("disable should succeed");
+        let hosts = seed_hosts();
+        let result = disable_forwarding("srv-defra-01.example.local", &hosts)
+            .expect("disable should succeed");
         assert!(result.success);
         assert!(result.message.contains("DRY-RUN"));
     }
 
     #[test]
     fn test_disable_forwarding_unknown_host() {
-        let result = disable_forwarding("srv-unknown.ryuki.local").expect("disable should succeed");
+        let hosts = seed_hosts();
+        let result = disable_forwarding("srv-unknown.example.local", &hosts)
+            .expect("disable should succeed");
         assert!(result.success);
         assert!(result.disabled_sources.is_empty());
     }
@@ -730,13 +777,13 @@ mod tests {
     fn test_onboard_result_serialization() {
         let result = OnboardingResult {
             success: true,
-            hostname: "srv-test.ryuki.local".into(),
+            hostname: "srv-test.example.local".into(),
             site: "DEFRA".into(),
             configured_sources: vec![LogSourceType::WindowsEventLog],
             message: "DRY-RUN: done".into(),
         };
         let json = serde_json::to_string(&result).expect("serialization should work");
-        assert!(json.contains("srv-test.ryuki.local"));
+        assert!(json.contains("srv-test.example.local"));
         assert!(json.contains("DEFRA"));
         let deserialized: OnboardingResult =
             serde_json::from_str(&json).expect("deserialization should work");

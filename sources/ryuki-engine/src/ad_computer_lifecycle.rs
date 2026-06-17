@@ -47,14 +47,7 @@ pub struct ADComputer {
 }
 
 fn computer_id() -> String {
-    format!(
-        "adc-{}",
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    )
+    Uuid::new_v4().to_string()
 }
 
 fn now_iso() -> String {
@@ -289,6 +282,90 @@ pub fn delete_computer(name: &str) -> Result<(), String> {
     }
     validate_naming_convention(name)?;
     Ok(())
+}
+
+// ─── Model-based pure transition functions (for persistence layer) ────────────
+
+/// Move an existing computer to a new OU. The computer is loaded from the DB
+/// before calling this; the function validates the target OU path and returns a
+/// clone with the updated `ou_path`.
+///
+/// Predecessor guard: only `Active` computers can be moved. Disabled,
+/// Quarantined, and Deleted computers are locked in place — moving them would
+/// silently bypass lifecycle controls.
+pub fn move_computer_model(computer: &ADComputer, target_ou: &str) -> Result<ADComputer, String> {
+    if computer.status != ComputerStatus::Active {
+        return Err(format!(
+            "Cannot move a computer that is '{}'; it must be Active",
+            computer.status
+        ));
+    }
+    validate_ou_path(target_ou)?;
+    Ok(ADComputer {
+        ou_path: target_ou.to_string(),
+        ..computer.clone()
+    })
+}
+
+/// Disable a computer that was loaded from the DB.
+///
+/// Predecessor guards:
+/// - `reason` must not be empty (caller should pre-validate at the handler
+///   boundary, but this is a second line of defence).
+/// - Must not already be `Disabled` — idempotent disable would silently
+///   overwrite the existing `disable_reason`.
+/// - Must not be `Deleted` — a deleted computer cannot be further modified.
+pub fn disable_computer_model(computer: &ADComputer, reason: &str) -> Result<ADComputer, String> {
+    if reason.is_empty() {
+        return Err("Disable reason cannot be empty".into());
+    }
+    match computer.status {
+        ComputerStatus::Disabled => {
+            return Err("Computer is already Disabled".into());
+        }
+        ComputerStatus::Deleted => {
+            return Err("Cannot disable a deleted computer".into());
+        }
+        ComputerStatus::Active | ComputerStatus::Quarantined => {}
+    }
+    let mut metadata = computer.metadata.clone();
+    metadata.insert("disable_reason".into(), reason.to_string());
+    Ok(ADComputer {
+        status: ComputerStatus::Disabled,
+        metadata,
+        ..computer.clone()
+    })
+}
+
+/// Re-enable a computer that was loaded from the DB. Guards: the computer must
+/// currently be `Disabled` — enabling an Active, Quarantined, or Deleted object
+/// is a state conflict.
+pub fn enable_computer_model(computer: &ADComputer) -> Result<ADComputer, String> {
+    if computer.status != ComputerStatus::Disabled {
+        return Err(format!(
+            "Cannot enable a computer that is '{}'; it must be Disabled",
+            computer.status
+        ));
+    }
+    let mut metadata = computer.metadata.clone();
+    metadata.remove("disable_reason");
+    Ok(ADComputer {
+        status: ComputerStatus::Active,
+        metadata,
+        ..computer.clone()
+    })
+}
+
+/// Soft-delete a computer that was loaded from the DB. Guards: must not already
+/// be `Deleted`.
+pub fn delete_computer_model(computer: &ADComputer) -> Result<ADComputer, String> {
+    if computer.status == ComputerStatus::Deleted {
+        return Err("Computer is already deleted".into());
+    }
+    Ok(ADComputer {
+        status: ComputerStatus::Deleted,
+        ..computer.clone()
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,5 +743,71 @@ mod tests {
     fn test_validate_empty_name() {
         let result = validate_computer("");
         assert!(result.is_err());
+    }
+
+    // ── model-based predecessor-guard tests ────────────────────────────────────
+
+    fn make_computer(status: ComputerStatus) -> ADComputer {
+        ADComputer {
+            id: Uuid::new_v4().to_string(),
+            name: "DEFRA-SRV-01".into(),
+            site: "DEFRA".into(),
+            ou_path: "OU=Servers,DC=corp,DC=local".into(),
+            status,
+            last_logon: chrono::Utc::now().to_rfc3339(),
+            os: "Windows Server 2022".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn move_deleted_computer_is_err() {
+        let deleted = make_computer(ComputerStatus::Deleted);
+        let result = move_computer_model(&deleted, "OU=DMZ,DC=corp,DC=local");
+        assert!(result.is_err(), "moving a Deleted computer must fail");
+        assert!(result.unwrap_err().contains("Deleted"));
+    }
+
+    #[test]
+    fn move_disabled_computer_is_err() {
+        let disabled = make_computer(ComputerStatus::Disabled);
+        let result = move_computer_model(&disabled, "OU=DMZ,DC=corp,DC=local");
+        assert!(result.is_err(), "moving a Disabled computer must fail");
+    }
+
+    #[test]
+    fn disable_already_disabled_is_err() {
+        let disabled = make_computer(ComputerStatus::Disabled);
+        let err = disable_computer_model(&disabled, "some reason")
+            .expect_err("disabling an already-Disabled computer must fail");
+        assert!(
+            err.to_lowercase().contains("disabled"),
+            "error message should mention Disabled: {err}"
+        );
+    }
+
+    #[test]
+    fn disable_deleted_computer_is_err() {
+        let deleted = make_computer(ComputerStatus::Deleted);
+        let result = disable_computer_model(&deleted, "reason");
+        assert!(result.is_err(), "disabling a Deleted computer must fail");
+    }
+
+    #[test]
+    fn enable_active_computer_is_err() {
+        let active = make_computer(ComputerStatus::Active);
+        let result = enable_computer_model(&active);
+        assert!(result.is_err(), "enabling an Active computer must fail");
+    }
+
+    #[test]
+    fn delete_already_deleted_is_err() {
+        let deleted = make_computer(ComputerStatus::Deleted);
+        let result = delete_computer_model(&deleted);
+        assert!(
+            result.is_err(),
+            "deleting an already-Deleted computer must fail"
+        );
     }
 }

@@ -3858,61 +3858,122 @@ async fn identity_ad_computer() -> Json<Value> {
 // ─── AD computer lifecycle handlers ───
 
 async fn ad_prestage(Json(body): Json<AdPrestageRequest>) -> ApiResult {
-    match ad_computer_lifecycle::prestage_computer(&body.name, &body.site, &body.ou_path) {
-        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let computer = ad_computer_lifecycle::prestage_computer(&body.name, &body.site, &body.ou_path)
+        .map_err(|e| status_400(&e))?;
+    let persisted = crate::repos::ad_computers::insert(pool, &computer)
+        .await
+        .map_err(|e| {
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation() && d.constraint() == Some("ad_computers_name_key") {
+                    return status_409("a computer with that name already exists");
+                }
+            }
+            db_error(e)
+        })?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn ad_validate(Json(body): Json<AdValidateRequest>) -> ApiResult {
+    // Pure naming-convention check — no DB interaction.
     match ad_computer_lifecycle::validate_computer(&body.name) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn ad_move(Path(name): Path<String>, Json(body): Json<AdMoveRequest>) -> ApiResult {
-    match ad_computer_lifecycle::move_computer(&name, &body.target_ou) {
-        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    // A non-Active computer is a state conflict (409), not bad input. Checking it
+    // here keeps a malformed target_ou as a 400 from the engine below.
+    if computer.status != ad_computer_lifecycle::ComputerStatus::Active {
+        return Err(status_409(&format!(
+            "cannot move computer in status {}; must be Active",
+            computer.status
+        )));
     }
+    let updated = ad_computer_lifecycle::move_computer_model(&computer, &body.target_ou)
+        .map_err(|e| status_400(&e))?;
+    let before_status = crate::repos::ad_computers::status_str(&computer.status);
+    let (persisted, _) =
+        crate::repos::ad_computers::transition(pool, before_status, updated_at, &updated)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn ad_disable(Path(name): Path<String>, Json(body): Json<AdDisableRequest>) -> ApiResult {
-    match ad_computer_lifecycle::disable_computer(&name, &body.reason) {
-        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
-        Err(e) => Err(status_400(&e)),
+    // Empty reason is bad input (400) — check before touching the DB.
+    if body.reason.trim().is_empty() {
+        return Err(status_400("disable reason must not be empty"));
     }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    // Guard failures (already Deleted / already Disabled) are state conflicts.
+    let updated = ad_computer_lifecycle::disable_computer_model(&computer, &body.reason)
+        .map_err(|e| status_409(&e))?;
+    let before = crate::repos::ad_computers::status_str(&computer.status);
+    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn ad_enable(Path(name): Path<String>) -> ApiResult {
-    match ad_computer_lifecycle::enable_computer(&name) {
-        Ok(computer) => Ok(Json(serde_json::to_value(computer).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    let updated =
+        ad_computer_lifecycle::enable_computer_model(&computer).map_err(|e| status_409(&e))?;
+    let before = crate::repos::ad_computers::status_str(&computer.status);
+    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn ad_delete(Path(name): Path<String>) -> ApiResult {
-    match ad_computer_lifecycle::delete_computer(&name) {
-        Ok(()) => Ok(Json(
-            serde_json::json!({"deleted": true, "computer": name, "dry_run": true}),
-        )),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    let updated =
+        ad_computer_lifecycle::delete_computer_model(&computer).map_err(|e| status_409(&e))?;
+    let before = crate::repos::ad_computers::status_str(&computer.status);
+    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn ad_reconcile(Query(query): Query<AdReconcileQuery>) -> ApiResult {
+    // Pure dry-run analytics — no DB interaction.
     let site = query.site.as_deref().unwrap_or("DEFRA");
     match ad_computer_lifecycle::reconcile_computers(site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
+        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn ad_orphaned(Query(query): Query<AdOrphanedQuery>) -> ApiResult {
+    // Pure dry-run analytics — no DB interaction.
     let site = query.site.as_deref().unwrap_or("DEFRA");
     match ad_computer_lifecycle::get_orphaned(site) {
-        Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap())),
+        Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
@@ -8359,80 +8420,193 @@ fn parse_source_types(raw: &[String]) -> Result<Vec<log_forwarder::LogSourceType
         .collect()
 }
 
-async fn logs_onboard(
-    Json(body): Json<LogsOnboardRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let source_types = match parse_source_types(&body.source_types) {
-        Ok(types) => types,
-        Err(e) => return Err(status_400(&e)),
+/// Insert one `LogSource` row per requested source type and return the list of
+/// persisted records. The handler fans out: one row per `(hostname, source_type)`
+/// pair so each source has an independent status lifecycle.
+async fn logs_onboard(Json(body): Json<LogsOnboardRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let source_types = parse_source_types(&body.source_types).map_err(|e| status_400(&e))?;
+
+    // Deduplicate source types (preserve first-occurrence order).
+    let mut seen = std::collections::HashSet::new();
+    let source_types: Vec<_> = source_types
+        .into_iter()
+        .filter(|st| seen.insert(crate::repos::log_forwarders::source_type_str(st)))
+        .collect();
+
+    // Engine validates the request and returns the planned result (pure).
+    let result = log_forwarder::onboard_host(&body.hostname, &source_types, &body.site)
+        .map_err(|e| status_400(&e))?;
+
+    // Build one row per source type, then persist concurrency-safely: the repo
+    // takes a per-hostname advisory lock, inserts new `(hostname, source_type)`
+    // pairs and re-enables previously-disabled ones, while leaving rows already
+    // Configured/Active untouched (idempotent), all in one transaction.
+    // `persisted` holds the rows this call inserted or re-enabled.
+    let sources: Vec<log_forwarder::LogSource> = result
+        .configured_sources
+        .iter()
+        .map(|st| log_forwarder::LogSource {
+            id: format!("ls-{}", uuid::Uuid::new_v4()),
+            hostname: result.hostname.clone(),
+            source_type: st.clone(),
+            site: result.site.clone(),
+            status: log_forwarder::ForwardingStatus::Configured,
+            log_volume_per_day_mb: 0,
+            retention_days: 90,
+        })
+        .collect();
+    let persisted = crate::repos::log_forwarders::onboard_sources(pool, &result.hostname, &sources)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(
+        serde_json::to_value(serde_json::json!({
+            "success": result.success,
+            "hostname": result.hostname,
+            "site": result.site,
+            "configured_sources": result.configured_sources,
+            "message": result.message,
+            "persisted": persisted,
+        }))
+        .unwrap_or_default(),
+    ))
+}
+
+/// Validate the forwarding config for a hostname.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_validate(Path(hostname): Path<String>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
     };
-    match log_forwarder::onboard_host(&body.hostname, &source_types, &body.site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+    log_forwarder::validate_config(&hostname, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_validate(
-    Path(hostname): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::validate_config(&hostname) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+/// Verify that a hostname is actively forwarding logs.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_verify(Path(hostname): Path<String>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    log_forwarder::verify_forwarding(&hostname, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_verify(
-    Path(hostname): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::verify_forwarding(&hostname) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+/// Return the coverage report for a site.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_coverage(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    log_forwarder::get_coverage_report(&params.site, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_coverage(
-    Query(params): Query<LogsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::get_coverage_report(&params.site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+/// Return the gap report for a site.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_gaps(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    log_forwarder::get_gap_report(&params.site, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_gaps(
-    Query(params): Query<LogsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::get_gap_report(&params.site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+/// Return the volume report for a site.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_volume(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    log_forwarder::get_volume_report(&params.site, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_volume(
-    Query(params): Query<LogsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::get_volume_report(&params.site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
+/// Return the retention status for a site.
+///
+/// Reads from DB when available. When no pool is connected the read degrades to
+/// an empty result (never seed data, which would mask missing persistence). A DB
+/// error propagates as 500.
+async fn logs_retention(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+    let hosts = match get_db() {
+        Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    log_forwarder::get_retention_status(&params.site, &hosts)
+        .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
+        .map_err(|e| status_400(&e))
 }
 
-async fn logs_retention(
-    Query(params): Query<LogsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::get_retention_status(&params.site) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
+/// Disable log forwarding for all sources on a hostname by transitioning each
+/// to `NotConfigured`.
+///
+/// Requires a database. Disables every still-active source for the hostname in
+/// one atomic, advisory-locked step (`repos::log_forwarders::disable_all_for_hostname`)
+/// so it cannot race a concurrent onboard or be left partially applied. The
+/// response lists the sources that were actually transitioned.
+async fn logs_disable(Path(hostname): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
 
-async fn logs_disable(
-    Path(hostname): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match log_forwarder::disable_forwarding(&hostname) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err(status_400(&e)),
+    if hostname.is_empty() {
+        return Err(status_400("hostname cannot be empty"));
     }
+
+    let disabled = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+        .await
+        .map_err(db_error)?;
+
+    let disabled_sources: Vec<log_forwarder::LogSourceType> =
+        disabled.into_iter().map(|s| s.source_type).collect();
+    let count = disabled_sources.len();
+    let result = log_forwarder::DisableResult {
+        success: true,
+        hostname: hostname.clone(),
+        disabled_sources,
+        message: format!(
+            "DRY-RUN: Log forwarding disabled for {count} source(s) on {hostname}. No live agent changes performed."
+        ),
+    };
+
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
 async fn logs_contract() -> Json<Value> {
@@ -8450,7 +8624,7 @@ async fn logs_contract() -> Json<Value> {
             "disable": "POST /api/observe/logs/disable/{hostname}"
         },
         "sourceTypes": ["windows-event-log", "syslog", "auditd", "iis", "apache"],
-        "statuses": ["not-configured", "configured", "active", "failed"],
+        "statuses": ["NotConfigured", "Configured", "Active", "Failed"],
         "hosts": log_forwarder::seed_hosts(),
         "workflows": ["windows-event-forwarding-readiness","linux-rsyslog-readiness","linux-auditd-readiness","siem-routing-review","agent-policy-review","evidence-pack-review"],
         "signals": ["missing-log-forwarder","unsupported-agent","policy-mismatch","stale-log-source","routing-missing","owner-missing","evidence-missing"],
@@ -15750,60 +15924,184 @@ struct ImageFactoryScheduleBody {
 }
 
 async fn image_factory_initiate_build(Json(body): Json<ImageFactoryBuildBody>) -> ApiResult {
-    image_factory::initiate_build(
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let img = image_factory::initiate_build(
         &body.image_name,
         &body.os_family,
         &body.distro,
         &body.version,
         &body.site,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    .map_err(|e| status_400(&e))?;
+
+    let persisted = crate::repos::golden_images::insert(pool, &img)
+        .await
+        .map_err(|e| {
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation()
+                    && d.constraint() == Some("golden_images_image_name_site_scope_key")
+                {
+                    return status_409("an image with that name already exists in this scope");
+                }
+            }
+            db_error(e)
+        })?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn image_factory_run_tests(Path(id): Path<String>) -> ApiResult {
-    image_factory::run_tests(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let img = crate::repos::golden_images::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::golden_images::status_str(&img.status);
+    let testing = image_factory::run_tests(&img).map_err(|e| status_409(&e))?;
+
+    let persisted = crate::repos::golden_images::transition(pool, before, &testing)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn image_factory_promote(Path(id): Path<String>) -> ApiResult {
-    image_factory::promote_image(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let img = crate::repos::golden_images::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let promoted = image_factory::promote_image(&img).map_err(|e| status_409(&e))?;
+
+    let (persisted, superseded_ids) = crate::repos::golden_images::promote(pool, &promoted)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(json!({
+        "image": serde_json::to_value(&persisted).unwrap_or_default(),
+        "superseded": superseded_ids,
+    })))
 }
 
 async fn image_factory_reject(
     Path(id): Path<String>,
     Json(body): Json<ImageFactoryRejectBody>,
 ) -> ApiResult {
-    image_factory::reject_image(&id, &body.reason)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let img = crate::repos::golden_images::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::golden_images::status_str(&img.status);
+    let failed = image_factory::reject_image(&img, &body.reason).map_err(|e| status_409(&e))?;
+
+    let persisted = crate::repos::golden_images::transition(pool, before, &failed)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
 async fn image_factory_active(Path(site): Path<String>) -> ApiResult {
-    image_factory::get_active_images(&site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    // Graceful degradation: no DB → empty list (not a 503)
+    if let Some(pool) = get_db() {
+        let images = crate::repos::golden_images::list_promoted(pool, &site)
+            .await
+            .map_err(db_error)?;
+
+        let mut by_os: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for img in &images {
+            by_os
+                .entry(img.os_family.clone())
+                .or_default()
+                .push(serde_json::to_value(img).unwrap_or_default());
+        }
+
+        return Ok(Json(json!({
+            "site": site,
+            "active_count": images.len(),
+            "active_by_os": by_os,
+        })));
+    }
+    Ok(Json(json!({
+        "site": site,
+        "active_count": 0,
+        "active_by_os": {},
+    })))
 }
 
 async fn image_factory_history(Path(site): Path<String>) -> ApiResult {
-    image_factory::get_build_history(&site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    // Graceful degradation: no DB → empty list
+    if let Some(pool) = get_db() {
+        let images = crate::repos::golden_images::list(pool, &site)
+            .await
+            .map_err(db_error)?;
+        return Ok(Json(json!({
+            "site": site,
+            "build_count": images.len(),
+            "builds": serde_json::to_value(&images).unwrap_or_default(),
+        })));
+    }
+    Ok(Json(json!({
+        "site": site,
+        "build_count": 0,
+        "builds": [],
+    })))
 }
 
 async fn image_factory_superseded() -> ApiResult {
-    image_factory::get_superseded()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    // Graceful degradation: no DB → empty list
+    if let Some(pool) = get_db() {
+        let images = crate::repos::golden_images::list_superseded(pool)
+            .await
+            .map_err(db_error)?;
+        return Ok(Json(json!({
+            "superseded_count": images.len(),
+            "images": serde_json::to_value(&images).unwrap_or_default(),
+        })));
+    }
+    Ok(Json(json!({
+        "superseded_count": 0,
+        "images": [],
+    })))
 }
 
 async fn image_factory_schedule_monthly(Json(body): Json<ImageFactoryScheduleBody>) -> ApiResult {
-    image_factory::schedule_monthly_build(&body.site, &body.os_family, &body.distro)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let img = image_factory::schedule_monthly_build(&body.site, &body.os_family, &body.distro)
+        .map_err(|e| status_400(&e))?;
+
+    let persisted = crate::repos::golden_images::insert(pool, &img)
+        .await
+        .map_err(|e| {
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation()
+                    && d.constraint() == Some("golden_images_image_name_site_scope_key")
+                {
+                    return status_409("an image with that name already exists in this scope");
+                }
+            }
+            db_error(e)
+        })?;
+
+    Ok(Json(json!({
+        "scheduled": true,
+        "cadence": "monthly",
+        "image": serde_json::to_value(&persisted).unwrap_or_default(),
+    })))
 }
 
 async fn image_factory_contract() -> Json<Value> {
@@ -30310,5 +30608,517 @@ mod hardware_db_tests {
             StatusCode::NOT_FOUND,
             "update_firmware on missing id must return 404"
         );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api log_forwarder_db_tests
+#[cfg(test)]
+mod log_forwarder_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    // Create a FRESH owned pool per test (like the ad_computers / golden_images
+    // db_tests) rather than reusing the process-wide `get_db()` static. The
+    // static pool is created inside the first #[tokio::test] runtime; reusing it
+    // from a later test's runtime yields stale connections and `PoolTimedOut`.
+    // An owned per-test pool is created and dropped within the same runtime.
+    async fn global_pool() -> Option<PgPool> {
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("log_forwarder_db_tests: RYUKI_DATABASE_URL not set — skipping");
+                return None;
+            }
+        };
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("RYUKI_DATABASE_URL is set but connection failed");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply cleanly when RYUKI_DATABASE_URL is set");
+        Some(pool)
+    }
+
+    /// Delete only the rows created by a test. Migration 022 seeds 7 rows with
+    /// ids starting "ls-00000000-…"; we never touch those.
+    async fn cleanup(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM log_forwarders WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    fn make_source(
+        id: &str,
+        hostname: &str,
+        site: &str,
+        status: ryuki_engine::log_forwarder::ForwardingStatus,
+    ) -> ryuki_engine::log_forwarder::LogSource {
+        ryuki_engine::log_forwarder::LogSource {
+            id: id.into(),
+            hostname: hostname.into(),
+            source_type: ryuki_engine::log_forwarder::LogSourceType::Syslog,
+            site: site.into(),
+            status,
+            log_volume_per_day_mb: 100,
+            retention_days: 90,
+        }
+    }
+
+    // ─── insert → get round-trip ──────────────────────────────────────────────
+
+    /// Insert a log forwarder and verify the persisted model round-trips all
+    /// fields correctly, including enum decoding for status and source_type.
+    #[tokio::test]
+    async fn test_insert_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let id = format!("ls-test-{}", uuid::Uuid::new_v4());
+        let source = make_source(
+            &id,
+            "srv-test-rt.ryuki.local",
+            "DEFRA",
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+
+        let inserted = crate::repos::log_forwarders::insert(pool, &source)
+            .await
+            .expect("insert failed");
+
+        assert_eq!(inserted.id, id, "id must round-trip");
+        assert_eq!(
+            inserted.hostname, "srv-test-rt.ryuki.local",
+            "hostname must round-trip"
+        );
+        assert_eq!(inserted.site, "DEFRA", "site must round-trip");
+        assert_eq!(
+            inserted.status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+            "status must round-trip"
+        );
+        assert_eq!(
+            inserted.source_type,
+            ryuki_engine::log_forwarder::LogSourceType::Syslog,
+            "source_type must round-trip"
+        );
+        assert_eq!(
+            inserted.log_volume_per_day_mb, 100,
+            "volume must round-trip"
+        );
+        assert_eq!(inserted.retention_days, 90, "retention must round-trip");
+
+        let fetched = crate::repos::log_forwarders::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("row not found after insert");
+
+        assert_eq!(fetched.id, id, "get id must match");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+            "get status must match"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── list / list_by_site / list_by_hostname filter seeds ─────────────────
+
+    /// The 7 migration-022 seed rows must be visible via list and at least 2
+    /// DEFRA rows must appear via list_by_site.
+    #[tokio::test]
+    async fn test_list_filters_seeds() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let all = crate::repos::log_forwarders::list(pool)
+            .await
+            .expect("list failed");
+        assert!(all.len() >= 7, "expected at least 7 seed rows from list");
+
+        let defra = crate::repos::log_forwarders::list_by_site(pool, "DEFRA")
+            .await
+            .expect("list_by_site failed");
+        assert!(defra.len() >= 2, "expected at least 2 DEFRA seed rows");
+
+        // list_by_hostname for a seed hostname.
+        let by_host =
+            crate::repos::log_forwarders::list_by_hostname(pool, "srv-defra-01.example.local")
+                .await
+                .expect("list_by_hostname failed");
+        assert!(
+            !by_host.is_empty(),
+            "expected at least 1 row for srv-defra-01.example.local"
+        );
+    }
+
+    // ─── transition CAS ───────────────────────────────────────────────────────
+
+    /// A valid CAS transition (Configured → Active) must return the updated row
+    /// with the new status persisted in the DB.
+    #[tokio::test]
+    async fn test_transition_cas_success() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let id = format!("ls-test-{}", uuid::Uuid::new_v4());
+        let source = make_source(
+            &id,
+            "srv-test-cas.ryuki.local",
+            "GBLON",
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+        crate::repos::log_forwarders::insert(pool, &source)
+            .await
+            .expect("insert failed");
+
+        let updated = crate::repos::log_forwarders::transition(pool, &id, "Configured", "Active")
+            .await
+            .expect("transition failed")
+            .expect("CAS must return the updated row");
+
+        assert_eq!(
+            updated.status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Active,
+            "status must be Active after CAS"
+        );
+
+        let fetched = crate::repos::log_forwarders::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("row not found");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Active,
+            "DB status must be Active after CAS"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// A CAS transition with the wrong expected status must return Ok(None) — no
+    /// panic, no DB mutation.
+    #[tokio::test]
+    async fn test_transition_cas_miss_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let id = format!("ls-test-{}", uuid::Uuid::new_v4());
+        let source = make_source(
+            &id,
+            "srv-test-miss.ryuki.local",
+            "NLAMS",
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+        crate::repos::log_forwarders::insert(pool, &source)
+            .await
+            .expect("insert failed");
+
+        // Claim row is Active when it is actually Configured → CAS miss.
+        let result = crate::repos::log_forwarders::transition(pool, &id, "Active", "NotConfigured")
+            .await
+            .expect("transition must not error on CAS miss");
+        assert!(result.is_none(), "CAS miss must return None");
+
+        // Row must be unchanged.
+        let fetched = crate::repos::log_forwarders::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("row not found");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+            "status must be unchanged after CAS miss"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── get unknown id → None ────────────────────────────────────────────────
+
+    /// Getting a nonexistent TEXT id must return Ok(None), not an error.
+    #[tokio::test]
+    async fn test_get_missing_id_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let result = crate::repos::log_forwarders::get(pool, "ls-does-not-exist-at-all")
+            .await
+            .expect("get must not error on missing id");
+        assert!(result.is_none(), "missing id must return None");
+    }
+
+    // ─── onboard_sources persists + is idempotent ────────────────────────────
+
+    /// Build the `LogSource`s the `logs_onboard` handler would build for a
+    /// hostname: one Configured row per source type, with a fresh id each.
+    fn build_source(
+        hostname: &str,
+        site: &str,
+        st: ryuki_engine::log_forwarder::LogSourceType,
+    ) -> ryuki_engine::log_forwarder::LogSource {
+        let mut s = make_source(
+            &format!("ls-onb-{}", uuid::Uuid::new_v4()),
+            hostname,
+            site,
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+        s.source_type = st;
+        s
+    }
+
+    /// `onboard_sources` inserts one row per (deduped) source type under the
+    /// per-hostname advisory lock, and a second identical call is a no-op rather
+    /// than creating duplicates or tripping the UNIQUE `(hostname, source_type)`
+    /// constraint. This is the concurrency-safe path the `logs_onboard` handler
+    /// now uses.
+    #[tokio::test]
+    async fn test_onboard_sources_persists_and_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let hostname = format!("srv-onb-{}.ryuki.local", uuid::Uuid::new_v4());
+        // Includes a duplicate Syslog that onboard_sources must dedupe away.
+        let sources = vec![
+            build_source(
+                &hostname,
+                "DEFRA",
+                ryuki_engine::log_forwarder::LogSourceType::Syslog,
+            ),
+            build_source(
+                &hostname,
+                "DEFRA",
+                ryuki_engine::log_forwarder::LogSourceType::Auditd,
+            ),
+            build_source(
+                &hostname,
+                "DEFRA",
+                ryuki_engine::log_forwarder::LogSourceType::Syslog,
+            ),
+        ];
+
+        let persisted = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+            .await
+            .expect("onboard_sources failed");
+        assert_eq!(
+            persisted.len(),
+            2,
+            "duplicate Syslog must be deduped to 2 inserts"
+        );
+
+        // Second identical call: idempotent no-op (already-present types skipped).
+        let again = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+            .await
+            .expect("second onboard_sources failed");
+        assert!(again.is_empty(), "re-onboarding must insert nothing");
+
+        let rows = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .expect("list_by_hostname failed");
+        assert_eq!(
+            rows.len(),
+            2,
+            "exactly one row per source type must persist"
+        );
+
+        for r in &rows {
+            cleanup(pool, &r.id).await;
+        }
+    }
+
+    // ─── re-onboard re-enables a disabled source ─────────────────────────────
+
+    /// Re-onboarding a source that was previously disabled (`NotConfigured`) must
+    /// re-enable it (→ `Configured`), not silently skip it as already-onboarded.
+    #[tokio::test]
+    async fn test_onboard_reenables_disabled_source() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let hostname = format!("srv-reonb-{}.ryuki.local", uuid::Uuid::new_v4());
+        let sources = vec![build_source(
+            &hostname,
+            "DEFRA",
+            ryuki_engine::log_forwarder::LogSourceType::Syslog,
+        )];
+
+        // Onboard, then disable → the Syslog row is NotConfigured.
+        crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+            .await
+            .expect("onboard failed");
+        crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+            .await
+            .expect("disable failed");
+        let after_disable = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .expect("list failed");
+        assert!(
+            after_disable
+                .iter()
+                .all(|r| r.status == ryuki_engine::log_forwarder::ForwardingStatus::NotConfigured),
+            "row must be NotConfigured after disable"
+        );
+
+        // Re-onboard the same source — it must be re-enabled, not skipped.
+        let reonboarded = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+            .await
+            .expect("re-onboard failed");
+        assert_eq!(
+            reonboarded.len(),
+            1,
+            "re-onboard must re-enable the disabled source"
+        );
+        assert_eq!(
+            reonboarded[0].status,
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+            "re-enabled source must be Configured"
+        );
+
+        let rows = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .expect("list failed");
+        assert!(
+            rows.iter()
+                .all(|r| r.status == ryuki_engine::log_forwarder::ForwardingStatus::Configured),
+            "DB row must be Configured after re-onboard"
+        );
+
+        for r in &rows {
+            cleanup(pool, &r.id).await;
+        }
+    }
+
+    // ─── disable_all_for_hostname is atomic + idempotent ─────────────────────
+
+    /// `disable_all_for_hostname` transitions every still-active source for a
+    /// hostname to NotConfigured in one atomic step, returns the rows it changed,
+    /// and a second call is a no-op.
+    #[tokio::test]
+    async fn test_disable_all_for_hostname() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let hostname = format!("srv-dis-{}.ryuki.local", uuid::Uuid::new_v4());
+        // One Configured + one Active source for the host (both non-NotConfigured).
+        let mut s1 = build_source(
+            &hostname,
+            "GBLON",
+            ryuki_engine::log_forwarder::LogSourceType::Syslog,
+        );
+        let mut s2 = build_source(
+            &hostname,
+            "GBLON",
+            ryuki_engine::log_forwarder::LogSourceType::Auditd,
+        );
+        s2.status = ryuki_engine::log_forwarder::ForwardingStatus::Active;
+        s1.status = ryuki_engine::log_forwarder::ForwardingStatus::Configured;
+        crate::repos::log_forwarders::onboard_sources(pool, &hostname, &[s1, s2])
+            .await
+            .expect("onboard_sources failed");
+
+        let disabled = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+            .await
+            .expect("disable failed");
+        assert_eq!(disabled.len(), 2, "both active sources must be disabled");
+        assert!(
+            disabled
+                .iter()
+                .all(|d| d.status == ryuki_engine::log_forwarder::ForwardingStatus::NotConfigured),
+            "returned rows must be NotConfigured"
+        );
+
+        let rows = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .expect("list failed");
+        assert!(
+            rows.iter()
+                .all(|r| r.status == ryuki_engine::log_forwarder::ForwardingStatus::NotConfigured),
+            "all rows must be NotConfigured after disable"
+        );
+
+        // Idempotent: a second disable changes nothing.
+        let again = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+            .await
+            .expect("second disable failed");
+        assert!(again.is_empty(), "re-disable must change nothing");
+
+        for r in &rows {
+            cleanup(pool, &r.id).await;
+        }
+    }
+
+    // ─── UNIQUE (hostname, source_type) constraint ───────────────────────────
+
+    /// The `(hostname, source_type)` UNIQUE constraint (migration 066) rejects a
+    /// duplicate forwarding row even via the low-level `insert`.
+    #[tokio::test]
+    async fn test_unique_hostname_source_type_constraint() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let hostname = format!("srv-uniq-{}.ryuki.local", uuid::Uuid::new_v4());
+        // make_source defaults source_type to Syslog, so both rows collide.
+        let first_id = format!("ls-uniq-{}", uuid::Uuid::new_v4());
+        let first = make_source(
+            &first_id,
+            &hostname,
+            "DEFRA",
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+        crate::repos::log_forwarders::insert(pool, &first)
+            .await
+            .expect("first insert must succeed");
+
+        let dup = make_source(
+            &format!("ls-uniq-{}", uuid::Uuid::new_v4()),
+            &hostname,
+            "DEFRA",
+            ryuki_engine::log_forwarder::ForwardingStatus::Configured,
+        );
+        let result = crate::repos::log_forwarders::insert(pool, &dup).await;
+        assert!(
+            result.is_err(),
+            "duplicate (hostname, source_type) must violate the UNIQUE constraint"
+        );
+
+        cleanup(pool, &first_id).await;
     }
 }
