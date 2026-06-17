@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RepositoryType {
@@ -72,7 +71,10 @@ pub struct RemediationPlan {
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
-fn seed_repositories() -> Vec<ImmutabilityCheck> {
+/// Test fixture: returns a set of seed repositories for use in unit tests.
+/// Production code loads from the database via the repo layer.
+#[cfg(test)]
+pub fn seed_repositories() -> Vec<ImmutabilityCheck> {
     let now = chrono::Utc::now();
     vec![
         ImmutabilityCheck {
@@ -122,15 +124,20 @@ fn seed_repositories() -> Vec<ImmutabilityCheck> {
     ]
 }
 
-static REPOSITORY_STORE: std::sync::LazyLock<Mutex<Vec<ImmutabilityCheck>>> =
-    std::sync::LazyLock::new(|| Mutex::new(seed_repositories()));
-
-pub fn check_immutability(repository_id: &str) -> Result<ImmutabilityCheck, String> {
+/// Check immutability status for a single repository. Looks up the check by
+/// `repository_id` in the provided slice, updates `last_verified` to now, and
+/// recomputes `status` based on `immutability_enabled`.
+///
+/// Returns `Err` when the slice contains no matching id, or when `repository_id`
+/// is empty. The caller is responsible for loading the slice from the DB.
+pub fn check_immutability(
+    repository_id: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<ImmutabilityCheck, String> {
     if repository_id.is_empty() {
         return Err("repository_id cannot be empty".into());
     }
-    let store = REPOSITORY_STORE.lock().unwrap();
-    let repo = store
+    let repo = checks
         .iter()
         .find(|r| r.id == repository_id)
         .ok_or_else(|| format!("Repository {} not found", repository_id))?;
@@ -144,12 +151,20 @@ pub fn check_immutability(repository_id: &str) -> Result<ImmutabilityCheck, Stri
     Ok(updated)
 }
 
-pub fn check_retention_lock(repository_id: &str) -> Result<ImmutabilityCheck, String> {
+/// Check retention lock status for a single repository. Looks up the check by
+/// `repository_id` in the provided slice, updates `last_verified` to now, and
+/// recomputes `status` based on `retention_lock_set` and `immutability_enabled`.
+///
+/// Returns `Err` when the slice contains no matching id, or when `repository_id`
+/// is empty.
+pub fn check_retention_lock(
+    repository_id: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<ImmutabilityCheck, String> {
     if repository_id.is_empty() {
         return Err("repository_id cannot be empty".into());
     }
-    let store = REPOSITORY_STORE.lock().unwrap();
-    let repo = store
+    let repo = checks
         .iter()
         .find(|r| r.id == repository_id)
         .ok_or_else(|| format!("Repository {} not found", repository_id))?;
@@ -167,12 +182,20 @@ pub fn check_retention_lock(repository_id: &str) -> Result<ImmutabilityCheck, St
     Ok(updated)
 }
 
-pub fn check_air_gap(repository_id: &str) -> Result<ImmutabilityCheck, String> {
+/// Check air-gap eligibility for a single repository. Looks up the check by
+/// `repository_id` in the provided slice, updates `last_verified` to now, and
+/// sets `status` to `AtRisk` when the repository type is not air-gap-eligible.
+///
+/// Returns `Err` when the slice contains no matching id, or when `repository_id`
+/// is empty.
+pub fn check_air_gap(
+    repository_id: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<ImmutabilityCheck, String> {
     if repository_id.is_empty() {
         return Err("repository_id cannot be empty".into());
     }
-    let store = REPOSITORY_STORE.lock().unwrap();
-    let repo = store
+    let repo = checks
         .iter()
         .find(|r| r.id == repository_id)
         .ok_or_else(|| format!("Repository {} not found", repository_id))?;
@@ -191,7 +214,15 @@ pub fn check_air_gap(repository_id: &str) -> Result<ImmutabilityCheck, String> {
     Ok(updated)
 }
 
-pub fn verify_all_repositories(site: &str) -> Result<Vec<ImmutabilityCheck>, String> {
+/// Verify all repositories for the given `site`. Filters the provided slice to
+/// the site's repositories, updates `last_verified` to now on each, and returns
+/// the results.
+///
+/// Returns `Err` when `site` is empty or unknown.
+pub fn verify_all_repositories(
+    site: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<Vec<ImmutabilityCheck>, String> {
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
@@ -199,8 +230,7 @@ pub fn verify_all_repositories(site: &str) -> Result<Vec<ImmutabilityCheck>, Str
         return Err(format!("Unknown site: {}", site));
     }
 
-    let store = REPOSITORY_STORE.lock().unwrap();
-    let results: Vec<ImmutabilityCheck> = store
+    let results: Vec<ImmutabilityCheck> = checks
         .iter()
         .filter(|r| r.site == site)
         .map(|r| {
@@ -213,7 +243,14 @@ pub fn verify_all_repositories(site: &str) -> Result<Vec<ImmutabilityCheck>, Str
     Ok(results)
 }
 
-pub fn get_compliance_report(site: &str) -> Result<ComplianceReport, String> {
+/// Generate a compliance report for the given `site`. Filters the provided
+/// slice to the site's repositories and aggregates counts by status.
+///
+/// Returns `Err` when `site` is empty or unknown.
+pub fn get_compliance_report(
+    site: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<ComplianceReport, String> {
     if site.is_empty() {
         return Err("site cannot be empty".into());
     }
@@ -221,9 +258,8 @@ pub fn get_compliance_report(site: &str) -> Result<ComplianceReport, String> {
         return Err(format!("Unknown site: {}", site));
     }
 
-    let store = REPOSITORY_STORE.lock().unwrap();
     let site_repos: Vec<ImmutabilityCheck> =
-        store.iter().filter(|r| r.site == site).cloned().collect();
+        checks.iter().filter(|r| r.site == site).cloned().collect();
 
     let total = site_repos.len();
     let compliant = site_repos
@@ -250,18 +286,20 @@ pub fn get_compliance_report(site: &str) -> Result<ComplianceReport, String> {
     })
 }
 
-pub fn get_noncompliant() -> Vec<ImmutabilityCheck> {
-    let store = REPOSITORY_STORE.lock().unwrap();
-    store
+/// Return all non-compliant repositories from the provided slice.
+pub fn get_noncompliant(checks: &[ImmutabilityCheck]) -> Vec<ImmutabilityCheck> {
+    checks
         .iter()
         .filter(|r| r.status == ComplianceStatus::NonCompliant)
         .cloned()
         .collect()
 }
 
-pub fn get_retention_risk() -> Vec<ImmutabilityCheck> {
-    let store = REPOSITORY_STORE.lock().unwrap();
-    store
+/// Return all repositories at retention risk from the provided slice.
+/// A repository is at risk when its status is not Compliant AND either
+/// `min_retention_days < 30` or `retention_lock_set` is false.
+pub fn get_retention_risk(checks: &[ImmutabilityCheck]) -> Vec<ImmutabilityCheck> {
+    checks
         .iter()
         .filter(|r| {
             r.status != ComplianceStatus::Compliant
@@ -271,12 +309,20 @@ pub fn get_retention_risk() -> Vec<ImmutabilityCheck> {
         .collect()
 }
 
-pub fn get_remediation_plan(repository_id: &str) -> Result<RemediationPlan, String> {
+/// Generate a remediation plan for a single repository. Looks up the check by
+/// `repository_id` in the provided slice and returns a plan describing the
+/// issues and suggested actions.
+///
+/// Returns `Err` when the slice contains no matching id, or when `repository_id`
+/// is empty.
+pub fn get_remediation_plan(
+    repository_id: &str,
+    checks: &[ImmutabilityCheck],
+) -> Result<RemediationPlan, String> {
     if repository_id.is_empty() {
         return Err("repository_id cannot be empty".into());
     }
-    let store = REPOSITORY_STORE.lock().unwrap();
-    let repo = store
+    let repo = checks
         .iter()
         .find(|r| r.id == repository_id)
         .ok_or_else(|| format!("Repository {} not found", repository_id))?;
@@ -338,7 +384,8 @@ mod tests {
 
     #[test]
     fn test_check_immutability_compliant() {
-        let result = check_immutability("imm-00000000-0000-0000-0000-000000000001")
+        let repos = seed_repositories();
+        let result = check_immutability("imm-00000000-0000-0000-0000-000000000001", &repos)
             .expect("should find repo");
         assert_eq!(result.repository_name, "repo-defra-storeonce-01");
         assert!(result.immutability_enabled);
@@ -347,27 +394,31 @@ mod tests {
 
     #[test]
     fn test_check_immutability_noncompliant() {
-        let result = check_immutability("imm-00000000-0000-0000-0000-000000000003")
+        let repos = seed_repositories();
+        let result = check_immutability("imm-00000000-0000-0000-0000-000000000003", &repos)
             .expect("should find repo");
         assert_eq!(result.status, ComplianceStatus::NonCompliant);
     }
 
     #[test]
     fn test_check_immutability_not_found() {
-        let result = check_immutability("nonexistent-id");
+        let repos = seed_repositories();
+        let result = check_immutability("nonexistent-id", &repos);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
     fn test_check_immutability_empty_id() {
-        let result = check_immutability("");
+        let repos = seed_repositories();
+        let result = check_immutability("", &repos);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_check_retention_lock_at_risk() {
-        let result = check_retention_lock("imm-00000000-0000-0000-0000-000000000002")
+        let repos = seed_repositories();
+        let result = check_retention_lock("imm-00000000-0000-0000-0000-000000000002", &repos)
             .expect("should find repo");
         assert!(!result.retention_lock_set);
         assert_eq!(result.status, ComplianceStatus::AtRisk);
@@ -375,34 +426,39 @@ mod tests {
 
     #[test]
     fn test_check_air_gap_storeonce_at_risk() {
-        let result =
-            check_air_gap("imm-00000000-0000-0000-0000-000000000001").expect("should find repo");
+        let repos = seed_repositories();
+        let result = check_air_gap("imm-00000000-0000-0000-0000-000000000001", &repos)
+            .expect("should find repo");
         assert_eq!(result.status, ComplianceStatus::AtRisk);
     }
 
     #[test]
     fn test_verify_all_repositories_for_site() {
-        let results = verify_all_repositories("DEFRA").expect("should return results");
+        let repos = seed_repositories();
+        let results = verify_all_repositories("DEFRA", &repos).expect("should return results");
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.site == "DEFRA"));
     }
 
     #[test]
     fn test_verify_all_repositories_unknown_site() {
-        let result = verify_all_repositories("UNKNOWN");
+        let repos = seed_repositories();
+        let result = verify_all_repositories("UNKNOWN", &repos);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown site"));
     }
 
     #[test]
     fn test_verify_all_repositories_empty_site() {
-        let result = verify_all_repositories("");
+        let repos = seed_repositories();
+        let result = verify_all_repositories("", &repos);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_compliance_report() {
-        let report = get_compliance_report("DEFRA").expect("should generate report");
+        let repos = seed_repositories();
+        let report = get_compliance_report("DEFRA", &repos).expect("should generate report");
         assert_eq!(report.site, "DEFRA");
         assert!(report.total_repositories > 0);
         assert!(
@@ -412,13 +468,15 @@ mod tests {
 
     #[test]
     fn test_get_compliance_report_unknown_site() {
-        let result = get_compliance_report("UNKNOWN");
+        let repos = seed_repositories();
+        let result = get_compliance_report("UNKNOWN", &repos);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_noncompliant() {
-        let noncompliant = get_noncompliant();
+        let repos = seed_repositories();
+        let noncompliant = get_noncompliant(&repos);
         assert!(!noncompliant.is_empty());
         assert!(
             noncompliant
@@ -433,7 +491,8 @@ mod tests {
 
     #[test]
     fn test_get_retention_risk() {
-        let at_risk = get_retention_risk();
+        let repos = seed_repositories();
+        let at_risk = get_retention_risk(&repos);
         assert!(!at_risk.is_empty());
         assert!(
             at_risk
@@ -444,7 +503,8 @@ mod tests {
 
     #[test]
     fn test_get_remediation_plan_noncompliant() {
-        let plan = get_remediation_plan("imm-00000000-0000-0000-0000-000000000003")
+        let repos = seed_repositories();
+        let plan = get_remediation_plan("imm-00000000-0000-0000-0000-000000000003", &repos)
             .expect("should return plan");
         assert_eq!(plan.current_status, ComplianceStatus::NonCompliant);
         assert!(plan.priority.contains("P1"));
@@ -459,7 +519,8 @@ mod tests {
 
     #[test]
     fn test_get_remediation_plan_at_risk() {
-        let plan = get_remediation_plan("imm-00000000-0000-0000-0000-000000000002")
+        let repos = seed_repositories();
+        let plan = get_remediation_plan("imm-00000000-0000-0000-0000-000000000002", &repos)
             .expect("should return plan");
         assert_eq!(plan.current_status, ComplianceStatus::AtRisk);
         assert!(
@@ -471,7 +532,8 @@ mod tests {
 
     #[test]
     fn test_get_remediation_plan_not_found() {
-        let result = get_remediation_plan("nonexistent-id");
+        let repos = seed_repositories();
+        let result = get_remediation_plan("nonexistent-id", &repos);
         assert!(result.is_err());
     }
 

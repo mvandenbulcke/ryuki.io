@@ -7298,36 +7298,46 @@ async fn protect_immutability_air_gap() -> Json<Value> {
 
 // ─── Immutability Compliance Engine Handlers ───
 
-async fn immutability_check(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match immutability_compliance::check_immutability(&id) {
-        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
-    }
+async fn immutability_check(Path(id): Path<String>) -> ApiResult {
+    let check = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&id))?,
+        None => return Err(status_404(&id)),
+    };
+    let result = immutability_compliance::check_immutability(&id, std::slice::from_ref(&check))
+        .map_err(|e| status_404(&e))?;
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_retention_lock(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match immutability_compliance::check_retention_lock(&id) {
-        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
-    }
+async fn immutability_retention_lock(Path(id): Path<String>) -> ApiResult {
+    let check = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&id))?,
+        None => return Err(status_404(&id)),
+    };
+    let result = immutability_compliance::check_retention_lock(&id, std::slice::from_ref(&check))
+        .map_err(|e| status_404(&e))?;
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_air_gap(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match immutability_compliance::check_air_gap(&id) {
-        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
-    }
+async fn immutability_air_gap(Path(id): Path<String>) -> ApiResult {
+    let check = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&id))?,
+        None => return Err(status_404(&id)),
+    };
+    let result = immutability_compliance::check_air_gap(&id, std::slice::from_ref(&check))
+        .map_err(|e| status_404(&e))?;
+    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_verify_all(
-    Query(q): Query<ImmutabilityVerifyAllQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn immutability_verify_all(Query(q): Query<ImmutabilityVerifyAllQuery>) -> ApiResult {
     let site = q.site.unwrap_or_default();
     if site.is_empty() {
         return Err((
@@ -7335,15 +7345,18 @@ async fn immutability_verify_all(
             Json(json!({"error": "Query parameter 'site' is required"})),
         ));
     }
-    match immutability_compliance::verify_all_repositories(&site) {
-        Ok(repos) => Ok(Json(serde_json::to_value(repos).unwrap())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+    let checks = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::list_by_site(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let repos = immutability_compliance::verify_all_repositories(&site, &checks)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_compliance_report(
-    Query(q): Query<ImmutabilityComplianceQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn immutability_compliance_report(Query(q): Query<ImmutabilityComplianceQuery>) -> ApiResult {
     let site = q.site.unwrap_or_default();
     if site.is_empty() {
         return Err((
@@ -7351,29 +7364,49 @@ async fn immutability_compliance_report(
             Json(json!({"error": "Query parameter 'site' is required"})),
         ));
     }
-    match immutability_compliance::get_compliance_report(&site) {
-        Ok(report) => Ok(Json(serde_json::to_value(report).unwrap())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+    let checks = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::list_by_site(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let report = immutability_compliance::get_compliance_report(&site, &checks)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
-async fn immutability_noncompliant() -> Json<Value> {
-    let repos = immutability_compliance::get_noncompliant();
-    Json(serde_json::to_value(repos).unwrap())
+async fn immutability_noncompliant() -> ApiResult {
+    let checks = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let repos = immutability_compliance::get_noncompliant(&checks);
+    Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_retention_risk() -> Json<Value> {
-    let repos = immutability_compliance::get_retention_risk();
-    Json(serde_json::to_value(repos).unwrap())
+async fn immutability_retention_risk() -> ApiResult {
+    let checks = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let repos = immutability_compliance::get_retention_risk(&checks);
+    Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_remediation(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match immutability_compliance::get_remediation_plan(&id) {
-        Ok(plan) => Ok(Json(serde_json::to_value(plan).unwrap())),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
-    }
+async fn immutability_remediation(Path(id): Path<String>) -> ApiResult {
+    let checks = match get_db() {
+        Some(pool) => crate::repos::immutability_compliance::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => return Err(status_404(&id)),
+    };
+    let plan =
+        immutability_compliance::get_remediation_plan(&id, &checks).map_err(|e| status_404(&e))?;
+    Ok(Json(serde_json::to_value(plan).unwrap_or_default()))
 }
 
 async fn immutability_contract() -> Json<Value> {
@@ -9433,68 +9466,99 @@ struct AnalyticsTrendQuery {
     metric: Option<String>,
 }
 
-async fn analytics_capacity(
-    Query(params): Query<AnalyticsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_capacity(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    cost_capacity::get_site_capacity(site)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    cost_capacity::get_site_capacity(site, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_capacity_cluster(
-    Query(params): Query<AnalyticsClusterQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_capacity_cluster(Query(params): Query<AnalyticsClusterQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let cluster = params.cluster.as_deref().unwrap_or("defra-general-cluster");
-    cost_capacity::get_cluster_capacity(site, cluster)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    cost_capacity::get_cluster_capacity(site, cluster, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_capacity_forecast(
-    Query(params): Query<AnalyticsForecastQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_capacity_forecast(Query(params): Query<AnalyticsForecastQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let months = params.months.unwrap_or(6);
-    cost_capacity::forecast_capacity(site, months)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    cost_capacity::forecast_capacity(site, months, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_cost_summary(
-    Query(params): Query<AnalyticsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_cost_summary(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    cost_capacity::get_cost_summary(site)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let pricing = cost_capacity::default_pricing();
+    cost_capacity::get_cost_summary(site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_waste(
-    Query(params): Query<AnalyticsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_waste(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    cost_capacity::get_waste_report(site)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let pricing = cost_capacity::default_pricing();
+    cost_capacity::get_waste_report(site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_rightsizing(
-    Query(params): Query<AnalyticsSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_rightsizing(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    cost_capacity::get_rightsizing_recommendations(site)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let pricing = cost_capacity::default_pricing();
+    cost_capacity::get_rightsizing_recommendations(site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_trend(
-    Query(params): Query<AnalyticsTrendQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn analytics_trend(Query(params): Query<AnalyticsTrendQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let metric = params.metric.as_deref().unwrap_or("cpu");
-    cost_capacity::get_trend_report(site, metric)
+    let vms = match crate::database::get_db() {
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    cost_capacity::get_trend_report(site, metric, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
