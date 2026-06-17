@@ -14,6 +14,7 @@
 pub mod ad_computers;
 pub mod backup_coverage_reports;
 pub mod certificates;
+pub mod datacenter_readiness;
 pub mod decommissions;
 pub mod file_share_ntfs;
 pub mod gmsa_accounts;
@@ -21,6 +22,7 @@ pub mod golden_images;
 pub mod hardware_assets;
 pub mod log_forwarders;
 pub mod patch_waves;
+pub mod repository_capacity;
 pub mod restore_requests;
 pub mod snapshots;
 pub mod synthetic_health;

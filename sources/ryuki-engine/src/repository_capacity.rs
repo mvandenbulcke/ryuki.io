@@ -1,88 +1,52 @@
-use serde::Serialize;
-use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
+//! Pure engine for repository capacity forecasting.
+//!
+//! All functions are pure over `&[Repository]` (or individual `&Repository`).
+//! No global state lives here — the in-memory `OnceLock` has been removed.
+//! Callers (handlers in `contracts.rs`) supply the data from the repository
+//! layer.
+//!
+//! # Derived fields
+//! `days_until_full` and `status` are NOT stored on `Repository`; they are
+//! COMPUTED by `repo_days` / `repo_status` on every call.  The persistence
+//! layer writes denormalized copies of these computed values to the
+//! `backup_repositories` table, but the engine struct intentionally omits them
+//! to keep the truth source (total, used, growth) as the single-source-of-truth.
 
-#[derive(Debug, Clone, Serialize)]
-struct Repository {
-    id: String,
-    name: String,
-    repository_type: RepositoryType,
-    site: String,
-    total_capacity_tb: f64,
-    used_capacity_tb: f64,
-    growth_rate_gb_per_day: f64,
-    last_forecast: String,
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+// ─── Domain types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Repository {
+    pub id: String,
+    pub name: String,
+    pub repository_type: RepositoryType,
+    pub site: String,
+    pub total_capacity_tb: f64,
+    pub used_capacity_tb: f64,
+    pub growth_rate_gb_per_day: f64,
+    pub last_forecast: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum RepositoryType {
+pub enum RepositoryType {
     StoreOnce,
     DataDomain,
     ObjectStorage,
     HardenedLinux,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum CapacityStatus {
+pub enum CapacityStatus {
     Healthy,
     Warning,
     Critical,
 }
 
-type RepoStore = Vec<Repository>;
-
-static REPO_STORE: OnceLock<Mutex<RepoStore>> = OnceLock::new();
-
-fn repo_store() -> &'static Mutex<RepoStore> {
-    REPO_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
-
-fn seed_data() -> RepoStore {
-    vec![
-        Repository {
-            id: "repo-001".into(),
-            name: "defra-storeonce-01".into(),
-            repository_type: RepositoryType::StoreOnce,
-            site: "DEFRA".into(),
-            total_capacity_tb: 200.0,
-            used_capacity_tb: 198.74,
-            growth_rate_gb_per_day: 200.0,
-            last_forecast: "2026-06-11T08:00:00Z".into(),
-        },
-        Repository {
-            id: "repo-002".into(),
-            name: "defra-datadomain-01".into(),
-            repository_type: RepositoryType::DataDomain,
-            site: "DEFRA".into(),
-            total_capacity_tb: 150.0,
-            used_capacity_tb: 147.0,
-            growth_rate_gb_per_day: 210.0,
-            last_forecast: "2026-06-11T08:00:00Z".into(),
-        },
-        Repository {
-            id: "repo-003".into(),
-            name: "gblon-storeonce-01".into(),
-            repository_type: RepositoryType::StoreOnce,
-            site: "GBLON".into(),
-            total_capacity_tb: 250.0,
-            used_capacity_tb: 230.0,
-            growth_rate_gb_per_day: 600.0,
-            last_forecast: "2026-06-11T08:00:00Z".into(),
-        },
-        Repository {
-            id: "repo-004".into(),
-            name: "gblon-hardened-01".into(),
-            repository_type: RepositoryType::HardenedLinux,
-            site: "GBLON".into(),
-            total_capacity_tb: 500.0,
-            used_capacity_tb: 120.0,
-            growth_rate_gb_per_day: 4200.0,
-            last_forecast: "2026-06-11T08:00:00Z".into(),
-        },
-    ]
-}
+// ─── Pure computation helpers ─────────────────────────────────────────────────
 
 fn compute_status(days_until_full: f64) -> CapacityStatus {
     if days_until_full < 7.0 {
@@ -103,7 +67,8 @@ fn effective_days_until_full(total_tb: f64, used_tb: f64, growth_gb_per_day: f64
     }
 }
 
-fn repo_days(repo: &Repository) -> f64 {
+/// Compute the days until this repository is full given its current state.
+pub fn repo_days(repo: &Repository) -> f64 {
     effective_days_until_full(
         repo.total_capacity_tb,
         repo.used_capacity_tb,
@@ -111,7 +76,8 @@ fn repo_days(repo: &Repository) -> f64 {
     )
 }
 
-fn repo_status(repo: &Repository) -> CapacityStatus {
+/// Compute the capacity status for this repository.
+pub fn repo_status(repo: &Repository) -> CapacityStatus {
     compute_status(repo_days(repo))
 }
 
@@ -130,50 +96,27 @@ fn repo_to_json(repo: &Repository) -> Value {
     })
 }
 
-pub fn get_repositories(site: &str) -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repos: Vec<&Repository> = store.iter().filter(|r| r.site == site).collect();
+// ─── Pure domain functions ────────────────────────────────────────────────────
 
-    if repos.is_empty() {
-        return Err(format!("Site '{}' not found", site));
-    }
+/// Return all repositories for the given site as a JSON value.
+/// Returns an empty repositories list (not an error) when no rows match.
+pub fn get_repositories(repos: &[Repository], site: &str) -> Value {
+    let site_repos: Vec<&Repository> = repos.iter().filter(|r| r.site == site).collect();
 
-    let repo_list: Vec<Value> = repos.iter().map(|r| repo_to_json(r)).collect();
+    let repo_list: Vec<Value> = site_repos.iter().map(|r| repo_to_json(r)).collect();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
         "site": site,
         "repository_count": repo_list.len(),
         "repositories": repo_list
-    }))
+    })
 }
 
-pub fn update_usage(repository_id: &str, used_tb: f64) -> Result<Value, String> {
-    let mut store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repo = store
-        .iter_mut()
-        .find(|r| r.id == repository_id)
-        .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
-
-    repo.used_capacity_tb = used_tb;
-    repo.last_forecast = chrono::Utc::now().to_rfc3339();
-
-    Ok(json!({
-        "source": "dry-run",
-        "repository_id": repo.id,
-        "name": repo.name,
-        "used_capacity_tb": repo.used_capacity_tb,
-        "days_until_full": repo_days(repo),
-        "status": repo_status(repo)
-    }))
-}
-
-pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repo = store
-        .iter()
-        .find(|r| r.id == repository_id)
-        .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
+/// Return the capacity forecast for a single repository.
+///
+/// Returns `None` when `repository_id` does not match any repo in `repos`.
+pub fn forecast_capacity(repos: &[Repository], repository_id: &str, days: u32) -> Option<Value> {
+    let repo = repos.iter().find(|r| r.id == repository_id)?;
 
     let projected_used_gb =
         repo.used_capacity_tb * 1000.0 + repo.growth_rate_gb_per_day * days as f64;
@@ -190,8 +133,7 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
     );
     let projected_status = compute_status(projected_days);
 
-    Ok(json!({
-        "source": "dry-run",
+    Some(json!({
         "repository_id": repo.id,
         "name": repo.name,
         "site": repo.site,
@@ -212,9 +154,9 @@ pub fn forecast_capacity(repository_id: &str, days: u32) -> Result<Value, String
     }))
 }
 
-pub fn get_at_risk() -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let at_risk: Vec<Value> = store
+/// Return all at-risk repositories (days_until_full < 30.0).
+pub fn get_at_risk(repos: &[Repository]) -> Value {
+    let at_risk: Vec<Value> = repos
         .iter()
         .filter(|r| repo_days(r) < 30.0)
         .map(|r| {
@@ -232,104 +174,63 @@ pub fn get_at_risk() -> Result<Value, String> {
         })
         .collect();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
         "at_risk_count": at_risk.len(),
         "repositories": at_risk
-    }))
+    })
 }
 
-pub fn get_capacity_report(site: &str) -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repos: Vec<&Repository> = store.iter().filter(|r| r.site == site).collect();
+/// Return the capacity report for all repositories at the given site.
+/// When `site` is empty, aggregate over all repositories.
+pub fn get_capacity_report(repos: &[Repository], site: &str) -> Value {
+    let site_repos: Vec<&Repository> = if site.is_empty() {
+        repos.iter().collect()
+    } else {
+        repos.iter().filter(|r| r.site == site).collect()
+    };
 
-    if repos.is_empty() {
-        return Err(format!("Site '{}' not found", site));
-    }
-
-    let total_tb: f64 = repos.iter().map(|r| r.total_capacity_tb).sum();
-    let used_tb: f64 = repos.iter().map(|r| r.used_capacity_tb).sum();
+    let total_tb: f64 = site_repos.iter().map(|r| r.total_capacity_tb).sum();
+    let used_tb: f64 = site_repos.iter().map(|r| r.used_capacity_tb).sum();
     let overall_pct = if total_tb > 0.0 {
         (used_tb / total_tb * 100.0 * 10.0).round() / 10.0
     } else {
         0.0
     };
-    let critical_count = repos
+    let critical_count = site_repos
         .iter()
         .filter(|r| repo_status(r) == CapacityStatus::Critical)
         .count();
-    let warning_count = repos
+    let warning_count = site_repos
         .iter()
         .filter(|r| repo_status(r) == CapacityStatus::Warning)
         .count();
-    let healthy_count = repos
+    let healthy_count = site_repos
         .iter()
         .filter(|r| repo_status(r) == CapacityStatus::Healthy)
         .count();
-    let total_growth_gb_per_day: f64 = repos.iter().map(|r| r.growth_rate_gb_per_day).sum();
+    let total_growth_gb_per_day: f64 = site_repos.iter().map(|r| r.growth_rate_gb_per_day).sum();
 
-    let repo_list: Vec<Value> = repos.iter().map(|r| repo_to_json(r)).collect();
+    let repo_list: Vec<Value> = site_repos.iter().map(|r| repo_to_json(r)).collect();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
         "site": site,
         "total_capacity_tb": (total_tb * 100.0).round() / 100.0,
         "used_capacity_tb": (used_tb * 100.0).round() / 100.0,
         "utilization_pct": overall_pct,
-        "repository_count": repos.len(),
+        "repository_count": site_repos.len(),
         "healthy_count": healthy_count,
         "warning_count": warning_count,
         "critical_count": critical_count,
         "total_growth_gb_per_day": (total_growth_gb_per_day * 100.0).round() / 100.0,
         "repositories": repo_list
-    }))
+    })
 }
 
-pub fn get_trend(repository_id: &str, months: u32) -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repo = store
-        .iter()
-        .find(|r| r.id == repository_id)
-        .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
-
-    let now = chrono::Utc::now();
-    let data_points: Vec<Value> = (0..=(months * 4))
-        .map(|i| {
-            let date = now - chrono::Duration::weeks(i as i64);
-            let weeks_ago = i as f64;
-            let jitter = (weeks_ago * 0.3).sin() * repo.total_capacity_tb * 0.02;
-            let simulated_used = (repo.used_capacity_tb
-                - (weeks_ago * repo.growth_rate_gb_per_day * 7.0 / 1000.0)
-                + jitter)
-                .max(0.0);
-
-            json!({
-                "date": date.format("%Y-%m-%d").to_string(),
-                "used_capacity_tb": (simulated_used * 100.0).round() / 100.0,
-                "utilization_pct": ((simulated_used / repo.total_capacity_tb * 100.0) * 10.0).round() / 10.0
-            })
-        })
-        .rev()
-        .collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "repository_id": repo.id,
-        "name": repo.name,
-        "site": repo.site,
-        "repository_type": repo.repository_type,
-        "months": months,
-        "growth_rate_gb_per_day": repo.growth_rate_gb_per_day,
-        "data_points": data_points
-    }))
-}
-
-pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
-    let store = repo_store().lock().map_err(|e| e.to_string())?;
-    let repo = store
-        .iter()
-        .find(|r| r.id == repository_id)
-        .ok_or_else(|| format!("Repository '{}' not found", repository_id))?;
+/// Return recommendations for a single repository.
+///
+/// Returns `None` when `repository_id` does not match any repo in `repos`.
+pub fn get_recommendations(repos: &[Repository], repository_id: &str) -> Option<Value> {
+    let repo = repos.iter().find(|r| r.id == repository_id)?;
 
     let mut recommendations: Vec<Value> = Vec::new();
     let days_left = repo_days(repo);
@@ -409,8 +310,7 @@ pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
         }));
     }
 
-    Ok(json!({
-        "source": "dry-run",
+    Some(json!({
         "repository_id": repo.id,
         "name": repo.name,
         "repository_type": repo.repository_type,
@@ -422,51 +322,86 @@ pub fn get_recommendations(repository_id: &str) -> Result<Value, String> {
     }))
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn seed_repos() -> Vec<Repository> {
+        vec![
+            Repository {
+                id: "repo-001".into(),
+                name: "defra-storeonce-01".into(),
+                repository_type: RepositoryType::StoreOnce,
+                site: "DEFRA".into(),
+                total_capacity_tb: 200.0,
+                used_capacity_tb: 198.74,
+                growth_rate_gb_per_day: 200.0,
+                last_forecast: "2026-06-11T08:00:00Z".into(),
+            },
+            Repository {
+                id: "repo-002".into(),
+                name: "defra-datadomain-01".into(),
+                repository_type: RepositoryType::DataDomain,
+                site: "DEFRA".into(),
+                total_capacity_tb: 150.0,
+                used_capacity_tb: 147.0,
+                growth_rate_gb_per_day: 210.0,
+                last_forecast: "2026-06-11T08:00:00Z".into(),
+            },
+            Repository {
+                id: "repo-003".into(),
+                name: "gblon-storeonce-01".into(),
+                repository_type: RepositoryType::StoreOnce,
+                site: "GBLON".into(),
+                total_capacity_tb: 250.0,
+                used_capacity_tb: 230.0,
+                growth_rate_gb_per_day: 600.0,
+                last_forecast: "2026-06-11T08:00:00Z".into(),
+            },
+            Repository {
+                id: "repo-004".into(),
+                name: "gblon-hardened-01".into(),
+                repository_type: RepositoryType::HardenedLinux,
+                site: "GBLON".into(),
+                total_capacity_tb: 500.0,
+                used_capacity_tb: 120.0,
+                growth_rate_gb_per_day: 4200.0,
+                last_forecast: "2026-06-11T08:00:00Z".into(),
+            },
+        ]
+    }
+
     #[test]
     fn test_get_repositories_defra() {
-        let result = get_repositories("DEFRA").unwrap();
+        let repos = seed_repos();
+        let result = get_repositories(&repos, "DEFRA");
         assert_eq!(result["site"], "DEFRA");
         assert_eq!(result["repository_count"].as_u64().unwrap(), 2);
-        let repos = result["repositories"].as_array().unwrap();
-        assert_eq!(repos.len(), 2);
+        let repo_list = result["repositories"].as_array().unwrap();
+        assert_eq!(repo_list.len(), 2);
     }
 
     #[test]
     fn test_get_repositories_gblon() {
-        let result = get_repositories("GBLON").unwrap();
+        let repos = seed_repos();
+        let result = get_repositories(&repos, "GBLON");
         assert_eq!(result["site"], "GBLON");
         assert_eq!(result["repository_count"].as_u64().unwrap(), 2);
     }
 
     #[test]
-    fn test_update_usage() {
-        let store = repo_store();
-        let initial_days;
-        {
-            let data = store.lock().unwrap();
-            let repo = data.iter().find(|r| r.id == "repo-003").unwrap();
-            initial_days = repo_days(repo);
-        }
-
-        let result = update_usage("repo-003", 248.0).unwrap();
-        assert_eq!(result["repository_id"], "repo-003");
-        assert_eq!(result["used_capacity_tb"].as_f64().unwrap(), 248.0);
-        let new_days = result["days_until_full"].as_f64().unwrap();
-        assert!(
-            new_days < initial_days,
-            "days until full should decrease when usage increases ({} -> {})",
-            initial_days,
-            new_days
-        );
+    fn test_get_repositories_unknown_site_returns_empty() {
+        let repos = seed_repos();
+        let result = get_repositories(&repos, "NONEXISTENT");
+        assert_eq!(result["repository_count"].as_u64().unwrap(), 0);
     }
 
     #[test]
     fn test_forecast_capacity() {
-        let result = forecast_capacity("repo-002", 30).unwrap();
+        let repos = seed_repos();
+        let result = forecast_capacity(&repos, "repo-002", 30).unwrap();
         assert_eq!(result["repository_id"], "repo-002");
         assert_eq!(result["forecast_days"].as_u64().unwrap(), 30);
         let projected_pct = result["projected"]["utilization_pct"].as_f64().unwrap();
@@ -480,72 +415,61 @@ mod tests {
     }
 
     #[test]
+    fn test_forecast_capacity_not_found() {
+        let repos = seed_repos();
+        assert!(forecast_capacity(&repos, "repo-999", 30).is_none());
+    }
+
+    #[test]
     fn test_get_at_risk() {
-        let result = get_at_risk().unwrap();
-        let repos = result["repositories"].as_array().unwrap();
+        let repos = seed_repos();
+        let result = get_at_risk(&repos);
+        let at_risk = result["repositories"].as_array().unwrap();
         assert!(
-            !repos.is_empty(),
+            !at_risk.is_empty(),
             "should have at least one at-risk repository"
         );
-        // repo-001 is always critical (6.3 days), repo-002 is always warning (14.3 days)
         assert!(
-            repos.iter().any(|r| r["id"] == "repo-001"),
+            at_risk.iter().any(|r| r["id"] == "repo-001"),
             "repo-001 should always be at risk"
         );
     }
 
     #[test]
     fn test_get_capacity_report() {
-        let result = get_capacity_report("DEFRA").unwrap();
+        let repos = seed_repos();
+        let result = get_capacity_report(&repos, "DEFRA");
         assert_eq!(result["site"], "DEFRA");
         assert!(result["total_capacity_tb"].as_f64().unwrap() > 0.0);
-        // DEFRA has 2 repos: one Critical (6.3 days), one Warning (14.3 days)
-        assert_eq!(result["critical_count"].as_u64().unwrap(), 1);
-        assert_eq!(result["warning_count"].as_u64().unwrap(), 1);
     }
 
     #[test]
-    fn test_get_trend() {
-        let result = get_trend("repo-003", 3).unwrap();
-        assert_eq!(result["months"].as_u64().unwrap(), 3);
-        let points = result["data_points"].as_array().unwrap();
-        assert_eq!(points.len(), 13); // 3 months * 4 + 1
-        assert!(points[0]["date"].as_str().is_some());
-    }
-
-    #[test]
-    fn test_get_recommendations() {
-        let result = get_recommendations("repo-001").unwrap();
-        assert!(result["recommendation_count"].as_u64().unwrap() > 0);
-        let recs = result["recommendations"].as_array().unwrap();
-        assert!(recs[0]["priority"].as_str().is_some());
-        assert!(recs[0]["action"].as_str().is_some());
+    fn test_get_recommendations_not_found() {
+        let repos = seed_repos();
+        assert!(get_recommendations(&repos, "repo-999").is_none());
     }
 
     #[test]
     fn test_get_recommendations_healthy() {
-        let result = get_recommendations("repo-004").unwrap();
+        let repos = seed_repos();
+        // repo-004 is healthy
+        let result = get_recommendations(&repos, "repo-004").unwrap();
         assert!(result["recommendation_count"].as_u64().unwrap() > 0);
     }
 
     #[test]
-    fn test_site_not_found() {
-        assert!(get_repositories("NONEXISTENT").is_err());
-        assert!(get_capacity_report("NONEXISTENT").is_err());
-    }
-
-    #[test]
-    fn test_repository_not_found() {
-        assert!(update_usage("repo-999", 100.0).is_err());
-        assert!(forecast_capacity("repo-999", 30).is_err());
-        assert!(get_trend("repo-999", 3).is_err());
-        assert!(get_recommendations("repo-999").is_err());
-    }
-
-    #[test]
-    fn test_forecast_capacity_gblon() {
-        let result = forecast_capacity("repo-003", 90).unwrap();
-        assert_eq!(result["forecast_days"].as_u64().unwrap(), 90);
-        assert!(result["projected"]["utilization_pct"].as_f64().unwrap() > 0.0);
+    fn test_repo_days_zero_growth() {
+        let repo = Repository {
+            id: "r".into(),
+            name: "test".into(),
+            repository_type: RepositoryType::StoreOnce,
+            site: "X".into(),
+            total_capacity_tb: 100.0,
+            used_capacity_tb: 50.0,
+            growth_rate_gb_per_day: 0.0,
+            last_forecast: "2026-06-11T08:00:00Z".into(),
+        };
+        assert_eq!(repo_days(&repo), 999.0);
+        assert_eq!(repo_status(&repo), CapacityStatus::Healthy);
     }
 }

@@ -15668,7 +15668,10 @@ struct RepoCapacitySiteQuery {
 
 #[derive(Deserialize)]
 struct RepoCapacityUpdateBody {
-    used_tb: Option<f64>,
+    // The API/response field is `used_capacity_tb`; accept the legacy `used_tb`
+    // key too so existing callers keep working.
+    #[serde(alias = "used_tb")]
+    used_capacity_tb: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -15681,66 +15684,167 @@ struct RepoCapacityTrendQuery {
     months: Option<u32>,
 }
 
-async fn repo_capacity_list(
-    Query(params): Query<RepoCapacitySiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn repo_capacity_list(Query(params): Query<RepoCapacitySiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    repository_capacity::get_repositories(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let repos = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(repository_capacity::get_repositories(&repos, site)))
 }
 
 async fn repo_capacity_update(
     Path(id): Path<String>,
     Json(body): Json<RepoCapacityUpdateBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let used_tb = body.used_tb.unwrap_or(0.0);
-    repository_capacity::update_usage(&id, used_tb)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // used_capacity_tb is required: defaulting a missing value to 0.0 would
+    // durably zero a repository's usage on an empty/partial body.
+    let used_tb = match body.used_capacity_tb {
+        Some(v) if v.is_finite() && v >= 0.0 => v,
+        Some(_) => {
+            return Err(status_400(
+                "used_capacity_tb must be a finite, non-negative number",
+            ));
+        }
+        None => return Err(status_400("used_capacity_tb is required")),
+    };
+
+    // Load the repository first so we can validate it exists and recompute
+    // derived fields using the engine before persisting.
+    let repo = crate::repos::repository_capacity::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    // Build an updated model with the new usage so the engine can recompute
+    // days_until_full and status from the authoritative (total, used, growth).
+    let updated = ryuki_engine::repository_capacity::Repository {
+        used_capacity_tb: used_tb,
+        ..repo
+    };
+    let new_days = repository_capacity::repo_days(&updated);
+    let new_status = repository_capacity::repo_status(&updated);
+    let new_status_str = crate::repos::repository_capacity::capacity_status_str(&new_status);
+
+    let persisted = crate::repos::repository_capacity::update_usage(
+        pool,
+        &id,
+        used_tb,
+        new_days,
+        new_status_str,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+
+    Ok(Json(json!({
+        "repository_id": persisted.id,
+        "name": persisted.name,
+        "used_capacity_tb": persisted.used_capacity_tb,
+        "days_until_full": repository_capacity::repo_days(&persisted),
+        "status": repository_capacity::repo_status(&persisted),
+        "last_forecast": persisted.last_forecast,
+    })))
 }
 
 async fn repo_capacity_forecast(
     Path(id): Path<String>,
     Query(params): Query<RepoCapacityForecastQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let days = params.days.unwrap_or(30);
-    repository_capacity::forecast_capacity(&id, days)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let repos = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::get(pool, &id)
+            .await
+            .map_err(db_error)?
+            .map(|r| vec![r])
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    match repository_capacity::forecast_capacity(&repos, &id, days) {
+        Some(v) => Ok(Json(v)),
+        None => Err(status_404(&id)),
+    }
 }
 
-async fn repo_capacity_at_risk() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    repository_capacity::get_at_risk()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn repo_capacity_at_risk() -> ApiResult {
+    let repos = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(repository_capacity::get_at_risk(&repos)))
 }
 
-async fn repo_capacity_report(
-    Query(params): Query<RepoCapacitySiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn repo_capacity_report(Query(params): Query<RepoCapacitySiteQuery>) -> ApiResult {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    repository_capacity::get_capacity_report(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let repos = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(repository_capacity::get_capacity_report(&repos, site)))
 }
 
 async fn repo_capacity_trend(
     Path(id): Path<String>,
     Query(params): Query<RepoCapacityTrendQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let months = params.months.unwrap_or(3);
-    repository_capacity::get_trend(&id, months)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let (repo_opt, history) = match get_db() {
+        Some(pool) => {
+            let repo = crate::repos::repository_capacity::get(pool, &id)
+                .await
+                .map_err(db_error)?;
+            let hist = crate::repos::repository_capacity::list_history_for_repo(pool, &id, months)
+                .await
+                .map_err(db_error)?;
+            (repo, hist)
+        }
+        None => (None, Vec::new()),
+    };
+    let repo = repo_opt.ok_or_else(|| status_404(&id))?;
+
+    let data_points: Vec<Value> = history
+        .into_iter()
+        .map(|h| {
+            json!({
+                "snapshot_at": h.snapshot_at,
+                "used_capacity_tb": h.used_capacity_tb,
+                "utilization_pct": h.utilization_pct,
+                "days_until_full": h.days_until_full,
+                "status": h.status,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "repository_id": repo.id,
+        "name": repo.name,
+        "site": repo.site,
+        "repository_type": repo.repository_type,
+        "growth_rate_gb_per_day": repo.growth_rate_gb_per_day,
+        "data_points": data_points,
+    })))
 }
 
-async fn repo_capacity_recommendations(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    repository_capacity::get_recommendations(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn repo_capacity_recommendations(Path(id): Path<String>) -> ApiResult {
+    let repos = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::get(pool, &id)
+            .await
+            .map_err(db_error)?
+            .map(|r| vec![r])
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    match repository_capacity::get_recommendations(&repos, &id) {
+        Some(v) => Ok(Json(v)),
+        None => Err(status_404(&id)),
+    }
 }
 
 // ─── Hardware lifecycle handlers ───
@@ -19121,11 +19225,23 @@ struct DatacenterSiteQuery {
 }
 
 // ─── Datacenter Readiness handlers ───
+//
+// All handlers are reads. Pattern:
+//   - `get_db() == Some(pool)` → load checks from the repo, pass to engine fn.
+//     A repo error surfaces as 500 (`db_error`); do NOT mask it with
+//     `unwrap_or_default()`.
+//   - `get_db() == None`       → degrade to empty slice (no DB available).
 
 async fn datacenter_readiness_score_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::get_readiness_score(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::get_readiness_score(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -19133,21 +19249,39 @@ async fn datacenter_readiness_score_endpoint(
 async fn datacenter_site_report_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::get_site_report(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::get_site_report(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn datacenter_failing_checks_endpoint() -> Json<Value> {
-    Json(datacenter_readiness::get_failing_checks().unwrap_or_else(
-        |e| json!({"source": "dry-run", "error": e, "failing_count": 0, "failing_checks": []}),
-    ))
+async fn datacenter_failing_checks_endpoint() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::get_failing_checks(&checks)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 
 async fn datacenter_check_power_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::check_power(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::check_power(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -19155,7 +19289,13 @@ async fn datacenter_check_power_endpoint(
 async fn datacenter_check_cooling_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::check_cooling(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::check_cooling(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -19163,7 +19303,13 @@ async fn datacenter_check_cooling_endpoint(
 async fn datacenter_check_rack_space_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::check_rack_space(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::check_rack_space(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -19171,7 +19317,13 @@ async fn datacenter_check_rack_space_endpoint(
 async fn datacenter_check_switchports_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::check_switchports(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::check_switchports(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -19179,16 +19331,27 @@ async fn datacenter_check_switchports_endpoint(
 async fn datacenter_full_readiness_endpoint(
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    datacenter_readiness::run_full_readiness(&params.site)
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::run_full_readiness(&checks, &params.site)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn datacenter_sites_endpoint() -> Json<Value> {
-    Json(
-        datacenter_readiness::get_sites()
-            .unwrap_or_else(|e| json!({"source": "dry-run", "error": e, "sites": []})),
-    )
+async fn datacenter_sites_endpoint() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let checks = match get_db() {
+        Some(pool) => crate::repos::datacenter_readiness::list_all(pool)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    datacenter_readiness::get_sites(&checks)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 
 // ─── SQL Server Deployment request types ───
@@ -32012,5 +32175,161 @@ mod synthetic_health_db_tests {
 
         cleanup_result(pool, &result_id).await;
         cleanup_check(pool, &check_id_str).await;
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api datacenter_readiness_db_tests
+//
+// Tests SKIP when RYUKI_DATABASE_URL is unset; FAIL if the URL is set but
+// connect or migrate fails — a migration error must not be silently skipped.
+// This is a read-only domain — tests read seeded rows only and do NOT insert
+// or delete.
+#[cfg(test)]
+mod datacenter_readiness_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use ryuki_engine::datacenter_readiness::{CheckStatus, CheckType};
+    use sqlx::PgPool;
+
+    // Create a FRESH owned pool per test (like file_share_ntfs_db_tests) rather
+    // than reusing the process-wide `get_db()` static. The static pool is created
+    // inside the first #[tokio::test] runtime; reusing it from a later test's
+    // runtime yields stale connections and `PoolTimedOut`.
+    async fn global_pool() -> Option<PgPool> {
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("datacenter_readiness_db_tests: RYUKI_DATABASE_URL not set — skipping");
+                return None;
+            }
+        };
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("RYUKI_DATABASE_URL is set but connection failed");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply cleanly when RYUKI_DATABASE_URL is set");
+        Some(pool)
+    }
+
+    // ─── list_all returns seeded rows ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_all_non_empty() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let checks = crate::repos::datacenter_readiness::list_all(pool)
+            .await
+            .expect("list_all failed");
+
+        // Migration 040 seeds 18 rows (3 sites × 6 check types).
+        assert!(
+            checks.len() >= 18,
+            "expected at least 18 seeded rows, got {}",
+            checks.len()
+        );
+
+        // All returned models must have a non-empty UUID id (real DB key, not
+        // the old synthetic "dc-check-{site}-{type}" string).
+        for check in &checks {
+            assert!(
+                !check.id.is_empty(),
+                "check id must not be empty (site={}, type={:?})",
+                check.site,
+                check.check_type
+            );
+        }
+    }
+
+    // ─── list_by_site returns rows for that site only ─────────────────────────
+
+    #[tokio::test]
+    async fn test_list_by_site_returns_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let checks = crate::repos::datacenter_readiness::list_by_site(pool, "DEFRA")
+            .await
+            .expect("list_by_site failed");
+
+        // Migration 040 seeds exactly 6 rows for DEFRA.
+        assert_eq!(
+            checks.len(),
+            6,
+            "expected 6 seeded DEFRA rows, got {}",
+            checks.len()
+        );
+
+        for check in &checks {
+            assert_eq!(check.site, "DEFRA", "all returned rows must be for DEFRA");
+        }
+    }
+
+    // ─── into_model decodes kebab-case check_type and status correctly ────────
+
+    #[tokio::test]
+    async fn test_into_model_decodes_known_kebab_values() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let checks = crate::repos::datacenter_readiness::list_by_site(pool, "DEFRA")
+            .await
+            .expect("list_by_site failed");
+
+        // Find the power check (seeded as 'power' / 'passed').
+        let power = checks
+            .iter()
+            .find(|c| c.check_type == CheckType::Power)
+            .expect("DEFRA power check must exist");
+        assert_eq!(
+            power.status,
+            CheckStatus::Passed,
+            "DEFRA power status must decode to Passed"
+        );
+
+        // Find the rack-space check (seeded as 'rack-space' / 'warning') —
+        // this is the hyphenated variant that exercises kebab-case decode.
+        let rack = checks
+            .iter()
+            .find(|c| c.check_type == CheckType::RackSpace)
+            .expect("DEFRA rack-space check must exist");
+        assert_eq!(
+            rack.status,
+            CheckStatus::Warning,
+            "DEFRA rack-space status must decode to Warning"
+        );
+
+        // Verify the last_checked field is a valid RFC-3339 timestamp.
+        chrono::DateTime::parse_from_rfc3339(&power.last_checked)
+            .expect("last_checked must be valid RFC-3339");
+    }
+
+    // ─── unknown site returns empty vec ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_by_site_unknown_returns_empty() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let pool = &pool;
+
+        let checks = crate::repos::datacenter_readiness::list_by_site(pool, "NOSUCHSITE")
+            .await
+            .expect("list_by_site must not error for unknown site");
+        assert!(checks.is_empty(), "unknown site must return empty vec");
     }
 }
