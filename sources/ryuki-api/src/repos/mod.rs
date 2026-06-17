@@ -15,6 +15,7 @@ pub mod backup_coverage_reports;
 pub mod certificates;
 pub mod decommissions;
 pub mod gmsa_accounts;
+pub mod hardware_assets;
 pub mod patch_waves;
 pub mod restore_requests;
 pub mod snapshots;

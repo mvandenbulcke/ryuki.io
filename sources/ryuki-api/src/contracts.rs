@@ -15442,72 +15442,115 @@ async fn repo_capacity_recommendations(
 
 // ─── Hardware lifecycle handlers ───
 
-async fn hardware_inventory(Query(query): Query<HardwareInventoryQuery>) -> Json<Value> {
-    let site = query.site.as_deref().unwrap_or("");
-    let inventory = hardware_lifecycle::get_inventory(site);
-    Json(serde_json::to_value(inventory).unwrap())
-}
-
-async fn hardware_warranty_expiring() -> Json<Value> {
-    let expiring = hardware_lifecycle::get_warranty_expiring();
-    Json(serde_json::to_value(expiring).unwrap())
-}
-
-async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
-    match hardware_lifecycle::check_firmware_compliance(&id) {
-        Ok(check) => Ok(Json(serde_json::to_value(check).unwrap())),
-        Err(e) => Err(status_404(&e)),
+/// Load all assets (optionally site-filtered) for a read endpoint, degrading
+/// gracefully to an empty set when no database is configured — matching the
+/// other domains' read surfaces (demo mode returns empty rather than 503).
+async fn hardware_assets_or_empty(
+    site: &str,
+) -> Result<Vec<ryuki_engine::hardware_lifecycle::HardwareAsset>, (StatusCode, Json<Value>)> {
+    match get_db() {
+        Some(pool) => crate::repos::hardware_assets::list(pool, site)
+            .await
+            .map_err(db_error),
+        None => Ok(Vec::new()),
     }
 }
 
-async fn hardware_firmware_gaps(Query(query): Query<HardwareFirmwareGapsQuery>) -> Json<Value> {
+async fn hardware_inventory(Query(query): Query<HardwareInventoryQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let gaps = hardware_lifecycle::get_firmware_gaps(site);
-    Json(serde_json::to_value(gaps).unwrap())
+    let assets = hardware_assets_or_empty(site).await?;
+    Ok(Json(serde_json::to_value(assets).unwrap_or_default()))
 }
 
-async fn hardware_support_risk(Query(query): Query<HardwareSupportRiskQuery>) -> Json<Value> {
-    let site = query.site.as_deref().unwrap_or("");
-    let risk = hardware_lifecycle::get_support_risk(site);
-    Json(serde_json::to_value(risk).unwrap())
+async fn hardware_warranty_expiring() -> ApiResult {
+    let assets = hardware_assets_or_empty("").await?;
+    let expiring = hardware_lifecycle::get_warranty_expiring(&assets);
+    Ok(Json(serde_json::to_value(expiring).unwrap_or_default()))
 }
 
-async fn hardware_refresh_plan(Query(query): Query<HardwareRefreshPlanQuery>) -> Json<Value> {
-    let site = query.site.as_deref().unwrap_or("");
-    let plan = hardware_lifecycle::get_refresh_plan(site);
-    Json(serde_json::to_value(plan).unwrap())
+async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
+    // Single-item read: 404 when absent or when no DB is configured.
+    let pool = get_db().ok_or_else(|| status_404(&id))?;
+    let asset = crate::repos::hardware_assets::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let check = hardware_lifecycle::check_firmware_compliance(&asset);
+    Ok(Json(serde_json::to_value(check).unwrap_or_default()))
 }
 
-async fn hardware_lifecycle_report(
-    Query(query): Query<HardwareLifecycleReportQuery>,
-) -> Json<Value> {
+async fn hardware_firmware_gaps(Query(query): Query<HardwareFirmwareGapsQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let report = hardware_lifecycle::get_lifecycle_report(site);
-    Json(serde_json::to_value(report).unwrap())
+    let assets = hardware_assets_or_empty("").await?;
+    let gaps = hardware_lifecycle::get_firmware_gaps(&assets, site);
+    Ok(Json(serde_json::to_value(gaps).unwrap_or_default()))
+}
+
+async fn hardware_support_risk(Query(query): Query<HardwareSupportRiskQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("");
+    let assets = hardware_assets_or_empty("").await?;
+    let risk = hardware_lifecycle::get_support_risk(&assets, site);
+    Ok(Json(serde_json::to_value(risk).unwrap_or_default()))
+}
+
+async fn hardware_refresh_plan(Query(query): Query<HardwareRefreshPlanQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("");
+    let assets = hardware_assets_or_empty("").await?;
+    let plan = hardware_lifecycle::get_refresh_plan(&assets, site);
+    Ok(Json(serde_json::to_value(plan).unwrap_or_default()))
+}
+
+async fn hardware_lifecycle_report(Query(query): Query<HardwareLifecycleReportQuery>) -> ApiResult {
+    let site = query.site.as_deref().unwrap_or("");
+    // No DB -> a zero report (get_lifecycle_report over an empty asset set).
+    let assets = hardware_assets_or_empty("").await?;
+    let report = hardware_lifecycle::get_lifecycle_report(&assets, site);
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
 async fn hardware_add(Json(body): Json<HardwareAddRequest>) -> ApiResult {
-    match hardware_lifecycle::add_asset(
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let asset = hardware_lifecycle::add_asset(
         &body.vendor,
         &body.model,
         &body.site,
         &body.cluster,
         &body.serial,
         &body.warranty_expiry,
-    ) {
-        Ok(asset) => Ok(Json(serde_json::to_value(asset).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    )
+    .map_err(|e| status_400(&e))?;
+
+    let persisted = crate::repos::hardware_assets::insert(pool, &asset)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn hardware_update_firmware(
     Path(id): Path<String>,
     Json(body): Json<HardwareUpdateFirmwareRequest>,
 ) -> ApiResult {
-    match hardware_lifecycle::update_firmware(&id, &body.version) {
-        Ok(asset) => Ok(Json(serde_json::to_value(asset).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // Load the asset so the engine can validate the version against it.
+    let asset = crate::repos::hardware_assets::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    // Engine validates (version non-empty) and computes the updated model; the
+    // repo call below does the actual durable write.
+    let (_updated, _record) =
+        hardware_lifecycle::update_firmware(&asset, &body.version).map_err(|e| status_400(&e))?;
+
+    let persisted = crate::repos::hardware_assets::apply_firmware_update(pool, &id, &body.version)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn hardware_contract() -> Json<Value> {
@@ -29867,5 +29910,405 @@ mod gmsa_db_tests {
         assert_eq!(absent, HostOpOutcome::HostNotPresent);
 
         cleanup(pool, &name).await;
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api hardware_db_tests
+#[cfg(test)]
+mod hardware_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// Delete only rows we created in a test. migration 039 seeds 6 rows; we
+    /// never touch them. `firmware_history` has NO ON DELETE CASCADE (migration
+    /// 039), so we must delete child rows BEFORE the parent.
+    async fn cleanup(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM firmware_history WHERE asset_id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM hardware_assets WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    fn add_request(vendor: &str, serial: &str) -> HardwareAddRequest {
+        HardwareAddRequest {
+            vendor: vendor.into(),
+            model: "DL360 Gen10".into(),
+            site: "GBLON".into(),
+            cluster: "gblon-prod-cluster-a".into(),
+            serial: serial.into(),
+            warranty_expiry: "2029-01-01T00:00:00Z".into(),
+        }
+    }
+
+    // ─── add → get round-trip ─────────────────────────────────────────────────
+
+    /// Insert an asset and verify the persisted model matches the request,
+    /// including correct enum decoding for all three enum columns.
+    #[tokio::test]
+    async fn test_add_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let serial = format!("HPE-TEST-{uid}")[..20].to_string();
+
+        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+            panic!("hardware_add failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let record = crate::repos::hardware_assets::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("asset not found after insert");
+
+        assert_eq!(record.id, id, "id must round-trip");
+        assert_eq!(
+            record.vendor,
+            ryuki_engine::hardware_lifecycle::Vendor::HPE,
+            "Vendor enum must round-trip"
+        );
+        assert_eq!(record.site, "GBLON", "site must round-trip");
+        assert_eq!(
+            record.serial_number, serial,
+            "serial_number must round-trip"
+        );
+        assert_eq!(
+            record.support_status,
+            ryuki_engine::hardware_lifecycle::SupportStatus::Supported,
+            "support_status default must be Supported"
+        );
+        assert_eq!(
+            record.lifecycle_status,
+            ryuki_engine::hardware_lifecycle::LifecycleStatus::Production,
+            "lifecycle_status default must be Production"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── update_firmware persists firmware_installed + child row ─────────────
+
+    /// After `hardware_update_firmware`, the asset row must reflect the new
+    /// version AND a `firmware_history` child row must exist.
+    #[tokio::test]
+    async fn test_update_firmware_persists_asset_and_history() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let serial = format!("HPE-FW-{uid}")[..18].to_string();
+
+        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+            panic!("hardware_add failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Ok(Json(updated)) = hardware_update_firmware(
+            Path(id.clone()),
+            Json(HardwareUpdateFirmwareRequest {
+                version: "3.00".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("hardware_update_firmware failed");
+        };
+
+        assert_eq!(
+            updated["firmware_installed"]
+                .as_str()
+                .expect("firmware_installed"),
+            "3.00",
+            "firmware_installed must be updated in response"
+        );
+
+        // Verify asset row in DB.
+        let record = crate::repos::hardware_assets::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("asset not found");
+        assert_eq!(
+            record.firmware_installed, "3.00",
+            "firmware_installed must be persisted in asset row"
+        );
+
+        // Verify firmware_history child row.
+        let asset_uuid = uuid::Uuid::parse_str(&id).unwrap();
+        let history_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM firmware_history WHERE asset_id = $1 AND version = $2",
+        )
+        .bind(asset_uuid)
+        .bind("3.00")
+        .fetch_one(pool)
+        .await
+        .expect("firmware_history query failed");
+        assert_eq!(
+            history_count, 1,
+            "exactly one firmware_history row must exist for this update"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── firmware_check reflects compliance ───────────────────────────────────
+
+    /// After a firmware update to the baseline value, `hardware_firmware_check`
+    /// must report `compliant: true`.
+    #[tokio::test]
+    async fn test_firmware_check_reflects_compliance() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let uid = uuid::Uuid::new_v4().to_string();
+        let serial = format!("HPE-CHK-{uid}")[..19].to_string();
+
+        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+            panic!("hardware_add failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // firmware_baseline is "pending" after add_asset; update to match it.
+        let Ok(_) = hardware_update_firmware(
+            Path(id.clone()),
+            Json(HardwareUpdateFirmwareRequest {
+                version: "pending".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("hardware_update_firmware failed");
+        };
+
+        let Ok(Json(check)) = hardware_firmware_check(Path(id.clone())).await else {
+            cleanup(pool, &id).await;
+            panic!("hardware_firmware_check failed");
+        };
+
+        assert!(
+            check["compliant"]
+                .as_bool()
+                .expect("compliant must be bool"),
+            "firmware_check must report compliant after update to baseline"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── inventory / warranty / gaps filter seed rows ─────────────────────────
+
+    /// The 6 migration-039 seed rows must be visible in the inventory and at
+    /// least one must appear in warranty-expiring and firmware-gaps lists.
+    #[tokio::test]
+    async fn test_inventory_warranty_gaps_filter_seeds() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // inventory: all sites returns ≥ 6 seed rows.
+        let Ok(Json(all)) = hardware_inventory(Query(HardwareInventoryQuery { site: None })).await
+        else {
+            panic!("hardware_inventory failed");
+        };
+        let all_arr = all.as_array().expect("inventory must be array");
+        assert!(
+            all_arr.len() >= 6,
+            "expected at least 6 assets from seed rows, got {}",
+            all_arr.len()
+        );
+
+        // inventory: GBLON returns ≥ 3 seed rows.
+        let Ok(Json(gblon)) = hardware_inventory(Query(HardwareInventoryQuery {
+            site: Some("GBLON".into()),
+        }))
+        .await
+        else {
+            panic!("hardware_inventory GBLON failed");
+        };
+        let gblon_arr = gblon.as_array().expect("inventory must be array");
+        assert!(
+            gblon_arr.len() >= 3,
+            "expected at least 3 GBLON assets, got {}",
+            gblon_arr.len()
+        );
+
+        // warranty-expiring + firmware-gaps: use a TEST-OWNED asset with a known
+        // warranty (now + 45 days) and an induced firmware gap, rather than
+        // relying on the migration-039 seed timestamps (which are relative to
+        // when 039 was applied and may have drifted on a long-lived test DB).
+        let uid = uuid::Uuid::new_v4().to_string();
+        let warranty = (chrono::Utc::now() + chrono::Duration::days(45)).to_rfc3339();
+        let Ok(Json(created)) = hardware_add(Json(HardwareAddRequest {
+            vendor: "HPE".into(),
+            model: "TestModel".into(),
+            site: "GBLON".into(),
+            cluster: "test-cluster".into(),
+            serial: format!("TEST-{}", &uid[..8]),
+            warranty_expiry: warranty,
+        }))
+        .await
+        else {
+            panic!("hardware_add failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Our asset (warranty now+45d <= now+90d) must appear in warranty-expiring.
+        let Ok(Json(expiring)) = hardware_warranty_expiring().await else {
+            cleanup(pool, &id).await;
+            panic!("hardware_warranty_expiring failed");
+        };
+        let expiring_arr = expiring
+            .as_array()
+            .expect("warranty_expiring must be array");
+        assert!(
+            expiring_arr
+                .iter()
+                .any(|a| a["id"].as_str() == Some(id.as_str())),
+            "the test asset (now+45d warranty) must be warranty-expiring"
+        );
+
+        // Induce a firmware gap: update installed firmware so it differs from the
+        // baseline ('pending'), then it must appear in firmware-gaps.
+        if hardware_update_firmware(
+            Path(id.clone()),
+            Json(HardwareUpdateFirmwareRequest {
+                version: "9.9.9".into(),
+            }),
+        )
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("hardware_update_firmware failed");
+        }
+        let Ok(Json(gaps)) =
+            hardware_firmware_gaps(Query(HardwareFirmwareGapsQuery { site: None })).await
+        else {
+            cleanup(pool, &id).await;
+            panic!("hardware_firmware_gaps failed");
+        };
+        let gaps_arr = gaps.as_array().expect("firmware_gaps must be array");
+        assert!(
+            gaps_arr
+                .iter()
+                .any(|g| g["asset_id"].as_str() == Some(id.as_str())),
+            "the test asset (installed 9.9.9 != baseline) must have a firmware gap"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    // ─── add with unknown vendor → 400 ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_add_unknown_vendor_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let result = hardware_add(Json(add_request("Dell", "DELL-001"))).await;
+        let Err((status, _)) = result else {
+            panic!("expected hardware_add with unknown vendor to fail");
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "unknown vendor must return 400"
+        );
+    }
+
+    // ─── add with a malformed warranty → 400 (not a 500 at the repo) ──────────
+
+    #[tokio::test]
+    async fn test_add_invalid_warranty_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let result = hardware_add(Json(HardwareAddRequest {
+            vendor: "HPE".into(),
+            model: "M".into(),
+            site: "GBLON".into(),
+            cluster: "c".into(),
+            serial: "BADW-001".into(),
+            warranty_expiry: "not-a-date".into(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected hardware_add with malformed warranty to fail");
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "malformed warranty_expiry must return 400, not a 500 from repo parsing"
+        );
+    }
+
+    // ─── update_firmware on missing id → 404 ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_update_firmware_missing_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let missing_id = uuid::Uuid::new_v4().to_string();
+        let result = hardware_update_firmware(
+            Path(missing_id),
+            Json(HardwareUpdateFirmwareRequest {
+                version: "1.0".into(),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = result else {
+            panic!("expected 404 for missing asset");
+        };
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "update_firmware on missing id must return 404"
+        );
     }
 }
