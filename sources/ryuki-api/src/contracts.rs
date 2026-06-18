@@ -14708,98 +14708,152 @@ async fn monitoring_alert_routing_contract() -> Json<Value> {
 
 async fn network_readiness_check(
     Query(query): Query<NetworkReadinessQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     let port_count = query.ports.unwrap_or(1);
     let vlan = query.vlan;
     let ip_count = query.ips.unwrap_or(1);
 
-    let port_result = network_readiness::check_port_readiness(&site, port_count);
+    let ports = match get_db() {
+        Some(pool) => crate::repos::network_readiness::list_ports(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let vlans = match get_db() {
+        Some(pool) => crate::repos::network_readiness::list_vlans(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
 
-    let mut response = json!({
-        "source": "dry-run",
+    let port_readiness = network_readiness::check_port_readiness(&site, port_count, &ports);
+
+    let vlan_readiness = if let Some(vlan_id) = vlan {
+        match network_readiness::check_vlan_readiness(&site, vlan_id, ip_count, &vlans) {
+            Ok(vr) => vr,
+            Err(e) => json!({"error": e}),
+        }
+    } else {
+        Value::Null
+    };
+
+    Ok(Json(json!({
         "site": site,
-        "port_readiness": null,
-        "vlan_readiness": null,
-        "dry_run": true
-    });
-
-    match port_result {
-        Ok(pr) => {
-            response["port_readiness"] = pr;
-        }
-        Err(e) => {
-            response["port_readiness"] = json!({"error": e});
-        }
-    }
-
-    if let Some(vlan_id) = vlan {
-        match network_readiness::check_vlan_readiness(&site, vlan_id, ip_count) {
-            Ok(vr) => {
-                response["vlan_readiness"] = vr;
-            }
-            Err(e) => {
-                response["vlan_readiness"] = json!({"error": e});
-            }
-        }
-    }
-
-    Ok(Json(response))
+        "port_readiness": port_readiness,
+        "vlan_readiness": vlan_readiness,
+    })))
 }
 
 async fn network_reserve_ports(
     Json(body): Json<NetworkReservePortsRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match network_readiness::reserve_ports(&body.site, body.count, &body.purpose) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::network_readiness::reserve_ports(pool, &body.site, body.count, &body.purpose).await {
+        Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
+        Err(crate::repos::network_readiness::ReserveError::Invalid(msg)) => Err(status_400(&msg)),
+        Err(crate::repos::network_readiness::ReserveError::Insufficient { needed, available }) => {
+            Err(status_409(&format!(
+                "insufficient port capacity at site {}: needed {needed}, available {available}",
+                body.site
+            )))
+        }
+        Err(crate::repos::network_readiness::ReserveError::NotFound) => {
+            Err(status_404(&body.site))
+        }
+        Err(crate::repos::network_readiness::ReserveError::Db(e)) => Err(db_error(e)),
     }
 }
 
 async fn network_reserve_ips(
     Json(body): Json<NetworkReserveIpsRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match network_readiness::reserve_ips(&body.site, body.vlan_id, body.count, &body.purpose) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::network_readiness::reserve_ips(
+        pool,
+        &body.site,
+        body.vlan_id,
+        body.count,
+        &body.purpose,
+    )
+    .await
+    {
+        Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
+        Err(crate::repos::network_readiness::ReserveError::Invalid(msg)) => Err(status_400(&msg)),
+        Err(crate::repos::network_readiness::ReserveError::Insufficient { needed, available }) => {
+            Err(status_409(&format!(
+                "insufficient IP capacity on VLAN {} at site {}: needed {needed}, available {available}",
+                body.vlan_id, body.site
+            )))
+        }
+        Err(crate::repos::network_readiness::ReserveError::NotFound) => {
+            Err(status_404(&format!("VLAN {} at site {}", body.vlan_id, body.site)))
+        }
+        Err(crate::repos::network_readiness::ReserveError::Db(e)) => Err(db_error(e)),
     }
 }
 
-async fn network_release(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match network_readiness::release_reservation(&id) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+async fn network_release(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::network_readiness::release_reservation(pool, &id).await {
+        Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
+        Err(crate::repos::network_readiness::ReleaseError::NotFound) => {
+            Err(status_404(&id))
+        }
+        Err(crate::repos::network_readiness::ReleaseError::AlreadyReleased) => {
+            Err(status_409("reservation is already released"))
+        }
+        Err(crate::repos::network_readiness::ReleaseError::Db(e)) => Err(db_error(e)),
     }
 }
 
 async fn network_capacity(
     Query(query): Query<NetworkSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match network_readiness::get_site_capacity(&site) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+    let (ports, vlans) = match get_db() {
+        Some(pool) => {
+            let p = crate::repos::network_readiness::list_ports(pool, &site)
+                .await
+                .map_err(db_error)?;
+            let v = crate::repos::network_readiness::list_vlans(pool, &site)
+                .await
+                .map_err(db_error)?;
+            (p, v)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(Json(network_readiness::build_site_capacity(&site, &ports, &vlans)))
 }
 
 async fn network_ports_inventory(
     Query(query): Query<NetworkSwitchQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let switch = query.switch.unwrap_or_else(|| "defra-sw-01".to_string());
-    match network_readiness::get_port_inventory(&switch) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+    let ports = match get_db() {
+        Some(pool) => crate::repos::network_readiness::list_ports_by_switch(pool, &switch)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    network_readiness::build_port_inventory(&switch, &ports)
+        .map(Json)
+        .map_err(|e| status_404(&e))
 }
 
 async fn network_vlans_inventory(
     Query(query): Query<NetworkSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match network_readiness::get_vlan_inventory(&site) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+    let vlans = match get_db() {
+        Some(pool) => crate::repos::network_readiness::list_vlans(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    network_readiness::build_vlan_inventory(&site, &vlans)
+        .map(Json)
+        .map_err(|e| status_404(&e))
 }
 
 async fn network_contract() -> Json<Value> {

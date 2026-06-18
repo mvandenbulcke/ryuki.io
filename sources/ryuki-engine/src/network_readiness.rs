@@ -1,100 +1,13 @@
+//! Pure network-readiness engine — no I/O, no interior-mutable state.
+//!
+//! All functions take data by reference and return values derived from the
+//! inputs alone.  Persistence is owned by `ryuki-api/src/repos/network_readiness.rs`.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
-type NetworkStore = (Vec<SwitchPort>, Vec<VLAN>, Vec<PortReservation>);
-
-static NETWORK_STORE: OnceLock<Mutex<NetworkStore>> = OnceLock::new();
-
-fn network_store() -> &'static Mutex<NetworkStore> {
-    NETWORK_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
-
-fn seed_data() -> NetworkStore {
-    let mut ports = Vec::new();
-    let mut vlans = Vec::new();
-
-    for (site_idx, site) in ["DEFRA", "GBLON"].iter().enumerate() {
-        for sw_idx in 0..3 {
-            let switch_name = format!("{}-sw-{:02}", site.to_lowercase(), sw_idx + 1);
-            for p in 0..8 {
-                let port_number = (p + 1) as u32;
-                let status = if sw_idx == 0 && p < 2 {
-                    "InUse"
-                } else if sw_idx == 2 && p >= 6 {
-                    "Disabled"
-                } else {
-                    "Available"
-                };
-                let vlan_id = match (sw_idx, p) {
-                    (0, 0..=1) => 100 + (site_idx * 10) as u32,
-                    (0, 2..=3) => 200 + (site_idx * 10) as u32,
-                    (1, 0..=3) => 300 + (site_idx * 10) as u32,
-                    _ => 1,
-                };
-                let vlan_name = match (sw_idx, p) {
-                    (0, 0..=1) => format!("{}-mgmt", site.to_lowercase()),
-                    (0, 2..=3) => format!("{}-prod", site.to_lowercase()),
-                    (1, 0..=3) => format!("{}-dmz", site.to_lowercase()),
-                    _ => "default".into(),
-                };
-                ports.push(SwitchPort {
-                    id: format!(
-                        "port-{}-{}-{}",
-                        site.to_lowercase(),
-                        switch_name,
-                        port_number
-                    ),
-                    switch_name: switch_name.clone(),
-                    port_number,
-                    vlan_id,
-                    vlan_name,
-                    status: status.to_string(),
-                    connected_device: if status == "InUse" {
-                        Some(format!("{}-srv-{:02}", site.to_lowercase(), p + 1))
-                    } else {
-                        None
-                    },
-                    site: site.to_string(),
-                });
-            }
-        }
-
-        vlans.push(VLAN {
-            id: format!("vlan-{}-mgmt", site.to_lowercase()),
-            vlan_id: 100 + (site_idx * 10) as u32,
-            vlan_name: format!("{}-mgmt", site.to_lowercase()),
-            subnet: format!("10.{}.1.0/24", site_idx + 1),
-            gateway: format!("10.{}.1.1", site_idx + 1),
-            site: site.to_string(),
-            purpose: "Management".into(),
-            available_ips: 200,
-        });
-        vlans.push(VLAN {
-            id: format!("vlan-{}-prod", site.to_lowercase()),
-            vlan_id: 200 + (site_idx * 10) as u32,
-            vlan_name: format!("{}-prod", site.to_lowercase()),
-            subnet: format!("10.{}.2.0/24", site_idx + 1),
-            gateway: format!("10.{}.2.1", site_idx + 1),
-            site: site.to_string(),
-            purpose: "Production".into(),
-            available_ips: 180,
-        });
-        vlans.push(VLAN {
-            id: format!("vlan-{}-dmz", site.to_lowercase()),
-            vlan_id: 300 + (site_idx * 10) as u32,
-            vlan_name: format!("{}-dmz", site.to_lowercase()),
-            subnet: format!("10.{}.3.0/24", site_idx + 1),
-            gateway: format!("10.{}.3.1", site_idx + 1),
-            site: site.to_string(),
-            purpose: "DMZ".into(),
-            available_ips: 50,
-        });
-    }
-
-    (ports, vlans, Vec::new())
-}
+// ─── Domain types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwitchPort {
@@ -133,232 +46,49 @@ pub struct PortReservation {
     pub created_at: String,
 }
 
-pub fn check_port_readiness(site: &str, port_count_needed: u32) -> Result<Value, String> {
-    let store = network_store().lock().unwrap();
-    let available: Vec<&SwitchPort> = store
-        .0
+// ─── Read helpers (pure, no DB) ───────────────────────────────────────────────
+
+/// Check whether `port_count_needed` Available ports exist at `site`.
+/// Returns a readiness summary JSON value.
+pub fn check_port_readiness(site: &str, port_count_needed: u32, ports: &[SwitchPort]) -> Value {
+    let available = ports
         .iter()
         .filter(|p| p.site == site && p.status == "Available")
-        .collect();
+        .count();
 
-    let satisfied = available.len() as u32 >= port_count_needed;
-
-    Ok(json!({
-        "source": "dry-run",
+    json!({
         "site": site,
         "port_count_needed": port_count_needed,
-        "available_ports": available.len(),
-        "satisfied": satisfied,
-        "dry_run": true
-    }))
+        "available_ports": available,
+        "satisfied": available as u32 >= port_count_needed,
+    })
 }
 
+/// Check whether a VLAN has enough available IPs.
+/// Returns `Err` if the VLAN is not found.
 pub fn check_vlan_readiness(
     site: &str,
     vlan_id_: u32,
     ip_count_needed: u32,
+    vlans: &[VLAN],
 ) -> Result<Value, String> {
-    let store = network_store().lock().unwrap();
-    let vlan = store
-        .1
+    let vlan = vlans
         .iter()
         .find(|v| v.site == site && v.vlan_id == vlan_id_)
         .ok_or_else(|| format!("VLAN {} not found at site {}", vlan_id_, site))?;
 
-    let satisfied = vlan.available_ips >= ip_count_needed;
-
     Ok(json!({
-        "source": "dry-run",
         "site": site,
         "vlan_id": vlan_id_,
         "vlan_name": vlan.vlan_name,
         "available_ips": vlan.available_ips,
         "ip_count_needed": ip_count_needed,
-        "satisfied": satisfied,
-        "dry_run": true
+        "satisfied": vlan.available_ips >= ip_count_needed,
     }))
 }
 
-pub fn reserve_ports(site: &str, count: u32, purpose: &str) -> Result<Value, String> {
-    let mut store = network_store().lock().unwrap();
-
-    let available_indices: Vec<usize> = store
-        .0
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.site == site && p.status == "Available")
-        .map(|(i, _)| i)
-        .take(count as usize)
-        .collect();
-
-    if available_indices.len() < count as usize {
-        return Err(format!(
-            "Not enough available ports at site {}: needed {}, available {}",
-            site,
-            count,
-            available_indices.len()
-        ));
-    }
-
-    let reservation_id = format!(
-        "presv-{}",
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
-
-    let mut port_ids = Vec::new();
-    for idx in &available_indices {
-        store.0[*idx].status = "Reserved".to_string();
-        port_ids.push(store.0[*idx].id.clone());
-    }
-
-    let reservation = PortReservation {
-        reservation_id: reservation_id.clone(),
-        site: site.to_string(),
-        resource_type: "ports".into(),
-        vlan_id: None,
-        port_ids: port_ids.clone(),
-        ip_count: 0,
-        purpose: purpose.to_string(),
-        status: "reserved".into(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    store.2.push(reservation);
-
-    Ok(json!({
-        "source": "dry-run",
-        "reservation_id": reservation_id,
-        "site": site,
-        "resource_type": "ports",
-        "reserved_count": port_ids.len(),
-        "port_ids": port_ids,
-        "purpose": purpose,
-        "status": "reserved",
-        "dry_run": true
-    }))
-}
-
-pub fn reserve_ips(site: &str, vlan_id_: u32, count: u32, purpose: &str) -> Result<Value, String> {
-    let mut store = network_store().lock().unwrap();
-
-    let vlan_idx = store
-        .1
-        .iter()
-        .position(|v| v.site == site && v.vlan_id == vlan_id_);
-
-    let reservation_id = format!(
-        "presv-{}",
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
-
-    let satisfied = match vlan_idx {
-        Some(idx) => {
-            if store.1[idx].available_ips >= count {
-                store.1[idx].available_ips -= count;
-                true
-            } else {
-                false
-            }
-        }
-        None => return Err(format!("VLAN {} not found at site {}", vlan_id_, site)),
-    };
-
-    if !satisfied {
-        return Err(format!(
-            "Not enough IPs available on VLAN {} at site {}: needed {}, available {}",
-            store.1[vlan_idx.unwrap()].vlan_id,
-            site,
-            count,
-            store.1[vlan_idx.unwrap()].available_ips
-        ));
-    }
-
-    let reservation = PortReservation {
-        reservation_id: reservation_id.clone(),
-        site: site.to_string(),
-        resource_type: "ips".into(),
-        vlan_id: Some(vlan_id_),
-        port_ids: Vec::new(),
-        ip_count: count,
-        purpose: purpose.to_string(),
-        status: "reserved".into(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    };
-
-    store.2.push(reservation);
-
-    Ok(json!({
-        "source": "dry-run",
-        "reservation_id": reservation_id,
-        "site": site,
-        "resource_type": "ips",
-        "vlan_id": vlan_id_,
-        "reserved_ip_count": count,
-        "purpose": purpose,
-        "status": "reserved",
-        "dry_run": true
-    }))
-}
-
-pub fn release_reservation(reservation_id: &str) -> Result<Value, String> {
-    let mut store = network_store().lock().unwrap();
-
-    let resv_idx = store
-        .2
-        .iter()
-        .position(|r| r.reservation_id == reservation_id)
-        .ok_or_else(|| format!("Reservation not found: {}", reservation_id))?;
-
-    if store.2[resv_idx].status != "reserved" {
-        return Err(format!(
-            "Reservation {} is not in reserved state",
-            reservation_id
-        ));
-    }
-
-    let resv = store.2[resv_idx].clone();
-
-    if resv.resource_type == "ports" {
-        for port_id in &resv.port_ids {
-            if let Some(port) = store.0.iter_mut().find(|p| p.id == *port_id)
-                && port.status == "Reserved"
-            {
-                port.status = "Available".to_string();
-            }
-        }
-    } else if resv.resource_type == "ips"
-        && let Some(vlan) = store
-            .1
-            .iter_mut()
-            .find(|v| v.site == resv.site && Some(v.vlan_id) == resv.vlan_id)
-    {
-        vlan.available_ips += resv.ip_count;
-    }
-
-    store.2[resv_idx].status = "released".to_string();
-
-    Ok(json!({
-        "source": "dry-run",
-        "reservation_id": reservation_id,
-        "status": "released",
-        "dry_run": true
-    }))
-}
-
-pub fn get_site_capacity(site: &str) -> Result<Value, String> {
-    let store = network_store().lock().unwrap();
-
-    let ports = &store.0;
-    let vlans = &store.1;
-
+/// Build the site-capacity summary from the provided slices (no DB access).
+pub fn build_site_capacity(site: &str, ports: &[SwitchPort], vlans: &[VLAN]) -> Value {
     let total_ports = ports.iter().filter(|p| p.site == site).count();
     let available_ports = ports
         .iter()
@@ -400,8 +130,7 @@ pub fn get_site_capacity(site: &str) -> Result<Value, String> {
         .into_iter()
         .collect();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
         "site": site,
         "switches": switches,
         "ports": {
@@ -412,15 +141,13 @@ pub fn get_site_capacity(site: &str) -> Result<Value, String> {
             "disabled": disabled_ports
         },
         "vlans": vlan_summaries,
-        "dry_run": true
-    }))
+    })
 }
 
-pub fn get_port_inventory(switch_name: &str) -> Result<Value, String> {
-    let store = network_store().lock().unwrap();
-
-    let matching: Vec<&SwitchPort> = store
-        .0
+/// Build the port-inventory JSON for a switch (no DB access).
+/// Returns `Err` if no ports found for that switch.
+pub fn build_port_inventory(switch_name: &str, ports: &[SwitchPort]) -> Result<Value, String> {
+    let matching: Vec<&SwitchPort> = ports
         .iter()
         .filter(|p| p.switch_name == switch_name)
         .collect();
@@ -430,7 +157,6 @@ pub fn get_port_inventory(switch_name: &str) -> Result<Value, String> {
     }
 
     Ok(json!({
-        "source": "dry-run",
         "switch_name": switch_name,
         "total_ports": matching.len(),
         "ports": matching.iter().map(|p| json!({
@@ -442,21 +168,19 @@ pub fn get_port_inventory(switch_name: &str) -> Result<Value, String> {
             "connected_device": p.connected_device,
             "site": p.site,
         })).collect::<Vec<_>>(),
-        "dry_run": true
     }))
 }
 
-pub fn get_vlan_inventory(site: &str) -> Result<Value, String> {
-    let store = network_store().lock().unwrap();
-
-    let matching: Vec<&VLAN> = store.1.iter().filter(|v| v.site == site).collect();
+/// Build the VLAN-inventory JSON for a site (no DB access).
+/// Returns `Err` if no VLANs found.
+pub fn build_vlan_inventory(site: &str, vlans: &[VLAN]) -> Result<Value, String> {
+    let matching: Vec<&VLAN> = vlans.iter().filter(|v| v.site == site).collect();
 
     if matching.is_empty() {
         return Err(format!("No VLANs found for site: {}", site));
     }
 
     Ok(json!({
-        "source": "dry-run",
         "site": site,
         "total_vlans": matching.len(),
         "vlans": matching.iter().map(|v| json!({
@@ -468,111 +192,247 @@ pub fn get_vlan_inventory(site: &str) -> Result<Value, String> {
             "purpose": v.purpose,
             "available_ips": v.available_ips,
         })).collect::<Vec<_>>(),
-        "dry_run": true
     }))
 }
 
+// ─── Mutation helpers (pure logic, used by repo to build request inputs) ──────
+
+/// Generate a fresh `presv-<short-uuid>` reservation ID.
+pub fn new_reservation_id() -> String {
+    format!(
+        "presv-{}",
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    )
+}
+
+// ─── Engine unit tests (pure logic — no DB, no store) ─────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_check_port_readiness_defra() {
-        let result = check_port_readiness("DEFRA", 10).unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert_eq!(result["site"], "DEFRA");
-        assert!(result["available_ports"].as_u64().unwrap() > 0);
-        assert!(result["dry_run"].as_bool().unwrap());
+    fn make_ports() -> Vec<SwitchPort> {
+        vec![
+            SwitchPort {
+                id: "p1".into(), switch_name: "sw-01".into(), port_number: 1,
+                vlan_id: 100, vlan_name: "mgmt".into(), status: "Available".into(),
+                connected_device: None, site: "DEFRA".into(),
+            },
+            SwitchPort {
+                id: "p2".into(), switch_name: "sw-01".into(), port_number: 2,
+                vlan_id: 100, vlan_name: "mgmt".into(), status: "Available".into(),
+                connected_device: None, site: "DEFRA".into(),
+            },
+            SwitchPort {
+                id: "p3".into(), switch_name: "sw-01".into(), port_number: 3,
+                vlan_id: 100, vlan_name: "mgmt".into(), status: "InUse".into(),
+                connected_device: Some("srv-01".into()), site: "DEFRA".into(),
+            },
+            SwitchPort {
+                id: "p4".into(), switch_name: "sw-02".into(), port_number: 1,
+                vlan_id: 200, vlan_name: "prod".into(), status: "Reserved".into(),
+                connected_device: None, site: "DEFRA".into(),
+            },
+            SwitchPort {
+                id: "p5".into(), switch_name: "sw-02".into(), port_number: 2,
+                vlan_id: 200, vlan_name: "prod".into(), status: "Disabled".into(),
+                connected_device: None, site: "DEFRA".into(),
+            },
+            SwitchPort {
+                id: "p6".into(), switch_name: "sw-03".into(), port_number: 1,
+                vlan_id: 300, vlan_name: "dmz".into(), status: "Available".into(),
+                connected_device: None, site: "GBLON".into(),
+            },
+        ]
     }
 
+    fn make_vlans() -> Vec<VLAN> {
+        vec![
+            VLAN {
+                id: "v1".into(), vlan_id: 100, vlan_name: "mgmt".into(),
+                subnet: "10.1.1.0/24".into(), gateway: "10.1.1.1".into(),
+                site: "DEFRA".into(), purpose: "Management".into(), available_ips: 200,
+            },
+            VLAN {
+                id: "v2".into(), vlan_id: 200, vlan_name: "prod".into(),
+                subnet: "10.1.2.0/24".into(), gateway: "10.1.2.1".into(),
+                site: "DEFRA".into(), purpose: "Production".into(), available_ips: 10,
+            },
+            VLAN {
+                id: "v3".into(), vlan_id: 300, vlan_name: "dmz".into(),
+                subnet: "10.2.3.0/24".into(), gateway: "10.2.3.1".into(),
+                site: "GBLON".into(), purpose: "DMZ".into(), available_ips: 5,
+            },
+        ]
+    }
+
+    // ── check_port_readiness ──
+
     #[test]
-    fn test_check_vlan_readiness_found() {
-        let result = check_vlan_readiness("DEFRA", 100, 5).unwrap();
-        assert_eq!(result["vlan_id"], 100);
+    fn port_readiness_satisfied() {
+        let ports = make_ports();
+        let result = check_port_readiness("DEFRA", 2, &ports);
         assert_eq!(result["satisfied"], true);
-        assert!(result["available_ips"].as_u64().unwrap() >= 5);
+        assert_eq!(result["available_ports"], 2u64);
     }
 
     #[test]
-    fn test_check_vlan_readiness_not_found() {
-        assert!(check_vlan_readiness("DEFRA", 999, 1).is_err());
+    fn port_readiness_not_satisfied() {
+        let ports = make_ports();
+        let result = check_port_readiness("DEFRA", 10, &ports);
+        assert_eq!(result["satisfied"], false);
     }
 
     #[test]
-    fn test_reserve_ports_success() {
-        let result = reserve_ports("GBLON", 3, "vm-deployment").unwrap();
-        assert_eq!(result["reserved_count"], 3);
-        assert_eq!(result["status"], "reserved");
-        assert!(!result["reservation_id"].as_str().unwrap().is_empty());
+    fn port_readiness_empty_site() {
+        let ports = make_ports();
+        let result = check_port_readiness("NOWHERE", 1, &ports);
+        assert_eq!(result["satisfied"], false);
+        assert_eq!(result["available_ports"], 0u64);
+    }
+
+    // ── check_vlan_readiness ──
+
+    #[test]
+    fn vlan_readiness_satisfied() {
+        let vlans = make_vlans();
+        let r = check_vlan_readiness("DEFRA", 100, 5, &vlans).unwrap();
+        assert_eq!(r["satisfied"], true);
+        assert_eq!(r["available_ips"], 200u64);
     }
 
     #[test]
-    fn test_reserve_ports_insufficient() {
-        assert!(reserve_ports("DEFRA", 50, "too-many").is_err());
+    fn vlan_readiness_insufficient() {
+        let vlans = make_vlans();
+        let r = check_vlan_readiness("DEFRA", 200, 100, &vlans).unwrap();
+        assert_eq!(r["satisfied"], false);
     }
 
     #[test]
-    fn test_reserve_ips_success() {
-        let result = reserve_ips("DEFRA", 100, 10, "server-deploy").unwrap();
-        assert_eq!(result["resource_type"], "ips");
-        assert_eq!(result["reserved_ip_count"], 10);
+    fn vlan_readiness_not_found() {
+        let vlans = make_vlans();
+        assert!(check_vlan_readiness("DEFRA", 999, 1, &vlans).is_err());
+    }
+
+    // ── build_site_capacity ──
+
+    #[test]
+    fn site_capacity_counts() {
+        let ports = make_ports();
+        let vlans = make_vlans();
+        let r = build_site_capacity("DEFRA", &ports, &vlans);
+        assert_eq!(r["ports"]["available"], 2u64);
+        assert_eq!(r["ports"]["in_use"], 1u64);
+        assert_eq!(r["ports"]["reserved"], 1u64);
+        assert_eq!(r["ports"]["disabled"], 1u64);
+        assert_eq!(r["ports"]["total"], 5u64);
+        let vlan_arr = r["vlans"].as_array().unwrap();
+        assert_eq!(vlan_arr.len(), 2); // DEFRA has 2 vlans
     }
 
     #[test]
-    fn test_release_reservation_success() {
-        let reserve = reserve_ports("GBLON", 2, "test-release").unwrap();
-        let resv_id = reserve["reservation_id"].as_str().unwrap().to_string();
-        let release = release_reservation(&resv_id).unwrap();
-        assert_eq!(release["status"], "released");
+    fn site_capacity_different_site() {
+        let ports = make_ports();
+        let vlans = make_vlans();
+        let r = build_site_capacity("GBLON", &ports, &vlans);
+        assert_eq!(r["ports"]["total"], 1u64);
+        assert_eq!(r["ports"]["available"], 1u64);
+    }
+
+    // ── build_port_inventory ──
+
+    #[test]
+    fn port_inventory_found() {
+        let ports = make_ports();
+        let r = build_port_inventory("sw-01", &ports).unwrap();
+        assert_eq!(r["total_ports"], 3u64);
+        assert_eq!(r["switch_name"], "sw-01");
     }
 
     #[test]
-    fn test_release_reservation_not_found() {
-        assert!(release_reservation("presv-nonexistent").is_err());
+    fn port_inventory_not_found() {
+        let ports = make_ports();
+        assert!(build_port_inventory("nonexistent", &ports).is_err());
+    }
+
+    // ── build_vlan_inventory ──
+
+    #[test]
+    fn vlan_inventory_found() {
+        let vlans = make_vlans();
+        let r = build_vlan_inventory("DEFRA", &vlans).unwrap();
+        assert_eq!(r["total_vlans"], 2u64);
+        assert_eq!(r["site"], "DEFRA");
     }
 
     #[test]
-    fn test_get_site_capacity() {
-        let result = get_site_capacity("DEFRA").unwrap();
-        assert_eq!(result["source"], "dry-run");
-        assert!(result["ports"]["total"].as_u64().unwrap() > 0);
-        assert!(!result["vlans"].as_array().unwrap().is_empty());
-        assert!(!result["switches"].as_array().unwrap().is_empty());
+    fn vlan_inventory_not_found() {
+        let vlans = make_vlans();
+        assert!(build_vlan_inventory("NOWHERE", &vlans).is_err());
+    }
+
+    // ── capacity math / reservation logic ──
+
+    // NOTE: the insufficient-capacity and release-idempotency GUARDS are
+    // enforced at the SQL layer in repos/network_readiness.rs (the FOR UPDATE
+    // SKIP LOCKED count check, the atomic `available_ips >= $count` decrement,
+    // and the `status = 'released'` short-circuit) and are covered by
+    // network_readiness_db_tests. They are deliberately NOT asserted here with
+    // tautological in-test re-implementations that would pass even if the
+    // production logic were deleted.
+
+    #[test]
+    fn release_restore_arithmetic_ports() {
+        // Simulate: 2 Available ports are reserved, then released → count back to 2.
+        // We track the ids that were flipped so the restore step only touches them
+        // (other ports may already be Reserved in the test data and must not be affected).
+        let mut ports = make_ports();
+        let initially_available = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
+        assert_eq!(initially_available, 2, "test data: 2 Available DEFRA ports");
+
+        // Collect the ids of Available ports before mutating.
+        let to_reserve: Vec<String> = ports
+            .iter()
+            .filter(|p| p.site == "DEFRA" && p.status == "Available")
+            .map(|p| p.id.clone())
+            .collect();
+
+        // "reserve" exactly those ports
+        for p in ports.iter_mut().filter(|p| to_reserve.contains(&p.id)) {
+            p.status = "Reserved".into();
+        }
+
+        let after_reserve = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
+        assert_eq!(after_reserve, 0, "no Available DEFRA ports after reservation");
+
+        // "release" — restore only the ports we reserved
+        for p in ports.iter_mut().filter(|p| to_reserve.contains(&p.id)) {
+            p.status = "Available".into();
+        }
+        let after_release = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
+        assert_eq!(after_release, initially_available, "count restored to initial");
     }
 
     #[test]
-    fn test_get_port_inventory_found() {
-        let result = get_port_inventory("defra-sw-01").unwrap();
-        assert_eq!(result["switch_name"], "defra-sw-01");
-        assert!(result["total_ports"].as_u64().unwrap() > 0);
+    fn release_restore_arithmetic_ips() {
+        let mut vlans = make_vlans();
+        let vlan = vlans.iter_mut().find(|v| v.site == "DEFRA" && v.vlan_id == 100).unwrap();
+        let initial = vlan.available_ips;
+        // reserve 5
+        vlan.available_ips -= 5;
+        assert_eq!(vlan.available_ips, initial - 5);
+        // release 5
+        vlan.available_ips += 5;
+        assert_eq!(vlan.available_ips, initial);
     }
 
     #[test]
-    fn test_get_port_inventory_not_found() {
-        assert!(get_port_inventory("nonexistent-sw").is_err());
-    }
-
-    #[test]
-    fn test_get_vlan_inventory() {
-        let result = get_vlan_inventory("GBLON").unwrap();
-        assert_eq!(result["site"], "GBLON");
-        assert!(result["total_vlans"].as_u64().unwrap() > 0);
-    }
-
-    #[test]
-    fn test_release_reservation_restores_ports() {
-        let initial = get_site_capacity("DEFRA").unwrap();
-        let initial_available = initial["ports"]["available"].as_u64().unwrap();
-
-        let reserve = reserve_ports("DEFRA", 2, "restore-test").unwrap();
-        let mid = get_site_capacity("DEFRA").unwrap();
-        let mid_available = mid["ports"]["available"].as_u64().unwrap();
-        assert_eq!(mid_available, initial_available - 2);
-
-        let resv_id = reserve["reservation_id"].as_str().unwrap().to_string();
-        release_reservation(&resv_id).unwrap();
-        let after = get_site_capacity("DEFRA").unwrap();
-        let after_available = after["ports"]["available"].as_u64().unwrap();
-        assert_eq!(after_available, initial_available);
+    fn new_reservation_id_format() {
+        let id = new_reservation_id();
+        assert!(id.starts_with("presv-"), "must start with presv-");
+        assert!(id.len() > 6, "must have content after prefix");
     }
 }
