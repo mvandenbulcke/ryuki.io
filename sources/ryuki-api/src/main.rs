@@ -647,6 +647,28 @@ fn read_authorized(session: &AuthSession, path: &str) -> bool {
     }
 }
 
+/// Notification self-service mutations (mark-one-read, mark-all-read) are
+/// authorized at the ordinary read tier (`audit` OR `request`) rather than the
+/// fail-closed `admin` default, because every notification recipient holds one
+/// of those tiers and the repo's recipient-filtered UPDATE is the real
+/// authorization boundary. Without this a plain Requester could see their own
+/// notifications but not mark them read. Scoped to exactly the two mutation
+/// paths so no other `/api/notifications` route is affected.
+fn is_notifications_self_service_path(path: &str) -> bool {
+    if path == "/api/notifications/read-all" {
+        return true;
+    }
+    // Exactly `/api/notifications/{id}/read`: one non-empty id segment, no
+    // extra path segments (so deeper/other paths don't inherit the read tier).
+    if let Some(id) = path
+        .strip_prefix("/api/notifications/")
+        .and_then(|rest| rest.strip_suffix("/read"))
+    {
+        return !id.is_empty() && !id.contains('/');
+    }
+    false
+}
+
 /// Builds the 403 ProblemDetails response for a missing mutating permission.
 fn forbidden(required: &str) -> Response {
     let body = serde_json::to_string(&ApiError::with_detail(
@@ -762,15 +784,21 @@ async fn auth_middleware(
     // read prefixes). Handler-level check_permission calls stay as
     // defense-in-depth.
     if !is_auth_exempt_path(&path) {
-        let required = if is_unsafe_method(&method) {
+        // Notification self-service mutations are gated like reads (audit OR
+        // request), not as ordinary mutations (which would fall to the admin
+        // default); the repo's recipient filter is the real boundary.
+        let notif_self_service =
+            is_unsafe_method(&method) && is_notifications_self_service_path(&path);
+        let required = if is_unsafe_method(&method) && !notif_self_service {
             route_permission_for(&method, &path)
         } else {
             read_permission_for(&path)
         };
-        // Mutations require the exact route permission; reads use the shared
-        // read_authorized tier (sensitive -> admin; ordinary -> audit OR
-        // request) so a Requester can view their own requests.
-        let authorized = if is_unsafe_method(&method) {
+        // Mutations require the exact route permission; reads — and notification
+        // self-service mutations — use the shared read_authorized tier (sensitive
+        // -> admin; ordinary -> audit OR request) so a recipient can manage their
+        // own feed and a Requester can view their own requests.
+        let authorized = if is_unsafe_method(&method) && !notif_self_service {
             ryuki_engine::auth::check_permission(&session, required)
         } else {
             read_authorized(&session, &path)
@@ -2142,6 +2170,32 @@ mod tests {
         assert!(is_unsafe_method(&Method::PATCH));
         assert!(is_unsafe_method(&Method::DELETE));
         assert!(!is_unsafe_method(&Method::GET));
+    }
+
+    #[test]
+    fn test_notifications_self_service_matcher_is_precise() {
+        // Exactly the two self-service mutation paths get the relaxed read tier.
+        assert!(is_notifications_self_service_path(
+            "/api/notifications/read-all"
+        ));
+        assert!(is_notifications_self_service_path(
+            "/api/notifications/pn-123/read"
+        ));
+        // Anything else under /api/notifications must NOT inherit the read tier.
+        assert!(!is_notifications_self_service_path("/api/notifications"));
+        assert!(!is_notifications_self_service_path(
+            "/api/notifications/pn-123"
+        ));
+        assert!(!is_notifications_self_service_path(
+            "/api/notifications//read"
+        )); // empty id
+        assert!(!is_notifications_self_service_path(
+            "/api/notifications/a/b/read"
+        )); // multi-segment
+        assert!(!is_notifications_self_service_path(
+            "/api/notifications/read"
+        )); // missing id
+        assert!(!is_notifications_self_service_path("/api/other/pn-1/read"));
     }
 
     #[test]

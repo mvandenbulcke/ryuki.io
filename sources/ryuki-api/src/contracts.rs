@@ -1805,6 +1805,20 @@ pub fn routes() -> Router {
             "/api/datacenter/image-factory-contract",
             get(image_factory_contract),
         )
+        // ─── Portal notifications (Theme 9 slice 1) ───
+        .route("/api/notifications", get(notifications_list))
+        .route(
+            "/api/notifications/unread-count",
+            get(notifications_unread_count),
+        )
+        .route(
+            "/api/notifications/{id}/read",
+            post(notifications_mark_read),
+        )
+        .route(
+            "/api/notifications/read-all",
+            post(notifications_mark_all_read),
+        )
 }
 
 // ─── Shared data ───
@@ -11033,6 +11047,29 @@ async fn apply_transition_audited(
     }
 
     tx.commit().await.map_err(db_error)?;
+    // Best-effort notification emit, DETACHED from the request path. The lifecycle
+    // transition is already durably committed; spawning the emit means a slow or
+    // locked notifications table can neither roll back the transition NOR delay the
+    // HTTP response into a timeout. Fail-open: errors are logged, never surfaced.
+    // At-most-once: a crash before the task runs simply drops the convenience entry.
+    {
+        let pool: sqlx::PgPool = pool.clone();
+        let action = action.to_string();
+        let request_id = request_id.clone();
+        let owner = current.created_by.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::repos::notifications::emit_for_transition(
+                &pool,
+                &action,
+                &request_id,
+                owner.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, request_id = %request_id, "post-commit notification emit failed (non-fatal)");
+            }
+        });
+    }
     Ok(row)
 }
 
@@ -33916,4 +33953,69 @@ mod datacenter_readiness_db_tests {
             .expect("list_by_site must not error for unknown site");
         assert!(checks.is_empty(), "unknown site must return empty vec");
     }
+}
+
+// ─── Portal notifications — Theme 9 slice 1 ──────────────────────────────────
+
+/// GET /api/notifications
+/// Returns the authenticated user's notification feed, newest first.
+/// Degrades gracefully to an empty list when no DB is configured. `source`
+/// reflects whether the DB was actually consulted (an empty live result is
+/// still "db", never "no-db").
+async fn notifications_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let (items, source) = match get_db() {
+        Some(pool) => (
+            crate::repos::notifications::list_for_recipient(pool, &session.user_id, &session.roles)
+                .await
+                .map_err(db_error)?,
+            "db",
+        ),
+        None => (vec![], "no-db"),
+    };
+    Ok(Json(json!({ "source": source, "notifications": items })))
+}
+
+/// GET /api/notifications/unread-count
+/// Returns the count of unread notifications for the authenticated user.
+/// Degrades to {"source":"no-db","unread":0} when no DB is configured.
+async fn notifications_unread_count(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let (unread, source) = match get_db() {
+        Some(pool) => (
+            crate::repos::notifications::unread_count(pool, &session.user_id, &session.roles)
+                .await
+                .map_err(db_error)?,
+            "db",
+        ),
+        None => (0, "no-db"),
+    };
+    Ok(Json(json!({ "source": source, "unread": unread })))
+}
+
+/// POST /api/notifications/{id}/read
+/// Marks a single notification as read. Returns 503 without a DB, 404 if not
+/// found or not owned by the caller (no existence leak).
+async fn notifications_mark_read(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::notifications::MarkOutcome;
+    match crate::repos::notifications::mark_read(pool, &id, &session.user_id, &session.roles)
+        .await
+        .map_err(db_error)?
+    {
+        MarkOutcome::Updated(n) => Ok(Json(json!({ "source": "db", "notification": n }))),
+        MarkOutcome::NotFound => Err(status_404(&id)),
+    }
+}
+
+/// POST /api/notifications/read-all
+/// Marks all unread notifications for the authenticated user as read.
+/// Returns 503 without a DB.
+async fn notifications_mark_all_read(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let marked = crate::repos::notifications::mark_all_read(pool, &session.user_id, &session.roles)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(json!({ "source": "db", "marked": marked })))
 }

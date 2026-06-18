@@ -1,0 +1,522 @@
+use ryuki_engine::notifications::{drafts_for_transition, Notification, RecipientKind, Severity};
+use sqlx::types::Uuid;
+use sqlx::PgPool;
+
+// ── DB row ───────────────────────────────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct NotificationRow {
+    id: String,
+    recipient_kind: String,
+    recipient_id: String,
+    event: String,
+    request_id: Option<Uuid>,
+    severity: String,
+    title: String,
+    body: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    /// Computed per-querying-user from the read-receipts table (NOT a column on
+    /// portal_notifications): true iff this user has a receipt for the row.
+    read: bool,
+}
+
+impl NotificationRow {
+    fn into_model(self) -> Result<Notification, sqlx::Error> {
+        let recipient_kind = recipient_kind_from_db(&self.recipient_kind)?;
+        let severity = severity_from_db(&self.severity)?;
+        Ok(Notification {
+            id: self.id,
+            recipient_kind,
+            recipient_id: self.recipient_id,
+            event: self.event,
+            request_id: self.request_id.map(|u| u.to_string()),
+            severity,
+            title: self.title,
+            body: self.body,
+            read: self.read,
+            created_at: self.created_at.to_rfc3339(),
+        })
+    }
+}
+
+// ── Enum helpers ─────────────────────────────────────────────────────────────
+
+fn recipient_kind_from_db(raw: &str) -> Result<RecipientKind, sqlx::Error> {
+    match raw {
+        "Role" => Ok(RecipientKind::Role),
+        "User" => Ok(RecipientKind::User),
+        other => Err(sqlx::Error::Decode(
+            format!("portal_notifications.recipient_kind: unknown value '{other}'").into(),
+        )),
+    }
+}
+
+fn recipient_kind_to_db(k: &RecipientKind) -> &'static str {
+    match k {
+        RecipientKind::Role => "Role",
+        RecipientKind::User => "User",
+    }
+}
+
+fn severity_from_db(raw: &str) -> Result<Severity, sqlx::Error> {
+    match raw {
+        "Info" => Ok(Severity::Info),
+        "Success" => Ok(Severity::Success),
+        "Warning" => Ok(Severity::Warning),
+        "Critical" => Ok(Severity::Critical),
+        other => Err(sqlx::Error::Decode(
+            format!("portal_notifications.severity: unknown value '{other}'").into(),
+        )),
+    }
+}
+
+fn severity_to_db(s: &Severity) -> &'static str {
+    match s {
+        Severity::Info => "Info",
+        Severity::Success => "Success",
+        Severity::Warning => "Warning",
+        Severity::Critical => "Critical",
+    }
+}
+
+// ── Outcome type ──────────────────────────────────────────────────────────────
+
+pub enum MarkOutcome {
+    Updated(Box<Notification>),
+    NotFound,
+}
+
+// SELECT column list shared by the queries that build a NotificationRow. The
+// `read` flag is supplied separately by each query (a LEFT JOIN test, or a
+// literal after a mark), never read from a column on portal_notifications.
+const READ_COLUMNS: &str = "n.id, n.recipient_kind, n.recipient_id, n.event, n.request_id, \
+                            n.severity, n.title, n.body, n.created_at";
+
+// ── Repo functions ────────────────────────────────────────────────────────────
+
+/// Best-effort, post-commit emit. Calls the pure engine to derive drafts, then
+/// INSERTs one row per draft. Caller swallows errors (fail-open contract).
+pub async fn emit_for_transition(
+    pool: &PgPool,
+    action: &str,
+    request_id: &str,
+    owner: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let drafts = drafts_for_transition(action, request_id, owner);
+    if drafts.is_empty() {
+        return Ok(());
+    }
+
+    let rid: Option<Uuid> = Uuid::parse_str(request_id).ok();
+
+    let mut tx = pool.begin().await?;
+    for draft in &drafts {
+        let id = format!("pn-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO portal_notifications \
+             (id, recipient_kind, recipient_id, event, request_id, severity, title, body) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&id)
+        .bind(recipient_kind_to_db(&draft.recipient_kind))
+        .bind(&draft.recipient_id)
+        .bind(&draft.event)
+        .bind(rid)
+        .bind(severity_to_db(&draft.severity))
+        .bind(&draft.title)
+        .bind(&draft.body)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Returns the recipient's notification feed, newest first. The `read` flag is
+/// resolved per-user from the read-receipts table (LEFT JOIN on this user_id),
+/// so a shared role notification reads independently for each recipient.
+pub async fn list_for_recipient(
+    pool: &PgPool,
+    user_id: &str,
+    roles: &[String],
+) -> Result<Vec<Notification>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {READ_COLUMNS}, (r.notification_id IS NOT NULL) AS \"read\" \
+         FROM portal_notifications n \
+         LEFT JOIN portal_notification_reads r \
+                ON r.notification_id = n.id AND r.user_id = $1 \
+         WHERE (n.recipient_kind = 'User' AND n.recipient_id = $1) \
+            OR (n.recipient_kind = 'Role' AND n.recipient_id = ANY($2)) \
+         ORDER BY n.created_at DESC \
+         LIMIT 200"
+    );
+    let rows: Vec<NotificationRow> = sqlx::query_as(&sql)
+        .bind(user_id)
+        .bind(roles)
+        .fetch_all(pool)
+        .await?;
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// COUNT of notifications visible to the recipient that this user has NOT yet
+/// read (no receipt row for this user_id).
+pub async fn unread_count(
+    pool: &PgPool,
+    user_id: &str,
+    roles: &[String],
+) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) \
+         FROM portal_notifications n \
+         WHERE ((n.recipient_kind = 'User' AND n.recipient_id = $1) \
+             OR (n.recipient_kind = 'Role' AND n.recipient_id = ANY($2))) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM portal_notification_reads r \
+               WHERE r.notification_id = n.id AND r.user_id = $1 \
+           )",
+    )
+    .bind(user_id)
+    .bind(roles)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+/// Atomically record a read receipt for ONE notification on behalf of `user_id`.
+///
+/// The CTE's `visible` filter is the authorization boundary: a non-recipient
+/// matches zero rows and gets NotFound (no existence leak). The receipt INSERT
+/// is idempotent (ON CONFLICT DO NOTHING), so re-marking an already-read
+/// notification is a no-op that still returns Updated. The receipt is per-user,
+/// so marking a shared role notification read does NOT clear it for other role
+/// holders.
+pub async fn mark_read(
+    pool: &PgPool,
+    id: &str,
+    user_id: &str,
+    roles: &[String],
+) -> Result<MarkOutcome, sqlx::Error> {
+    let row: Option<NotificationRow> = sqlx::query_as(
+        "WITH visible AS ( \
+             SELECT n.id, n.recipient_kind, n.recipient_id, n.event, n.request_id, \
+                    n.severity, n.title, n.body, n.created_at \
+             FROM portal_notifications n \
+             WHERE n.id = $1 \
+               AND ((n.recipient_kind = 'User' AND n.recipient_id = $2) \
+                 OR (n.recipient_kind = 'Role' AND n.recipient_id = ANY($3))) \
+         ), ins AS ( \
+             INSERT INTO portal_notification_reads (notification_id, user_id) \
+             SELECT id, $2 FROM visible \
+             ON CONFLICT (notification_id, user_id) DO NOTHING \
+         ) \
+         SELECT id, recipient_kind, recipient_id, event, request_id, \
+                severity, title, body, created_at, TRUE AS \"read\" \
+         FROM visible",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(roles)
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(r) => Ok(MarkOutcome::Updated(Box::new(r.into_model()?))),
+        None => Ok(MarkOutcome::NotFound),
+    }
+}
+
+/// Record read receipts for ALL of this user's currently-unread visible
+/// notifications. Returns the number of receipts newly inserted.
+pub async fn mark_all_read(
+    pool: &PgPool,
+    user_id: &str,
+    roles: &[String],
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO portal_notification_reads (notification_id, user_id) \
+         SELECT n.id, $1 \
+         FROM portal_notifications n \
+         WHERE ((n.recipient_kind = 'User' AND n.recipient_id = $1) \
+             OR (n.recipient_kind = 'Role' AND n.recipient_id = ANY($2))) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM portal_notification_reads r \
+               WHERE r.notification_id = n.id AND r.user_id = $1 \
+           ) \
+         ON CONFLICT (notification_id, user_id) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(roles)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+// ── DB integration tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod notifications_db_tests {
+    use super::*;
+
+    async fn test_pool() -> Option<PgPool> {
+        let url = match std::env::var("RYUKI_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("notifications_db_tests: RYUKI_DATABASE_URL not set — skipping");
+                return None;
+            }
+        };
+        let db = PgPool::connect(&url).await.expect("DB connection failed");
+        crate::database::run_migrations(&db)
+            .await
+            .expect("migrations must apply");
+        Some(db)
+    }
+
+    /// Delete the notifications inserted by a test (CASCADE removes their
+    /// receipts), identified by a unique recipient_id used only by that test.
+    async fn cleanup_recipient(pool: &PgPool, recipient_id: &str) {
+        sqlx::query("DELETE FROM portal_notifications WHERE recipient_id = $1")
+            .bind(recipient_id)
+            .execute(pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    // ── emit + list + unread_count ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn emit_approve_is_visible_to_owner() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-approve-001";
+        let rid = "00000000-0000-0000-0000-000000000001";
+
+        emit_for_transition(&pool, "request.approve", rid, Some(owner))
+            .await
+            .expect("emit must not fail");
+
+        let items = list_for_recipient(&pool, owner, &[])
+            .await
+            .expect("list must not fail");
+        let found = items
+            .iter()
+            .find(|n| n.recipient_id == owner && n.event == "request.approve")
+            .expect("emitted notification must appear in the owner's feed");
+        assert!(!found.read, "a freshly emitted notification is unread");
+
+        let count = unread_count(&pool, owner, &[])
+            .await
+            .expect("unread_count must not fail");
+        assert!(count >= 1, "unread count must be at least 1");
+
+        cleanup_recipient(&pool, owner).await;
+    }
+
+    #[tokio::test]
+    async fn emit_plan_is_visible_to_approver_role() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let rid = "00000000-0000-0000-0000-000000000002";
+        emit_for_transition(&pool, "request.plan", rid, None)
+            .await
+            .expect("emit must not fail");
+
+        let items =
+            list_for_recipient(&pool, "x-no-such-user", &["DatacenterApprover".to_string()])
+                .await
+                .expect("list must not fail");
+        assert!(
+            items
+                .iter()
+                .any(|n| n.recipient_id == "DatacenterApprover" && n.event == "request.plan"),
+            "plan notification must appear for a session that holds the DatacenterApprover role"
+        );
+
+        sqlx::query("DELETE FROM portal_notifications WHERE recipient_id = 'DatacenterApprover' AND event = 'request.plan' AND request_id = $1::uuid")
+            .bind(rid)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+    }
+
+    #[tokio::test]
+    async fn emit_unmapped_action_inserts_nothing() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-lock-001";
+        let rid = "00000000-0000-0000-0000-000000000003";
+
+        let before = list_for_recipient(&pool, owner, &[])
+            .await
+            .expect("list before")
+            .len();
+
+        emit_for_transition(&pool, "request.lock", rid, Some(owner))
+            .await
+            .expect("emit must not fail (fail-open means no error)");
+
+        let after = list_for_recipient(&pool, owner, &[])
+            .await
+            .expect("list after")
+            .len();
+
+        assert_eq!(before, after, "unmapped action must insert nothing");
+    }
+
+    // ── mark_read: auth + idempotency ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_read_idempotent_and_auth() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-markread-001";
+        let other = "test-owner-markread-other";
+        let rid = "00000000-0000-0000-0000-000000000004";
+
+        emit_for_transition(&pool, "request.approve", rid, Some(owner))
+            .await
+            .expect("emit");
+
+        let items = list_for_recipient(&pool, owner, &[]).await.expect("list");
+        let notif = items
+            .iter()
+            .find(|n| n.recipient_id == owner && n.event == "request.approve")
+            .expect("notification must be present");
+        let nid = notif.id.clone();
+
+        // Non-recipient cannot mark it read (auth boundary is the CTE filter).
+        let non_owner_result = mark_read(&pool, &nid, other, &[])
+            .await
+            .expect("mark_read must not err");
+        assert!(
+            matches!(non_owner_result, MarkOutcome::NotFound),
+            "non-recipient must get NotFound"
+        );
+
+        // Owner marks it read.
+        let first = mark_read(&pool, &nid, owner, &[])
+            .await
+            .expect("mark_read must not err");
+        assert!(
+            matches!(first, MarkOutcome::Updated(_)),
+            "first mark_read must return Updated"
+        );
+
+        // Idempotent: marking an already-read notification read again is a no-op
+        // that still returns Updated (the receipt already exists).
+        let second = mark_read(&pool, &nid, owner, &[])
+            .await
+            .expect("mark_read must not err");
+        assert!(
+            matches!(second, MarkOutcome::Updated(_)),
+            "re-marking is idempotent and returns Updated"
+        );
+
+        let count = unread_count(&pool, owner, &[]).await.expect("unread");
+        assert_eq!(
+            count, 0,
+            "owner has no unread after marking the only one read"
+        );
+
+        cleanup_recipient(&pool, owner).await;
+    }
+
+    // ── per-user read isolation on a SHARED role notification ──────────────────
+
+    #[tokio::test]
+    async fn role_notification_read_is_per_user() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        // A bespoke role used only by this test, so the seed DatacenterApprover
+        // rows do not interfere.
+        let role = "test-role-isolation-001";
+        let rid = "00000000-0000-0000-0000-000000000007";
+
+        // A role-targeted notification is ONE shared row (mirrors what the plan
+        // path emits for DatacenterApprover, but with an isolated role).
+        let nid = format!("pn-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO portal_notifications \
+             (id, recipient_kind, recipient_id, event, request_id, severity, title, body) \
+             VALUES ($1, 'Role', $2, 'request.plan', $3::uuid, 'Info', 'Awaiting approval', 'A request awaits approval.')",
+        )
+        .bind(&nid)
+        .bind(role)
+        .bind(rid)
+        .execute(&pool)
+        .await
+        .expect("seed role notification");
+
+        let roles = [role.to_string()];
+
+        // User A (holds the role) marks the shared notification read.
+        let marked = mark_read(&pool, &nid, "user-a", &roles)
+            .await
+            .expect("mark_read");
+        assert!(matches!(marked, MarkOutcome::Updated(_)));
+
+        // For user A it now reads true; for user B (same role) it stays unread.
+        let a_view = list_for_recipient(&pool, "user-a", &roles)
+            .await
+            .expect("list A");
+        let a_row = a_view.iter().find(|n| n.id == nid).expect("A sees it");
+        assert!(a_row.read, "user A has read the shared role notification");
+
+        let b_view = list_for_recipient(&pool, "user-b", &roles)
+            .await
+            .expect("list B");
+        let b_row = b_view.iter().find(|n| n.id == nid).expect("B sees it");
+        assert!(
+            !b_row.read,
+            "user B must still see the shared role notification as UNREAD"
+        );
+        assert!(
+            unread_count(&pool, "user-b", &roles)
+                .await
+                .expect("unread B")
+                >= 1,
+            "user B's unread count must still include the role notification"
+        );
+
+        cleanup_recipient(&pool, role).await;
+    }
+
+    // ── mark_all_read ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_all_read_clears_unread() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-markall-001";
+        let rid1 = "00000000-0000-0000-0000-000000000005";
+        let rid2 = "00000000-0000-0000-0000-000000000006";
+
+        emit_for_transition(&pool, "request.approve", rid1, Some(owner))
+            .await
+            .expect("emit 1");
+        emit_for_transition(&pool, "request.reject", rid2, Some(owner))
+            .await
+            .expect("emit 2");
+
+        let before = unread_count(&pool, owner, &[])
+            .await
+            .expect("unread before");
+        assert!(before >= 2, "must have at least 2 unread");
+
+        mark_all_read(&pool, owner, &[])
+            .await
+            .expect("mark_all_read must not fail");
+
+        let after = unread_count(&pool, owner, &[]).await.expect("unread after");
+        assert_eq!(after, 0, "unread count must be 0 after mark_all_read");
+
+        cleanup_recipient(&pool, owner).await;
+    }
+}

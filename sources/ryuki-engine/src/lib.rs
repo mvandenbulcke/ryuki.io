@@ -37,6 +37,7 @@ pub mod maintenance_calendar;
 pub mod models;
 pub mod network_readiness;
 pub mod noise_remediation;
+pub mod notifications;
 pub mod oob_access;
 pub mod os_baseline;
 pub mod outage_comms;
