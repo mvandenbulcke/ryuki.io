@@ -369,6 +369,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | POST | `/api/monitoring/zabbix/drift/detect` |
 | POST | `/api/monitoring/zabbix/drift/execute/{drift_id}` |
 | POST | `/api/monitoring/zabbix/drift/plan/{drift_id}` |
+| POST | `/api/monitoring/zabbix/drift/validate/{drift_id}` |
 | POST | `/api/monitoring/zabbix/drift/verify/{drift_id}` |
 | GET | `/api/network/dns-ipam-contract` |
 | GET | `/api/network/dns/records` |

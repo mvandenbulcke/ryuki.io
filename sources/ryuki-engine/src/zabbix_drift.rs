@@ -2,8 +2,6 @@ use crate::models::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-use uuid::Uuid;
 
 const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
 
@@ -38,12 +36,19 @@ pub enum DriftSeverity {
 
 impl std::fmt::Display for DriftSeverity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl DriftSeverity {
+    /// Canonical PascalCase variant name — matches DB CHECK constraint values.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            DriftSeverity::Critical => write!(f, "critical"),
-            DriftSeverity::High => write!(f, "high"),
-            DriftSeverity::Medium => write!(f, "medium"),
-            DriftSeverity::Low => write!(f, "low"),
-            DriftSeverity::Info => write!(f, "info"),
+            DriftSeverity::Critical => "Critical",
+            DriftSeverity::High => "High",
+            DriftSeverity::Medium => "Medium",
+            DriftSeverity::Low => "Low",
+            DriftSeverity::Info => "Info",
         }
     }
 }
@@ -60,38 +65,40 @@ pub enum DriftStatus {
 
 impl std::fmt::Display for DriftStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl DriftStatus {
+    /// Canonical PascalCase variant name — matches DB CHECK constraint values.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            DriftStatus::Detected => write!(f, "detected"),
-            DriftStatus::Planned => write!(f, "planned"),
-            DriftStatus::Validated => write!(f, "validated"),
-            DriftStatus::Remediated => write!(f, "remediated"),
-            DriftStatus::Verified => write!(f, "verified"),
-            DriftStatus::Failed => write!(f, "failed"),
+            DriftStatus::Detected => "Detected",
+            DriftStatus::Planned => "Planned",
+            DriftStatus::Validated => "Validated",
+            DriftStatus::Remediated => "Remediated",
+            DriftStatus::Verified => "Verified",
+            DriftStatus::Failed => "Failed",
         }
     }
 }
 
-static DRIFT_STORE: OnceLock<Mutex<Vec<DriftReport>>> = OnceLock::new();
+// ─── Pure engine functions ────────────────────────────────────────────────────
 
-fn drift_store() -> &'static Mutex<Vec<DriftReport>> {
-    DRIFT_STORE.get_or_init(|| Mutex::new(Vec::new()))
-}
-
+/// Fabricate synthetic drift rows for `site`. This is a PURE function with no
+/// side effects: it does not assign ids (id is left as empty String; the repo's
+/// RETURNING clause assigns the real UUID on INSERT) and does not touch any
+/// global store.
 pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
     if !VALID_SITES.contains(&site) {
         return Err(format!("Unknown site: {}", site));
     }
 
+    let now = chrono::Utc::now().to_rfc3339();
+
     let drift_entries = vec![
         DriftReport {
-            id: format!(
-                "zdr-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .split('-')
-                    .next()
-                    .unwrap_or("unknown")
-            ),
+            id: String::new(),
             host_id: format!("host-{}-srv-01", site.to_lowercase()),
             hostname: format!("{}-srv-01.contoso.com", site.to_lowercase()),
             site: site.to_string(),
@@ -104,22 +111,15 @@ pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
             drift_severity: DriftSeverity::High,
             status: DriftStatus::Detected,
             remediation_steps: Vec::new(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
             metadata: HashMap::from([
                 ("drift_type".into(), "host-group-template".into()),
                 ("dry_run".into(), "true".into()),
             ]),
         },
         DriftReport {
-            id: format!(
-                "zdr-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .split('-')
-                    .next()
-                    .unwrap_or("unknown")
-            ),
+            id: String::new(),
             host_id: format!("host-{}-srv-02", site.to_lowercase()),
             hostname: format!("{}-srv-02.contoso.com", site.to_lowercase()),
             site: site.to_string(),
@@ -132,22 +132,15 @@ pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
             drift_severity: DriftSeverity::Medium,
             status: DriftStatus::Detected,
             remediation_steps: Vec::new(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
             metadata: HashMap::from([
                 ("drift_type".into(), "template-only".into()),
                 ("dry_run".into(), "true".into()),
             ]),
         },
         DriftReport {
-            id: format!(
-                "zdr-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .split('-')
-                    .next()
-                    .unwrap_or("unknown")
-            ),
+            id: String::new(),
             host_id: format!("host-{}-srv-03", site.to_lowercase()),
             hostname: format!("{}-srv-03.contoso.com", site.to_lowercase()),
             site: site.to_string(),
@@ -160,22 +153,15 @@ pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
             drift_severity: DriftSeverity::Critical,
             status: DriftStatus::Detected,
             remediation_steps: Vec::new(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
             metadata: HashMap::from([
                 ("drift_type".into(), "group-proxy".into()),
                 ("dry_run".into(), "true".into()),
             ]),
         },
         DriftReport {
-            id: format!(
-                "zdr-{}",
-                Uuid::new_v4()
-                    .to_string()
-                    .split('-')
-                    .next()
-                    .unwrap_or("unknown")
-            ),
+            id: String::new(),
             host_id: format!("host-{}-srv-04", site.to_lowercase()),
             hostname: format!("{}-srv-04.contoso.com", site.to_lowercase()),
             site: site.to_string(),
@@ -188,8 +174,8 @@ pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
             drift_severity: DriftSeverity::Medium,
             status: DriftStatus::Detected,
             remediation_steps: Vec::new(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
             metadata: HashMap::from([
                 ("drift_type".into(), "maintenance-window-only".into()),
                 ("dry_run".into(), "true".into()),
@@ -197,27 +183,18 @@ pub fn detect_drift(site: &str) -> Result<Vec<DriftReport>, String> {
         },
     ];
 
-    {
-        let mut store = drift_store().lock().unwrap();
-        for entry in &drift_entries {
-            if !store.iter().any(|e| e.id == entry.id) {
-                store.push(entry.clone());
-            }
-        }
-    }
-
     Ok(drift_entries)
 }
 
-pub fn plan_remediation(drift_id: &str) -> Result<DriftReport, String> {
-    let mut store = drift_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|d| d.id == drift_id)
-        .ok_or_else(|| format!("Drift report not found: {}", drift_id))?;
-
-    let mut drift = store[idx].clone();
-
+/// Compute remediation steps for `drift` and return them. PURE — no I/O.
+///
+/// The caller (handler) must:
+/// 1. Load the report from the repo.
+/// 2. Call this to compute steps.
+/// 3. Call `repo::transition(Detected → Planned, steps)`.
+///
+/// Returns `Err` if the report is not in `Detected` status.
+pub fn plan_remediation(drift: &DriftReport) -> Result<Vec<String>, String> {
     if drift.status != DriftStatus::Detected {
         return Err(format!(
             "Cannot plan remediation for drift in status {:?}. Must be Detected first.",
@@ -231,7 +208,7 @@ pub fn plan_remediation(drift_id: &str) -> Result<DriftReport, String> {
         .cloned()
         .unwrap_or_default();
 
-    drift.remediation_steps = match drift_type.as_str() {
+    let steps = match drift_type.as_str() {
         "host-group-template" => vec![
             format!(
                 "DRY-RUN: Move host {} from {} to {} in Zabbix (simulated)",
@@ -279,25 +256,14 @@ pub fn plan_remediation(drift_id: &str) -> Result<DriftReport, String> {
         ],
     };
 
-    drift.status = DriftStatus::Planned;
-    drift.updated_at = chrono::Utc::now().to_rfc3339();
-    drift.metadata.insert(
-        "remediation_planned_at".into(),
-        chrono::Utc::now().to_rfc3339(),
-    );
-
-    store[idx] = drift.clone();
-    Ok(drift)
+    Ok(steps)
 }
 
-pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> {
-    let mut store = drift_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|d| d.id == drift_id)
-        .ok_or_else(|| format!("Drift report not found: {}", drift_id))?;
-    let drift = &mut store[idx];
-
+/// Guard: report must be in `Planned` status. PURE — no I/O.
+///
+/// Returns `Ok(())` when the guard passes. The handler then calls
+/// `repo::transition(Planned → Validated)`.
+pub fn validate_remediation(drift: &DriftReport) -> Result<ValidationResult, String> {
     if drift.status != DriftStatus::Planned {
         return Err(format!(
             "Cannot validate remediation for drift in status {:?}. Must be Planned first.",
@@ -308,7 +274,7 @@ pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> 
     if drift.remediation_steps.is_empty() {
         return Err(format!(
             "Drift {} has no remediation steps planned",
-            drift_id
+            drift.id
         ));
     }
 
@@ -320,13 +286,6 @@ pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> 
         "DRY-RUN: Maintenance window overlap checked (simulated)".into(),
     ];
 
-    drift.status = DriftStatus::Validated;
-    drift.updated_at = chrono::Utc::now().to_rfc3339();
-    drift.metadata.insert(
-        "remediation_validated_at".into(),
-        chrono::Utc::now().to_rfc3339(),
-    );
-
     Ok(ValidationResult {
         passed: true,
         errors: Vec::new(),
@@ -336,15 +295,11 @@ pub fn validate_remediation(drift_id: &str) -> Result<ValidationResult, String> 
     })
 }
 
-pub fn execute_remediation(drift_id: &str) -> Result<Vec<EvidenceItem>, String> {
-    let mut store = drift_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|d| d.id == drift_id)
-        .ok_or_else(|| format!("Drift report not found: {}", drift_id))?;
-
-    let mut drift = store[idx].clone();
-
+/// Guard + evidence fabrication: report must be in `Validated` status. PURE.
+///
+/// Returns evidence items. The handler then calls
+/// `repo::transition(Validated → Remediated)`.
+pub fn execute_remediation(drift: &DriftReport) -> Result<Vec<EvidenceItem>, String> {
     if drift.status != DriftStatus::Validated {
         return Err(format!(
             "Cannot execute remediation for drift in status {:?}. Must be Validated first.",
@@ -386,26 +341,18 @@ pub fn execute_remediation(drift_id: &str) -> Result<Vec<EvidenceItem>, String> 
         evidence_type: EvidenceType::Summary,
     });
 
-    drift.status = DriftStatus::Remediated;
-    drift.updated_at = chrono::Utc::now().to_rfc3339();
-    drift
-        .metadata
-        .insert("remediated_at".into(), chrono::Utc::now().to_rfc3339());
-
-    store[idx] = drift;
-
     Ok(evidence)
 }
 
-pub fn verify_remediation(drift_id: &str) -> Result<ValidationResult, String> {
-    let store = drift_store().lock().unwrap();
-    let idx = store
-        .iter()
-        .position(|d| d.id == drift_id)
-        .ok_or_else(|| format!("Drift report not found: {}", drift_id))?;
-
-    let drift = &store[idx];
-
+/// Guard: report must be in `Remediated` status. PURE.
+///
+/// Returns a `ValidationResult`. The handler then calls
+/// `repo::transition(Remediated → Verified)` to persist the status change.
+///
+/// BUG FIX: previously this function read from the global store but never wrote
+/// the `Verified` status back. The repo now owns persistence; this function is
+/// purely a guard + result constructor.
+pub fn verify_remediation(drift: &DriftReport) -> Result<ValidationResult, String> {
     if drift.status != DriftStatus::Remediated {
         return Err(format!(
             "Cannot verify remediation for drift in status {:?}. Must be Remediated first.",
@@ -413,21 +360,22 @@ pub fn verify_remediation(drift_id: &str) -> Result<ValidationResult, String> {
         ));
     }
 
-    let mut warnings: Vec<String> = Vec::new();
-    warnings.push(format!(
-        "DRY-RUN: Host {} group '{}' matches expected (simulated)",
-        drift.hostname, drift.expected_group
-    ));
-    warnings.push(format!(
-        "DRY-RUN: Host {} template '{}' matches expected (simulated)",
-        drift.hostname, drift.expected_template
-    ));
-    warnings.push(format!(
-        "DRY-RUN: Host {} proxy '{}' matches expected (simulated)",
-        drift.hostname, drift.expected_proxy
-    ));
-    warnings.push("DRY-RUN: Monitoring data flowing on expected template (simulated)".into());
-    warnings.push("DRY-RUN: No new alerts generated after drift remediation (simulated)".into());
+    let warnings: Vec<String> = vec![
+        format!(
+            "DRY-RUN: Host {} group '{}' matches expected (simulated)",
+            drift.hostname, drift.expected_group
+        ),
+        format!(
+            "DRY-RUN: Host {} template '{}' matches expected (simulated)",
+            drift.hostname, drift.expected_template
+        ),
+        format!(
+            "DRY-RUN: Host {} proxy '{}' matches expected (simulated)",
+            drift.hostname, drift.expected_proxy
+        ),
+        "DRY-RUN: Monitoring data flowing on expected template (simulated)".into(),
+        "DRY-RUN: No new alerts generated after drift remediation (simulated)".into(),
+    ];
 
     Ok(ValidationResult {
         passed: true,
@@ -438,13 +386,11 @@ pub fn verify_remediation(drift_id: &str) -> Result<ValidationResult, String> {
     })
 }
 
-pub fn get_drift_summary(site: &str) -> Result<Value, String> {
-    if !VALID_SITES.contains(&site) {
-        return Err(format!("Unknown site: {}", site));
-    }
-
-    let reports = detect_drift(site)?;
-
+/// PURE read summary built from `reports` (already loaded from the DB).
+///
+/// Previously this called `detect_drift` (a side-effectful mutation). Now the
+/// caller loads reports from `repo::list_by_site` and passes them in.
+pub fn drift_summary_from_reports(site: &str, reports: &[DriftReport]) -> Value {
     let total = reports.len();
     let critical = reports
         .iter()
@@ -458,6 +404,14 @@ pub fn get_drift_summary(site: &str) -> Result<Value, String> {
         .iter()
         .filter(|r| r.drift_severity == DriftSeverity::Medium)
         .count();
+    let low = reports
+        .iter()
+        .filter(|r| r.drift_severity == DriftSeverity::Low)
+        .count();
+    let info = reports
+        .iter()
+        .filter(|r| r.drift_severity == DriftSeverity::Info)
+        .count();
 
     let drift_types: Vec<String> = {
         let mut types: Vec<String> = reports
@@ -469,8 +423,8 @@ pub fn get_drift_summary(site: &str) -> Result<Value, String> {
         types
     };
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
+        "source": "postgres",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "site": site,
         "total_drift_reports": total,
@@ -478,23 +432,51 @@ pub fn get_drift_summary(site: &str) -> Result<Value, String> {
             "critical": critical,
             "high": high,
             "medium": medium,
-            "low": 0,
-            "info": 0
+            "low": low,
+            "info": info
         },
         "drift_types": drift_types,
         "remediable": total,
         "dry_run": true
-    }))
+    })
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(test)]
+    fn make_detected(site: &str, host_suffix: &str, drift_type: &str) -> DriftReport {
+        let now = chrono::Utc::now().to_rfc3339();
+        DriftReport {
+            id: format!("test-id-{}", host_suffix),
+            host_id: format!("host-{}-{}", site.to_lowercase(), host_suffix),
+            hostname: format!("{}-{}.contoso.com", site.to_lowercase(), host_suffix),
+            site: site.to_string(),
+            expected_group: format!("{}-Production-Servers", site),
+            actual_group: format!("{}-Discovered-Hosts", site),
+            expected_template: "Template-OS-Windows-Server-2022".into(),
+            actual_template: "Template-OS-Windows-Server-2019".into(),
+            expected_proxy: format!("zabbix-proxy-{}", site.to_lowercase()),
+            actual_proxy: format!("zabbix-proxy-{}", site.to_lowercase()),
+            drift_severity: DriftSeverity::High,
+            status: DriftStatus::Detected,
+            remediation_steps: Vec::new(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: HashMap::from([
+                ("drift_type".into(), drift_type.into()),
+                ("dry_run".into(), "true".into()),
+            ]),
+        }
+    }
+
     #[test]
     fn test_detect_drift_returns_entries() {
         let reports = detect_drift("DEFRA").unwrap();
-        assert!(reports.len() >= 4);
+        assert_eq!(reports.len(), 4);
         assert!(
             reports
                 .iter()
@@ -508,68 +490,81 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_drift_ids_empty() {
+        let reports = detect_drift("DEFRA").unwrap();
+        for r in &reports {
+            assert!(r.id.is_empty(), "engine must not assign ids — repo does");
+        }
+    }
+
+    #[test]
     fn test_detect_drift_unknown_site_fails() {
         assert!(detect_drift("UNKNOWN").is_err());
     }
 
     #[test]
     fn test_plan_remediation_generates_steps() {
-        let reports = detect_drift("GBLON").unwrap();
-        let first_id = reports[0].id.clone();
-
-        let planned = plan_remediation(&first_id).unwrap();
-        assert_eq!(planned.status, DriftStatus::Planned);
-        assert!(!planned.remediation_steps.is_empty());
+        let drift = make_detected("DEFRA", "srv-01", "host-group-template");
+        let steps = plan_remediation(&drift).unwrap();
+        assert!(!steps.is_empty());
     }
 
     #[test]
-    fn test_plan_remediation_not_found() {
-        assert!(plan_remediation("zdr-nonexistent").is_err());
+    fn test_plan_remediation_wrong_status_fails() {
+        let mut drift = make_detected("DEFRA", "srv-01", "host-group-template");
+        drift.status = DriftStatus::Planned;
+        assert!(plan_remediation(&drift).is_err());
     }
 
     #[test]
     fn test_validate_remediation_passes() {
-        let reports = detect_drift("NLAMS").unwrap();
-        let first_id = reports[0].id.clone();
-
-        plan_remediation(&first_id).unwrap();
-        let result = validate_remediation(&first_id).unwrap();
+        let mut drift = make_detected("DEFRA", "srv-01", "template-only");
+        drift.status = DriftStatus::Planned;
+        drift.remediation_steps = vec!["step 1".into()];
+        let result = validate_remediation(&drift).unwrap();
         assert!(result.passed);
         assert!(!result.warnings.is_empty());
     }
 
     #[test]
-    fn test_execute_remediation_returns_evidence() {
-        let reports = detect_drift("DEFRA").unwrap();
-        let first_id = reports[0].id.clone();
+    fn test_validate_remediation_wrong_status_fails() {
+        let drift = make_detected("DEFRA", "srv-01", "template-only");
+        // status is Detected, not Planned
+        assert!(validate_remediation(&drift).is_err());
+    }
 
-        plan_remediation(&first_id).unwrap();
-        validate_remediation(&first_id).unwrap();
-        let evidence = execute_remediation(&first_id).unwrap();
+    #[test]
+    fn test_validate_remediation_no_steps_fails() {
+        let mut drift = make_detected("DEFRA", "srv-01", "template-only");
+        drift.status = DriftStatus::Planned;
+        // remediation_steps is empty
+        assert!(validate_remediation(&drift).is_err());
+    }
+
+    #[test]
+    fn test_execute_remediation_returns_evidence() {
+        let mut drift = make_detected("DEFRA", "srv-01", "group-proxy");
+        drift.status = DriftStatus::Validated;
+        drift.remediation_steps = vec!["step 1".into(), "step 2".into()];
+        let evidence = execute_remediation(&drift).unwrap();
         assert!(evidence.len() >= 3);
         assert!(evidence.iter().any(|e| e.key == "pre-remediation-snapshot"));
         assert!(evidence.iter().any(|e| e.key == "post-remediation-verify"));
     }
 
     #[test]
-    fn test_execute_remediation_requires_validation() {
-        let reports = detect_drift("DEFRA").unwrap();
-        let first_id = reports[0].id.clone();
-
-        plan_remediation(&first_id).unwrap();
-        let error = execute_remediation(&first_id).unwrap_err();
-        assert!(error.contains("Must be Validated first"));
+    fn test_execute_remediation_requires_validated() {
+        let mut drift = make_detected("DEFRA", "srv-01", "group-proxy");
+        drift.status = DriftStatus::Planned;
+        drift.remediation_steps = vec!["step 1".into()];
+        assert!(execute_remediation(&drift).is_err());
     }
 
     #[test]
     fn test_verify_remediation_passes() {
-        let reports = detect_drift("GBLON").unwrap();
-        let first_id = reports[0].id.clone();
-
-        plan_remediation(&first_id).unwrap();
-        validate_remediation(&first_id).unwrap();
-        execute_remediation(&first_id).unwrap();
-        let result = verify_remediation(&first_id).unwrap();
+        let mut drift = make_detected("DEFRA", "srv-01", "maintenance-window-only");
+        drift.status = DriftStatus::Remediated;
+        let result = verify_remediation(&drift).unwrap();
         assert!(result.passed);
         assert!(
             result
@@ -580,33 +575,37 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_remediation_not_remediated_fails() {
-        let reports = detect_drift("DEBER").unwrap();
-        let first_id = reports[0].id.clone();
-
-        assert!(verify_remediation(&first_id).is_err());
+    fn test_verify_remediation_wrong_status_fails() {
+        let drift = make_detected("DEFRA", "srv-01", "maintenance-window-only");
+        // status is Detected
+        assert!(verify_remediation(&drift).is_err());
     }
 
     #[test]
-    fn test_get_drift_summary() {
-        let summary = get_drift_summary("DEFRA").unwrap();
-        assert_eq!(summary["source"], "dry-run");
-        assert_eq!(summary["dry_run"], true);
+    fn test_drift_summary_from_reports() {
+        let reports = detect_drift("DEFRA").unwrap();
+        let summary = drift_summary_from_reports("DEFRA", &reports);
+        assert_eq!(summary["source"], "postgres");
         assert_eq!(summary["site"], "DEFRA");
-        assert!(summary["total_drift_reports"].as_u64().unwrap() >= 4);
+        assert_eq!(summary["total_drift_reports"], 4);
     }
 
     #[test]
-    fn test_get_drift_summary_unknown_site_fails() {
-        assert!(get_drift_summary("UNKNOWN").is_err());
+    fn test_severity_str_pascal_case() {
+        assert_eq!(DriftSeverity::Critical.as_str(), "Critical");
+        assert_eq!(DriftSeverity::High.as_str(), "High");
+        assert_eq!(DriftSeverity::Medium.as_str(), "Medium");
+        assert_eq!(DriftSeverity::Low.as_str(), "Low");
+        assert_eq!(DriftSeverity::Info.as_str(), "Info");
     }
 
     #[test]
-    fn test_plan_remediation_already_planned_fails() {
-        let reports = detect_drift("NLAMS").unwrap();
-        let first_id = reports[0].id.clone();
-
-        plan_remediation(&first_id).unwrap();
-        assert!(plan_remediation(&first_id).is_err());
+    fn test_status_str_pascal_case() {
+        assert_eq!(DriftStatus::Detected.as_str(), "Detected");
+        assert_eq!(DriftStatus::Planned.as_str(), "Planned");
+        assert_eq!(DriftStatus::Validated.as_str(), "Validated");
+        assert_eq!(DriftStatus::Remediated.as_str(), "Remediated");
+        assert_eq!(DriftStatus::Verified.as_str(), "Verified");
+        assert_eq!(DriftStatus::Failed.as_str(), "Failed");
     }
 }

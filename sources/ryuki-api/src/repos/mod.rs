@@ -29,3 +29,4 @@ pub mod repository_capacity;
 pub mod restore_requests;
 pub mod snapshots;
 pub mod synthetic_health;
+pub mod zabbix_drift;

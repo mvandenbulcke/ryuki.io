@@ -1225,6 +1225,10 @@ pub fn routes() -> Router {
             post(zabbix_drift_plan),
         )
         .route(
+            "/api/monitoring/zabbix/drift/validate/{drift_id}",
+            post(zabbix_drift_validate),
+        )
+        .route(
             "/api/monitoring/zabbix/drift/execute/{drift_id}",
             post(zabbix_drift_execute),
         )
@@ -8005,50 +8009,117 @@ async fn observe_zabbix_drift() -> Json<Value> {
 
 // ─── Zabbix drift remediation endpoints ───
 
-async fn zabbix_drift_summary(
-    Query(query): Query<ZabbixDriftQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn zabbix_drift_summary(Query(query): Query<ZabbixDriftQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match zabbix_drift::get_drift_summary(&site) {
-        Ok(summary) => Ok(Json(summary)),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
+    match get_db() {
+        Some(pool) => {
+            let reports = crate::repos::zabbix_drift::list_by_site(pool, &site)
+                .await
+                .map_err(db_error)?;
+            let summary = zabbix_drift::drift_summary_from_reports(&site, &reports);
+            Ok(Json(summary))
+        }
+        None => {
+            // No DB — return an empty summary (reads degrade gracefully).
+            Ok(Json(zabbix_drift::drift_summary_from_reports(&site, &[])))
+        }
     }
 }
 
-async fn zabbix_drift_detect(
-    Json(body): Json<ZabbixDriftSiteRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match zabbix_drift::detect_drift(&body.site) {
-        Ok(reports) => Ok(Json(serde_json::to_value(reports).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+async fn zabbix_drift_detect(Json(body): Json<ZabbixDriftSiteRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let reports = zabbix_drift::detect_drift(&body.site).map_err(|e| status_400(&e))?;
+    let persisted = crate::repos::zabbix_drift::upsert_detected(pool, &reports)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&persisted).map_err(db_error)?))
 }
 
-async fn zabbix_drift_plan(
-    Path(drift_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match zabbix_drift::plan_remediation(&drift_id) {
-        Ok(planned) => Ok(Json(serde_json::to_value(planned).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+async fn zabbix_drift_plan(Path(drift_id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let report = crate::repos::zabbix_drift::get(pool, &drift_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&drift_id))?;
+    let steps = zabbix_drift::plan_remediation(&report).map_err(|e| status_409(&e))?;
+    let expected =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Detected);
+    let new_status =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Planned);
+    let planned =
+        crate::repos::zabbix_drift::transition(pool, &drift_id, expected, new_status, Some(&steps))
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                status_409("drift report was modified concurrently; reload and retry")
+            })?;
+    Ok(Json(serde_json::to_value(&planned).map_err(db_error)?))
 }
 
-async fn zabbix_drift_execute(
-    Path(drift_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match zabbix_drift::execute_remediation(&drift_id) {
-        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+async fn zabbix_drift_validate(Path(drift_id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let report = crate::repos::zabbix_drift::get(pool, &drift_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&drift_id))?;
+    let result = zabbix_drift::validate_remediation(&report).map_err(|e| status_409(&e))?;
+    let expected =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Planned);
+    let new_status =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Validated);
+    let _validated =
+        crate::repos::zabbix_drift::transition(pool, &drift_id, expected, new_status, None)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                status_409("drift report was modified concurrently; reload and retry")
+            })?;
+    Ok(Json(serde_json::to_value(&result).map_err(db_error)?))
 }
 
-async fn zabbix_drift_verify(
-    Path(drift_id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match zabbix_drift::verify_remediation(&drift_id) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
-        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
-    }
+async fn zabbix_drift_execute(Path(drift_id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let report = crate::repos::zabbix_drift::get(pool, &drift_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&drift_id))?;
+    let evidence = zabbix_drift::execute_remediation(&report).map_err(|e| status_409(&e))?;
+    let expected =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Validated);
+    let new_status = crate::repos::zabbix_drift::status_str(
+        &ryuki_engine::zabbix_drift::DriftStatus::Remediated,
+    );
+    let _remediated =
+        crate::repos::zabbix_drift::transition(pool, &drift_id, expected, new_status, None)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                status_409("drift report was modified concurrently; reload and retry")
+            })?;
+    Ok(Json(serde_json::to_value(&evidence).map_err(db_error)?))
+}
+
+async fn zabbix_drift_verify(Path(drift_id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let report = crate::repos::zabbix_drift::get(pool, &drift_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&drift_id))?;
+    let result = zabbix_drift::verify_remediation(&report).map_err(|e| status_409(&e))?;
+    // FIX: persist the Verified status — previously this was never written back.
+    let expected = crate::repos::zabbix_drift::status_str(
+        &ryuki_engine::zabbix_drift::DriftStatus::Remediated,
+    );
+    let new_status =
+        crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Verified);
+    let _verified =
+        crate::repos::zabbix_drift::transition(pool, &drift_id, expected, new_status, None)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                status_409("drift report was modified concurrently; reload and retry")
+            })?;
+    Ok(Json(serde_json::to_value(&result).map_err(db_error)?))
 }
 
 async fn zabbix_drift_contract() -> Json<Value> {
@@ -8110,6 +8181,7 @@ async fn zabbix_drift_contract() -> Json<Value> {
             "GET /api/monitoring/zabbix/drift": "Get per-site Zabbix drift summary",
             "POST /api/monitoring/zabbix/drift/detect": "Detect Zabbix configuration drift for a site",
             "POST /api/monitoring/zabbix/drift/plan/{drift_id}": "Plan remediation steps for a drift report",
+            "POST /api/monitoring/zabbix/drift/validate/{drift_id}": "Validate remediation plan before execution",
             "POST /api/monitoring/zabbix/drift/execute/{drift_id}": "Execute remediation for a drift report",
             "POST /api/monitoring/zabbix/drift/verify/{drift_id}": "Verify remediation was applied successfully"
         }
