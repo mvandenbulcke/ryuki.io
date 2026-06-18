@@ -2701,6 +2701,7 @@ mod tests {
         "/api/maintain/patch/approve",
         "/api/maintain/patch/execute",
         "/api/maintain/patch/verify",
+        "/api/maintain/patch/reboot",
         "/api/maintain/software/validate",
         "/api/maintain/software/plan",
         "/api/maintain/software/approve/s1",

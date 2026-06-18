@@ -335,6 +335,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | POST | `/api/maintain/patch/execute` |
 | GET | `/api/maintain/patch/pending-reboots` |
 | POST | `/api/maintain/patch/plan` |
+| POST | `/api/maintain/patch/reboot` |
 | POST | `/api/maintain/patch/validate` |
 | POST | `/api/maintain/patch/verify` |
 | GET | `/api/maintain/patch/waves` |

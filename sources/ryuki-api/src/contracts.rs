@@ -802,6 +802,7 @@ pub fn routes() -> Router {
         .route("/api/maintain/patch/approve", post(patch_approve))
         .route("/api/maintain/patch/execute", post(patch_execute))
         .route("/api/maintain/patch/verify", post(patch_verify))
+        .route("/api/maintain/patch/reboot", post(patch_reboot))
         .route("/api/maintain/patch/waves", get(patch_waves_list))
         .route("/api/maintain/patch/waves/{id}", get(patch_wave_get))
         .route("/api/maintain/patch/compliance", get(patch_compliance))
@@ -6628,6 +6629,24 @@ async fn patch_verify(Json(body): Json<PatchActionRequest>) -> ApiResult {
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
+/// Produce the dry-run reboot-orchestration plan for a persisted wave. Like
+/// verify, this is evidence-only: it computes the staged reboot plan (backup
+/// verify -> drain -> per-server reboots -> post-checks, all simulated) and
+/// does NOT transition the wave. 503 without a database, 404 when the wave is
+/// absent, 409 when the engine rejects the wave (e.g. zero servers).
+async fn patch_reboot(Json(body): Json<PatchActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.wave_id))?;
+
+    let stages = patch_engine::orchestrate_reboot(&wave).map_err(|e| status_409(&e))?;
+
+    Ok(Json(serde_json::to_value(&stages).unwrap_or_default()))
+}
+
 /// List all persisted patch waves (read surface). Returns an empty list when no
 /// database is configured (demo mode), matching the other read-only GETs.
 async fn patch_waves_list() -> ApiResult {
@@ -6676,7 +6695,7 @@ async fn patch_contract() -> Json<Value> {
         "patchMode": "dry-run-orchestration",
         "dryRunRequired": true,
         "liveExecutionAllowed": false,
-        "supportedWorkflows": ["patch-plan","patch-validate","patch-approve","patch-execute","patch-verify","patch-compliance","pending-reboots"],
+        "supportedWorkflows": ["patch-plan","patch-validate","patch-approve","patch-execute","patch-verify","patch-reboot","patch-compliance","pending-reboots"],
         "waveDimensions": ["site","osFamily","criticality","maintenanceWindow","rebootPolicy","dependencyGroup","backupState"],
         "validOsFamilies": ["windows","linux"],
         "validSites": ["DEBER","DEFRA","DEDUS","FRPAR","GBLON","NLAMS","ESMAD","ITMIL","CHZRH","ATVIE","BEBRU","SE STO","DKCPH","IE DUB"],

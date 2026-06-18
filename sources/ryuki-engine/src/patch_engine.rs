@@ -148,6 +148,23 @@ pub fn orchestrate_reboot(wave: &PatchWave) -> Result<Vec<Stage>, String> {
         return Err("Cannot orchestrate reboot with zero servers".into());
     }
 
+    // Reboot orchestration only applies to policies that actually reboot. A
+    // NoReboot wave performs no reboots, and a ScheduleOnly wave reboots only
+    // via manual coordination outside this orchestrator; for either, emitting
+    // per-server reboot stages would misrepresent the wave, so reject them.
+    match wave.reboot_policy {
+        RebootPolicy::RebootIfRequired | RebootPolicy::RebootAlways => {}
+        RebootPolicy::NoReboot => {
+            return Err(
+                "Cannot orchestrate reboot: wave reboot policy is NoReboot (no reboots planned)"
+                    .into(),
+            );
+        }
+        RebootPolicy::ScheduleOnly => {
+            return Err("Cannot orchestrate reboot: wave reboot policy is ScheduleOnly (reboots require manual coordination)".into());
+        }
+    }
+
     let mut stages: Vec<Stage> = Vec::new();
 
     stages.push(Stage {
@@ -731,6 +748,37 @@ mod tests {
         };
 
         assert!(orchestrate_reboot(&wave).is_err());
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_rejects_non_rebooting_policies() {
+        let servers = vec![make_test_server(
+            "srv-001",
+            "web01",
+            "DEFRA",
+            "production",
+            "high",
+        )];
+        let mut wave = plan_patch_wave_from_servers(&servers).unwrap();
+
+        // NoReboot and ScheduleOnly do not auto-reboot, so orchestration must
+        // refuse rather than emit misleading per-server reboot stages.
+        wave.reboot_policy = RebootPolicy::NoReboot;
+        assert!(orchestrate_reboot(&wave).is_err());
+
+        wave.reboot_policy = RebootPolicy::ScheduleOnly;
+        assert!(orchestrate_reboot(&wave).is_err());
+
+        // The two rebooting policies still produce per-server reboot stages.
+        for policy in [RebootPolicy::RebootIfRequired, RebootPolicy::RebootAlways] {
+            wave.reboot_policy = policy;
+            let stages = orchestrate_reboot(&wave).unwrap();
+            assert!(
+                stages.iter().any(|s| s.name.starts_with("reboot-server-")),
+                "policy {:?} should still emit per-server reboot stages",
+                wave.reboot_policy
+            );
+        }
     }
 
     #[test]
