@@ -16,6 +16,7 @@ pub mod access_recertification;
 pub mod ad_computers;
 pub mod backup_coverage_reports;
 pub mod certificates;
+pub mod compliance_reporting;
 pub mod container_namespace;
 pub mod cost_capacity;
 pub mod datacenter_readiness;

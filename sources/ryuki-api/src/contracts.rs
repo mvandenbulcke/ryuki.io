@@ -19541,89 +19541,265 @@ struct ComplianceSiteQuery {
     site: Option<String>,
 }
 
-async fn compliance_frameworks() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::list_frameworks()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn compliance_frameworks() -> ApiResult {
+    let frameworks = match get_db() {
+        Some(pool) => crate::repos::compliance_reporting::list_frameworks(pool)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    let source = if frameworks.is_empty() { "static-seed" } else { "db" };
+    Ok(Json(json!({ "source": source, "frameworks": frameworks })))
 }
-async fn compliance_framework_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::get_framework(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+
+async fn compliance_framework_get(Path(id): Path<String>) -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance framework '{}' not found", id)})),
+        ));
+    };
+    let fw = crate::repos::compliance_reporting::get_framework(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Compliance framework '{}' not found", id)})),
+            )
+        })?;
+    Ok(Json(json!({ "source": "db", "framework": fw })))
 }
-async fn compliance_controls_list(
-    Query(q): Query<ComplianceControlsQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::list_controls(
-        q.framework_id.as_deref().unwrap_or(""),
-        q.site.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+
+async fn compliance_controls_list(Query(q): Query<ComplianceControlsQuery>) -> ApiResult {
+    let framework_id = q.framework_id.as_deref().unwrap_or("");
+    let site = q.site.as_deref().unwrap_or("");
+    let controls = match get_db() {
+        Some(pool) => crate::repos::compliance_reporting::list_controls(pool, framework_id, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    let source = if controls.is_empty() { "static-seed" } else { "db" };
+    Ok(Json(json!({
+        "source": source,
+        "framework_id": framework_id,
+        "site": site,
+        "controls": controls
+    })))
 }
-async fn compliance_control_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::get_control(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+
+async fn compliance_control_get(Path(id): Path<String>) -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance control '{}' not found", id)})),
+        ));
+    };
+    let ctrl = crate::repos::compliance_reporting::get_control(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Compliance control '{}' not found", id)})),
+            )
+        })?;
+    Ok(Json(json!({ "source": "db", "control": ctrl })))
 }
+
 async fn compliance_control_assess(
     Path(id): Path<String>,
     Json(b): Json<ComplianceAssessRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::assess_control(&id, &b.status, &b.assessed_by, &b.evidence_ref)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
-}
-async fn compliance_report_generate(
-    Json(b): Json<ComplianceReportGenerateRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::generate_report(&b.framework_id, &b.site)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
-}
-async fn compliance_report_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::get_report(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
-}
-async fn compliance_findings_list(
-    Query(q): Query<ComplianceFindingsQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::list_findings(
-        q.site.as_deref().unwrap_or(""),
-        q.severity.as_deref().unwrap_or(""),
+) -> ApiResult {
+    if b.assessed_by.trim().is_empty() {
+        return Err(status_400("assessed_by cannot be empty"));
+    }
+    if b.evidence_ref.trim().is_empty() {
+        return Err(status_400("evidence_ref cannot be empty"));
+    }
+    let status = compliance_reporting::parse_control_status(&b.status).map_err(|e| status_400(&e))?;
+
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::compliance_reporting::AssessOutcome;
+    match crate::repos::compliance_reporting::assess_control(
+        pool,
+        &id,
+        &status,
+        &b.assessed_by,
+        &b.evidence_ref,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    .await
+    .map_err(db_error)?
+    {
+        AssessOutcome::Updated(ctrl) => Ok(Json(json!({ "source": "db", "control": ctrl }))),
+        AssessOutcome::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance control '{}' not found", id)})),
+        )),
+    }
 }
+
+async fn compliance_report_generate(Json(b): Json<ComplianceReportGenerateRequest>) -> ApiResult {
+    if b.site.trim().is_empty() {
+        return Err(status_400("site cannot be empty"));
+    }
+    if b.framework_id.trim().is_empty() {
+        return Err(status_400("framework_id cannot be empty"));
+    }
+
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // Verify framework exists
+    crate::repos::compliance_reporting::get_framework(pool, &b.framework_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(
+                    json!({"error": format!("Compliance framework '{}' not found", b.framework_id)}),
+                ),
+            )
+        })?;
+
+    // Load controls for this framework+site
+    let controls =
+        crate::repos::compliance_reporting::list_controls(pool, &b.framework_id, &b.site)
+            .await
+            .map_err(db_error)?;
+    if controls.is_empty() {
+        return Err(status_400(&format!(
+            "No controls found for framework '{}' at site '{}'",
+            b.framework_id, b.site
+        )));
+    }
+
+    let report =
+        crate::repos::compliance_reporting::generate_report(pool, &b.framework_id, &b.site, &controls)
+            .await
+            .map_err(db_error)?;
+    Ok(Json(json!({ "source": "db", "report": report })))
+}
+
+async fn compliance_report_get(Path(id): Path<String>) -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance report '{}' not found", id)})),
+        ));
+    };
+    let report = crate::repos::compliance_reporting::get_report(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Compliance report '{}' not found", id)})),
+            )
+        })?;
+    Ok(Json(json!({ "source": "db", "report": report })))
+}
+
+async fn compliance_findings_list(Query(q): Query<ComplianceFindingsQuery>) -> ApiResult {
+    let site = q.site.as_deref().unwrap_or("");
+    let severity = q.severity.as_deref().unwrap_or("");
+    if !severity.is_empty() {
+        compliance_reporting::parse_severity(severity).map_err(|e| status_400(&e))?;
+    }
+    let findings = match get_db() {
+        Some(pool) => crate::repos::compliance_reporting::list_findings(pool, site, severity)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    let source = if findings.is_empty() { "static-seed" } else { "db" };
+    Ok(Json(json!({
+        "source": source,
+        "site": site,
+        "severity": severity,
+        "findings": findings
+    })))
+}
+
 async fn compliance_finding_resolve(
     Path(id): Path<String>,
     Json(b): Json<ComplianceResolveRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::resolve_finding(&id, &b.resolution)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    if b.resolution.trim().is_empty() {
+        return Err(status_400("resolution cannot be empty"));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::compliance_reporting::MutationOutcome;
+    match crate::repos::compliance_reporting::resolve_finding(pool, &id, &b.resolution)
+        .await
+        .map_err(db_error)?
+    {
+        MutationOutcome::Updated(f) => Ok(Json(json!({ "source": "db", "finding": f }))),
+        MutationOutcome::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Finding '{}' not found", id)})),
+        )),
+    }
 }
+
 async fn compliance_finding_waive(
     Path(id): Path<String>,
     Json(b): Json<ComplianceWaiveRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::create_waiver(&id, &b.reason, &b.approved_by, &b.expiry)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    if b.reason.trim().is_empty() {
+        return Err(status_400("reason cannot be empty"));
+    }
+    if b.approved_by.trim().is_empty() {
+        return Err(status_400("approved_by cannot be empty"));
+    }
+    if chrono::DateTime::parse_from_rfc3339(&b.expiry).is_err() {
+        return Err(status_400(&format!("Invalid waiver expiry: {}", b.expiry)));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::compliance_reporting::MutationOutcome;
+    match crate::repos::compliance_reporting::create_waiver(
+        pool,
+        &id,
+        &b.reason,
+        &b.approved_by,
+        &b.expiry,
+    )
+    .await
+    .map_err(db_error)?
+    {
+        MutationOutcome::Updated(f) => Ok(Json(json!({
+            "source": "db",
+            "waiver": {
+                "finding_id": &id,
+                "reason": &b.reason,
+                "approved_by": &b.approved_by,
+                "expiry": &b.expiry,
+                "created_at": chrono::Utc::now().to_rfc3339()
+            },
+            "finding": f
+        }))),
+        MutationOutcome::NotFound => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Finding '{}' not found", id)})),
+        )),
+    }
 }
-async fn compliance_summary(
-    Query(q): Query<ComplianceSiteQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    compliance_reporting::get_compliance_summary(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+
+async fn compliance_summary(Query(q): Query<ComplianceSiteQuery>) -> ApiResult {
+    let site = q.site.as_deref().unwrap_or("");
+    let summaries = match get_db() {
+        Some(pool) => crate::repos::compliance_reporting::get_compliance_summary(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    let source = if summaries.is_empty() { "static-seed" } else { "db" };
+    Ok(Json(json!({
+        "source": source,
+        "site": site,
+        "frameworks": summaries
+    })))
 }
 async fn compliance_contract() -> Json<Value> {
     Json(
