@@ -7193,43 +7193,94 @@ struct BaselineQuery {
 }
 
 async fn baseline_check(Path(server): Path<String>) -> ApiResult {
-    let results = os_baseline::check_server_compliance(&server);
-    Ok(Json(serde_json::to_value(results).unwrap()))
+    // The repo already filters by server_name; no engine call needed here.
+    let results = match get_db() {
+        Some(pool) => crate::repos::os_baseline::list_results_for_server(pool, &server)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(results).unwrap_or_default()))
 }
 
 async fn baseline_compliance(Query(query): Query<BaselineQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match os_baseline::check_site_compliance(&site) {
-        Ok(summary) => Ok(Json(serde_json::to_value(summary).unwrap())),
+    let results = match get_db() {
+        Some(pool) => crate::repos::os_baseline::list_results_for_site(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    match os_baseline::check_site_compliance(&results, &site) {
+        Ok(summary) => Ok(Json(serde_json::to_value(summary).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn baseline_noncompliant(Query(query): Query<BaselineQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match os_baseline::get_noncompliant(&site) {
-        Ok(servers) => Ok(Json(serde_json::to_value(servers).unwrap())),
+    let (checks, results) = match get_db() {
+        Some(pool) => {
+            let checks = crate::repos::os_baseline::list_checks(pool)
+                .await
+                .map_err(db_error)?;
+            let results = crate::repos::os_baseline::list_results_for_site(pool, &site)
+                .await
+                .map_err(db_error)?;
+            (checks, results)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    match os_baseline::get_noncompliant(&checks, &results, &site) {
+        Ok(servers) => Ok(Json(serde_json::to_value(servers).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
 async fn baseline_trend(Query(query): Query<BaselineQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
-    match os_baseline::get_compliance_trend(&site) {
-        Ok(trend) => Ok(Json(serde_json::to_value(trend).unwrap())),
+    let trend_points = match get_db() {
+        Some(pool) => crate::repos::os_baseline::compliance_trend_for_site(pool, &site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    match os_baseline::get_compliance_trend(&trend_points, &site) {
+        Ok(trend) => Ok(Json(serde_json::to_value(trend).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
-async fn baseline_coverage() -> Json<Value> {
-    let coverage = os_baseline::get_check_coverage();
-    Json(serde_json::to_value(coverage).unwrap())
+async fn baseline_coverage() -> ApiResult {
+    let (checks, results) = match get_db() {
+        Some(pool) => {
+            let checks = crate::repos::os_baseline::list_checks(pool)
+                .await
+                .map_err(db_error)?;
+            let results = crate::repos::os_baseline::list_all_results(pool)
+                .await
+                .map_err(db_error)?;
+            (checks, results)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let coverage = os_baseline::get_check_coverage(&checks, &results);
+    Ok(Json(serde_json::to_value(coverage).unwrap_or_default()))
 }
 
 async fn baseline_remediate(Path((server, check_id)): Path<(String, String)>) -> ApiResult {
-    match os_baseline::remediate_finding(&server, &check_id) {
-        Ok(result) => Ok(Json(result)),
-        Err(e) => Err(status_400(&e)),
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // The repo derives the authoritative expected_value from baseline_checks
+    // inside the same transaction (no stale/fallback value), and returns None
+    // (→404) when the (server, check) result row does not exist.
+    let result = crate::repos::os_baseline::remediate(pool, &server, &check_id)
+        .await
+        .map_err(db_error)?;
+
+    match result {
+        None => Err(status_404(&format!("{server}/{check_id}"))),
+        Some(r) => Ok(Json(serde_json::to_value(r).unwrap_or_default())),
     }
 }
 

@@ -23,6 +23,7 @@ pub mod golden_images;
 pub mod hardware_assets;
 pub mod immutability_compliance;
 pub mod log_forwarders;
+pub mod os_baseline;
 pub mod patch_waves;
 pub mod repository_capacity;
 pub mod restore_requests;
