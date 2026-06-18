@@ -17143,76 +17143,226 @@ struct FirmwareExceptionRequest {
 async fn firmware_devices_list(
     Query(params): Query<FirmwareDeviceQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::list_devices(params.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    let site = params.site.as_deref().unwrap_or("");
+    match get_db() {
+        Some(pool) => {
+            let devices = crate::repos::firmware_lifecycle::list_devices(pool, site)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(json!({
+                "source": "live",
+                "site": if site.is_empty() { Value::Null } else { json!(site) },
+                "count": devices.len(),
+                "devices": devices
+            })))
+        }
+        None => Ok(Json(json!({
+            "source": "dry-run",
+            "site": if site.is_empty() { Value::Null } else { json!(site) },
+            "count": 0,
+            "devices": []
+        }))),
+    }
 }
 
 async fn firmware_device_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::get_device(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let device = crate::repos::firmware_lifecycle::get_device(pool, &id)
+                .await
+                .map_err(db_error)?
+                .ok_or_else(|| status_404(&id))?;
+            Ok(Json(json!({
+                "source": "live",
+                "device": device
+            })))
+        }
+        None => Err(status_404(&id)),
+    }
 }
 
 async fn firmware_check_compliance(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::check_compliance(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Recalculate + persist in ONE transaction (SELECT ... FOR UPDATE inside the
+    // repo) so a concurrent request_exception (which sets the device to Exception)
+    // cannot be clobbered by a stale recompute writing back the old status.
+    let updated = crate::repos::firmware_lifecycle::recalculate_compliance(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "live",
+        "device_id": updated.id,
+        "site": updated.site,
+        "vendor": updated.vendor,
+        "model": updated.model,
+        "current_version": updated.current_version,
+        "minimum_version": updated.minimum_version,
+        "latest_version": updated.latest_version,
+        "eol_date": updated.eol_date,
+        "compliance_status": updated.compliance_status.to_string(),
+        "meets_minimum": firmware_lifecycle::compare_versions(&updated.current_version, &updated.minimum_version) != std::cmp::Ordering::Less,
+        "latest_available": updated.current_version == updated.latest_version,
+    })))
 }
 
 async fn firmware_noncompliant() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::get_noncompliant()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let devices = crate::repos::firmware_lifecycle::list_noncompliant(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(json!({
+                "source": "live",
+                "count": devices.len(),
+                "devices": devices
+            })))
+        }
+        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "devices": [] }))),
+    }
 }
 
 async fn firmware_eol() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::get_eol_devices()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let devices = crate::repos::firmware_lifecycle::list_eol(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(json!({
+                "source": "live",
+                "count": devices.len(),
+                "devices": devices
+            })))
+        }
+        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "devices": [] }))),
+    }
 }
 
 async fn firmware_request_exception(
     Json(body): Json<FirmwareExceptionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::request_exception(
+    // Pure validation first (engine guard).
+    firmware_lifecycle::validate_exception_request(&body.reason, &body.approved_by, body.expiry_days)
+        .map_err(|e| status_400(&e))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let exception = crate::repos::firmware_lifecycle::request_exception(
+        pool,
         &body.device_id,
         &body.reason,
         &body.approved_by,
         body.expiry_days,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&body.device_id))?;
+    Ok(Json(json!({
+        "source": "live",
+        "exception": exception,
+        "device_status": firmware_lifecycle::ComplianceStatus::Exception.to_string()
+    })))
 }
 
 async fn firmware_exceptions_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::list_exceptions()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let exceptions = crate::repos::firmware_lifecycle::list_active_exceptions(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(json!({
+                "source": "live",
+                "count": exceptions.len(),
+                "exceptions": exceptions
+            })))
+        }
+        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "exceptions": [] }))),
+    }
 }
 
 async fn firmware_revoke_exception(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::revoke_exception(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let device_id = crate::repos::firmware_lifecycle::revoke_exception(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "live",
+        "revoked_exception_id": id,
+        "device_id": device_id,
+        "device_status": firmware_lifecycle::ComplianceStatus::NonCompliant.to_string()
+    })))
 }
 
 async fn firmware_compliance_report() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::get_compliance_report()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
+                .await
+                .map_err(db_error)?;
+            let total = devices.len();
+            let compliant = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Compliant).count();
+            let noncompliant = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::NonCompliant).count();
+            let eol = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::EOL).count();
+            let exception = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Exception).count();
+            Ok(Json(json!({
+                "source": "live",
+                "total": total,
+                "compliant": compliant,
+                "noncompliant": noncompliant,
+                "eol": eol,
+                "exception": exception,
+            })))
+        }
+        None => Ok(Json(json!({
+            "source": "dry-run",
+            "total": 0,
+            "compliant": 0,
+            "noncompliant": 0,
+            "eol": 0,
+            "exception": 0,
+            "dry_run": true
+        }))),
+    }
 }
 
 async fn firmware_vendor_summary() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firmware_lifecycle::get_vendor_summary()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
+                .await
+                .map_err(db_error)?;
+            let mut vendors: std::collections::BTreeMap<String, (usize, usize, usize, usize, usize)> = std::collections::BTreeMap::new();
+            for device in &devices {
+                let entry = vendors.entry(device.vendor.clone()).or_insert((0, 0, 0, 0, 0));
+                entry.0 += 1;
+                match device.compliance_status {
+                    firmware_lifecycle::ComplianceStatus::Compliant => entry.1 += 1,
+                    firmware_lifecycle::ComplianceStatus::NonCompliant => entry.2 += 1,
+                    firmware_lifecycle::ComplianceStatus::EOL => entry.3 += 1,
+                    firmware_lifecycle::ComplianceStatus::Exception => entry.4 += 1,
+                }
+            }
+            let summary: Vec<Value> = vendors.into_iter().map(|(vendor, (total, compliant, noncompliant, eol, exception))| {
+                let pct = if total == 0 { 0.0 } else { (compliant as f64 / total as f64) * 100.0 };
+                json!({
+                    "vendor": vendor,
+                    "total": total,
+                    "compliant": compliant,
+                    "noncompliant": noncompliant,
+                    "eol": eol,
+                    "exception": exception,
+                    "compliance_percentage": pct
+                })
+            }).collect();
+            Ok(Json(json!({ "source": "live", "vendors": summary })))
+        }
+        None => Ok(Json(json!({ "source": "dry-run", "vendors": [] }))),
+    }
 }
 
 async fn firmware_contract() -> Json<Value> {
