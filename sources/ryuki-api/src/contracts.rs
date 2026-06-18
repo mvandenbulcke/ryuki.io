@@ -16256,83 +16256,149 @@ async fn hardware_contract() -> Json<Value> {
 
 // ─── Outage communications handlers ───
 
-async fn outage_notices_list(Query(query): Query<OutageNoticeListQuery>) -> Json<Value> {
+async fn outage_notices_list(Query(query): Query<OutageNoticeListQuery>) -> ApiResult {
     let site = query.site.as_deref().unwrap_or("");
-    let notices = outage_comms::get_all_notices(site);
-    Json(serde_json::to_value(notices).unwrap())
+    let notices = match get_db() {
+        Some(pool) => crate::repos::outage_comms::list(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
 async fn outage_notices_create(Json(body): Json<OutageNoticeCreateRequest>) -> ApiResult {
-    match outage_comms::create_notice(
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let notice = outage_comms::build_notice(
         &body.site,
         body.affected_systems,
         &body.start_time,
         &body.end_time,
         &body.impact_level,
-    ) {
-        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    )
+    .map_err(|e| status_400(&e))?;
+    let persisted = crate::repos::outage_comms::insert(pool, &notice)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
 async fn outage_notices_get(Path(id): Path<String>) -> ApiResult {
-    match outage_comms::get_notice(&id) {
-        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
-        Err(e) => Err(status_404(&e)),
-    }
+    // Read surface: 404-as-absent when no DB (not 503).
+    let Some(pool) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(notice).unwrap_or_default()))
 }
 
 async fn outage_notices_preview(Path(id): Path<String>) -> ApiResult {
-    match outage_comms::preview_notice(&id) {
-        Ok(preview) => Ok(Json(preview)),
-        Err(e) => Err(status_404(&e)),
-    }
+    // Read surface: 404-as-absent when no DB.
+    let Some(pool) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(outage_comms::preview_notice_pure(&notice)))
 }
 
 async fn outage_notices_send(Path(id): Path<String>) -> ApiResult {
-    match outage_comms::send_notice(&id) {
-        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    outage_comms::send_guard(&notice).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::outage_comms::send(pool, &id, &notice.status.to_string())
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
 async fn outage_notices_acknowledge(
     Path(id): Path<String>,
     Json(body): Json<OutageNoticeAcknowledgeRequest>,
 ) -> ApiResult {
-    match outage_comms::acknowledge_notice(&id, &body.user) {
-        Ok(ack) => Ok(Json(serde_json::to_value(ack).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    outage_comms::acknowledge_guard(&notice).map_err(|e| status_409(&e))?;
+    let ack = crate::repos::outage_comms::acknowledge(
+        pool,
+        &id,
+        &body.user,
+        &notice.status.to_string(),
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(ack).unwrap_or_default()))
 }
 
 async fn outage_notices_complete(Path(id): Path<String>) -> ApiResult {
-    match outage_comms::complete_notice(&id) {
-        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    outage_comms::complete_guard(&notice).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::outage_comms::complete(pool, &id, &notice.status.to_string())
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
 async fn outage_notices_cancel(Path(id): Path<String>) -> ApiResult {
-    match outage_comms::cancel_notice(&id) {
-        Ok(notice) => Ok(Json(serde_json::to_value(notice).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let notice = crate::repos::outage_comms::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    outage_comms::cancel_guard(&notice).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::outage_comms::cancel(pool, &id, &notice.status.to_string())
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
-async fn outage_notices_active(Query(query): Query<OutageNoticeActiveQuery>) -> Json<Value> {
-    let active = outage_comms::get_active_notices(&query.site);
-    Json(serde_json::to_value(active).unwrap())
+async fn outage_notices_active(Query(query): Query<OutageNoticeActiveQuery>) -> ApiResult {
+    let notices = match get_db() {
+        Some(pool) => crate::repos::outage_comms::list_active(pool, &query.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
-async fn outage_notices_history(Query(query): Query<OutageNoticeHistoryQuery>) -> Json<Value> {
-    let history = outage_comms::get_notice_history(&query.site);
-    Json(serde_json::to_value(history).unwrap())
+async fn outage_notices_history(Query(query): Query<OutageNoticeHistoryQuery>) -> ApiResult {
+    let notices = match get_db() {
+        Some(pool) => crate::repos::outage_comms::list_history(pool, &query.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
-async fn outage_notices_upcoming(Query(query): Query<OutageNoticeUpcomingQuery>) -> Json<Value> {
-    let upcoming = outage_comms::get_upcoming(&query.site);
-    Json(serde_json::to_value(upcoming).unwrap())
+async fn outage_notices_upcoming(Query(query): Query<OutageNoticeUpcomingQuery>) -> ApiResult {
+    let notices = match get_db() {
+        Some(pool) => crate::repos::outage_comms::list_upcoming(pool, &query.site)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
 async fn outage_contract() -> Json<Value> {

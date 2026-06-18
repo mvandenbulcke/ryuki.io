@@ -25,6 +25,7 @@ pub mod hardware_assets;
 pub mod immutability_compliance;
 pub mod log_forwarders;
 pub mod os_baseline;
+pub mod outage_comms;
 pub mod patch_waves;
 pub mod repository_capacity;
 pub mod restore_requests;

@@ -1,7 +1,6 @@
 use chrono::{Days, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,85 +77,19 @@ pub struct NoticeAckEvent {
     pub acknowledged_at: String,
 }
 
-type NoticeStore = Vec<OutageNotice>;
-
-static NOTICE_STORE: OnceLock<Mutex<NoticeStore>> = OnceLock::new();
-
-fn notice_store() -> &'static Mutex<NoticeStore> {
-    NOTICE_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
+// ─── Pure helpers ─────────────────────────────────────────────────────────────
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn parse_iso_time(time: &str) -> Option<chrono::DateTime<Utc>> {
+pub fn parse_iso_time(time: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(time)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn seed_data() -> NoticeStore {
-    let now = Utc::now();
-    vec![
-        OutageNotice {
-            id: "oc-defra-001".into(),
-            site: "DEFRA".into(),
-            affected_systems: vec!["defra-db-cluster".into(), "defra-app-servers".into()],
-            start_time: (now + Days::new(2)).to_rfc3339(),
-            end_time: (now + Days::new(2) + chrono::Duration::hours(4)).to_rfc3339(),
-            impact_level: ImpactLevel::High,
-            message_template: "Scheduled database maintenance on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.".into(),
-            status: NoticeStatus::Draft,
-            sent_at: None,
-            acknowledged_by: None,
-            created_at: (now - chrono::Duration::hours(12)).to_rfc3339(),
-            updated_at: (now - chrono::Duration::hours(12)).to_rfc3339(),
-            metadata: vec![
-                NoticeMetadata { key: "source".into(), value: "static-seed".into() },
-                NoticeMetadata { key: "dry_run".into(), value: "true".into() },
-            ],
-        },
-        OutageNotice {
-            id: "oc-gblon-001".into(),
-            site: "GBLON".into(),
-            affected_systems: vec!["gblon-vsan-cluster".into(), "gblon-esx-hosts".into()],
-            start_time: (now - chrono::Duration::hours(6)).to_rfc3339(),
-            end_time: (now - chrono::Duration::hours(1)).to_rfc3339(),
-            impact_level: ImpactLevel::Critical,
-            message_template: "Emergency storage expansion on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.".into(),
-            status: NoticeStatus::Sent,
-            sent_at: Some((now - chrono::Duration::hours(5) - chrono::Duration::minutes(30)).to_rfc3339()),
-            acknowledged_by: Some("bob.engineer".into()),
-            created_at: (now - chrono::Duration::hours(7)).to_rfc3339(),
-            updated_at: (now - chrono::Duration::hours(5)).to_rfc3339(),
-            metadata: vec![
-                NoticeMetadata { key: "source".into(), value: "static-seed".into() },
-                NoticeMetadata { key: "dry_run".into(), value: "true".into() },
-            ],
-        },
-        OutageNotice {
-            id: "oc-frpar-001".into(),
-            site: "FRPAR".into(),
-            affected_systems: vec!["frpar-core-switch".into(), "frpar-edge-firewall".into()],
-            start_time: (now + Days::new(5)).to_rfc3339(),
-            end_time: (now + Days::new(5) + chrono::Duration::hours(3)).to_rfc3339(),
-            impact_level: ImpactLevel::Med,
-            message_template: "Network firmware upgrade on {{site}}. Systems affected: {{systems}}. Expected impact: {{impact}}. Window: {{start}} to {{end}} UTC.".into(),
-            status: NoticeStatus::Draft,
-            sent_at: None,
-            acknowledged_by: None,
-            created_at: (now - chrono::Duration::hours(1)).to_rfc3339(),
-            updated_at: (now - chrono::Duration::hours(1)).to_rfc3339(),
-            metadata: vec![
-                NoticeMetadata { key: "source".into(), value: "static-seed".into() },
-                NoticeMetadata { key: "dry_run".into(), value: "true".into() },
-            ],
-        },
-    ]
-}
-
-fn expand_template(notice: &OutageNotice) -> String {
+pub fn expand_template(notice: &OutageNotice) -> String {
     notice
         .message_template
         .replace("{{site}}", &notice.site)
@@ -166,7 +99,11 @@ fn expand_template(notice: &OutageNotice) -> String {
         .replace("{{end}}", &notice.end_time)
 }
 
-pub fn create_notice(
+// ─── Pure business logic ──────────────────────────────────────────────────────
+
+/// Validate inputs and return a new `OutageNotice` in Draft status.
+/// Does NOT write to any store — caller persists the returned notice.
+pub fn build_notice(
     site: &str,
     affected_systems: Vec<String>,
     start_time: &str,
@@ -188,19 +125,7 @@ pub fn create_notice(
     if parse_iso_time(end_time) <= parse_iso_time(start_time) {
         return Err("end_time must be after start_time".into());
     }
-    let impact = match impact_level {
-        "None" => ImpactLevel::None,
-        "Low" => ImpactLevel::Low,
-        "Med" => ImpactLevel::Med,
-        "High" => ImpactLevel::High,
-        "Critical" => ImpactLevel::Critical,
-        other => {
-            return Err(format!(
-                "Invalid impact_level: {}. Must be None, Low, Med, High, or Critical",
-                other
-            ));
-        }
-    };
+    let impact = parse_impact_level(impact_level)?;
 
     let id = format!(
         "oc-{}-{}",
@@ -212,45 +137,92 @@ pub fn create_notice(
             .unwrap_or("unknown")
     );
 
-    let notice = OutageNotice {
-        id: id.clone(),
+    let now = now_iso();
+    Ok(OutageNotice {
+        id,
         site: site.to_string(),
         affected_systems,
         start_time: start_time.to_string(),
         end_time: end_time.to_string(),
         impact_level: impact,
-        message_template: "Maintenance on {site}. Systems affected: {systems}. Impact: {impact}. Window: {start} to {end} UTC.".to_string(),
+        message_template: "Maintenance on {{site}}. Systems affected: {{systems}}. Impact: {{impact}}. Window: {{start}} to {{end}} UTC.".to_string(),
         status: NoticeStatus::Draft,
         sent_at: None,
         acknowledged_by: None,
-        created_at: now_iso(),
-        updated_at: now_iso(),
+        created_at: now.clone(),
+        updated_at: now,
         metadata: vec![
-            NoticeMetadata {
-                key: "source".into(),
-                value: "static-seed".into(),
-            },
-            NoticeMetadata {
-                key: "dry_run".into(),
-                value: "true".into(),
-            },
+            NoticeMetadata { key: "source".into(), value: "static-seed".into() },
+            NoticeMetadata { key: "dry_run".into(), value: "true".into() },
         ],
-    };
-
-    notice_store().lock().unwrap().push(notice.clone());
-    Ok(notice)
+    })
 }
 
-pub fn preview_notice(notice_id: &str) -> Result<Value, String> {
-    let store = notice_store().lock().unwrap();
-    let notice = store
-        .iter()
-        .find(|n| n.id == notice_id)
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))?;
+pub fn parse_impact_level(impact_level: &str) -> Result<ImpactLevel, String> {
+    match impact_level {
+        "None" => Ok(ImpactLevel::None),
+        "Low" => Ok(ImpactLevel::Low),
+        "Med" => Ok(ImpactLevel::Med),
+        "High" => Ok(ImpactLevel::High),
+        "Critical" => Ok(ImpactLevel::Critical),
+        other => Err(format!(
+            "Invalid impact_level: {}. Must be None, Low, Med, High, or Critical",
+            other
+        )),
+    }
+}
 
+/// Guard: validate that a notice can transition to Sent. Returns Err with reason if not.
+pub fn send_guard(notice: &OutageNotice) -> Result<(), String> {
+    if notice.status == NoticeStatus::Sent || notice.status == NoticeStatus::Acknowledged {
+        return Err(format!("Notice '{}' has already been sent", notice.id));
+    }
+    if notice.status == NoticeStatus::Completed {
+        return Err(format!("Cannot send a completed notice '{}'", notice.id));
+    }
+    if notice.status == NoticeStatus::Cancelled {
+        return Err(format!("Cannot send a cancelled notice '{}'", notice.id));
+    }
+    Ok(())
+}
+
+/// Guard: validate that a notice can be acknowledged (must be Sent).
+pub fn acknowledge_guard(notice: &OutageNotice) -> Result<(), String> {
+    if notice.status != NoticeStatus::Sent {
+        return Err(format!(
+            "Notice '{}' must be in Sent status to acknowledge (current: {})",
+            notice.id, notice.status
+        ));
+    }
+    Ok(())
+}
+
+/// Guard: validate that a notice can be completed (must be Sent or Acknowledged).
+pub fn complete_guard(notice: &OutageNotice) -> Result<(), String> {
+    if notice.status != NoticeStatus::Acknowledged && notice.status != NoticeStatus::Sent {
+        return Err(format!(
+            "Notice '{}' must be sent before completion (current: {})",
+            notice.id, notice.status
+        ));
+    }
+    Ok(())
+}
+
+/// Guard: validate that a notice can be cancelled (not already Completed or Cancelled).
+pub fn cancel_guard(notice: &OutageNotice) -> Result<(), String> {
+    if notice.status == NoticeStatus::Completed {
+        return Err(format!("Cannot cancel a completed notice '{}'", notice.id));
+    }
+    if notice.status == NoticeStatus::Cancelled {
+        return Err("Notice is already cancelled".into());
+    }
+    Ok(())
+}
+
+/// Pure preview: render a notice's template without any store access.
+pub fn preview_notice_pure(notice: &OutageNotice) -> Value {
     let rendered = expand_template(notice);
-
-    Ok(json!({
+    json!({
         "source": "dry-run",
         "notice_id": notice.id,
         "site": notice.site,
@@ -260,149 +232,42 @@ pub fn preview_notice(notice_id: &str) -> Result<Value, String> {
         "affected_systems": notice.affected_systems,
         "start_time": notice.start_time,
         "end_time": notice.end_time
-    }))
-}
-
-pub fn send_notice(notice_id: &str) -> Result<OutageNotice, String> {
-    let mut store = notice_store().lock().unwrap();
-    let notice = store
-        .iter_mut()
-        .find(|n| n.id == notice_id)
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))?;
-
-    if notice.status == NoticeStatus::Sent || notice.status == NoticeStatus::Acknowledged {
-        return Err(format!("Notice '{}' has already been sent", notice_id));
-    }
-    if notice.status == NoticeStatus::Completed {
-        return Err(format!("Cannot send a completed notice '{}'", notice_id));
-    }
-    if notice.status == NoticeStatus::Cancelled {
-        return Err(format!("Cannot send a cancelled notice '{}'", notice_id));
-    }
-
-    notice.status = NoticeStatus::Sent;
-    notice.sent_at = Some(now_iso());
-    notice.updated_at = now_iso();
-    notice.metadata.push(NoticeMetadata {
-        key: "sent_to".into(),
-        value: "support-groups (mock)".into(),
-    });
-
-    Ok(notice.clone())
-}
-
-pub fn acknowledge_notice(notice_id: &str, user: &str) -> Result<NoticeAckEvent, String> {
-    let mut store = notice_store().lock().unwrap();
-    let notice = store
-        .iter_mut()
-        .find(|n| n.id == notice_id)
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))?;
-
-    if notice.status != NoticeStatus::Sent {
-        return Err(format!(
-            "Notice '{}' must be in Sent status to acknowledge (current: {})",
-            notice_id, notice.status
-        ));
-    }
-
-    notice.status = NoticeStatus::Acknowledged;
-    notice.acknowledged_by = Some(user.to_string());
-    notice.updated_at = now_iso();
-    notice.metadata.push(NoticeMetadata {
-        key: "acknowledged_by".into(),
-        value: user.to_string(),
-    });
-
-    Ok(NoticeAckEvent {
-        notice_id: notice_id.to_string(),
-        user: user.to_string(),
-        acknowledged_at: now_iso(),
     })
 }
 
-pub fn complete_notice(notice_id: &str) -> Result<OutageNotice, String> {
-    let mut store = notice_store().lock().unwrap();
-    let notice = store
-        .iter_mut()
-        .find(|n| n.id == notice_id)
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))?;
-
-    if notice.status != NoticeStatus::Acknowledged && notice.status != NoticeStatus::Sent {
-        return Err(format!(
-            "Notice '{}' must be sent before completion (current: {})",
-            notice_id, notice.status
-        ));
-    }
-
-    notice.status = NoticeStatus::Completed;
-    notice.updated_at = now_iso();
-    notice.metadata.push(NoticeMetadata {
-        key: "completed_at".into(),
-        value: now_iso(),
-    });
-
-    Ok(notice.clone())
-}
-
-pub fn cancel_notice(notice_id: &str) -> Result<OutageNotice, String> {
-    let mut store = notice_store().lock().unwrap();
-    let notice = store
-        .iter_mut()
-        .find(|n| n.id == notice_id)
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))?;
-
-    if notice.status == NoticeStatus::Completed {
-        return Err(format!("Cannot cancel a completed notice '{}'", notice_id));
-    }
-    if notice.status == NoticeStatus::Cancelled {
-        return Err("Notice is already cancelled".into());
-    }
-
-    notice.status = NoticeStatus::Cancelled;
-    notice.updated_at = now_iso();
-    notice.metadata.push(NoticeMetadata {
-        key: "cancelled_at".into(),
-        value: now_iso(),
-    });
-
-    Ok(notice.clone())
-}
-
-pub fn get_active_notices(site: &str) -> Vec<OutageNotice> {
+/// Pure filter: active notices from a slice (not Completed/Cancelled and end_time >= now).
+pub fn filter_active<'a>(notices: &'a [OutageNotice], site: &str) -> Vec<&'a OutageNotice> {
     let now = Utc::now();
-    let store = notice_store().lock().unwrap();
-    store
+    notices
         .iter()
         .filter(|n| {
             n.site == site
                 && n.status != NoticeStatus::Completed
                 && n.status != NoticeStatus::Cancelled
-                && match (parse_iso_time(&n.start_time), parse_iso_time(&n.end_time)) {
-                    (Some(_start), Some(end)) => now <= end,
-                    _ => false,
+                && match parse_iso_time(&n.end_time) {
+                    Some(end) => now <= end,
+                    None => false,
                 }
         })
-        .cloned()
         .collect()
 }
 
-pub fn get_notice_history(site: &str) -> Vec<OutageNotice> {
-    let store = notice_store().lock().unwrap();
-    store
+/// Pure filter: history (Completed or Cancelled) from a slice.
+pub fn filter_history<'a>(notices: &'a [OutageNotice], site: &str) -> Vec<&'a OutageNotice> {
+    notices
         .iter()
         .filter(|n| {
             n.site == site
                 && (n.status == NoticeStatus::Completed || n.status == NoticeStatus::Cancelled)
         })
-        .cloned()
         .collect()
 }
 
-pub fn get_upcoming(site: &str) -> Vec<OutageNotice> {
+/// Pure filter: upcoming notices within 7 days from a slice.
+pub fn filter_upcoming<'a>(notices: &'a [OutageNotice], site: &str) -> Vec<&'a OutageNotice> {
     let now = Utc::now();
     let cutoff = now + Days::new(7);
-    let store = notice_store().lock().unwrap();
-    store
+    notices
         .iter()
         .filter(|n| {
             n.site == site
@@ -413,26 +278,7 @@ pub fn get_upcoming(site: &str) -> Vec<OutageNotice> {
                     None => false,
                 }
         })
-        .cloned()
         .collect()
-}
-
-pub fn get_notice(notice_id: &str) -> Result<OutageNotice, String> {
-    let store = notice_store().lock().unwrap();
-    store
-        .iter()
-        .find(|n| n.id == notice_id)
-        .cloned()
-        .ok_or_else(|| format!("Notice '{}' not found", notice_id))
-}
-
-pub fn get_all_notices(site: &str) -> Vec<OutageNotice> {
-    let store = notice_store().lock().unwrap();
-    if site.is_empty() {
-        store.clone()
-    } else {
-        store.iter().filter(|n| n.site == site).cloned().collect()
-    }
 }
 
 pub fn get_outage_contract() -> Value {
@@ -527,9 +373,40 @@ pub fn get_outage_contract() -> Value {
 mod tests {
     use super::*;
 
+    /// Build a notice in an arbitrary status for guard/filter tests. Times are
+    /// expressed as offsets (in hours) from now so filter windows are testable.
+    fn notice_with(
+        id: &str,
+        site: &str,
+        status: NoticeStatus,
+        start_offset_hours: i64,
+        end_offset_hours: i64,
+    ) -> OutageNotice {
+        let now = Utc::now();
+        OutageNotice {
+            id: id.into(),
+            site: site.into(),
+            affected_systems: vec![format!("{}-srv-01", site.to_lowercase())],
+            start_time: (now + chrono::Duration::hours(start_offset_hours)).to_rfc3339(),
+            end_time: (now + chrono::Duration::hours(end_offset_hours)).to_rfc3339(),
+            impact_level: ImpactLevel::Med,
+            message_template:
+                "Maintenance on {{site}}. Systems affected: {{systems}}. Impact: {{impact}}. Window: {{start}} to {{end}} UTC."
+                    .into(),
+            status,
+            sent_at: None,
+            acknowledged_by: None,
+            created_at: now.to_rfc3339(),
+            updated_at: now.to_rfc3339(),
+            metadata: Vec::new(),
+        }
+    }
+
+    // ─── build_notice (pure validation) ───────────────────────────────────────
+
     #[test]
-    fn test_create_notice_succeeds() {
-        let notice = create_notice(
+    fn test_build_notice_succeeds() {
+        let notice = build_notice(
             "DEFRA",
             vec!["defra-app-01".into()],
             "2026-07-01T10:00:00Z",
@@ -537,7 +414,6 @@ mod tests {
             "High",
         )
         .unwrap();
-
         assert!(notice.id.starts_with("oc-defra-"));
         assert_eq!(notice.site, "DEFRA");
         assert_eq!(notice.impact_level, ImpactLevel::High);
@@ -546,235 +422,219 @@ mod tests {
     }
 
     #[test]
-    fn test_create_notice_invalid_impact() {
-        let result = create_notice(
+    fn test_build_notice_invalid_impact() {
+        assert!(
+            build_notice(
+                "DEFRA",
+                vec!["srv".into()],
+                "2026-07-01T10:00:00Z",
+                "2026-07-01T14:00:00Z",
+                "Catastrophic",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_notice_empty_site() {
+        assert!(
+            build_notice(
+                "",
+                vec!["srv".into()],
+                "2026-07-01T10:00:00Z",
+                "2026-07-01T14:00:00Z",
+                "Low",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_notice_empty_systems() {
+        assert!(
+            build_notice(
+                "DEFRA",
+                vec![],
+                "2026-07-01T10:00:00Z",
+                "2026-07-01T14:00:00Z",
+                "Low",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_notice_invalid_time_range() {
+        assert!(
+            build_notice(
+                "DEFRA",
+                vec!["srv".into()],
+                "2026-07-01T14:00:00Z",
+                "2026-07-01T10:00:00Z",
+                "Low",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_notice_default_template_expands() {
+        // The default template must use {{double}} braces so expand_template
+        // (and the DB-stored template) actually substitute the placeholders.
+        let notice = build_notice(
             "DEFRA",
-            vec!["srv".into()],
+            vec!["defra-db".into()],
             "2026-07-01T10:00:00Z",
             "2026-07-01T14:00:00Z",
-            "Catastrophic",
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_notice_empty_site() {
-        let result = create_notice(
-            "",
-            vec!["srv".into()],
-            "2026-07-01T10:00:00Z",
-            "2026-07-01T14:00:00Z",
-            "Low",
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_create_notice_invalid_time_range() {
-        let result = create_notice(
-            "DEFRA",
-            vec!["srv".into()],
-            "2026-07-01T14:00:00Z",
-            "2026-07-01T10:00:00Z",
-            "Low",
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_preview_notice_renders_template() {
-        let preview = preview_notice("oc-defra-001").unwrap();
-        assert_eq!(preview["notice_id"], "oc-defra-001");
-        assert_eq!(preview["status"], "draft");
-        let rendered = preview["rendered_message"].as_str().unwrap();
-        assert!(rendered.contains("DEFRA"));
-        assert!(rendered.contains("defra-db-cluster"));
-        assert!(!rendered.contains("{{site}}"));
-    }
-
-    #[test]
-    fn test_preview_notice_not_found() {
-        assert!(preview_notice("oc-nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_send_notice() {
-        let notice = create_notice(
-            "GBLON",
-            vec!["gblon-app-01".into()],
-            "2026-08-01T10:00:00Z",
-            "2026-08-01T14:00:00Z",
-            "Med",
-        )
-        .unwrap();
-
-        let sent = send_notice(&notice.id).unwrap();
-        assert_eq!(sent.status, NoticeStatus::Sent);
-        assert!(sent.sent_at.is_some());
-    }
-
-    #[test]
-    fn test_send_notice_already_sent() {
-        assert!(send_notice("oc-gblon-001").is_err());
-    }
-
-    #[test]
-    fn test_acknowledge_notice() {
-        let notice = create_notice(
-            "FRPAR",
-            vec!["frpar-srv-01".into()],
-            "2026-08-02T10:00:00Z",
-            "2026-08-02T12:00:00Z",
-            "Low",
-        )
-        .unwrap();
-
-        let _sent = send_notice(&notice.id).unwrap();
-        let ack = acknowledge_notice(&notice.id, "alice.operator").unwrap();
-        assert_eq!(ack.notice_id, notice.id);
-        assert_eq!(ack.user, "alice.operator");
-
-        let updated = get_notice(&notice.id).unwrap();
-        assert_eq!(updated.status, NoticeStatus::Acknowledged);
-        assert_eq!(updated.acknowledged_by, Some("alice.operator".into()));
-    }
-
-    #[test]
-    fn test_acknowledge_notice_not_sent() {
-        assert!(acknowledge_notice("oc-defra-001", "user").is_err());
-    }
-
-    #[test]
-    fn test_complete_notice() {
-        let notice = create_notice(
-            "NLAMS",
-            vec!["nlams-srv-01".into()],
-            "2026-08-03T08:00:00Z",
-            "2026-08-03T10:00:00Z",
             "High",
         )
         .unwrap();
-
-        let _sent = send_notice(&notice.id).unwrap();
-        let _ack = acknowledge_notice(&notice.id, "bob.engineer").unwrap();
-        let completed = complete_notice(&notice.id).unwrap();
-        assert_eq!(completed.status, NoticeStatus::Completed);
-
-        let updated = get_notice(&notice.id).unwrap();
-        assert_eq!(updated.status, NoticeStatus::Completed);
+        let rendered = expand_template(&notice);
+        assert!(rendered.contains("DEFRA"));
+        assert!(rendered.contains("defra-db"));
+        assert!(!rendered.contains("{{site}}"));
+        assert!(!rendered.contains("{{systems}}"));
     }
 
     #[test]
-    fn test_complete_notice_not_sent() {
-        assert!(complete_notice("oc-frpar-001").is_err());
+    fn test_parse_impact_level() {
+        assert_eq!(parse_impact_level("Critical").unwrap(), ImpactLevel::Critical);
+        assert!(parse_impact_level("Nope").is_err());
     }
 
-    #[test]
-    fn test_cancel_notice() {
-        let notice = create_notice(
-            "DEFRA",
-            vec!["defra-srv-01".into()],
-            "2026-08-04T10:00:00Z",
-            "2026-08-04T12:00:00Z",
-            "Med",
-        )
-        .unwrap();
-
-        let cancelled = cancel_notice(&notice.id).unwrap();
-        assert_eq!(cancelled.status, NoticeStatus::Cancelled);
-    }
+    // ─── Lifecycle guards (pure) ──────────────────────────────────────────────
 
     #[test]
-    fn test_cancel_notice_already_completed() {
-        let notice = create_notice(
-            "GBLON",
-            vec!["gblon-srv-01".into()],
-            "2026-07-01T10:00:00Z",
-            "2026-07-01T14:00:00Z",
-            "Low",
-        )
-        .unwrap();
-        // Must send + ack + complete before testing cancel on completed
-        let _sent = send_notice(&notice.id).unwrap();
-        let _ack = acknowledge_notice(&notice.id, "user").unwrap();
-        let _completed = complete_notice(&notice.id).unwrap();
-        assert!(cancel_notice(&notice.id).is_err());
-    }
-
-    #[test]
-    fn test_get_active_notices() {
-        let active = get_active_notices("DEFRA");
-        assert!(!active.is_empty());
-        for notice in &active {
-            assert!(notice.status != NoticeStatus::Completed);
-            assert!(notice.status != NoticeStatus::Cancelled);
+    fn test_send_guard() {
+        assert!(send_guard(&notice_with("n", "DEFRA", NoticeStatus::Draft, 24, 28)).is_ok());
+        for s in [
+            NoticeStatus::Sent,
+            NoticeStatus::Acknowledged,
+            NoticeStatus::Completed,
+            NoticeStatus::Cancelled,
+        ] {
+            assert!(
+                send_guard(&notice_with("n", "DEFRA", s.clone(), 24, 28)).is_err(),
+                "send_guard should reject {s}"
+            );
         }
     }
 
     #[test]
-    fn test_get_notice_history() {
-        let notice = create_notice(
-            "DEBER",
-            vec!["deber-srv-01".into()],
-            "2026-06-10T08:00:00Z",
-            "2026-06-10T10:00:00Z",
-            "Low",
-        )
-        .unwrap();
-        let _sent = send_notice(&notice.id).unwrap();
-        let _ack = acknowledge_notice(&notice.id, "user").unwrap();
-        let _completed = complete_notice(&notice.id).unwrap();
-
-        let history = get_notice_history("DEBER");
-        assert!(!history.is_empty());
-        assert!(history.iter().any(|n| n.id == notice.id));
-    }
-
-    #[test]
-    fn test_get_upcoming() {
-        let upcoming = get_upcoming("DEFRA");
-        assert!(!upcoming.is_empty(), "oc-defra-001 is 2 days in the future");
-        for notice in &upcoming {
-            assert!(notice.status != NoticeStatus::Cancelled);
-            assert!(notice.status != NoticeStatus::Completed);
+    fn test_acknowledge_guard() {
+        assert!(acknowledge_guard(&notice_with("n", "DEFRA", NoticeStatus::Sent, 1, 4)).is_ok());
+        for s in [
+            NoticeStatus::Draft,
+            NoticeStatus::Acknowledged,
+            NoticeStatus::Completed,
+            NoticeStatus::Cancelled,
+        ] {
+            assert!(
+                acknowledge_guard(&notice_with("n", "DEFRA", s.clone(), 1, 4)).is_err(),
+                "acknowledge_guard should reject {s}"
+            );
         }
     }
 
     #[test]
-    fn test_get_all_notices() {
-        let all = get_all_notices("");
-        assert!(all.len() >= 3);
-
-        let defra = get_all_notices("DEFRA");
-        assert!(!defra.is_empty());
-        for n in &defra {
-            assert_eq!(n.site, "DEFRA");
-        }
-    }
-
-    #[test]
-    fn test_get_notice() {
-        let notice = get_notice("oc-defra-001").unwrap();
-        assert_eq!(notice.id, "oc-defra-001");
-        assert_eq!(notice.site, "DEFRA");
-    }
-
-    #[test]
-    fn test_get_notice_not_found() {
-        assert!(get_notice("oc-nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_create_notice_empty_systems() {
-        let result = create_notice(
-            "DEFRA",
-            vec![],
-            "2026-07-01T10:00:00Z",
-            "2026-07-01T14:00:00Z",
-            "Low",
+    fn test_complete_guard() {
+        assert!(complete_guard(&notice_with("n", "DEFRA", NoticeStatus::Sent, 1, 4)).is_ok());
+        assert!(
+            complete_guard(&notice_with("n", "DEFRA", NoticeStatus::Acknowledged, 1, 4)).is_ok()
         );
-        assert!(result.is_err());
+        for s in [
+            NoticeStatus::Draft,
+            NoticeStatus::Completed,
+            NoticeStatus::Cancelled,
+        ] {
+            assert!(
+                complete_guard(&notice_with("n", "DEFRA", s.clone(), 1, 4)).is_err(),
+                "complete_guard should reject {s}"
+            );
+        }
     }
+
+    #[test]
+    fn test_cancel_guard() {
+        for s in [
+            NoticeStatus::Draft,
+            NoticeStatus::Sent,
+            NoticeStatus::Acknowledged,
+        ] {
+            assert!(
+                cancel_guard(&notice_with("n", "DEFRA", s.clone(), 1, 4)).is_ok(),
+                "cancel_guard should allow {s}"
+            );
+        }
+        assert!(cancel_guard(&notice_with("n", "DEFRA", NoticeStatus::Completed, 1, 4)).is_err());
+        assert!(cancel_guard(&notice_with("n", "DEFRA", NoticeStatus::Cancelled, 1, 4)).is_err());
+    }
+
+    // ─── Pure preview + template ──────────────────────────────────────────────
+
+    #[test]
+    fn test_preview_notice_pure_renders_template() {
+        let notice = notice_with("oc-defra-001", "DEFRA", NoticeStatus::Draft, 48, 52);
+        let preview = preview_notice_pure(&notice);
+        assert_eq!(preview["notice_id"], "oc-defra-001");
+        // status serializes via serde rename_all = kebab-case
+        assert_eq!(preview["status"], "draft");
+        let rendered = preview["rendered_message"].as_str().unwrap();
+        assert!(rendered.contains("DEFRA"));
+        assert!(rendered.contains("defra-srv-01"));
+        assert!(!rendered.contains("{{site}}"));
+    }
+
+    // ─── Pure filters ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_filter_active() {
+        let notices = vec![
+            notice_with("a", "DEFRA", NoticeStatus::Sent, -2, 4), // active: ends in future
+            notice_with("b", "DEFRA", NoticeStatus::Completed, -10, -2), // terminal
+            notice_with("c", "DEFRA", NoticeStatus::Draft, -2, -1), // ended in past
+            notice_with("d", "GBLON", NoticeStatus::Sent, -2, 4), // other site
+        ];
+        let active = filter_active(&notices, "DEFRA");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "a");
+    }
+
+    #[test]
+    fn test_filter_history() {
+        let notices = vec![
+            notice_with("a", "DEFRA", NoticeStatus::Completed, -20, -10),
+            notice_with("b", "DEFRA", NoticeStatus::Cancelled, -20, -10),
+            notice_with("c", "DEFRA", NoticeStatus::Sent, 1, 4),
+            notice_with("d", "GBLON", NoticeStatus::Completed, -20, -10),
+        ];
+        let history = filter_history(&notices, "DEFRA");
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|n| n.site == "DEFRA"));
+    }
+
+    #[test]
+    fn test_filter_upcoming() {
+        let notices = vec![
+            notice_with("a", "DEFRA", NoticeStatus::Draft, 48, 52), // upcoming (2 days)
+            notice_with("b", "DEFRA", NoticeStatus::Draft, 24 * 10, 24 * 10 + 4), // beyond 7 days
+            notice_with("c", "DEFRA", NoticeStatus::Draft, -5, -1), // already started
+            notice_with("d", "DEFRA", NoticeStatus::Cancelled, 48, 52), // terminal
+        ];
+        let upcoming = filter_upcoming(&notices, "DEFRA");
+        assert_eq!(upcoming.len(), 1);
+        assert_eq!(upcoming[0].id, "a");
+    }
+
+    #[test]
+    fn test_filter_empty_for_unknown_site() {
+        let notices = vec![notice_with("a", "DEFRA", NoticeStatus::Sent, -2, 4)];
+        assert!(filter_active(&notices, "DEHAM").is_empty());
+        assert!(filter_history(&notices, "DEHAM").is_empty());
+        assert!(filter_upcoming(&notices, "DEHAM").is_empty());
+    }
+
+    // ─── Display + contract ───────────────────────────────────────────────────
 
     #[test]
     fn test_impact_level_display() {
@@ -806,49 +666,5 @@ mod tests {
                 .is_empty()
         );
         assert!(!contract["impactLevels"].as_array().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_send_notice_not_found() {
-        assert!(send_notice("oc-nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_acknowledge_notice_not_found() {
-        assert!(acknowledge_notice("oc-nonexistent", "user").is_err());
-    }
-
-    #[test]
-    fn test_complete_notice_not_found() {
-        assert!(complete_notice("oc-nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_cancel_notice_not_found() {
-        assert!(cancel_notice("oc-nonexistent").is_err());
-    }
-
-    #[test]
-    fn test_get_notice_history_empty_for_new_site() {
-        let history = get_notice_history("DEHAM");
-        assert!(history.is_empty());
-    }
-
-    #[test]
-    fn test_get_active_notices_empty_for_completed_site() {
-        let notice = create_notice(
-            "DEBER",
-            vec!["deber-srv-01".into()],
-            "2026-06-09T08:00:00Z",
-            "2026-06-09T10:00:00Z",
-            "Low",
-        )
-        .unwrap();
-        let _sent = send_notice(&notice.id).unwrap();
-        let _ack = acknowledge_notice(&notice.id, "user").unwrap();
-        let _completed = complete_notice(&notice.id).unwrap();
-
-        let active = get_active_notices("DEBER");
-        assert!(active.is_empty());
     }
 }
