@@ -28,7 +28,7 @@ use ryuki_engine::compliance_reporting::{
     ComplianceControl, ComplianceFramework, ComplianceReport, ControlStatus, Finding,
     FindingSeverity, FindingStatus, OverallStatus,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -192,9 +192,7 @@ impl ReportRow {
             )
         })?;
         let total_controls = usize::try_from(self.total_controls).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("compliance_reports.total_controls negative: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("compliance_reports.total_controls negative: {e}").into())
         })?;
         Ok(ComplianceReport {
             id: self.id,
@@ -233,7 +231,6 @@ impl FindingRow {
             status,
         })
     }
-
 }
 
 // ─── Outcome types ────────────────────────────────────────────────────────────
@@ -301,38 +298,46 @@ pub async fn list_controls(
     site: &str,
 ) -> Result<Vec<ComplianceControl>, sqlx::Error> {
     let rows: Vec<ControlRow> = match (framework_id.is_empty(), site.is_empty()) {
-        (true, true) => sqlx::query_as(
-            "SELECT id, framework_id, control_id, title, description, status, \
+        (true, true) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
               evidence_ref, assessed_by, assessed_at, site \
              FROM compliance_controls ORDER BY id",
-        )
-        .fetch_all(pool)
-        .await?,
-        (false, true) => sqlx::query_as(
-            "SELECT id, framework_id, control_id, title, description, status, \
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        (false, true) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
               evidence_ref, assessed_by, assessed_at, site \
              FROM compliance_controls WHERE framework_id = $1 ORDER BY id",
-        )
-        .bind(framework_id)
-        .fetch_all(pool)
-        .await?,
-        (true, false) => sqlx::query_as(
-            "SELECT id, framework_id, control_id, title, description, status, \
+            )
+            .bind(framework_id)
+            .fetch_all(pool)
+            .await?
+        }
+        (true, false) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
               evidence_ref, assessed_by, assessed_at, site \
              FROM compliance_controls WHERE site = $1 ORDER BY id",
-        )
-        .bind(site)
-        .fetch_all(pool)
-        .await?,
-        (false, false) => sqlx::query_as(
-            "SELECT id, framework_id, control_id, title, description, status, \
+            )
+            .bind(site)
+            .fetch_all(pool)
+            .await?
+        }
+        (false, false) => {
+            sqlx::query_as(
+                "SELECT id, framework_id, control_id, title, description, status, \
               evidence_ref, assessed_by, assessed_at, site \
              FROM compliance_controls WHERE framework_id = $1 AND site = $2 ORDER BY id",
-        )
-        .bind(framework_id)
-        .bind(site)
-        .fetch_all(pool)
-        .await?,
+            )
+            .bind(framework_id)
+            .bind(site)
+            .fetch_all(pool)
+            .await?
+        }
     };
 
     rows.into_iter().map(|r| r.into_model()).collect()
@@ -399,12 +404,10 @@ pub async fn generate_report(
 
     let (compliant, total, overall_status) = summarize_controls(controls);
 
-    let compliant_i32 = i32::try_from(compliant).map_err(|e| {
-        sqlx::Error::Decode(format!("compliant_controls overflow: {e}").into())
-    })?;
-    let total_i32 = i32::try_from(total).map_err(|e| {
-        sqlx::Error::Decode(format!("total_controls overflow: {e}").into())
-    })?;
+    let compliant_i32 = i32::try_from(compliant)
+        .map_err(|e| sqlx::Error::Decode(format!("compliant_controls overflow: {e}").into()))?;
+    let total_i32 = i32::try_from(total)
+        .map_err(|e| sqlx::Error::Decode(format!("total_controls overflow: {e}").into()))?;
 
     // Full UUID (not an 8-hex prefix) so a generated id can't birthday-collide
     // with the report PK and surface as a 500.
@@ -478,10 +481,7 @@ pub async fn generate_report(
     })
 }
 
-pub async fn get_report(
-    pool: &PgPool,
-    id: &str,
-) -> Result<Option<ComplianceReport>, sqlx::Error> {
+pub async fn get_report(pool: &PgPool, id: &str) -> Result<Option<ComplianceReport>, sqlx::Error> {
     let row: Option<ReportRow> = sqlx::query_as(
         "SELECT id, framework_id, site, generated_at, overall_status, \
           compliant_controls, total_controls \
@@ -498,10 +498,7 @@ pub async fn get_report(
 
 /// List all reports with their findings, optionally filtered by site.
 #[allow(dead_code)]
-pub async fn list_reports(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<ComplianceReport>, sqlx::Error> {
+pub async fn list_reports(pool: &PgPool, site: &str) -> Result<Vec<ComplianceReport>, sqlx::Error> {
     let rows: Vec<ReportRow> = if site.is_empty() {
         sqlx::query_as(
             "SELECT id, framework_id, site, generated_at, overall_status, \
@@ -597,12 +594,11 @@ pub async fn list_findings(
     let mut report_meta: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
     for rid in &report_ids {
-        let meta: Option<(String, String)> = sqlx::query_as(
-            "SELECT framework_id, site FROM compliance_reports WHERE id = $1",
-        )
-        .bind(rid)
-        .fetch_optional(pool)
-        .await?;
+        let meta: Option<(String, String)> =
+            sqlx::query_as("SELECT framework_id, site FROM compliance_reports WHERE id = $1")
+                .bind(rid)
+                .fetch_optional(pool)
+                .await?;
         if let Some((fw, s)) = meta {
             report_meta.insert(rid.clone(), (fw, s));
         }
@@ -610,10 +606,8 @@ pub async fn list_findings(
 
     let mut result = Vec::with_capacity(rows.len());
     for row in rows {
-        let (framework_id, report_site) = report_meta
-            .get(&row.report_id)
-            .cloned()
-            .unwrap_or_default();
+        let (framework_id, report_site) =
+            report_meta.get(&row.report_id).cloned().unwrap_or_default();
         let report_id = row.report_id.clone();
         let finding = row.into_model()?;
         result.push(json!({
@@ -683,10 +677,7 @@ pub async fn create_waiver(
 // ─── Summary ──────────────────────────────────────────────────────────────────
 
 /// Compute per-framework compliance summary, optionally filtered by site.
-pub async fn get_compliance_summary(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<Value>, sqlx::Error> {
+pub async fn get_compliance_summary(pool: &PgPool, site: &str) -> Result<Vec<Value>, sqlx::Error> {
     use ryuki_engine::compliance_reporting::summarize_controls;
 
     // Load all frameworks
@@ -761,9 +752,7 @@ mod compliance_reporting_db_tests {
         let url = match std::env::var("RYUKI_DATABASE_URL") {
             Ok(u) if !u.is_empty() => u,
             _ => {
-                eprintln!(
-                    "compliance_reporting_db_tests: RYUKI_DATABASE_URL not set — skipping"
-                );
+                eprintln!("compliance_reporting_db_tests: RYUKI_DATABASE_URL not set — skipping");
                 return None;
             }
         };
@@ -776,8 +765,12 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_list_frameworks() {
-        let Some(pool) = test_pool().await else { return };
-        let fws = list_frameworks(&pool).await.expect("list_frameworks failed");
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let fws = list_frameworks(&pool)
+            .await
+            .expect("list_frameworks failed");
         assert!(
             fws.len() >= 3,
             "expected >=3 seeded frameworks, got {}",
@@ -787,7 +780,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_get_framework_by_id() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
         let fw = get_framework(&pool, "cf-pci-dss")
             .await
             .expect("get_framework failed")
@@ -803,9 +798,13 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_list_controls_all_and_filtered() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
-        let all = list_controls(&pool, "", "").await.expect("list_controls failed");
+        let all = list_controls(&pool, "", "")
+            .await
+            .expect("list_controls failed");
         assert!(
             all.len() >= 15,
             "expected >=15 seeded controls, got {}",
@@ -815,7 +814,11 @@ mod compliance_reporting_db_tests {
         let pci = list_controls(&pool, "cf-pci-dss", "")
             .await
             .expect("list_controls(pci) failed");
-        assert!(pci.len() >= 5, "expected >=5 pci controls, got {}", pci.len());
+        assert!(
+            pci.len() >= 5,
+            "expected >=5 pci controls, got {}",
+            pci.len()
+        );
 
         let defra = list_controls(&pool, "", "DEFRA")
             .await
@@ -828,7 +831,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_get_control_by_id() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let ctrl = get_control(&pool, "cc-pci-001")
             .await
@@ -845,7 +850,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_enum_roundtrip_control_status() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let c1 = get_control(&pool, "cc-pci-001").await.unwrap().unwrap();
         assert_eq!(c1.status, ControlStatus::Compliant);
@@ -863,7 +870,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_enum_roundtrip_finding_status() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let report = get_report(&pool, "cr-defra-pci-001")
             .await
@@ -887,10 +896,18 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_enum_roundtrip_severity() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
-        let r1 = get_report(&pool, "cr-defra-pci-001").await.unwrap().unwrap();
-        let r2 = get_report(&pool, "cr-gblon-soc2-001").await.unwrap().unwrap();
+        let r1 = get_report(&pool, "cr-defra-pci-001")
+            .await
+            .unwrap()
+            .unwrap();
+        let r2 = get_report(&pool, "cr-gblon-soc2-001")
+            .await
+            .unwrap()
+            .unwrap();
 
         let high = r1.findings.iter().find(|f| f.id == "cr-find-001").unwrap();
         assert_eq!(high.severity, FindingSeverity::High);
@@ -907,15 +924,22 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_enum_roundtrip_overall_status() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
-        let r = get_report(&pool, "cr-defra-pci-001").await.unwrap().unwrap();
+        let r = get_report(&pool, "cr-defra-pci-001")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(r.overall_status, OverallStatus::NonCompliant);
     }
 
     #[tokio::test]
     async fn test_list_reports_with_findings() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let reports = list_reports(&pool, "").await.expect("list_reports failed");
         assert!(
@@ -937,7 +961,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_get_report_child_findings_aggregation() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let report = get_report(&pool, "cr-defra-pci-001")
             .await
@@ -956,7 +982,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_assess_control_updates_control() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         // Save original so we can restore
         let original = get_control(&pool, "cc-pci-002").await.unwrap().unwrap();
@@ -997,16 +1025,23 @@ mod compliance_reporting_db_tests {
         .expect("restore failed");
 
         // NotFound for absent
-        let absent =
-            assess_control(&pool, "cc-does-not-exist", &ControlStatus::Compliant, "a", "e")
-                .await
-                .expect("assess_control failed");
+        let absent = assess_control(
+            &pool,
+            "cc-does-not-exist",
+            &ControlStatus::Compliant,
+            "a",
+            "e",
+        )
+        .await
+        .expect("assess_control failed");
         assert!(matches!(absent, AssessOutcome::NotFound));
     }
 
     #[tokio::test]
     async fn test_generate_report_inserts_report_and_findings_in_tx() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let controls = list_controls(&pool, "cf-pci-dss", "DEFRA")
             .await
@@ -1043,7 +1078,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_resolve_finding_updates_status() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         // Generate a transient report + finding to avoid mutating seed data
         let controls = list_controls(&pool, "cf-soc2", "GBLON")
@@ -1095,7 +1132,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_create_waiver_updates_finding() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         // Generate a transient report
         let controls = list_controls(&pool, "cf-iso27001", "FRPAR")
@@ -1140,9 +1179,15 @@ mod compliance_reporting_db_tests {
         }
 
         // NotFound for absent
-        let absent = create_waiver(&pool, "cr-find-does-not-exist", "r", "a", "2027-01-01T00:00:00Z")
-            .await
-            .expect("create_waiver failed");
+        let absent = create_waiver(
+            &pool,
+            "cr-find-does-not-exist",
+            "r",
+            "a",
+            "2027-01-01T00:00:00Z",
+        )
+        .await
+        .expect("create_waiver failed");
         assert!(matches!(absent, MutationOutcome::NotFound));
 
         // Cleanup
@@ -1155,7 +1200,9 @@ mod compliance_reporting_db_tests {
 
     #[tokio::test]
     async fn test_get_compliance_summary_counts_and_no_numeric_trap() {
-        let Some(pool) = test_pool().await else { return };
+        let Some(pool) = test_pool().await else {
+            return;
+        };
 
         let summaries = get_compliance_summary(&pool, "DEFRA")
             .await

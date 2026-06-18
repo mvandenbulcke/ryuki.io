@@ -87,12 +87,9 @@ pub struct SwitchPortRow {
 
 impl SwitchPortRow {
     pub fn into_model(self) -> Result<SwitchPort, sqlx::Error> {
-        let port_number =
-            u32::try_from(self.port_number).map_err(|e| {
-                sqlx::Error::Decode(
-                    format!("switch_ports.port_number out of range: {e}").into(),
-                )
-            })?;
+        let port_number = u32::try_from(self.port_number).map_err(|e| {
+            sqlx::Error::Decode(format!("switch_ports.port_number out of range: {e}").into())
+        })?;
         let vlan_id = u32::try_from(self.vlan_id).map_err(|e| {
             sqlx::Error::Decode(format!("switch_ports.vlan_id out of range: {e}").into())
         })?;
@@ -126,9 +123,8 @@ pub struct VlanRow {
 
 impl VlanRow {
     pub fn into_model(self) -> Result<VLAN, sqlx::Error> {
-        let vlan_id = u32::try_from(self.vlan_id).map_err(|e| {
-            sqlx::Error::Decode(format!("vlans.vlan_id out of range: {e}").into())
-        })?;
+        let vlan_id = u32::try_from(self.vlan_id)
+            .map_err(|e| sqlx::Error::Decode(format!("vlans.vlan_id out of range: {e}").into()))?;
         let available_ips = u32::try_from(self.available_ips).map_err(|e| {
             sqlx::Error::Decode(format!("vlans.available_ips out of range: {e}").into())
         })?;
@@ -275,7 +271,9 @@ pub async fn reserve_ports(
     purpose: &str,
 ) -> Result<PortReservation, ReserveError> {
     if count == 0 {
-        return Err(ReserveError::Invalid("count must be greater than zero".into()));
+        return Err(ReserveError::Invalid(
+            "count must be greater than zero".into(),
+        ));
     }
 
     let mut tx = pool.begin().await?;
@@ -344,10 +342,8 @@ pub async fn reserve_ports(
     get_reservation(pool, &reservation_id)
         .await?
         .ok_or_else(|| {
-            sqlx::Error::Decode(
-                "port_reservations: row vanished immediately after insert".into(),
-            )
-            .into()
+            sqlx::Error::Decode("port_reservations: row vanished immediately after insert".into())
+                .into()
         })
 }
 
@@ -373,12 +369,19 @@ pub async fn reserve_ips(
     // decrement into an INCREMENT — committed capacity inflation. Convert with
     // checked try_from and reject zero so a degenerate request can't allocate.
     if count == 0 {
-        return Err(ReserveError::Invalid("count must be greater than zero".into()));
+        return Err(ReserveError::Invalid(
+            "count must be greater than zero".into(),
+        ));
     }
-    let count_i32 = i32::try_from(count)
-        .map_err(|_| ReserveError::Invalid(format!("count {count} exceeds the maximum of {}", i32::MAX)))?;
-    let vlan_i32 = i32::try_from(vlan_id_)
-        .map_err(|_| ReserveError::Invalid(format!("vlan_id {vlan_id_} exceeds the maximum of {}", i32::MAX)))?;
+    let count_i32 = i32::try_from(count).map_err(|_| {
+        ReserveError::Invalid(format!("count {count} exceeds the maximum of {}", i32::MAX))
+    })?;
+    let vlan_i32 = i32::try_from(vlan_id_).map_err(|_| {
+        ReserveError::Invalid(format!(
+            "vlan_id {vlan_id_} exceeds the maximum of {}",
+            i32::MAX
+        ))
+    })?;
 
     let mut tx = pool.begin().await?;
 
@@ -435,10 +438,8 @@ pub async fn reserve_ips(
     get_reservation(pool, &reservation_id)
         .await?
         .ok_or_else(|| {
-            sqlx::Error::Decode(
-                "port_reservations: row vanished immediately after insert".into(),
-            )
-            .into()
+            sqlx::Error::Decode("port_reservations: row vanished immediately after insert".into())
+                .into()
         })
 }
 
@@ -490,9 +491,7 @@ pub async fn release_reservation(
             .map(|s| Uuid::parse_str(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
-                sqlx::Error::Decode(
-                    format!("port_reservations.port_ids UUID parse: {e}").into(),
-                )
+                sqlx::Error::Decode(format!("port_reservations.port_ids UUID parse: {e}").into())
             })?;
 
         if !port_uuids.is_empty() {
@@ -542,14 +541,9 @@ pub async fn release_reservation(
 
     tx.commit().await?;
 
-    get_reservation(pool, reservation_id)
-        .await?
-        .ok_or_else(|| {
-            sqlx::Error::Decode(
-                "port_reservations: row vanished after release".into(),
-            )
-            .into()
-        })
+    get_reservation(pool, reservation_id).await?.ok_or_else(|| {
+        sqlx::Error::Decode("port_reservations: row vanished after release".into()).into()
+    })
 }
 
 // ─── Error types ─────────────────────────────────────────────────────────────
@@ -574,7 +568,10 @@ impl std::fmt::Display for ReserveError {
         match self {
             ReserveError::Invalid(msg) => write!(f, "invalid request: {msg}"),
             ReserveError::Insufficient { needed, available } => {
-                write!(f, "insufficient capacity: needed {needed}, available {available}")
+                write!(
+                    f,
+                    "insufficient capacity: needed {needed}, available {available}"
+                )
             }
             ReserveError::NotFound => write!(f, "resource not found"),
             ReserveError::Db(e) => write!(f, "database error: {e}"),
@@ -648,12 +645,10 @@ mod network_readiness_db_tests {
     /// port/vlan state it may have left behind (best-effort cleanup).
     async fn cleanup_reservation(pool: &PgPool, reservation_id: &str) {
         // Best-effort: ignore errors (reservation may already be released/cleaned)
-        let _ = sqlx::query(
-            "DELETE FROM port_reservations WHERE reservation_id = $1",
-        )
-        .bind(reservation_id)
-        .execute(pool)
-        .await;
+        let _ = sqlx::query("DELETE FROM port_reservations WHERE reservation_id = $1")
+            .bind(reservation_id)
+            .execute(pool)
+            .await;
     }
 
     /// Reset all switch_ports for a site back to Available (cleanup helper).
@@ -692,20 +687,24 @@ mod network_readiness_db_tests {
             "SELECT COUNT(*) FROM switch_ports \
              WHERE id = ANY($1::uuid[]) AND status = 'Reserved'",
         )
-        .bind(resv.port_ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect::<Vec<_>>())
+        .bind(
+            resv.port_ids
+                .iter()
+                .filter_map(|s| Uuid::parse_str(s).ok())
+                .collect::<Vec<_>>(),
+        )
         .fetch_one(&pool)
         .await
         .expect("count reserved ports");
         assert_eq!(reserved_count.0, 3, "all 3 ports should be Reserved");
 
         // Verify port_ids stored in the DB
-        let stored: Option<(Vec<String>,)> = sqlx::query_as(
-            "SELECT port_ids FROM port_reservations WHERE reservation_id = $1",
-        )
-        .bind(&resv.reservation_id)
-        .fetch_optional(&pool)
-        .await
-        .expect("fetch reservation");
+        let stored: Option<(Vec<String>,)> =
+            sqlx::query_as("SELECT port_ids FROM port_reservations WHERE reservation_id = $1")
+                .bind(&resv.reservation_id)
+                .fetch_optional(&pool)
+                .await
+                .expect("fetch reservation");
         assert!(stored.is_some(), "reservation row must exist");
         let (stored_ids,) = stored.unwrap();
         assert_eq!(stored_ids.len(), 3, "port_ids TEXT[] has 3 entries");
@@ -722,8 +721,7 @@ mod network_readiness_db_tests {
             return;
         };
 
-        let result = reserve_ports(&pool, "DEFRA", 9999, "test-insufficient")
-            .await;
+        let result = reserve_ports(&pool, "DEFRA", 9999, "test-insufficient").await;
 
         match result {
             Err(ReserveError::Insufficient { .. }) => {} // expected
@@ -870,7 +868,9 @@ mod network_readiness_db_tests {
             .expect("reserve_ports");
 
         // Verify ports are Reserved
-        let reserved_uuids: Vec<Uuid> = resv.port_ids.iter()
+        let reserved_uuids: Vec<Uuid> = resv
+            .port_ids
+            .iter()
             .filter_map(|s| Uuid::parse_str(s).ok())
             .collect();
         let (reserved_before,): (i64,) = sqlx::query_as(
@@ -896,7 +896,10 @@ mod network_readiness_db_tests {
         .fetch_one(&pool)
         .await
         .expect("count available after release");
-        assert_eq!(available_after, 2, "ports should be Available after release");
+        assert_eq!(
+            available_after, 2,
+            "ports should be Available after release"
+        );
 
         cleanup_reservation(&pool, &resv.reservation_id).await;
     }

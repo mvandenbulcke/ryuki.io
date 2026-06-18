@@ -317,9 +317,18 @@ mod tests {
 
     #[test]
     fn test_parse_control_status_valid() {
-        assert_eq!(parse_control_status("Compliant").unwrap(), ControlStatus::Compliant);
-        assert_eq!(parse_control_status("NonCompliant").unwrap(), ControlStatus::NonCompliant);
-        assert_eq!(parse_control_status("NotApplicable").unwrap(), ControlStatus::NotApplicable);
+        assert_eq!(
+            parse_control_status("Compliant").unwrap(),
+            ControlStatus::Compliant
+        );
+        assert_eq!(
+            parse_control_status("NonCompliant").unwrap(),
+            ControlStatus::NonCompliant
+        );
+        assert_eq!(
+            parse_control_status("NotApplicable").unwrap(),
+            ControlStatus::NotApplicable
+        );
     }
 
     #[test]
@@ -331,7 +340,10 @@ mod tests {
 
     #[test]
     fn test_parse_severity_valid() {
-        assert_eq!(parse_severity("Critical").unwrap(), FindingSeverity::Critical);
+        assert_eq!(
+            parse_severity("Critical").unwrap(),
+            FindingSeverity::Critical
+        );
         assert_eq!(parse_severity("High").unwrap(), FindingSeverity::High);
         assert_eq!(parse_severity("Medium").unwrap(), FindingSeverity::Medium);
         assert_eq!(parse_severity("Low").unwrap(), FindingSeverity::Low);
@@ -347,8 +359,26 @@ mod tests {
     #[test]
     fn test_summarize_controls_all_compliant() {
         let controls = vec![
-            control("c1", "fw", "X.1", "t", "d", ControlStatus::Compliant, "SITE", 1),
-            control("c2", "fw", "X.2", "t", "d", ControlStatus::Compliant, "SITE", 1),
+            control(
+                "c1",
+                "fw",
+                "X.1",
+                "t",
+                "d",
+                ControlStatus::Compliant,
+                "SITE",
+                1,
+            ),
+            control(
+                "c2",
+                "fw",
+                "X.2",
+                "t",
+                "d",
+                ControlStatus::Compliant,
+                "SITE",
+                1,
+            ),
         ];
         let (compliant, total, status) = summarize_controls(&controls);
         assert_eq!(compliant, 2);
@@ -359,8 +389,26 @@ mod tests {
     #[test]
     fn test_summarize_controls_non_compliant() {
         let controls = vec![
-            control("c1", "fw", "X.1", "t", "d", ControlStatus::Compliant, "SITE", 1),
-            control("c2", "fw", "X.2", "t", "d", ControlStatus::NonCompliant, "SITE", 1),
+            control(
+                "c1",
+                "fw",
+                "X.1",
+                "t",
+                "d",
+                ControlStatus::Compliant,
+                "SITE",
+                1,
+            ),
+            control(
+                "c2",
+                "fw",
+                "X.2",
+                "t",
+                "d",
+                ControlStatus::NonCompliant,
+                "SITE",
+                1,
+            ),
         ];
         let (compliant, total, status) = summarize_controls(&controls);
         assert_eq!(compliant, 1);
@@ -371,9 +419,16 @@ mod tests {
     #[test]
     fn test_summarize_controls_at_risk() {
         // All NotApplicable → compliant==0 < total, no non-compliant → AtRisk
-        let controls = vec![
-            control("c1", "fw", "X.1", "t", "d", ControlStatus::NotApplicable, "SITE", 1),
-        ];
+        let controls = vec![control(
+            "c1",
+            "fw",
+            "X.1",
+            "t",
+            "d",
+            ControlStatus::NotApplicable,
+            "SITE",
+            1,
+        )];
         let (compliant, total, status) = summarize_controls(&controls);
         assert_eq!(compliant, 0);
         assert_eq!(total, 1);

@@ -52,21 +52,18 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> String {
 }
 
 fn enum_from_db<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<T, sqlx::Error> {
-    serde_json::from_value(Value::String(raw.to_owned())).map_err(|e| {
-        sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into())
-    })
+    serde_json::from_value(Value::String(raw.to_owned()))
+        .map_err(|e| sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into()))
 }
 
 // ─── Column lists ─────────────────────────────────────────────────────────────
 
-const NS_COLUMNS: &str =
-    "id, name, cluster, site, \
+const NS_COLUMNS: &str = "id, name, cluster, site, \
      cpu_limit, cpu_request, memory_limit_gb, memory_request_gb, storage_gb, max_pods, \
      network_policy, service_accounts, status";
 
 #[allow(dead_code)]
-const REQ_COLUMNS: &str =
-    "id, requester, namespace_name, cluster, site, \
+const REQ_COLUMNS: &str = "id, requester, namespace_name, cluster, site, \
      cpu_request, memory_gb, storage_gb, environment, purpose, status";
 
 // ─── Row structs ──────────────────────────────────────────────────────────────
@@ -90,18 +87,24 @@ struct K8sNamespaceRow {
 
 impl K8sNamespaceRow {
     fn into_model(self) -> Result<K8sNamespace, sqlx::Error> {
-        let status: NamespaceStatus =
-            enum_from_db(&self.status, "k8s_namespaces.status")?;
+        let status: NamespaceStatus = enum_from_db(&self.status, "k8s_namespaces.status")?;
 
         let cpu_limit = u32::try_from(self.cpu_limit).map_err(|e| {
             sqlx::Error::Decode(
-                format!("k8s_namespaces.cpu_limit: corrupt value {}: {e}", self.cpu_limit).into(),
+                format!(
+                    "k8s_namespaces.cpu_limit: corrupt value {}: {e}",
+                    self.cpu_limit
+                )
+                .into(),
             )
         })?;
         let cpu_request = u32::try_from(self.cpu_request).map_err(|e| {
             sqlx::Error::Decode(
-                format!("k8s_namespaces.cpu_request: corrupt value {}: {e}", self.cpu_request)
-                    .into(),
+                format!(
+                    "k8s_namespaces.cpu_request: corrupt value {}: {e}",
+                    self.cpu_request
+                )
+                .into(),
             )
         })?;
         let memory_limit_gb = u32::try_from(self.memory_limit_gb).map_err(|e| {
@@ -124,13 +127,20 @@ impl K8sNamespaceRow {
         })?;
         let storage_gb = u32::try_from(self.storage_gb).map_err(|e| {
             sqlx::Error::Decode(
-                format!("k8s_namespaces.storage_gb: corrupt value {}: {e}", self.storage_gb)
-                    .into(),
+                format!(
+                    "k8s_namespaces.storage_gb: corrupt value {}: {e}",
+                    self.storage_gb
+                )
+                .into(),
             )
         })?;
         let max_pods = u32::try_from(self.max_pods).map_err(|e| {
             sqlx::Error::Decode(
-                format!("k8s_namespaces.max_pods: corrupt value {}: {e}", self.max_pods).into(),
+                format!(
+                    "k8s_namespaces.max_pods: corrupt value {}: {e}",
+                    self.max_pods
+                )
+                .into(),
             )
         })?;
 
@@ -174,8 +184,7 @@ impl ContainerRequestRow {
     fn into_model(self) -> Result<ContainerRequest, sqlx::Error> {
         let environment: Environment =
             enum_from_db(&self.environment, "container_requests.environment")?;
-        let status: RequestStatus =
-            enum_from_db(&self.status, "container_requests.status")?;
+        let status: RequestStatus = enum_from_db(&self.status, "container_requests.status")?;
         let cpu_request = u32::try_from(self.cpu_request).map_err(|e| {
             sqlx::Error::Decode(
                 format!(
@@ -221,10 +230,7 @@ impl ContainerRequestRow {
 
 // ─── Read functions ───────────────────────────────────────────────────────────
 
-pub async fn list_namespaces(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<K8sNamespace>, sqlx::Error> {
+pub async fn list_namespaces(pool: &PgPool, site: &str) -> Result<Vec<K8sNamespace>, sqlx::Error> {
     let rows: Vec<K8sNamespaceRow> = if site.is_empty() {
         sqlx::query_as(&format!(
             "SELECT {NS_COLUMNS} FROM k8s_namespaces ORDER BY id"
@@ -242,10 +248,7 @@ pub async fn list_namespaces(
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-pub async fn get_namespace(
-    pool: &PgPool,
-    id: &str,
-) -> Result<Option<K8sNamespace>, sqlx::Error> {
+pub async fn get_namespace(pool: &PgPool, id: &str) -> Result<Option<K8sNamespace>, sqlx::Error> {
     let row: Option<K8sNamespaceRow> = sqlx::query_as(&format!(
         "SELECT {NS_COLUMNS} FROM k8s_namespaces WHERE id = $1"
     ))
@@ -307,34 +310,25 @@ pub async fn provision_namespace(
     // Convert u32 quota fields to i32 for INTEGER columns.
     // These conversions are infallible at this point because validate_capacity_bounds
     // rejected oversized values in the handler.
-    let cpu_limit = i32::try_from(ns.resource_quota.cpu_limit).map_err(|e| {
-        sqlx::Error::Decode(format!("cpu_limit overflow: {e}").into())
-    })?;
-    let cpu_request_ns = i32::try_from(ns.resource_quota.cpu_request).map_err(|e| {
-        sqlx::Error::Decode(format!("cpu_request overflow: {e}").into())
-    })?;
-    let memory_limit_gb = i32::try_from(ns.resource_quota.memory_limit_gb).map_err(|e| {
-        sqlx::Error::Decode(format!("memory_limit_gb overflow: {e}").into())
-    })?;
-    let memory_request_gb = i32::try_from(ns.resource_quota.memory_request_gb).map_err(|e| {
-        sqlx::Error::Decode(format!("memory_request_gb overflow: {e}").into())
-    })?;
-    let storage_gb_ns = i32::try_from(ns.resource_quota.storage_gb).map_err(|e| {
-        sqlx::Error::Decode(format!("storage_gb overflow: {e}").into())
-    })?;
-    let max_pods = i32::try_from(ns.resource_quota.max_pods).map_err(|e| {
-        sqlx::Error::Decode(format!("max_pods overflow: {e}").into())
-    })?;
+    let cpu_limit = i32::try_from(ns.resource_quota.cpu_limit)
+        .map_err(|e| sqlx::Error::Decode(format!("cpu_limit overflow: {e}").into()))?;
+    let cpu_request_ns = i32::try_from(ns.resource_quota.cpu_request)
+        .map_err(|e| sqlx::Error::Decode(format!("cpu_request overflow: {e}").into()))?;
+    let memory_limit_gb = i32::try_from(ns.resource_quota.memory_limit_gb)
+        .map_err(|e| sqlx::Error::Decode(format!("memory_limit_gb overflow: {e}").into()))?;
+    let memory_request_gb = i32::try_from(ns.resource_quota.memory_request_gb)
+        .map_err(|e| sqlx::Error::Decode(format!("memory_request_gb overflow: {e}").into()))?;
+    let storage_gb_ns = i32::try_from(ns.resource_quota.storage_gb)
+        .map_err(|e| sqlx::Error::Decode(format!("storage_gb overflow: {e}").into()))?;
+    let max_pods = i32::try_from(ns.resource_quota.max_pods)
+        .map_err(|e| sqlx::Error::Decode(format!("max_pods overflow: {e}").into()))?;
 
-    let cpu_request_req = i32::try_from(req.cpu_request).map_err(|e| {
-        sqlx::Error::Decode(format!("req.cpu_request overflow: {e}").into())
-    })?;
-    let memory_gb_req = i32::try_from(req.memory_gb).map_err(|e| {
-        sqlx::Error::Decode(format!("req.memory_gb overflow: {e}").into())
-    })?;
-    let storage_gb_req = i32::try_from(req.storage_gb).map_err(|e| {
-        sqlx::Error::Decode(format!("req.storage_gb overflow: {e}").into())
-    })?;
+    let cpu_request_req = i32::try_from(req.cpu_request)
+        .map_err(|e| sqlx::Error::Decode(format!("req.cpu_request overflow: {e}").into()))?;
+    let memory_gb_req = i32::try_from(req.memory_gb)
+        .map_err(|e| sqlx::Error::Decode(format!("req.memory_gb overflow: {e}").into()))?;
+    let storage_gb_req = i32::try_from(req.storage_gb)
+        .map_err(|e| sqlx::Error::Decode(format!("req.storage_gb overflow: {e}").into()))?;
 
     let mut tx = pool.begin().await?;
 
@@ -498,9 +492,7 @@ mod container_namespace_db_tests {
         let url = match std::env::var("RYUKI_DATABASE_URL") {
             Ok(u) if !u.is_empty() => u,
             _ => {
-                eprintln!(
-                    "container_namespace_db_tests: RYUKI_DATABASE_URL not set — skipping"
-                );
+                eprintln!("container_namespace_db_tests: RYUKI_DATABASE_URL not set — skipping");
                 return None;
             }
         };
@@ -532,7 +524,11 @@ mod container_namespace_db_tests {
         let all = list_namespaces(&db, "")
             .await
             .expect("list_namespaces all failed");
-        assert!(all.len() >= 6, "migration 081 seeds 6 namespaces, got {}", all.len());
+        assert!(
+            all.len() >= 6,
+            "migration 081 seeds 6 namespaces, got {}",
+            all.len()
+        );
 
         let defra = list_namespaces(&db, "DEFRA")
             .await
@@ -560,8 +556,12 @@ mod container_namespace_db_tests {
         assert_eq!(ns.cluster, "defra-aks-01");
         assert_eq!(ns.status, NamespaceStatus::Active);
         // service_accounts TEXT[] round-trip
-        assert!(ns.service_accounts.contains(&"defra-app-deployer".to_string()));
-        assert!(ns.service_accounts.contains(&"defra-app-reader".to_string()));
+        assert!(ns
+            .service_accounts
+            .contains(&"defra-app-deployer".to_string()));
+        assert!(ns
+            .service_accounts
+            .contains(&"defra-app-reader".to_string()));
         // Flattened quota decode: quota(8,16,200)
         assert_eq!(ns.resource_quota.cpu_request, 8);
         assert_eq!(ns.resource_quota.cpu_limit, 16);
@@ -611,7 +611,11 @@ mod container_namespace_db_tests {
         let all = list_requests(&db, "")
             .await
             .expect("list_requests all failed");
-        assert!(all.len() >= 4, "migration 081 seeds 4 requests, got {}", all.len());
+        assert!(
+            all.len() >= 4,
+            "migration 081 seeds 4 requests, got {}",
+            all.len()
+        );
 
         // Environment enum round-trip
         let req = all
@@ -654,8 +658,7 @@ mod container_namespace_db_tests {
         let env = parse_environment("Dev").unwrap();
         validate_capacity(4, 8, 100).unwrap();
         validate_capacity_bounds(4, 8, 100).unwrap();
-        let (ns, req) =
-            build_namespace_and_request(&name, "defra-aks-01", "DEFRA", 4, 8, 100, env);
+        let (ns, req) = build_namespace_and_request(&name, "defra-aks-01", "DEFRA", 4, 8, 100, env);
         let ns_id = ns.id.clone();
         let req_id = req.id.clone();
 
@@ -754,8 +757,7 @@ mod container_namespace_db_tests {
         let sfx = sfx();
         let name = format!("gblon-quota-test-{sfx}");
         let env = parse_environment("Test").unwrap();
-        let (ns, req) =
-            build_namespace_and_request(&name, "gblon-k8s-01", "GBLON", 4, 8, 100, env);
+        let (ns, req) = build_namespace_and_request(&name, "gblon-k8s-01", "GBLON", 4, 8, 100, env);
         let ns_id = ns.id.clone();
         let req_id = req.id.clone();
 
@@ -807,8 +809,7 @@ mod container_namespace_db_tests {
         let sfx = sfx();
         let name = format!("frpar-transition-test-{sfx}");
         let env = parse_environment("Staging").unwrap();
-        let (ns, req) =
-            build_namespace_and_request(&name, "frpar-k8s-01", "FRPAR", 4, 8, 100, env);
+        let (ns, req) = build_namespace_and_request(&name, "frpar-k8s-01", "FRPAR", 4, 8, 100, env);
         let ns_id = ns.id.clone();
         let req_id = req.id.clone();
 
@@ -888,8 +889,7 @@ mod container_namespace_db_tests {
         let sfx = sfx();
         let name = format!("defra-active-check-{sfx}");
         let env = parse_environment("Dev").unwrap();
-        let (ns, req) =
-            build_namespace_and_request(&name, "defra-aks-01", "DEFRA", 4, 8, 100, env);
+        let (ns, req) = build_namespace_and_request(&name, "defra-aks-01", "DEFRA", 4, 8, 100, env);
         let ns_id = ns.id.clone();
         let req_id = req.id.clone();
 
@@ -910,7 +910,10 @@ mod container_namespace_db_tests {
         let not_found = find_active_namespace_by_name(&db, &name, "defra-aks-01")
             .await
             .expect("find failed");
-        assert!(not_found.is_none(), "Terminating namespace must not appear as active");
+        assert!(
+            not_found.is_none(),
+            "Terminating namespace must not appear as active"
+        );
 
         // Cleanup
         sqlx::query("DELETE FROM container_requests WHERE id = $1")

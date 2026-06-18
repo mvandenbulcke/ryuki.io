@@ -8620,10 +8620,10 @@ async fn synthetic_run_all(Query(query): Query<SyntheticRunAllQuery>) -> ApiResu
     let checks = crate::repos::synthetic_health::list_checks_for_site(pool, site)
         .await
         .map_err(db_error)?;
-    let mut persisted_results = Vec::with_capacity(checks.len());
-    for check in &checks {
-        let result = synthetic_health::run_check(check);
-        let persisted = crate::repos::synthetic_health::insert_result(pool, &result)
+    let results = synthetic_health::run_all_checks(&checks);
+    let mut persisted_results = Vec::with_capacity(results.len());
+    for result in &results {
+        let persisted = crate::repos::synthetic_health::insert_result(pool, result)
             .await
             .map_err(db_error)?;
         persisted_results.push(persisted);
@@ -9782,11 +9782,9 @@ async fn aiops_generate(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let suggestions = match get_db() {
-        Some(pool) => {
-            crate::repos::aiops::list_by_site(pool, site)
-                .await
-                .map_err(db_error)?
-        }
+        Some(pool) => crate::repos::aiops::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?,
         None => vec![],
     };
     Ok(Json(aiops::generate_suggestions(site, &suggestions)))
@@ -9909,11 +9907,9 @@ async fn aiops_type(
     };
 
     let suggestions = match get_db() {
-        Some(pool) => {
-            crate::repos::aiops::list_by_type(pool, &db_form)
-                .await
-                .map_err(db_error)?
-        }
+        Some(pool) => crate::repos::aiops::list_by_type(pool, &db_form)
+            .await
+            .map_err(db_error)?,
         None => vec![],
     };
     Ok(Json(aiops::get_suggestions_by_type(
@@ -9927,11 +9923,9 @@ async fn aiops_savings(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let suggestions = match get_db() {
-        Some(pool) => {
-            crate::repos::aiops::list_by_site(pool, site)
-                .await
-                .map_err(db_error)?
-        }
+        Some(pool) => crate::repos::aiops::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?,
         None => vec![],
     };
     Ok(Json(aiops::get_savings_summary(site, &suggestions)))
@@ -9942,11 +9936,9 @@ async fn aiops_stats(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
     let suggestions = match get_db() {
-        Some(pool) => {
-            crate::repos::aiops::list_by_site(pool, site)
-                .await
-                .map_err(db_error)?
-        }
+        Some(pool) => crate::repos::aiops::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?,
         None => vec![],
     };
     Ok(Json(aiops::get_suggestion_stats(site, &suggestions)))
@@ -14815,9 +14807,7 @@ async fn monitoring_alert_routing_contract() -> Json<Value> {
 
 // ─── Network Port & VLAN Readiness handlers ───
 
-async fn network_readiness_check(
-    Query(query): Query<NetworkReadinessQuery>,
-) -> ApiResult {
+async fn network_readiness_check(Query(query): Query<NetworkReadinessQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     let port_count = query.ports.unwrap_or(1);
     let vlan = query.vlan;
@@ -14854,11 +14844,16 @@ async fn network_readiness_check(
     })))
 }
 
-async fn network_reserve_ports(
-    Json(body): Json<NetworkReservePortsRequest>,
-) -> ApiResult {
+async fn network_reserve_ports(Json(body): Json<NetworkReservePortsRequest>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    match crate::repos::network_readiness::reserve_ports(pool, &body.site, body.count, &body.purpose).await {
+    match crate::repos::network_readiness::reserve_ports(
+        pool,
+        &body.site,
+        body.count,
+        &body.purpose,
+    )
+    .await
+    {
         Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
         Err(crate::repos::network_readiness::ReserveError::Invalid(msg)) => Err(status_400(&msg)),
         Err(crate::repos::network_readiness::ReserveError::Insufficient { needed, available }) => {
@@ -14867,16 +14862,12 @@ async fn network_reserve_ports(
                 body.site
             )))
         }
-        Err(crate::repos::network_readiness::ReserveError::NotFound) => {
-            Err(status_404(&body.site))
-        }
+        Err(crate::repos::network_readiness::ReserveError::NotFound) => Err(status_404(&body.site)),
         Err(crate::repos::network_readiness::ReserveError::Db(e)) => Err(db_error(e)),
     }
 }
 
-async fn network_reserve_ips(
-    Json(body): Json<NetworkReserveIpsRequest>,
-) -> ApiResult {
+async fn network_reserve_ips(Json(body): Json<NetworkReserveIpsRequest>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     match crate::repos::network_readiness::reserve_ips(
         pool,
@@ -14906,9 +14897,7 @@ async fn network_release(Path(id): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     match crate::repos::network_readiness::release_reservation(pool, &id).await {
         Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
-        Err(crate::repos::network_readiness::ReleaseError::NotFound) => {
-            Err(status_404(&id))
-        }
+        Err(crate::repos::network_readiness::ReleaseError::NotFound) => Err(status_404(&id)),
         Err(crate::repos::network_readiness::ReleaseError::AlreadyReleased) => {
             Err(status_409("reservation is already released"))
         }
@@ -14916,9 +14905,7 @@ async fn network_release(Path(id): Path<String>) -> ApiResult {
     }
 }
 
-async fn network_capacity(
-    Query(query): Query<NetworkSiteQuery>,
-) -> ApiResult {
+async fn network_capacity(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     let (ports, vlans) = match get_db() {
         Some(pool) => {
@@ -14932,12 +14919,12 @@ async fn network_capacity(
         }
         None => (Vec::new(), Vec::new()),
     };
-    Ok(Json(network_readiness::build_site_capacity(&site, &ports, &vlans)))
+    Ok(Json(network_readiness::build_site_capacity(
+        &site, &ports, &vlans,
+    )))
 }
 
-async fn network_ports_inventory(
-    Query(query): Query<NetworkSwitchQuery>,
-) -> ApiResult {
+async fn network_ports_inventory(Query(query): Query<NetworkSwitchQuery>) -> ApiResult {
     let switch = query.switch.unwrap_or_else(|| "defra-sw-01".to_string());
     let ports = match get_db() {
         Some(pool) => crate::repos::network_readiness::list_ports_by_switch(pool, &switch)
@@ -14950,9 +14937,7 @@ async fn network_ports_inventory(
         .map_err(|e| status_404(&e))
 }
 
-async fn network_vlans_inventory(
-    Query(query): Query<NetworkSiteQuery>,
-) -> ApiResult {
+async fn network_vlans_inventory(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
     let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
     let vlans = match get_db() {
         Some(pool) => crate::repos::network_readiness::list_vlans(pool, &site)
@@ -16494,15 +16479,11 @@ async fn outage_notices_acknowledge(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     outage_comms::acknowledge_guard(&notice).map_err(|e| status_409(&e))?;
-    let ack = crate::repos::outage_comms::acknowledge(
-        pool,
-        &id,
-        &body.user,
-        &notice.status.to_string(),
-    )
-    .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    let ack =
+        crate::repos::outage_comms::acknowledge(pool, &id, &body.user, &notice.status.to_string())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
     Ok(Json(serde_json::to_value(ack).unwrap_or_default()))
 }
 
@@ -17331,7 +17312,9 @@ async fn firmware_noncompliant() -> Result<Json<Value>, (StatusCode, Json<Value>
                 "devices": devices
             })))
         }
-        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "devices": [] }))),
+        None => Ok(Json(
+            json!({ "source": "dry-run", "count": 0, "devices": [] }),
+        )),
     }
 }
 
@@ -17347,7 +17330,9 @@ async fn firmware_eol() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
                 "devices": devices
             })))
         }
-        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "devices": [] }))),
+        None => Ok(Json(
+            json!({ "source": "dry-run", "count": 0, "devices": [] }),
+        )),
     }
 }
 
@@ -17355,8 +17340,12 @@ async fn firmware_request_exception(
     Json(body): Json<FirmwareExceptionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Pure validation first (engine guard).
-    firmware_lifecycle::validate_exception_request(&body.reason, &body.approved_by, body.expiry_days)
-        .map_err(|e| status_400(&e))?;
+    firmware_lifecycle::validate_exception_request(
+        &body.reason,
+        &body.approved_by,
+        body.expiry_days,
+    )
+    .map_err(|e| status_400(&e))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let exception = crate::repos::firmware_lifecycle::request_exception(
         pool,
@@ -17387,7 +17376,9 @@ async fn firmware_exceptions_list() -> Result<Json<Value>, (StatusCode, Json<Val
                 "exceptions": exceptions
             })))
         }
-        None => Ok(Json(json!({ "source": "dry-run", "count": 0, "exceptions": [] }))),
+        None => Ok(Json(
+            json!({ "source": "dry-run", "count": 0, "exceptions": [] }),
+        )),
     }
 }
 
@@ -17414,10 +17405,24 @@ async fn firmware_compliance_report() -> Result<Json<Value>, (StatusCode, Json<V
                 .await
                 .map_err(db_error)?;
             let total = devices.len();
-            let compliant = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Compliant).count();
-            let noncompliant = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::NonCompliant).count();
-            let eol = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::EOL).count();
-            let exception = devices.iter().filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Exception).count();
+            let compliant = devices
+                .iter()
+                .filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Compliant)
+                .count();
+            let noncompliant = devices
+                .iter()
+                .filter(|d| {
+                    d.compliance_status == firmware_lifecycle::ComplianceStatus::NonCompliant
+                })
+                .count();
+            let eol = devices
+                .iter()
+                .filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::EOL)
+                .count();
+            let exception = devices
+                .iter()
+                .filter(|d| d.compliance_status == firmware_lifecycle::ComplianceStatus::Exception)
+                .count();
             Ok(Json(json!({
                 "source": "live",
                 "total": total,
@@ -17445,9 +17450,14 @@ async fn firmware_vendor_summary() -> Result<Json<Value>, (StatusCode, Json<Valu
             let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
                 .await
                 .map_err(db_error)?;
-            let mut vendors: std::collections::BTreeMap<String, (usize, usize, usize, usize, usize)> = std::collections::BTreeMap::new();
+            let mut vendors: std::collections::BTreeMap<
+                String,
+                (usize, usize, usize, usize, usize),
+            > = std::collections::BTreeMap::new();
             for device in &devices {
-                let entry = vendors.entry(device.vendor.clone()).or_insert((0, 0, 0, 0, 0));
+                let entry = vendors
+                    .entry(device.vendor.clone())
+                    .or_insert((0, 0, 0, 0, 0));
                 entry.0 += 1;
                 match device.compliance_status {
                     firmware_lifecycle::ComplianceStatus::Compliant => entry.1 += 1,
@@ -17456,18 +17466,27 @@ async fn firmware_vendor_summary() -> Result<Json<Value>, (StatusCode, Json<Valu
                     firmware_lifecycle::ComplianceStatus::Exception => entry.4 += 1,
                 }
             }
-            let summary: Vec<Value> = vendors.into_iter().map(|(vendor, (total, compliant, noncompliant, eol, exception))| {
-                let pct = if total == 0 { 0.0 } else { (compliant as f64 / total as f64) * 100.0 };
-                json!({
-                    "vendor": vendor,
-                    "total": total,
-                    "compliant": compliant,
-                    "noncompliant": noncompliant,
-                    "eol": eol,
-                    "exception": exception,
-                    "compliance_percentage": pct
-                })
-            }).collect();
+            let summary: Vec<Value> = vendors
+                .into_iter()
+                .map(
+                    |(vendor, (total, compliant, noncompliant, eol, exception))| {
+                        let pct = if total == 0 {
+                            0.0
+                        } else {
+                            (compliant as f64 / total as f64) * 100.0
+                        };
+                        json!({
+                            "vendor": vendor,
+                            "total": total,
+                            "compliant": compliant,
+                            "noncompliant": noncompliant,
+                            "eol": eol,
+                            "exception": exception,
+                            "compliance_percentage": pct
+                        })
+                    },
+                )
+                .collect();
             Ok(Json(json!({ "source": "live", "vendors": summary })))
         }
         None => Ok(Json(json!({ "source": "dry-run", "vendors": [] }))),
@@ -18921,7 +18940,11 @@ async fn storage_volume_provision(
     }
 
     let volume = ryuki_engine::storage_provisioning::build_volume(
-        &b.name, b.size_gb, volume_type, &b.array_id, &b.site,
+        &b.name,
+        b.size_gb,
+        volume_type,
+        &b.array_id,
+        &b.site,
     );
 
     use crate::repos::storage_provisioning::ProvisionOutcome;
@@ -19094,13 +19117,15 @@ async fn storage_report(
             .map_err(db_error)?,
         None => (0_i64, 0_i64, 0_i64, 0_i64),
     };
-    Ok(Json(ryuki_engine::storage_provisioning::get_storage_report(
-        site,
-        total_gb,
-        used_gb,
-        volume_count,
-        array_count,
-    )))
+    Ok(Json(
+        ryuki_engine::storage_provisioning::get_storage_report(
+            site,
+            total_gb,
+            used_gb,
+            volume_count,
+            array_count,
+        ),
+    ))
 }
 async fn storage_contract() -> Json<Value> {
     Json(
@@ -19150,7 +19175,10 @@ async fn k8s_namespaces_list(
             .map_err(db_error)?,
         None => vec![],
     };
-    Ok(Json(container_namespace::list_namespaces(site, &namespaces)))
+    Ok(Json(container_namespace::list_namespaces(
+        site,
+        &namespaces,
+    )))
 }
 async fn k8s_namespace_provision(
     Json(b): Json<K8sProvisionRequest>,
@@ -19168,8 +19196,8 @@ async fn k8s_namespace_provision(
         .map_err(|e| status_400(&e))?;
     container_namespace::validate_capacity_bounds(b.cpu, b.memory, b.storage)
         .map_err(|e| status_400(&e))?;
-    let environment = container_namespace::parse_environment(&b.environment)
-        .map_err(|e| status_400(&e))?;
+    let environment =
+        container_namespace::parse_environment(&b.environment).map_err(|e| status_400(&e))?;
 
     let db = get_db().ok_or_else(status_503_no_db)?;
 
@@ -19334,7 +19362,10 @@ async fn k8s_cluster_utilization(
             .map_err(db_error)?,
         None => vec![],
     };
-    Ok(Json(container_namespace::get_cluster_utilization(site, &namespaces)))
+    Ok(Json(container_namespace::get_cluster_utilization(
+        site,
+        &namespaces,
+    )))
 }
 async fn k8s_validate_name(
     Json(b): Json<K8sValidateRequest>,
@@ -19346,11 +19377,11 @@ async fn k8s_validate_name(
         return Err(status_400("cluster cannot be empty"));
     }
     let existing = match get_db() {
-        Some(pool) => {
-            crate::repos::container_namespace::find_active_namespace_by_name(pool, &b.name, &b.cluster)
-                .await
-                .map_err(db_error)?
-        }
+        Some(pool) => crate::repos::container_namespace::find_active_namespace_by_name(
+            pool, &b.name, &b.cluster,
+        )
+        .await
+        .map_err(db_error)?,
         None => None,
     };
     Ok(Json(container_namespace::validate_namespace_name_response(
@@ -19369,7 +19400,10 @@ async fn k8s_summary(
             .map_err(db_error)?,
         None => vec![],
     };
-    Ok(Json(container_namespace::get_k8s_summary(site, &namespaces)))
+    Ok(Json(container_namespace::get_k8s_summary(
+        site,
+        &namespaces,
+    )))
 }
 async fn k8s_contract() -> Json<Value> {
     Json(
@@ -19548,7 +19582,11 @@ async fn compliance_frameworks() -> ApiResult {
             .map_err(db_error)?,
         None => vec![],
     };
-    let source = if frameworks.is_empty() { "static-seed" } else { "db" };
+    let source = if frameworks.is_empty() {
+        "static-seed"
+    } else {
+        "db"
+    };
     Ok(Json(json!({ "source": source, "frameworks": frameworks })))
 }
 
@@ -19580,7 +19618,11 @@ async fn compliance_controls_list(Query(q): Query<ComplianceControlsQuery>) -> A
             .map_err(db_error)?,
         None => vec![],
     };
-    let source = if controls.is_empty() { "static-seed" } else { "db" };
+    let source = if controls.is_empty() {
+        "static-seed"
+    } else {
+        "db"
+    };
     Ok(Json(json!({
         "source": source,
         "framework_id": framework_id,
@@ -19618,7 +19660,8 @@ async fn compliance_control_assess(
     if b.evidence_ref.trim().is_empty() {
         return Err(status_400("evidence_ref cannot be empty"));
     }
-    let status = compliance_reporting::parse_control_status(&b.status).map_err(|e| status_400(&e))?;
+    let status =
+        compliance_reporting::parse_control_status(&b.status).map_err(|e| status_400(&e))?;
 
     let pool = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::compliance_reporting::AssessOutcome;
@@ -19675,10 +19718,14 @@ async fn compliance_report_generate(Json(b): Json<ComplianceReportGenerateReques
         )));
     }
 
-    let report =
-        crate::repos::compliance_reporting::generate_report(pool, &b.framework_id, &b.site, &controls)
-            .await
-            .map_err(db_error)?;
+    let report = crate::repos::compliance_reporting::generate_report(
+        pool,
+        &b.framework_id,
+        &b.site,
+        &controls,
+    )
+    .await
+    .map_err(db_error)?;
     Ok(Json(json!({ "source": "db", "report": report })))
 }
 
@@ -19713,7 +19760,11 @@ async fn compliance_findings_list(Query(q): Query<ComplianceFindingsQuery>) -> A
             .map_err(db_error)?,
         None => vec![],
     };
-    let source = if findings.is_empty() { "static-seed" } else { "db" };
+    let source = if findings.is_empty() {
+        "static-seed"
+    } else {
+        "db"
+    };
     Ok(Json(json!({
         "source": source,
         "site": site,
@@ -19794,7 +19845,11 @@ async fn compliance_summary(Query(q): Query<ComplianceSiteQuery>) -> ApiResult {
             .map_err(db_error)?,
         None => vec![],
     };
-    let source = if summaries.is_empty() { "static-seed" } else { "db" };
+    let source = if summaries.is_empty() {
+        "static-seed"
+    } else {
+        "db"
+    };
     Ok(Json(json!({
         "source": source,
         "site": site,
@@ -20588,13 +20643,12 @@ async fn lb_vs_enable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
 }
 async fn lb_status(Query(q): Query<LbSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = q.site.as_deref().unwrap_or("");
-    let (vs_count, pool_count, up_members, down_members, offline_vs, draining_vs) =
-        match get_db() {
-            Some(pool) => crate::repos::load_balancer::get_lb_status(pool, site)
-                .await
-                .map_err(db_error)?,
-            None => (0, 0, 0, 0, 0, 0),
-        };
+    let (vs_count, pool_count, up_members, down_members, offline_vs, draining_vs) = match get_db() {
+        Some(pool) => crate::repos::load_balancer::get_lb_status(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => (0, 0, 0, 0, 0, 0),
+    };
     Ok(Json(load_balancer::get_lb_status(
         site,
         vs_count,
@@ -20610,10 +20664,16 @@ async fn lb_validate_vip(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Pure validation first
     if b.vip.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "vip cannot be empty"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "vip cannot be empty"})),
+        ));
     }
     if b.site.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "site cannot be empty"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site cannot be empty"})),
+        ));
     }
 
     let conflict = match get_db() {

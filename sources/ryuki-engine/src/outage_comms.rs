@@ -498,7 +498,10 @@ mod tests {
 
     #[test]
     fn test_parse_impact_level() {
-        assert_eq!(parse_impact_level("Critical").unwrap(), ImpactLevel::Critical);
+        assert_eq!(
+            parse_impact_level("Critical").unwrap(),
+            ImpactLevel::Critical
+        );
         assert!(parse_impact_level("Nope").is_err());
     }
 

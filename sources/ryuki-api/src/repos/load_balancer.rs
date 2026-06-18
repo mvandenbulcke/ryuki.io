@@ -39,8 +39,8 @@
 //! The handler is: load → UPDATE status → return updated VS.
 
 use ryuki_engine::load_balancer::{
-    LbPool, LbProtocol, LbRequest, LbVirtualServer, PoolAlgorithm, PoolMember,
-    PoolMemberStatus, PersistenceMethod, VirtualServerStatus,
+    LbPool, LbProtocol, LbRequest, LbVirtualServer, PersistenceMethod, PoolAlgorithm, PoolMember,
+    PoolMemberStatus, VirtualServerStatus,
 };
 use serde_json::Value;
 use sqlx::PgPool;
@@ -61,13 +61,9 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> String {
 /// Decode a raw DB string into an engine enum via serde.
 /// A decode failure means the persisted row is corrupt → surfaced as
 /// `sqlx::Error::Decode` so the handler maps it to 500.
-fn enum_from_db<T: serde::de::DeserializeOwned>(
-    raw: &str,
-    column: &str,
-) -> Result<T, sqlx::Error> {
-    serde_json::from_value(Value::String(raw.to_owned())).map_err(|e| {
-        sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into())
-    })
+fn enum_from_db<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<T, sqlx::Error> {
+    serde_json::from_value(Value::String(raw.to_owned()))
+        .map_err(|e| sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into()))
 }
 
 // ─── Column constants ─────────────────────────────────────────────────────────
@@ -75,11 +71,9 @@ fn enum_from_db<T: serde::de::DeserializeOwned>(
 pub const VS_COLUMNS: &str =
     "id, name, vip, port, protocol, pool_id, site, ssl_profile, persistence_method, status";
 
-pub const POOL_COLUMNS: &str =
-    "id, name, site, algorithm, health_monitor";
+pub const POOL_COLUMNS: &str = "id, name, site, algorithm, health_monitor";
 
-pub const MEMBER_COLUMNS: &str =
-    "pool_id, hostname, ip, port, weight, status";
+pub const MEMBER_COLUMNS: &str = "pool_id, hostname, ip, port, weight, status";
 
 // ─── Row structs ──────────────────────────────────────────────────────────────
 
@@ -105,10 +99,11 @@ impl LbVirtualServerRow {
             )
         })?;
         let protocol: LbProtocol = enum_from_db(&self.protocol, "lb_virtual_servers.protocol")?;
-        let persistence_method: PersistenceMethod =
-            enum_from_db(&self.persistence_method, "lb_virtual_servers.persistence_method")?;
-        let status: VirtualServerStatus =
-            enum_from_db(&self.status, "lb_virtual_servers.status")?;
+        let persistence_method: PersistenceMethod = enum_from_db(
+            &self.persistence_method,
+            "lb_virtual_servers.persistence_method",
+        )?;
+        let status: VirtualServerStatus = enum_from_db(&self.status, "lb_virtual_servers.status")?;
         Ok(LbVirtualServer {
             id: self.id,
             name: self.name,
@@ -170,8 +165,7 @@ impl LbPoolMemberRow {
                 format!("lb_pool_members.weight: corrupt value {}: {e}", self.weight).into(),
             )
         })?;
-        let status: PoolMemberStatus =
-            enum_from_db(&self.status, "lb_pool_members.status")?;
+        let status: PoolMemberStatus = enum_from_db(&self.status, "lb_pool_members.status")?;
         Ok(PoolMember {
             hostname: self.hostname,
             ip: self.ip,
@@ -185,10 +179,7 @@ impl LbPoolMemberRow {
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Load all members for a given pool_id.
-async fn load_pool_members(
-    pool: &PgPool,
-    pool_id: &str,
-) -> Result<Vec<PoolMember>, sqlx::Error> {
+async fn load_pool_members(pool: &PgPool, pool_id: &str) -> Result<Vec<PoolMember>, sqlx::Error> {
     let rows: Vec<LbPoolMemberRow> = sqlx::query_as(&format!(
         "SELECT {MEMBER_COLUMNS} FROM lb_pool_members WHERE pool_id = $1 ORDER BY hostname"
     ))
@@ -492,12 +483,11 @@ pub async fn remove_pool_member(
     pool_id: &str,
     hostname: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result =
-        sqlx::query("DELETE FROM lb_pool_members WHERE pool_id = $1 AND hostname = $2")
-            .bind(pool_id)
-            .bind(hostname)
-            .execute(pool)
-            .await?;
+    let result = sqlx::query("DELETE FROM lb_pool_members WHERE pool_id = $1 AND hostname = $2")
+        .bind(pool_id)
+        .bind(hostname)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -530,7 +520,10 @@ pub async fn update_vs_status(
 #[cfg(test)]
 mod load_balancer_db_tests {
     use super::*;
-    use ryuki_engine::load_balancer::{LbPool, LbProtocol, LbRequest, LbRequestStatus, LbVirtualServer, PoolAlgorithm, PoolMember, PoolMemberStatus, PersistenceMethod, VirtualServerStatus};
+    use ryuki_engine::load_balancer::{
+        LbPool, LbProtocol, LbRequest, LbRequestStatus, LbVirtualServer, PersistenceMethod,
+        PoolAlgorithm, PoolMember, PoolMemberStatus, VirtualServerStatus,
+    };
     use uuid::Uuid;
 
     async fn test_pool() -> Option<PgPool> {
@@ -679,12 +672,11 @@ mod load_balancer_db_tests {
         assert_eq!(loaded_pool.members[0].hostname, format!("member-{sfx}"));
 
         // Verify request
-        let (req_row,): (String,) =
-            sqlx::query_as("SELECT status FROM lb_requests WHERE id = $1")
-                .bind(&req_id)
-                .fetch_one(&db)
-                .await
-                .expect("request must exist");
+        let (req_row,): (String,) = sqlx::query_as("SELECT status FROM lb_requests WHERE id = $1")
+            .bind(&req_id)
+            .fetch_one(&db)
+            .await
+            .expect("request must exist");
         assert_eq!(req_row, "provisioned");
 
         // Cleanup
@@ -806,16 +798,14 @@ mod load_balancer_db_tests {
         let pool_id = format!("pool-addmem-{sfx}");
 
         // Insert a minimal pool first
-        sqlx::query(
-            "INSERT INTO lb_pools (id, name, site, algorithm) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&pool_id)
-        .bind(format!("addmem-pool-{sfx}"))
-        .bind("TESTAM")
-        .bind("round-robin")
-        .execute(&db)
-        .await
-        .expect("insert pool");
+        sqlx::query("INSERT INTO lb_pools (id, name, site, algorithm) VALUES ($1, $2, $3, $4)")
+            .bind(&pool_id)
+            .bind(format!("addmem-pool-{sfx}"))
+            .bind("TESTAM")
+            .bind("round-robin")
+            .execute(&db)
+            .await
+            .expect("insert pool");
 
         let member = PoolMember {
             hostname: format!("mem-{sfx}"),
@@ -858,16 +848,14 @@ mod load_balancer_db_tests {
         let sfx = suffix();
         let pool_id = format!("pool-rmmem-{sfx}");
 
-        sqlx::query(
-            "INSERT INTO lb_pools (id, name, site, algorithm) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(&pool_id)
-        .bind(format!("rmmem-pool-{sfx}"))
-        .bind("TESTRM")
-        .bind("weighted")
-        .execute(&db)
-        .await
-        .expect("insert pool");
+        sqlx::query("INSERT INTO lb_pools (id, name, site, algorithm) VALUES ($1, $2, $3, $4)")
+            .bind(&pool_id)
+            .bind(format!("rmmem-pool-{sfx}"))
+            .bind("TESTRM")
+            .bind("weighted")
+            .execute(&db)
+            .await
+            .expect("insert pool");
 
         let member = PoolMember {
             hostname: format!("mem-rm-{sfx}"),
@@ -944,15 +932,24 @@ mod load_balancer_db_tests {
             .expect("get_virtual_server_with_pool failed")
             .expect("vs-gblon-api must exist");
         assert_eq!(vs.protocol, LbProtocol::Https);
-        assert!(pool.members.iter().any(|m| m.status == PoolMemberStatus::Up));
-        assert!(pool.members.iter().any(|m| m.status == PoolMemberStatus::Down));
+        assert!(pool
+            .members
+            .iter()
+            .any(|m| m.status == PoolMemberStatus::Up));
+        assert!(pool
+            .members
+            .iter()
+            .any(|m| m.status == PoolMemberStatus::Down));
 
         // frpar member status: disabled
         let (_, frpar_pool) = get_virtual_server_with_pool(&db, "vs-frpar-tcp")
             .await
             .expect("get_virtual_server_with_pool failed")
             .expect("vs-frpar-tcp must exist");
-        assert!(frpar_pool.members.iter().any(|m| m.status == PoolMemberStatus::Disabled));
+        assert!(frpar_pool
+            .members
+            .iter()
+            .any(|m| m.status == PoolMemberStatus::Disabled));
 
         // Enum round-trip: verify that 'least-connections' decodes to LeastConnections
         assert_eq!(frpar_pool.algorithm, PoolAlgorithm::LeastConnections);

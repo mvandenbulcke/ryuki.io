@@ -182,7 +182,9 @@ pub fn default_protection(volume_type: &VolumeType) -> ProtectionType {
 }
 
 pub fn available_capacity_gb(array: &StorageArray) -> u64 {
-    array.total_capacity_gb.saturating_sub(array.used_capacity_gb)
+    array
+        .total_capacity_gb
+        .saturating_sub(array.used_capacity_gb)
 }
 
 /// Build a new StorageVolume without persisting. Called by the provision handler

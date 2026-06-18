@@ -60,17 +60,18 @@ pub struct FirmwareRecordRow {
 
 impl FirmwareRecordRow {
     pub fn into_model(self) -> Result<FirmwareRecord, sqlx::Error> {
-        let device_type: DeviceType =
-            serde_json::from_value(serde_json::Value::String(self.device_type.clone()))
-                .map_err(|e| {
-                    sqlx::Error::Decode(
-                        format!(
-                            "firmware_records.device_type: corrupt value '{}': {e}",
-                            self.device_type
-                        )
-                        .into(),
-                    )
-                })?;
+        let device_type: DeviceType = serde_json::from_value(serde_json::Value::String(
+            self.device_type.clone(),
+        ))
+        .map_err(|e| {
+            sqlx::Error::Decode(
+                format!(
+                    "firmware_records.device_type: corrupt value '{}': {e}",
+                    self.device_type
+                )
+                .into(),
+            )
+        })?;
         let compliance_status: ComplianceStatus =
             serde_json::from_value(serde_json::Value::String(self.compliance_status.clone()))
                 .map_err(|e| {
@@ -121,10 +122,7 @@ impl FirmwareExceptionRow {
 // ─── Read functions ───────────────────────────────────────────────────────────
 
 /// List all firmware records, optionally filtered by site.
-pub async fn list_devices(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
+pub async fn list_devices(pool: &PgPool, site: &str) -> Result<Vec<FirmwareRecord>, sqlx::Error> {
     let rows: Vec<FirmwareRecordRow> = if site.is_empty() {
         sqlx::query_as(&format!(
             "SELECT {RECORD_COLUMNS} FROM firmware_records ORDER BY id"
@@ -143,10 +141,7 @@ pub async fn list_devices(
 }
 
 /// Get a single firmware record by TEXT id. Returns `Ok(None)` when absent.
-pub async fn get_device(
-    pool: &PgPool,
-    id: &str,
-) -> Result<Option<FirmwareRecord>, sqlx::Error> {
+pub async fn get_device(pool: &PgPool, id: &str) -> Result<Option<FirmwareRecord>, sqlx::Error> {
     let row: Option<FirmwareRecordRow> = sqlx::query_as(&format!(
         "SELECT {RECORD_COLUMNS} FROM firmware_records WHERE id = $1"
     ))
@@ -196,9 +191,7 @@ pub async fn list_all_for_report(pool: &PgPool) -> Result<Vec<FirmwareRecord>, s
 /// Return active exceptions (expiry_date >= today, ISO date TEXT lexicographic
 /// comparison). The cutoff is the UTC date from Rust (NOT SQL CURRENT_DATE), so
 /// it matches the engine's `active_exception` which uses `Utc::now().date_naive()`.
-pub async fn list_active_exceptions(
-    pool: &PgPool,
-) -> Result<Vec<FirmwareException>, sqlx::Error> {
+pub async fn list_active_exceptions(pool: &PgPool) -> Result<Vec<FirmwareException>, sqlx::Error> {
     let today_utc = Utc::now().date_naive().to_string();
     let rows: Vec<FirmwareExceptionRow> = sqlx::query_as(&format!(
         "SELECT {EXCEPTION_COLUMNS} FROM firmware_exceptions \
@@ -481,10 +474,16 @@ mod firmware_lifecycle_db_tests {
         .await
         .expect("request_exception failed");
 
-        assert!(result.is_some(), "request_exception must return Some for known device");
+        assert!(
+            result.is_some(),
+            "request_exception must return Some for known device"
+        );
         let exc = result.unwrap();
         assert_eq!(exc.device_id, "fw-gblon-srv-001");
-        assert!(exc.id.starts_with("fwex-"), "exception id must start with fwex-");
+        assert!(
+            exc.id.starts_with("fwex-"),
+            "exception id must start with fwex-"
+        );
 
         // Device must now be Exception.
         let device = get_device(&pool, "fw-gblon-srv-001")

@@ -164,12 +164,18 @@ mod tests {
 
     #[test]
     fn test_compare_versions_equal() {
-        assert_eq!(compare_versions("10.2.1", "10.2.1"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_versions("10.2.1", "10.2.1"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
     fn test_compare_versions_greater() {
-        assert_eq!(compare_versions("4.25.7", "4.24.0"), std::cmp::Ordering::Greater);
+        assert_eq!(
+            compare_versions("4.25.7", "4.24.0"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

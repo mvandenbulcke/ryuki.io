@@ -77,9 +77,7 @@ fn cluster_mode_from_db(raw: &str) -> Result<ClusterMode, sqlx::Error> {
 /// `SQLEdition` serde uses PascalCase which matches — this helper centralises the Decode error.
 fn edition_from_db(raw: &str) -> Result<SQLEdition, sqlx::Error> {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).map_err(|e| {
-        sqlx::Error::Decode(
-            format!("sql_deployments.edition: unknown value '{raw}': {e}").into(),
-        )
+        sqlx::Error::Decode(format!("sql_deployments.edition: unknown value '{raw}': {e}").into())
     })
 }
 
@@ -87,9 +85,7 @@ fn edition_from_db(raw: &str) -> Result<SQLEdition, sqlx::Error> {
 /// `DeploymentStatus` serde uses kebab-case — serde decode works directly.
 fn status_from_db(raw: &str) -> Result<DeploymentStatus, sqlx::Error> {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).map_err(|e| {
-        sqlx::Error::Decode(
-            format!("sql_deployments.status: unknown value '{raw}': {e}").into(),
-        )
+        sqlx::Error::Decode(format!("sql_deployments.status: unknown value '{raw}': {e}").into())
     })
 }
 
@@ -142,29 +138,19 @@ impl SQLDeploymentRow {
         let status = status_from_db(&self.status)?;
 
         let cpu = u32::try_from(self.cpu).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("sql_deployments.cpu out of range: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("sql_deployments.cpu out of range: {e}").into())
         })?;
         let memory_gb = u32::try_from(self.memory_gb).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("sql_deployments.memory_gb out of range: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("sql_deployments.memory_gb out of range: {e}").into())
         })?;
         let data_disk_gb = u32::try_from(self.data_disk_gb).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("sql_deployments.data_disk_gb out of range: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("sql_deployments.data_disk_gb out of range: {e}").into())
         })?;
         let log_disk_gb = u32::try_from(self.log_disk_gb).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("sql_deployments.log_disk_gb out of range: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("sql_deployments.log_disk_gb out of range: {e}").into())
         })?;
         let tempdb_disk_gb = u32::try_from(self.tempdb_disk_gb).map_err(|e| {
-            sqlx::Error::Decode(
-                format!("sql_deployments.tempdb_disk_gb out of range: {e}").into(),
-            )
+            sqlx::Error::Decode(format!("sql_deployments.tempdb_disk_gb out of range: {e}").into())
         })?;
 
         Ok(SQLDeployment {
@@ -217,10 +203,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<SQLDeployment>, sqlx:
 }
 
 /// List deployments by site. If site is empty, returns all deployments.
-pub async fn list_by_site(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<SQLDeployment>, sqlx::Error> {
+pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<SQLDeployment>, sqlx::Error> {
     let rows: Vec<SQLDeploymentRow> = if site.is_empty() {
         sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM sql_deployments ORDER BY created_at DESC"
@@ -295,9 +278,7 @@ pub async fn insert(
     tx.commit().await?;
 
     get(pool, &id.to_string()).await?.ok_or_else(|| {
-        sqlx::Error::Decode(
-            "sql_deployments: row vanished immediately after insert".into(),
-        )
+        sqlx::Error::Decode("sql_deployments: row vanished immediately after insert".into())
     })
 }
 
@@ -363,14 +344,15 @@ pub async fn transition(
 #[cfg(test)]
 mod sql_deployment_db_tests {
     use super::*;
-    use ryuki_engine::sql_deployment::{plan_deployment, guard_install, guard_configure};
+    use ryuki_engine::sql_deployment::{guard_configure, guard_install, plan_deployment};
     use serde_json::json;
 
     static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("RYUKI_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform".to_string());
+        let url = std::env::var("RYUKI_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform".to_string()
+        });
         if url.is_empty() {
             return None;
         }
@@ -449,9 +431,7 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("NLAMS-SQL-TEST-01", "NLAMS", "AG");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json)
-            .await
-            .expect("insert");
+        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
 
         assert!(!inserted.id.is_empty());
         assert_eq!(inserted.instance_name, "NLAMS-SQL-TEST-01");
@@ -518,12 +498,13 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("FRPAR-SQL-TEST-01", "FRPAR", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json)
-            .await
-            .expect("insert");
+        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
 
         // planned → installing (validate guard first)
-        let loaded = get(&pool, &inserted.id).await.expect("get").expect("exists");
+        let loaded = get(&pool, &inserted.id)
+            .await
+            .expect("get")
+            .expect("exists");
         guard_install(&loaded).expect("guard_install should pass for Planned");
 
         let installing = transition(
@@ -553,7 +534,10 @@ mod sql_deployment_db_tests {
         assert_eq!(op_count, 1, "one install operations row");
 
         // installing → configuring
-        let loaded2 = get(&pool, &inserted.id).await.expect("get").expect("exists");
+        let loaded2 = get(&pool, &inserted.id)
+            .await
+            .expect("get")
+            .expect("exists");
         guard_configure(&loaded2).expect("guard_configure should pass for Installing");
 
         let configuring = transition(
@@ -586,15 +570,19 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("DEBER-SQL-TEST-01", "DEBER", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json)
-            .await
-            .expect("insert");
+        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
 
         // Engine guard: planned deployment cannot be configured (must be Installing)
-        let loaded = get(&pool, &inserted.id).await.expect("get").expect("exists");
+        let loaded = get(&pool, &inserted.id)
+            .await
+            .expect("get")
+            .expect("exists");
         assert_eq!(loaded.status, DeploymentStatus::Planned);
         let guard_err = guard_configure(&loaded);
-        assert!(guard_err.is_err(), "configure guard must reject Planned status");
+        assert!(
+            guard_err.is_err(),
+            "configure guard must reject Planned status"
+        );
 
         // Repo CAS miss: wrong expected_status (installing when actual is planned)
         let miss = transition(
@@ -608,7 +596,10 @@ mod sql_deployment_db_tests {
         )
         .await
         .expect("no DB error");
-        assert!(miss.is_none(), "CAS miss when expected_status does not match → Ok(None)");
+        assert!(
+            miss.is_none(),
+            "CAS miss when expected_status does not match → Ok(None)"
+        );
 
         // Malformed UUID → Ok(None), not error
         let malformed = get(&pool, "not-a-uuid").await.expect("get malformed");
@@ -629,13 +620,14 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("GBLON-SQL-ROUNDTRIP", "GBLON", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json)
-            .await
-            .expect("insert");
+        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
 
         // Round-trip: the DB stores 'Standalone'; the cluster_mode_from_db helper
         // must decode it to ClusterMode::Standalone (not fail due to UPPERCASE serde mismatch).
-        let loaded = get(&pool, &inserted.id).await.expect("get").expect("exists");
+        let loaded = get(&pool, &inserted.id)
+            .await
+            .expect("get")
+            .expect("exists");
         assert_eq!(
             loaded.cluster_mode,
             ClusterMode::Standalone,
@@ -645,7 +637,9 @@ mod sql_deployment_db_tests {
         // Also verify against the seeded GBLON row (which also has Standalone)
         let gblon_rows = list_by_site(&pool, "GBLON").await.expect("list GBLON");
         assert!(
-            gblon_rows.iter().any(|d| d.cluster_mode == ClusterMode::Standalone),
+            gblon_rows
+                .iter()
+                .any(|d| d.cluster_mode == ClusterMode::Standalone),
             "seeded GBLON row must also decode cluster_mode=Standalone"
         );
 

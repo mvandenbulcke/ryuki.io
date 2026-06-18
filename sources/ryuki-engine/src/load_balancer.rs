@@ -377,23 +377,100 @@ mod tests {
 
     #[test]
     fn test_build_provision_validation_errors() {
-        assert!(build_provision("", "10.1.1.1", 80, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
-        assert!(build_provision("name", "", 80, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
-        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "", vec!["x".into()], "RoundRobin").is_err());
-        assert!(build_provision("name", "10.1.1.1", 0, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
-        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec![], "RoundRobin").is_err());
-        assert!(build_provision("name", "10.1.1.1", 80, "INVALID", "S", vec!["x".into()], "RoundRobin").is_err());
-        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["x".into()], "BadAlgo").is_err());
+        assert!(
+            build_provision(
+                "",
+                "10.1.1.1",
+                80,
+                "HTTP",
+                "S",
+                vec!["x".into()],
+                "RoundRobin"
+            )
+            .is_err()
+        );
+        assert!(
+            build_provision("name", "", 80, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err()
+        );
+        assert!(
+            build_provision(
+                "name",
+                "10.1.1.1",
+                80,
+                "HTTP",
+                "",
+                vec!["x".into()],
+                "RoundRobin"
+            )
+            .is_err()
+        );
+        assert!(
+            build_provision(
+                "name",
+                "10.1.1.1",
+                0,
+                "HTTP",
+                "S",
+                vec!["x".into()],
+                "RoundRobin"
+            )
+            .is_err()
+        );
+        assert!(
+            build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec![], "RoundRobin").is_err()
+        );
+        assert!(
+            build_provision(
+                "name",
+                "10.1.1.1",
+                80,
+                "INVALID",
+                "S",
+                vec!["x".into()],
+                "RoundRobin"
+            )
+            .is_err()
+        );
+        assert!(
+            build_provision(
+                "name",
+                "10.1.1.1",
+                80,
+                "HTTP",
+                "S",
+                vec!["x".into()],
+                "BadAlgo"
+            )
+            .is_err()
+        );
         // A member with an explicit port 0 must be rejected (engine -> 400), not
         // pass through to the DB CHECK (port >= 1) as a 500.
         assert!(
-            build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["host:10.0.0.1:0".into()], "RoundRobin").is_err(),
+            build_provision(
+                "name",
+                "10.1.1.1",
+                80,
+                "HTTP",
+                "S",
+                vec!["host:10.0.0.1:0".into()],
+                "RoundRobin"
+            )
+            .is_err(),
             "member port 0 must be rejected"
         );
         // Duplicate member hostnames within one request must be rejected (engine ->
         // 400), not hit the lb_pool_members (pool_id, hostname) PK as a 500.
         assert!(
-            build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["dup".into(), "dup".into()], "RoundRobin").is_err(),
+            build_provision(
+                "name",
+                "10.1.1.1",
+                80,
+                "HTTP",
+                "S",
+                vec!["dup".into(), "dup".into()],
+                "RoundRobin"
+            )
+            .is_err(),
             "duplicate member hostnames must be rejected"
         );
     }
@@ -512,11 +589,26 @@ mod tests {
 
     #[test]
     fn test_parse_algorithm_variants() {
-        assert_eq!(parse_algorithm("RoundRobin").unwrap(), PoolAlgorithm::RoundRobin);
-        assert_eq!(parse_algorithm("round-robin").unwrap(), PoolAlgorithm::RoundRobin);
-        assert_eq!(parse_algorithm("LeastConnections").unwrap(), PoolAlgorithm::LeastConnections);
-        assert_eq!(parse_algorithm("least-connections").unwrap(), PoolAlgorithm::LeastConnections);
-        assert_eq!(parse_algorithm("Weighted").unwrap(), PoolAlgorithm::Weighted);
+        assert_eq!(
+            parse_algorithm("RoundRobin").unwrap(),
+            PoolAlgorithm::RoundRobin
+        );
+        assert_eq!(
+            parse_algorithm("round-robin").unwrap(),
+            PoolAlgorithm::RoundRobin
+        );
+        assert_eq!(
+            parse_algorithm("LeastConnections").unwrap(),
+            PoolAlgorithm::LeastConnections
+        );
+        assert_eq!(
+            parse_algorithm("least-connections").unwrap(),
+            PoolAlgorithm::LeastConnections
+        );
+        assert_eq!(
+            parse_algorithm("Weighted").unwrap(),
+            PoolAlgorithm::Weighted
+        );
         assert!(parse_algorithm("bad").is_err());
     }
 }

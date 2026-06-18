@@ -50,9 +50,8 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> String {
 }
 
 fn enum_from_db<T: serde::de::DeserializeOwned>(raw: &str, column: &str) -> Result<T, sqlx::Error> {
-    serde_json::from_value(Value::String(raw.to_owned())).map_err(|e| {
-        sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into())
-    })
+    serde_json::from_value(Value::String(raw.to_owned()))
+        .map_err(|e| sqlx::Error::Decode(format!("{column}: corrupt value '{raw}': {e}").into()))
 }
 
 // ─── Column constants ─────────────────────────────────────────────────────────
@@ -518,9 +517,7 @@ mod storage_provisioning_db_tests {
         let url = match std::env::var("RYUKI_DATABASE_URL") {
             Ok(u) if !u.is_empty() => u,
             _ => {
-                eprintln!(
-                    "storage_provisioning_db_tests: RYUKI_DATABASE_URL not set — skipping"
-                );
+                eprintln!("storage_provisioning_db_tests: RYUKI_DATABASE_URL not set — skipping");
                 return None;
             }
         };
@@ -661,8 +658,7 @@ mod storage_provisioning_db_tests {
             .await
             .expect("get_array")
             .unwrap();
-        let avail_before =
-            ryuki_engine::storage_provisioning::available_capacity_gb(&array_before);
+        let avail_before = ryuki_engine::storage_provisioning::available_capacity_gb(&array_before);
 
         let volume = ryuki_engine::storage_provisioning::build_volume(
             &format!("frpar-test-vol-{sfx}"),
@@ -761,10 +757,7 @@ mod storage_provisioning_db_tests {
                 assert_eq!(v.size_gb, 128, "volume must have grown to 128 gb");
                 assert_eq!(v.status, VolumeStatus::Available);
             }
-            other => panic!(
-                "expected Done, got {:?}",
-                std::mem::discriminant(&other)
-            ),
+            other => panic!("expected Done, got {:?}", std::mem::discriminant(&other)),
         }
 
         // Not found

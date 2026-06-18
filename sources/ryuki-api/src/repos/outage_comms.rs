@@ -26,9 +26,7 @@
 //! signals a concurrent state change (→ Ok(None), caller → 409).
 
 use chrono::{DateTime, Utc};
-use ryuki_engine::outage_comms::{
-    ImpactLevel, NoticeAckEvent, NoticeStatus, OutageNotice,
-};
+use ryuki_engine::outage_comms::{ImpactLevel, NoticeAckEvent, NoticeStatus, OutageNotice};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -216,14 +214,12 @@ pub async fn list_upcoming(pool: &PgPool, site: &str) -> Result<Vec<OutageNotice
 pub async fn insert(pool: &PgPool, notice: &OutageNotice) -> Result<OutageNotice, sqlx::Error> {
     let id = Uuid::new_v4();
 
-    let start_time: DateTime<Utc> =
-        chrono::DateTime::parse_from_rfc3339(&notice.start_time)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-    let end_time: DateTime<Utc> =
-        chrono::DateTime::parse_from_rfc3339(&notice.end_time)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let start_time: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&notice.start_time)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let end_time: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&notice.end_time)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let mut tx = pool.begin().await?;
 
@@ -244,13 +240,11 @@ pub async fn insert(pool: &PgPool, notice: &OutageNotice) -> Result<OutageNotice
     .await?;
 
     for system in &notice.affected_systems {
-        sqlx::query(
-            "INSERT INTO outage_notice_systems (notice_id, system_name) VALUES ($1, $2)",
-        )
-        .bind(id)
-        .bind(system)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO outage_notice_systems (notice_id, system_name) VALUES ($1, $2)")
+            .bind(id)
+            .bind(system)
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -546,9 +540,7 @@ mod outage_comms_db_tests {
         assert!(sent.sent_at.is_some());
 
         // CAS rejection: notice is now Sent, not Draft anymore
-        let miss = send(&pool, &inserted.id, "Draft")
-            .await
-            .expect("send miss");
+        let miss = send(&pool, &inserted.id, "Draft").await.expect("send miss");
         assert!(miss.is_none(), "stale expected_status → Ok(None) / 409");
 
         // Illegal transition guard (engine-level): try sending again via Sent status
@@ -634,7 +626,10 @@ mod outage_comms_db_tests {
         // Complete path: Draft → Sent → Acknowledged → Completed
         let n1 = make_notice("GBLON", vec!["gblon-srv"]);
         let i1 = insert(&pool, &n1).await.expect("insert n1");
-        send(&pool, &i1.id, "Draft").await.expect("send").expect("sent");
+        send(&pool, &i1.id, "Draft")
+            .await
+            .expect("send")
+            .expect("sent");
         acknowledge(&pool, &i1.id, "user", "Sent")
             .await
             .expect("ack")

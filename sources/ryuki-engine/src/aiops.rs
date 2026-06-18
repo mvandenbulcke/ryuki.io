@@ -213,8 +213,7 @@ pub fn get_savings_summary(site: &str, all: &[AIOpsSuggestion]) -> Value {
 
 /// Count suggestions by status and type for a site.
 pub fn get_suggestion_stats(site: &str, all: &[AIOpsSuggestion]) -> Value {
-    let site_suggestions: Vec<&AIOpsSuggestion> =
-        all.iter().filter(|s| s.site == site).collect();
+    let site_suggestions: Vec<&AIOpsSuggestion> = all.iter().filter(|s| s.site == site).collect();
 
     let accepted = site_suggestions
         .iter()
@@ -226,9 +225,7 @@ pub fn get_suggestion_stats(site: &str, all: &[AIOpsSuggestion]) -> Value {
         .count();
     let pending = site_suggestions
         .iter()
-        .filter(|s| {
-            s.status == SuggestionStatus::New || s.status == SuggestionStatus::Reviewed
-        })
+        .filter(|s| s.status == SuggestionStatus::New || s.status == SuggestionStatus::Reviewed)
         .count();
     let implemented = site_suggestions
         .iter()
@@ -284,8 +281,7 @@ pub fn guard_accept(suggestion: &AIOpsSuggestion) -> Result<&'static str, String
 
 /// Guard: suggestion must be `New` or `Reviewed` to transition to `Rejected`.
 pub fn guard_reject(suggestion: &AIOpsSuggestion) -> Result<&'static str, String> {
-    if suggestion.status != SuggestionStatus::New
-        && suggestion.status != SuggestionStatus::Reviewed
+    if suggestion.status != SuggestionStatus::New && suggestion.status != SuggestionStatus::Reviewed
     {
         return Err(format!(
             "Suggestion '{}' cannot be rejected (current status: {})",
@@ -424,7 +420,10 @@ mod tests {
             (SuggestionType::Consolidation, "Consolidation"),
             (SuggestionType::RiskReduction, "RiskReduction"),
             (SuggestionType::CostOptimization, "CostOptimization"),
-            (SuggestionType::PerformanceImprovement, "PerformanceImprovement"),
+            (
+                SuggestionType::PerformanceImprovement,
+                "PerformanceImprovement",
+            ),
         ];
         for (variant, db_str) in &types {
             assert_eq!(suggestion_type_to_db(variant), *db_str);
@@ -463,7 +462,10 @@ mod tests {
     #[test]
     fn suggestion_type_display() {
         assert_eq!(SuggestionType::RightSizing.to_string(), "right-sizing");
-        assert_eq!(SuggestionType::CostOptimization.to_string(), "cost-optimization");
+        assert_eq!(
+            SuggestionType::CostOptimization.to_string(),
+            "cost-optimization"
+        );
         assert_eq!(SuggestionType::Migration.to_string(), "migration");
         assert_eq!(SuggestionType::Consolidation.to_string(), "consolidation");
         assert_eq!(SuggestionType::RiskReduction.to_string(), "risk-reduction");

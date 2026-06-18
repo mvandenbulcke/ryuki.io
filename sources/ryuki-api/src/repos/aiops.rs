@@ -33,15 +33,14 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::aiops::{
-    AIOpsSuggestion, SuggestionStatus, SuggestionType, suggestion_status_from_db,
-    suggestion_status_to_db, suggestion_type_from_db,
+    suggestion_status_from_db, suggestion_status_to_db, suggestion_type_from_db, AIOpsSuggestion,
+    SuggestionStatus, SuggestionType,
 };
 use sqlx::PgPool;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
 
-pub const COLUMNS: &str =
-    "id, suggestion_type, title, description, affected_components, \
+pub const COLUMNS: &str = "id, suggestion_type, title, description, affected_components, \
      estimated_savings, confidence_score, status, reviewer, rejection_reason, \
      implementation_plan, site, created_at, updated_at";
 
@@ -77,8 +76,8 @@ impl AiopsSuggestionRow {
     /// DB CHECK stores.  A decode failure means the row is corrupt; surfaced
     /// as a `sqlx::Error::Decode` so the handler maps it to 500.
     pub fn into_model(self) -> Result<AIOpsSuggestion, sqlx::Error> {
-        let suggestion_type: SuggestionType =
-            suggestion_type_from_db(&self.suggestion_type).map_err(|e| {
+        let suggestion_type: SuggestionType = suggestion_type_from_db(&self.suggestion_type)
+            .map_err(|e| {
                 sqlx::Error::Decode(
                     format!(
                         "aiops_suggestions.suggestion_type: corrupt value '{}': {e}",
@@ -88,16 +87,15 @@ impl AiopsSuggestionRow {
                 )
             })?;
 
-        let status: SuggestionStatus =
-            suggestion_status_from_db(&self.status).map_err(|e| {
-                sqlx::Error::Decode(
-                    format!(
-                        "aiops_suggestions.status: corrupt value '{}': {e}",
-                        self.status
-                    )
-                    .into(),
+        let status: SuggestionStatus = suggestion_status_from_db(&self.status).map_err(|e| {
+            sqlx::Error::Decode(
+                format!(
+                    "aiops_suggestions.status: corrupt value '{}': {e}",
+                    self.status
                 )
-            })?;
+                .into(),
+            )
+        })?;
 
         Ok(AIOpsSuggestion {
             id: self.id,
@@ -121,10 +119,7 @@ impl AiopsSuggestionRow {
 // ─── Read functions ───────────────────────────────────────────────────────────
 
 /// List suggestions for a site.
-pub async fn list_by_site(
-    pool: &PgPool,
-    site: &str,
-) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
+pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<AIOpsSuggestion>, sqlx::Error> {
     let rows: Vec<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM aiops_suggestions WHERE site = $1 ORDER BY created_at"
     ))
@@ -151,10 +146,7 @@ pub async fn list_by_type(
 }
 
 /// Get a single suggestion by TEXT id. Returns Ok(None) when absent.
-pub async fn get(
-    pool: &PgPool,
-    id: &str,
-) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
+pub async fn get(pool: &PgPool, id: &str) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM aiops_suggestions WHERE id = $1"
     ))
@@ -276,7 +268,7 @@ pub async fn implement(
 #[cfg(test)]
 mod aiops_db_tests {
     use super::*;
-    use ryuki_engine::aiops::{SuggestionType, suggestion_type_to_db};
+    use ryuki_engine::aiops::{suggestion_type_to_db, SuggestionType};
 
     static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -446,7 +438,10 @@ mod aiops_db_tests {
         let result = review(&pool, id, "bob", "Reviewed")
             .await
             .expect("query ok");
-        assert!(result.is_none(), "wrong expected_status → Ok(None) (CAS miss)");
+        assert!(
+            result.is_none(),
+            "wrong expected_status → Ok(None) (CAS miss)"
+        );
 
         cleanup(&pool, id).await;
     }
@@ -473,10 +468,7 @@ mod aiops_db_tests {
             .expect("CAS hit");
 
         assert_eq!(updated.status, SuggestionStatus::Rejected);
-        assert_eq!(
-            updated.rejection_reason,
-            Some("Insufficient data".into())
-        );
+        assert_eq!(updated.rejection_reason, Some("Insufficient data".into()));
 
         cleanup(&pool, id).await;
     }
@@ -507,7 +499,10 @@ mod aiops_db_tests {
             + stats["rejected"].as_u64().unwrap()
             + stats["pending"].as_u64().unwrap()
             + stats["implemented"].as_u64().unwrap();
-        assert_eq!(total, sum, "accepted+rejected+pending+implemented must equal total");
+        assert_eq!(
+            total, sum,
+            "accepted+rejected+pending+implemented must equal total"
+        );
         assert!(total >= 3, "migration 035 seeds 3 DEFRA rows");
     }
 
@@ -526,9 +521,13 @@ mod aiops_db_tests {
             .await
             .expect("list_by_type");
         assert!(
-            rows.iter().all(|r| r.suggestion_type == SuggestionType::RightSizing),
+            rows.iter()
+                .all(|r| r.suggestion_type == SuggestionType::RightSizing),
             "all returned rows must be RightSizing"
         );
-        assert!(!rows.is_empty(), "migration 035 seeds at least one RightSizing row");
+        assert!(
+            !rows.is_empty(),
+            "migration 035 seeds at least one RightSizing row"
+        );
     }
 }

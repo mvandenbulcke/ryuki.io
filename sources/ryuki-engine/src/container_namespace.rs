@@ -287,10 +287,8 @@ pub fn get_k8s_summary(site: &str, namespaces: &[K8sNamespace]) -> Value {
         .iter()
         .map(|ns| ns.resource_quota.memory_request_gb)
         .sum();
-    let total_storage_allocated_gb: u32 = filtered
-        .iter()
-        .map(|ns| ns.resource_quota.storage_gb)
-        .sum();
+    let total_storage_allocated_gb: u32 =
+        filtered.iter().map(|ns| ns.resource_quota.storage_gb).sum();
 
     json!({
         "source": "database",
@@ -307,7 +305,13 @@ pub fn get_k8s_summary(site: &str, namespaces: &[K8sNamespace]) -> Value {
 mod tests {
     use super::*;
 
-    fn make_ns(id: &str, name: &str, cluster: &str, site: &str, status: NamespaceStatus) -> K8sNamespace {
+    fn make_ns(
+        id: &str,
+        name: &str,
+        cluster: &str,
+        site: &str,
+        status: NamespaceStatus,
+    ) -> K8sNamespace {
         K8sNamespace {
             id: id.into(),
             name: name.into(),
@@ -365,7 +369,13 @@ mod tests {
     fn test_build_namespace_and_request() {
         let env = Environment::Staging;
         let (ns, req) = build_namespace_and_request(
-            "frpar-api-staging", "frpar-k8s-01", "FRPAR", 10, 24, 250, env,
+            "frpar-api-staging",
+            "frpar-k8s-01",
+            "FRPAR",
+            10,
+            24,
+            250,
+            env,
         );
         assert_eq!(ns.name, "frpar-api-staging");
         assert_eq!(ns.cluster, "frpar-k8s-01");
@@ -386,8 +396,20 @@ mod tests {
     #[test]
     fn test_list_namespaces_filter() {
         let namespaces = vec![
-            make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active),
-            make_ns("ns-2", "gblon-obs", "gblon-k8s-01", "GBLON", NamespaceStatus::Active),
+            make_ns(
+                "ns-1",
+                "defra-apps",
+                "defra-aks-01",
+                "DEFRA",
+                NamespaceStatus::Active,
+            ),
+            make_ns(
+                "ns-2",
+                "gblon-obs",
+                "gblon-k8s-01",
+                "GBLON",
+                NamespaceStatus::Active,
+            ),
         ];
         let all = list_namespaces("", &namespaces);
         assert_eq!(all["count"], 2);
@@ -405,7 +427,13 @@ mod tests {
 
     #[test]
     fn test_get_namespace_response() {
-        let ns = make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active);
+        let ns = make_ns(
+            "ns-1",
+            "defra-apps",
+            "defra-aks-01",
+            "DEFRA",
+            NamespaceStatus::Active,
+        );
         let resp = get_namespace_response(&ns);
         assert_eq!(resp["namespace"]["id"], "ns-1");
         assert_eq!(resp["resource_quota"]["cpu_request"], 4);
@@ -420,7 +448,13 @@ mod tests {
 
     #[test]
     fn test_validate_namespace_name_response_taken() {
-        let ns = make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active);
+        let ns = make_ns(
+            "ns-1",
+            "defra-apps",
+            "defra-aks-01",
+            "DEFRA",
+            NamespaceStatus::Active,
+        );
         let resp = validate_namespace_name_response("defra-apps", "defra-aks-01", Some(&ns));
         assert_eq!(resp["available"], false);
         assert!(resp["reason"].as_str().unwrap().contains("ns-1"));
@@ -429,9 +463,27 @@ mod tests {
     #[test]
     fn test_get_cluster_utilization() {
         let namespaces = vec![
-            make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active),
-            make_ns("ns-2", "defra-data", "defra-aks-02", "DEFRA", NamespaceStatus::Active),
-            make_ns("ns-3", "gblon-obs", "gblon-k8s-01", "GBLON", NamespaceStatus::Active),
+            make_ns(
+                "ns-1",
+                "defra-apps",
+                "defra-aks-01",
+                "DEFRA",
+                NamespaceStatus::Active,
+            ),
+            make_ns(
+                "ns-2",
+                "defra-data",
+                "defra-aks-02",
+                "DEFRA",
+                NamespaceStatus::Active,
+            ),
+            make_ns(
+                "ns-3",
+                "gblon-obs",
+                "gblon-k8s-01",
+                "GBLON",
+                NamespaceStatus::Active,
+            ),
         ];
         let util = get_cluster_utilization("DEFRA", &namespaces);
         let clusters = util["clusters"].as_array().unwrap();
@@ -442,8 +494,20 @@ mod tests {
     #[test]
     fn test_get_k8s_summary() {
         let namespaces = vec![
-            make_ns("ns-1", "frpar-api", "frpar-k8s-01", "FRPAR", NamespaceStatus::Creating),
-            make_ns("ns-2", "frpar-edge", "frpar-k8s-01", "FRPAR", NamespaceStatus::Active),
+            make_ns(
+                "ns-1",
+                "frpar-api",
+                "frpar-k8s-01",
+                "FRPAR",
+                NamespaceStatus::Creating,
+            ),
+            make_ns(
+                "ns-2",
+                "frpar-edge",
+                "frpar-k8s-01",
+                "FRPAR",
+                NamespaceStatus::Active,
+            ),
         ];
         let summary = get_k8s_summary("FRPAR", &namespaces);
         assert_eq!(summary["total_namespaces"], 2);

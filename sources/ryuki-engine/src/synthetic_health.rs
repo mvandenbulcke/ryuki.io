@@ -124,6 +124,14 @@ pub fn run_check(check: &HealthCheck) -> CheckResult {
     }
 }
 
+/// Run every check in `checks` and collect the results, preserving input order.
+/// The function is pure: it delegates to [`run_check`] for each definition and
+/// performs no I/O. The caller loads the check definitions (e.g. from the
+/// database) and is responsible for persisting the returned results.
+pub fn run_all_checks(checks: &[HealthCheck]) -> Vec<CheckResult> {
+    checks.iter().map(run_check).collect()
+}
+
 /// Find the most recent result for `check_id` in the provided slice.
 /// Returns `None` if no result exists for the given check id.
 pub fn get_check_status<'a>(results: &'a [CheckResult], check_id: &str) -> Option<&'a CheckResult> {

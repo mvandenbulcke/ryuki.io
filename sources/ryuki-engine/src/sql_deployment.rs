@@ -370,8 +370,7 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
         if cpu < 4 {
             warnings.push("AG deployments benefit from at least 4 CPU cores per node".into());
         }
-        warnings
-            .push("AG requires Windows Server Failover Clustering and at least 2 nodes".into());
+        warnings.push("AG requires Windows Server Failover Clustering and at least 2 nodes".into());
         remediation
             .push("Ensure 2+ nodes, WSFC, and AG listener DNS record are pre-provisioned".into());
     }
@@ -438,7 +437,11 @@ pub fn guard_verify(deployment: &SQLDeployment) -> Result<(), String> {
 
 /// Guard: deployment must be in `Verified` status before backup registration.
 pub fn guard_backup(deployment: &SQLDeployment) -> Result<(), String> {
-    require_status(deployment, &DeploymentStatus::Verified, "register backup for")
+    require_status(
+        deployment,
+        &DeploymentStatus::Verified,
+        "register backup for",
+    )
 }
 
 /// Guard: deployment must be in `BackedUp` status before monitoring onboarding.
@@ -785,7 +788,10 @@ mod tests {
             "instance_name": "DEFRA-SQL-DEF", "sql_version": "2022", "edition": "Standard",
             "service_account": "svc@ryuki.local", "site": "DEFRA", "cluster_mode": "Standalone"
         });
-        assert!(plan_deployment(req).is_ok(), "absent dimensions use defaults");
+        assert!(
+            plan_deployment(req).is_ok(),
+            "absent dimensions use defaults"
+        );
     }
 
     #[test]
@@ -1147,14 +1153,11 @@ mod tests {
 
     #[test]
     fn test_inventory_response_filters_by_site() {
-        let deployments = [
-            make_deployment(DeploymentStatus::Draft),
-            {
-                let mut d = make_deployment(DeploymentStatus::Planned);
-                d.site = "GBLON".into();
-                d
-            },
-        ];
+        let deployments = [make_deployment(DeploymentStatus::Draft), {
+            let mut d = make_deployment(DeploymentStatus::Planned);
+            d.site = "GBLON".into();
+            d
+        }];
         let defra_only: Vec<SQLDeployment> = deployments
             .iter()
             .filter(|d| d.site == "DEFRA")

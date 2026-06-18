@@ -217,34 +217,64 @@ mod tests {
     fn make_ports() -> Vec<SwitchPort> {
         vec![
             SwitchPort {
-                id: "p1".into(), switch_name: "sw-01".into(), port_number: 1,
-                vlan_id: 100, vlan_name: "mgmt".into(), status: "Available".into(),
-                connected_device: None, site: "DEFRA".into(),
+                id: "p1".into(),
+                switch_name: "sw-01".into(),
+                port_number: 1,
+                vlan_id: 100,
+                vlan_name: "mgmt".into(),
+                status: "Available".into(),
+                connected_device: None,
+                site: "DEFRA".into(),
             },
             SwitchPort {
-                id: "p2".into(), switch_name: "sw-01".into(), port_number: 2,
-                vlan_id: 100, vlan_name: "mgmt".into(), status: "Available".into(),
-                connected_device: None, site: "DEFRA".into(),
+                id: "p2".into(),
+                switch_name: "sw-01".into(),
+                port_number: 2,
+                vlan_id: 100,
+                vlan_name: "mgmt".into(),
+                status: "Available".into(),
+                connected_device: None,
+                site: "DEFRA".into(),
             },
             SwitchPort {
-                id: "p3".into(), switch_name: "sw-01".into(), port_number: 3,
-                vlan_id: 100, vlan_name: "mgmt".into(), status: "InUse".into(),
-                connected_device: Some("srv-01".into()), site: "DEFRA".into(),
+                id: "p3".into(),
+                switch_name: "sw-01".into(),
+                port_number: 3,
+                vlan_id: 100,
+                vlan_name: "mgmt".into(),
+                status: "InUse".into(),
+                connected_device: Some("srv-01".into()),
+                site: "DEFRA".into(),
             },
             SwitchPort {
-                id: "p4".into(), switch_name: "sw-02".into(), port_number: 1,
-                vlan_id: 200, vlan_name: "prod".into(), status: "Reserved".into(),
-                connected_device: None, site: "DEFRA".into(),
+                id: "p4".into(),
+                switch_name: "sw-02".into(),
+                port_number: 1,
+                vlan_id: 200,
+                vlan_name: "prod".into(),
+                status: "Reserved".into(),
+                connected_device: None,
+                site: "DEFRA".into(),
             },
             SwitchPort {
-                id: "p5".into(), switch_name: "sw-02".into(), port_number: 2,
-                vlan_id: 200, vlan_name: "prod".into(), status: "Disabled".into(),
-                connected_device: None, site: "DEFRA".into(),
+                id: "p5".into(),
+                switch_name: "sw-02".into(),
+                port_number: 2,
+                vlan_id: 200,
+                vlan_name: "prod".into(),
+                status: "Disabled".into(),
+                connected_device: None,
+                site: "DEFRA".into(),
             },
             SwitchPort {
-                id: "p6".into(), switch_name: "sw-03".into(), port_number: 1,
-                vlan_id: 300, vlan_name: "dmz".into(), status: "Available".into(),
-                connected_device: None, site: "GBLON".into(),
+                id: "p6".into(),
+                switch_name: "sw-03".into(),
+                port_number: 1,
+                vlan_id: 300,
+                vlan_name: "dmz".into(),
+                status: "Available".into(),
+                connected_device: None,
+                site: "GBLON".into(),
             },
         ]
     }
@@ -252,19 +282,34 @@ mod tests {
     fn make_vlans() -> Vec<VLAN> {
         vec![
             VLAN {
-                id: "v1".into(), vlan_id: 100, vlan_name: "mgmt".into(),
-                subnet: "10.1.1.0/24".into(), gateway: "10.1.1.1".into(),
-                site: "DEFRA".into(), purpose: "Management".into(), available_ips: 200,
+                id: "v1".into(),
+                vlan_id: 100,
+                vlan_name: "mgmt".into(),
+                subnet: "10.1.1.0/24".into(),
+                gateway: "10.1.1.1".into(),
+                site: "DEFRA".into(),
+                purpose: "Management".into(),
+                available_ips: 200,
             },
             VLAN {
-                id: "v2".into(), vlan_id: 200, vlan_name: "prod".into(),
-                subnet: "10.1.2.0/24".into(), gateway: "10.1.2.1".into(),
-                site: "DEFRA".into(), purpose: "Production".into(), available_ips: 10,
+                id: "v2".into(),
+                vlan_id: 200,
+                vlan_name: "prod".into(),
+                subnet: "10.1.2.0/24".into(),
+                gateway: "10.1.2.1".into(),
+                site: "DEFRA".into(),
+                purpose: "Production".into(),
+                available_ips: 10,
             },
             VLAN {
-                id: "v3".into(), vlan_id: 300, vlan_name: "dmz".into(),
-                subnet: "10.2.3.0/24".into(), gateway: "10.2.3.1".into(),
-                site: "GBLON".into(), purpose: "DMZ".into(), available_ips: 5,
+                id: "v3".into(),
+                vlan_id: 300,
+                vlan_name: "dmz".into(),
+                subnet: "10.2.3.0/24".into(),
+                gateway: "10.2.3.1".into(),
+                site: "GBLON".into(),
+                purpose: "DMZ".into(),
+                available_ips: 5,
             },
         ]
     }
@@ -390,7 +435,10 @@ mod tests {
         // We track the ids that were flipped so the restore step only touches them
         // (other ports may already be Reserved in the test data and must not be affected).
         let mut ports = make_ports();
-        let initially_available = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
+        let initially_available = ports
+            .iter()
+            .filter(|p| p.site == "DEFRA" && p.status == "Available")
+            .count();
         assert_eq!(initially_available, 2, "test data: 2 Available DEFRA ports");
 
         // Collect the ids of Available ports before mutating.
@@ -405,21 +453,36 @@ mod tests {
             p.status = "Reserved".into();
         }
 
-        let after_reserve = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
-        assert_eq!(after_reserve, 0, "no Available DEFRA ports after reservation");
+        let after_reserve = ports
+            .iter()
+            .filter(|p| p.site == "DEFRA" && p.status == "Available")
+            .count();
+        assert_eq!(
+            after_reserve, 0,
+            "no Available DEFRA ports after reservation"
+        );
 
         // "release" — restore only the ports we reserved
         for p in ports.iter_mut().filter(|p| to_reserve.contains(&p.id)) {
             p.status = "Available".into();
         }
-        let after_release = ports.iter().filter(|p| p.site == "DEFRA" && p.status == "Available").count();
-        assert_eq!(after_release, initially_available, "count restored to initial");
+        let after_release = ports
+            .iter()
+            .filter(|p| p.site == "DEFRA" && p.status == "Available")
+            .count();
+        assert_eq!(
+            after_release, initially_available,
+            "count restored to initial"
+        );
     }
 
     #[test]
     fn release_restore_arithmetic_ips() {
         let mut vlans = make_vlans();
-        let vlan = vlans.iter_mut().find(|v| v.site == "DEFRA" && v.vlan_id == 100).unwrap();
+        let vlan = vlans
+            .iter_mut()
+            .find(|v| v.site == "DEFRA" && v.vlan_id == 100)
+            .unwrap();
         let initial = vlan.available_ips;
         // reserve 5
         vlan.available_ips -= 5;
