@@ -9782,65 +9782,175 @@ async fn aiops_generate(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    aiops::generate_suggestions(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let suggestions = match get_db() {
+        Some(pool) => {
+            crate::repos::aiops::list_by_site(pool, site)
+                .await
+                .map_err(db_error)?
+        }
+        None => vec![],
+    };
+    Ok(Json(aiops::generate_suggestions(site, &suggestions)))
 }
 
 async fn aiops_review(
     Path(id): Path<String>,
     Json(body): Json<AiopsReviewRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    aiops::review_suggestion(&id, &body.reviewer)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let suggestion = crate::repos::aiops::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let expected = aiops::guard_review(&suggestion).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::aiops::review(pool, &id, &body.reviewer, expected)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
+    Ok(Json(json!({
+        "source": "db",
+        "id": updated.id,
+        "status": updated.status.to_string(),
+        "reviewer": updated.reviewer,
+        "updated_at": updated.updated_at
+    })))
 }
 
 async fn aiops_accept(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    aiops::accept_suggestion(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let suggestion = crate::repos::aiops::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let expected = aiops::guard_accept(&suggestion).map_err(|e| status_409(&e))?;
+    let plan = format!(
+        "Implementation plan for {}: dry-run assessment, maintenance window scheduling, execution, verification.",
+        suggestion.title
+    );
+    let updated = crate::repos::aiops::accept(pool, &id, &plan, expected)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
+    Ok(Json(json!({
+        "source": "db",
+        "id": updated.id,
+        "status": updated.status.to_string(),
+        "implementation_plan": updated.implementation_plan,
+        "updated_at": updated.updated_at
+    })))
 }
 
 async fn aiops_reject(
     Path(id): Path<String>,
     Json(body): Json<AiopsRejectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    aiops::reject_suggestion(&id, &body.reason)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let suggestion = crate::repos::aiops::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let expected = aiops::guard_reject(&suggestion).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::aiops::reject(pool, &id, &body.reason, expected)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
+    Ok(Json(json!({
+        "source": "db",
+        "id": updated.id,
+        "status": updated.status.to_string(),
+        "rejection_reason": updated.rejection_reason,
+        "updated_at": updated.updated_at
+    })))
 }
 
 async fn aiops_implement(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    aiops::implement_suggestion(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let suggestion = crate::repos::aiops::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let expected = aiops::guard_implement(&suggestion).map_err(|e| status_409(&e))?;
+    let updated = crate::repos::aiops::implement(pool, &id, expected)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
+    Ok(Json(json!({
+        "source": "db",
+        "id": updated.id,
+        "status": updated.status.to_string(),
+        "updated_at": updated.updated_at,
+        "note": "Implementation tracked — persisted to database."
+    })))
 }
 
 async fn aiops_type(
     Query(params): Query<AiopsTypeQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    aiops::get_suggestions_by_type(&params.suggestion_type)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    // Convert display form (e.g. "right-sizing") to DB form (e.g. "RightSizing")
+    // for the repo query. If the display form is unknown we still query; the
+    // repo will return an empty set (no matching rows) rather than an error.
+    // Attempt display→DB conversion by scanning variants; fall back to
+    // querying with the raw string (returns empty) if not recognised.
+    let db_form: String = {
+        let display = &params.suggestion_type;
+        // Map known display forms to DB PascalCase.
+        let known: &[(&str, &str)] = &[
+            ("right-sizing", "RightSizing"),
+            ("migration", "Migration"),
+            ("consolidation", "Consolidation"),
+            ("risk-reduction", "RiskReduction"),
+            ("cost-optimization", "CostOptimization"),
+            ("performance-improvement", "PerformanceImprovement"),
+        ];
+        known
+            .iter()
+            .find(|(d, _)| *d == display.as_str())
+            .map(|(_, db)| db.to_string())
+            .unwrap_or_else(|| display.clone())
+    };
+
+    let suggestions = match get_db() {
+        Some(pool) => {
+            crate::repos::aiops::list_by_type(pool, &db_form)
+                .await
+                .map_err(db_error)?
+        }
+        None => vec![],
+    };
+    Ok(Json(aiops::get_suggestions_by_type(
+        &params.suggestion_type,
+        &suggestions,
+    )))
 }
 
 async fn aiops_savings(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    aiops::get_savings_summary(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let suggestions = match get_db() {
+        Some(pool) => {
+            crate::repos::aiops::list_by_site(pool, site)
+                .await
+                .map_err(db_error)?
+        }
+        None => vec![],
+    };
+    Ok(Json(aiops::get_savings_summary(site, &suggestions)))
 }
 
 async fn aiops_stats(
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("DEFRA");
-    aiops::get_suggestion_stats(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let suggestions = match get_db() {
+        Some(pool) => {
+            crate::repos::aiops::list_by_site(pool, site)
+                .await
+                .map_err(db_error)?
+        }
+        None => vec![],
+    };
+    Ok(Json(aiops::get_suggestion_stats(site, &suggestions)))
 }
 
 async fn aiops_contract() -> Json<Value> {
