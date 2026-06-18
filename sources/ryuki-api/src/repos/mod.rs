@@ -35,5 +35,6 @@ pub mod repository_capacity;
 pub mod restore_requests;
 pub mod snapshots;
 pub mod sql_deployment;
+pub mod storage_provisioning;
 pub mod synthetic_health;
 pub mod zabbix_drift;

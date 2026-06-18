@@ -77,7 +77,6 @@ use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::software_deployment;
 use ryuki_engine::sql_deployment;
-use ryuki_engine::storage_provisioning;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
 use ryuki_engine::zabbix_drift;
@@ -18873,82 +18872,235 @@ struct StorageCapacityRequest {
 async fn storage_volumes_list(
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::list_volumes(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let volumes = match get_db() {
+        Some(pool) => crate::repos::storage_provisioning::list_volumes(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    Ok(Json(ryuki_engine::storage_provisioning::list_volumes(
+        site, &volumes,
+    )))
 }
 async fn storage_volume_provision(
     Json(b): Json<StorageProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::provision_volume(&b.name, b.size_gb, &b.volume_type, &b.array_id, &b.site)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    if b.name.trim().is_empty() {
+        return Err(status_400("name cannot be empty"));
+    }
+    if b.size_gb == 0 {
+        return Err(status_400("size_gb must be greater than 0"));
+    }
+    if b.size_gb > i64::MAX as u64 {
+        return Err(status_400("size_gb is too large"));
+    }
+    if b.site.trim().is_empty() {
+        return Err(status_400("site cannot be empty"));
+    }
+
+    let volume_type = ryuki_engine::storage_provisioning::parse_volume_type(&b.volume_type)
+        .map_err(|e| status_400(&e))?;
+
+    let db = get_db().ok_or_else(status_503_no_db)?;
+
+    // Preserve the original engine guard: the target array must exist and belong
+    // to the requested site. Without it, provisioning against an array at a
+    // different site would decrement THAT array's capacity while storing a volume
+    // whose site != its array's site (internally-inconsistent durable data), and
+    // flip a previously-400-rejected request to accepted.
+    let array = crate::repos::storage_provisioning::get_array(db, &b.array_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&b.array_id))?;
+    if array.site != b.site {
+        return Err(status_400(&format!(
+            "Storage array '{}' belongs to site '{}' not '{}'",
+            b.array_id, array.site, b.site
+        )));
+    }
+
+    let volume = ryuki_engine::storage_provisioning::build_volume(
+        &b.name, b.size_gb, volume_type, &b.array_id, &b.site,
+    );
+
+    use crate::repos::storage_provisioning::ProvisionOutcome;
+    match crate::repos::storage_provisioning::provision_volume(db, &volume).await {
+        Ok(ProvisionOutcome::Done) => Ok(Json(json!({
+            "source": "db",
+            "action": "provision-volume",
+            "providerCallsEnabled": false,
+            "volume": volume,
+        }))),
+        Ok(ProvisionOutcome::InsufficientCapacity) => Err(status_409(&format!(
+            "Insufficient capacity on storage array '{}'",
+            b.array_id
+        ))),
+        Err(e) => {
+            if e.as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false)
+            {
+                Err(status_409(&format!(
+                    "A volume named '{}' already exists at site '{}'",
+                    b.name, b.site
+                )))
+            } else {
+                Err(db_error(e))
+            }
+        }
+    }
 }
 async fn storage_volume_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::get_volume(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let Some(db) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let volume = crate::repos::storage_provisioning::get_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(
+        ryuki_engine::storage_provisioning::get_volume_response(&volume),
+    ))
 }
 async fn storage_volume_extend(
     Path(id): Path<String>,
     Json(b): Json<StorageExtendRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::extend_volume(&id, b.additional_gb)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    if b.additional_gb == 0 {
+        return Err(status_400("additional_gb must be greater than 0"));
+    }
+    if b.additional_gb > i64::MAX as u64 {
+        return Err(status_400("additional_gb is too large"));
+    }
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::storage_provisioning::ExtendOutcome;
+    match crate::repos::storage_provisioning::extend_volume(db, &id, b.additional_gb).await {
+        Ok(ExtendOutcome::Done(v)) => Ok(Json(json!({
+            "source": "db",
+            "action": "extend-volume",
+            "providerCallsEnabled": false,
+            "volume": v,
+        }))),
+        Ok(ExtendOutcome::NotFound) => Err(status_404(&id)),
+        Ok(ExtendOutcome::InsufficientCapacity) => {
+            Err(status_409("Insufficient capacity on storage array"))
+        }
+        Err(e) => Err(db_error(e)),
+    }
 }
 async fn storage_volume_map(
     Path(id): Path<String>,
     Json(b): Json<StorageMapRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::map_volume(&id, &b.hostname)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    if b.hostname.trim().is_empty() {
+        return Err(status_400("hostname cannot be empty"));
+    }
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let volume = crate::repos::storage_provisioning::map_volume(db, &id, &b.hostname)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "map-volume",
+        "providerCallsEnabled": false,
+        "volume": volume,
+    })))
 }
 async fn storage_volume_unmap(
     Path(id): Path<String>,
     Json(b): Json<StorageMapRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::unmap_volume(&id, &b.hostname)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let volume = crate::repos::storage_provisioning::unmap_volume(db, &id, &b.hostname)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "unmap-volume",
+        "providerCallsEnabled": false,
+        "volume": volume,
+    })))
 }
 async fn storage_volume_retire(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::retire_volume(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let volume = crate::repos::storage_provisioning::retire_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "retire-volume",
+        "providerCallsEnabled": false,
+        "volume": volume,
+    })))
 }
 async fn storage_arrays_list(
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::list_arrays(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let arrays = match get_db() {
+        Some(pool) => crate::repos::storage_provisioning::list_arrays(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    Ok(Json(ryuki_engine::storage_provisioning::list_arrays(
+        site, &arrays,
+    )))
 }
 async fn storage_array_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::get_array(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let Some(db) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let array = crate::repos::storage_provisioning::get_array(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(
+        ryuki_engine::storage_provisioning::get_array_response(&array),
+    ))
 }
 async fn storage_check_capacity(
     Json(b): Json<StorageCapacityRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::check_capacity(&b.array_id, b.requested_gb)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let array = match get_db() {
+        Some(pool) => crate::repos::storage_provisioning::get_array(pool, &b.array_id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&b.array_id))?,
+        None => return Err(status_404(&b.array_id)),
+    };
+    Ok(Json(ryuki_engine::storage_provisioning::check_capacity(
+        &array,
+        b.requested_gb,
+    )))
 }
 async fn storage_report(
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    storage_provisioning::get_storage_report(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let (total_gb, used_gb, volume_count, array_count) = match get_db() {
+        Some(pool) => crate::repos::storage_provisioning::get_storage_report(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => (0_i64, 0_i64, 0_i64, 0_i64),
+    };
+    Ok(Json(ryuki_engine::storage_provisioning::get_storage_report(
+        site,
+        total_gb,
+        used_gb,
+        volume_count,
+        array_count,
+    )))
 }
 async fn storage_contract() -> Json<Value> {
     Json(
