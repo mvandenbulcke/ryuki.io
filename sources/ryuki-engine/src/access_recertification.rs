@@ -1,7 +1,6 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +51,15 @@ pub enum CampaignStatus {
     Completed,
 }
 
+impl std::fmt::Display for CampaignStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CampaignStatus::Active => write!(f, "Active"),
+            CampaignStatus::Completed => write!(f, "Completed"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessReview {
     pub id: String,
@@ -79,19 +87,11 @@ pub struct RecertificationCampaign {
     pub status: CampaignStatus,
 }
 
-type AccessStore = (Vec<AccessReview>, Vec<RecertificationCampaign>);
-
-static ACCESS_STORE: OnceLock<Mutex<AccessStore>> = OnceLock::new();
-
-fn store() -> &'static Mutex<AccessStore> {
-    ACCESS_STORE.get_or_init(|| Mutex::new((seed_reviews(), seed_campaigns())))
-}
-
-fn now_iso() -> String {
+pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn parse_review_type(value: &str) -> Result<ReviewType, String> {
+pub fn parse_review_type(value: &str) -> Result<ReviewType, String> {
     match value {
         "ADGroup" => Ok(ReviewType::ADGroup),
         "ServiceAccount" => Ok(ReviewType::ServiceAccount),
@@ -104,13 +104,272 @@ fn parse_review_type(value: &str) -> Result<ReviewType, String> {
     }
 }
 
-fn parse_date(value: &str) -> Option<DateTime<Utc>> {
+pub fn parse_date(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn seed_reviews() -> Vec<AccessReview> {
+fn review_response(review: &AccessReview) -> Value {
+    json!({
+        "source": "db",
+        "review": review
+    })
+}
+
+pub fn completed_reviews_count(reviews: &[AccessReview], review_type: &ReviewType) -> usize {
+    reviews
+        .iter()
+        .filter(|review| review.review_type == *review_type)
+        .filter(|review| {
+            matches!(
+                review.status,
+                ReviewStatus::Approved | ReviewStatus::Revoked | ReviewStatus::Exempted
+            )
+        })
+        .count()
+}
+
+/// Pure read over a slice. Returns JSON with count and reviews filtered by site/type.
+pub fn list_reviews_pure(
+    reviews: &[AccessReview],
+    site: &str,
+    review_type: Option<&ReviewType>,
+) -> Value {
+    let filtered: Vec<&AccessReview> = reviews
+        .iter()
+        .filter(|r| site.is_empty() || r.site == site)
+        .filter(|r| review_type.is_none_or(|rt| r.review_type == *rt))
+        .collect();
+    json!({
+        "source": "db",
+        "count": filtered.len(),
+        "reviews": filtered
+    })
+}
+
+/// Pure read over a slice. Returns due reviews (next_review_due < now, not Revoked).
+pub fn list_due_reviews_pure(reviews: &[AccessReview]) -> Value {
+    let now = Utc::now();
+    let due: Vec<&AccessReview> = reviews
+        .iter()
+        .filter(|r| {
+            parse_date(&r.next_review_due).is_some_and(|d| d < now)
+                && r.status != ReviewStatus::Revoked
+        })
+        .collect();
+    json!({
+        "source": "db",
+        "count": due.len(),
+        "reviews": due
+    })
+}
+
+/// Pure read over a slice. Returns reviews expiring within `days` days from now.
+pub fn list_expiring_pure(reviews: &[AccessReview], days: i64) -> Value {
+    let now = Utc::now();
+    let threshold = now + Duration::days(days);
+    let expiring: Vec<&AccessReview> = reviews
+        .iter()
+        .filter(|r| parse_date(&r.next_review_due).is_some_and(|d| d >= now && d <= threshold))
+        .collect();
+    json!({
+        "source": "db",
+        "days": days,
+        "count": expiring.len(),
+        "reviews": expiring
+    })
+}
+
+/// Pure summary over a slice.
+pub fn get_summary_pure(reviews: &[AccessReview]) -> Value {
+    let pending = reviews
+        .iter()
+        .filter(|r| r.status == ReviewStatus::Pending)
+        .count();
+    let in_progress = reviews
+        .iter()
+        .filter(|r| r.status == ReviewStatus::InProgress)
+        .count();
+    let approved = reviews
+        .iter()
+        .filter(|r| r.status == ReviewStatus::Approved)
+        .count();
+    let revoked = reviews
+        .iter()
+        .filter(|r| r.status == ReviewStatus::Revoked)
+        .count();
+    let exempted = reviews
+        .iter()
+        .filter(|r| r.status == ReviewStatus::Exempted)
+        .count();
+    json!({
+        "source": "db",
+        "total": reviews.len(),
+        "pending": pending,
+        "in_progress": in_progress,
+        "approved": approved,
+        "revoked": revoked,
+        "exempted": exempted
+    })
+}
+
+/// Pure guard for start_review: validates that the loaded review is Pending and
+/// reviewer is non-empty. Returns the new field values or an error string.
+/// Does NOT mutate — the repo applies the CAS UPDATE.
+pub fn start_review_guard(review: &AccessReview, reviewer: &str) -> Result<(), String> {
+    if reviewer.trim().is_empty() {
+        return Err("reviewer cannot be empty".into());
+    }
+    if review.status != ReviewStatus::Pending {
+        return Err(format!(
+            "access review '{}' is not in Pending status (current: {})",
+            review.id, review.status
+        ));
+    }
+    Ok(())
+}
+
+/// Pure guard for approve_review.
+pub fn approve_review_guard(
+    review: &AccessReview,
+    reviewer: &str,
+    justification: &str,
+) -> Result<(), String> {
+    if reviewer.trim().is_empty() {
+        return Err("reviewer cannot be empty".into());
+    }
+    if justification.trim().is_empty() {
+        return Err("justification cannot be empty".into());
+    }
+    if !matches!(
+        review.status,
+        ReviewStatus::InProgress | ReviewStatus::Pending
+    ) {
+        return Err(format!(
+            "access review '{}' cannot be approved from status '{}'",
+            review.id, review.status
+        ));
+    }
+    Ok(())
+}
+
+/// Pure guard for revoke_review.
+pub fn revoke_review_guard(
+    review: &AccessReview,
+    reviewer: &str,
+    reason: &str,
+) -> Result<(), String> {
+    if reviewer.trim().is_empty() {
+        return Err("reviewer cannot be empty".into());
+    }
+    if reason.trim().is_empty() {
+        return Err("reason cannot be empty".into());
+    }
+    if !matches!(
+        review.status,
+        ReviewStatus::InProgress | ReviewStatus::Pending
+    ) {
+        return Err(format!(
+            "access review '{}' cannot be revoked from status '{}'",
+            review.id, review.status
+        ));
+    }
+    Ok(())
+}
+
+/// Pure guard for exempt_review.
+pub fn exempt_review_guard(
+    review: &AccessReview,
+    reviewer: &str,
+    justification: &str,
+    exemption_expiry: &str,
+) -> Result<(), String> {
+    if reviewer.trim().is_empty() {
+        return Err("reviewer cannot be empty".into());
+    }
+    if justification.trim().is_empty() {
+        return Err("justification cannot be empty".into());
+    }
+    if parse_date(exemption_expiry).is_none() {
+        return Err(format!("Invalid exemption_expiry: {exemption_expiry}"));
+    }
+    // An exemption grants an exception while a review is still open; a review
+    // already Approved/Revoked/Exempted is terminal and must not be rewritten.
+    if !matches!(
+        review.status,
+        ReviewStatus::InProgress | ReviewStatus::Pending
+    ) {
+        return Err(format!(
+            "access review '{}' cannot be exempted from status '{}'",
+            review.id, review.status
+        ));
+    }
+    Ok(())
+}
+
+/// Pure guard for create_campaign.
+pub fn create_campaign_guard(name: &str, reviewer_group: &str, days: i64) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if reviewer_group.trim().is_empty() {
+        return Err("reviewer_group cannot be empty".into());
+    }
+    if days <= 0 {
+        return Err("days must be greater than zero".into());
+    }
+    Ok(())
+}
+
+/// Build a new RecertificationCampaign value (for the repo to INSERT).
+pub fn build_campaign(
+    name: &str,
+    review_type: ReviewType,
+    reviewer_group: &str,
+    days: i64,
+    reviews_count: usize,
+    completed_count: usize,
+) -> RecertificationCampaign {
+    RecertificationCampaign {
+        id: format!(
+            "arcamp-{}",
+            Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("unknown")
+        ),
+        name: name.to_string(),
+        start_date: now_iso(),
+        end_date: (Utc::now() + Duration::days(days)).to_rfc3339(),
+        review_type,
+        reviewer_group: reviewer_group.to_string(),
+        reviews_count,
+        completed_count,
+        status: CampaignStatus::Active,
+    }
+}
+
+pub fn campaign_response(campaign: &RecertificationCampaign) -> Value {
+    let progress_percent = if campaign.reviews_count == 0 {
+        0.0
+    } else {
+        (campaign.completed_count as f64 / campaign.reviews_count as f64) * 100.0
+    };
+    json!({
+        "source": "db",
+        "campaign": campaign,
+        "progress_percent": progress_percent
+    })
+}
+
+pub fn get_review_response(review: &AccessReview) -> Value {
+    review_response(review)
+}
+
+#[cfg(test)]
+pub fn seed_reviews() -> Vec<AccessReview> {
     let now = Utc::now();
     vec![
         AccessReview {
@@ -251,7 +510,8 @@ fn seed_reviews() -> Vec<AccessReview> {
     ]
 }
 
-fn seed_campaigns() -> Vec<RecertificationCampaign> {
+#[cfg(test)]
+pub fn seed_campaigns() -> Vec<RecertificationCampaign> {
     let now = Utc::now();
     vec![
         RecertificationCampaign {
@@ -279,416 +539,110 @@ fn seed_campaigns() -> Vec<RecertificationCampaign> {
     ]
 }
 
-fn review_response(review: &AccessReview) -> Value {
-    json!({
-        "source": "dry-run",
-        "review": review
-    })
-}
-
-fn completed_reviews_count(reviews: &[AccessReview], review_type: &ReviewType) -> usize {
-    reviews
-        .iter()
-        .filter(|review| review.review_type == *review_type)
-        .filter(|review| {
-            matches!(
-                review.status,
-                ReviewStatus::Approved | ReviewStatus::Revoked | ReviewStatus::Exempted
-            )
-        })
-        .count()
-}
-
-pub fn list_reviews(site: &str, review_type: &str) -> Result<Value, String> {
-    let parsed_type = if review_type.is_empty() {
-        None
-    } else {
-        Some(parse_review_type(review_type)?)
-    };
-    let store = store().lock().unwrap();
-    let reviews: Vec<AccessReview> = store
-        .0
-        .iter()
-        .filter(|review| site.is_empty() || review.site == site)
-        .filter(|review| match &parsed_type {
-            Some(review_type) => review.review_type == *review_type,
-            None => true,
-        })
-        .cloned()
-        .collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "count": reviews.len(),
-        "reviews": reviews
-    }))
-}
-
-pub fn get_review(id: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let review = store
-        .0
-        .iter()
-        .find(|review| review.id == id)
-        .ok_or_else(|| format!("Access review '{id}' not found"))?;
-
-    Ok(review_response(review))
-}
-
-pub fn list_due_reviews() -> Result<Value, String> {
-    let now = Utc::now();
-    let store = store().lock().unwrap();
-    let reviews: Vec<AccessReview> = store
-        .0
-        .iter()
-        .filter(|review| {
-            parse_date(&review.next_review_due).is_some_and(|due| due < now)
-                && review.status != ReviewStatus::Revoked
-        })
-        .cloned()
-        .collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "count": reviews.len(),
-        "reviews": reviews
-    }))
-}
-
-pub fn list_expiring(days: i64) -> Result<Value, String> {
-    if days < 0 {
-        return Err("days must be zero or greater".into());
-    }
-    let now = Utc::now();
-    let threshold = now + Duration::days(days);
-    let store = store().lock().unwrap();
-    let reviews: Vec<AccessReview> = store
-        .0
-        .iter()
-        .filter(|review| {
-            parse_date(&review.next_review_due).is_some_and(|due| due >= now && due <= threshold)
-        })
-        .cloned()
-        .collect();
-
-    Ok(json!({
-        "source": "dry-run",
-        "days": days,
-        "count": reviews.len(),
-        "reviews": reviews
-    }))
-}
-
-pub fn start_review(id: &str, reviewer: &str) -> Result<Value, String> {
-    if reviewer.trim().is_empty() {
-        return Err("reviewer cannot be empty".into());
-    }
-    let mut store = store().lock().unwrap();
-    let review = store
-        .0
-        .iter_mut()
-        .find(|review| review.id == id)
-        .ok_or_else(|| format!("Access review '{id}' not found"))?;
-
-    review.status = ReviewStatus::InProgress;
-    review.reviewer = Some(reviewer.to_string());
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "start-review",
-        "review": review
-    }))
-}
-
-pub fn approve_review(id: &str, reviewer: &str, justification: &str) -> Result<Value, String> {
-    if reviewer.trim().is_empty() {
-        return Err("reviewer cannot be empty".into());
-    }
-    if justification.trim().is_empty() {
-        return Err("justification cannot be empty".into());
-    }
-    let mut store = store().lock().unwrap();
-    let review = store
-        .0
-        .iter_mut()
-        .find(|review| review.id == id)
-        .ok_or_else(|| format!("Access review '{id}' not found"))?;
-
-    review.status = ReviewStatus::Approved;
-    review.reviewer = Some(reviewer.to_string());
-    review.last_reviewed = now_iso();
-    review.next_review_due = (Utc::now() + Duration::days(90)).to_rfc3339();
-    review
-        .access_details
-        .push(format!("Approved justification: {justification}"));
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "approve-review",
-        "review": review
-    }))
-}
-
-pub fn revoke_review(id: &str, reviewer: &str, reason: &str) -> Result<Value, String> {
-    if reviewer.trim().is_empty() {
-        return Err("reviewer cannot be empty".into());
-    }
-    if reason.trim().is_empty() {
-        return Err("reason cannot be empty".into());
-    }
-    let mut store = store().lock().unwrap();
-    let review = store
-        .0
-        .iter_mut()
-        .find(|review| review.id == id)
-        .ok_or_else(|| format!("Access review '{id}' not found"))?;
-
-    review.status = ReviewStatus::Revoked;
-    review.reviewer = Some(reviewer.to_string());
-    review.last_reviewed = now_iso();
-    review
-        .access_details
-        .push(format!("Revocation reason: {reason}"));
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "revoke-review",
-        "review": review
-    }))
-}
-
-pub fn exempt_review(
-    id: &str,
-    reviewer: &str,
-    justification: &str,
-    exemption_expiry: &str,
-) -> Result<Value, String> {
-    if reviewer.trim().is_empty() {
-        return Err("reviewer cannot be empty".into());
-    }
-    if justification.trim().is_empty() {
-        return Err("justification cannot be empty".into());
-    }
-    if parse_date(exemption_expiry).is_none() {
-        return Err(format!("Invalid exemption_expiry: {exemption_expiry}"));
-    }
-    let mut store = store().lock().unwrap();
-    let review = store
-        .0
-        .iter_mut()
-        .find(|review| review.id == id)
-        .ok_or_else(|| format!("Access review '{id}' not found"))?;
-
-    review.status = ReviewStatus::Exempted;
-    review.reviewer = Some(reviewer.to_string());
-    review.last_reviewed = now_iso();
-    review.next_review_due = exemption_expiry.to_string();
-    review.access_details.push(format!(
-        "Exemption justification: {justification}; expires: {exemption_expiry}"
-    ));
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "exempt-review",
-        "review": review
-    }))
-}
-
-pub fn get_summary() -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let reviews = &store.0;
-    let pending = reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Pending)
-        .count();
-    let in_progress = reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::InProgress)
-        .count();
-    let approved = reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Approved)
-        .count();
-    let revoked = reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Revoked)
-        .count();
-    let exempted = reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Exempted)
-        .count();
-
-    Ok(json!({
-        "source": "dry-run",
-        "total": reviews.len(),
-        "pending": pending,
-        "in_progress": in_progress,
-        "approved": approved,
-        "revoked": revoked,
-        "exempted": exempted
-    }))
-}
-
-pub fn create_campaign(
-    name: &str,
-    review_type: &str,
-    reviewer_group: &str,
-    days: i64,
-) -> Result<Value, String> {
-    if name.trim().is_empty() {
-        return Err("name cannot be empty".into());
-    }
-    if reviewer_group.trim().is_empty() {
-        return Err("reviewer_group cannot be empty".into());
-    }
-    if days <= 0 {
-        return Err("days must be greater than zero".into());
-    }
-
-    let review_type = parse_review_type(review_type)?;
-    let mut store = store().lock().unwrap();
-    let reviews_count = store
-        .0
-        .iter()
-        .filter(|review| review.review_type == review_type)
-        .count();
-    let completed_count = completed_reviews_count(&store.0, &review_type);
-    let campaign = RecertificationCampaign {
-        id: format!(
-            "arcamp-{}",
-            Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("unknown")
-        ),
-        name: name.to_string(),
-        start_date: now_iso(),
-        end_date: (Utc::now() + Duration::days(days)).to_rfc3339(),
-        review_type,
-        reviewer_group: reviewer_group.to_string(),
-        reviews_count,
-        completed_count,
-        status: CampaignStatus::Active,
-    };
-
-    store.1.push(campaign.clone());
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "create-campaign",
-        "campaign": campaign
-    }))
-}
-
-pub fn get_campaign(id: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let campaign = store
-        .1
-        .iter()
-        .find(|campaign| campaign.id == id)
-        .ok_or_else(|| format!("Recertification campaign '{id}' not found"))?;
-    let progress_percent = if campaign.reviews_count == 0 {
-        0.0
-    } else {
-        (campaign.completed_count as f64 / campaign.reviews_count as f64) * 100.0
-    };
-
-    Ok(json!({
-        "source": "dry-run",
-        "campaign": campaign,
-        "progress_percent": progress_percent
-    }))
-}
-
-pub fn list_campaigns() -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    Ok(json!({
-        "source": "dry-run",
-        "count": store.1.len(),
-        "campaigns": store.1.clone()
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_list_reviews_returns_seed_entries() {
-        let result = list_reviews("", "").unwrap();
-        assert_eq!(result["source"], "dry-run");
+        let reviews = seed_reviews();
+        let result = list_reviews_pure(&reviews, "", None);
+        assert_eq!(result["source"], "db");
         assert!(result["reviews"].as_array().unwrap().len() >= 9);
 
-        let defra = list_reviews("DEFRA", "").unwrap();
+        let defra = list_reviews_pure(&reviews, "DEFRA", None);
         assert!(defra["reviews"].as_array().unwrap().len() >= 3);
     }
 
     #[test]
     fn test_list_due_reviews_finds_overdue_reviews() {
-        let result = list_due_reviews().unwrap();
-        let reviews = result["reviews"].as_array().unwrap();
-        assert!(
-            reviews
-                .iter()
-                .any(|review| review["id"] == "ar-defra-ad-001")
-        );
+        let reviews = seed_reviews();
+        let result = list_due_reviews_pure(&reviews);
+        let arr = result["reviews"].as_array().unwrap();
+        assert!(arr.iter().any(|r| r["id"] == "ar-defra-ad-001"));
     }
 
     #[test]
-    fn test_start_review_sets_in_progress() {
-        let result = start_review("ar-gblon-sudo-001", "test.reviewer").unwrap();
-        assert_eq!(result["review"]["status"], "InProgress");
-        assert_eq!(result["review"]["reviewer"], "test.reviewer");
+    fn test_start_review_guard_ok_on_pending() {
+        let reviews = seed_reviews();
+        let review = reviews
+            .iter()
+            .find(|r| r.id == "ar-gblon-sudo-001")
+            .unwrap();
+        assert!(start_review_guard(review, "test.reviewer").is_ok());
     }
 
     #[test]
-    fn test_approve_review_sets_approved() {
-        let result =
-            approve_review("ar-defra-svc-001", "test.approver", "Access still required").unwrap();
-        assert_eq!(result["review"]["status"], "Approved");
-        assert_eq!(result["review"]["reviewer"], "test.approver");
+    fn test_approve_review_guard_ok_on_in_progress() {
+        let reviews = seed_reviews();
+        let review = reviews.iter().find(|r| r.id == "ar-defra-svc-001").unwrap();
+        assert!(approve_review_guard(review, "test.approver", "Access still required").is_ok());
     }
 
     #[test]
-    fn test_revoke_review_sets_revoked() {
-        let result = revoke_review(
-            "ar-gblon-admin-001",
-            "test.reviewer",
-            "Access no longer needed",
-        )
-        .unwrap();
-        assert_eq!(result["review"]["status"], "Revoked");
-        assert_eq!(result["review"]["reviewer"], "test.reviewer");
+    fn test_revoke_review_guard_ok_on_in_progress() {
+        let reviews = seed_reviews();
+        let review = reviews
+            .iter()
+            .find(|r| r.id == "ar-gblon-admin-001")
+            .unwrap();
+        assert!(revoke_review_guard(review, "test.reviewer", "Access no longer needed").is_ok());
     }
 
     #[test]
-    fn test_create_campaign_creates_with_correct_counts() {
-        let result = create_campaign(
+    fn test_exempt_review_guard_rejects_terminal_states() {
+        let reviews = seed_reviews();
+        let open = reviews
+            .iter()
+            .find(|r| matches!(r.status, ReviewStatus::Pending | ReviewStatus::InProgress))
+            .expect("a seed review should be Pending/InProgress");
+        let expiry = "2027-01-01T00:00:00Z";
+        // OK while the review is still open.
+        assert!(exempt_review_guard(open, "test.reviewer", "temporary exception", expiry).is_ok());
+        // Rejected once the review is terminal — exempt must not rewrite it.
+        let mut terminal = open.clone();
+        for st in [
+            ReviewStatus::Approved,
+            ReviewStatus::Revoked,
+            ReviewStatus::Exempted,
+        ] {
+            terminal.status = st;
+            assert!(
+                exempt_review_guard(&terminal, "test.reviewer", "temporary exception", expiry)
+                    .is_err(),
+                "exempt must reject a terminal-status review"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_campaign_creates_with_correct_counts() {
+        let reviews = seed_reviews();
+        let rt = ReviewType::ServiceAccount;
+        let reviews_count = reviews.iter().filter(|r| r.review_type == rt).count();
+        let completed_count = completed_reviews_count(&reviews, &rt);
+        let campaign = build_campaign(
             "Service account recertification",
-            "ServiceAccount",
+            rt,
             "iam-reviewers",
             14,
-        )
-        .unwrap();
-        assert_eq!(
-            result["campaign"]["name"],
-            "Service account recertification"
+            reviews_count,
+            completed_count,
         );
-        assert_eq!(result["campaign"]["review_type"], "ServiceAccount");
-        assert_eq!(result["campaign"]["reviews_count"], 2);
+        assert_eq!(campaign.name, "Service account recertification");
+        assert_eq!(campaign.reviews_count, 2);
     }
 
     #[test]
     fn test_get_summary_returns_correct_aggregate_counts() {
-        let result = get_summary().unwrap();
+        let reviews = seed_reviews();
+        let result = get_summary_pure(&reviews);
         let total = result["total"].as_u64().unwrap();
         let counted = result["pending"].as_u64().unwrap()
             + result["in_progress"].as_u64().unwrap()
             + result["approved"].as_u64().unwrap()
             + result["revoked"].as_u64().unwrap()
             + result["exempted"].as_u64().unwrap();
-
         assert_eq!(total, counted);
         assert!(total >= 9);
     }

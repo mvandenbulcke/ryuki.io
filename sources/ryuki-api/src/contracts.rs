@@ -17267,115 +17267,264 @@ struct AccessCampaignCreateRequest {
     days: i64,
 }
 
-async fn access_reviews_list(
-    Query(params): Query<AccessReviewQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::list_reviews(
-        params.site.as_deref().unwrap_or(""),
-        params.review_type.as_deref().unwrap_or(""),
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn access_reviews_list(Query(params): Query<AccessReviewQuery>) -> ApiResult {
+    let site = params.site.as_deref().unwrap_or("");
+    let review_type_str = params.review_type.as_deref().unwrap_or("");
+    let reviews = match get_db() {
+        Some(pool) => crate::repos::access_recertification::list(pool, site, review_type_str)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    let parsed_type = if review_type_str.is_empty() {
+        None
+    } else {
+        Some(
+            access_recertification::parse_review_type(review_type_str)
+                .map_err(|e| status_400(&e))?,
+        )
+    };
+    Ok(Json(access_recertification::list_reviews_pure(
+        &reviews,
+        site,
+        parsed_type.as_ref(),
+    )))
 }
 
-async fn access_review_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::get_review(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn access_review_get(Path(id): Path<String>) -> ApiResult {
+    // Read surface: with no DB there is no data, so degrade to 404-as-absent
+    // (not 503 — only governed mutations require a DB).
+    let Some(pool) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let (review, _) = crate::repos::access_recertification::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(access_recertification::get_review_response(&review)))
 }
 
-async fn access_reviews_due() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::list_due_reviews()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn access_reviews_due() -> ApiResult {
+    let reviews = match get_db() {
+        Some(pool) => crate::repos::access_recertification::list_due(pool)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(access_recertification::list_due_reviews_pure(
+        &reviews,
+    )))
 }
 
-async fn access_reviews_expiring(
-    Query(params): Query<AccessReviewExpiringQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::list_expiring(params.days.unwrap_or(30))
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn access_reviews_expiring(Query(params): Query<AccessReviewExpiringQuery>) -> ApiResult {
+    let days = params.days.unwrap_or(30);
+    if days < 0 {
+        return Err(status_400("days must be zero or greater"));
+    }
+    let reviews = match get_db() {
+        Some(pool) => crate::repos::access_recertification::list_expiring(pool, days)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(access_recertification::list_expiring_pure(
+        &reviews, days,
+    )))
 }
 
 async fn access_review_start(
     Path(id): Path<String>,
     Json(body): Json<AccessReviewActionRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::start_review(&id, &body.reviewer)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    access_recertification::start_review_guard(&review, &body.reviewer)
+        .map_err(|e| status_400(&e))?;
+    let (updated, _) =
+        crate::repos::access_recertification::start(pool, &id, &body.reviewer, updated_at)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| {
+                status_409("access review was modified concurrently; reload and retry")
+            })?;
+    Ok(Json(access_recertification::get_review_response(&updated)))
 }
 
 async fn access_review_approve(
     Path(id): Path<String>,
     Json(body): Json<AccessReviewActionRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::approve_review(
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let justification = body.justification.as_deref().unwrap_or("");
+    let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    access_recertification::approve_review_guard(&review, &body.reviewer, justification)
+        .map_err(|e| status_400(&e))?;
+    let expected_nrd: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339(&review.next_review_due)
+            .map_err(|e| {
+                db_error(sqlx::Error::Decode(
+                    format!("next_review_due not RFC-3339: {e}").into(),
+                ))
+            })?
+            .with_timezone(&chrono::Utc);
+    let expected_status = review.status.to_string();
+    let (updated, _) = crate::repos::access_recertification::approve(
+        pool,
         &id,
         &body.reviewer,
-        &body.justification.unwrap_or_default(),
+        justification,
+        &expected_status,
+        updated_at,
+        expected_nrd,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("access review was modified concurrently; reload and retry"))?;
+    Ok(Json(access_recertification::get_review_response(&updated)))
 }
 
 async fn access_review_revoke(
     Path(id): Path<String>,
     Json(body): Json<AccessReviewActionRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::revoke_review(&id, &body.reviewer, &body.reason.unwrap_or_default())
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let reason = body.reason.as_deref().unwrap_or("");
+    let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    access_recertification::revoke_review_guard(&review, &body.reviewer, reason)
+        .map_err(|e| status_400(&e))?;
+    let expected_status = review.status.to_string();
+    let (updated, _) = crate::repos::access_recertification::revoke(
+        pool,
+        &id,
+        &body.reviewer,
+        reason,
+        &expected_status,
+        updated_at,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("access review was modified concurrently; reload and retry"))?;
+    Ok(Json(access_recertification::get_review_response(&updated)))
 }
 
 async fn access_review_exempt(
     Path(id): Path<String>,
     Json(body): Json<AccessReviewExemptRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::exempt_review(
-        &id,
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    access_recertification::exempt_review_guard(
+        &review,
         &body.reviewer,
         &body.justification,
         &body.exemption_expiry,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    .map_err(|e| status_400(&e))?;
+    let expiry: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339(&body.exemption_expiry)
+            .map_err(|e| status_400(&format!("Invalid exemption_expiry: {e}")))?
+            .with_timezone(&chrono::Utc);
+    let expected_nrd: chrono::DateTime<chrono::Utc> =
+        chrono::DateTime::parse_from_rfc3339(&review.next_review_due)
+            .map_err(|e| {
+                db_error(sqlx::Error::Decode(
+                    format!("next_review_due not RFC-3339: {e}").into(),
+                ))
+            })?
+            .with_timezone(&chrono::Utc);
+    let expected_status = review.status.to_string();
+    let (updated, _) = crate::repos::access_recertification::exempt(
+        pool,
+        &id,
+        &body.reviewer,
+        &body.justification,
+        expiry,
+        &expected_status,
+        updated_at,
+        expected_nrd,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("access review was modified concurrently; reload and retry"))?;
+    Ok(Json(access_recertification::get_review_response(&updated)))
 }
 
-async fn access_review_summary() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::get_summary()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn access_review_summary() -> ApiResult {
+    match get_db() {
+        Some(pool) => {
+            let val = crate::repos::access_recertification::summary(pool)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(val))
+        }
+        None => Ok(Json(serde_json::json!({
+            "source": "empty",
+            "total": 0,
+            "pending": 0,
+            "in_progress": 0,
+            "approved": 0,
+            "revoked": 0,
+            "exempted": 0
+        }))),
+    }
 }
 
-async fn access_campaign_create(
-    Json(body): Json<AccessCampaignCreateRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::create_campaign(
+async fn access_campaign_create(Json(body): Json<AccessCampaignCreateRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let review_type =
+        access_recertification::parse_review_type(&body.review_type).map_err(|e| status_400(&e))?;
+    access_recertification::create_campaign_guard(&body.name, &body.reviewer_group, body.days)
+        .map_err(|e| status_400(&e))?;
+    let campaign = access_recertification::build_campaign(
         &body.name,
-        &body.review_type,
+        review_type,
         &body.reviewer_group,
         body.days,
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+        0, // overwritten by insert_campaign DB count
+        0,
+    );
+    let inserted = crate::repos::access_recertification::insert_campaign(pool, &campaign)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(access_recertification::campaign_response(&inserted)))
 }
 
-async fn access_campaign_get(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::get_campaign(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn access_campaign_get(Path(id): Path<String>) -> ApiResult {
+    // Read surface: degrade to 404-as-absent when no DB (only mutations 503).
+    let Some(pool) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let campaign = crate::repos::access_recertification::get_campaign(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(access_recertification::campaign_response(&campaign)))
 }
 
-async fn access_campaigns_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    access_recertification::list_campaigns()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn access_campaigns_list() -> ApiResult {
+    let campaigns = match get_db() {
+        Some(pool) => crate::repos::access_recertification::list_campaigns(pool)
+            .await
+            .map_err(db_error)?,
+        None => Vec::new(),
+    };
+    Ok(Json(serde_json::json!({
+        "source": "db",
+        "count": campaigns.len(),
+        "campaigns": campaigns
+    })))
 }
 
 async fn access_review_contract() -> Json<Value> {
