@@ -19885,6 +19885,7 @@ struct SqlDeployInventoryQuery {
 async fn sql_deploy_plan(
     Json(body): Json<SqlDeployPlanRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let req = json!({
         "instance_name": body.instance_name,
         "sql_version": body.sql_version,
@@ -19899,9 +19900,29 @@ async fn sql_deploy_plan(
         "site": body.site,
         "cluster_mode": body.cluster_mode
     });
-    sql_deployment::plan_deployment(req)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let (deployment, plan_json) =
+        sql_deployment::plan_deployment(req).map_err(|e| status_400(&e))?;
+    let inserted = crate::repos::sql_deployment::insert(pool, &deployment, plan_json.clone())
+        .await
+        .map_err(|e| {
+            // A duplicate (site, instance_name) is a client conflict, not a server
+            // error: return 409, not the blanket 500 from db_error.
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation() {
+                    return status_409(
+                        "a SQL deployment with that instance name already exists at this site",
+                    );
+                }
+            }
+            db_error(e)
+        })?;
+    Ok(Json(json!({
+        "deployment_id": inserted.id,
+        "instance_name": inserted.instance_name,
+        "site": inserted.site,
+        "status": inserted.status,
+        "plan": plan_json
+    })))
 }
 
 async fn sql_deploy_validate(
@@ -19925,50 +19946,136 @@ async fn sql_deploy_validate(
 async fn sql_deploy_install(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    sql_deployment::install_sql(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deployment = crate::repos::sql_deployment::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    sql_deployment::guard_install(&deployment).map_err(|e| status_409(&e))?;
+    let _ = crate::repos::sql_deployment::transition(
+        pool,
+        &id,
+        "install",
+        "planned",
+        "installing",
+        None,
+        None,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    Ok(Json(sql_deployment::install_response(&deployment)))
 }
 
 async fn sql_deploy_configure(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    sql_deployment::configure_sql(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deployment = crate::repos::sql_deployment::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    sql_deployment::guard_configure(&deployment).map_err(|e| status_409(&e))?;
+    let _ = crate::repos::sql_deployment::transition(
+        pool,
+        &id,
+        "configure",
+        "installing",
+        "configuring",
+        None,
+        None,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    Ok(Json(sql_deployment::configure_response(&deployment)))
 }
 
 async fn sql_deploy_verify(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    sql_deployment::verify_sql(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deployment = crate::repos::sql_deployment::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    sql_deployment::guard_verify(&deployment).map_err(|e| status_409(&e))?;
+    let _ = crate::repos::sql_deployment::transition(
+        pool,
+        &id,
+        "verify",
+        "configuring",
+        "verified",
+        None,
+        None,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    Ok(Json(sql_deployment::verify_response(&deployment)))
 }
 
 async fn sql_deploy_backup(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    sql_deployment::add_to_backup(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deployment = crate::repos::sql_deployment::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    sql_deployment::guard_backup(&deployment).map_err(|e| status_409(&e))?;
+    let _ = crate::repos::sql_deployment::transition(
+        pool,
+        &id,
+        "backup",
+        "verified",
+        "backed-up",
+        None,
+        None,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    Ok(Json(sql_deployment::backup_response(&deployment)))
 }
 
 async fn sql_deploy_monitoring(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    sql_deployment::add_to_monitoring(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deployment = crate::repos::sql_deployment::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    sql_deployment::guard_monitoring(&deployment).map_err(|e| status_409(&e))?;
+    let _ = crate::repos::sql_deployment::transition(
+        pool,
+        &id,
+        "monitoring",
+        "backed-up",
+        "monitored",
+        None,
+        None,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    Ok(Json(sql_deployment::monitoring_response(&deployment)))
 }
 
 async fn sql_deploy_inventory(
     Query(params): Query<SqlDeployInventoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let site = params.site.as_deref().unwrap_or("");
-    sql_deployment::get_inventory(site)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+    match get_db() {
+        Some(pool) => {
+            let deployments = crate::repos::sql_deployment::list_by_site(pool, site)
+                .await
+                .map_err(db_error)?;
+            Ok(Json(sql_deployment::inventory_response(site, &deployments)))
+        }
+        None => Ok(Json(sql_deployment::inventory_response(site, &[]))),
+    }
 }
 
 async fn sql_deployment_contract() -> Json<Value> {

@@ -1,28 +1,36 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SQLDeployment {
-    id: String,
-    instance_name: String,
-    sql_version: SQLVersion,
-    edition: SQLEdition,
-    cpu: u32,
-    memory_gb: u32,
-    data_disk_gb: u32,
-    log_disk_gb: u32,
-    tempdb_disk_gb: u32,
-    collation: String,
-    service_account: String,
-    site: String,
-    cluster_mode: ClusterMode,
-    status: DeploymentStatus,
-}
+// ─── Domain types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SQLDeployment {
+    pub id: String,
+    pub instance_name: String,
+    pub sql_version: SQLVersion,
+    pub edition: SQLEdition,
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub data_disk_gb: u32,
+    pub log_disk_gb: u32,
+    pub tempdb_disk_gb: u32,
+    pub collation_name: String,
+    pub service_account: String,
+    pub site: String,
+    pub cluster_mode: ClusterMode,
+    pub status: DeploymentStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// SQL Server version.
+///
+/// Serde uses `rename_all = "kebab-case"` ("sql-2019" / "sql-2022").
+/// The DB CHECK stores '2019' / '2022'.
+/// Use `Display` when writing to the DB; use `sql_version_from_db` when reading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum SQLVersion {
+pub enum SQLVersion {
     Sql2019,
     Sql2022,
 }
@@ -36,9 +44,13 @@ impl std::fmt::Display for SQLVersion {
     }
 }
 
+/// SQL Server edition.
+///
+/// Serde uses `rename_all = "PascalCase"` ("Standard" / "Enterprise" / "Developer").
+/// The DB CHECK stores the same PascalCase values — serde decode works directly.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
-enum SQLEdition {
+pub enum SQLEdition {
     Standard,
     Enterprise,
     Developer,
@@ -54,10 +66,15 @@ impl std::fmt::Display for SQLEdition {
     }
 }
 
+/// Cluster topology.
+///
+/// Serde uses `rename_all = "UPPERCASE"` → "STANDALONE" / "FCI" / "AG".
+/// The DB CHECK stores 'Standalone' / 'FCI' / 'AG' (PascalCase for Standalone).
+/// `Display` produces the DB form. Use `cluster_mode_from_db` when reading.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 #[allow(clippy::upper_case_acronyms)]
-enum ClusterMode {
+pub enum ClusterMode {
     Standalone,
     FCI,
     AG,
@@ -73,9 +90,13 @@ impl std::fmt::Display for ClusterMode {
     }
 }
 
+/// Deployment lifecycle status.
+///
+/// Serde uses `rename_all = "kebab-case"` → "draft", "backed-up", etc.
+/// The DB CHECK stores the identical kebab-case values, so serde decode works.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum DeploymentStatus {
+pub enum DeploymentStatus {
     Draft,
     Validated,
     Planned,
@@ -88,104 +109,58 @@ enum DeploymentStatus {
     Failed,
 }
 
-type DeploymentStore = Vec<SQLDeployment>;
-
-static DEPLOYMENT_STORE: OnceLock<Mutex<DeploymentStore>> = OnceLock::new();
-
-fn deployment_store() -> &'static Mutex<DeploymentStore> {
-    DEPLOYMENT_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
-
-fn seed_data() -> DeploymentStore {
-    let sites = crate::site_registry::get_active_site_codes()
-        .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()]);
-    let s0 = sites.first().map(|s| s.as_str()).unwrap_or("DEFRA");
-    let s1 = sites.get(1).map(|s| s.as_str()).unwrap_or("GBLON");
-
-    vec![
-        SQLDeployment {
-            id: "sql-001".into(),
-            instance_name: format!("{}-SQL-PROD-01", s0),
-            sql_version: SQLVersion::Sql2022,
-            edition: SQLEdition::Enterprise,
-            cpu: 8,
-            memory_gb: 64,
-            data_disk_gb: 500,
-            log_disk_gb: 200,
-            tempdb_disk_gb: 100,
-            collation: "Latin1_General_CI_AS".into(),
-            service_account: format!("svc-sql-{}-prod@ryuki.local", s0.to_lowercase()),
-            site: s0.into(),
-            cluster_mode: ClusterMode::AG,
-            status: DeploymentStatus::Draft,
-        },
-        SQLDeployment {
-            id: "sql-002".into(),
-            instance_name: format!("{}-SQL-PROD-01", s1),
-            sql_version: SQLVersion::Sql2019,
-            edition: SQLEdition::Standard,
-            cpu: 4,
-            memory_gb: 32,
-            data_disk_gb: 250,
-            log_disk_gb: 100,
-            tempdb_disk_gb: 50,
-            collation: "SQL_Latin1_General_CP1_CI_AS".into(),
-            service_account: format!("svc-sql-{}-prod@ryuki.local", s1.to_lowercase()),
-            site: s1.into(),
-            cluster_mode: ClusterMode::Standalone,
-            status: DeploymentStatus::Draft,
-        },
-    ]
-}
-
-fn deployment_to_json(d: &SQLDeployment) -> Value {
-    json!({
-        "id": d.id,
-        "instance_name": d.instance_name,
-        "sql_version": d.sql_version.to_string(),
-        "edition": d.edition.to_string(),
-        "cpu": d.cpu,
-        "memory_gb": d.memory_gb,
-        "data_disk_gb": d.data_disk_gb,
-        "log_disk_gb": d.log_disk_gb,
-        "tempdb_disk_gb": d.tempdb_disk_gb,
-        "collation": d.collation,
-        "service_account": d.service_account,
-        "site": d.site,
-        "cluster_mode": d.cluster_mode.to_string(),
-        "status": d.status
-    })
-}
-
-fn make_id(store: &DeploymentStore) -> String {
-    format!("sql-{:03}", store.len() + 1)
-}
-
-fn require_status(
-    deployment: &SQLDeployment,
-    expected: DeploymentStatus,
-    action: &str,
-) -> Result<(), String> {
-    if deployment.status != expected {
-        return Err(format!(
-            "Cannot {} SQL deployment in status {:?}. Must be {:?} first.",
-            action, deployment.status, expected
-        ));
+impl std::fmt::Display for DeploymentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Produces the kebab-case form that matches the DB CHECK values.
+        let s = serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{self:?}").to_lowercase());
+        write!(f, "{s}")
     }
-    Ok(())
 }
 
-pub fn plan_deployment(req: Value) -> Result<Value, String> {
+// ─── Pure plan helpers ────────────────────────────────────────────────────────
+
+/// Parse and validate the plan request body, returning a built `SQLDeployment`
+/// (with an empty id — the repo assigns a real UUID) and a plan summary `Value`.
+/// Returns `Err` on invalid inputs (bad version / edition / cluster / missing fields).
+/// Parse a JSON integer "dimension" (cpu / memory / disk size) as u32, rejecting
+/// values that would not fit the DB INTEGER column (0..=i32::MAX) or fall below
+/// `min`. This keeps an out-of-range request a 400 at the engine boundary rather
+/// than letting a bare `as` cast wrap, a `total_disk` sum overflow/panic, or a
+/// repo i32 Decode surface as a 500.
+fn parse_dimension(req: &Value, key: &str, default: u64, min: u32) -> Result<u32, String> {
+    // Default ONLY when the field is absent/null. A present-but-wrong-type value
+    // ("8", -1, 3.5, {}) must fail loudly rather than silently fall back to the
+    // default and hide a malformed request from a direct engine caller.
+    let raw = match &req[key] {
+        Value::Null => default,
+        v => v
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be a non-negative integer"))?,
+    };
+    if raw > i32::MAX as u64 {
+        return Err(format!("{key} must be at most {}", i32::MAX));
+    }
+    let value = raw as u32; // safe: raw <= i32::MAX
+    if value < min {
+        return Err(format!("{key} must be at least {min}"));
+    }
+    Ok(value)
+}
+
+pub fn plan_deployment(req: Value) -> Result<(SQLDeployment, Value), String> {
     let instance_name = req["instance_name"]
         .as_str()
         .ok_or("instance_name is required")?;
     let version_str = req["sql_version"].as_str().unwrap_or("2022");
     let edition_str = req["edition"].as_str().unwrap_or("Standard");
-    let cpu = req["cpu"].as_u64().unwrap_or(4) as u32;
-    let memory_gb = req["memory_gb"].as_u64().unwrap_or(16) as u32;
-    let data_disk_gb = req["data_disk_gb"].as_u64().unwrap_or(100) as u32;
-    let log_disk_gb = req["log_disk_gb"].as_u64().unwrap_or(50) as u32;
-    let tempdb_disk_gb = req["tempdb_disk_gb"].as_u64().unwrap_or(30) as u32;
+    let cpu = parse_dimension(&req, "cpu", 4, 1)?;
+    let memory_gb = parse_dimension(&req, "memory_gb", 16, 2)?;
+    let data_disk_gb = parse_dimension(&req, "data_disk_gb", 100, 10)?;
+    let log_disk_gb = parse_dimension(&req, "log_disk_gb", 50, 10)?;
+    let tempdb_disk_gb = parse_dimension(&req, "tempdb_disk_gb", 30, 10)?;
     let collation = req["collation"]
         .as_str()
         .unwrap_or("SQL_Latin1_General_CP1_CI_AS");
@@ -230,7 +205,10 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         }
     };
 
-    let total_disk = data_disk_gb + log_disk_gb + tempdb_disk_gb;
+    // Bounds are enforced by parse_dimension above (each value is in 10..=i32::MAX
+    // for disks), so sum in u64 to avoid a u32 overflow when three near-i32::MAX
+    // disk sizes are added.
+    let total_disk = data_disk_gb as u64 + log_disk_gb as u64 + tempdb_disk_gb as u64;
     let recommended_memory = if memory_gb < 4 {
         "Warning: minimum 4 GB recommended for SQL Server".to_string()
     } else {
@@ -258,10 +236,8 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         json!({ "file_count": cpu, "initial_size_mb": 512, "autogrowth_mb": 256 })
     };
 
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let id = make_id(&store);
-    store.push(SQLDeployment {
-        id: id.clone(),
+    let deployment = SQLDeployment {
+        id: String::new(), // assigned by repo
         instance_name: instance_name.to_string(),
         sql_version,
         edition,
@@ -270,16 +246,17 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         data_disk_gb,
         log_disk_gb,
         tempdb_disk_gb,
-        collation: collation.to_string(),
+        collation_name: collation.to_string(),
         service_account: service_account.to_string(),
         site: site.to_string(),
         cluster_mode,
         status: DeploymentStatus::Planned,
-    });
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
 
-    Ok(json!({
+    let plan = json!({
         "source": "dry-run",
-        "deployment_id": id,
         "instance_name": instance_name,
         "sql_version": version_str,
         "edition": edition_str,
@@ -294,14 +271,21 @@ pub fn plan_deployment(req: Value) -> Result<Value, String> {
         "service_account": service_account,
         "site": site,
         "status": "planned"
-    }))
+    });
+
+    Ok((deployment, plan))
 }
 
+/// Pure validation of a deployment request body — no side effects.
+/// Returns a validation report (never Err; the report carries passed/errors).
 pub fn validate_deployment(req: Value) -> Result<Value, String> {
     let instance_name = req["instance_name"].as_str().unwrap_or("");
     let version_str = req["sql_version"].as_str().unwrap_or("");
-    let cpu = req["cpu"].as_u64().unwrap_or(0) as u32;
-    let memory_gb = req["memory_gb"].as_u64().unwrap_or(0) as u32;
+    // Keep these as u64 (no `as u32` wrap): the checks below are pure comparisons
+    // and the upper-bound checks (cpu > 256, memory_gb > 24576) flag oversized
+    // values accurately instead of letting them wrap to a small in-range number.
+    let cpu = req["cpu"].as_u64().unwrap_or(0);
+    let memory_gb = req["memory_gb"].as_u64().unwrap_or(0);
     let site = req["site"].as_str().unwrap_or("");
     let edition_str = req["edition"].as_str().unwrap_or("");
     let cluster_str = req["cluster_mode"].as_str().unwrap_or("Standalone");
@@ -373,7 +357,7 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
         if cpu < 4 {
             warnings.push("FCI deployments benefit from at least 4 CPU cores".into());
         }
-        warnings.push("FCI requires shared storage (SAN/FC) and Windows Server Faidefrar Clustering pre-configured".into());
+        warnings.push("FCI requires shared storage (SAN/FC) and Windows Server Failover Clustering pre-configured".into());
         remediation.push(
             "Verify WSFC cluster exists and shared storage is available before deployment".into(),
         );
@@ -387,7 +371,7 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
             warnings.push("AG deployments benefit from at least 4 CPU cores per node".into());
         }
         warnings
-            .push("AG requires Windows Server Faidefrar Clustering and at least 2 nodes".into());
+            .push("AG requires Windows Server Failover Clustering and at least 2 nodes".into());
         remediation
             .push("Ensure 2+ nodes, WSFC, and AG listener DNS record are pre-provisioned".into());
     }
@@ -431,17 +415,62 @@ pub fn validate_deployment(req: Value) -> Result<Value, String> {
     }))
 }
 
-pub fn install_sql(deployment_id: &str) -> Result<Value, String> {
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let deployment = store
-        .iter_mut()
-        .find(|d| d.id == deployment_id)
-        .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
+// ─── Pure lifecycle guards ────────────────────────────────────────────────────
+//
+// Each guard validates that the loaded deployment is in the expected status.
+// Returns Ok(()) on success; Err(msg) on illegal transition.
+// The repo performs the actual DB mutation; the handler owns the orchestration.
 
-    require_status(deployment, DeploymentStatus::Planned, "install")?;
-    deployment.status = DeploymentStatus::Installing;
+/// Guard: deployment must be in `Planned` status before installation.
+pub fn guard_install(deployment: &SQLDeployment) -> Result<(), String> {
+    require_status(deployment, &DeploymentStatus::Planned, "install")
+}
 
-    Ok(json!({
+/// Guard: deployment must be in `Installing` status before configuration.
+pub fn guard_configure(deployment: &SQLDeployment) -> Result<(), String> {
+    require_status(deployment, &DeploymentStatus::Installing, "configure")
+}
+
+/// Guard: deployment must be in `Configuring` status before verification.
+pub fn guard_verify(deployment: &SQLDeployment) -> Result<(), String> {
+    require_status(deployment, &DeploymentStatus::Configuring, "verify")
+}
+
+/// Guard: deployment must be in `Verified` status before backup registration.
+pub fn guard_backup(deployment: &SQLDeployment) -> Result<(), String> {
+    require_status(deployment, &DeploymentStatus::Verified, "register backup for")
+}
+
+/// Guard: deployment must be in `BackedUp` status before monitoring onboarding.
+pub fn guard_monitoring(deployment: &SQLDeployment) -> Result<(), String> {
+    require_status(
+        deployment,
+        &DeploymentStatus::BackedUp,
+        "register monitoring for",
+    )
+}
+
+fn require_status(
+    deployment: &SQLDeployment,
+    expected: &DeploymentStatus,
+    action: &str,
+) -> Result<(), String> {
+    if &deployment.status != expected {
+        return Err(format!(
+            "Cannot {} SQL deployment in status {:?}. Must be {:?} first.",
+            action, deployment.status, expected
+        ));
+    }
+    Ok(())
+}
+
+// ─── Pure response builders ───────────────────────────────────────────────────
+//
+// These produce the JSON body that handlers return after the repo writes succeed.
+// They read from the deployment so they reflect persisted state.
+
+pub fn install_response(deployment: &SQLDeployment) -> Value {
+    json!({
         "source": "dry-run",
         "deployment_id": deployment.id,
         "instance_name": deployment.instance_name,
@@ -459,18 +488,10 @@ pub fn install_sql(deployment_id: &str) -> Result<Value, String> {
             "Mock installation of SQL Server {} {} on {} started (dry-run)",
             deployment.sql_version, deployment.edition, deployment.instance_name
         )
-    }))
+    })
 }
 
-pub fn configure_sql(deployment_id: &str) -> Result<Value, String> {
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let deployment = store
-        .iter_mut()
-        .find(|d| d.id == deployment_id)
-        .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
-
-    require_status(deployment, DeploymentStatus::Installing, "configure")?;
-
+pub fn configure_response(deployment: &SQLDeployment) -> Value {
     let maxdop = if deployment.cpu >= 8 {
         8
     } else {
@@ -481,16 +502,13 @@ pub fn configure_sql(deployment_id: &str) -> Result<Value, String> {
     } else {
         deployment.memory_gb * 512
     };
-
     let tempdb_files = if deployment.cpu >= 8 {
         (deployment.cpu / 2).min(8)
     } else {
         deployment.cpu
     };
 
-    deployment.status = DeploymentStatus::Configuring;
-
-    Ok(json!({
+    json!({
         "source": "dry-run",
         "deployment_id": deployment.id,
         "instance_name": deployment.instance_name,
@@ -508,27 +526,18 @@ pub fn configure_sql(deployment_id: &str) -> Result<Value, String> {
             "optimize_for_ad_hoc_workloads": 1,
             "cost_threshold_for_parallelism": 50,
             "instant_file_initialization_enabled": true,
-            "collation": deployment.collation,
+            "collation": deployment.collation_name,
             "service_account": deployment.service_account
         },
         "message": format!(
             "Mock post-install configuration applied to {} (dry-run)",
             deployment.instance_name
         )
-    }))
+    })
 }
 
-pub fn verify_sql(deployment_id: &str) -> Result<Value, String> {
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let deployment = store
-        .iter_mut()
-        .find(|d| d.id == deployment_id)
-        .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
-
-    require_status(deployment, DeploymentStatus::Configuring, "verify")?;
-    deployment.status = DeploymentStatus::Verified;
-
-    Ok(json!({
+pub fn verify_response(deployment: &SQLDeployment) -> Value {
+    json!({
         "source": "dry-run",
         "deployment_id": deployment.id,
         "instance_name": deployment.instance_name,
@@ -565,24 +574,11 @@ pub fn verify_sql(deployment_id: &str) -> Result<Value, String> {
             "Mock verification of {} completed successfully (dry-run)",
             deployment.instance_name
         )
-    }))
+    })
 }
 
-pub fn add_to_backup(deployment_id: &str) -> Result<Value, String> {
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let deployment = store
-        .iter_mut()
-        .find(|d| d.id == deployment_id)
-        .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
-
-    require_status(
-        deployment,
-        DeploymentStatus::Verified,
-        "register backup for",
-    )?;
-    deployment.status = DeploymentStatus::BackedUp;
-
-    Ok(json!({
+pub fn backup_response(deployment: &SQLDeployment) -> Value {
+    json!({
         "source": "dry-run",
         "deployment_id": deployment.id,
         "instance_name": deployment.instance_name,
@@ -607,24 +603,11 @@ pub fn add_to_backup(deployment_id: &str) -> Result<Value, String> {
             "Mock Veeam application-aware backup registered for {} (dry-run)",
             deployment.instance_name
         )
-    }))
+    })
 }
 
-pub fn add_to_monitoring(deployment_id: &str) -> Result<Value, String> {
-    let mut store = deployment_store().lock().map_err(|e| e.to_string())?;
-    let deployment = store
-        .iter_mut()
-        .find(|d| d.id == deployment_id)
-        .ok_or_else(|| format!("Deployment '{}' not found", deployment_id))?;
-
-    require_status(
-        deployment,
-        DeploymentStatus::BackedUp,
-        "register monitoring for",
-    )?;
-    deployment.status = DeploymentStatus::Monitored;
-
-    Ok(json!({
+pub fn monitoring_response(deployment: &SQLDeployment) -> Value {
+    json!({
         "source": "dry-run",
         "deployment_id": deployment.id,
         "instance_name": deployment.instance_name,
@@ -662,35 +645,72 @@ pub fn add_to_monitoring(deployment_id: &str) -> Result<Value, String> {
             "Mock Zabbix SQL monitoring template onboarded for {} (dry-run)",
             deployment.instance_name
         )
-    }))
+    })
 }
 
-pub fn get_inventory(site: &str) -> Result<Value, String> {
-    let store = deployment_store().lock().map_err(|e| e.to_string())?;
-
-    let deployments: Vec<&SQLDeployment> = if site.is_empty() {
-        store.iter().collect()
-    } else {
-        store.iter().filter(|d| d.site == site).collect()
-    };
-
-    let deployment_list: Vec<Value> = deployments.iter().map(|d| deployment_to_json(d)).collect();
-
-    Ok(json!({
-        "source": "dry-run",
+/// Returns a JSON inventory list from a slice of deployments (pure, no I/O).
+/// Empty slice → empty result (no Err).
+pub fn inventory_response(site: &str, deployments: &[SQLDeployment]) -> Value {
+    let list: Vec<Value> = deployments.iter().map(deployment_to_json).collect();
+    json!({
+        "source": "live",
         "site": if site.is_empty() { "all" } else { site },
-        "deployment_count": deployment_list.len(),
-        "deployments": deployment_list
-    }))
+        "deployment_count": list.len(),
+        "deployments": list
+    })
 }
+
+fn deployment_to_json(d: &SQLDeployment) -> Value {
+    json!({
+        "id": d.id,
+        "instance_name": d.instance_name,
+        "sql_version": d.sql_version.to_string(),
+        "edition": d.edition.to_string(),
+        "cpu": d.cpu,
+        "memory_gb": d.memory_gb,
+        "data_disk_gb": d.data_disk_gb,
+        "log_disk_gb": d.log_disk_gb,
+        "tempdb_disk_gb": d.tempdb_disk_gb,
+        "collation_name": d.collation_name,
+        "service_account": d.service_account,
+        "site": d.site,
+        "cluster_mode": d.cluster_mode.to_string(),
+        "status": d.status
+    })
+}
+
+// ─── Unit tests (pure surface only — no store, no I/O) ───────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn make_deployment(status: DeploymentStatus) -> SQLDeployment {
+        SQLDeployment {
+            id: "test-id".into(),
+            instance_name: "DEFRA-SQL-TEST-01".into(),
+            sql_version: SQLVersion::Sql2022,
+            edition: SQLEdition::Enterprise,
+            cpu: 8,
+            memory_gb: 64,
+            data_disk_gb: 500,
+            log_disk_gb: 200,
+            tempdb_disk_gb: 100,
+            collation_name: "Latin1_General_CI_AS".into(),
+            service_account: "svc-sql-test@ryuki.local".into(),
+            site: "DEFRA".into(),
+            cluster_mode: ClusterMode::AG,
+            status,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    // ── plan_deployment ──
+
     #[test]
     fn test_plan_deployment_basic() {
-        let result = plan_deployment(json!({
+        let (deployment, plan) = plan_deployment(json!({
             "instance_name": "DEFRA-SQL-TEST-01",
             "sql_version": "2022",
             "edition": "Standard",
@@ -706,27 +726,173 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(result["instance_name"], "DEFRA-SQL-TEST-01");
-        assert_eq!(result["site"], "DEFRA");
-        assert_eq!(result["status"], "planned");
-        assert!(
-            result["deployment_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("sql-")
-        );
-        assert!(result["disk_layout"]["data"]["size_gb"].as_u64().unwrap() == 200);
-        assert!(result["total_disk_gb"].as_u64().unwrap() == 350);
+        assert_eq!(deployment.instance_name, "DEFRA-SQL-TEST-01");
+        assert_eq!(deployment.site, "DEFRA");
+        assert_eq!(deployment.status, DeploymentStatus::Planned);
+        assert_eq!(deployment.sql_version, SQLVersion::Sql2022);
+        assert_eq!(deployment.cluster_mode, ClusterMode::Standalone);
+        assert!(deployment.id.is_empty(), "id assigned by repo, not engine");
+
+        assert_eq!(plan["instance_name"], "DEFRA-SQL-TEST-01");
+        assert_eq!(plan["status"], "planned");
+        assert_eq!(plan["total_disk_gb"], 350_u64);
+        assert_eq!(plan["disk_layout"]["data"]["size_gb"], 200_u64);
     }
 
     #[test]
-    fn test_plan_deployment_missing_required_fields() {
-        let result = plan_deployment(json!({
-            "sql_version": "2022"
-        }));
+    fn test_plan_deployment_missing_instance_name() {
+        let result = plan_deployment(json!({ "sql_version": "2022" }));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("instance_name"));
     }
+
+    fn dim_req(field: &str, value: serde_json::Value) -> Value {
+        let mut req = json!({
+            "instance_name": "DEFRA-SQL-DIM",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "service_account": "svc@ryuki.local",
+            "site": "DEFRA",
+            "cluster_mode": "Standalone"
+        });
+        req[field] = value;
+        req
+    }
+
+    #[test]
+    fn test_plan_deployment_rejects_dimension_above_i32_max() {
+        // > i32::MAX would wrap on a bare `as i32` repo bind and surface as a 500.
+        let result = plan_deployment(dim_req("cpu", json!(3_000_000_000u64)));
+        assert!(result.is_err(), "cpu above i32::MAX must be rejected");
+        assert!(result.unwrap_err().contains("cpu"));
+    }
+
+    #[test]
+    fn test_plan_deployment_rejects_below_minimum() {
+        assert!(plan_deployment(dim_req("cpu", json!(0))).is_err());
+        assert!(plan_deployment(dim_req("memory_gb", json!(1))).is_err());
+        assert!(plan_deployment(dim_req("data_disk_gb", json!(5))).is_err());
+    }
+
+    #[test]
+    fn test_plan_deployment_rejects_wrong_type_dimension() {
+        // Present-but-wrong-type must error, not silently default.
+        assert!(plan_deployment(dim_req("cpu", json!("8"))).is_err());
+        assert!(plan_deployment(dim_req("memory_gb", json!(-1))).is_err());
+        assert!(plan_deployment(dim_req("data_disk_gb", json!(10.5))).is_err());
+        // Absent dimension still defaults (no cpu key -> default 4, valid).
+        let req = json!({
+            "instance_name": "DEFRA-SQL-DEF", "sql_version": "2022", "edition": "Standard",
+            "service_account": "svc@ryuki.local", "site": "DEFRA", "cluster_mode": "Standalone"
+        });
+        assert!(plan_deployment(req).is_ok(), "absent dimensions use defaults");
+    }
+
+    #[test]
+    fn test_plan_deployment_large_disks_do_not_overflow_total() {
+        // Three near-i32::MAX disks: summing as u32 would overflow (panic in debug);
+        // total_disk is computed in u64, so this plans cleanly.
+        let mut req = dim_req("data_disk_gb", json!(2_000_000_000u64));
+        req["log_disk_gb"] = json!(2_000_000_000u64);
+        req["tempdb_disk_gb"] = json!(2_000_000_000u64);
+        let (_, plan) = plan_deployment(req).expect("near-max disks within i32 must plan");
+        assert_eq!(plan["total_disk_gb"].as_u64(), Some(6_000_000_000));
+    }
+
+    #[test]
+    fn test_plan_deployment_missing_service_account() {
+        let result = plan_deployment(json!({
+            "instance_name": "DEFRA-SQL-01",
+            "sql_version": "2022",
+            "site": "DEFRA"
+        }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("service_account"));
+    }
+
+    #[test]
+    fn test_plan_deployment_unsupported_version() {
+        let result = plan_deployment(json!({
+            "instance_name": "BAD-SQL-01",
+            "sql_version": "2017",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "collation": "Latin1_General_CI_AS",
+            "service_account": "svc@ryuki.local",
+            "site": "DEFRA",
+            "cluster_mode": "Standalone"
+        }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported SQL version"));
+    }
+
+    #[test]
+    fn test_plan_deployment_unsupported_cluster_mode() {
+        let result = plan_deployment(json!({
+            "instance_name": "BAD-SQL-01",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "service_account": "svc@ryuki.local",
+            "site": "DEFRA",
+            "cluster_mode": "CLUSTER"
+        }));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported cluster mode"));
+    }
+
+    #[test]
+    fn test_plan_deployment_tempdb_config_cpu_lt_8() {
+        let (deployment, plan) = plan_deployment(json!({
+            "instance_name": "GBLON-SQL-01",
+            "sql_version": "2022",
+            "edition": "Standard",
+            "cpu": 4,
+            "memory_gb": 16,
+            "data_disk_gb": 100,
+            "log_disk_gb": 50,
+            "tempdb_disk_gb": 30,
+            "service_account": "svc@ryuki.local",
+            "site": "GBLON",
+            "cluster_mode": "Standalone"
+        }))
+        .unwrap();
+        // cpu < 8: file_count = cpu, initial_size_mb = 512
+        assert_eq!(plan["tempdb_config"]["file_count"], 4_u64);
+        assert_eq!(plan["tempdb_config"]["initial_size_mb"], 512_u64);
+        assert_eq!(deployment.cpu, 4);
+    }
+
+    #[test]
+    fn test_plan_deployment_tempdb_config_cpu_ge_8() {
+        let (_, plan) = plan_deployment(json!({
+            "instance_name": "DEFRA-SQL-BIG",
+            "sql_version": "2022",
+            "edition": "Enterprise",
+            "cpu": 16,
+            "memory_gb": 128,
+            "data_disk_gb": 1000,
+            "log_disk_gb": 500,
+            "tempdb_disk_gb": 200,
+            "service_account": "svc@ryuki.local",
+            "site": "DEFRA",
+            "cluster_mode": "AG"
+        }))
+        .unwrap();
+        // cpu >= 8: file_count = min(cpu/2, 8) = min(8, 8) = 8, initial_size_mb = 1024
+        assert_eq!(plan["tempdb_config"]["file_count"], 8_u64);
+        assert_eq!(plan["tempdb_config"]["initial_size_mb"], 1024_u64);
+    }
+
+    // ── validate_deployment ──
 
     #[test]
     fn test_validate_deployment_all_passing() {
@@ -786,197 +952,6 @@ mod tests {
             .map(|w| w.as_str().unwrap())
             .collect();
         assert!(warnings.iter().any(|w| w.contains("2019")));
-    }
-
-    #[test]
-    fn test_install_configure_verify_backup_monitoring_flow() {
-        plan_deployment(json!({
-            "instance_name": "GBLON-SQL-DEV-01",
-            "sql_version": "2022",
-            "edition": "Developer",
-            "cpu": 2,
-            "memory_gb": 8,
-            "data_disk_gb": 100,
-            "log_disk_gb": 50,
-            "tempdb_disk_gb": 30,
-            "collation": "SQL_Latin1_General_CP1_CI_AS",
-            "service_account": "svc-dev@ryuki.local",
-            "site": "GBLON",
-            "cluster_mode": "Standalone"
-        }))
-        .unwrap();
-
-        let store = deployment_store().lock().unwrap();
-        let deployment_id = store
-            .iter()
-            .find(|d| d.instance_name == "GBLON-SQL-DEV-01")
-            .map(|d| d.id.clone())
-            .unwrap();
-        drop(store);
-
-        let install_result = install_sql(&deployment_id).unwrap();
-        assert_eq!(install_result["status"], "installing");
-        assert!(install_result["steps"].as_array().unwrap().len() >= 3);
-
-        let config_result = configure_sql(&deployment_id).unwrap();
-        assert_eq!(config_result["status"], "configuring");
-        assert!(
-            config_result["config_applied"]["backup_compression_default"]
-                .as_u64()
-                .unwrap()
-                == 1
-        );
-
-        let verify_result = verify_sql(&deployment_id).unwrap();
-        assert_eq!(verify_result["status"], "verified");
-        assert!(
-            verify_result["checks"]["connectivity"]["passed"]
-                .as_bool()
-                .unwrap()
-        );
-
-        let backup_result = add_to_backup(&deployment_id).unwrap();
-        assert_eq!(backup_result["status"], "backed-up");
-        assert!(
-            backup_result["veeam_config"]["application_aware_processing"]
-                .as_bool()
-                .unwrap()
-        );
-
-        let monitoring_result = add_to_monitoring(&deployment_id).unwrap();
-        assert_eq!(monitoring_result["status"], "monitored");
-        assert!(
-            monitoring_result["zabbix_config"]["items_monitored"]
-                .as_array()
-                .unwrap()
-                .len()
-                >= 5
-        );
-    }
-
-    #[test]
-    fn test_sql_deployment_actions_require_lifecycle_order() {
-        let planned = plan_deployment(json!({
-            "instance_name": "NLAMS-SQL-01",
-            "sql_version": "2022",
-            "edition": "Standard",
-            "cpu": 4,
-            "memory_gb": 16,
-            "data_disk_gb": 100,
-            "log_disk_gb": 50,
-            "tempdb_disk_gb": 30,
-            "collation": "SQL_Latin1_General_CP1_CI_AS",
-            "service_account": "svc-nlams@ryuki.local",
-            "site": "NLAMS",
-            "cluster_mode": "Standalone"
-        }))
-        .unwrap();
-        let deployment_id = planned["deployment_id"].as_str().unwrap();
-
-        assert!(
-            configure_sql(deployment_id)
-                .unwrap_err()
-                .contains("Must be Installing first")
-        );
-
-        install_sql(deployment_id).unwrap();
-        assert!(
-            verify_sql(deployment_id)
-                .unwrap_err()
-                .contains("Must be Configuring first")
-        );
-
-        configure_sql(deployment_id).unwrap();
-        assert!(
-            add_to_backup(deployment_id)
-                .unwrap_err()
-                .contains("Must be Verified first")
-        );
-
-        verify_sql(deployment_id).unwrap();
-        assert!(
-            add_to_monitoring(deployment_id)
-                .unwrap_err()
-                .contains("Must be BackedUp first")
-        );
-
-        add_to_backup(deployment_id).unwrap();
-        add_to_monitoring(deployment_id).unwrap();
-    }
-
-    #[test]
-    fn test_sql_deployment_ids_are_allocated_under_store_lock() {
-        let first = plan_deployment(json!({
-            "instance_name": "FRPAR-SQL-01",
-            "sql_version": "2022",
-            "edition": "Standard",
-            "cpu": 4,
-            "memory_gb": 16,
-            "data_disk_gb": 100,
-            "log_disk_gb": 50,
-            "tempdb_disk_gb": 30,
-            "collation": "SQL_Latin1_General_CP1_CI_AS",
-            "service_account": "svc-frpar-01@ryuki.local",
-            "site": "FRPAR",
-            "cluster_mode": "Standalone"
-        }))
-        .unwrap();
-        let second = plan_deployment(json!({
-            "instance_name": "FRPAR-SQL-02",
-            "sql_version": "2022",
-            "edition": "Standard",
-            "cpu": 4,
-            "memory_gb": 16,
-            "data_disk_gb": 100,
-            "log_disk_gb": 50,
-            "tempdb_disk_gb": 30,
-            "collation": "SQL_Latin1_General_CP1_CI_AS",
-            "service_account": "svc-frpar-02@ryuki.local",
-            "site": "FRPAR",
-            "cluster_mode": "Standalone"
-        }))
-        .unwrap();
-
-        assert_ne!(first["deployment_id"], second["deployment_id"]);
-    }
-
-    fn active_sites() -> Vec<String> {
-        crate::site_registry::get_active_site_codes()
-            .unwrap_or_else(|_| vec!["DEFRA".into(), "GBLON".into()])
-    }
-
-    #[test]
-    fn test_get_inventory_all() {
-        let result = get_inventory("").unwrap();
-        assert!(result["deployment_count"].as_u64().unwrap() >= 2);
-        let deployments = result["deployments"].as_array().unwrap();
-        let sites = active_sites();
-        assert!(deployments.iter().any(|d| d["site"] == sites[0]));
-    }
-
-    #[test]
-    fn test_get_inventory_by_site() {
-        let site = active_sites()[0].clone();
-        let result = get_inventory(&site).unwrap();
-        let deployments = result["deployments"].as_array().unwrap();
-        for d in deployments {
-            assert_eq!(d["site"], site);
-        }
-    }
-
-    #[test]
-    fn test_get_inventory_empty_site() {
-        let result = get_inventory("NONEXISTENT").unwrap();
-        assert_eq!(result["deployment_count"].as_u64().unwrap(), 0);
-    }
-
-    #[test]
-    fn test_deployment_not_found() {
-        assert!(install_sql("sql-999").is_err());
-        assert!(configure_sql("sql-999").is_err());
-        assert!(verify_sql("sql-999").is_err());
-        assert!(add_to_backup("sql-999").is_err());
-        assert!(add_to_monitoring("sql-999").is_err());
     }
 
     #[test]
@@ -1051,23 +1026,171 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("NetBIOS")));
     }
 
+    // ── Lifecycle guards ──
+
     #[test]
-    fn test_plan_deployment_unsupported_version() {
-        let result = plan_deployment(json!({
-            "instance_name": "BAD-SQL-01",
-            "sql_version": "2017",
-            "edition": "Standard",
-            "cpu": 4,
-            "memory_gb": 16,
-            "data_disk_gb": 100,
-            "log_disk_gb": 50,
-            "tempdb_disk_gb": 30,
-            "collation": "Latin1_General_CI_AS",
-            "service_account": "svc@ryuki.local",
-            "site": "DEFRA",
-            "cluster_mode": "Standalone"
-        }));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unsupported SQL version"));
+    fn test_guard_install_requires_planned() {
+        let planned = make_deployment(DeploymentStatus::Planned);
+        assert!(guard_install(&planned).is_ok());
+
+        let draft = make_deployment(DeploymentStatus::Draft);
+        let err = guard_install(&draft).unwrap_err();
+        assert!(err.contains("Must be Planned first") || err.contains("install"));
+    }
+
+    #[test]
+    fn test_guard_configure_requires_installing() {
+        let installing = make_deployment(DeploymentStatus::Installing);
+        assert!(guard_configure(&installing).is_ok());
+
+        let planned = make_deployment(DeploymentStatus::Planned);
+        let err = guard_configure(&planned).unwrap_err();
+        assert!(err.contains("Must be Installing first") || err.contains("configure"));
+    }
+
+    #[test]
+    fn test_guard_verify_requires_configuring() {
+        let configuring = make_deployment(DeploymentStatus::Configuring);
+        assert!(guard_verify(&configuring).is_ok());
+
+        let installing = make_deployment(DeploymentStatus::Installing);
+        assert!(guard_verify(&installing).is_err());
+    }
+
+    #[test]
+    fn test_guard_backup_requires_verified() {
+        let verified = make_deployment(DeploymentStatus::Verified);
+        assert!(guard_backup(&verified).is_ok());
+
+        let configuring = make_deployment(DeploymentStatus::Configuring);
+        assert!(guard_backup(&configuring).is_err());
+    }
+
+    #[test]
+    fn test_guard_monitoring_requires_backed_up() {
+        let backed_up = make_deployment(DeploymentStatus::BackedUp);
+        assert!(guard_monitoring(&backed_up).is_ok());
+
+        let verified = make_deployment(DeploymentStatus::Verified);
+        assert!(guard_monitoring(&verified).is_err());
+    }
+
+    #[test]
+    fn test_full_guard_sequence() {
+        // Confirm every guard rejects a status that's one step ahead or behind.
+        let draft = make_deployment(DeploymentStatus::Draft);
+        assert!(guard_install(&draft).is_err());
+
+        let planned = make_deployment(DeploymentStatus::Planned);
+        assert!(guard_install(&planned).is_ok());
+        assert!(guard_configure(&planned).is_err());
+    }
+
+    // ── Response builders ──
+
+    #[test]
+    fn test_install_response() {
+        let d = make_deployment(DeploymentStatus::Installing);
+        let r = install_response(&d);
+        assert_eq!(r["status"], "installing");
+        assert!(r["steps"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn test_configure_response() {
+        let d = make_deployment(DeploymentStatus::Configuring);
+        let r = configure_response(&d);
+        assert_eq!(r["status"], "configuring");
+        assert_eq!(r["config_applied"]["backup_compression_default"], 1_u64);
+    }
+
+    #[test]
+    fn test_verify_response() {
+        let d = make_deployment(DeploymentStatus::Verified);
+        let r = verify_response(&d);
+        assert_eq!(r["status"], "verified");
+        assert!(r["checks"]["connectivity"]["passed"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_backup_response() {
+        let d = make_deployment(DeploymentStatus::BackedUp);
+        let r = backup_response(&d);
+        assert_eq!(r["status"], "backed-up");
+        assert!(
+            r["veeam_config"]["application_aware_processing"]
+                .as_bool()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_monitoring_response() {
+        let d = make_deployment(DeploymentStatus::Monitored);
+        let r = monitoring_response(&d);
+        assert_eq!(r["status"], "monitored");
+        assert!(
+            r["zabbix_config"]["items_monitored"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 5
+        );
+    }
+
+    #[test]
+    fn test_inventory_response_empty() {
+        let r = inventory_response("DEFRA", &[]);
+        assert_eq!(r["deployment_count"], 0_u64);
+        assert_eq!(r["site"], "DEFRA");
+    }
+
+    #[test]
+    fn test_inventory_response_filters_by_site() {
+        let deployments = [
+            make_deployment(DeploymentStatus::Draft),
+            {
+                let mut d = make_deployment(DeploymentStatus::Planned);
+                d.site = "GBLON".into();
+                d
+            },
+        ];
+        let defra_only: Vec<SQLDeployment> = deployments
+            .iter()
+            .filter(|d| d.site == "DEFRA")
+            .cloned()
+            .collect::<Vec<_>>();
+        let r = inventory_response("DEFRA", &defra_only);
+        assert_eq!(r["deployment_count"], 1_u64);
+    }
+
+    #[test]
+    fn test_inventory_response_all_sites() {
+        let d = make_deployment(DeploymentStatus::Draft);
+        let r = inventory_response("", &[d]);
+        assert_eq!(r["site"], "all");
+        assert_eq!(r["deployment_count"], 1_u64);
+    }
+
+    // ── Enum display / serde round-trip ──
+
+    #[test]
+    fn test_cluster_mode_display_matches_db_form() {
+        assert_eq!(ClusterMode::Standalone.to_string(), "Standalone");
+        assert_eq!(ClusterMode::FCI.to_string(), "FCI");
+        assert_eq!(ClusterMode::AG.to_string(), "AG");
+    }
+
+    #[test]
+    fn test_sql_version_display_matches_db_form() {
+        assert_eq!(SQLVersion::Sql2019.to_string(), "2019");
+        assert_eq!(SQLVersion::Sql2022.to_string(), "2022");
+    }
+
+    #[test]
+    fn test_deployment_status_display_matches_db_form() {
+        assert_eq!(DeploymentStatus::Draft.to_string(), "draft");
+        assert_eq!(DeploymentStatus::BackedUp.to_string(), "backed-up");
+        assert_eq!(DeploymentStatus::Completed.to_string(), "completed");
     }
 }

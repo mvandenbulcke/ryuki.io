@@ -31,5 +31,6 @@ pub mod patch_waves;
 pub mod repository_capacity;
 pub mod restore_requests;
 pub mod snapshots;
+pub mod sql_deployment;
 pub mod synthetic_health;
 pub mod zabbix_drift;
