@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,148 +86,23 @@ pub struct ContainerRequest {
     pub status: RequestStatus,
 }
 
-type ContainerStore = (Vec<K8sNamespace>, Vec<ContainerRequest>);
+// ─── Pure helpers ──────────────────────────────────────────────────────────────
 
-static CONTAINER_STORE: OnceLock<Mutex<ContainerStore>> = OnceLock::new();
-
-fn store() -> &'static Mutex<ContainerStore> {
-    CONTAINER_STORE.get_or_init(|| Mutex::new((seed_namespaces(), seed_requests())))
-}
-
-fn quota(cpu: u32, memory_gb: u32, storage_gb: u32) -> ResourceQuota {
+pub fn build_quota(cpu: u32, memory_gb: u32, storage_gb: u32) -> ResourceQuota {
+    // saturating_mul so an unvalidated call can never panic (debug) or silently
+    // wrap (release). validate_capacity_bounds is the real gate (-> 400) and
+    // guarantees these products fit i32 for any request that reaches the repo.
     ResourceQuota {
-        cpu_limit: cpu * 2,
+        cpu_limit: cpu.saturating_mul(2),
         cpu_request: cpu,
-        memory_limit_gb: memory_gb * 2,
+        memory_limit_gb: memory_gb.saturating_mul(2),
         memory_request_gb: memory_gb,
         storage_gb,
-        max_pods: (cpu * 8).max(16),
+        max_pods: cpu.saturating_mul(8).max(16),
     }
 }
 
-fn seed_namespaces() -> Vec<K8sNamespace> {
-    vec![
-        K8sNamespace {
-            id: "k8s-defra-app-001".into(),
-            name: "defra-apps-dev".into(),
-            cluster: "defra-aks-01".into(),
-            site: "DEFRA".into(),
-            resource_quota: quota(8, 16, 200),
-            network_policy: "deny-by-default".into(),
-            service_accounts: vec!["defra-app-deployer".into(), "defra-app-reader".into()],
-            status: NamespaceStatus::Active,
-        },
-        K8sNamespace {
-            id: "k8s-defra-data-001".into(),
-            name: "defra-data-prod".into(),
-            cluster: "defra-aks-02".into(),
-            site: "DEFRA".into(),
-            resource_quota: quota(24, 96, 800),
-            network_policy: "restricted-egress".into(),
-            service_accounts: vec!["defra-data-runner".into()],
-            status: NamespaceStatus::Active,
-        },
-        K8sNamespace {
-            id: "k8s-gblon-obs-001".into(),
-            name: "gblon-observability".into(),
-            cluster: "gblon-k8s-01".into(),
-            site: "GBLON".into(),
-            resource_quota: quota(16, 64, 500),
-            network_policy: "monitoring-ingress".into(),
-            service_accounts: vec!["gblon-prometheus".into(), "gblon-grafana".into()],
-            status: NamespaceStatus::Active,
-        },
-        K8sNamespace {
-            id: "k8s-gblon-build-001".into(),
-            name: "gblon-build-test".into(),
-            cluster: "gblon-k8s-02".into(),
-            site: "GBLON".into(),
-            resource_quota: quota(12, 32, 300),
-            network_policy: "ci-egress".into(),
-            service_accounts: vec!["gblon-build-runner".into()],
-            status: NamespaceStatus::Suspended,
-        },
-        K8sNamespace {
-            id: "k8s-frpar-api-001".into(),
-            name: "frpar-api-staging".into(),
-            cluster: "frpar-k8s-01".into(),
-            site: "FRPAR".into(),
-            resource_quota: quota(10, 24, 250),
-            network_policy: "staging-shared".into(),
-            service_accounts: vec!["frpar-api-deployer".into()],
-            status: NamespaceStatus::Creating,
-        },
-        K8sNamespace {
-            id: "k8s-frpar-edge-001".into(),
-            name: "frpar-edge-prod".into(),
-            cluster: "frpar-k8s-01".into(),
-            site: "FRPAR".into(),
-            resource_quota: quota(20, 48, 400),
-            network_policy: "edge-restricted".into(),
-            service_accounts: vec!["frpar-edge-runtime".into()],
-            status: NamespaceStatus::Active,
-        },
-    ]
-}
-
-fn seed_requests() -> Vec<ContainerRequest> {
-    vec![
-        ContainerRequest {
-            id: "cr-defra-001".into(),
-            requester: "alice.platform".into(),
-            namespace_name: "defra-risk-dev".into(),
-            cluster: "defra-aks-01".into(),
-            site: "DEFRA".into(),
-            cpu_request: 4,
-            memory_gb: 12,
-            storage_gb: 100,
-            environment: Environment::Dev,
-            purpose: "Risk model development".into(),
-            status: RequestStatus::Validated,
-        },
-        ContainerRequest {
-            id: "cr-gblon-001".into(),
-            requester: "bob.sre".into(),
-            namespace_name: "gblon-chaos-test".into(),
-            cluster: "gblon-k8s-02".into(),
-            site: "GBLON".into(),
-            cpu_request: 6,
-            memory_gb: 16,
-            storage_gb: 120,
-            environment: Environment::Test,
-            purpose: "Chaos testing sandbox".into(),
-            status: RequestStatus::Draft,
-        },
-        ContainerRequest {
-            id: "cr-frpar-001".into(),
-            requester: "carla.apps".into(),
-            namespace_name: "frpar-payments-staging".into(),
-            cluster: "frpar-k8s-01".into(),
-            site: "FRPAR".into(),
-            cpu_request: 8,
-            memory_gb: 24,
-            storage_gb: 200,
-            environment: Environment::Staging,
-            purpose: "Payments pre-prod validation".into(),
-            status: RequestStatus::Approved,
-        },
-        ContainerRequest {
-            id: "cr-defra-002".into(),
-            requester: "diego.data".into(),
-            namespace_name: "defra-analytics-prod".into(),
-            cluster: "defra-aks-02".into(),
-            site: "DEFRA".into(),
-            cpu_request: 16,
-            memory_gb: 64,
-            storage_gb: 500,
-            environment: Environment::Prod,
-            purpose: "Analytics production workloads".into(),
-            status: RequestStatus::Approved,
-        },
-    ]
-}
-
-fn parse_environment(environment: &str) -> Result<Environment, String> {
+pub fn parse_environment(environment: &str) -> Result<Environment, String> {
     match environment {
         "Dev" => Ok(Environment::Dev),
         "Test" => Ok(Environment::Test),
@@ -240,7 +114,7 @@ fn parse_environment(environment: &str) -> Result<Environment, String> {
     }
 }
 
-fn validate_capacity(cpu: u32, memory: u32, storage: u32) -> Result<(), String> {
+pub fn validate_capacity(cpu: u32, memory: u32, storage: u32) -> Result<(), String> {
     if cpu == 0 {
         return Err("cpu must be greater than zero".into());
     }
@@ -253,178 +127,106 @@ fn validate_capacity(cpu: u32, memory: u32, storage: u32) -> Result<(), String> 
     Ok(())
 }
 
-pub fn list_namespaces(site: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let namespaces: Vec<K8sNamespace> = if site.is_empty() {
-        store.0.clone()
-    } else {
-        store
-            .0
-            .iter()
-            .filter(|ns| ns.site == site)
-            .cloned()
-            .collect()
-    };
-
-    Ok(json!({
-        "source": "dry-run",
-        "site": if site.is_empty() { "all" } else { site },
-        "count": namespaces.len(),
-        "namespaces": namespaces
-    }))
+/// Validate that the RAW cpu/memory/storage AND the DERIVED quota columns that
+/// build_quota persists (cpu_limit = cpu*2, memory_limit_gb = memory*2,
+/// max_pods = cpu*8) all fit in i32 (the DB INTEGER columns). Checked with
+/// checked_mul so an oversized request is rejected here (-> 400) rather than
+/// overflowing u32 in build_quota or failing i32::try_from in the repo (-> 500).
+pub fn validate_capacity_bounds(cpu: u32, memory: u32, storage: u32) -> Result<(), String> {
+    let max = i32::MAX as u32;
+    for (value, label) in [(cpu, "cpu"), (memory, "memory"), (storage, "storage")] {
+        if value > max {
+            return Err(format!("{label} value {value} exceeds maximum allowed"));
+        }
+    }
+    for (base, mult, label) in [
+        (cpu, 2u32, "cpu_limit"),
+        (cpu, 8, "max_pods"),
+        (memory, 2, "memory_limit_gb"),
+    ] {
+        match base.checked_mul(mult) {
+            Some(product) if product <= max => {}
+            _ => {
+                return Err(format!(
+                    "{label} (derived from {base}*{mult}) exceeds maximum allowed"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
-pub fn get_namespace(id: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let namespace = store
-        .0
-        .iter()
-        .find(|ns| ns.id == id)
-        .ok_or_else(|| format!("Namespace '{id}' not found"))?;
-
-    Ok(json!({
-        "source": "dry-run",
-        "namespace": namespace,
-        "resource_quota": namespace.resource_quota
-    }))
-}
-
-pub fn provision_namespace(
+/// Build a new K8sNamespace (Creating status) and its paired ContainerRequest (Provisioned).
+/// IDs use full Uuid::new_v4().
+pub fn build_namespace_and_request(
     name: &str,
     cluster: &str,
     site: &str,
     cpu: u32,
     memory: u32,
     storage: u32,
-    environment: &str,
-) -> Result<Value, String> {
-    if name.trim().is_empty() {
-        return Err("name cannot be empty".into());
-    }
-    if cluster.trim().is_empty() {
-        return Err("cluster cannot be empty".into());
-    }
-    if site.trim().is_empty() {
-        return Err("site cannot be empty".into());
-    }
-    validate_capacity(cpu, memory, storage)?;
-    let parsed_environment = parse_environment(environment)?;
-
-    let mut store = store().lock().unwrap();
-    if store.0.iter().any(|ns| {
-        ns.name == name && ns.cluster == cluster && ns.status != NamespaceStatus::Terminating
-    }) {
-        return Err(format!(
-            "Namespace '{name}' already exists on cluster '{cluster}'"
-        ));
-    }
-
-    let id = format!(
-        "k8s-{}-{}",
-        site.to_lowercase(),
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
+    environment: Environment,
+) -> (K8sNamespace, ContainerRequest) {
+    let ns_id = Uuid::new_v4().to_string();
+    let req_id = Uuid::new_v4().to_string();
     let namespace = K8sNamespace {
-        id: id.clone(),
+        id: ns_id.clone(),
         name: name.to_string(),
         cluster: cluster.to_string(),
         site: site.to_string(),
-        resource_quota: quota(cpu, memory, storage),
+        resource_quota: build_quota(cpu, memory, storage),
         network_policy: format!(
             "{}-{}-default",
             site.to_lowercase(),
-            parsed_environment.to_string().to_lowercase()
+            environment.to_string().to_lowercase()
         ),
-        service_accounts: vec![format!("{}-deployer", name)],
+        service_accounts: vec![format!("{name}-deployer")],
         status: NamespaceStatus::Creating,
     };
     let request = ContainerRequest {
-        id: format!("cr-{}", id.trim_start_matches("k8s-")),
-        requester: "platform-engineering (mock)".into(),
+        id: req_id,
+        requester: "platform-engineering".into(),
         namespace_name: name.to_string(),
         cluster: cluster.to_string(),
         site: site.to_string(),
         cpu_request: cpu,
         memory_gb: memory,
         storage_gb: storage,
-        environment: parsed_environment,
-        purpose: "Namespace provisioning dry-run".into(),
+        environment,
+        purpose: "Namespace provisioning".into(),
         status: RequestStatus::Provisioned,
     };
+    (namespace, request)
+}
 
-    store.0.push(namespace.clone());
-    store.1.push(request.clone());
+// ─── Pure read surface (degrades to empty slices when called without a store) ──
 
-    Ok(json!({
-        "source": "dry-run",
-        "provisioned": true,
+pub fn list_namespaces(site: &str, namespaces: &[K8sNamespace]) -> Value {
+    let filtered: Vec<&K8sNamespace> = if site.is_empty() {
+        namespaces.iter().collect()
+    } else {
+        namespaces.iter().filter(|ns| ns.site == site).collect()
+    };
+    json!({
+        "source": "database",
+        "site": if site.is_empty() { "all" } else { site },
+        "count": filtered.len(),
+        "namespaces": filtered
+    })
+}
+
+pub fn get_namespace_response(namespace: &K8sNamespace) -> Value {
+    json!({
+        "source": "database",
         "namespace": namespace,
-        "request": request
-    }))
+        "resource_quota": namespace.resource_quota
+    })
 }
 
-pub fn update_quota(id: &str, cpu: u32, memory: u32, storage: u32) -> Result<Value, String> {
-    validate_capacity(cpu, memory, storage)?;
-    let mut store = store().lock().unwrap();
-    let namespace = store
-        .0
-        .iter_mut()
-        .find(|ns| ns.id == id)
-        .ok_or_else(|| format!("Namespace '{id}' not found"))?;
-
-    if namespace.status == NamespaceStatus::Terminating {
-        return Err(format!(
-            "Cannot update quota for terminating namespace '{id}'"
-        ));
-    }
-
-    namespace.resource_quota = quota(cpu, memory, storage);
-
-    Ok(json!({
-        "source": "dry-run",
-        "updated": true,
-        "namespace": namespace
-    }))
-}
-
-pub fn suspend_namespace(id: &str) -> Result<Value, String> {
-    set_namespace_status(id, NamespaceStatus::Suspended)
-}
-
-pub fn resume_namespace(id: &str) -> Result<Value, String> {
-    set_namespace_status(id, NamespaceStatus::Active)
-}
-
-pub fn terminate_namespace(id: &str) -> Result<Value, String> {
-    set_namespace_status(id, NamespaceStatus::Terminating)
-}
-
-fn set_namespace_status(id: &str, status: NamespaceStatus) -> Result<Value, String> {
-    let mut store = store().lock().unwrap();
-    let namespace = store
-        .0
-        .iter_mut()
-        .find(|ns| ns.id == id)
-        .ok_or_else(|| format!("Namespace '{id}' not found"))?;
-
-    namespace.status = status;
-
-    Ok(json!({
-        "source": "dry-run",
-        "namespace": namespace
-    }))
-}
-
-pub fn get_cluster_utilization(site: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
+pub fn get_cluster_utilization(site: &str, namespaces: &[K8sNamespace]) -> Value {
     let mut clusters: BTreeMap<String, (usize, u32, u32)> = BTreeMap::new();
 
-    for namespace in store
-        .0
+    for namespace in namespaces
         .iter()
         .filter(|ns| site.is_empty() || ns.site == site)
     {
@@ -450,178 +252,216 @@ pub fn get_cluster_utilization(site: &str) -> Result<Value, String> {
         )
         .collect();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
+        "source": "database",
         "site": if site.is_empty() { "all" } else { site },
         "clusters": utilization
-    }))
+    })
 }
 
-pub fn validate_namespace_name(name: &str, cluster: &str) -> Result<Value, String> {
-    if name.trim().is_empty() {
-        return Err("name cannot be empty".into());
-    }
-    if cluster.trim().is_empty() {
-        return Err("cluster cannot be empty".into());
-    }
-
-    let store = store().lock().unwrap();
-    let existing = store.0.iter().find(|ns| {
-        ns.name == name && ns.cluster == cluster && ns.status != NamespaceStatus::Terminating
-    });
-
-    Ok(json!({
-        "source": "dry-run",
+pub fn validate_namespace_name_response(
+    name: &str,
+    cluster: &str,
+    existing: Option<&K8sNamespace>,
+) -> Value {
+    json!({
+        "source": "database",
         "name": name,
         "cluster": cluster,
         "available": existing.is_none(),
         "reason": existing.map(|ns| format!("Namespace already exists with id {}", ns.id))
-    }))
+    })
 }
 
-pub fn get_k8s_summary(site: &str) -> Result<Value, String> {
-    let store = store().lock().unwrap();
-    let namespaces: Vec<&K8sNamespace> = store
-        .0
+pub fn get_k8s_summary(site: &str, namespaces: &[K8sNamespace]) -> Value {
+    let filtered: Vec<&K8sNamespace> = namespaces
         .iter()
         .filter(|ns| site.is_empty() || ns.site == site)
         .collect();
-    let clusters: BTreeSet<String> = namespaces.iter().map(|ns| ns.cluster.clone()).collect();
-    let total_cpu_allocated: u32 = namespaces
+    let clusters: BTreeSet<String> = filtered.iter().map(|ns| ns.cluster.clone()).collect();
+    let total_cpu_allocated: u32 = filtered
         .iter()
         .map(|ns| ns.resource_quota.cpu_request)
         .sum();
-    let total_memory_allocated_gb: u32 = namespaces
+    let total_memory_allocated_gb: u32 = filtered
         .iter()
         .map(|ns| ns.resource_quota.memory_request_gb)
         .sum();
-    let total_storage_allocated_gb: u32 = namespaces
+    let total_storage_allocated_gb: u32 = filtered
         .iter()
         .map(|ns| ns.resource_quota.storage_gb)
         .sum();
 
-    Ok(json!({
-        "source": "dry-run",
+    json!({
+        "source": "database",
         "site": if site.is_empty() { "all" } else { site },
-        "total_namespaces": namespaces.len(),
+        "total_namespaces": filtered.len(),
         "clusters": clusters.len(),
         "total_cpu_allocated": total_cpu_allocated,
         "total_memory_allocated_gb": total_memory_allocated_gb,
         "total_storage_allocated_gb": total_storage_allocated_gb
-    }))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_provision_and_list_namespaces() {
-        let name = format!(
-            "defra-test-{}",
-            Uuid::new_v4().to_string().split('-').next().unwrap()
-        );
-        let provisioned =
-            provision_namespace(&name, "defra-aks-01", "DEFRA", 3, 8, 90, "Dev").unwrap();
-
-        assert_eq!(provisioned["provisioned"], true);
-        assert_eq!(provisioned["namespace"]["name"], name);
-        assert_eq!(provisioned["namespace"]["status"], "Creating");
-
-        let listed = list_namespaces("DEFRA").unwrap();
-        assert!(listed["count"].as_u64().unwrap() >= 3);
-        assert!(
-            listed["namespaces"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|ns| ns["name"] == name)
-        );
+    fn make_ns(id: &str, name: &str, cluster: &str, site: &str, status: NamespaceStatus) -> K8sNamespace {
+        K8sNamespace {
+            id: id.into(),
+            name: name.into(),
+            cluster: cluster.into(),
+            site: site.into(),
+            resource_quota: build_quota(4, 8, 100),
+            network_policy: "deny-by-default".into(),
+            service_accounts: vec!["test-deployer".into()],
+            status,
+        }
     }
 
     #[test]
-    fn test_update_quota() {
-        let updated = update_quota("k8s-defra-app-001", 14, 40, 350).unwrap();
-
-        assert_eq!(updated["updated"], true);
-        assert_eq!(updated["namespace"]["resource_quota"]["cpu_request"], 14);
-        assert_eq!(
-            updated["namespace"]["resource_quota"]["memory_request_gb"],
-            40
-        );
-        assert_eq!(updated["namespace"]["resource_quota"]["storage_gb"], 350);
+    fn test_build_quota() {
+        let q = build_quota(8, 16, 200);
+        assert_eq!(q.cpu_limit, 16);
+        assert_eq!(q.cpu_request, 8);
+        assert_eq!(q.memory_limit_gb, 32);
+        assert_eq!(q.memory_request_gb, 16);
+        assert_eq!(q.storage_gb, 200);
+        assert_eq!(q.max_pods, 64);
     }
 
     #[test]
-    fn test_suspend_and_resume() {
-        let name = format!(
-            "gblon-suspend-{}",
-            Uuid::new_v4().to_string().split('-').next().unwrap()
-        );
-        let namespace =
-            provision_namespace(&name, "gblon-k8s-01", "GBLON", 2, 4, 50, "Test").unwrap();
-        let id = namespace["namespace"]["id"].as_str().unwrap();
-
-        let suspended = suspend_namespace(id).unwrap();
-        assert_eq!(suspended["namespace"]["status"], "Suspended");
-
-        let resumed = resume_namespace(id).unwrap();
-        assert_eq!(resumed["namespace"]["status"], "Active");
+    fn test_build_quota_min_pods() {
+        // cpu=1 -> cpu*8=8 < 16, so max_pods=16
+        let q = build_quota(1, 2, 10);
+        assert_eq!(q.max_pods, 16);
     }
 
     #[test]
-    fn test_terminate_namespace() {
-        let name = format!(
-            "frpar-terminate-{}",
-            Uuid::new_v4().to_string().split('-').next().unwrap()
-        );
-        let namespace =
-            provision_namespace(&name, "frpar-k8s-01", "FRPAR", 2, 4, 50, "Staging").unwrap();
-        let id = namespace["namespace"]["id"].as_str().unwrap();
-
-        let terminated = terminate_namespace(id).unwrap();
-        assert_eq!(terminated["namespace"]["status"], "Terminating");
+    fn test_parse_environment_valid() {
+        assert_eq!(parse_environment("Dev").unwrap(), Environment::Dev);
+        assert_eq!(parse_environment("Test").unwrap(), Environment::Test);
+        assert_eq!(parse_environment("Staging").unwrap(), Environment::Staging);
+        assert_eq!(parse_environment("Prod").unwrap(), Environment::Prod);
     }
 
     #[test]
-    fn test_validate_unique_name() {
-        let duplicate = validate_namespace_name("defra-apps-dev", "defra-aks-01").unwrap();
-        assert_eq!(duplicate["available"], false);
-
-        let unique = validate_namespace_name("defra-new-namespace", "defra-aks-01").unwrap();
-        assert_eq!(unique["available"], true);
+    fn test_parse_environment_invalid() {
+        assert!(parse_environment("dev").is_err());
+        assert!(parse_environment("production").is_err());
+        assert!(parse_environment("").is_err());
     }
 
     #[test]
-    fn test_cluster_utilization() {
-        let utilization = get_cluster_utilization("DEFRA").unwrap();
-        let clusters = utilization["clusters"].as_array().unwrap();
-
-        assert!(
-            clusters
-                .iter()
-                .any(|cluster| cluster["cluster"] == "defra-aks-01")
-        );
-        assert!(
-            clusters
-                .iter()
-                .any(|cluster| cluster["cluster"] == "defra-aks-02")
-        );
-        assert!(
-            clusters
-                .iter()
-                .all(|cluster| cluster["namespace_count"].as_u64().unwrap() > 0)
-        );
+    fn test_validate_capacity_zero_rejected() {
+        assert!(validate_capacity(0, 8, 100).is_err());
+        assert!(validate_capacity(4, 0, 100).is_err());
+        assert!(validate_capacity(4, 8, 0).is_err());
+        assert!(validate_capacity(4, 8, 100).is_ok());
     }
 
     #[test]
-    fn test_k8s_summary() {
-        let summary = get_k8s_summary("FRPAR").unwrap();
+    fn test_build_namespace_and_request() {
+        let env = Environment::Staging;
+        let (ns, req) = build_namespace_and_request(
+            "frpar-api-staging", "frpar-k8s-01", "FRPAR", 10, 24, 250, env,
+        );
+        assert_eq!(ns.name, "frpar-api-staging");
+        assert_eq!(ns.cluster, "frpar-k8s-01");
+        assert_eq!(ns.site, "FRPAR");
+        assert_eq!(ns.status, NamespaceStatus::Creating);
+        assert_eq!(ns.network_policy, "frpar-staging-default");
+        assert_eq!(ns.service_accounts, vec!["frpar-api-staging-deployer"]);
+        assert!(!ns.id.is_empty());
 
-        assert_eq!(summary["site"], "FRPAR");
-        assert!(summary["total_namespaces"].as_u64().unwrap() >= 2);
-        assert!(summary["clusters"].as_u64().unwrap() >= 1);
-        assert!(summary["total_cpu_allocated"].as_u64().unwrap() >= 30);
-        assert!(summary["total_memory_allocated_gb"].as_u64().unwrap() >= 72);
+        assert_eq!(req.namespace_name, "frpar-api-staging");
+        assert_eq!(req.cluster, "frpar-k8s-01");
+        assert_eq!(req.status, RequestStatus::Provisioned);
+        assert_eq!(req.cpu_request, 10);
+        assert_eq!(req.memory_gb, 24);
+        assert_eq!(req.storage_gb, 250);
+    }
+
+    #[test]
+    fn test_list_namespaces_filter() {
+        let namespaces = vec![
+            make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active),
+            make_ns("ns-2", "gblon-obs", "gblon-k8s-01", "GBLON", NamespaceStatus::Active),
+        ];
+        let all = list_namespaces("", &namespaces);
+        assert_eq!(all["count"], 2);
+        let defra = list_namespaces("DEFRA", &namespaces);
+        assert_eq!(defra["count"], 1);
+        assert_eq!(defra["namespaces"][0]["id"], "ns-1");
+    }
+
+    #[test]
+    fn test_list_namespaces_empty_db() {
+        let result = list_namespaces("DEFRA", &[]);
+        assert_eq!(result["count"], 0);
+        assert!(result["namespaces"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_namespace_response() {
+        let ns = make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active);
+        let resp = get_namespace_response(&ns);
+        assert_eq!(resp["namespace"]["id"], "ns-1");
+        assert_eq!(resp["resource_quota"]["cpu_request"], 4);
+    }
+
+    #[test]
+    fn test_validate_namespace_name_response_available() {
+        let resp = validate_namespace_name_response("new-ns", "defra-aks-01", None);
+        assert_eq!(resp["available"], true);
+        assert!(resp["reason"].is_null());
+    }
+
+    #[test]
+    fn test_validate_namespace_name_response_taken() {
+        let ns = make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active);
+        let resp = validate_namespace_name_response("defra-apps", "defra-aks-01", Some(&ns));
+        assert_eq!(resp["available"], false);
+        assert!(resp["reason"].as_str().unwrap().contains("ns-1"));
+    }
+
+    #[test]
+    fn test_get_cluster_utilization() {
+        let namespaces = vec![
+            make_ns("ns-1", "defra-apps", "defra-aks-01", "DEFRA", NamespaceStatus::Active),
+            make_ns("ns-2", "defra-data", "defra-aks-02", "DEFRA", NamespaceStatus::Active),
+            make_ns("ns-3", "gblon-obs", "gblon-k8s-01", "GBLON", NamespaceStatus::Active),
+        ];
+        let util = get_cluster_utilization("DEFRA", &namespaces);
+        let clusters = util["clusters"].as_array().unwrap();
+        assert_eq!(clusters.len(), 2);
+        assert!(clusters.iter().any(|c| c["cluster"] == "defra-aks-01"));
+    }
+
+    #[test]
+    fn test_get_k8s_summary() {
+        let namespaces = vec![
+            make_ns("ns-1", "frpar-api", "frpar-k8s-01", "FRPAR", NamespaceStatus::Creating),
+            make_ns("ns-2", "frpar-edge", "frpar-k8s-01", "FRPAR", NamespaceStatus::Active),
+        ];
+        let summary = get_k8s_summary("FRPAR", &namespaces);
+        assert_eq!(summary["total_namespaces"], 2);
+        assert_eq!(summary["clusters"], 1);
+        // build_quota(4,8,100) -> cpu_request=4 each -> total=8
+        assert_eq!(summary["total_cpu_allocated"], 8);
+    }
+
+    #[test]
+    fn test_enum_serde_roundtrip() {
+        // Confirm serde serializes to PascalCase variant name (no rename attribute)
+        let s = serde_json::to_value(NamespaceStatus::Active).unwrap();
+        assert_eq!(s.as_str().unwrap(), "Active");
+        let s = serde_json::to_value(NamespaceStatus::Terminating).unwrap();
+        assert_eq!(s.as_str().unwrap(), "Terminating");
+        let e = serde_json::to_value(Environment::Staging).unwrap();
+        assert_eq!(e.as_str().unwrap(), "Staging");
+        let r = serde_json::to_value(RequestStatus::Provisioned).unwrap();
+        assert_eq!(r.as_str().unwrap(), "Provisioned");
     }
 }

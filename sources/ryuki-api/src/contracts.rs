@@ -19143,81 +19143,233 @@ struct K8sValidateRequest {
 async fn k8s_namespaces_list(
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::list_namespaces(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let namespaces = match get_db() {
+        Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    Ok(Json(container_namespace::list_namespaces(site, &namespaces)))
 }
 async fn k8s_namespace_provision(
     Json(b): Json<K8sProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::provision_namespace(
+    if b.name.trim().is_empty() {
+        return Err(status_400("name cannot be empty"));
+    }
+    if b.cluster.trim().is_empty() {
+        return Err(status_400("cluster cannot be empty"));
+    }
+    if b.site.trim().is_empty() {
+        return Err(status_400("site cannot be empty"));
+    }
+    container_namespace::validate_capacity(b.cpu, b.memory, b.storage)
+        .map_err(|e| status_400(&e))?;
+    container_namespace::validate_capacity_bounds(b.cpu, b.memory, b.storage)
+        .map_err(|e| status_400(&e))?;
+    let environment = container_namespace::parse_environment(&b.environment)
+        .map_err(|e| status_400(&e))?;
+
+    let db = get_db().ok_or_else(status_503_no_db)?;
+
+    let (ns, req) = container_namespace::build_namespace_and_request(
         &b.name,
         &b.cluster,
         &b.site,
         b.cpu,
         b.memory,
         b.storage,
-        &b.environment,
-    )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+        environment,
+    );
+
+    match crate::repos::container_namespace::provision_namespace(db, &ns, &req).await {
+        Ok(()) => Ok(Json(json!({
+            "source": "db",
+            "action": "provision-namespace",
+            "providerCallsEnabled": false,
+            "namespace": ns,
+            "request": req,
+        }))),
+        Err(e) => {
+            if e.as_database_error()
+                .map(|d| d.is_unique_violation())
+                .unwrap_or(false)
+            {
+                Err(status_409(&format!(
+                    "Namespace '{}' already exists on cluster '{}'",
+                    b.name, b.cluster
+                )))
+            } else {
+                Err(db_error(e))
+            }
+        }
+    }
 }
 async fn k8s_namespace_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::get_namespace(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let Some(db) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let ns = crate::repos::container_namespace::get_namespace(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(container_namespace::get_namespace_response(&ns)))
 }
 async fn k8s_namespace_update_quota(
     Path(id): Path<String>,
     Json(b): Json<K8sQuotaRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::update_quota(&id, b.cpu, b.memory, b.storage)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    container_namespace::validate_capacity(b.cpu, b.memory, b.storage)
+        .map_err(|e| status_400(&e))?;
+    container_namespace::validate_capacity_bounds(b.cpu, b.memory, b.storage)
+        .map_err(|e| status_400(&e))?;
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    // The Terminating guard is applied ATOMICALLY in the repo UPDATE (no
+    // read-then-write race): NotFound -> 404, Terminating -> 409.
+    use crate::repos::container_namespace::TransitionOutcome;
+    match crate::repos::container_namespace::update_quota(db, &id, b.cpu, b.memory, b.storage)
+        .await
+        .map_err(db_error)?
+    {
+        TransitionOutcome::Updated(ns) => Ok(Json(json!({
+            "source": "db",
+            "action": "update-quota",
+            "providerCallsEnabled": false,
+            "namespace": ns,
+        }))),
+        TransitionOutcome::NotFound => Err(status_404(&id)),
+        TransitionOutcome::Terminating => Err(status_409(&format!(
+            "Cannot update quota for terminating namespace '{id}'"
+        ))),
+    }
 }
 async fn k8s_namespace_suspend(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::suspend_namespace(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::container_namespace::TransitionOutcome;
+    match crate::repos::container_namespace::set_namespace_status(
+        db,
+        &id,
+        &ryuki_engine::container_namespace::NamespaceStatus::Suspended,
+    )
+    .await
+    .map_err(db_error)?
+    {
+        TransitionOutcome::Updated(ns) => Ok(Json(json!({
+            "source": "db",
+            "action": "suspend-namespace",
+            "providerCallsEnabled": false,
+            "namespace": ns,
+        }))),
+        TransitionOutcome::NotFound => Err(status_404(&id)),
+        TransitionOutcome::Terminating => Err(status_409(&format!(
+            "Cannot suspend terminating namespace '{id}'"
+        ))),
+    }
 }
 async fn k8s_namespace_resume(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::resume_namespace(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::container_namespace::TransitionOutcome;
+    match crate::repos::container_namespace::set_namespace_status(
+        db,
+        &id,
+        &ryuki_engine::container_namespace::NamespaceStatus::Active,
+    )
+    .await
+    .map_err(db_error)?
+    {
+        TransitionOutcome::Updated(ns) => Ok(Json(json!({
+            "source": "db",
+            "action": "resume-namespace",
+            "providerCallsEnabled": false,
+            "namespace": ns,
+        }))),
+        TransitionOutcome::NotFound => Err(status_404(&id)),
+        TransitionOutcome::Terminating => Err(status_409(&format!(
+            "Cannot resume terminating namespace '{id}'"
+        ))),
+    }
 }
 async fn k8s_namespace_terminate(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::terminate_namespace(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    // The "not already Terminating" guard is applied ATOMICALLY in the repo
+    // UPDATE, so two concurrent terminates can't both succeed: the loser sees
+    // Terminating -> 409. NotFound -> 404.
+    use crate::repos::container_namespace::TransitionOutcome;
+    match crate::repos::container_namespace::set_namespace_status(
+        db,
+        &id,
+        &ryuki_engine::container_namespace::NamespaceStatus::Terminating,
+    )
+    .await
+    .map_err(db_error)?
+    {
+        TransitionOutcome::Updated(ns) => Ok(Json(json!({
+            "source": "db",
+            "action": "terminate-namespace",
+            "providerCallsEnabled": false,
+            "namespace": ns,
+        }))),
+        TransitionOutcome::NotFound => Err(status_404(&id)),
+        TransitionOutcome::Terminating => Err(status_409(&format!(
+            "Namespace '{id}' is already terminating"
+        ))),
+    }
 }
 async fn k8s_cluster_utilization(
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::get_cluster_utilization(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let namespaces = match get_db() {
+        Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    Ok(Json(container_namespace::get_cluster_utilization(site, &namespaces)))
 }
 async fn k8s_validate_name(
     Json(b): Json<K8sValidateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::validate_namespace_name(&b.name, &b.cluster)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    if b.name.trim().is_empty() {
+        return Err(status_400("name cannot be empty"));
+    }
+    if b.cluster.trim().is_empty() {
+        return Err(status_400("cluster cannot be empty"));
+    }
+    let existing = match get_db() {
+        Some(pool) => {
+            crate::repos::container_namespace::find_active_namespace_by_name(pool, &b.name, &b.cluster)
+                .await
+                .map_err(db_error)?
+        }
+        None => None,
+    };
+    Ok(Json(container_namespace::validate_namespace_name_response(
+        &b.name,
+        &b.cluster,
+        existing.as_ref(),
+    )))
 }
 async fn k8s_summary(
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    container_namespace::get_k8s_summary(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let namespaces = match get_db() {
+        Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    Ok(Json(container_namespace::get_k8s_summary(site, &namespaces)))
 }
 async fn k8s_contract() -> Json<Value> {
     Json(
