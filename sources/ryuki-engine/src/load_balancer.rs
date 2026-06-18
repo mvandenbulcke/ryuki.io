@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,169 +99,9 @@ pub struct LbRequest {
     pub status: LbRequestStatus,
 }
 
-type LbStore = (Vec<LbVirtualServer>, Vec<LbPool>, Vec<LbRequest>);
+// ─── Input parsing helpers (pure) ────────────────────────────────────────────
 
-static LB_STORE: OnceLock<Mutex<LbStore>> = OnceLock::new();
-
-fn lb_store() -> &'static Mutex<LbStore> {
-    LB_STORE.get_or_init(|| Mutex::new(seed_data()))
-}
-
-fn seed_data() -> LbStore {
-    let pools = vec![
-        LbPool {
-            id: "pool-defra-web".into(),
-            name: "defra-web-pool".into(),
-            site: "DEFRA".into(),
-            members: vec![
-                PoolMember {
-                    hostname: "defra-web-01".into(),
-                    ip: "10.10.20.11".into(),
-                    port: 8080,
-                    weight: 1,
-                    status: PoolMemberStatus::Up,
-                },
-                PoolMember {
-                    hostname: "defra-web-02".into(),
-                    ip: "10.10.20.12".into(),
-                    port: 8080,
-                    weight: 1,
-                    status: PoolMemberStatus::Up,
-                },
-            ],
-            algorithm: PoolAlgorithm::RoundRobin,
-            health_monitor: Some("http-200".into()),
-        },
-        LbPool {
-            id: "pool-gblon-api".into(),
-            name: "gblon-api-pool".into(),
-            site: "GBLON".into(),
-            members: vec![
-                PoolMember {
-                    hostname: "gblon-api-01".into(),
-                    ip: "10.20.30.21".into(),
-                    port: 8443,
-                    weight: 2,
-                    status: PoolMemberStatus::Up,
-                },
-                PoolMember {
-                    hostname: "gblon-api-02".into(),
-                    ip: "10.20.30.22".into(),
-                    port: 8443,
-                    weight: 1,
-                    status: PoolMemberStatus::Down,
-                },
-            ],
-            algorithm: PoolAlgorithm::Weighted,
-            health_monitor: Some("https-api".into()),
-        },
-        LbPool {
-            id: "pool-frpar-tcp".into(),
-            name: "frpar-tcp-pool".into(),
-            site: "FRPAR".into(),
-            members: vec![PoolMember {
-                hostname: "frpar-tcp-01".into(),
-                ip: "10.30.40.31".into(),
-                port: 9000,
-                weight: 1,
-                status: PoolMemberStatus::Disabled,
-            }],
-            algorithm: PoolAlgorithm::LeastConnections,
-            health_monitor: None,
-        },
-    ];
-
-    let virtual_servers = vec![
-        LbVirtualServer {
-            id: "vs-defra-web".into(),
-            name: "defra-web-vs".into(),
-            vip: "10.10.10.50".into(),
-            port: 443,
-            protocol: LbProtocol::Https,
-            pool_id: "pool-defra-web".into(),
-            site: "DEFRA".into(),
-            ssl_profile: Some("standard-tls".into()),
-            persistence_method: PersistenceMethod::Cookie,
-            status: VirtualServerStatus::Online,
-        },
-        LbVirtualServer {
-            id: "vs-defra-admin".into(),
-            name: "defra-admin-vs".into(),
-            vip: "10.10.10.51".into(),
-            port: 80,
-            protocol: LbProtocol::Http,
-            pool_id: "pool-defra-web".into(),
-            site: "DEFRA".into(),
-            ssl_profile: None,
-            persistence_method: PersistenceMethod::SourceIp,
-            status: VirtualServerStatus::Draining,
-        },
-        LbVirtualServer {
-            id: "vs-gblon-api".into(),
-            name: "gblon-api-vs".into(),
-            vip: "10.20.10.50".into(),
-            port: 443,
-            protocol: LbProtocol::Https,
-            pool_id: "pool-gblon-api".into(),
-            site: "GBLON".into(),
-            ssl_profile: Some("api-tls".into()),
-            persistence_method: PersistenceMethod::None,
-            status: VirtualServerStatus::Online,
-        },
-        LbVirtualServer {
-            id: "vs-frpar-tcp".into(),
-            name: "frpar-tcp-vs".into(),
-            vip: "10.30.10.50".into(),
-            port: 9000,
-            protocol: LbProtocol::Tcp,
-            pool_id: "pool-frpar-tcp".into(),
-            site: "FRPAR".into(),
-            ssl_profile: None,
-            persistence_method: PersistenceMethod::None,
-            status: VirtualServerStatus::Offline,
-        },
-    ];
-
-    let requests = vec![
-        LbRequest {
-            id: "lbr-defra-001".into(),
-            requester: "alice.operator".into(),
-            virtual_server_name: "defra-web-vs".into(),
-            vip: "10.10.10.50".into(),
-            port: 443,
-            protocol: LbProtocol::Https,
-            site: "DEFRA".into(),
-            pool_members: vec!["defra-web-01".into(), "defra-web-02".into()],
-            status: LbRequestStatus::Provisioned,
-        },
-        LbRequest {
-            id: "lbr-gblon-001".into(),
-            requester: "bob.engineer".into(),
-            virtual_server_name: "gblon-api-vs".into(),
-            vip: "10.20.10.50".into(),
-            port: 443,
-            protocol: LbProtocol::Https,
-            site: "GBLON".into(),
-            pool_members: vec!["gblon-api-01".into(), "gblon-api-02".into()],
-            status: LbRequestStatus::Verified,
-        },
-        LbRequest {
-            id: "lbr-frpar-001".into(),
-            requester: "carol.admin".into(),
-            virtual_server_name: "frpar-tcp-vs".into(),
-            vip: "10.30.10.50".into(),
-            port: 9000,
-            protocol: LbProtocol::Tcp,
-            site: "FRPAR".into(),
-            pool_members: vec!["frpar-tcp-01".into()],
-            status: LbRequestStatus::Validated,
-        },
-    ];
-
-    (virtual_servers, pools, requests)
-}
-
-fn parse_protocol(protocol: &str) -> Result<LbProtocol, String> {
+pub fn parse_protocol(protocol: &str) -> Result<LbProtocol, String> {
     match protocol.to_ascii_uppercase().as_str() {
         "HTTP" => Ok(LbProtocol::Http),
         "HTTPS" => Ok(LbProtocol::Https),
@@ -274,7 +113,7 @@ fn parse_protocol(protocol: &str) -> Result<LbProtocol, String> {
     }
 }
 
-fn parse_algorithm(algorithm: &str) -> Result<PoolAlgorithm, String> {
+pub fn parse_algorithm(algorithm: &str) -> Result<PoolAlgorithm, String> {
     match algorithm
         .to_ascii_lowercase()
         .replace(['-', '_'], "")
@@ -290,7 +129,7 @@ fn parse_algorithm(algorithm: &str) -> Result<PoolAlgorithm, String> {
     }
 }
 
-fn member_from_input(member: &str, default_port: u16) -> Result<PoolMember, String> {
+pub fn member_from_input(member: &str, default_port: u16) -> Result<PoolMember, String> {
     let parts: Vec<&str> = member.split(':').collect();
     let hostname = parts
         .first()
@@ -308,6 +147,11 @@ fn member_from_input(member: &str, default_port: u16) -> Result<PoolMember, Stri
             .map_err(|_| format!("Invalid pool member port: {}", value))?,
         None => default_port,
     };
+    // Reject port 0 here (engine -> 400) rather than letting it reach the DB
+    // CHECK (port >= 1) and surface as a 500.
+    if port == 0 {
+        return Err("pool member port must be greater than zero".into());
+    }
 
     Ok(PoolMember {
         hostname: hostname.to_string(),
@@ -318,54 +162,11 @@ fn member_from_input(member: &str, default_port: u16) -> Result<PoolMember, Stri
     })
 }
 
-fn pool_for_vs<'a>(pools: &'a [LbPool], vs: &LbVirtualServer) -> Option<&'a LbPool> {
-    pools.iter().find(|pool| pool.id == vs.pool_id)
-}
+// ─── Pure builder for provision_lb ───────────────────────────────────────────
 
-pub fn list_virtual_servers(site: &str) -> Result<Value, String> {
-    let store = lb_store().lock().unwrap();
-    let virtual_servers: Vec<LbVirtualServer> = if site.is_empty() {
-        store.0.clone()
-    } else {
-        store
-            .0
-            .iter()
-            .filter(|vs| vs.site == site)
-            .cloned()
-            .collect()
-    };
-
-    Ok(json!({
-        "source": "dry-run",
-        "site": site,
-        "count": virtual_servers.len(),
-        "virtual_servers": virtual_servers
-    }))
-}
-
-pub fn get_virtual_server(id: &str) -> Result<Value, String> {
-    let store = lb_store().lock().unwrap();
-    let vs = store
-        .0
-        .iter()
-        .find(|candidate| candidate.id == id)
-        .ok_or_else(|| format!("Virtual server '{}' not found", id))?;
-    let pool = pool_for_vs(&store.1, vs).ok_or_else(|| {
-        format!(
-            "Pool '{}' for virtual server '{}' not found",
-            vs.pool_id, id
-        )
-    })?;
-
-    Ok(json!({
-        "source": "dry-run",
-        "virtual_server": vs,
-        "pool": pool,
-        "pool_members": pool.members
-    }))
-}
-
-pub fn provision_lb(
+/// Validate inputs and build the (LbPool, LbVirtualServer, LbRequest) triple.
+/// Does NOT check VIP uniqueness — the caller (handler/repo) is responsible for that.
+pub fn build_provision(
     name: &str,
     vip: &str,
     port: u16,
@@ -373,7 +174,7 @@ pub fn provision_lb(
     site: &str,
     members: Vec<String>,
     algorithm: &str,
-) -> Result<Value, String> {
+) -> Result<(LbPool, LbVirtualServer, LbRequest), String> {
     if name.trim().is_empty() {
         return Err("name cannot be empty".into());
     }
@@ -397,20 +198,19 @@ pub fn provision_lb(
         .map(|member| member_from_input(member, port))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut store = lb_store().lock().unwrap();
-    if store.0.iter().any(|vs| vs.vip == vip && vs.site == site) {
-        return Err(format!(
-            "VIP '{}' is already in use at site '{}'",
-            vip, site
-        ));
+    // Reject duplicate member hostnames within one request here (engine -> 400),
+    // rather than letting the second one hit the lb_pool_members PK
+    // (pool_id, hostname) and surface as a unique-violation/500.
+    let mut seen_hostnames = std::collections::HashSet::new();
+    for m in &pool_members {
+        if !seen_hostnames.insert(m.hostname.as_str()) {
+            return Err(format!("duplicate pool member hostname '{}'", m.hostname));
+        }
     }
 
-    let suffix = Uuid::new_v4()
-        .to_string()
-        .split('-')
-        .next()
-        .unwrap_or("unknown")
-        .to_string();
+    // Full UUID (not just the first 8-hex segment) for the generated ids, so a
+    // birthday collision can't fail the PK insert with a (now 409-mapped) error.
+    let suffix = Uuid::new_v4().to_string();
     let pool = LbPool {
         id: format!("pool-{}-{}", site.to_lowercase(), suffix),
         name: format!("{}-pool", name),
@@ -447,184 +247,71 @@ pub fn provision_lb(
         status: LbRequestStatus::Provisioned,
     };
 
-    store.1.push(pool.clone());
-    store.0.push(virtual_server.clone());
-    store.2.push(request.clone());
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "provision-lb",
-        "providerCallsEnabled": false,
-        "virtual_server": virtual_server,
-        "pool": pool,
-        "request": request
-    }))
+    Ok((pool, virtual_server, request))
 }
 
-pub fn add_pool_member(vs_id: &str, hostname: &str, ip: &str, port: u16) -> Result<Value, String> {
-    if hostname.trim().is_empty() {
-        return Err("hostname cannot be empty".into());
-    }
-    if ip.trim().is_empty() {
-        return Err("ip cannot be empty".into());
-    }
-    if port == 0 {
-        return Err("port must be greater than zero".into());
-    }
+// ─── Pure read functions (degrade to empty when called without DB data) ───────
 
-    let mut store = lb_store().lock().unwrap();
-    let pool_id = store
-        .0
-        .iter()
-        .find(|vs| vs.id == vs_id)
-        .map(|vs| vs.pool_id.clone())
-        .ok_or_else(|| format!("Virtual server '{}' not found", vs_id))?;
-    let pool = store
-        .1
-        .iter_mut()
-        .find(|candidate| candidate.id == pool_id)
-        .ok_or_else(|| format!("Pool '{}' not found", pool_id))?;
-
-    if pool
-        .members
-        .iter()
-        .any(|member| member.hostname == hostname)
-    {
-        return Err(format!(
-            "Pool member '{}' already exists on virtual server '{}'",
-            hostname, vs_id
-        ));
-    }
-
-    let member = PoolMember {
-        hostname: hostname.to_string(),
-        ip: ip.to_string(),
-        port,
-        weight: 1,
-        status: PoolMemberStatus::Up,
-    };
-    pool.members.push(member.clone());
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "add-pool-member",
-        "virtual_server_id": vs_id,
-        "pool_id": pool.id,
-        "member": member,
-        "member_count": pool.members.len()
-    }))
-}
-
-pub fn remove_pool_member(vs_id: &str, hostname: &str) -> Result<Value, String> {
-    let mut store = lb_store().lock().unwrap();
-    let pool_id = store
-        .0
-        .iter()
-        .find(|vs| vs.id == vs_id)
-        .map(|vs| vs.pool_id.clone())
-        .ok_or_else(|| format!("Virtual server '{}' not found", vs_id))?;
-    let pool = store
-        .1
-        .iter_mut()
-        .find(|candidate| candidate.id == pool_id)
-        .ok_or_else(|| format!("Pool '{}' not found", pool_id))?;
-    let original_len = pool.members.len();
-    pool.members.retain(|member| member.hostname != hostname);
-
-    if pool.members.len() == original_len {
-        return Err(format!(
-            "Pool member '{}' not found on virtual server '{}'",
-            hostname, vs_id
-        ));
-    }
-
-    Ok(json!({
-        "source": "dry-run",
-        "action": "remove-pool-member",
-        "virtual_server_id": vs_id,
-        "pool_id": pool.id,
-        "removed_hostname": hostname,
-        "member_count": pool.members.len()
-    }))
-}
-
-pub fn drain_virtual_server(id: &str) -> Result<Value, String> {
-    update_virtual_server_status(id, VirtualServerStatus::Draining, "drain-virtual-server")
-}
-
-pub fn disable_virtual_server(id: &str) -> Result<Value, String> {
-    update_virtual_server_status(id, VirtualServerStatus::Offline, "disable-virtual-server")
-}
-
-pub fn enable_virtual_server(id: &str) -> Result<Value, String> {
-    update_virtual_server_status(id, VirtualServerStatus::Online, "enable-virtual-server")
-}
-
-fn update_virtual_server_status(
-    id: &str,
-    status: VirtualServerStatus,
-    action: &str,
+/// Build the list_virtual_servers JSON response from provided data.
+pub fn list_virtual_servers(
+    site: &str,
+    virtual_servers: &[LbVirtualServer],
 ) -> Result<Value, String> {
-    let mut store = lb_store().lock().unwrap();
-    let vs = store
-        .0
-        .iter_mut()
-        .find(|candidate| candidate.id == id)
-        .ok_or_else(|| format!("Virtual server '{}' not found", id))?;
-
-    vs.status = status;
+    let filtered: Vec<&LbVirtualServer> = if site.is_empty() {
+        virtual_servers.iter().collect()
+    } else {
+        virtual_servers
+            .iter()
+            .filter(|vs| vs.site == site)
+            .collect()
+    };
 
     Ok(json!({
-        "source": "dry-run",
-        "action": action,
-        "providerCallsEnabled": false,
-        "virtual_server": vs,
-        "new_connections": if vs.status == VirtualServerStatus::Draining { "stopped" } else { "allowed" }
+        "source": "db",
+        "site": site,
+        "count": filtered.len(),
+        "virtual_servers": filtered
     }))
 }
 
-pub fn get_lb_status(site: &str) -> Result<Value, String> {
-    let store = lb_store().lock().unwrap();
-    let virtual_servers: Vec<&LbVirtualServer> = store
-        .0
-        .iter()
-        .filter(|vs| site.is_empty() || vs.site == site)
-        .collect();
-    let pools: Vec<&LbPool> = store
-        .1
-        .iter()
-        .filter(|pool| site.is_empty() || pool.site == site)
-        .collect();
-    let up_members = pools
-        .iter()
-        .flat_map(|pool| &pool.members)
-        .filter(|member| member.status == PoolMemberStatus::Up)
-        .count();
-    let down_members = pools
-        .iter()
-        .flat_map(|pool| &pool.members)
-        .filter(|member| member.status == PoolMemberStatus::Down)
-        .count();
+/// Build the get_virtual_server JSON response from provided vs and pool.
+pub fn get_virtual_server(vs: &LbVirtualServer, pool: &LbPool) -> Value {
+    json!({
+        "source": "db",
+        "virtual_server": vs,
+        "pool": pool,
+        "pool_members": pool.members
+    })
+}
 
-    Ok(json!({
-        "source": "dry-run",
+/// Build the get_lb_status JSON response from aggregate counts.
+pub fn get_lb_status(
+    site: &str,
+    vs_count: i64,
+    pool_count: i64,
+    up_members: i64,
+    down_members: i64,
+    offline_vs: i64,
+    draining_vs: i64,
+) -> Value {
+    json!({
+        "source": "db",
         "site": site,
-        "virtual_server_count": virtual_servers.len(),
-        "pool_count": pools.len(),
+        "virtual_server_count": vs_count,
+        "pool_count": pool_count,
         "up_members": up_members,
         "down_members": down_members,
-        "offline_virtual_servers": virtual_servers
-            .iter()
-            .filter(|vs| vs.status == VirtualServerStatus::Offline)
-            .count(),
-        "draining_virtual_servers": virtual_servers
-            .iter()
-            .filter(|vs| vs.status == VirtualServerStatus::Draining)
-            .count()
-    }))
+        "offline_virtual_servers": offline_vs,
+        "draining_virtual_servers": draining_vs
+    })
 }
 
-pub fn validate_vip(vip: &str, site: &str) -> Result<Value, String> {
+/// Validate that a VIP is available at a site (pure computation over provided data).
+pub fn validate_vip(
+    vip: &str,
+    site: &str,
+    conflict: Option<&LbVirtualServer>,
+) -> Result<Value, String> {
     if vip.trim().is_empty() {
         return Err("vip cannot be empty".into());
     }
@@ -632,11 +319,8 @@ pub fn validate_vip(vip: &str, site: &str) -> Result<Value, String> {
         return Err("site cannot be empty".into());
     }
 
-    let store = lb_store().lock().unwrap();
-    let conflict = store.0.iter().find(|vs| vs.vip == vip && vs.site == site);
-
     Ok(json!({
-        "source": "dry-run",
+        "source": "db",
         "vip": vip,
         "site": site,
         "available": conflict.is_none(),
@@ -648,131 +332,191 @@ pub fn validate_vip(vip: &str, site: &str) -> Result<Value, String> {
 mod tests {
     use super::*;
 
-    fn unique_site(prefix: &str) -> String {
-        format!(
-            "{}{}",
-            prefix,
-            Uuid::new_v4()
-                .to_string()
-                .split('-')
-                .next()
-                .unwrap_or("site")
-                .to_ascii_uppercase()
-        )
-    }
-
     #[test]
-    fn test_provision_and_list_lb() {
-        let site = unique_site("LB");
-        let provisioned = provision_lb(
+    fn test_build_provision_https_sets_ssl_profile() {
+        let (pool, vs, req) = build_provision(
             "test-web-vs",
             "10.99.10.10",
             443,
             "HTTPS",
-            &site,
+            "TESTSITE",
             vec!["test-web-01:10.99.20.11:8443".into()],
             "RoundRobin",
         )
         .unwrap();
 
-        assert_eq!(provisioned["source"], "dry-run");
-        assert_eq!(provisioned["virtual_server"]["name"], "test-web-vs");
-        assert_eq!(provisioned["pool"]["members"].as_array().unwrap().len(), 1);
-
-        let listed = list_virtual_servers(&site).unwrap();
-        assert_eq!(listed["count"], 1);
-        assert_eq!(listed["virtual_servers"][0]["site"], site);
+        assert_eq!(vs.name, "test-web-vs");
+        assert_eq!(vs.ssl_profile, Some("standard-tls".into()));
+        assert_eq!(vs.protocol, LbProtocol::Https);
+        assert_eq!(vs.status, VirtualServerStatus::Online);
+        assert_eq!(vs.persistence_method, PersistenceMethod::None);
+        assert_eq!(pool.members.len(), 1);
+        assert_eq!(pool.members[0].hostname, "test-web-01");
+        assert_eq!(pool.members[0].port, 8443);
+        assert_eq!(pool.members[0].status, PoolMemberStatus::Up);
+        assert_eq!(req.status, LbRequestStatus::Provisioned);
+        assert_eq!(req.pool_members, vec!["test-web-01:10.99.20.11:8443"]);
     }
 
     #[test]
-    fn test_add_and_remove_pool_member() {
-        let site = unique_site("LR");
-        let provisioned = provision_lb(
-            "member-test-vs",
+    fn test_build_provision_tcp_no_ssl_profile() {
+        let (_, vs, _) = build_provision(
+            "test-tcp-vs",
             "10.99.10.11",
-            80,
-            "HTTP",
-            &site,
-            vec!["member-test-01:10.99.20.12:8080".into()],
+            9000,
+            "TCP",
+            "TESTSITE",
+            vec!["tcp-node-01:10.1.1.1:9000".into()],
             "LeastConnections",
         )
         .unwrap();
-        let vs_id = provisioned["virtual_server"]["id"].as_str().unwrap();
 
-        let added = add_pool_member(vs_id, "member-test-02", "10.99.20.13", 8080).unwrap();
-        assert_eq!(added["member_count"], 2);
-        assert_eq!(added["member"]["status"], "up");
-
-        let removed = remove_pool_member(vs_id, "member-test-02").unwrap();
-        assert_eq!(removed["member_count"], 1);
+        assert_eq!(vs.protocol, LbProtocol::Tcp);
+        assert!(vs.ssl_profile.is_none());
     }
 
     #[test]
-    fn test_drain_and_enable_vs() {
-        let site = unique_site("LD");
-        let provisioned = provision_lb(
-            "drain-test-vs",
-            "10.99.10.12",
-            443,
-            "HTTPS",
-            &site,
-            vec!["drain-test-01:10.99.20.14:8443".into()],
-            "Weighted",
-        )
-        .unwrap();
-        let vs_id = provisioned["virtual_server"]["id"].as_str().unwrap();
-
-        let drained = drain_virtual_server(vs_id).unwrap();
-        assert_eq!(drained["virtual_server"]["status"], "draining");
-        assert_eq!(drained["new_connections"], "stopped");
-
-        let enabled = enable_virtual_server(vs_id).unwrap();
-        assert_eq!(enabled["virtual_server"]["status"], "online");
-        assert_eq!(enabled["new_connections"], "allowed");
+    fn test_build_provision_validation_errors() {
+        assert!(build_provision("", "10.1.1.1", 80, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
+        assert!(build_provision("name", "", 80, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
+        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "", vec!["x".into()], "RoundRobin").is_err());
+        assert!(build_provision("name", "10.1.1.1", 0, "HTTP", "S", vec!["x".into()], "RoundRobin").is_err());
+        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec![], "RoundRobin").is_err());
+        assert!(build_provision("name", "10.1.1.1", 80, "INVALID", "S", vec!["x".into()], "RoundRobin").is_err());
+        assert!(build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["x".into()], "BadAlgo").is_err());
+        // A member with an explicit port 0 must be rejected (engine -> 400), not
+        // pass through to the DB CHECK (port >= 1) as a 500.
+        assert!(
+            build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["host:10.0.0.1:0".into()], "RoundRobin").is_err(),
+            "member port 0 must be rejected"
+        );
+        // Duplicate member hostnames within one request must be rejected (engine ->
+        // 400), not hit the lb_pool_members (pool_id, hostname) PK as a 500.
+        assert!(
+            build_provision("name", "10.1.1.1", 80, "HTTP", "S", vec!["dup".into(), "dup".into()], "RoundRobin").is_err(),
+            "duplicate member hostnames must be rejected"
+        );
     }
 
     #[test]
-    fn test_validate_vip_conflict() {
-        let validation = validate_vip("10.10.10.50", "DEFRA").unwrap();
-        assert_eq!(validation["available"], false);
-        assert_eq!(validation["conflict"]["id"], "vs-defra-web");
+    fn test_list_virtual_servers_filter() {
+        let vss = vec![
+            LbVirtualServer {
+                id: "vs-a".into(),
+                name: "a".into(),
+                vip: "1.1.1.1".into(),
+                port: 80,
+                protocol: LbProtocol::Http,
+                pool_id: "p-a".into(),
+                site: "SITEА".into(),
+                ssl_profile: None,
+                persistence_method: PersistenceMethod::None,
+                status: VirtualServerStatus::Online,
+            },
+            LbVirtualServer {
+                id: "vs-b".into(),
+                name: "b".into(),
+                vip: "2.2.2.2".into(),
+                port: 443,
+                protocol: LbProtocol::Https,
+                pool_id: "p-b".into(),
+                site: "SITEB".into(),
+                ssl_profile: None,
+                persistence_method: PersistenceMethod::Cookie,
+                status: VirtualServerStatus::Offline,
+            },
+        ];
+
+        let all = list_virtual_servers("", &vss).unwrap();
+        assert_eq!(all["count"], 2);
+
+        let filtered = list_virtual_servers("SITEА", &vss).unwrap();
+        assert_eq!(filtered["count"], 1);
+        assert_eq!(filtered["virtual_servers"][0]["id"], "vs-a");
     }
 
     #[test]
-    fn test_get_lb_status() {
-        let status = get_lb_status("GBLON").unwrap();
-        assert_eq!(status["source"], "dry-run");
-        assert_eq!(status["virtual_server_count"], 1);
-        assert_eq!(status["pool_count"], 1);
-        assert_eq!(status["up_members"], 1);
-        assert_eq!(status["down_members"], 1);
+    fn test_validate_vip_pure() {
+        let result = validate_vip("10.1.1.1", "SITE", None).unwrap();
+        assert_eq!(result["available"], true);
+        assert!(result["conflict"].is_null());
+
+        let conflict_vs = LbVirtualServer {
+            id: "vs-x".into(),
+            name: "x".into(),
+            vip: "10.1.1.1".into(),
+            port: 80,
+            protocol: LbProtocol::Http,
+            pool_id: "p-x".into(),
+            site: "SITE".into(),
+            ssl_profile: None,
+            persistence_method: PersistenceMethod::None,
+            status: VirtualServerStatus::Online,
+        };
+        let conflict_result = validate_vip("10.1.1.1", "SITE", Some(&conflict_vs)).unwrap();
+        assert_eq!(conflict_result["available"], false);
+        assert_eq!(conflict_result["conflict"]["id"], "vs-x");
     }
 
     #[test]
-    fn test_disable_vs() {
-        let site = unique_site("LO");
-        let provisioned = provision_lb(
-            "disable-test-vs",
-            "10.99.10.13",
-            9000,
-            "TCP",
-            &site,
-            vec!["disable-test-01:10.99.20.15:9000".into()],
-            "RoundRobin",
-        )
-        .unwrap();
-        let vs_id = provisioned["virtual_server"]["id"].as_str().unwrap();
+    fn test_enum_serde_kebab_forms() {
+        // Verify each enum's serde output matches the DB CHECK values exactly.
+        let proto_http = serde_json::to_value(&LbProtocol::Http).unwrap();
+        assert_eq!(proto_http.as_str().unwrap(), "http");
+        let proto_https = serde_json::to_value(&LbProtocol::Https).unwrap();
+        assert_eq!(proto_https.as_str().unwrap(), "https");
+        let proto_tcp = serde_json::to_value(&LbProtocol::Tcp).unwrap();
+        assert_eq!(proto_tcp.as_str().unwrap(), "tcp");
 
-        let disabled = disable_virtual_server(vs_id).unwrap();
-        assert_eq!(disabled["virtual_server"]["status"], "offline");
+        let pm_cookie = serde_json::to_value(&PersistenceMethod::Cookie).unwrap();
+        assert_eq!(pm_cookie.as_str().unwrap(), "cookie");
+        let pm_sourceip = serde_json::to_value(&PersistenceMethod::SourceIp).unwrap();
+        assert_eq!(pm_sourceip.as_str().unwrap(), "source-ip");
+        let pm_none = serde_json::to_value(&PersistenceMethod::None).unwrap();
+        assert_eq!(pm_none.as_str().unwrap(), "none");
+
+        let vs_online = serde_json::to_value(&VirtualServerStatus::Online).unwrap();
+        assert_eq!(vs_online.as_str().unwrap(), "online");
+        let vs_offline = serde_json::to_value(&VirtualServerStatus::Offline).unwrap();
+        assert_eq!(vs_offline.as_str().unwrap(), "offline");
+        let vs_draining = serde_json::to_value(&VirtualServerStatus::Draining).unwrap();
+        assert_eq!(vs_draining.as_str().unwrap(), "draining");
+        let vs_creating = serde_json::to_value(&VirtualServerStatus::Creating).unwrap();
+        assert_eq!(vs_creating.as_str().unwrap(), "creating");
+
+        let algo_rr = serde_json::to_value(&PoolAlgorithm::RoundRobin).unwrap();
+        assert_eq!(algo_rr.as_str().unwrap(), "round-robin");
+        let algo_lc = serde_json::to_value(&PoolAlgorithm::LeastConnections).unwrap();
+        assert_eq!(algo_lc.as_str().unwrap(), "least-connections");
+        let algo_w = serde_json::to_value(&PoolAlgorithm::Weighted).unwrap();
+        assert_eq!(algo_w.as_str().unwrap(), "weighted");
+
+        let ms_up = serde_json::to_value(&PoolMemberStatus::Up).unwrap();
+        assert_eq!(ms_up.as_str().unwrap(), "up");
+        let ms_down = serde_json::to_value(&PoolMemberStatus::Down).unwrap();
+        assert_eq!(ms_down.as_str().unwrap(), "down");
+        let ms_disabled = serde_json::to_value(&PoolMemberStatus::Disabled).unwrap();
+        assert_eq!(ms_disabled.as_str().unwrap(), "disabled");
+        let ms_draining = serde_json::to_value(&PoolMemberStatus::Draining).unwrap();
+        assert_eq!(ms_draining.as_str().unwrap(), "draining");
+
+        let rs_draft = serde_json::to_value(&LbRequestStatus::Draft).unwrap();
+        assert_eq!(rs_draft.as_str().unwrap(), "draft");
+        let rs_validated = serde_json::to_value(&LbRequestStatus::Validated).unwrap();
+        assert_eq!(rs_validated.as_str().unwrap(), "validated");
+        let rs_provisioned = serde_json::to_value(&LbRequestStatus::Provisioned).unwrap();
+        assert_eq!(rs_provisioned.as_str().unwrap(), "provisioned");
+        let rs_verified = serde_json::to_value(&LbRequestStatus::Verified).unwrap();
+        assert_eq!(rs_verified.as_str().unwrap(), "verified");
     }
 
     #[test]
-    fn test_pool_member_status() {
-        let details = get_virtual_server("vs-gblon-api").unwrap();
-        let members = details["pool_members"].as_array().unwrap();
-
-        assert!(members.iter().any(|member| member["status"] == "up"));
-        assert!(members.iter().any(|member| member["status"] == "down"));
+    fn test_parse_algorithm_variants() {
+        assert_eq!(parse_algorithm("RoundRobin").unwrap(), PoolAlgorithm::RoundRobin);
+        assert_eq!(parse_algorithm("round-robin").unwrap(), PoolAlgorithm::RoundRobin);
+        assert_eq!(parse_algorithm("LeastConnections").unwrap(), PoolAlgorithm::LeastConnections);
+        assert_eq!(parse_algorithm("least-connections").unwrap(), PoolAlgorithm::LeastConnections);
+        assert_eq!(parse_algorithm("Weighted").unwrap(), PoolAlgorithm::Weighted);
+        assert!(parse_algorithm("bad").is_err());
     }
 }

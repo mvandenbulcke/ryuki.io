@@ -19879,14 +19879,21 @@ struct LbValidateVipRequest {
 async fn lb_vs_list(
     Query(q): Query<LbSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::list_virtual_servers(q.site.as_deref().unwrap_or(""))
+    let site = q.site.as_deref().unwrap_or("");
+    let vss = match get_db() {
+        Some(pool) => crate::repos::load_balancer::list_virtual_servers(pool, site)
+            .await
+            .map_err(db_error)?,
+        None => vec![],
+    };
+    load_balancer::list_virtual_servers(site, &vss)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn lb_provision(
     Json(b): Json<LbProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::provision_lb(
+    let (pool_entity, vs, request) = load_balancer::build_provision(
         &b.name,
         &b.vip,
         b.port,
@@ -19895,53 +19902,248 @@ async fn lb_provision(
         b.members,
         &b.algorithm,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+
+    let db = get_db().ok_or_else(status_503_no_db)?;
+
+    // Check VIP uniqueness before inserting
+    if let Some(conflict) = crate::repos::load_balancer::find_vip_conflict(db, &vs.vip, &vs.site)
+        .await
+        .map_err(db_error)?
+    {
+        return Err(status_409(&format!(
+            "VIP '{}' is already in use at site '{}'",
+            conflict.vip, conflict.site
+        )));
+    }
+
+    crate::repos::load_balancer::provision_lb(db, &vs, &pool_entity, &request)
+        .await
+        .map_err(|e| {
+            // The find_vip_conflict pre-check above is advisory; the UNIQUE(vip,
+            // site) index is the real guard. A concurrent provision that loses the
+            // race (or any duplicate id) hits a unique-violation here — return 409,
+            // not the blanket 500 from db_error.
+            if let Some(d) = e.as_database_error() {
+                if d.is_unique_violation() {
+                    return status_409(&format!(
+                        "VIP '{}' is already in use at site '{}'",
+                        vs.vip, vs.site
+                    ));
+                }
+            }
+            db_error(e)
+        })?;
+
+    Ok(Json(json!({
+        "source": "db",
+        "action": "provision-lb",
+        "providerCallsEnabled": false,
+        "virtual_server": vs,
+        "pool": pool_entity,
+        "request": request
+    })))
 }
 async fn lb_vs_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::get_virtual_server(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let Some(db) = get_db() else {
+        return Err(status_404(&id));
+    };
+    let (vs, pool) = crate::repos::load_balancer::get_virtual_server_with_pool(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(load_balancer::get_virtual_server(&vs, &pool)))
 }
 async fn lb_pool_member_add(
     Path(id): Path<String>,
     Json(b): Json<LbMemberRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::add_pool_member(&id, &b.hostname, &b.ip, b.port)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    if b.hostname.trim().is_empty() {
+        return Err(status_400("hostname cannot be empty"));
+    }
+    if b.ip.trim().is_empty() {
+        return Err(status_400("ip cannot be empty"));
+    }
+    if b.port == 0 {
+        return Err(status_400("port must be greater than zero"));
+    }
+
+    let db = get_db().ok_or_else(status_503_no_db)?;
+
+    // Resolve VS → pool_id
+    let vs = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let pool_id = vs.pool_id.clone();
+
+    let member = ryuki_engine::load_balancer::PoolMember {
+        hostname: b.hostname.clone(),
+        ip: b.ip.clone(),
+        port: b.port,
+        weight: 1,
+        status: ryuki_engine::load_balancer::PoolMemberStatus::Up,
+    };
+
+    crate::repos::load_balancer::add_pool_member(db, &pool_id, &member)
+        .await
+        .map_err(|e| {
+            if e.as_database_error()
+                .map(|de| de.is_unique_violation())
+                .unwrap_or(false)
+            {
+                status_409(&format!(
+                    "Pool member '{}' already exists on virtual server '{}'",
+                    b.hostname, id
+                ))
+            } else {
+                db_error(e)
+            }
+        })?;
+
+    // Return updated member count
+    let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &pool_id)
+        .await
+        .map_err(db_error)?;
+    let member_count = pool.as_ref().map(|p| p.members.len()).unwrap_or(0);
+
+    Ok(Json(json!({
+        "source": "db",
+        "action": "add-pool-member",
+        "virtual_server_id": id,
+        "pool_id": pool_id,
+        "member": member,
+        "member_count": member_count
+    })))
 }
 async fn lb_pool_member_remove(
-    Path((id, _hostname)): Path<(String, String)>,
+    Path((id, hostname)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::remove_pool_member(&id, &_hostname)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+
+    let vs = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let pool_id = vs.pool_id.clone();
+
+    let removed = crate::repos::load_balancer::remove_pool_member(db, &pool_id, &hostname)
+        .await
+        .map_err(db_error)?;
+
+    if !removed {
+        return Err(status_404(&format!(
+            "Pool member '{}' not found on virtual server '{}'",
+            hostname, id
+        )));
+    }
+
+    let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &pool_id)
+        .await
+        .map_err(db_error)?;
+    let member_count = pool.as_ref().map(|p| p.members.len()).unwrap_or(0);
+
+    Ok(Json(json!({
+        "source": "db",
+        "action": "remove-pool-member",
+        "virtual_server_id": id,
+        "pool_id": pool_id,
+        "removed_hostname": hostname,
+        "member_count": member_count
+    })))
 }
 async fn lb_vs_drain(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::drain_virtual_server(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let vs = crate::repos::load_balancer::update_vs_status(
+        db,
+        &id,
+        &ryuki_engine::load_balancer::VirtualServerStatus::Draining,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "drain-virtual-server",
+        "providerCallsEnabled": false,
+        "virtual_server": vs,
+        "new_connections": "stopped"
+    })))
 }
 async fn lb_vs_disable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::disable_virtual_server(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let vs = crate::repos::load_balancer::update_vs_status(
+        db,
+        &id,
+        &ryuki_engine::load_balancer::VirtualServerStatus::Offline,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "disable-virtual-server",
+        "providerCallsEnabled": false,
+        "virtual_server": vs,
+        "new_connections": "allowed"
+    })))
 }
 async fn lb_vs_enable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::enable_virtual_server(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let vs = crate::repos::load_balancer::update_vs_status(
+        db,
+        &id,
+        &ryuki_engine::load_balancer::VirtualServerStatus::Online,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "enable-virtual-server",
+        "providerCallsEnabled": false,
+        "virtual_server": vs,
+        "new_connections": "allowed"
+    })))
 }
 async fn lb_status(Query(q): Query<LbSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::get_lb_status(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let site = q.site.as_deref().unwrap_or("");
+    let (vs_count, pool_count, up_members, down_members, offline_vs, draining_vs) =
+        match get_db() {
+            Some(pool) => crate::repos::load_balancer::get_lb_status(pool, site)
+                .await
+                .map_err(db_error)?,
+            None => (0, 0, 0, 0, 0, 0),
+        };
+    Ok(Json(load_balancer::get_lb_status(
+        site,
+        vs_count,
+        pool_count,
+        up_members,
+        down_members,
+        offline_vs,
+        draining_vs,
+    )))
 }
 async fn lb_validate_vip(
     Json(b): Json<LbValidateVipRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    load_balancer::validate_vip(&b.vip, &b.site)
+    // Pure validation first
+    if b.vip.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "vip cannot be empty"}))));
+    }
+    if b.site.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "site cannot be empty"}))));
+    }
+
+    let conflict = match get_db() {
+        Some(pool) => crate::repos::load_balancer::find_vip_conflict(pool, &b.vip, &b.site)
+            .await
+            .map_err(db_error)?,
+        None => None,
+    };
+
+    load_balancer::validate_vip(&b.vip, &b.site, conflict.as_ref())
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }

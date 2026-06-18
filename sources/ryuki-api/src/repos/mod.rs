@@ -25,6 +25,7 @@ pub mod gmsa_accounts;
 pub mod golden_images;
 pub mod hardware_assets;
 pub mod immutability_compliance;
+pub mod load_balancer;
 pub mod log_forwarders;
 pub mod network_readiness;
 pub mod os_baseline;
