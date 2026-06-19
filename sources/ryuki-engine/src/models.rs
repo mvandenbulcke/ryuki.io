@@ -109,9 +109,11 @@ pub enum RequestStatus {
     Verifying,
     Completed,
     // Post-completion governed lifecycle (Theme 8): operator-initiated, additive.
-    // `Completed` remains a valid resting state; Protecting/Operational extend it.
+    // `Completed` remains a valid resting state; Protecting/Operational extend it,
+    // and Retired is the governed end-of-life terminal.
     Protecting,
     Operational,
+    Retired,
     Failed,
     Rejected,
     Cancelled,
@@ -131,6 +133,7 @@ impl RequestStatus {
             Self::Completed => "completed",
             Self::Protecting => "protecting",
             Self::Operational => "operational",
+            Self::Retired => "retired",
             Self::Failed => "failed",
             Self::Rejected => "rejected",
             Self::Cancelled => "cancelled",
@@ -157,6 +160,7 @@ impl RequestStatus {
             Self::Completed
             | Self::Protecting
             | Self::Operational
+            | Self::Retired
             | Self::Failed
             | Self::Rejected
             | Self::Cancelled => true,

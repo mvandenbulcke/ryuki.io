@@ -1460,6 +1460,11 @@ pub enum CreateLiveApplyJobError {
     /// The supplied spec/request did not satisfy the LiveApply preconditions.
     #[error("invalid live-apply parameters: {0}")]
     Invalid(&'static str),
+    /// The request has already CONCLUDED (Completed, the post-completion
+    /// lifecycle Protecting/Operational/Retired, or a terminal state); a
+    /// live-apply grant must never be minted against it. Maps to 409 Conflict.
+    #[error("request has concluded; a live-apply grant cannot be minted")]
+    RequestConcluded,
     /// A database error occurred while enqueuing the job.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -1502,6 +1507,31 @@ pub async fn create_live_apply_job(
     // on LiveApply results. Fail closed (return Err) rather than panic so a
     // future operator endpoint can surface a 4xx instead of crashing the request.
     validate_live_apply_params(spec, request_id).map_err(CreateLiveApplyJobError::Invalid)?;
+
+    // Fail closed: never mint a LiveApply grant for a request that has CONCLUDED
+    // (Completed, the post-completion lifecycle Protecting/Operational/Retired, or
+    // any terminal state). This gate lives in the SHARED minting choke point so it
+    // covers EVERY path — the request-scoped approval AND the operator/admin
+    // endpoint (/api/admin/agents/live-apply-jobs), which would otherwise bypass
+    // the request-scoped status check entirely. A stale plan can therefore never
+    // re-open a concluded request to infrastructure mutation. The exhaustive
+    // is_concluded() classifier is the single source of truth.
+    let req_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(pool)
+            .await?;
+    match req_status {
+        None => {
+            return Err(CreateLiveApplyJobError::Invalid(
+                "request not found; cannot mint a live-apply grant",
+            ));
+        }
+        Some(status) if crate::contracts::db_status_to_request_status(&status).is_concluded() => {
+            return Err(CreateLiveApplyJobError::RequestConcluded);
+        }
+        Some(_) => {}
+    }
 
     // Validate the grant fields before signing — a signed grant is authoritative,
     // so it must never carry a bogus digest, an empty approver, or an abusive
@@ -1700,6 +1730,9 @@ pub async fn approve_live_apply_with(
     .await
     .map_err(|e| match e {
         CreateLiveApplyJobError::Invalid(msg) => bad_request(msg),
+        CreateLiveApplyJobError::RequestConcluded => {
+            conflict("request has concluded; a live-apply grant cannot be minted")
+        }
         CreateLiveApplyJobError::Db(db_e) => db_err(db_e),
     })?;
 
@@ -4352,6 +4385,22 @@ mod tests {
         TEST_CP_KEY.clone()
     }
 
+    /// Seed a minimal ACTIVE (`locked`) request row for `request_id`. A LiveApply
+    /// grant may only be minted for a real, non-concluded request — the gate in
+    /// `create_live_apply_job` loads `requests.status` — so any test that mints a
+    /// grant directly must seed the request first.
+    async fn seed_active_request(pool: &PgPool, request_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'live-apply-test', 'locked', 'lock', '[]'::jsonb) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .expect("seed active request for live-apply minting");
+    }
+
     /// Seed a Pending LiveApply job carrying a CP-signed grant (live_context),
     /// signed with `signing_key`. The grant's `request_id` is bound to the job
     /// spec by default; pass a different `grant_request_id` to exercise the
@@ -4681,6 +4730,17 @@ mod tests {
         let request_id = Uuid::new_v4();
         let plan_digest = proto_sha256(b"approved-plan-bytes");
 
+        // A LiveApply grant may only be minted for a real, ACTIVE request — the
+        // concluded-status gate in create_live_apply_job loads requests.status.
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 's5a2-live-apply', 'locked', 'lock', '[]'::jsonb)",
+        )
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .expect("seed active request for live-apply minting");
+
         let spec = JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -4736,6 +4796,71 @@ mod tests {
         pool.close().await;
     }
 
+    /// The concluded-status gate: a LiveApply grant must NEVER be minted for a
+    /// request that has concluded — here a `retired` request. This is the shared
+    /// choke-point check that closes the admin-route (`/api/admin/agents/
+    /// live-apply-jobs`) bypass of the request-scoped status guard.
+    #[tokio::test]
+    async fn db_s5a2_create_live_apply_job_refused_for_concluded_request() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use chrono::Utc;
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let request_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 's5a2-concluded', 'retired', 'retire', '[]'::jsonb)",
+        )
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .expect("seed retired request");
+
+        let spec = JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+
+        let result = create_live_apply_job(
+            &pool,
+            request_id,
+            "s5a2-concluded-plt",
+            &spec,
+            &proto_sha256(b"approved-plan-bytes"),
+            "ops-alice",
+            Utc::now() + Duration::hours(1),
+            &cp_key,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(CreateLiveApplyJobError::RequestConcluded)),
+            "minting must be refused for a concluded (retired) request; got {result:?}"
+        );
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+        assert_eq!(count, 0, "no LiveApply job minted for a concluded request");
+
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(request_id)
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+    }
+
     /// End-to-end: create_live_apply_job produces a CP-signed grant; the agent
     /// builds a result carrying the matching plan digest; the S5a-1 verifier
     /// in post_job_result_with_pool accepts it. This is the composition test:
@@ -4758,6 +4883,7 @@ mod tests {
         let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id).await;
         let plan_digest = proto_sha256(b"the-exact-approved-plan");
 
         let spec = JobSpec {
@@ -4856,6 +4982,7 @@ mod tests {
         let (agent_token, agent_key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
 
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id).await;
         let approved_digest = proto_sha256(b"the-approved-plan");
         let unapproved_digest = proto_sha256(b"a-different-unapproved-plan");
 
@@ -5237,6 +5364,7 @@ mod tests {
         use std::collections::BTreeMap;
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id).await;
         let platform = format!(
             "s5a2-badf-{}",
             &Uuid::new_v4().to_string().replace('-', "")[..8]
@@ -5659,6 +5787,7 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5c-t1-{suffix}");
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id).await;
         let digest = proto_sha256(b"approved-plan-s5c");
 
         let spec = JobSpec {
@@ -5742,6 +5871,9 @@ mod tests {
 
         let cp_key = ensure_test_cp_key();
         let request_id = Uuid::new_v4();
+        // Seed an active request so the bad-DIGEST rejection (a post-gate check
+        // in create_live_apply_job) is what's exercised — not the concluded gate.
+        seed_active_request(&pool, request_id).await;
         let spec = JobSpec {
             request_id,
             offering_id: Uuid::new_v4(),
@@ -5892,6 +6024,7 @@ mod tests {
         let suffix = &Uuid::new_v4().to_string().replace('-', "")[..8];
         let platform = format!("s5c-t6-{suffix}");
         let request_id = Uuid::new_v4();
+        seed_active_request(&pool, request_id).await;
         let digest = proto_sha256(b"plan-for-approver-test");
         let sentinel_approver = "session-derived-approver-not-from-body";
 

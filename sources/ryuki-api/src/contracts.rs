@@ -119,6 +119,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/verify", post(requests_verify))
         .route("/api/requests/{id}/protect", post(requests_protect))
         .route("/api/requests/{id}/publish", post(requests_publish))
+        .route("/api/requests/{id}/retire", post(requests_retire))
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route(
@@ -11174,7 +11175,7 @@ fn parse_request_type(
     }
 }
 
-fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
+pub(crate) fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
     use ryuki_engine::models::RequestStatus;
     match s {
         "intake" => RequestStatus::Intake,
@@ -11187,6 +11188,7 @@ fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
         "completed" => RequestStatus::Completed,
         "protecting" => RequestStatus::Protecting,
         "operational" => RequestStatus::Operational,
+        "retired" => RequestStatus::Retired,
         "failed" => RequestStatus::Failed,
         "rejected" => RequestStatus::Rejected,
         "cancelled" => RequestStatus::Cancelled,
@@ -11208,6 +11210,7 @@ fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str
         RequestStatus::Completed => "completed",
         RequestStatus::Protecting => "protecting",
         RequestStatus::Operational => "operational",
+        RequestStatus::Retired => "retired",
         RequestStatus::Failed => "failed",
         RequestStatus::Rejected => "rejected",
         RequestStatus::Cancelled => "cancelled",
@@ -13230,6 +13233,115 @@ async fn requests_publish(
         Some(&from_stage),
         &to_status,
         "publish",
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/retire — the governed end-of-life stage (Theme 8).
+/// Valid only from `Operational`; computes a dry-run decommission plan
+/// (quarantine-first, rollback-capable) and transitions the request to `Retired`
+/// (the terminal end-of-life state). Operator-initiated; `execute` permission.
+/// Mirrors `requests_verify` (dual-store + CAS).
+async fn requests_retire(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.retire").await;
+        return Err(status_403());
+    }
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let evidence = request_lifecycle::retire_request(&request).map_err(map_engine_error)?;
+        let mut retired_request = request.clone();
+        retired_request
+            .stages
+            .push(completed_request_stage("retire", evidence.clone()));
+
+        let retired = request_lifecycle::transition_status(
+            &retired_request,
+            ryuki_engine::models::RequestStatus::Retired,
+        )
+        .map_err(map_engine_error)?;
+
+        let stages_json =
+            serde_json::to_value(&retired_request.stages).unwrap_or_else(|_| json!([]));
+        let db_status = request_status_to_db(&retired.status);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.retire",
+            &current.status,
+            db_status,
+            "retire",
+            json!({}),
+            TransitionArtifacts::stages_only(stages_json),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
+    }
+
+    // ── No-DB branch ────────────────────────────────────────────────────────
+    let cloned_request = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].clone()
+    };
+
+    let evidence = request_lifecycle::retire_request(&cloned_request).map_err(map_engine_error)?;
+    let mut retired_request = cloned_request.clone();
+    retired_request
+        .stages
+        .push(completed_request_stage("retire", evidence.clone()));
+
+    let retired = request_lifecycle::transition_status(
+        &retired_request,
+        ryuki_engine::models::RequestStatus::Retired,
+    )
+    .map_err(map_engine_error)?;
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+    if store[idx].status != cloned_request.status {
+        return Err(status_409(&format!(
+            "request {request_id} was modified concurrently during retire; retry"
+        )));
+    }
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    let to_status = retired.status.as_str().to_string();
+    store[idx] = retired;
+    drop(store);
+
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.retire",
+        Some(&from_status),
+        Some(&from_stage),
+        &to_status,
+        "retire",
     )
     .await;
 
@@ -23849,6 +23961,35 @@ mod db_lifecycle_tests {
         assert!(
             st == StatusCode::BAD_REQUEST || st == StatusCode::CONFLICT,
             "re-publish rejected; got {st}"
+        );
+
+        // Retire: Operational -> Retired with decommission-plan evidence.
+        let Json(retire_ev) = requests_retire(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("retire must succeed from Operational");
+        assert!(
+            retire_ev
+                .as_array()
+                .map(|a| a.iter().any(|e| e["key"] == "retirement-plan"))
+                .unwrap_or(false),
+            "retire returns the decommission retirement-plan evidence"
+        );
+        let row = read_global_row(pool, id).await;
+        assert_eq!(row.status, "retired", "request is Retired after retire");
+        let rehydrated = db_row_to_request(&row, &id_str);
+        let names: Vec<&str> = rehydrated.stages.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"retire"),
+            "retire stage persisted; got {names:?}"
+        );
+
+        // From Retired (terminal), retire is no longer valid (engine guard -> 400).
+        let Err((st, _)) = requests_retire(p(&id_str), AuthExtractor(session.clone())).await else {
+            panic!("retire from Retired must be refused");
+        };
+        assert!(
+            st == StatusCode::BAD_REQUEST || st == StatusCode::CONFLICT,
+            "re-retire rejected; got {st}"
         );
 
         cleanup_request(pool, id).await;

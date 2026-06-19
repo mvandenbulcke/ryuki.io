@@ -716,6 +716,53 @@ pub fn publish_request(request: &Request) -> Result<Vec<EvidenceItem>, String> {
     ])
 }
 
+/// Produce the Retire-stage evidence for an `Operational` request (pure,
+/// dry-run). Computes a decommission plan (quarantine-first, rollback-capable)
+/// for the delivered asset via the server_decommission engine. Guards that the
+/// request is `Operational` and its `publish` stage finished; the caller appends
+/// a completed `retire` stage with this evidence and transitions the request to
+/// `Retired` (the governed end-of-life terminal).
+pub fn retire_request(request: &Request) -> Result<Vec<EvidenceItem>, String> {
+    if request.status != RequestStatus::Operational {
+        return Err(format!(
+            "Cannot retire request in status {:?}. Request must be Operational first.",
+            request.status
+        ));
+    }
+    if !has_completed_stage(request, "publish") {
+        return Err("Cannot retire a request without a completed publish stage.".into());
+    }
+
+    let os_family = request
+        .metadata
+        .get("operating_system")
+        .map(String::as_str)
+        .unwrap_or("linux");
+    let plan = crate::server_decommission::plan_decommission(
+        &request.id,
+        &request.site,
+        os_family,
+        ServerType::VM,
+        "lifecycle retirement",
+        true,
+        30,
+    )?;
+
+    Ok(vec![EvidenceItem {
+        key: "retirement-plan".into(),
+        value: format!(
+            "DRY-RUN: Retirement plan for request {} at site {} — {} dependency check(s), {}-day quarantine, final backup required",
+            request.id,
+            request.site,
+            plan.dependencies_identified.len(),
+            plan.quarantine_days,
+        ),
+        redacted_value: None,
+        redacted: false,
+        evidence_type: EvidenceType::Summary,
+    }])
+}
+
 pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result<Request, String> {
     let valid_transitions: Vec<(RequestStatus, RequestStatus)> = vec![
         (RequestStatus::Draft, RequestStatus::Intake),
@@ -729,6 +776,7 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
         // Post-completion governed lifecycle (Theme 8): operator-initiated.
         (RequestStatus::Completed, RequestStatus::Protecting),
         (RequestStatus::Protecting, RequestStatus::Operational),
+        (RequestStatus::Operational, RequestStatus::Retired),
     ];
 
     if !valid_transitions.contains(&(request.status.clone(), new_status.clone())) {
@@ -772,6 +820,9 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
         }
         (RequestStatus::Protecting, RequestStatus::Operational) => {
             require_completed_stage_for_transition(request, "protect", &new_status)?;
+        }
+        (RequestStatus::Operational, RequestStatus::Retired) => {
+            require_completed_stage_for_transition(request, "publish", &new_status)?;
         }
         _ => {}
     }
@@ -1440,6 +1491,7 @@ mod tests {
             RequestStatus::Completed,
             RequestStatus::Protecting,
             RequestStatus::Operational,
+            RequestStatus::Retired,
             RequestStatus::Failed,
             RequestStatus::Rejected,
             RequestStatus::Cancelled,
@@ -1454,6 +1506,7 @@ mod tests {
             RequestStatus::Completed,
             RequestStatus::Protecting,
             RequestStatus::Operational,
+            RequestStatus::Retired,
         ] {
             let mut req = make_completed_request();
             req.status = s.clone();
@@ -1463,5 +1516,57 @@ mod tests {
         let mut active = make_completed_request();
         active.status = RequestStatus::Executing;
         assert!(fail_request(&active, "boom").is_ok());
+    }
+
+    // ── Retire stage (Theme 8 slice 2) ───────────────────────────────────────
+
+    /// An Operational request with the protect+publish stages finished — the
+    /// state from which Retire is valid.
+    fn make_operational_request() -> Request {
+        let mut req = make_completed_request();
+        req.status = RequestStatus::Operational;
+        req.stages = vec![
+            completed_stage("verify"),
+            completed_stage("protect"),
+            completed_stage("publish"),
+        ];
+        req
+    }
+
+    #[test]
+    fn test_retire_request_produces_decommission_evidence() {
+        let req = make_operational_request();
+        let evidence =
+            retire_request(&req).expect("retire should succeed for an operational request");
+        assert!(evidence.iter().any(|e| e.key == "retirement-plan"));
+        assert!(evidence[0].value.contains("quarantine"));
+    }
+
+    #[test]
+    fn test_retire_request_rejects_non_operational() {
+        let req = make_completed_request(); // Completed, not Operational
+        assert!(retire_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_retire_request_requires_completed_publish_stage() {
+        let mut req = make_operational_request();
+        req.stages = vec![completed_stage("verify"), completed_stage("protect")]; // no publish
+        assert!(retire_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_transition_operational_to_retired() {
+        let req = make_operational_request();
+        let retired = transition_status(&req, RequestStatus::Retired)
+            .expect("Operational -> Retired with a completed publish stage");
+        assert_eq!(retired.status, RequestStatus::Retired);
+    }
+
+    #[test]
+    fn test_transition_operational_to_retired_requires_publish_stage() {
+        let mut req = make_operational_request();
+        req.stages = vec![completed_stage("verify"), completed_stage("protect")]; // no publish
+        assert!(transition_status(&req, RequestStatus::Retired).is_err());
     }
 }

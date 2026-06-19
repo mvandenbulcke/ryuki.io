@@ -2688,6 +2688,7 @@ mod tests {
         "/api/requests/00000000-0000-0000-0000-000000000000/verify",
         "/api/requests/00000000-0000-0000-0000-000000000000/protect",
         "/api/requests/00000000-0000-0000-0000-000000000000/publish",
+        "/api/requests/00000000-0000-0000-0000-000000000000/retire",
         "/api/requests/00000000-0000-0000-0000-000000000000/reject",
         "/api/requests/00000000-0000-0000-0000-000000000000/cancel",
         "/api/identity/access-review/r1/start",
