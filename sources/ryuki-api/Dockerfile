@@ -22,6 +22,7 @@ COPY portal/ portal/
 COPY scripts/validator-rs/ scripts/validator-rs/
 COPY tests/ tests/
 COPY migrations/ migrations/
+COPY catalog/ catalog/
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -38,6 +39,7 @@ COPY portal/ portal/
 COPY scripts/validator-rs/ scripts/validator-rs/
 COPY tests/ tests/
 COPY migrations/ migrations/
+COPY catalog/ catalog/
 
 RUN cargo build --release -p ryuki-api
 

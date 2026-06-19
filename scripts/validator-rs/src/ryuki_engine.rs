@@ -52,6 +52,7 @@ const DECLARED_MODULES: &[&str] = &[
     "os_baseline",
     "outage_comms",
     "patch_engine",
+    "policy_engine",
     "repository_capacity",
     "request_lifecycle",
     "runbook_execution",

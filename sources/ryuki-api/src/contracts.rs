@@ -120,6 +120,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/protect", post(requests_protect))
         .route("/api/requests/{id}/publish", post(requests_publish))
         .route("/api/requests/{id}/retire", post(requests_retire))
+        .route("/api/requests/{id}/policy-eval", get(requests_policy_eval))
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route(
@@ -198,6 +199,10 @@ pub fn routes() -> Router {
         .route(
             "/api/catalog/policy-guardrails-contract",
             get(catalog_policy_guardrails),
+        )
+        .route(
+            "/api/catalog/policy-guardrails",
+            get(catalog_policy_guardrails_rules),
         )
         .route("/api/catalog/access-control", get(catalog_access_control))
         .route("/api/catalog/approval-routes", get(catalog_approval_routes))
@@ -3592,6 +3597,72 @@ async fn catalog_policy_guardrails() -> Json<Value> {
             {"id":"raw-policy-data-not-exposed","decision":"block","requirement":"Policy guardrail evidence must use safe summaries only and must not expose raw request payloads, raw policy inputs, tenant IDs, object IDs, private network values, credentials, tokens, or provider payloads.","evidence":"Evidence references"}
         ]
     }))
+}
+
+/// GET /api/catalog/policy-guardrails — the REAL parsed guardrail rules from the
+/// policy engine (`catalog/policy-guardrails.yaml`), evaluable per request via
+/// `/api/requests/{id}/policy-eval`. Distinct from the `-contract` descriptor
+/// above, which is a static readiness disclaimer.
+async fn catalog_policy_guardrails_rules() -> Json<Value> {
+    let g = ryuki_engine::policy_engine::guardrails();
+    Json(json!({
+        "source": "policy-engine",
+        "version": g.version,
+        "status": g.status,
+        "ruleCount": g.rules.len(),
+        "rules": g.rules,
+    }))
+}
+
+/// GET /api/requests/{id}/policy-eval — evaluate the request's policy readiness
+/// against the guardrail catalog. Informational (a read): it reports which
+/// guardrail rules' required inputs are satisfied; it does NOT gate the
+/// lifecycle. Degrades to 404 when the request is unknown.
+async fn requests_policy_eval(Path(request_id): Path<String>) -> ApiResult {
+    let request = if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let row: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+        db_row_to_request(&row, &request_id)
+    } else {
+        request_store()
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.id == request_id)
+            .cloned()
+            .ok_or_else(|| status_404(&request_id))?
+    };
+
+    // Resolve the catalog workflow id the SAME way every execution path does
+    // (RequestType slug like "server-deployment" -> "linux-/windows-server-
+    // deployment" via the operating_system metadata). The catalog's appliesTo
+    // lists use the resolved offering ids, so evaluating against the raw
+    // request.offering_id would match zero rules for the common request types.
+    let workflow_id = ryuki_runner::iac::resolve_offering_id(&request);
+    let decisions = ryuki_engine::policy_engine::evaluate(&request, &workflow_id);
+    let applicable = !decisions.is_empty();
+    let blocking_failures = decisions
+        .iter()
+        .filter(|d| !d.passed && d.decision == "block")
+        .count();
+    Ok(Json(json!({
+        "source": "policy-engine",
+        "request_id": request.id,
+        "workflow_id": workflow_id,
+        // No guardrail rule applies to this workflow -> NOT "ready" (do not
+        // report vacuous readiness when nothing was actually evaluated).
+        "applicable": applicable,
+        "ready": applicable && decisions.iter().all(|d| d.passed),
+        "blocking_failures": blocking_failures,
+        "decisions": decisions,
+    })))
 }
 
 async fn catalog_access_control() -> Json<Value> {
