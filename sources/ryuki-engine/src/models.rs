@@ -108,6 +108,10 @@ pub enum RequestStatus {
     Executing,
     Verifying,
     Completed,
+    // Post-completion governed lifecycle (Theme 8): operator-initiated, additive.
+    // `Completed` remains a valid resting state; Protecting/Operational extend it.
+    Protecting,
+    Operational,
     Failed,
     Rejected,
     Cancelled,
@@ -125,9 +129,37 @@ impl RequestStatus {
             Self::Executing => "executing",
             Self::Verifying => "verifying",
             Self::Completed => "completed",
+            Self::Protecting => "protecting",
+            Self::Operational => "operational",
             Self::Failed => "failed",
             Self::Rejected => "rejected",
             Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether the request has CONCLUDED its delivery: it reached `Completed`
+    /// (and possibly the post-completion governed lifecycle `Protecting`/
+    /// `Operational`), or it ended in a terminal state (`Failed`/`Rejected`/
+    /// `Cancelled`). A concluded request must never be failed, and a live-apply
+    /// grant must never be authorised against one (a stale plan must not re-open
+    /// it). The match is EXHAUSTIVE so a future status variant fails closed at
+    /// compile time rather than silently slipping past these guards.
+    pub fn is_concluded(&self) -> bool {
+        match self {
+            Self::Draft
+            | Self::Intake
+            | Self::Validated
+            | Self::Planned
+            | Self::Approved
+            | Self::Locked
+            | Self::Executing
+            | Self::Verifying => false,
+            Self::Completed
+            | Self::Protecting
+            | Self::Operational
+            | Self::Failed
+            | Self::Rejected
+            | Self::Cancelled => true,
         }
     }
 }

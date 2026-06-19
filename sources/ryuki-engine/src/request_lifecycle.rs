@@ -632,6 +632,90 @@ pub fn verify_request(request: &Request) -> Result<Vec<EvidenceItem>, String> {
     Ok(evidence_items)
 }
 
+/// Produce the Protect-stage evidence for a `Completed` request (pure, dry-run).
+/// Computes a backup-coverage summary for the delivered asset's site/environment.
+/// Guards that the request is `Completed` and its `verify` stage finished; the
+/// caller appends a completed `protect` stage with this evidence and transitions
+/// the request to `Protecting`.
+pub fn protect_request(request: &Request) -> Result<Vec<EvidenceItem>, String> {
+    if request.status != RequestStatus::Completed {
+        return Err(format!(
+            "Cannot protect request in status {:?}. Request must be Completed first.",
+            request.status
+        ));
+    }
+    if !has_completed_stage(request, "verify") {
+        return Err("Cannot protect a request without a completed verify stage.".into());
+    }
+
+    let report = crate::backup_engine::generate_backup_coverage_report(
+        std::slice::from_ref(&request.site),
+        std::slice::from_ref(&request.environment),
+    )?;
+
+    Ok(vec![EvidenceItem {
+        key: "protection-policy-summary".into(),
+        value: format!(
+            "DRY-RUN: Backup coverage {:.1}% ({}/{} assets), {} critical gap(s) for site {} environment {}",
+            report.coverage_percentage,
+            report.covered_assets,
+            report.total_assets,
+            report.critical_gaps.len(),
+            request.site,
+            request.environment
+        ),
+        redacted_value: None,
+        redacted: false,
+        evidence_type: EvidenceType::Summary,
+    }])
+}
+
+/// Produce the Publish-stage evidence for a `Protecting` request (pure, dry-run).
+/// Imports the CI records and prepares the CMDB export representation. Guards that
+/// the request is `Protecting` and its `protect` stage finished; the caller appends
+/// a completed `publish` stage with this evidence and transitions to `Operational`.
+pub fn publish_request(request: &Request) -> Result<Vec<EvidenceItem>, String> {
+    if request.status != RequestStatus::Protecting {
+        return Err(format!(
+            "Cannot publish request in status {:?}. Request must be Protecting first.",
+            request.status
+        ));
+    }
+    if !has_completed_stage(request, "protect") {
+        return Err("Cannot publish a request without a completed protect stage.".into());
+    }
+
+    let records = crate::cmdb_engine::import_cmdb_records("cmdb-excel-export")?;
+    let export = crate::cmdb_engine::export_cmdb(&records, "json")?;
+
+    Ok(vec![
+        EvidenceItem {
+            key: "publish-plan".into(),
+            value: format!(
+                "DRY-RUN: Publishing {} CI record(s) for request {} (site {}, environment {}) to the CMDB",
+                records.len(),
+                request.id,
+                request.site,
+                request.environment
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::Summary,
+        },
+        EvidenceItem {
+            key: "cmdb-export".into(),
+            value: format!(
+                "DRY-RUN: CMDB export prepared ({} records, json format, {} bytes)",
+                records.len(),
+                export.len()
+            ),
+            redacted_value: None,
+            redacted: false,
+            evidence_type: EvidenceType::ExportPackage,
+        },
+    ])
+}
+
 pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result<Request, String> {
     let valid_transitions: Vec<(RequestStatus, RequestStatus)> = vec![
         (RequestStatus::Draft, RequestStatus::Intake),
@@ -642,6 +726,9 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
         (RequestStatus::Locked, RequestStatus::Executing),
         (RequestStatus::Executing, RequestStatus::Verifying),
         (RequestStatus::Verifying, RequestStatus::Completed),
+        // Post-completion governed lifecycle (Theme 8): operator-initiated.
+        (RequestStatus::Completed, RequestStatus::Protecting),
+        (RequestStatus::Protecting, RequestStatus::Operational),
     ];
 
     if !valid_transitions.contains(&(request.status.clone(), new_status.clone())) {
@@ -680,6 +767,12 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
         (RequestStatus::Verifying, RequestStatus::Completed) => {
             require_completed_stage_for_transition(request, "verify", &new_status)?;
         }
+        (RequestStatus::Completed, RequestStatus::Protecting) => {
+            require_completed_stage_for_transition(request, "verify", &new_status)?;
+        }
+        (RequestStatus::Protecting, RequestStatus::Operational) => {
+            require_completed_stage_for_transition(request, "protect", &new_status)?;
+        }
         _ => {}
     }
 
@@ -691,8 +784,10 @@ pub fn transition_status(request: &Request, new_status: RequestStatus) -> Result
 }
 
 pub fn fail_request(request: &Request, reason: &str) -> Result<Request, String> {
-    if request.status == RequestStatus::Completed {
-        return Err("Cannot fail a completed request.".into());
+    // A request that has concluded — Completed, the post-completion lifecycle
+    // (Protecting/Operational), or any terminal state — must not be failed.
+    if request.status.is_concluded() {
+        return Err("Cannot fail a request that has already concluded.".into());
     }
 
     let mut failed = request.clone();
@@ -1204,5 +1299,169 @@ mod tests {
         let req = make_test_request();
         assert!(cancel_request(&req, "alice", "").is_err());
         assert!(cancel_request(&req, "alice", "   ").is_err());
+    }
+
+    // ── Post-completion lifecycle (Theme 8): protect / publish ───────────────
+
+    fn completed_stage(name: &str) -> Stage {
+        Stage {
+            name: name.into(),
+            status: StageStatus::Completed,
+            started_at: None,
+            completed_at: None,
+            evidence: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn pending_stage(name: &str) -> Stage {
+        Stage {
+            name: name.into(),
+            status: StageStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            evidence: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A request that has reached `Completed` with a finished `verify` stage and
+    /// the pending protect/publish stages `plan_request` seeds. Site DEFRA is a
+    /// VALID_SITE so the backup-coverage report succeeds.
+    fn make_completed_request() -> Request {
+        let mut req = make_test_request();
+        req.status = RequestStatus::Completed;
+        req.stages = vec![
+            completed_stage("verify"),
+            pending_stage("protect"),
+            pending_stage("publish"),
+        ];
+        req
+    }
+
+    #[test]
+    fn test_protect_request_produces_backup_evidence() {
+        let req = make_completed_request();
+        let evidence =
+            protect_request(&req).expect("protect should succeed for a completed request");
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.key == "protection-policy-summary")
+        );
+        assert!(evidence[0].value.contains("Backup coverage"));
+    }
+
+    #[test]
+    fn test_protect_request_rejects_non_completed() {
+        let mut req = make_completed_request();
+        req.status = RequestStatus::Verifying;
+        assert!(protect_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_protect_request_requires_completed_verify_stage() {
+        let mut req = make_completed_request();
+        req.stages = vec![pending_stage("protect")]; // no completed verify
+        assert!(protect_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_publish_request_produces_cmdb_evidence() {
+        let mut req = make_completed_request();
+        req.status = RequestStatus::Protecting;
+        req.stages = vec![
+            completed_stage("verify"),
+            completed_stage("protect"),
+            pending_stage("publish"),
+        ];
+        let evidence =
+            publish_request(&req).expect("publish should succeed for a protecting request");
+        assert!(evidence.iter().any(|e| e.key == "publish-plan"));
+        assert!(evidence.iter().any(|e| e.key == "cmdb-export"));
+    }
+
+    #[test]
+    fn test_publish_request_rejects_non_protecting() {
+        let req = make_completed_request(); // status Completed, not Protecting
+        assert!(publish_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_publish_request_requires_completed_protect_stage() {
+        let mut req = make_completed_request();
+        req.status = RequestStatus::Protecting; // protect stage still pending
+        assert!(publish_request(&req).is_err());
+    }
+
+    #[test]
+    fn test_transition_completed_to_protecting_then_operational() {
+        let req = make_completed_request();
+        let protecting = transition_status(&req, RequestStatus::Protecting)
+            .expect("Completed -> Protecting with a completed verify stage");
+        assert_eq!(protecting.status, RequestStatus::Protecting);
+
+        let mut ready = protecting.clone();
+        ready.stages = vec![completed_stage("verify"), completed_stage("protect")];
+        let operational = transition_status(&ready, RequestStatus::Operational)
+            .expect("Protecting -> Operational with a completed protect stage");
+        assert_eq!(operational.status, RequestStatus::Operational);
+    }
+
+    #[test]
+    fn test_transition_protecting_to_operational_requires_protect_stage() {
+        let mut req = make_completed_request();
+        req.status = RequestStatus::Protecting; // protect not completed
+        assert!(transition_status(&req, RequestStatus::Operational).is_err());
+    }
+
+    #[test]
+    fn test_transition_completed_to_protecting_requires_verify_stage() {
+        let mut req = make_completed_request();
+        req.stages = vec![pending_stage("protect")]; // no completed verify
+        assert!(transition_status(&req, RequestStatus::Protecting).is_err());
+    }
+
+    #[test]
+    fn test_is_concluded_classification() {
+        for s in [
+            RequestStatus::Draft,
+            RequestStatus::Intake,
+            RequestStatus::Validated,
+            RequestStatus::Planned,
+            RequestStatus::Approved,
+            RequestStatus::Locked,
+            RequestStatus::Executing,
+            RequestStatus::Verifying,
+        ] {
+            assert!(!s.is_concluded(), "{s:?} is active, not concluded");
+        }
+        for s in [
+            RequestStatus::Completed,
+            RequestStatus::Protecting,
+            RequestStatus::Operational,
+            RequestStatus::Failed,
+            RequestStatus::Rejected,
+            RequestStatus::Cancelled,
+        ] {
+            assert!(s.is_concluded(), "{s:?} has concluded");
+        }
+    }
+
+    #[test]
+    fn test_fail_request_refuses_concluded_states() {
+        for s in [
+            RequestStatus::Completed,
+            RequestStatus::Protecting,
+            RequestStatus::Operational,
+        ] {
+            let mut req = make_completed_request();
+            req.status = s.clone();
+            assert!(fail_request(&req, "x").is_err(), "{s:?} must be unfailable");
+        }
+        // An active (not yet concluded) request remains failable.
+        let mut active = make_completed_request();
+        active.status = RequestStatus::Executing;
+        assert!(fail_request(&active, "boom").is_ok());
     }
 }

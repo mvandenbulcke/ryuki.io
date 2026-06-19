@@ -117,6 +117,8 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/lock", post(requests_lock))
         .route("/api/requests/{id}/execute", post(requests_execute))
         .route("/api/requests/{id}/verify", post(requests_verify))
+        .route("/api/requests/{id}/protect", post(requests_protect))
+        .route("/api/requests/{id}/publish", post(requests_publish))
         .route("/api/requests/{id}/reject", post(requests_reject))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route(
@@ -11183,6 +11185,8 @@ fn db_status_to_request_status(s: &str) -> ryuki_engine::models::RequestStatus {
         "executing" | "executed" => RequestStatus::Executing,
         "verifying" | "verified" => RequestStatus::Verifying,
         "completed" => RequestStatus::Completed,
+        "protecting" => RequestStatus::Protecting,
+        "operational" => RequestStatus::Operational,
         "failed" => RequestStatus::Failed,
         "rejected" => RequestStatus::Rejected,
         "cancelled" => RequestStatus::Cancelled,
@@ -11202,6 +11206,8 @@ fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str
         RequestStatus::Executing => "executing",
         RequestStatus::Verifying => "verifying",
         RequestStatus::Completed => "completed",
+        RequestStatus::Protecting => "protecting",
+        RequestStatus::Operational => "operational",
         RequestStatus::Failed => "failed",
         RequestStatus::Rejected => "rejected",
         RequestStatus::Cancelled => "cancelled",
@@ -11700,13 +11706,13 @@ async fn requests_approve_live_apply(
         ));
     };
 
-    // A live apply must never be authorised once the request itself is terminal
-    // (a stale plan must not re-open a cancelled/rejected/completed/failed
-    // request — its result backlink would no-op anyway).
-    if matches!(
-        plan.req_status.as_str(),
-        "completed" | "failed" | "cancelled" | "rejected"
-    ) {
+    // A live apply must never be authorised once the request itself has
+    // CONCLUDED — a terminal state (cancelled/rejected/completed/failed) OR the
+    // post-completion governed lifecycle (protecting/operational). A stale plan
+    // must not re-open such a request (its result backlink would no-op anyway).
+    // is_concluded() is an exhaustive engine classifier, so a future status
+    // variant fails closed here at compile time instead of slipping through.
+    if db_status_to_request_status(&plan.req_status).is_concluded() {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
@@ -13008,6 +13014,222 @@ async fn requests_verify(
         Some(&from_stage),
         &to_status,
         "verify",
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/protect — the post-completion Protect stage (Theme 8).
+/// Valid only from `Completed`; computes a dry-run backup-coverage summary for
+/// the delivered asset and transitions the request to `Protecting`. Operator-
+/// initiated; `execute` permission. Mirrors `requests_verify` (dual-store + CAS).
+async fn requests_protect(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.protect").await;
+        return Err(status_403());
+    }
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let evidence = request_lifecycle::protect_request(&request).map_err(map_engine_error)?;
+        let mut protected_request = request.clone();
+        protected_request
+            .stages
+            .push(completed_request_stage("protect", evidence.clone()));
+
+        let protecting = request_lifecycle::transition_status(
+            &protected_request,
+            ryuki_engine::models::RequestStatus::Protecting,
+        )
+        .map_err(map_engine_error)?;
+
+        let stages_json =
+            serde_json::to_value(&protected_request.stages).unwrap_or_else(|_| json!([]));
+        let db_status = request_status_to_db(&protecting.status);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.protect",
+            &current.status,
+            db_status,
+            "protect",
+            json!({}),
+            TransitionArtifacts::stages_only(stages_json),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
+    }
+
+    // ── No-DB branch ────────────────────────────────────────────────────────
+    let cloned_request = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].clone()
+    };
+
+    let evidence = request_lifecycle::protect_request(&cloned_request).map_err(map_engine_error)?;
+    let mut protected_request = cloned_request.clone();
+    protected_request
+        .stages
+        .push(completed_request_stage("protect", evidence.clone()));
+
+    let protecting = request_lifecycle::transition_status(
+        &protected_request,
+        ryuki_engine::models::RequestStatus::Protecting,
+    )
+    .map_err(map_engine_error)?;
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+    if store[idx].status != cloned_request.status {
+        return Err(status_409(&format!(
+            "request {request_id} was modified concurrently during protect; retry"
+        )));
+    }
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    let to_status = protecting.status.as_str().to_string();
+    store[idx] = protecting;
+    drop(store);
+
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.protect",
+        Some(&from_status),
+        Some(&from_stage),
+        &to_status,
+        "protect",
+    )
+    .await;
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/publish — the post-completion Publish stage (Theme 8).
+/// Valid only from `Protecting`; imports the CI records and prepares the dry-run
+/// CMDB export, then transitions the request to `Operational` (its resting
+/// state). Operator-initiated; `execute` permission. Mirrors `requests_verify`.
+async fn requests_publish(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.publish").await;
+        return Err(status_403());
+    }
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let evidence = request_lifecycle::publish_request(&request).map_err(map_engine_error)?;
+        let mut published_request = request.clone();
+        published_request
+            .stages
+            .push(completed_request_stage("publish", evidence.clone()));
+
+        let operational = request_lifecycle::transition_status(
+            &published_request,
+            ryuki_engine::models::RequestStatus::Operational,
+        )
+        .map_err(map_engine_error)?;
+
+        let stages_json =
+            serde_json::to_value(&published_request.stages).unwrap_or_else(|_| json!([]));
+        let db_status = request_status_to_db(&operational.status);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.publish",
+            &current.status,
+            db_status,
+            "publish",
+            json!({}),
+            TransitionArtifacts::stages_only(stages_json),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()));
+    }
+
+    // ── No-DB branch ────────────────────────────────────────────────────────
+    let cloned_request = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].clone()
+    };
+
+    let evidence = request_lifecycle::publish_request(&cloned_request).map_err(map_engine_error)?;
+    let mut published_request = cloned_request.clone();
+    published_request
+        .stages
+        .push(completed_request_stage("publish", evidence.clone()));
+
+    let operational = request_lifecycle::transition_status(
+        &published_request,
+        ryuki_engine::models::RequestStatus::Operational,
+    )
+    .map_err(map_engine_error)?;
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+    if store[idx].status != cloned_request.status {
+        return Err(status_409(&format!(
+            "request {request_id} was modified concurrently during publish; retry"
+        )));
+    }
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    let to_status = operational.status.as_str().to_string();
+    store[idx] = operational;
+    drop(store);
+
+    record_local_transition(
+        &session,
+        &request_id,
+        "request.publish",
+        Some(&from_status),
+        Some(&from_stage),
+        &to_status,
+        "publish",
     )
     .await;
 
@@ -23513,6 +23735,120 @@ mod db_lifecycle_tests {
         assert!(
             !fabricated,
             "no fabricated validate stage (None timestamps + empty evidence) may appear"
+        );
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// Theme 8: the post-completion Protect -> Publish stages persist durably and
+    /// advance the request Completed -> Protecting -> Operational, with the
+    /// protect/publish stages rehydrating from the JSONB column.
+    #[tokio::test]
+    async fn test_protect_publish_persists_post_completion() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let session = admin_session("approver-pp");
+        let p = |s: &str| Path(s.to_string());
+
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(session.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        let _ = requests_validate(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("plan");
+        let _ = requests_approve(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("approve");
+        let _ = requests_lock(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("lock");
+
+        // Execute dispatches an async agent job (the request sits in Executing
+        // until the agent-result backlink — a separate slice — drives it to
+        // Completed). Protect requires Completed, so force the row to Completed
+        // with a finished verify stage, standing in for that backlink.
+        let row = read_global_row(pool, id).await;
+        let mut req = db_row_to_request(&row, &id_str);
+        req.status = ryuki_engine::models::RequestStatus::Completed;
+        // A faithful Completed row has the execute + verify stages finished (the
+        // real path: agent-result backlink completes execute, then requests_verify
+        // completes verify and lands Completed).
+        req.stages.push(completed_request_stage("execute", vec![]));
+        req.stages.push(completed_request_stage("verify", vec![]));
+        let stages_json = serde_json::to_value(&req.stages).unwrap_or_else(|_| json!([]));
+        sqlx::query(
+            "UPDATE requests SET status = 'completed', stage = 'verify', stages = $2::jsonb WHERE id = $1",
+        )
+        .bind(id)
+        .bind(&stages_json)
+        .execute(pool)
+        .await
+        .expect("force completed state");
+
+        // Protect: Completed -> Protecting with backup-coverage evidence.
+        let Json(protect_ev) = requests_protect(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("protect must succeed from Completed");
+        assert!(
+            protect_ev
+                .as_array()
+                .map(|a| a.iter().any(|e| e["key"] == "protection-policy-summary"))
+                .unwrap_or(false),
+            "protect returns the backup-coverage evidence"
+        );
+        let row = read_global_row(pool, id).await;
+        assert_eq!(
+            row.status, "protecting",
+            "request is Protecting after protect"
+        );
+
+        // Publish: Protecting -> Operational with CMDB evidence.
+        let Json(publish_ev) = requests_publish(p(&id_str), AuthExtractor(session.clone()))
+            .await
+            .expect("publish must succeed from Protecting");
+        assert!(
+            publish_ev
+                .as_array()
+                .map(|a| a.iter().any(|e| e["key"] == "publish-plan"))
+                .unwrap_or(false),
+            "publish returns the CMDB publish-plan evidence"
+        );
+        let row = read_global_row(pool, id).await;
+        assert_eq!(
+            row.status, "operational",
+            "request rests in Operational after publish"
+        );
+
+        // The protect + publish stages rehydrate from the persisted JSONB.
+        let rehydrated = db_row_to_request(&row, &id_str);
+        let names: Vec<&str> = rehydrated.stages.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"protect") && names.contains(&"publish"),
+            "post-completion stages persisted; got {names:?}"
+        );
+
+        // From Operational, publish is no longer valid (engine guard -> 400).
+        let Err((st, _)) = requests_publish(p(&id_str), AuthExtractor(session.clone())).await
+        else {
+            panic!("publish from Operational must be refused");
+        };
+        assert!(
+            st == StatusCode::BAD_REQUEST || st == StatusCode::CONFLICT,
+            "re-publish rejected; got {st}"
         );
 
         cleanup_request(pool, id).await;
