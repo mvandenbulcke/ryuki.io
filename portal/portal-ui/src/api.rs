@@ -18,6 +18,9 @@ const CATALOG_REQUEST_FORM_PATH: &str = "/api/catalog/request-form-contract";
 const SITE_CATALOG_PATH: &str = "/api/catalog/site-catalog-contract";
 const APPROVAL_DECISION_READINESS_PATH: &str = "/api/approvals/decision-readiness-contract";
 const APPROVALS_PENDING_PATH: &str = "/api/approvals/pending";
+const NOTIFICATIONS_PATH: &str = "/api/notifications";
+const NOTIFICATIONS_UNREAD_COUNT_PATH: &str = "/api/notifications/unread-count";
+const NOTIFICATIONS_READ_ALL_PATH: &str = "/api/notifications/read-all";
 const ACTIVITY_OPERATION_QUEUE_PATH: &str = "/api/operations/activity-queue-contract";
 /// Global, newest-first governance audit feed across all requests.
 const ACTIVITY_AUDIT_FEED_PATH: &str = "/api/activity/audit";
@@ -162,6 +165,18 @@ pub fn approval_decision_readiness_path() -> &'static str {
 
 pub fn approvals_pending_path() -> &'static str {
     APPROVALS_PENDING_PATH
+}
+
+pub fn notifications_path() -> &'static str {
+    NOTIFICATIONS_PATH
+}
+
+pub fn notifications_unread_count_path() -> &'static str {
+    NOTIFICATIONS_UNREAD_COUNT_PATH
+}
+
+pub fn notifications_read_all_path() -> &'static str {
+    NOTIFICATIONS_READ_ALL_PATH
 }
 
 pub fn activity_operation_queue_path() -> &'static str {
@@ -475,6 +490,24 @@ mod tests {
     #[test]
     fn approvals_pending_path_matches_api_contract() {
         assert_eq!(approvals_pending_path(), "/api/approvals/pending");
+    }
+
+    #[test]
+    fn notifications_path_matches_api_contract() {
+        assert_eq!(notifications_path(), "/api/notifications");
+    }
+
+    #[test]
+    fn notifications_unread_count_path_matches_api_contract() {
+        assert_eq!(
+            notifications_unread_count_path(),
+            "/api/notifications/unread-count"
+        );
+    }
+
+    #[test]
+    fn notifications_read_all_path_matches_api_contract() {
+        assert_eq!(notifications_read_all_path(), "/api/notifications/read-all");
     }
 
     #[test]

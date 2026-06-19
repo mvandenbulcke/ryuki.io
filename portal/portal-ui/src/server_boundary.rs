@@ -13,7 +13,8 @@ use crate::api::{
     datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
     dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
     evidence_export_retention_path, evidence_summary_path, integrations_path,
-    inventory_ownership_risk_path, inventory_resource_overview_path, operation_runs_path,
+    inventory_ownership_risk_path, inventory_resource_overview_path, notifications_path,
+    notifications_read_all_path, notifications_unread_count_path, operation_runs_path,
     operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
     platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
     request_intake_form_preview_path, request_intake_path, request_list_path,
@@ -68,10 +69,10 @@ use crate::models::{
     CreateRequestPayload, CreateTokenPayload, CreateTokenResult, DatacenterFailingChecksSummary,
     DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
     DatacenterSitesCatalog, DryRunPlanSummary, EvidencePackExport, EvidenceSummary, ExecutionJob,
-    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, OperationRunSummary,
-    PlatformHealth, PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext,
-    PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm,
-    RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
+    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, NotificationSummary,
+    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
+    PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail,
+    RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
     StageActionResponse, UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
@@ -117,6 +118,9 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     site_catalog_path,
     approval_decision_readiness_path,
     approvals_pending_path,
+    notifications_path,
+    notifications_unread_count_path,
+    notifications_read_all_path,
     activity_operation_queue_path,
     activity_audit_feed_path,
     shift_queue_path,
@@ -1815,6 +1819,109 @@ pub async fn get_approvals_pending() -> Result<Vec<RequestSummary>, ServerFnErro
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
             "approvals pending fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Live GET of the current user's unread notification count. Returns 0 in
+/// static/degraded mode (consistent with Slice 1's no-DB behavior). The API
+/// returns a `{source, unread}` envelope, so we parse the wrapper.
+#[server(prefix = "/portal/api", endpoint = "notifications-unread-count")]
+pub async fn get_notifications_unread_count() -> Result<i64, ServerFnError> {
+    #[derive(serde::Deserialize)]
+    struct UnreadEnvelope {
+        unread: i64,
+    }
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(notifications_unread_count_path())
+        .map_err(|_| {
+            ServerFnError::new("notifications unread-count API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(0);
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let env: UnreadEnvelope = response.json().map_err(|_| {
+                ServerFnError::new("notifications unread-count response was malformed")
+            })?;
+            Ok(env.unread)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "notifications unread-count fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Live GET of the current user's notification feed (newest first). Returns an
+/// empty Vec in static/degraded mode. The API returns a `{source, notifications}`
+/// envelope, so we parse the wrapper and return the inner list.
+#[server(prefix = "/portal/api", endpoint = "notifications-list")]
+pub async fn get_notifications() -> Result<Vec<NotificationSummary>, ServerFnError> {
+    #[derive(serde::Deserialize)]
+    struct ListEnvelope {
+        notifications: Vec<NotificationSummary>,
+    }
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(notifications_path())
+        .map_err(|_| ServerFnError::new("notifications list API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(Vec::new());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.get(path, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let env: ListEnvelope = response
+                .json()
+                .map_err(|_| ServerFnError::new("notifications list response was malformed"))?;
+            Ok(env.notifications)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "notifications list fetch failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
+/// Live POST marking ALL of the current user's notifications read. Returns the
+/// number marked (0 in static/degraded mode). The API returns a `{source, marked}`
+/// envelope. Identity is server-derived; the API self-scopes to the caller.
+#[server(prefix = "/portal/api", endpoint = "notifications-mark-all-read")]
+pub async fn mark_all_notifications_read() -> Result<i64, ServerFnError> {
+    #[derive(serde::Deserialize)]
+    struct MarkedEnvelope {
+        marked: i64,
+    }
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = boundary
+        .validate_platform_api_path(notifications_read_all_path())
+        .map_err(|_| {
+            ServerFnError::new("notifications read-all API path failed same-origin guard")
+        })?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(0);
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.post(path, None, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => {
+            let env: MarkedEnvelope = response
+                .json()
+                .map_err(|_| ServerFnError::new("notifications read-all response was malformed"))?;
+            Ok(env.marked)
+        }
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "notifications read-all failed",
         ))),
         Err(_) => Err(ServerFnError::new("API unreachable")),
     }

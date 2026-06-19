@@ -2264,3 +2264,186 @@ tbody tr:hover {
     transform: none;
   }
 }
+
+/* ── Notification bell (Theme 9 slice 2) ─────────────────────────────────────
+   Lives in the top-bar .toolbar next to the theme toggle. The bell button
+   matches .theme-toggle (pill, 31px); the dropdown is absolutely positioned
+   under it and shares the surface/line/shadow language of the rest of the UI. */
+.notif-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.notif-bell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 31px;
+  height: 31px;
+  border: 1px solid var(--line);
+  border-radius: 100px;
+  background: var(--surface-2);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.notif-bell:hover {
+  background: var(--accent-bg);
+  border-color: var(--pill-border);
+}
+
+.notif-bell-icon {
+  pointer-events: none;
+}
+
+.notif-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 100px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.notif-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 340px;
+  max-width: 88vw;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  z-index: 50;
+  overflow: hidden;
+}
+
+.notif-dropdown-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.notif-dropdown-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.notif-mark-all {
+  border: 1px solid var(--line);
+  border-radius: 100px;
+  background: var(--surface-2);
+  color: var(--accent-text);
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.notif-mark-all:hover {
+  border-color: var(--pill-border);
+}
+
+.notif-mark-all:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.notif-dropdown-body {
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.notif-loading,
+.notif-empty,
+.notif-error {
+  margin: 0;
+  padding: 18px 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.notif-error {
+  color: var(--accent-text);
+}
+
+.notif-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.notif-item {
+  display: flex;
+  gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.notif-item:last-child {
+  border-bottom: none;
+}
+
+.notif-item.unread {
+  background: var(--accent-bg);
+}
+
+.notif-sev {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 100px;
+  background: var(--muted);
+}
+
+.notif-sev.sev-success {
+  background: var(--good);
+}
+
+.notif-sev.sev-warning {
+  background: var(--warn);
+}
+
+.notif-sev.sev-critical {
+  background: var(--accent);
+}
+
+.notif-item-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.notif-item-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.notif-item-body {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.notif-item-time {
+  font-size: 11px;
+  color: var(--muted);
+  opacity: 0.85;
+}

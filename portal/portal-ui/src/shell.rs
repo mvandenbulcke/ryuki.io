@@ -1,6 +1,7 @@
 use crate::app::SessionResource;
 use crate::models::{auth_session_fallback, AuthSession};
 use crate::server_boundary::{perform_logout, PortalRouteStateSnapshot};
+use crate::views::notifications::NotificationBell;
 use crate::workspace_catalog::{nav_item_is_active, role_satisfies, PRIMARY_NAV_ITEMS};
 use leptos::prelude::*;
 use leptos_router::components::Outlet;
@@ -285,6 +286,7 @@ pub fn Shell(route_snapshot: PortalRouteStateSnapshot) -> impl IntoView {
                             "Sign out"
                         </button>
                     </div>
+                    <NotificationBell />
                     <button
                         class="theme-toggle"
                         aria-label="Toggle theme"

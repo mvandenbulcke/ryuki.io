@@ -1063,6 +1063,28 @@ pub struct RequestSummary {
     pub created: String,
 }
 
+// ── Notification types ────────────────────────────────────────────────────
+//
+// These types mirror the `GET /api/notifications` API shape. The endpoint is
+// user-scoped (self) and returns the {source, notifications:[...]} envelope.
+// `read` tracks whether the user has already seen the notification.
+// severity is one of: Info | Success | Warning | Critical.
+//
+// Static/degraded mode returns an empty Vec — no synthetic notification rows
+// are fabricated.
+
+/// Portal-facing summary of one notification.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct NotificationSummary {
+    pub id: String,
+    pub event: String,
+    pub severity: String,
+    pub title: String,
+    pub body: String,
+    pub read: bool,
+    pub created_at: String,
+}
+
 // ── Agent types ───────────────────────────────────────────────────────────
 //
 // These types mirror the `GET /api/admin/agents` API shape. The endpoint is
