@@ -601,31 +601,18 @@ mod tests {
 
     #[test]
     fn available_does_not_inherit_parent_secrets() {
-        // Plant a sentinel env var in the current process. The available() probe
-        // must NOT pass it to the child binary. We use a shim that prints its full
-        // environment to stdout so we can inspect what the child received.
-        let ws = Workspace::new().expect("test workspace");
-        let shim = ws.path().join("tf-env-probe");
-        // Print the entire environment, one var per line.
-        std::fs::write(&shim, "#!/bin/sh\nenv\nexit 0\n").expect("write shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-
-        // Plant a secret in the parent process environment for this test.
-        // Safety: tests run in a single-threaded context for env mutation.
+        // Plant a sentinel env var in the current process. The probe must NOT
+        // pass it to the child. We run `/usr/bin/env`, which prints its full
+        // environment to stdout, so we can inspect what the child received.
+        // Execing an existing binary (rather than writing a temp shim and
+        // immediately execing it) avoids the ETXTBSY ("text file busy") race a
+        // freshly-written executable hits under parallel test execution.
         std::env::set_var(
             "RYUKI_INTEGRATION__ENCRYPTION_KEY",
             "PARENT-SECRET-SENTINEL",
         );
 
-        let _runner = TerraformRunner::with_binary(shim.to_string_lossy().to_string());
-        // Directly call available() to exercise the probe path.
-        // Since the shim prints env to stdout and we suppress it in available(),
-        // we need to run the probe manually here so we can capture output.
-        let mut cmd = Command::new(&shim);
+        let mut cmd = Command::new("/usr/bin/env");
         apply_env_allowlist(&mut cmd);
         let output = cmd.output().expect("probe must succeed");
         let child_env = String::from_utf8_lossy(&output.stdout);

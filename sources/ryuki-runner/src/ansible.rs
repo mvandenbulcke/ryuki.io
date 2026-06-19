@@ -419,19 +419,14 @@ mod tests {
 
     #[test]
     fn available_does_not_inherit_parent_secrets() {
-        let ws = Workspace::new().expect("ws");
-        let shim = ws.path().join("ans-env-probe");
-        std::fs::write(&shim, "#!/bin/sh\nenv\nexit 0\n").expect("write shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-
         std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", "ANS-PARENT-SECRET");
 
-        // Probe the allowlist directly (same logic as available()).
-        let mut cmd = Command::new(&shim);
+        // Probe the allowlist by running `/usr/bin/env`, which prints the child
+        // environment. Execing an existing binary (rather than writing a temp
+        // shim and immediately execing it) avoids the ETXTBSY ("text file busy")
+        // race a freshly-written executable hits under parallel test execution,
+        // where a concurrent test's fork transiently holds a write fd to it.
+        let mut cmd = Command::new("/usr/bin/env");
         apply_env_allowlist(&mut cmd);
         let output = cmd.output().expect("probe must succeed");
         let child_env = String::from_utf8_lossy(&output.stdout);
