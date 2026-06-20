@@ -144,29 +144,30 @@ pub fn get_site_capacity(site: &str, vms: &[VmUtilization]) -> Result<Value, Str
     let total_mem: u64 = site_vms.iter().map(|v| v.memory_gb as u64).sum::<u64>();
     let total_storage: u64 = site_vms.iter().map(|v| v.storage_gb as u64).sum::<u64>();
 
-    let used_cpu = (total_cpu as f64 * site_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>()
-        / (site_vms.len() as f64 * 100.0))
-        .round();
-    let used_mem = (total_mem as f64 * site_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
-        / (site_vms.len() as f64 * 100.0))
-        .round();
+    // Used capacity is summed PER VM (cores × util% / 100), not total × mean(util%):
+    // the mean formula is skewed by idle VMs and under-counts hot heterogeneous
+    // clusters. Utilization % is then derived from used so the two stay consistent
+    // (used == utilization_pct/100 × total). Mirrors the admission gate's per-VM
+    // math in cluster_capacity_admission.
+    let used_cpu = used_per_vm(&site_vms, |v| v.cpu_cores, |v| v.cpu_usage_pct);
+    let used_mem = used_per_vm(&site_vms, |v| v.memory_gb, |v| v.memory_usage_pct);
     let used_storage = total_storage; // storage is allocated, not dynamic
 
-    let cpu_util = site_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / site_vms.len() as f64;
-    let mem_util = site_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / site_vms.len() as f64;
+    let cpu_util = util_pct(used_cpu, total_cpu);
+    let mem_util = util_pct(used_mem, total_mem);
 
     Ok(json!({
         "source": "dry-run",
         "site": site,
         "total_cpu_cores": total_cpu,
-        "used_cpu_cores": used_cpu,
+        "used_cpu_cores": used_cpu.round(),
         "total_memory_gb": total_mem,
-        "used_memory_gb": used_mem,
+        "used_memory_gb": used_mem.round(),
         "total_storage_gb": total_storage,
         "used_storage_gb": used_storage,
         "vm_count": site_vms.len(),
-        "cpu_utilization_pct": (cpu_util * 10.0).round() / 10.0,
-        "memory_utilization_pct": (mem_util * 10.0).round() / 10.0,
+        "cpu_utilization_pct": round1(cpu_util),
+        "memory_utilization_pct": round1(mem_util),
         "clusters": cluster_summary(site, &site_vms)
     }))
 }
@@ -182,21 +183,66 @@ fn cluster_summary(_site: &str, vms: &[&VmUtilization]) -> Value {
         .map(|(name, cluster_vms)| {
             let total_cpu: u64 = cluster_vms.iter().map(|v| v.cpu_cores as u64).sum::<u64>();
             let total_mem: u64 = cluster_vms.iter().map(|v| v.memory_gb as u64).sum::<u64>();
-            let cpu_util =
-                cluster_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
-            let mem_util = cluster_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
-                / cluster_vms.len() as f64;
+            // Size-weighted utilization derived from per-VM used capacity (see
+            // get_site_capacity) — not the idle-skewed mean of per-VM percentages.
+            // Route through used_per_vm (single source of truth, incl. sane_pct);
+            // strip the HashMap's extra reference layer first.
+            let refs: Vec<&VmUtilization> = cluster_vms.iter().map(|v| **v).collect();
+            let used_cpu = used_per_vm(&refs, |v| v.cpu_cores, |v| v.cpu_usage_pct);
+            let used_mem = used_per_vm(&refs, |v| v.memory_gb, |v| v.memory_usage_pct);
             json!({
                 "cluster_name": name,
                 "total_cpu_cores": total_cpu,
                 "total_memory_gb": total_mem,
                 "vm_count": cluster_vms.len(),
-                "cpu_utilization_pct": (cpu_util * 10.0).round() / 10.0,
-                "memory_utilization_pct": (mem_util * 10.0).round() / 10.0
+                "cpu_utilization_pct": round1(util_pct(used_cpu, total_cpu)),
+                "memory_utilization_pct": round1(util_pct(used_mem, total_mem))
             })
         })
         .collect();
     Value::Array(summaries)
+}
+
+/// Used capacity summed PER VM (`resource × sane_pct(util%) / 100`). Honest for
+/// heterogeneous clusters — unlike `total × mean(util%)` it is not skewed by idle
+/// VMs masking hot ones. Each percentage is clamped by [`sane_pct`] so a
+/// malformed inventory row never yields NaN/`null` or a >100% figure. Exact
+/// (callers round for display). Mirrors the admission gate's per-VM math in
+/// `cluster_capacity_admission`.
+fn used_per_vm(
+    vms: &[&VmUtilization],
+    resource: impl Fn(&VmUtilization) -> u32,
+    pct: impl Fn(&VmUtilization) -> f64,
+) -> f64 {
+    vms.iter()
+        .map(|&v| f64::from(resource(v)) * sane_pct(pct(v)) / 100.0)
+        .sum()
+}
+
+/// Constrain a utilization percentage to a sane `[0, 100]` band; non-finite or
+/// out-of-range values fail closed to 100% (same posture as the admission gate's
+/// `sane_pct`). The `021_cost_capacity` table has no `[0,100]` CHECK, so this
+/// keeps a bad row from rendering as `null` or a nonsensical >100% utilization.
+fn sane_pct(pct: f64) -> f64 {
+    if pct.is_finite() && (0.0..=100.0).contains(&pct) {
+        pct
+    } else {
+        100.0
+    }
+}
+
+/// Size-weighted utilization %: `used / total * 100`, `0.0` for an empty cluster.
+fn util_pct(used: f64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        used / total as f64 * 100.0
+    }
+}
+
+/// Round to one decimal place for display.
+fn round1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
 }
 
 pub fn get_cluster_capacity(
@@ -226,17 +272,12 @@ pub fn get_cluster_capacity(
     }
 
     let total_cpu: u64 = cluster_vms.iter().map(|v| v.cpu_cores as u64).sum::<u64>();
-    let used_cpu = (total_cpu as f64 * cluster_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>()
-        / (cluster_vms.len() as f64 * 100.0))
-        .round();
     let total_mem: u64 = cluster_vms.iter().map(|v| v.memory_gb as u64).sum::<u64>();
-    let used_mem = (total_mem as f64 * cluster_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>()
-        / (cluster_vms.len() as f64 * 100.0))
-        .round();
-    let cpu_util =
-        cluster_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
-    let mem_util =
-        cluster_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / cluster_vms.len() as f64;
+    // Per-VM used capacity + derived weighted utilization (see get_site_capacity).
+    let used_cpu = used_per_vm(&cluster_vms, |v| v.cpu_cores, |v| v.cpu_usage_pct);
+    let used_mem = used_per_vm(&cluster_vms, |v| v.memory_gb, |v| v.memory_usage_pct);
+    let cpu_util = util_pct(used_cpu, total_cpu);
+    let mem_util = util_pct(used_mem, total_mem);
 
     let vm_list: Vec<Value> = cluster_vms
         .iter()
@@ -258,11 +299,11 @@ pub fn get_cluster_capacity(
         "site": site,
         "cluster": cluster,
         "total_cpu_cores": total_cpu,
-        "used_cpu_cores": used_cpu,
+        "used_cpu_cores": used_cpu.round(),
         "total_memory_gb": total_mem,
-        "used_memory_gb": used_mem,
-        "cpu_utilization_pct": (cpu_util * 10.0).round() / 10.0,
-        "memory_utilization_pct": (mem_util * 10.0).round() / 10.0,
+        "used_memory_gb": used_mem.round(),
+        "cpu_utilization_pct": round1(cpu_util),
+        "memory_utilization_pct": round1(mem_util),
         "vm_count": cluster_vms.len(),
         "vms": vm_list
     }))
@@ -593,6 +634,10 @@ pub fn get_trend_report(site: &str, metric: &str, vms: &[VmUtilization]) -> Resu
     let data_points: Vec<Value> = (0..12)
         .map(|i| {
             let date = now - chrono::Duration::weeks(i * 4);
+            // Intentionally the SIMPLE mean of per-VM utilization (not the
+            // size-weighted figure from get_site_capacity): this is an
+            // illustrative trend line with deterministic jitter, not a capacity
+            // decision input, so the anchor is the unweighted average by design.
             let base_value = match metric {
                 "cpu" => {
                     site_vms.iter().map(|v| v.cpu_usage_pct).sum::<f64>() / site_vms.len() as f64
@@ -658,6 +703,71 @@ mod tests {
         assert_eq!(result["cluster"], "defra-general-cluster");
         assert!(result["vm_count"].as_u64().unwrap() > 0);
         assert!(result["vms"].as_array().is_some());
+    }
+
+    /// Regression: used capacity must be summed PER VM, not `total × mean(util%)`.
+    /// A hot 100-core VM (100%) beside an idle 4-core VM (0%) actually uses 100 of
+    /// 104 cores (~96.2%). The old mean formula reported round(104 × 50%) = 52
+    /// used and 50% utilization — badly under-counting the hot host.
+    #[test]
+    fn used_capacity_is_per_vm_not_mean_of_percentages() {
+        let mk = |name: &str, cpu: u32, mem: u32, cpu_pct: f64, mem_pct: f64| VmUtilization {
+            vm_name: name.into(),
+            site: "X".into(),
+            cluster: "c".into(),
+            cpu_cores: cpu,
+            memory_gb: mem,
+            storage_gb: 100,
+            cpu_usage_pct: cpu_pct,
+            memory_usage_pct: mem_pct,
+            monthly_cost: 0.0,
+            idle: false,
+            oversized: false,
+            orphaned_disk_gb: 0,
+        };
+        let vms = vec![
+            mk("hot", 100, 256, 100.0, 50.0),
+            mk("idle", 4, 16, 0.0, 0.0),
+        ];
+        let result = get_cluster_capacity("X", "c", &vms).unwrap();
+        assert_eq!(result["total_cpu_cores"].as_u64().unwrap(), 104);
+        // Per-VM used = 100×1.0 + 4×0.0 = 100 cores (mean formula would give 52).
+        assert_eq!(result["used_cpu_cores"].as_f64().unwrap(), 100.0);
+        // Weighted utilization = 100/104×100 = 96.2 (mean formula would give 50.0).
+        assert_eq!(result["cpu_utilization_pct"].as_f64().unwrap(), 96.2);
+    }
+
+    /// A malformed inventory row (the `021_cost_capacity` table has no `[0,100]`
+    /// CHECK, so 150% is storable) must be clamped — never rendering a >100%
+    /// utilization or `used > total` in the analytics output.
+    #[test]
+    fn out_of_range_utilization_is_clamped() {
+        let bad = VmUtilization {
+            vm_name: "bad".into(),
+            site: "X".into(),
+            cluster: "c".into(),
+            cpu_cores: 100,
+            memory_gb: 256,
+            storage_gb: 100,
+            cpu_usage_pct: 150.0,
+            memory_usage_pct: f64::NAN,
+            monthly_cost: 0.0,
+            idle: false,
+            oversized: false,
+            orphaned_disk_gb: 0,
+        };
+        let result = get_cluster_capacity("X", "c", &[bad]).unwrap();
+        let cpu_util = result["cpu_utilization_pct"].as_f64().unwrap();
+        assert!(
+            cpu_util <= 100.0,
+            "utilization must clamp to <= 100, got {cpu_util}"
+        );
+        assert!(
+            result["used_cpu_cores"].as_f64().unwrap()
+                <= result["total_cpu_cores"].as_f64().unwrap()
+        );
+        // NaN must not slip through as JSON null.
+        assert!(result["memory_utilization_pct"].as_f64().is_some());
     }
 
     #[test]
