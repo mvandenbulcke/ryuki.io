@@ -51,6 +51,9 @@ pub(crate) fn status_badge_class(status: &str) -> &'static str {
         "validated" => "badge good",
         "approved" => "badge good",
         "executed" | "verified" | "completed" => "badge good",
+        // Post-completion governed lifecycle (Theme 8).
+        "protecting" | "operational" => "badge good",
+        "retired" => "badge neutral",
         "failed" => "badge bad",
         "rejected" | "cancelled" => "badge bad",
         "executing" | "verifying" => "badge warn",
@@ -62,8 +65,18 @@ pub(crate) fn status_label(status: &str) -> &'static str {
     match status {
         "intake" => "Intake",
         "validated" => "Validated",
+        "planned" => "Planned",
         "approved" => "Approved",
+        "locked" => "Locked",
+        "executing" => "Executing",
         "executed" => "Executed",
+        "verifying" => "Verifying",
+        "verified" => "Verified",
+        "completed" => "Completed",
+        // Post-completion governed lifecycle (Theme 8).
+        "protecting" => "Protecting",
+        "operational" => "Operational",
+        "retired" => "Retired",
         "failed" => "Failed",
         "rejected" => "Rejected",
         "cancelled" => "Cancelled",

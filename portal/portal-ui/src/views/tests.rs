@@ -112,6 +112,13 @@ mod tests {
             ("locked", "Locked"),
             ("executed", "Executed"),
             ("verified", "Verified"),
+            // Post-completion lifecycle: stage action names + milestone statuses.
+            ("protect", "Protect"),
+            ("publish", "Publish"),
+            ("retire", "Retire"),
+            ("protecting", "Protecting"),
+            ("operational", "Operational"),
+            ("retired", "Retired"),
             ("failed", "Failed"),
             ("rejected", "Rejected"),
             ("cancelled", "Cancelled"),

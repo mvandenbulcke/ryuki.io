@@ -57,6 +57,9 @@ pub(crate) fn status_badge_class(status: &str) -> &'static str {
         "approved" => "badge good",
         // Legacy portal-vocab (DB normalize path) and canonical engine-vocab both accepted.
         "executed" | "verified" | "completed" | "Completed" => "badge good",
+        // Post-completion governed lifecycle (Theme 8).
+        "protecting" | "Protecting" | "operational" | "Operational" => "badge good",
+        "retired" | "Retired" => "badge neutral",
         "failed" | "Failed" => "badge bad",
         "rejected" | "cancelled" | "Rejected" | "Cancelled" => "badge bad",
         "executing" | "verifying" | "Executing" | "Verifying" => "badge warn",
@@ -75,11 +78,22 @@ pub(crate) fn stage_label(stage: &str) -> &'static str {
         "executing" => "Executing",
         "verifying" => "Verifying",
         "completed" => "Completed",
+        // Post-completion governed lifecycle (Theme 8) milestones.
+        "protecting" => "Protecting",
+        "operational" => "Operational",
+        "retired" => "Retired",
         // Legacy portal-vocab aliases produced by normalize_api_stage on DB rows.
         // Kept so the audit trail and timeline continue to render correctly for
         // existing persisted requests.
         "executed" => "Executed",
         "verified" => "Verified",
+        // Post-completion stage ACTION names: the to_stage column + stage
+        // records store these for the protect/publish/retire transitions, so the
+        // stage-evidence list and audit timeline label them directly (the rail,
+        // by contrast, uses the milestone vocab above).
+        "protect" => "Protect",
+        "publish" => "Publish",
+        "retire" => "Retire",
         "failed" => "Failed",
         "rejected" => "Rejected",
         "cancelled" => "Cancelled",
@@ -107,6 +121,11 @@ const STAGE_MILESTONES: &[&str] = &[
     "executing",
     "verifying",
     "completed",
+    // Post-completion governed lifecycle (Theme 8): protect -> publish (lands
+    // Operational) -> retire.
+    "protecting",
+    "operational",
+    "retired",
 ];
 
 /// Derives the effective stage for the progression rail from the portal
@@ -131,6 +150,15 @@ pub(crate) fn effective_stage_for_rail(stage: &str, status: &str) -> &'static st
         "executing" => "executing",
         "verifying" => "verifying",
         "completed" => "completed",
+        // Post-completion governed lifecycle (Theme 8): the canonical milestones
+        // pass through unchanged, and the action-name to_stage values
+        // (protect/publish/retire) map onto them.
+        "protecting" => "protecting",
+        "operational" => "operational",
+        "retired" => "retired",
+        "protect" => "protecting",
+        "publish" => "operational",
+        "retire" => "retired",
         // Terminal states also pass through as 'static literals.
         "failed" => "failed",
         "rejected" => "rejected",
@@ -145,6 +173,9 @@ pub(crate) fn effective_stage_for_rail(stage: &str, status: &str) -> &'static st
             "executing" | "Executing" => "executing",
             "verifying" | "Verifying" => "verifying",
             "completed" | "Completed" => "completed",
+            "protecting" | "Protecting" => "protecting",
+            "operational" | "Operational" => "operational",
+            "retired" | "Retired" => "retired",
             "failed" | "Failed" => "failed",
             "rejected" | "Rejected" => "rejected",
             "cancelled" | "Cancelled" => "cancelled",
@@ -1468,21 +1499,44 @@ mod tests {
     /// Regression: completed request must mark EVERY forward milestone as done
     /// — previously "completed" had no milestone at all and showed nothing.
     #[test]
-    fn completed_marks_all_milestones_done() {
-        for &m in STAGE_MILESTONES {
-            if m == "completed" {
-                assert_eq!(
-                    stage_step_state(m, "completed"),
-                    "stage-step active",
-                    "completed milestone should be active when current=completed"
-                );
+    fn completed_marks_prior_done_and_post_completion_pending() {
+        // `completed` is no longer the last milestone — the post-completion
+        // governed lifecycle (protecting/operational/retired) follows it. When a
+        // request is merely Completed, those later milestones are not yet reached.
+        let completed_idx = STAGE_MILESTONES
+            .iter()
+            .position(|&m| m == "completed")
+            .expect("completed is a milestone");
+        for (i, &m) in STAGE_MILESTONES.iter().enumerate() {
+            let expected = if i < completed_idx {
+                "stage-step done"
+            } else if i == completed_idx {
+                "stage-step active"
             } else {
-                assert_eq!(
-                    stage_step_state(m, "completed"),
-                    "stage-step done",
-                    "expected {m} to be done when current=completed"
-                );
-            }
+                "stage-step pending"
+            };
+            assert_eq!(
+                stage_step_state(m, "completed"),
+                expected,
+                "milestone {m} (idx {i}) with current=completed"
+            );
+        }
+    }
+
+    #[test]
+    fn retired_marks_all_prior_milestones_done() {
+        // Retired is the terminal forward milestone: everything before it is done.
+        for &m in STAGE_MILESTONES {
+            let expected = if m == "retired" {
+                "stage-step active"
+            } else {
+                "stage-step done"
+            };
+            assert_eq!(
+                stage_step_state(m, "retired"),
+                expected,
+                "milestone {m} with current=retired"
+            );
         }
     }
 
