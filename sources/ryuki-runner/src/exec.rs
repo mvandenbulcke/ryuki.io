@@ -83,9 +83,8 @@ pub fn run_command_with_timeout(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RunnerError::Spawn(format!("spawn: {e}")))?;
+    let mut child =
+        retry_on_etxtbsy(|| cmd.spawn()).map_err(|e| RunnerError::Spawn(format!("spawn: {e}")))?;
 
     // Capture the child pid before we move `child` into wait_timeout.
     // On Unix this equals the pgid after setsid().
@@ -154,6 +153,40 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
     buf
 }
 
+/// Retry a spawn-like operation on a transient ETXTBSY ("text file busy", os
+/// error 26). When a runner execs a binary that was just written to disk, a
+/// concurrent thread's `fork()` can transiently inherit a write fd to that file,
+/// so the kernel refuses to exec it with ETXTBSY. The condition clears within
+/// milliseconds once the sibling execs (its CLOEXEC fds close), so a short
+/// bounded retry turns an intermittent spurious failure into a reliable spawn.
+/// Non-ETXTBSY errors propagate immediately. Installed binaries
+/// (terraform/ansible) never hit this, so in production the retry never fires.
+fn retry_on_etxtbsy<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const BACKOFF: Duration = Duration::from_millis(20);
+    let mut attempt = 1u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < MAX_ATTEMPTS && is_etxtbsy(&error) => {
+                attempt += 1;
+                std::thread::sleep(BACKOFF);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_etxtbsy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn is_etxtbsy(_error: &std::io::Error) -> bool {
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -162,14 +195,24 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::workspace::Workspace;
-    use std::os::unix::fs::PermissionsExt;
 
-    fn write_script(ws: &Workspace, name: &str, content: &str) -> std::path::PathBuf {
+    /// Writes `content` as a shell script in `ws` and returns a `Command` that
+    /// runs it via `/bin/sh <path>` — deliberately NOT by exec-ing the file
+    /// directly. Exec-ing a just-written file races with concurrent tests'
+    /// `fork()`s and intermittently fails with ETXTBSY ("text file busy", os
+    /// error 26): a forked-but-not-yet-exec'd child transiently inherits a write
+    /// fd to the new file, so the kernel refuses to exec it. Running it through
+    /// the shell only ever *reads* the file, which cannot trigger ETXTBSY. The
+    /// process tree is identical to the shebang form (`/bin/sh` interpreting the
+    /// script — the `#!/bin/sh` line is just a comment to `sh`), so the
+    /// process-group kill semantics are unchanged. Production exec paths run
+    /// stable installed binaries (terraform/ansible), so this is test-only.
+    fn sh_script_command(ws: &Workspace, name: &str, content: &str) -> Command {
         let path = ws.path().join(name);
         std::fs::write(&path, content).expect("write script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
-        path
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(&path);
+        cmd
     }
 
     // ── Task 1 RED→GREEN: timeout kills child and returns Timeout ──
@@ -179,10 +222,9 @@ mod tests {
     #[test]
     fn run_command_with_timeout_kills_slow_child() {
         let ws = Workspace::new().expect("workspace");
-        let script = write_script(&ws, "slow.sh", "#!/bin/sh\nsleep 5\n");
+        let cmd = sh_script_command(&ws, "slow.sh", "#!/bin/sh\nsleep 5\n");
 
         let start = std::time::Instant::now();
-        let cmd = Command::new(&script);
         let result = run_command_with_timeout(cmd, Duration::from_secs(1));
         let elapsed = start.elapsed();
 
@@ -201,9 +243,8 @@ mod tests {
     #[test]
     fn run_command_with_timeout_fast_child_succeeds() {
         let ws = Workspace::new().expect("workspace");
-        let script = write_script(&ws, "fast.sh", "#!/bin/sh\necho hello\nexit 0\n");
+        let cmd = sh_script_command(&ws, "fast.sh", "#!/bin/sh\necho hello\nexit 0\n");
 
-        let cmd = Command::new(&script);
         let result = run_command_with_timeout(cmd, Duration::from_secs(5));
         assert!(result.is_ok(), "fast child must succeed: {result:?}");
         let output = result.unwrap();
@@ -218,9 +259,8 @@ mod tests {
         // Write ~512 KiB to both stdout and stderr.
         let script = "#!/bin/sh\nyes x | head -c 524288; yes y | head -c 524288 >&2; exit 0\n";
         let ws = Workspace::new().expect("workspace");
-        let path = write_script(&ws, "big.sh", script);
+        let cmd = sh_script_command(&ws, "big.sh", script);
 
-        let cmd = Command::new(&path);
         let result = run_command_with_timeout(cmd, Duration::from_secs(10));
         assert!(
             result.is_ok(),
@@ -233,9 +273,8 @@ mod tests {
     #[test]
     fn run_command_with_timeout_non_zero_exit_ok() {
         let ws = Workspace::new().expect("workspace");
-        let script = write_script(&ws, "fail.sh", "#!/bin/sh\nexit 42\n");
+        let cmd = sh_script_command(&ws, "fail.sh", "#!/bin/sh\nexit 42\n");
 
-        let cmd = Command::new(&script);
         let output = run_command_with_timeout(cmd, Duration::from_secs(5))
             .expect("non-zero exit must be Ok, not Err");
         assert_eq!(output.status.code(), Some(42));
@@ -266,7 +305,7 @@ mod tests {
         let script_body = format!(
             "#!/bin/sh\nsleep 30 &\nGRAND=$!\nprintf '%s' \"$GRAND\" > {pidfile_str}\nwait\n"
         );
-        let script = write_script(&ws, "grand.sh", &script_body);
+        let cmd = sh_script_command(&ws, "grand.sh", &script_body);
 
         let start = std::time::Instant::now();
         // 5 s timeout (not 1 s): generous headroom so the shell reliably reaches
@@ -274,7 +313,7 @@ mod tests {
         // under heavy parallel-test CPU starvation. Still far below the 30 s
         // grandchild sleep, so this verifies the timeout fires and kills the
         // whole group (not the grandchild completing naturally).
-        let result = run_command_with_timeout(Command::new(&script), Duration::from_secs(5));
+        let result = run_command_with_timeout(cmd, Duration::from_secs(5));
         let elapsed = start.elapsed();
 
         // (a) Must time out before the 30 s grandchild sleep completes. The bound
@@ -333,5 +372,59 @@ mod tests {
             grandchild_dead,
             "grandchild PID {grandchild_pid} must be dead after process-group SIGKILL"
         );
+    }
+
+    // ── retry_on_etxtbsy: transient ETXTBSY is retried, other errors are not ──
+
+    /// A transient ETXTBSY (the first two attempts) must be retried until the
+    /// operation succeeds, rather than bubbling up as a spurious failure.
+    #[cfg(unix)]
+    #[test]
+    fn retry_on_etxtbsy_succeeds_after_transient_busy() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let result: std::io::Result<u32> = retry_on_etxtbsy(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            if n < 3 {
+                Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+            } else {
+                Ok(n)
+            }
+        });
+        assert_eq!(result.expect("should succeed after retries"), 3);
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// A non-ETXTBSY error must propagate immediately with no retry — we only
+    /// paper over the specific transient text-file-busy race.
+    #[cfg(unix)]
+    #[test]
+    fn retry_on_etxtbsy_does_not_retry_other_errors() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let result: std::io::Result<u32> = retry_on_etxtbsy(|| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1, "non-ETXTBSY errors must not be retried");
+    }
+
+    /// ETXTBSY on every attempt must give up after exactly MAX_ATTEMPTS (10) and
+    /// return the final ETXTBSY error — never loop forever. Pins the loop bound
+    /// against an off-by-one regression in the `attempt < MAX_ATTEMPTS` guard.
+    #[cfg(unix)]
+    #[test]
+    fn retry_on_etxtbsy_gives_up_after_max_attempts() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let result: std::io::Result<u32> = retry_on_etxtbsy(|| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::ETXTBSY))
+        });
+        let err = result.expect_err("must fail after exhausting retries");
+        assert_eq!(err.raw_os_error(), Some(libc::ETXTBSY));
+        assert_eq!(calls.get(), 10, "must give up after exactly MAX_ATTEMPTS");
     }
 }
