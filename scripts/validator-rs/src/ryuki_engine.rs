@@ -51,6 +51,7 @@ const DECLARED_MODULES: &[&str] = &[
     "network_readiness",
     "noise_remediation",
     "notifications",
+    "object_placement",
     "oob_access",
     "os_baseline",
     "outage_comms",

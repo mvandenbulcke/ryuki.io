@@ -65,6 +65,7 @@ use ryuki_engine::log_forwarder;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
 use ryuki_engine::noise_remediation;
+use ryuki_engine::object_placement;
 use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::outage_comms;
@@ -445,6 +446,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/object-placement-contract",
             get(integrations_vmware_object_placement),
+        )
+        .route(
+            "/api/integrations/vmware/object-placement",
+            get(integrations_vmware_object_placement_plan),
         )
         .route(
             "/api/integrations/vmware/vsan-esxi-lifecycle-contract",
@@ -4948,6 +4953,48 @@ async fn integrations_vmware_object_placement() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"livePlacementEnabled":false,"vcenterDimensions":["folder","cluster","resource-pool","datastore","storage-policy","network","tag-policy","site","environment"],"hyperVDimensions":["folder","cluster","resource-pool","storage-policy","network","tag-policy","site","environment"],"proxmoxDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"nutanixAhvDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"xenDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"kvmDimensions":["folder","cluster","resource-pool","datastore","network","tag-policy","site","environment"],"requiredGuards":["site-known","environment-known","folder-policy-known","cluster-capacity-admitted","resource-pool-policy-known","datastore-policy-known","storage-policy-known","network-profile-known","tag-policy-known","dry-run-plan-produced","evidence-redacted"],"planSections":["placementSummary","folderPlan","clusterResourcePoolPlan","datastoreStoragePolicyPlan","networkPlan","tagPolicyPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-placement-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","site-unknown","environment-unknown","folder-policy-missing","cluster-capacity-missing","resource-pool-policy-missing","datastore-policy-missing","storage-policy-missing","network-profile-missing","tag-policy-missing","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct ObjectPlacementQuery {
+    placement_scope: Option<String>,
+    workload_profile: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    criticality: Option<String>,
+    owner: Option<String>,
+    capacity_decision: Option<String>,
+    network_profile: Option<String>,
+    storage_profile: Option<String>,
+    tag_policy: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run vCenter object-placement planning. Turns the static `object-placement`
+/// descriptor into a real decision: evaluate the placement readiness guards over
+/// a proposed request and, when met, produce a dry-run plan that becomes
+/// approvable. Three guards are data-backed — site validity (site registry),
+/// folder derivability (governed catalog site), and capacity admitted (chains
+/// from the cluster-capacity-admission gate). Never places live — decision is
+/// `block` or `placement-planned`; redacted summaries only.
+async fn integrations_vmware_object_placement_plan(
+    Query(params): Query<ObjectPlacementQuery>,
+) -> Json<Value> {
+    let input = object_placement::PlacementInput {
+        placement_scope: params.placement_scope,
+        workload_profile: params.workload_profile,
+        site: params.site,
+        environment: params.environment,
+        criticality: params.criticality,
+        owner: params.owner,
+        capacity_decision: params.capacity_decision,
+        network_profile: params.network_profile,
+        storage_profile: params.storage_profile,
+        tag_policy: params.tag_policy,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = object_placement::evaluate_object_placement(&input);
+    Json(json!(result))
 }
 
 async fn integrations_vmware_vsan_esxi() -> Json<Value> {
@@ -21867,6 +21914,51 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The object-placement action endpoint produces an approvable placement plan
+    /// for a complete request against a governed site with capacity admitted.
+    #[tokio::test]
+    async fn object_placement_plans_complete_request() {
+        let Json(result) = integrations_vmware_object_placement_plan(Query(ObjectPlacementQuery {
+            placement_scope: Some("single-vm".into()),
+            workload_profile: Some("general".into()),
+            site: Some("DEFRA".into()),
+            environment: Some("prod".into()),
+            criticality: Some("tier-2".into()),
+            owner: Some("team-platform".into()),
+            capacity_decision: Some("admit".into()),
+            network_profile: Some("vlan-100".into()),
+            storage_profile: Some("gold".into()),
+            tag_policy: Some("standard".into()),
+            evidence_manifest: Some("ev-1".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "placement-planned");
+        assert_ne!(result["decision"], "admit");
+    }
+
+    /// An unknown site blocks (data-backed site + folder checks both fail).
+    #[tokio::test]
+    async fn object_placement_blocks_unknown_site() {
+        let Json(result) = integrations_vmware_object_placement_plan(Query(ObjectPlacementQuery {
+            placement_scope: Some("single-vm".into()),
+            workload_profile: Some("general".into()),
+            site: Some("ZZZZZ".into()),
+            environment: Some("prod".into()),
+            criticality: Some("tier-2".into()),
+            owner: Some("team-platform".into()),
+            capacity_decision: Some("admit".into()),
+            network_profile: Some("vlan-100".into()),
+            storage_profile: Some("gold".into()),
+            tag_policy: Some("standard".into()),
+            evidence_manifest: Some("ev-1".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "block");
+        assert!(result["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "site-unknown")));
+    }
 
     /// The vsan-esxi-lifecycle action endpoint produces an approvable lifecycle
     /// plan for a complete, supported-hypervisor request.
