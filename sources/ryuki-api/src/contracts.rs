@@ -42,6 +42,7 @@ use ryuki_engine::container_namespace;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::customization_spec_governance;
 use ryuki_engine::datacenter_readiness;
+use ryuki_engine::decommission_quarantine;
 use ryuki_engine::degradation_mode;
 use ryuki_engine::dns_ipam;
 use ryuki_engine::dr_testing;
@@ -463,6 +464,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/decommission-quarantine-contract",
             get(integrations_vmware_decommission),
+        )
+        .route(
+            "/api/integrations/vmware/decommission-quarantine",
+            get(integrations_vmware_decommission_quarantine),
         )
         .route(
             "/api/integrations/hyperv/readiness",
@@ -4999,6 +5004,47 @@ async fn integrations_vmware_decommission() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"stages":["intake-review","dependency-review","backup-retention-review","monitoring-disable-plan","cmdb-retirement-plan","quarantine-window-plan","rollback-window-review","final-disposition-review"],"domains":["vcenter-placement","backup-retention","monitoring-state","cmdb-state","dns-dependency","owner-approval","rollback-window","evidence-readiness"],"requiredGuards":["request-preflight-ready","cmdb-ci-known","owner-approval-assigned","dependency-impact-reviewed","backup-retention-reviewed","monitoring-disable-reviewed","quarantine-window-approved","rollback-plan-ready","final-disposition-blocked","evidence-redacted"],"planSections":["quarantineSummary","dependencyReview","backupRetentionReview","monitoringPlan","cmdbRetirementPlan","quarantineWindow","rollbackPlan","finalDispositionHold","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-decommission-disabled","live-delete-disabled","raw-inventory-rows-disabled","object-identifiers-disabled","cmdb-ci-unknown","owner-approval-missing","dependency-review-missing","backup-retention-missing","monitoring-disable-review-missing","quarantine-window-missing","rollback-plan-missing","final-disposition-blocked","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct DecommissionQuarantineQuery {
+    ci_key: Option<String>,
+    target_scope: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    owner: Option<String>,
+    business_justification: Option<String>,
+    dependency_review: Option<String>,
+    backup_retention_need: Option<String>,
+    quarantine_window: Option<String>,
+    cmdb_context: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run VM decommission QUARANTINE planning. Turns the static
+/// `decommission-quarantine` descriptor into a real decision: evaluate the
+/// required guards over a proposed decommission and, when met, produce a dry-run
+/// quarantine plan. Final disposition (deletion) is ALWAYS held — this contract
+/// never deletes; the decision is `block` or `quarantine-planned`, never an
+/// admit-to-delete. No live decommission/delete; redacted summaries only.
+async fn integrations_vmware_decommission_quarantine(
+    Query(params): Query<DecommissionQuarantineQuery>,
+) -> Json<Value> {
+    let input = decommission_quarantine::DecommissionQuarantineInput {
+        ci_key: params.ci_key,
+        target_scope: params.target_scope,
+        site: params.site,
+        environment: params.environment,
+        owner: params.owner,
+        business_justification: params.business_justification,
+        dependency_review: params.dependency_review,
+        backup_retention_need: params.backup_retention_need,
+        quarantine_window: params.quarantine_window,
+        cmdb_context: params.cmdb_context,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = decommission_quarantine::evaluate_decommission_quarantine(&input);
+    Json(json!(result))
 }
 
 async fn operations_certificate_lifecycle() -> Json<Value> {
@@ -21774,6 +21820,52 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The decommission-quarantine action endpoint produces a quarantine plan for
+    /// a complete request, with final disposition always held (never deletes).
+    #[tokio::test]
+    async fn decommission_quarantine_plans_complete_request() {
+        let Json(result) =
+            integrations_vmware_decommission_quarantine(Query(DecommissionQuarantineQuery {
+                ci_key: Some("CI-1".into()),
+                target_scope: Some("single-vm".into()),
+                site: Some("DEFRA".into()),
+                environment: Some("prod".into()),
+                owner: Some("team-platform".into()),
+                business_justification: Some("end of life".into()),
+                dependency_review: Some("reviewed".into()),
+                backup_retention_need: Some("90d".into()),
+                quarantine_window: Some("2026-07-01..2026-07-30".into()),
+                cmdb_context: Some("ctx".into()),
+                evidence_manifest: Some("ev-1".into()),
+            }))
+            .await;
+        assert_eq!(result["decision"], "quarantine-planned");
+        assert_eq!(result["final_disposition"], "blocked");
+    }
+
+    /// An incomplete request blocks, produces no plan, and still never deletes.
+    #[tokio::test]
+    async fn decommission_quarantine_blocks_incomplete_request() {
+        let Json(result) =
+            integrations_vmware_decommission_quarantine(Query(DecommissionQuarantineQuery {
+                ci_key: Some("CI-1".into()),
+                target_scope: None,
+                site: None,
+                environment: None,
+                owner: None,
+                business_justification: None,
+                dependency_review: None,
+                backup_retention_need: None,
+                quarantine_window: None,
+                cmdb_context: None,
+                evidence_manifest: None,
+            }))
+            .await;
+        assert_eq!(result["decision"], "block");
+        assert_eq!(result["final_disposition"], "blocked");
+        assert_ne!(result["decision"], "admit");
+    }
 
     /// The snapshot-governance action endpoint blocks a request missing the
     /// required guards (owner/expiry/backup/approval/lock/rollback/evidence).
