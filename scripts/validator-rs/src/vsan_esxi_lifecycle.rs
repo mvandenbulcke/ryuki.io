@@ -591,6 +591,22 @@ fn validate_program_text(program: &str, _catalog: &Value, errors: &mut Vec<Strin
         "API must keep static-seed source",
     );
     crate::rust_contract::check_safety_flags_disabled(&payload, errors);
+    // Parity: the descriptor must advertise EXACTLY the catalog's supported
+    // hypervisors + platform-lifecycle parity (bidirectional — no missing, no
+    // extra). Without this the descriptor silently drifted to 6 platforms while
+    // the catalog, engine, validator, and docs all use 3.
+    validate_required_array(
+        &payload,
+        "supportedHypervisors",
+        REQUIRED_HYPERVISORS,
+        errors,
+    );
+    validate_required_array(
+        &payload,
+        "platformLifecycleParity",
+        REQUIRED_PLATFORM_LIFECYCLE_PARITY,
+        errors,
+    );
 }
 
 fn validate_program_text_csharp(program: &str, catalog: &Value, errors: &mut Vec<String>) {
