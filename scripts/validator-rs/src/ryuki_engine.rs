@@ -65,6 +65,7 @@ const DECLARED_MODULES: &[&str] = &[
     "shift_queue",
     "site_registry",
     "snapshot_engine",
+    "snapshot_governance",
     "software_deployment",
     "sql_deployment",
     "storage_provisioning",

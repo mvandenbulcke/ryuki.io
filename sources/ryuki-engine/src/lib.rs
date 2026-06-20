@@ -55,6 +55,7 @@ pub mod servicenow_api;
 pub mod shift_queue;
 pub mod site_registry;
 pub mod snapshot_engine;
+pub mod snapshot_governance;
 pub mod software_deployment;
 pub mod sql_deployment;
 pub mod storage_provisioning;

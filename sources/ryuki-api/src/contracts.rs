@@ -77,6 +77,7 @@ use ryuki_engine::servicenow_api;
 use ryuki_engine::shift_queue;
 use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
+use ryuki_engine::snapshot_governance;
 use ryuki_engine::software_deployment;
 use ryuki_engine::sql_deployment;
 use ryuki_engine::synthetic_health;
@@ -454,6 +455,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/snapshot-governance-contract",
             get(integrations_vmware_snapshot),
+        )
+        .route(
+            "/api/integrations/vmware/snapshot-governance",
+            get(integrations_vmware_snapshot_governance),
         )
         .route(
             "/api/integrations/vmware/decommission-quarantine-contract",
@@ -4951,6 +4956,43 @@ async fn integrations_vmware_snapshot() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["planned-snapshot-exception","snapshot-expiry-review","stale-snapshot-remediation","owner-attestation","backup-conflict-review"],"signals":["planned-exception","expiry-due","stale-snapshot","owner-unknown","backup-conflict","policy-exception","evidence-missing"],"requiredGuards":["cmdb-ci-known","owner-known","backup-state-known","expiry-policy-known","approval-route-assigned","lock-scope-defined","rollback-notes-ready","evidence-redacted"],"planSections":["snapshotSummary","policyDecision","expiryReview","backupImpact","remediationPlan","approvalRoute","lockPlan","handoverNotes"],"blockedReasons":["provider-calls-disabled","live-snapshot-disabled","live-deletion-disabled","stale-inventory","missing-owner","missing-expiry","backup-conflict-unknown","approval-missing","lock-scope-missing","rollback-notes-missing","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct SnapshotGovernanceQuery {
+    ci_key: Option<String>,
+    purpose: Option<String>,
+    requested_expiry: Option<String>,
+    owner: Option<String>,
+    backup_state: Option<String>,
+    approval_route: Option<String>,
+    lock_scope: Option<String>,
+    rollback_notes: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run snapshot GOVERNANCE. Turns the static `snapshot-governance` descriptor
+/// into a real admit/review/block decision: evaluate the contract's required
+/// guards (owner / expiry / backup-state / approval / lock / rollback / evidence
+/// / CMDB-CI) over a proposed snapshot exception and emit the contract signals,
+/// with data-backed expiry/staleness checks. Review/remediation plans only — no
+/// live snapshot create/delete.
+async fn integrations_vmware_snapshot_governance(
+    Query(params): Query<SnapshotGovernanceQuery>,
+) -> Json<Value> {
+    let input = snapshot_governance::SnapshotGovernanceInput {
+        ci_key: params.ci_key,
+        purpose: params.purpose,
+        requested_expiry: params.requested_expiry,
+        owner: params.owner,
+        backup_state: params.backup_state,
+        approval_route: params.approval_route,
+        lock_scope: params.lock_scope,
+        rollback_notes: params.rollback_notes,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = snapshot_governance::evaluate_snapshot_governance(&input, chrono::Utc::now());
+    Json(json!(result))
 }
 
 async fn integrations_vmware_decommission() -> Json<Value> {
@@ -21732,6 +21774,69 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The snapshot-governance action endpoint blocks a request missing the
+    /// required guards (owner/expiry/backup/approval/lock/rollback/evidence).
+    #[tokio::test]
+    async fn snapshot_governance_blocks_incomplete_request() {
+        let Json(result) =
+            integrations_vmware_snapshot_governance(Query(SnapshotGovernanceQuery {
+                ci_key: Some("CI-1".into()),
+                purpose: Some("driver upgrade".into()),
+                requested_expiry: None,
+                owner: None,
+                backup_state: None,
+                approval_route: None,
+                lock_scope: None,
+                rollback_notes: None,
+                evidence_manifest: None,
+            }))
+            .await;
+        assert_eq!(result["decision"], "block");
+        assert!(result["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "missing-owner")));
+    }
+
+    /// A fully-specified request with a far-future expiry, no conflict, and a
+    /// non-exception purpose admits.
+    #[tokio::test]
+    async fn snapshot_governance_admits_complete_request() {
+        let Json(result) =
+            integrations_vmware_snapshot_governance(Query(SnapshotGovernanceQuery {
+                ci_key: Some("CI-1".into()),
+                purpose: Some("driver upgrade".into()),
+                // Far future so it is never within the expiry-due window at runtime.
+                requested_expiry: Some("2099-12-01T00:00:00Z".into()),
+                owner: Some("team-platform".into()),
+                backup_state: Some("protected".into()),
+                approval_route: Some("change-board".into()),
+                lock_scope: Some("vm-only".into()),
+                rollback_notes: Some("revert".into()),
+                evidence_manifest: Some("ev-1".into()),
+            }))
+            .await;
+        assert_eq!(result["decision"], "admit");
+    }
+
+    /// A backup conflict on an otherwise-complete request forces review.
+    #[tokio::test]
+    async fn snapshot_governance_reviews_on_backup_conflict() {
+        let Json(result) =
+            integrations_vmware_snapshot_governance(Query(SnapshotGovernanceQuery {
+                ci_key: Some("CI-1".into()),
+                purpose: Some("driver upgrade".into()),
+                requested_expiry: Some("2099-12-01T00:00:00Z".into()),
+                owner: Some("team-platform".into()),
+                backup_state: Some("conflict".into()),
+                approval_route: Some("change-board".into()),
+                lock_scope: Some("vm-only".into()),
+                rollback_notes: Some("revert".into()),
+                evidence_manifest: Some("ev-1".into()),
+            }))
+            .await;
+        assert_eq!(result["decision"], "review");
+    }
 
     /// The customization-spec-governance action endpoint derives the catalog
     /// safe facts for a governed site. With no proposed values it verifies
