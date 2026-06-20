@@ -525,8 +525,10 @@ fn binary_available(binary: &str) -> bool {
     apply_env_allowlist(&mut cmd);
     cmd.arg("version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::null());
+    // Retry the probe on transient ETXTBSY: tests probe a just-written shim, and
+    // a concurrent fork() can briefly hold a write fd to it (see exec.rs).
+    crate::exec::retry_on_etxtbsy(|| cmd.status())
         .map(|s| s.success())
         .unwrap_or(false)
 }

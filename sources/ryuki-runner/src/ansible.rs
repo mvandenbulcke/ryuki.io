@@ -214,8 +214,10 @@ impl Runner for AnsibleRunner {
         apply_env_allowlist(&mut cmd);
         cmd.arg("--version")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        // Retry on transient ETXTBSY: a test probe may exec a just-written shim
+        // that a concurrent fork() briefly holds a write fd to (see exec.rs).
+        crate::exec::retry_on_etxtbsy(|| cmd.status())
             .map(|s| s.success())
             .unwrap_or(false)
     }

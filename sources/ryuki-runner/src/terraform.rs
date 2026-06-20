@@ -219,8 +219,10 @@ impl Runner for TerraformRunner {
         apply_env_allowlist(&mut cmd);
         cmd.arg("version")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::null());
+        // Retry on transient ETXTBSY: a test probe may exec a just-written shim
+        // that a concurrent fork() briefly holds a write fd to (see exec.rs).
+        crate::exec::retry_on_etxtbsy(|| cmd.status())
             .map(|s| s.success())
             .unwrap_or(false)
     }
@@ -658,7 +660,9 @@ mod tests {
         // by running the shim directly with the allowlist applied.
         let mut cmd = Command::new(&shim);
         apply_env_allowlist(&mut cmd);
-        let output = cmd.output().expect("probe");
+        // Retry on transient ETXTBSY: this execs a just-written shim, which a
+        // concurrent fork() can briefly hold a write fd to (see exec.rs).
+        let output = crate::exec::retry_on_etxtbsy(|| cmd.output()).expect("probe");
         let child_env = String::from_utf8_lossy(&output.stdout);
 
         assert!(

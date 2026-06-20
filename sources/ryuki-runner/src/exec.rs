@@ -161,7 +161,9 @@ fn read_all(mut reader: impl Read) -> Vec<u8> {
 /// bounded retry turns an intermittent spurious failure into a reliable spawn.
 /// Non-ETXTBSY errors propagate immediately. Installed binaries
 /// (terraform/ansible) never hit this, so in production the retry never fires.
-fn retry_on_etxtbsy<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+pub(crate) fn retry_on_etxtbsy<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     const MAX_ATTEMPTS: u32 = 10;
     const BACKOFF: Duration = Duration::from_millis(20);
     let mut attempt = 1u32;
