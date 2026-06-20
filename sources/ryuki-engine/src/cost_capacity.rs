@@ -37,9 +37,11 @@ pub fn default_pricing() -> PricingConfig {
     }
 }
 
-// ─── Seed data (test fixtures only) ──────────────────────────────────────────
+// ─── Seed data ───────────────────────────────────────────────────────────────
+// Static, non-sensitive demo inventory. Used by the engine tests and by the
+// integrations/vmware static-seed endpoints (e.g. cluster-capacity-admission)
+// so they produce a real dry-run decision without a database. No live data.
 
-#[cfg(test)]
 pub fn seed_vms() -> Vec<VmUtilization> {
     let pricing = default_pricing();
     let mut vms = Vec::new();

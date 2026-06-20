@@ -34,6 +34,7 @@ use ryuki_engine::alert_routing_engine;
 use ryuki_engine::app_environment;
 use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
+use ryuki_engine::cluster_capacity_admission;
 use ryuki_engine::cmdb_engine;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::compliance_reporting;
@@ -424,6 +425,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/cluster-capacity-admission-contract",
             get(integrations_vmware_cluster_capacity),
+        )
+        .route(
+            "/api/integrations/vmware/cluster-capacity-admission",
+            get(integrations_vmware_cluster_capacity_admission),
         )
         .route(
             "/api/integrations/vmware/customization-spec-governance-contract",
@@ -9684,6 +9689,15 @@ struct AnalyticsClusterQuery {
 }
 
 #[derive(Deserialize)]
+struct ClusterAdmissionQuery {
+    site: Option<String>,
+    cluster: Option<String>,
+    cpu_cores: Option<u32>,
+    memory_gb: Option<u32>,
+    storage_gb: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct AnalyticsForecastQuery {
     site: Option<String>,
     months: Option<u32>,
@@ -9720,6 +9734,39 @@ async fn analytics_capacity_cluster(Query(params): Query<AnalyticsClusterQuery>)
     cost_capacity::get_cluster_capacity(site, cluster, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+}
+
+/// Dry-run cluster capacity ADMISSION. Turns the static
+/// `cluster-capacity-admission-contract` descriptor into a real
+/// admit/review/block/defer decision over the capacity inventory: compute
+/// (CPU + memory) headroom is data-backed; datastore, vSAN, HA failover, DRS
+/// balance, and reservation impact are reviewed in dry-run. Prefers live
+/// inventory when a DB is wired, otherwise the static seed (matching the
+/// integrations/vmware static-seed posture). No live vCenter calls.
+async fn integrations_vmware_cluster_capacity_admission(
+    Query(params): Query<ClusterAdmissionQuery>,
+) -> ApiResult {
+    let site = params.site.as_deref().unwrap_or("DEFRA");
+    let cluster = params.cluster.as_deref().unwrap_or("defra-general-cluster");
+    let (vms, inventory_source) = match crate::database::get_db() {
+        Some(pool) => (
+            crate::repos::cost_capacity::list_vms_for_site(pool, site)
+                .await
+                .map_err(db_error)?,
+            "db",
+        ),
+        None => (cost_capacity::seed_vms(), "static-seed"),
+    };
+    let result = cluster_capacity_admission::evaluate_cluster_admission(
+        site,
+        cluster,
+        params.cpu_cores.unwrap_or(0),
+        params.memory_gb.unwrap_or(0),
+        params.storage_gb.unwrap_or(0),
+        &vms,
+        inventory_source,
+    );
+    Ok(Json(json!(result)))
 }
 
 async fn analytics_capacity_forecast(Query(params): Query<AnalyticsForecastQuery>) -> ApiResult {
@@ -21646,6 +21693,82 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The cluster-capacity-admission action endpoint wires the descriptor to a
+    /// real decision: in the no-DB test path it evaluates over the static seed,
+    /// so a modest compute-only ask against the seeded general cluster is
+    /// admitted, and the response discloses the seed as the inventory source.
+    #[tokio::test]
+    async fn cluster_capacity_admission_admits_modest_request() {
+        let Json(result) =
+            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+                site: Some("DEFRA".into()),
+                cluster: Some("defra-general-cluster".into()),
+                cpu_cores: Some(4),
+                memory_gb: Some(16),
+                storage_gb: Some(0),
+            }))
+            .await
+            .expect("admission evaluation should succeed");
+        assert_eq!(result["decision"], "admit");
+        assert_eq!(result["inventory_source"], "static-seed");
+        assert!(
+            result["signals"]
+                .as_array()
+                .is_some_and(|s| s.iter().any(|sig| sig["name"] == "cpu-headroom")),
+            "cpu-headroom signal must be present: {result}"
+        );
+    }
+
+    /// A nonzero storage ask cannot ride out on a compute-only admit: storage is
+    /// only reviewed in dry-run, so the decision downgrades admit -> review.
+    #[tokio::test]
+    async fn cluster_capacity_admission_reviews_when_storage_requested() {
+        let Json(result) =
+            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+                site: Some("DEFRA".into()),
+                cluster: Some("defra-general-cluster".into()),
+                cpu_cores: Some(4),
+                memory_gb: Some(16),
+                storage_gb: Some(500),
+            }))
+            .await
+            .expect("admission evaluation should succeed");
+        assert_eq!(result["decision"], "review");
+    }
+
+    /// An oversized ask blocks: the requested cores exceed the cluster's total,
+    /// so compute headroom is exceeded.
+    #[tokio::test]
+    async fn cluster_capacity_admission_blocks_oversized_request() {
+        let Json(result) =
+            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+                site: Some("DEFRA".into()),
+                cluster: Some("defra-general-cluster".into()),
+                cpu_cores: Some(500),
+                memory_gb: Some(8),
+                storage_gb: Some(0),
+            }))
+            .await
+            .expect("admission evaluation should succeed");
+        assert_eq!(result["decision"], "block");
+    }
+
+    /// A cluster with no seeded inventory cannot be decided against -> defer.
+    #[tokio::test]
+    async fn cluster_capacity_admission_defers_unknown_cluster() {
+        let Json(result) =
+            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+                site: Some("DEFRA".into()),
+                cluster: Some("ghost-cluster".into()),
+                cpu_cores: Some(4),
+                memory_gb: Some(8),
+                storage_gb: Some(50),
+            }))
+            .await
+            .expect("admission evaluation should succeed");
+        assert_eq!(result["decision"], "defer");
+    }
 
     /// A non-VM request type's intake JSON omits cpu/memory_gb. It must
     /// deserialize (not 422) now that those fields default to 0, and its

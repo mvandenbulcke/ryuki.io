@@ -7,6 +7,7 @@ pub mod app_environment;
 pub mod auth;
 pub mod backup_engine;
 pub mod certificate_lifecycle;
+pub mod cluster_capacity_admission;
 pub mod cmdb_engine;
 pub mod cmdb_impact;
 pub mod compliance_reporting;
