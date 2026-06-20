@@ -83,6 +83,7 @@ use ryuki_engine::software_deployment;
 use ryuki_engine::sql_deployment;
 use ryuki_engine::synthetic_health;
 use ryuki_engine::vm_operations;
+use ryuki_engine::vsan_esxi_lifecycle;
 use ryuki_engine::zabbix_drift;
 
 pub fn routes() -> Router {
@@ -448,6 +449,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/vsan-esxi-lifecycle-contract",
             get(integrations_vmware_vsan_esxi),
+        )
+        .route(
+            "/api/integrations/vmware/vsan-esxi-lifecycle",
+            get(integrations_vmware_vsan_esxi_lifecycle),
         )
         .route(
             "/api/integrations/vmware/day2-change-contract",
@@ -4949,6 +4954,48 @@ async fn integrations_vmware_vsan_esxi() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["vsan-cluster-lifecycle","esxi-patch-lifecycle","firmware-baseline-review","hardware-readiness-review","maintenance-mode-plan","lifecycle-exception-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"platformLifecycleParity":["vmware-vsan-esxi-lifecycle-safe-summary","hyper-v-cluster-host-lifecycle-safe-summary","proxmox-cluster-node-lifecycle-safe-summary","nutanix-ahv-cluster-lifecycle-safe-summary","xen-cluster-host-lifecycle-safe-summary","kvm-cluster-host-lifecycle-safe-summary"],"domains":["vsan-health","esxi-version","firmware-baseline","driver-compatibility","hardware-hcl","cluster-maintenance","network-readiness","storage-policy"],"requiredGuards":["cluster-scope-known","site-known","platform-profile-known","target-baseline-known","hardware-readiness-reviewed","network-readiness-reviewed","capacity-admission-ready","maintenance-window-approved","rollback-plan-ready","dry-run-plan-produced","evidence-redacted"],"planSections":["lifecycleSummary","currentBaseline","targetBaseline","hardwareFirmwareReview","networkStorageReadiness","maintenanceModePlan","capacityAndFailureDomainImpact","rollbackPlan","policyExceptions","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-lifecycle-disabled","unsupported-hypervisor","raw-inventory-rows-disabled","host-identifiers-disabled","cluster-scope-missing","site-unknown","platform-profile-missing","target-baseline-missing","hardware-readiness-missing","network-readiness-missing","capacity-admission-missing","maintenance-window-missing","rollback-plan-missing","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct VsanEsxiLifecycleQuery {
+    cluster_scope: Option<String>,
+    site: Option<String>,
+    hypervisor_platform: Option<String>,
+    platform_profile: Option<String>,
+    target_baseline: Option<String>,
+    maintenance_window: Option<String>,
+    capacity_decision: Option<String>,
+    hardware_readiness: Option<String>,
+    network_readiness: Option<String>,
+    rollback_plan: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run vSAN/ESXi (Hyper-V/Proxmox) lifecycle planning. Turns the static
+/// `vsan-esxi-lifecycle` descriptor into a real decision: evaluate the readiness
+/// guards over a proposed cluster/host lifecycle request and, when met, produce a
+/// dry-run plan that becomes approvable. Never executes — decision is `block` or
+/// `lifecycle-planned`; live change is a separately-approved workflow. The
+/// supported-hypervisor set follows the catalog source of truth (VMware/Hyper-V/
+/// Proxmox). No live lifecycle action; redacted summaries only.
+async fn integrations_vmware_vsan_esxi_lifecycle(
+    Query(params): Query<VsanEsxiLifecycleQuery>,
+) -> Json<Value> {
+    let input = vsan_esxi_lifecycle::LifecycleInput {
+        cluster_scope: params.cluster_scope,
+        site: params.site,
+        hypervisor_platform: params.hypervisor_platform,
+        platform_profile: params.platform_profile,
+        target_baseline: params.target_baseline,
+        maintenance_window: params.maintenance_window,
+        capacity_decision: params.capacity_decision,
+        hardware_readiness: params.hardware_readiness,
+        network_readiness: params.network_readiness,
+        rollback_plan: params.rollback_plan,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = vsan_esxi_lifecycle::evaluate_vsan_esxi_lifecycle(&input);
+    Json(json!(result))
 }
 
 async fn integrations_vmware_day2() -> Json<Value> {
@@ -21820,6 +21867,51 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The vsan-esxi-lifecycle action endpoint produces an approvable lifecycle
+    /// plan for a complete, supported-hypervisor request.
+    #[tokio::test]
+    async fn vsan_esxi_lifecycle_plans_complete_request() {
+        let Json(result) = integrations_vmware_vsan_esxi_lifecycle(Query(VsanEsxiLifecycleQuery {
+            cluster_scope: Some("defra-general-cluster".into()),
+            site: Some("DEFRA".into()),
+            hypervisor_platform: Some("VMware".into()),
+            platform_profile: Some("vsan-esa".into()),
+            target_baseline: Some("esxi-8.0u2".into()),
+            maintenance_window: Some("2026-07-01T00:00:00Z".into()),
+            capacity_decision: Some("admitted".into()),
+            hardware_readiness: Some("reviewed".into()),
+            network_readiness: Some("reviewed".into()),
+            rollback_plan: Some("snapshot+revert".into()),
+            evidence_manifest: Some("ev-1".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "lifecycle-planned");
+        assert_ne!(result["decision"], "admit");
+    }
+
+    /// An unsupported hypervisor blocks even when everything else is supplied.
+    #[tokio::test]
+    async fn vsan_esxi_lifecycle_blocks_unsupported_hypervisor() {
+        let Json(result) = integrations_vmware_vsan_esxi_lifecycle(Query(VsanEsxiLifecycleQuery {
+            cluster_scope: Some("c".into()),
+            site: Some("DEFRA".into()),
+            hypervisor_platform: Some("KVM".into()),
+            platform_profile: Some("p".into()),
+            target_baseline: Some("b".into()),
+            maintenance_window: Some("w".into()),
+            capacity_decision: Some("admitted".into()),
+            hardware_readiness: Some("reviewed".into()),
+            network_readiness: Some("reviewed".into()),
+            rollback_plan: Some("rb".into()),
+            evidence_manifest: Some("ev".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "block");
+        assert!(result["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "unsupported-hypervisor")));
+    }
 
     /// The decommission-quarantine action endpoint produces a quarantine plan for
     /// a complete request, with final disposition always held (never deletes).

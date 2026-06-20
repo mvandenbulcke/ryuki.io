@@ -72,6 +72,7 @@ const DECLARED_MODULES: &[&str] = &[
     "storage_provisioning",
     "synthetic_health",
     "vm_operations",
+    "vsan_esxi_lifecycle",
     "zabbix_drift",
 ];
 
