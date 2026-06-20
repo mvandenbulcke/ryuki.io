@@ -13,6 +13,7 @@ pub mod cmdb_impact;
 pub mod compliance_reporting;
 pub mod container_namespace;
 pub mod cost_capacity;
+pub mod customization_spec_governance;
 pub mod datacenter_readiness;
 pub mod degradation_mode;
 pub mod dns_ipam;

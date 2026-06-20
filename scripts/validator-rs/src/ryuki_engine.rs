@@ -23,6 +23,7 @@ const DECLARED_MODULES: &[&str] = &[
     "compliance_reporting",
     "container_namespace",
     "cost_capacity",
+    "customization_spec_governance",
     "datacenter_readiness",
     "degradation_mode",
     "dns_ipam",

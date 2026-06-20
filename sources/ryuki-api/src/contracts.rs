@@ -40,6 +40,7 @@ use ryuki_engine::cmdb_impact;
 use ryuki_engine::compliance_reporting;
 use ryuki_engine::container_namespace;
 use ryuki_engine::cost_capacity;
+use ryuki_engine::customization_spec_governance;
 use ryuki_engine::datacenter_readiness;
 use ryuki_engine::degradation_mode;
 use ryuki_engine::dns_ipam;
@@ -433,6 +434,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/vmware/customization-spec-governance-contract",
             get(integrations_vmware_customization_spec),
+        )
+        .route(
+            "/api/integrations/vmware/customization-spec-governance",
+            get(integrations_vmware_customization_spec_governance),
         )
         .route(
             "/api/integrations/vmware/object-placement-contract",
@@ -4888,6 +4893,40 @@ async fn integrations_vmware_customization_spec() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["request-preflight","windows-server-deployment","ou-placement-review","customization-spec-drift-review","site-catalog-review"],"supportedHypervisors":["VMware","Hyper-V","Proxmox","Nutanix AHV","Xen","KVM"],"guestCustomizationParity":["vmware-vcenter-customization-spec-safe-facts","hyper-v-answer-file-safe-facts","proxmox-cloud-init-safe-facts","nutanix-ahv-cloud-init-safe-facts","xen-cloud-init-safe-facts","kvm-cloud-init-safe-facts"],"safeFacts":["customizationSpecReference","countryCode","siteCode","domainReference","ouPatternReference","timezoneCode","dhcpNetworkBehavior","organizationLabel","windowsBehavior"],"driftSignals":["missing-expected-spec","unknown-spec","country-site-mismatch","ou-pattern-mismatch","domain-mismatch","timezone-mismatch","network-behavior-mismatch","windows-behavior-mismatch","stale-spec-inventory"],"requiredGuards":["site-known","safe-facts-from-catalog","ou-pattern-derived","free-form-ou-blocked","encrypted-xml-excluded","drift-check-reviewed","stale-data-marked","owner-known","evidence-redacted"],"planSections":["safeFactSummary","siteMapping","ouPlacementDecision","timezoneAndNetworkBehavior","windowsBehaviorReview","driftReview","blockedFindings","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-provider-validation-disabled","live-guest-customization-disabled","unsupported-hypervisor","raw-xml-blocked","encrypted-xml-blocked","credential-material-blocked","site-unknown","spec-reference-unknown","ou-pattern-mismatch","stale-spec-inventory","owner-unknown","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct CustomizationSpecQuery {
+    site: Option<String>,
+    spec: Option<String>,
+    country: Option<String>,
+    timezone: Option<u32>,
+    ou: Option<String>,
+    domain: Option<String>,
+    network: Option<String>,
+}
+
+/// Dry-run guest-customization GOVERNANCE. Turns the static
+/// `customization-spec-governance` descriptor into a real decision: derive the
+/// catalog-governed safe Windows customization facts for the site (spec, OU
+/// pattern, domain, timezone, DHCP behavior) and flag drift against any proposed
+/// values. `block` for an unknown site, `review` on drift, `admit` when the
+/// proposal matches the catalog. Catalog-derived safe facts only — no live
+/// vCenter/directory calls.
+async fn integrations_vmware_customization_spec_governance(
+    Query(params): Query<CustomizationSpecQuery>,
+) -> Json<Value> {
+    let site = params.site.as_deref().unwrap_or("DEFRA");
+    let proposed = customization_spec_governance::ProposedSpec {
+        spec_reference: params.spec,
+        country_code: params.country,
+        timezone_code: params.timezone,
+        ou: params.ou,
+        domain: params.domain,
+        network_behavior: params.network,
+    };
+    let result = customization_spec_governance::evaluate_customization_spec(site, &proposed);
+    Json(json!(result))
 }
 
 async fn integrations_vmware_object_placement() -> Json<Value> {
@@ -21693,6 +21732,64 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The customization-spec-governance action endpoint derives the catalog
+    /// safe facts for a governed site. With no proposed values it verifies
+    /// nothing, so it returns review (with the derived facts), not admit.
+    #[tokio::test]
+    async fn customization_spec_governance_derives_facts_for_known_site() {
+        let Json(result) =
+            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+                site: Some("DEFRA".into()),
+                spec: None,
+                country: None,
+                timezone: None,
+                ou: None,
+                domain: None,
+                network: None,
+            }))
+            .await;
+        assert_eq!(result["decision"], "review");
+        assert_eq!(
+            result["safe_facts"]["ou_pattern_reference"],
+            "OU=Servers,OU=DEFRA,OU=DE,DC=corp,DC=local"
+        );
+    }
+
+    /// A proposed value that drifts from the catalog downgrades to review.
+    #[tokio::test]
+    async fn customization_spec_governance_reviews_on_drift() {
+        let Json(result) =
+            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+                site: Some("DEFRA".into()),
+                spec: None,
+                country: Some("FR".into()),
+                timezone: None,
+                ou: None,
+                domain: None,
+                network: None,
+            }))
+            .await;
+        assert_eq!(result["decision"], "review");
+    }
+
+    /// An ungoverned site is blocked (no catalog spec).
+    #[tokio::test]
+    async fn customization_spec_governance_blocks_unknown_site() {
+        let Json(result) =
+            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+                site: Some("ZZZZZ".into()),
+                spec: None,
+                country: None,
+                timezone: None,
+                ou: None,
+                domain: None,
+                network: None,
+            }))
+            .await;
+        assert_eq!(result["decision"], "block");
+        assert!(result["safe_facts"].is_null());
+    }
 
     /// The cluster-capacity-admission action endpoint wires the descriptor to a
     /// real decision: in the no-DB test path it evaluates over the static seed,
