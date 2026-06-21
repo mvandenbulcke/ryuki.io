@@ -65,6 +65,7 @@ const DECLARED_MODULES: &[&str] = &[
     "secrets_rotation",
     "server_decommission",
     "servicenow_api",
+    "servicenow_future_api",
     "shift_queue",
     "site_registry",
     "snapshot_engine",

@@ -77,6 +77,7 @@ use ryuki_engine::runbook_execution;
 use ryuki_engine::secrets_rotation;
 use ryuki_engine::server_decommission;
 use ryuki_engine::servicenow_api;
+use ryuki_engine::servicenow_future_api;
 use ryuki_engine::shift_queue;
 use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
@@ -555,6 +556,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/servicenow/future-api-contract",
             get(integrations_servicenow_future_api),
+        )
+        .route(
+            "/api/integrations/servicenow/future-api-readiness",
+            get(integrations_servicenow_future_api_readiness),
         )
         // ─── Inventory Sync Engine ───
         .route("/api/inventory/sync", post(inventory_run_sync))
@@ -4807,6 +4812,41 @@ async fn integrations_servicenow_future_api() -> Json<Value> {
         "planSections": ["integrationSummary","authReference","instanceConfiguration","tableMapping","callbackPlan","importSetPlan","statusSyncPlan","rollbackReadiness","evidenceReferences"],
         "blockedReasons": ["live-api-disabled","provider-calls-disabled","request-callbacks-disabled","change-callbacks-disabled","cmdb-updates-disabled","import-set-writes-disabled","status-sync-disabled","table-api-calls-disabled","credential-values-disabled","instance-identifiers-disabled","table-identifiers-disabled","sys-identifiers-disabled","raw-request-payloads-disabled","raw-response-payloads-disabled","raw-ticket-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","approval-missing","secret-reference-missing","table-mapping-missing","payload-redaction-missing","rollback-plan-missing","evidence-not-redacted"]
     }))
+}
+
+#[derive(Deserialize)]
+struct FutureApiQuery {
+    approval_record: Option<String>,
+    secret_reference: Option<String>,
+    table_mapping_summary: Option<String>,
+    rollback_plan: Option<String>,
+    evidence_manifest: Option<String>,
+    // Context-only — recorded, not gated.
+    integration_scope: Option<String>,
+    instance_profile: Option<String>,
+    owner: Option<String>,
+}
+
+/// Dry-run ServiceNow future-API integration readiness. Turns the static
+/// `servicenow-future-api` descriptor into a real decision: evaluate the readiness
+/// guards over a proposed integration request and return `readiness-recorded` (all
+/// criteria met; live-API enablement is a separately-approved step) or `block`.
+/// Never calls ServiceNow; authentication is referenced by secret handle only.
+async fn integrations_servicenow_future_api_readiness(
+    Query(params): Query<FutureApiQuery>,
+) -> Json<Value> {
+    let input = servicenow_future_api::FutureApiInput {
+        approval_record: params.approval_record,
+        secret_reference: params.secret_reference,
+        table_mapping_summary: params.table_mapping_summary,
+        rollback_plan: params.rollback_plan,
+        evidence_manifest: params.evidence_manifest,
+        integration_scope: params.integration_scope,
+        instance_profile: params.instance_profile,
+        owner: params.owner,
+    };
+    let result = servicenow_future_api::evaluate_future_api(&input);
+    Json(json!(result))
 }
 
 // ─── Remaining endpoints (inventory, software, workflows, integrations-vmware, operations, images, patching, protect, observe, cmdb, admin, auth, analytics) ───
@@ -22081,11 +22121,61 @@ mod router_tests {
             .as_array()
             .is_some_and(|r| r.iter().any(|x| x == "unsupported-hypervisor")));
     }
+
+    /// servicenow future-api readiness through the router: a complete request
+    /// records readiness.
+    #[tokio::test]
+    async fn router_serves_servicenow_future_api_readiness() {
+        let (status, json) = get_json(
+            "/api/integrations/servicenow/future-api-readiness?integration_scope=request-callback&approval_record=CHG-1&secret_reference=h://s&instance_profile=p&table_mapping_summary=m&rollback_plan=rb&owner=o&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "readiness-recorded");
+    }
 }
 
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The servicenow future-api readiness endpoint blocks an incomplete request
+    /// and records readiness for a complete one.
+    #[tokio::test]
+    async fn servicenow_future_api_blocks_then_records() {
+        let Json(blocked) = integrations_servicenow_future_api_readiness(Query(FutureApiQuery {
+            approval_record: None,
+            secret_reference: None,
+            table_mapping_summary: None,
+            rollback_plan: None,
+            evidence_manifest: None,
+            integration_scope: Some("request-callback".into()),
+            instance_profile: None,
+            owner: Some("o".into()),
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "approval-missing")));
+        // rollback readiness is now an input gate, so its reason is reachable.
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "rollback-plan-missing")));
+
+        let Json(ready) = integrations_servicenow_future_api_readiness(Query(FutureApiQuery {
+            approval_record: Some("CHG-1".into()),
+            secret_reference: Some("h://s".into()),
+            table_mapping_summary: Some("m".into()),
+            rollback_plan: Some("rb".into()),
+            evidence_manifest: Some("ev".into()),
+            integration_scope: Some("request-callback".into()),
+            instance_profile: Some("p".into()),
+            owner: Some("o".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "readiness-recorded");
+    }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
     #[tokio::test]
