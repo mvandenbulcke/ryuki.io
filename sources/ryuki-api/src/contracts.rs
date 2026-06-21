@@ -18429,7 +18429,6 @@ struct AccessReviewQuery {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct AccessReviewActionRequest {
-    reviewer: String,
     justification: Option<String>,
     reason: Option<String>,
 }
@@ -18437,7 +18436,6 @@ struct AccessReviewActionRequest {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct AccessReviewExemptRequest {
-    reviewer: String,
     justification: String,
     #[serde(rename = "exemptionExpiry")]
     exemption_expiry: String,
@@ -18527,17 +18525,17 @@ async fn access_reviews_expiring(Query(params): Query<AccessReviewExpiringQuery>
 
 async fn access_review_start(
     Path(id): Path<String>,
-    Json(body): Json<AccessReviewActionRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    access_recertification::start_review_guard(&review, &body.reviewer)
+    access_recertification::start_review_guard(&review, &session.user_id)
         .map_err(|e| status_400(&e))?;
     let (updated, _) =
-        crate::repos::access_recertification::start(pool, &id, &body.reviewer, updated_at)
+        crate::repos::access_recertification::start(pool, &id, &session.user_id, updated_at)
             .await
             .map_err(db_error)?
             .ok_or_else(|| {
@@ -18548,6 +18546,7 @@ async fn access_review_start(
 
 async fn access_review_approve(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<AccessReviewActionRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -18556,7 +18555,7 @@ async fn access_review_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    access_recertification::approve_review_guard(&review, &body.reviewer, justification)
+    access_recertification::approve_review_guard(&review, &session.user_id, justification)
         .map_err(|e| status_400(&e))?;
     let expected_nrd: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339(&review.next_review_due)
@@ -18570,7 +18569,7 @@ async fn access_review_approve(
     let (updated, _) = crate::repos::access_recertification::approve(
         pool,
         &id,
-        &body.reviewer,
+        &session.user_id,
         justification,
         &expected_status,
         updated_at,
@@ -18584,6 +18583,7 @@ async fn access_review_approve(
 
 async fn access_review_revoke(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<AccessReviewActionRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -18592,13 +18592,13 @@ async fn access_review_revoke(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    access_recertification::revoke_review_guard(&review, &body.reviewer, reason)
+    access_recertification::revoke_review_guard(&review, &session.user_id, reason)
         .map_err(|e| status_400(&e))?;
     let expected_status = review.status.to_string();
     let (updated, _) = crate::repos::access_recertification::revoke(
         pool,
         &id,
-        &body.reviewer,
+        &session.user_id,
         reason,
         &expected_status,
         updated_at,
@@ -18611,6 +18611,7 @@ async fn access_review_revoke(
 
 async fn access_review_exempt(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<AccessReviewExemptRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -18620,7 +18621,7 @@ async fn access_review_exempt(
         .ok_or_else(|| status_404(&id))?;
     access_recertification::exempt_review_guard(
         &review,
-        &body.reviewer,
+        &session.user_id,
         &body.justification,
         &body.exemption_expiry,
     )
@@ -18641,7 +18642,7 @@ async fn access_review_exempt(
     let (updated, _) = crate::repos::access_recertification::exempt(
         pool,
         &id,
-        &body.reviewer,
+        &session.user_id,
         &body.justification,
         expiry,
         &expected_status,
