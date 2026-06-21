@@ -21950,6 +21950,89 @@ async fn sql_deployment_contract() -> Json<Value> {
     }))
 }
 
+/// Router-level integration tests: build the REAL `routes()` Router and drive
+/// requests through it end to end (routing + extractors + handler + JSON), rather
+/// than calling handlers directly. Closes the "no test constructs the router" gap.
+/// Only the static-seed / pure dry-run endpoints are exercised (no DB, no auth
+/// extension), so these run in the no-Postgres CI path via `--bins`.
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn get_json(uri: &str) -> (StatusCode, Value) {
+        let app = routes();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// The cluster-capacity-admission engine, reached through the real router.
+    #[tokio::test]
+    async fn router_serves_cluster_capacity_admission() {
+        let (status, json) = get_json(
+            "/api/integrations/vmware/cluster-capacity-admission?cpu_cores=4&memory_gb=16&storage_gb=0",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "admit");
+        assert_eq!(json["inventory_source"], "static-seed");
+    }
+
+    /// object-placement through the router blocks an unknown site (data-backed).
+    #[tokio::test]
+    async fn router_serves_object_placement_unknown_site() {
+        let (status, json) = get_json(
+            "/api/integrations/vmware/object-placement?site=ZZZZZ&environment=prod&capacity_decision=admit&network_profile=n&storage_profile=s&tag_policy=t&evidence_manifest=e",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "block");
+    }
+
+    /// cmdb-file row validation through the router accepts a complete row.
+    #[tokio::test]
+    async fn router_serves_cmdb_file_row_validation() {
+        let (status, json) = get_json(
+            "/api/integrations/servicenow/cmdb-file-row-validation?ci_name=a&environment=prod&business_owner=o&support_group=g&site_code=DEFRA&evidence_reference=e",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "accepted");
+    }
+
+    /// A static descriptor endpoint is wired and returns its contract JSON.
+    #[tokio::test]
+    async fn router_serves_a_static_descriptor() {
+        let (status, json) =
+            get_json("/api/integrations/vmware/snapshot-governance-contract").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["source"], "static-seed");
+    }
+
+    /// An unregistered route returns 404 — proves the router is real, not a stub
+    /// that answers everything.
+    #[tokio::test]
+    async fn router_returns_404_for_unknown_route() {
+        let (status, _) = get_json("/api/this-route-does-not-exist").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
 #[cfg(test)]
 mod unit_tests {
     use super::*;
