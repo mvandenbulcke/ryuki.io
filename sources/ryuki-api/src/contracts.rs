@@ -5357,8 +5357,10 @@ async fn shift_summary() -> Json<Value> {
 
 async fn shift_acknowledge(
     Path(id): Path<String>,
-    Json(body): Json<ShiftActionRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Acknowledger = authenticated caller (from request extensions), never a
+    // client body field — the audit trail must name the real principal.
     if let Some(pool) = get_db() {
         // The shift_queue.id column is UUID; bind a parsed Uuid (not the raw
         // path String) or Postgres rejects the comparison with `uuid = text`.
@@ -5402,7 +5404,7 @@ async fn shift_acknowledge(
              acknowledged_at = $2, updated_at = $2 \
              WHERE id = $3 AND resolved = false AND acknowledged = false",
         )
-        .bind(&body.user)
+        .bind(&session.user_id)
         .bind(now)
         .bind(uid)
         .execute(pool)
@@ -5419,12 +5421,12 @@ async fn shift_acknowledge(
         return Ok(Json(json!({
             "status": "acknowledged",
             "id": id,
-            "acknowledged_by": body.user,
+            "acknowledged_by": session.user_id,
             "acknowledged_at": now.to_rfc3339(),
             "source": "database",
         })));
     }
-    shift_queue::acknowledge_item(&id, &body.user)
+    shift_queue::acknowledge_item(&id, &session.user_id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -27017,6 +27019,16 @@ mod approved_packages_db_tests {
 #[cfg(test)]
 mod shift_queue_db_tests {
     use super::*;
+
+    /// Authenticated acknowledger session — shift_acknowledge records the
+    /// actor from `session.user_id`, so `acknowledged_by` is this id.
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -27077,9 +27089,7 @@ mod shift_queue_db_tests {
         // Call the handler — must go through the DB path.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Json(ShiftActionRequest {
-                user: "db-test-user".to_string(),
-            }),
+            Extension(approver_session("db-test-user")),
         )
         .await;
 
@@ -27103,9 +27113,7 @@ mod shift_queue_db_tests {
         };
         let result = shift_acknowledge(
             Path("e0000291-0000-0000-0000-000000000099".to_string()),
-            Json(ShiftActionRequest {
-                user: "nobody".to_string(),
-            }),
+            Extension(approver_session("nobody")),
         )
         .await;
         let Err((status, _)) = result else {
@@ -27127,9 +27135,7 @@ mod shift_queue_db_tests {
         // First acknowledge.
         let _ = shift_acknowledge(
             Path(id.to_string()),
-            Json(ShiftActionRequest {
-                user: "ops-lead".to_string(),
-            }),
+            Extension(approver_session("ops-lead")),
         )
         .await
         .expect("first acknowledge must succeed");
@@ -27137,9 +27143,7 @@ mod shift_queue_db_tests {
         // Second acknowledge must fail with 400.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Json(ShiftActionRequest {
-                user: "ops-lead".to_string(),
-            }),
+            Extension(approver_session("ops-lead")),
         )
         .await;
 
@@ -27478,14 +27482,15 @@ mod shift_queue_db_tests {
         assert_eq!(body["stale_threshold_hours"].as_u64().unwrap(), 4);
     }
 
-    // ── CAS guard: resolving a row then trying to acknowledge it → 409 ──
+    // ── Acknowledging an already-resolved item is rejected (pre-read 400) ──
     //
-    // This verifies the WHERE-clause state guard added to shift_acknowledge.
-    // A resolved item has resolved=true, so `AND resolved = false` fails and
-    // rows_affected() == 0, which must return 409 CONFLICT.
-
+    // The pre-read state check fires first for an already-resolved item and
+    // returns 400, matching the shift handler family's state-precondition
+    // convention (assign/escalate/resolve all 400 on a bad precondition). The
+    // WHERE-clause CAS guard (`AND resolved = false`) remains a secondary defense
+    // for the concurrent-resolve race between the read and the UPDATE.
     #[tokio::test]
-    async fn test_acknowledge_after_resolve_returns_409() {
+    async fn test_acknowledge_after_resolve_rejected() {
         let _serial = DB_TEST_SERIAL.lock().await;
         let Some(pool) = global_pool().await else {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
@@ -27504,31 +27509,29 @@ mod shift_queue_db_tests {
         .await
         .expect("resolve must succeed");
 
-        // Now try to acknowledge the resolved item — must hit the CAS guard.
+        // Now try to acknowledge the resolved item — the pre-read check rejects it.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Json(ShiftActionRequest {
-                user: "late-user".to_string(),
-            }),
+            Extension(approver_session("late-user")),
         )
         .await;
 
         cleanup_item(pool, id).await;
 
         let Err((status, Json(err))) = result else {
-            panic!("expected Err, got Ok — CAS guard not firing");
+            panic!("expected Err, got Ok — resolved item must be rejected");
         };
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "resolved item must return 409: {err}"
+            StatusCode::BAD_REQUEST,
+            "acknowledging a resolved item must be rejected: {err}"
         );
         assert!(
             err["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("state changed concurrently"),
-            "error message must mention concurrent state change: {err}"
+                .contains("Cannot acknowledge a resolved item"),
+            "error message must name the resolved item: {err}"
         );
     }
 
