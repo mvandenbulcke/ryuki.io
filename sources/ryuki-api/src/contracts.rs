@@ -22031,6 +22031,56 @@ mod router_tests {
         let (status, _) = get_json("/api/this-route-does-not-exist").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// customization-spec-governance through the router: deriving facts for a
+    /// governed site with no proposed values returns review.
+    #[tokio::test]
+    async fn router_serves_customization_spec_governance() {
+        let (status, json) =
+            get_json("/api/integrations/vmware/customization-spec-governance?site=DEFRA").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "review");
+        assert_eq!(
+            json["safe_facts"]["ou_pattern_reference"],
+            "OU=Servers,OU=DEFRA,OU=DE,DC=corp,DC=local"
+        );
+    }
+
+    /// snapshot-governance through the router: a complete, ample request admits.
+    #[tokio::test]
+    async fn router_serves_snapshot_governance() {
+        let (status, json) = get_json(
+            "/api/integrations/vmware/snapshot-governance?ci_key=CI-1&purpose=upgrade&requested_expiry=2099-12-01T00:00:00Z&owner=o&backup_state=protected&approval_route=cab&lock_scope=vm&rollback_notes=rb&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "admit");
+    }
+
+    /// decommission-quarantine through the router: incomplete request blocks, and
+    /// final disposition is always held.
+    #[tokio::test]
+    async fn router_serves_decommission_quarantine() {
+        let (status, json) =
+            get_json("/api/integrations/vmware/decommission-quarantine?ci_key=CI-1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "block");
+        assert_eq!(json["final_disposition"], "blocked");
+    }
+
+    /// vsan-esxi-lifecycle through the router: an unsupported hypervisor blocks.
+    #[tokio::test]
+    async fn router_serves_vsan_esxi_lifecycle_unsupported_hypervisor() {
+        let (status, json) = get_json(
+            "/api/integrations/vmware/vsan-esxi-lifecycle?cluster_scope=c&site=DEFRA&hypervisor_platform=KVM&platform_profile=p&target_baseline=b&maintenance_window=w&capacity_decision=admitted&hardware_readiness=r&network_readiness=r&rollback_plan=rb&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "block");
+        assert!(json["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "unsupported-hypervisor")));
+    }
 }
 
 #[cfg(test)]
