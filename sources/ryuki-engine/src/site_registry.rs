@@ -953,6 +953,20 @@ pub fn is_valid_site(unlocode: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `unlocode` is a RECOGNISED site in the registry, regardless of its
+/// active status — i.e. membership only. Unlike [`is_valid_site`] (which also
+/// requires the site to be ACTIVE/operational), this answers "is this a real,
+/// known UN/LOCODE?". A CMDB record can legitimately reference a recognised but
+/// currently-inactive site, so import validation uses this rather than the
+/// active-only check. Membership is also stable against runtime activate/
+/// deactivate toggling of the registry.
+pub fn is_known_site(unlocode: &str) -> bool {
+    site_store()
+        .lock()
+        .map(|store| store.iter().any(|s| s.unlocode == unlocode))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,6 +1038,16 @@ mod tests {
         assert!(is_valid_site("DEFRA"));
         assert!(!is_valid_site("NONEXISTENT"));
         assert!(!is_valid_site("ESMAD"));
+    }
+
+    #[test]
+    fn test_is_known_site_is_membership_not_active() {
+        // is_known_site is membership-only: an active site AND a recognised but
+        // inactive site both count; only a truly-unrecognised code does not.
+        assert!(is_known_site("DEFRA")); // active
+        assert!(is_known_site("ESMAD")); // recognised but inactive (is_valid_site is false)
+        assert!(!is_valid_site("ESMAD")); // distinction: active-only check rejects it
+        assert!(!is_known_site("NONEXISTENT"));
     }
 
     #[test]

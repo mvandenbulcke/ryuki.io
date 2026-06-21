@@ -36,6 +36,7 @@ use ryuki_engine::backup_engine;
 use ryuki_engine::certificate_lifecycle;
 use ryuki_engine::cluster_capacity_admission;
 use ryuki_engine::cmdb_engine;
+use ryuki_engine::cmdb_file_exchange;
 use ryuki_engine::cmdb_impact;
 use ryuki_engine::compliance_reporting;
 use ryuki_engine::container_namespace;
@@ -546,6 +547,10 @@ pub fn routes() -> Router {
         .route(
             "/api/integrations/servicenow/cmdb-file-contract",
             get(integrations_servicenow_cmdb_file),
+        )
+        .route(
+            "/api/integrations/servicenow/cmdb-file-row-validation",
+            get(integrations_servicenow_cmdb_file_row_validation),
         )
         .route(
             "/api/integrations/servicenow/future-api-contract",
@@ -4757,6 +4762,40 @@ async fn integrations_servicenow_cmdb_file() -> Json<Value> {
         "syntheticCategoryExamples": ["identity synthetic-ci-name","ownership synthetic-business-owner","classification synthetic-ci-class","governance-evidence synthetic-file-hash-reference","operating-system synthetic-os-family","lifecycle synthetic-lifecycle-state","service-context synthetic-environment","location synthetic-site-code","normalized-fallback synthetic-review-note"],
         "rejectionReasons": ["missing-ci-identity","ambiguous-ci-identity","unknown-site-code","missing-owner","missing-support-group","invalid-environment","missing-evidence-reference"]
     }))
+}
+
+#[derive(Deserialize)]
+struct CmdbRowQuery {
+    ci_name: Option<String>,
+    fqdn: Option<String>,
+    ci_class: Option<String>,
+    environment: Option<String>,
+    business_owner: Option<String>,
+    support_group: Option<String>,
+    site_code: Option<String>,
+    evidence_reference: Option<String>,
+}
+
+/// Dry-run ServiceNow CMDB file-exchange row validation. Turns the static
+/// `cmdb-file-exchange` descriptor into a real decision: validate a proposed
+/// normalized CMDB import row against the contract rejection reasons and return
+/// `accepted` / `rejected` with reasons. Site validation is data-backed (site
+/// registry). File-based dry-run only — no live ServiceNow API call.
+async fn integrations_servicenow_cmdb_file_row_validation(
+    Query(params): Query<CmdbRowQuery>,
+) -> Json<Value> {
+    let input = cmdb_file_exchange::CmdbRowInput {
+        ci_name: params.ci_name,
+        fqdn: params.fqdn,
+        ci_class: params.ci_class,
+        environment: params.environment,
+        business_owner: params.business_owner,
+        support_group: params.support_group,
+        site_code: params.site_code,
+        evidence_reference: params.evidence_reference,
+    };
+    let result = cmdb_file_exchange::evaluate_cmdb_row(&input);
+    Json(json!(result))
 }
 
 async fn integrations_servicenow_future_api() -> Json<Value> {
@@ -21914,6 +21953,43 @@ async fn sql_deployment_contract() -> Json<Value> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
+    #[tokio::test]
+    async fn cmdb_file_row_validation_accepts_complete_row() {
+        let Json(result) = integrations_servicenow_cmdb_file_row_validation(Query(CmdbRowQuery {
+            ci_name: Some("app-srv-01".into()),
+            fqdn: Some("app-srv-01.corp.local".into()),
+            ci_class: Some("server".into()),
+            environment: Some("prod".into()),
+            business_owner: Some("team-platform".into()),
+            support_group: Some("platform-ops".into()),
+            site_code: Some("DEFRA".into()),
+            evidence_reference: Some("ev-1".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "accepted");
+    }
+
+    /// An unknown site code rejects with the data-backed reason.
+    #[tokio::test]
+    async fn cmdb_file_row_validation_rejects_unknown_site() {
+        let Json(result) = integrations_servicenow_cmdb_file_row_validation(Query(CmdbRowQuery {
+            ci_name: Some("app-srv-01".into()),
+            fqdn: Some("app-srv-01.corp.local".into()),
+            ci_class: Some("server".into()),
+            environment: Some("prod".into()),
+            business_owner: Some("team-platform".into()),
+            support_group: Some("platform-ops".into()),
+            site_code: Some("ZZZZZ".into()),
+            evidence_reference: Some("ev-1".into()),
+        }))
+        .await;
+        assert_eq!(result["decision"], "rejected");
+        assert!(result["rejection_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "unknown-site-code")));
+    }
 
     /// The object-placement action endpoint produces an approvable placement plan
     /// for a complete request against a governed site with capacity admitted.

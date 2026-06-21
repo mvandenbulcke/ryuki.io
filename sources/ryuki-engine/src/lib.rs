@@ -9,6 +9,7 @@ pub mod backup_engine;
 pub mod certificate_lifecycle;
 pub mod cluster_capacity_admission;
 pub mod cmdb_engine;
+pub mod cmdb_file_exchange;
 pub mod cmdb_impact;
 pub mod compliance_reporting;
 pub mod container_namespace;
