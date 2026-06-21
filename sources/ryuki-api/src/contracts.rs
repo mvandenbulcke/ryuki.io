@@ -2486,12 +2486,6 @@ struct OutageNoticeUpcomingQuery {
     site: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct OutageNoticeAcknowledgeRequest {
-    user: String,
-}
-
 // ─── Request lifecycle types ───
 
 #[derive(Debug, Deserialize)]
@@ -10198,11 +10192,6 @@ struct AiopsTypeQuery {
 }
 
 #[derive(Deserialize)]
-struct AiopsReviewRequest {
-    reviewer: String,
-}
-
-#[derive(Deserialize)]
 struct AiopsRejectRequest {
     reason: String,
 }
@@ -10222,7 +10211,7 @@ async fn aiops_generate(
 
 async fn aiops_review(
     Path(id): Path<String>,
-    Json(body): Json<AiopsReviewRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let suggestion = crate::repos::aiops::get(pool, &id)
@@ -10230,7 +10219,9 @@ async fn aiops_review(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     let expected = aiops::guard_review(&suggestion).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::aiops::review(pool, &id, &body.reviewer, expected)
+    // Reviewer = authenticated caller (from request extensions), never a
+    // client-supplied body field — the audit trail must name the real principal.
+    let updated = crate::repos::aiops::review(pool, &id, &session.user_id, expected)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
@@ -17256,7 +17247,7 @@ async fn outage_notices_send(Path(id): Path<String>) -> ApiResult {
 
 async fn outage_notices_acknowledge(
     Path(id): Path<String>,
-    Json(body): Json<OutageNoticeAcknowledgeRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = crate::repos::outage_comms::get(pool, &id)
@@ -17265,7 +17256,9 @@ async fn outage_notices_acknowledge(
         .ok_or_else(|| status_404(&id))?;
     outage_comms::acknowledge_guard(&notice).map_err(|e| status_409(&e))?;
     let ack =
-        crate::repos::outage_comms::acknowledge(pool, &id, &body.user, &notice.status.to_string())
+        // Acknowledger = authenticated caller (from request extensions), never a
+        // client body field — the audit trail must name the real principal.
+        crate::repos::outage_comms::acknowledge(pool, &id, &session.user_id, &notice.status.to_string())
             .await
             .map_err(db_error)?
             .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
