@@ -7197,14 +7197,6 @@ struct SoftwarePackagesQuery {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct SoftwareActionRequest {
-    #[serde(rename = "requestId")]
-    request_id: String,
-    approver: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 struct SoftwareComplianceQuery {
     site: String,
 }
@@ -7341,9 +7333,13 @@ async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>)
 
 async fn software_approve(
     Path(id): Path<String>,
-    Json(body): Json<SoftwareActionRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
-    let approver = body.approver.unwrap_or_else(|| "admin".into());
+    // The approver is the AUTHENTICATED caller (resolved by the auth middleware
+    // and injected into request extensions), never a client-supplied body field.
+    // Audit integrity requires attributing the approval to the real principal —
+    // a caller must not be able to claim someone else (or "admin") approved.
+    let approver = session.user_id;
 
     if let Some(pool) = get_db() {
         // DB path: validate inline against the DB row, then CAS UPDATE.
@@ -30989,6 +30985,16 @@ mod software_deployment_db_tests {
         }
     }
 
+    /// An authenticated approver session — software_approve records the approver
+    /// from `session.user_id`, so the recorded `approved_by` is this id.
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
     /// plan → approve → execute → verify: each transition persists in DB.
     /// history SELECT returns the deployment.
     #[tokio::test]
@@ -31015,10 +31021,7 @@ mod software_deployment_db_tests {
         // Approve.
         let Ok(Json(approved)) = software_approve(
             Path(id.clone()),
-            Json(SoftwareActionRequest {
-                request_id: id.clone(),
-                approver: Some("test-approver".into()),
-            }),
+            Extension(approver_session("test-approver")),
         )
         .await
         else {
@@ -31099,14 +31102,8 @@ mod software_deployment_db_tests {
         let id = planned["id"].as_str().expect("id").to_string();
 
         // First approve: OK.
-        let Ok(_) = software_approve(
-            Path(id.clone()),
-            Json(SoftwareActionRequest {
-                request_id: id.clone(),
-                approver: Some("approver-1".into()),
-            }),
-        )
-        .await
+        let Ok(_) =
+            software_approve(Path(id.clone()), Extension(approver_session("approver-1"))).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("first approve failed");
@@ -31115,14 +31112,8 @@ mod software_deployment_db_tests {
         // Second approve: engine already changed status to Approved so engine
         // rejects it; DB CAS would also reject (row not in Planned). Either way
         // we expect an Err.
-        let Err(_) = software_approve(
-            Path(id.clone()),
-            Json(SoftwareActionRequest {
-                request_id: id.clone(),
-                approver: Some("approver-2".into()),
-            }),
-        )
-        .await
+        let Err(_) =
+            software_approve(Path(id.clone()), Extension(approver_session("approver-2"))).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("expected Err on double-approve");
@@ -31158,14 +31149,8 @@ mod software_deployment_db_tests {
         .expect("direct SQL insert");
 
         // Approve.
-        let Ok(Json(approved)) = software_approve(
-            Path(id.clone()),
-            Json(SoftwareActionRequest {
-                request_id: id.clone(),
-                approver: Some("db-approver".into()),
-            }),
-        )
-        .await
+        let Ok(Json(approved)) =
+            software_approve(Path(id.clone()), Extension(approver_session("db-approver"))).await
         else {
             cleanup_deployment(pool, &id).await;
             panic!("approve on direct-insert row must succeed");
@@ -31228,10 +31213,7 @@ mod software_deployment_db_tests {
 
         let result = software_approve(
             Path(id.clone()),
-            Json(SoftwareActionRequest {
-                request_id: id.clone(),
-                approver: Some("late-approver".into()),
-            }),
+            Extension(approver_session("late-approver")),
         )
         .await;
 
