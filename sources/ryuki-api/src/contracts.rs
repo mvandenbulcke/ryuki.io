@@ -1963,7 +1963,6 @@ struct RestorePlanRequest {
 struct RestoreActionRequest {
     #[serde(rename = "restoreId")]
     restore_id: String,
-    approver: Option<String>,
 }
 
 // ─── Legal hold request types ───
@@ -14448,7 +14447,10 @@ async fn backup_restore_validate(Json(body): Json<RestoreActionRequest>) -> ApiR
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+async fn backup_restore_approve(
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<RestoreActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let r = crate::repos::restore_requests::get(pool, &body.restore_id)
@@ -14457,7 +14459,9 @@ async fn backup_restore_approve(Json(body): Json<RestoreActionRequest>) -> ApiRe
         .ok_or_else(|| status_404(&body.restore_id))?;
 
     let before = crate::repos::restore_requests::status_str(&r.status);
-    let approver = body.approver.as_deref().unwrap_or("Backup Operator");
+    // Approver = authenticated caller (from request extensions), never a
+    // client-supplied body field — the audit trail must name the real principal.
+    let approver = session.user_id.as_str();
 
     let approved = backup_engine::approve_restore(&r, approver).map_err(|e| status_409(&e))?;
 
@@ -14584,12 +14588,6 @@ struct DecommissionPlanRequest {
     quarantine_days: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct DecommissionApproveRequest {
-    approver: String,
-}
-
 // ─── Server Decommission handlers ───
 
 /// 503 returned by handlers that require a database when no pool is available.
@@ -14654,7 +14652,7 @@ async fn decommission_validate(Json(body): Json<DecommissionPlanRequest>) -> Api
 
 async fn decommission_approve(
     Path(id): Path<String>,
-    Json(body): Json<DecommissionApproveRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
@@ -14665,7 +14663,9 @@ async fn decommission_approve(
 
     let before = crate::repos::decommissions::status_str(&req.status);
 
-    let approved = server_decommission::approve_decommission(&req, &body.approver)
+    // Approver = authenticated caller (from request extensions), never a
+    // client-supplied body field — the audit trail must name the real principal.
+    let approved = server_decommission::approve_decommission(&req, &session.user_id)
         .map_err(|e| status_409(&e))?;
 
     let ok = crate::repos::decommissions::transition(pool, before, &approved, None)
@@ -17880,12 +17880,6 @@ struct RunbookStartRequest {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-struct RunbookApproveRequest {
-    approver: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct RunbookFailRequest {
     reason: String,
 }
@@ -17929,9 +17923,11 @@ async fn runbook_execute_step(
 
 async fn runbook_approve(
     Path(id): Path<String>,
-    Json(body): Json<RunbookApproveRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::approve_execution(&id, &body.approver)
+    // Approver = authenticated caller (from request extensions), never a
+    // client-supplied body field — the audit trail must name the real principal.
+    runbook_execution::approve_execution(&id, &session.user_id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -31291,6 +31287,16 @@ mod server_decommission_db_tests {
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
+    /// An authenticated approver session — decommission_approve records the
+    /// approver from `session.user_id`, so the recorded approver is this id.
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         if url.is_empty() {
@@ -31387,9 +31393,7 @@ mod server_decommission_db_tests {
         // 2. approve
         let Ok(Json(approved)) = decommission_approve(
             Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "test-approver".into(),
-            }),
+            Extension(approver_session("test-approver")),
         )
         .await
         else {
@@ -31490,13 +31494,8 @@ mod server_decommission_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // approve
-        let Ok(_) = decommission_approve(
-            Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "inv-tester".into(),
-            }),
-        )
-        .await
+        let Ok(_) =
+            decommission_approve(Path(id.clone()), Extension(approver_session("inv-tester"))).await
         else {
             cleanup(pool, &id).await;
             panic!("approve failed");
@@ -31542,9 +31541,7 @@ mod server_decommission_db_tests {
 
         let Ok(_) = decommission_approve(
             Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "audit-tester".into(),
-            }),
+            Extension(approver_session("audit-tester")),
         )
         .await
         else {
@@ -31627,13 +31624,9 @@ mod server_decommission_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // Approve so status = Approved, then try execute (skipping quarantine)
-        let Ok(_) = decommission_approve(
-            Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "exec-tester".into(),
-            }),
-        )
-        .await
+        let Ok(_) =
+            decommission_approve(Path(id.clone()), Extension(approver_session("exec-tester")))
+                .await
         else {
             cleanup(pool, &id).await;
             panic!("approve failed");
@@ -31668,13 +31661,8 @@ mod server_decommission_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Err((status, _)) = decommission_approve(
-            Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "".into(),
-            }),
-        )
-        .await
+        let Err((status, _)) =
+            decommission_approve(Path(id.clone()), Extension(approver_session(""))).await
         else {
             cleanup(pool, &id).await;
             panic!("expected error for empty approver but got Ok");
@@ -31703,9 +31691,7 @@ mod server_decommission_db_tests {
         // First approve — should succeed
         let Ok(_) = decommission_approve(
             Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "first-approver".into(),
-            }),
+            Extension(approver_session("first-approver")),
         )
         .await
         else {
@@ -31716,9 +31702,7 @@ mod server_decommission_db_tests {
         // Second approve from Approved state — must return 409
         let Err((status, _)) = decommission_approve(
             Path(id.clone()),
-            Json(DecommissionApproveRequest {
-                approver: "second-approver".into(),
-            }),
+            Extension(approver_session("second-approver")),
         )
         .await
         else {
@@ -32280,6 +32264,16 @@ mod backup_restore_db_tests {
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
+    /// An authenticated approver session — backup_restore_approve records the
+    /// approver from `session.user_id`, so the recorded approver is this id.
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
     async fn global_pool() -> Option<&'static PgPool> {
         let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         if url.is_empty() {
@@ -32414,10 +32408,12 @@ mod backup_restore_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // Approve.
-        let Ok(Json(approved_resp)) = backup_restore_approve(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-            approver: Some("Datacenter Lead".into()),
-        }))
+        let Ok(Json(approved_resp)) = backup_restore_approve(
+            Extension(approver_session("Datacenter Lead")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup_restore(pool, &id).await;
@@ -32468,10 +32464,12 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        if backup_restore_approve(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-            approver: Some("First Approver".into()),
-        }))
+        if backup_restore_approve(
+            Extension(approver_session("First Approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
@@ -32480,10 +32478,12 @@ mod backup_restore_db_tests {
         }
 
         // Second approve must fail (Approved != Planned → engine guard → 409).
-        let Err((status, _)) = backup_restore_approve(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-            approver: Some("Second Approver".into()),
-        }))
+        let Err((status, _)) = backup_restore_approve(
+            Extension(approver_session("Second Approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup_restore(pool, &id).await;
@@ -32521,10 +32521,12 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        if backup_restore_approve(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-            approver: Some("Exec Approver".into()),
-        }))
+        if backup_restore_approve(
+            Extension(approver_session("Exec Approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
@@ -32534,7 +32536,6 @@ mod backup_restore_db_tests {
 
         let Ok(Json(evidence)) = backup_restore_execute(Json(RestoreActionRequest {
             restore_id: id.clone(),
-            approver: None,
         }))
         .await
         else {
@@ -32563,7 +32564,6 @@ mod backup_restore_db_tests {
         // A second execute must be rejected — the request is no longer Approved.
         let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
             restore_id: id.clone(),
-            approver: None,
         }))
         .await
         else {
@@ -32604,7 +32604,6 @@ mod backup_restore_db_tests {
 
         let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
             restore_id: id.clone(),
-            approver: None,
         }))
         .await
         else {
@@ -32654,10 +32653,12 @@ mod backup_restore_db_tests {
         );
 
         // Advance it to Approved through the normal path.
-        if backup_restore_approve(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-            approver: Some("CAS Approver".into()),
-        }))
+        if backup_restore_approve(
+            Extension(approver_session("CAS Approver")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
