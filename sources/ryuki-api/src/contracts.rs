@@ -5809,8 +5809,6 @@ const EMERGENCY_CHANGE_COLUMNS: &str =
 struct EmergencyInitiateRequest {
     description: String,
     systems: Vec<String>,
-    #[serde(rename = "initiatedBy")]
-    initiated_by: String,
     reason: String,
     site: String,
 }
@@ -5830,18 +5828,17 @@ struct EmergencySiteQuery {
 // ─── Emergency Change (Break-Glass) handlers ───
 
 async fn emergency_initiate(
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<EmergencyInitiateRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
+    // Initiator = authenticated caller (from request extensions), never a
+    // client body field — break-glass audit must name the real principal.
     if let Some(pool) = get_db() {
-        if body.description.is_empty()
-            || body.initiated_by.is_empty()
-            || body.reason.is_empty()
-            || body.site.is_empty()
-        {
+        if body.description.is_empty() || body.reason.is_empty() || body.site.is_empty() {
             return Err(problem_details(
                 StatusCode::BAD_REQUEST,
                 "EMERGENCY_INITIATE_FAILED",
-                "description, initiated_by, reason, and site are required",
+                "description, reason, and site are required",
                 None::<&str>,
             ));
         }
@@ -5856,7 +5853,7 @@ async fn emergency_initiate(
         .bind(id)
         .bind(&body.description)
         .bind(&body.systems)
-        .bind(&body.initiated_by)
+        .bind(&session.user_id)
         .bind(&body.reason)
         .bind(&body.site)
         .bind(now)
@@ -5874,7 +5871,7 @@ async fn emergency_initiate(
             "source": "database",
             "change_id": id.to_string(),
             "status": "Initiated",
-            "initiated_by": body.initiated_by,
+            "initiated_by": session.user_id,
             "site": body.site,
             "created_at": now.to_rfc3339(),
             "dry_run": true,
@@ -5883,7 +5880,7 @@ async fn emergency_initiate(
     match emergency_change::initiate_emergency(
         &body.description,
         body.systems,
-        &body.initiated_by,
+        &session.user_id,
         &body.reason,
         &body.site,
     ) {
@@ -27605,19 +27602,28 @@ mod shift_queue_db_tests {
 mod emergency_change_unit_tests {
     use super::*;
 
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.provider_mode = "local".into();
+        s
+    }
+
     #[tokio::test]
     async fn test_initiate_fallback_no_db() {
         if crate::database::get_db().is_some() {
             eprintln!("SKIP test_initiate_fallback_no_db: running in DB mode");
             return;
         }
-        let result = emergency_initiate(Json(EmergencyInitiateRequest {
-            description: "Unit test emergency".into(),
-            systems: vec!["host-a".into()],
-            initiated_by: "unit.user".into(),
-            reason: "test reason".into(),
-            site: "DEFRA".into(),
-        }))
+        let result = emergency_initiate(
+            Extension(approver_session("test.user")),
+            Json(EmergencyInitiateRequest {
+                description: "Unit test emergency".into(),
+                systems: vec!["host-a".into()],
+                reason: "test reason".into(),
+                site: "DEFRA".into(),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -27633,13 +27639,15 @@ mod emergency_change_unit_tests {
             eprintln!("SKIP test_initiate_validation_fallback_no_db: running in DB mode");
             return;
         }
-        let result = emergency_initiate(Json(EmergencyInitiateRequest {
-            description: String::new(),
-            systems: vec![],
-            initiated_by: "u".into(),
-            reason: "r".into(),
-            site: "DEFRA".into(),
-        }))
+        let result = emergency_initiate(
+            Extension(approver_session("test.user")),
+            Json(EmergencyInitiateRequest {
+                description: String::new(),
+                systems: vec![],
+                reason: "r".into(),
+                site: "DEFRA".into(),
+            }),
+        )
         .await;
         assert!(result.is_err(), "empty description must fail");
     }
@@ -27706,6 +27714,13 @@ mod emergency_change_unit_tests {
 #[cfg(test)]
 mod emergency_change_db_tests {
     use super::*;
+
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.provider_mode = "local".into();
+        s
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -27757,13 +27772,15 @@ mod emergency_change_db_tests {
             return;
         };
 
-        let result = emergency_initiate(Json(EmergencyInitiateRequest {
-            description: "DB test emergency".into(),
-            systems: vec!["db-host-a".into()],
-            initiated_by: "db.test.user".into(),
-            reason: "DB integration test".into(),
-            site: "DEFRA".into(),
-        }))
+        let result = emergency_initiate(
+            Extension(approver_session("db.test.user")),
+            Json(EmergencyInitiateRequest {
+                description: "DB test emergency".into(),
+                systems: vec!["db-host-a".into()],
+                reason: "DB integration test".into(),
+                site: "DEFRA".into(),
+            }),
+        )
         .await;
 
         let Ok(Json(body)) = result else {
@@ -27966,13 +27983,15 @@ mod emergency_change_db_tests {
         };
 
         // Initiate via handler.
-        let Ok(Json(init_body)) = emergency_initiate(Json(EmergencyInitiateRequest {
-            description: "Full lifecycle DB test".into(),
-            systems: vec!["host-x".into()],
-            initiated_by: "lifecycle.user".into(),
-            reason: "Full test".into(),
-            site: "GBLON".into(),
-        }))
+        let Ok(Json(init_body)) = emergency_initiate(
+            Extension(approver_session("test.user")),
+            Json(EmergencyInitiateRequest {
+                description: "Full lifecycle DB test".into(),
+                systems: vec!["host-x".into()],
+                reason: "Full test".into(),
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("initiate failed");
