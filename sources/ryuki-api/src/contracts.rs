@@ -20345,18 +20345,45 @@ async fn firewall_rule_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
+        // Atomic: delete the rule AND scrub its id from any rule-set that
+        // references it, so deleting a rule never leaves a dangling reference in
+        // the now-durable firewall_rule_sets table. This is the durable mirror of
+        // the engine's in-memory delete_rule, which already retain()s the id out
+        // of the static rule-sets.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query("DELETE FROM firewall_rules WHERE id = $1")
             .bind(&id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(db_error)?;
         if result.rows_affected() == 0 {
+            tx.rollback().await.ok();
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Firewall rule '{}' not found", id)})),
             ));
         }
-        // Keep engine in sync.
+        // Cascade: rebuild rule_set_json.rules without the deleted id, only for
+        // rule-sets that actually reference it (the ids live inside the JSONB
+        // array at $.rules). jsonb_exists guards the WHERE so unaffected rule-sets
+        // are not rewritten (no spurious updated_at/xmin churn).
+        sqlx::query(
+            "UPDATE firewall_rule_sets \
+             SET rule_set_json = jsonb_set( \
+                     rule_set_json, '{rules}', \
+                     COALESCE((SELECT jsonb_agg(e) \
+                               FROM jsonb_array_elements_text(rule_set_json->'rules') e \
+                               WHERE e <> $1), '[]'::jsonb)), \
+                 updated_at = NOW() \
+             WHERE jsonb_exists(rule_set_json->'rules', $1)",
+        )
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        // Keep the engine static in sync (delete_rule already scrubs the static
+        // rule-sets the same way).
         let _ = firewall_rules::delete_rule(&id);
         return Ok(Json(json!({
             "source": "database",
@@ -32113,6 +32140,72 @@ mod firewall_rules_db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// Deleting a rule cascades into rule-sets: the deleted rule id is removed
+    /// from any firewall_rule_sets.rule_set_json.rules array, while unrelated rule
+    /// ids in the same rule-set survive — so no dangling references remain.
+    #[tokio::test]
+    async fn test_firewall_rule_delete_cascades_into_rule_sets() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        // 1. Create a rule.
+        let Ok(Json(created)) = firewall_rule_create(
+            Extension(approver_session("fw-user")),
+            Json(create_body(&suffix)),
+        )
+        .await
+        else {
+            panic!("create rule failed");
+        };
+        let rule_id = created["rule"]["id"].as_str().unwrap().to_string();
+
+        // 2. A rule-set that references the new rule plus an unrelated id.
+        let rs_id = format!("fws-cascade-{suffix}");
+        let rule_set = firewall_rules::FirewallRuleSet {
+            id: rs_id.clone(),
+            name: "cascade-test".into(),
+            rules: vec![rule_id.clone(), "fw-keep-001".into()],
+            site: "DEFRA".into(),
+            applied_to: "edge".into(),
+            status: firewall_rules::RuleSetStatus::Draft,
+        };
+        crate::repos::firewall_rule_sets::insert(pool, &rule_set)
+            .await
+            .expect("insert rule-set");
+
+        // 3. Delete the rule.
+        let _ = firewall_rule_delete(Path(rule_id.clone()))
+            .await
+            .expect("delete rule");
+
+        // 4. The deleted id is gone from the rule-set; the unrelated id remains.
+        let (rs, _v) = crate::repos::firewall_rule_sets::get(pool, &rs_id)
+            .await
+            .expect("get rule-set")
+            .expect("rule-set present");
+        assert!(
+            !rs.rules.contains(&rule_id),
+            "deleted rule id must be removed from the rule-set: {:?}",
+            rs.rules
+        );
+        assert!(
+            rs.rules.contains(&"fw-keep-001".to_string()),
+            "unrelated rule id must survive the cascade: {:?}",
+            rs.rules
+        );
+
+        sqlx::query("DELETE FROM firewall_rule_sets WHERE id = $1")
+            .bind(&rs_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup_rule(pool, &rule_id).await;
     }
 
     /// Create → update (action=deny) → GET verifies update persisted.
