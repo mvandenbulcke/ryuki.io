@@ -30,6 +30,7 @@ pub mod firewall_rules;
 pub mod firmware_lifecycle;
 pub mod gmsa_lifecycle;
 pub mod hardware_lifecycle;
+pub mod hardware_readiness;
 pub mod health_monitor;
 pub mod image_factory;
 pub mod immutability_compliance;

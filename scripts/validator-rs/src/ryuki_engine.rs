@@ -40,6 +40,7 @@ const DECLARED_MODULES: &[&str] = &[
     "firmware_lifecycle",
     "gmsa_lifecycle",
     "hardware_lifecycle",
+    "hardware_readiness",
     "health_monitor",
     "image_factory",
     "immutability_compliance",

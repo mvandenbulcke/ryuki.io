@@ -452,6 +452,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/operations/emergency-change-contract` |
 | GET | `/api/operations/firmware-compliance-exception-contract` |
 | GET | `/api/operations/hardware-lifecycle-contract` |
+| GET | `/api/operations/hardware-lifecycle-readiness` |
 | GET | `/api/operations/incident-context-contract` |
 | GET | `/api/operations/incident-context-readiness` |
 | GET | `/api/operations/knowledge-suggestion-contract` |

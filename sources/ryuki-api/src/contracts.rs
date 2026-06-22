@@ -57,6 +57,7 @@ use ryuki_engine::firewall_rules;
 use ryuki_engine::firmware_lifecycle;
 use ryuki_engine::gmsa_lifecycle;
 use ryuki_engine::hardware_lifecycle;
+use ryuki_engine::hardware_readiness;
 use ryuki_engine::health_monitor;
 use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
@@ -725,6 +726,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/hardware-lifecycle-contract",
             get(operations_hardware_lifecycle),
+        )
+        .route(
+            "/api/operations/hardware-lifecycle-readiness",
+            get(operations_hardware_lifecycle_readiness),
         )
         .route(
             "/api/operations/firmware-compliance-exception-contract",
@@ -6529,6 +6534,43 @@ async fn operations_network_vlan() -> Json<Value> {
     Json(
         json!({"source":"static-seed","readinessMode":"review-only","providerCallsEnabled":false,"liveNetworkChangesAllowed":false,"rawInventoryRowsAllowed":false,"networkIdentifiersAllowed":false,"supportedWorkflows":["host-network-readiness","workload-vlan-readiness","switchport-capacity-review","portgroup-policy-review","vlan-catalog-review","network-exception-review"],"readinessDomains":["switchport-capacity","vlan-catalog","portgroup-policy","trunk-policy","uplink-redundancy","mtu-policy","network-segmentation","evidence-readiness"],"requiredInputs":["site","networkScope","workloadProfile","platformProfile","vlanPolicy","portgroupPolicy","redundancyRequirement","maintenanceWindow","owner","evidenceManifest"],"requiredGuards":["site-known","network-scope-known","vlan-catalog-reviewed","portgroup-policy-reviewed","switchport-capacity-reviewed","uplink-redundancy-reviewed","segmentation-reviewed","maintenance-window-known","owner-known","evidence-redacted"],"planSections":["readinessSummary","vlanPolicyReview","portgroupPolicyReview","switchportCapacityReview","uplinkAndTrunkReview","segmentationReview","exceptionDecision","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-network-change-disabled","raw-inventory-rows-disabled","network-identifiers-disabled","site-unknown","network-scope-missing","vlan-catalog-missing","portgroup-policy-missing","switchport-capacity-unknown","uplink-redundancy-unknown","segmentation-unknown","maintenance-window-missing","owner-unknown","evidence-not-redacted"],"requiredEvidence":["Readiness summary","VLAN policy review","Portgroup policy review","Switchport capacity review","Uplink and trunk review","Segmentation review","Exception decision","Evidence references"],"rules":[{"id":"no-live-network-changes","decision":"block","requirement":"Network and VLAN readiness contracts report review state only and never configure switches, port groups, VLANs, trunks, uplinks, or provider networking.","evidence":"Readiness summary"},{"id":"vlan-catalog-required","decision":"block","requirement":"VLAN and port group policy decisions must come from reviewed catalog summaries before host or workload placement can proceed.","evidence":"VLAN policy review"},{"id":"switchport-capacity-required","decision":"block","requirement":"Switchport capacity, uplink redundancy, and trunk policy summaries must be reviewed before network readiness can be accepted.","evidence":"Switchport capacity review"},{"id":"segmentation-review-required","decision":"block","requirement":"Segmentation and environment policy decisions must be reviewed before readiness can be accepted.","evidence":"Segmentation review"},{"id":"raw-network-inventory-not-exposed","decision":"block","requirement":"Network readiness evidence must use safe summaries only and must not expose switch IDs, switchport IDs, MAC addresses, VLAN IDs, endpoint names, private IPs, raw network inventory rows, serials, or provider payloads.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct HardwareReadinessQuery {
+    hardware_profile: Option<String>,
+    site: Option<String>,
+    support_status: Option<String>,
+    firmware_baseline: Option<String>,
+    capacity_role: Option<String>,
+    owner: Option<String>,
+    evidence_manifest: Option<String>,
+    lifecycle_state: Option<String>,
+    refresh_window: Option<String>,
+}
+
+/// Dry-run operations hardware-lifecycle readiness. Turns the static
+/// `operations/hardware-lifecycle` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed hardware-lifecycle action and return
+/// `hardware-lifecycle-recorded` (all criteria met; the live change is a
+/// separately-approved step) or `block`. Never changes live hardware state
+/// (distinct from the stateful hardware_lifecycle engine).
+async fn operations_hardware_lifecycle_readiness(
+    Query(params): Query<HardwareReadinessQuery>,
+) -> Json<Value> {
+    let input = hardware_readiness::HardwareReadinessInput {
+        hardware_profile: params.hardware_profile,
+        site: params.site,
+        support_status: params.support_status,
+        firmware_baseline: params.firmware_baseline,
+        capacity_role: params.capacity_role,
+        owner: params.owner,
+        evidence_manifest: params.evidence_manifest,
+        lifecycle_state: params.lifecycle_state,
+        refresh_window: params.refresh_window,
+    };
+    let result = hardware_readiness::evaluate_hardware_readiness(&input);
+    Json(json!(result))
 }
 
 async fn operations_hardware_lifecycle() -> Json<Value> {
@@ -22517,6 +22559,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "incident-context-recorded");
     }
+
+    /// operations hardware-lifecycle readiness through the router: a complete
+    /// request records the action.
+    #[tokio::test]
+    async fn router_serves_operations_hardware_lifecycle_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/hardware-lifecycle-readiness?hardware_profile=dl360&site=DEFRA&support_status=active&firmware_baseline=b26&capacity_role=compute&owner=dc&evidence_manifest=ev&lifecycle_state=in-service&refresh_window=2027",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "hardware-lifecycle-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22832,6 +22886,43 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "incident-context-recorded");
+    }
+
+    /// The operations hardware-lifecycle readiness endpoint blocks an incomplete
+    /// request and records the action for a complete one.
+    #[tokio::test]
+    async fn operations_hardware_lifecycle_blocks_then_records() {
+        let Json(blocked) =
+            operations_hardware_lifecycle_readiness(Query(HardwareReadinessQuery {
+                hardware_profile: None,
+                site: None,
+                support_status: None,
+                firmware_baseline: None,
+                capacity_role: None,
+                owner: None,
+                evidence_manifest: None,
+                lifecycle_state: None,
+                refresh_window: None,
+            }))
+            .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "model-unknown")));
+
+        let Json(ready) = operations_hardware_lifecycle_readiness(Query(HardwareReadinessQuery {
+            hardware_profile: Some("dl360".into()),
+            site: Some("DEFRA".into()),
+            support_status: Some("active".into()),
+            firmware_baseline: Some("b26".into()),
+            capacity_role: Some("compute".into()),
+            owner: Some("dc".into()),
+            evidence_manifest: Some("ev".into()),
+            lifecycle_state: Some("in-service".into()),
+            refresh_window: Some("2027".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "hardware-lifecycle-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
