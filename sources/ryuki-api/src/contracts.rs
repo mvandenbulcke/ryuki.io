@@ -75,6 +75,7 @@ use ryuki_engine::oob_access;
 use ryuki_engine::os_baseline;
 use ryuki_engine::outage_comms;
 use ryuki_engine::patch_engine;
+use ryuki_engine::platform_health;
 use ryuki_engine::repository_capacity;
 use ryuki_engine::request_lifecycle;
 use ryuki_engine::runbook_execution;
@@ -729,6 +730,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/platform-health-contract",
             get(operations_platform_health),
+        )
+        .route(
+            "/api/operations/platform-health-readiness",
+            get(operations_platform_health_readiness),
         )
         // ─── Incident Context Engine ───
         .route("/api/ops/incident/assemble", post(incident_assemble))
@@ -6521,6 +6526,39 @@ async fn operations_firmware_compliance() -> Json<Value> {
     Json(
         json!({"source":"static-seed","exceptionMode":"review-only","dryRunRequired":true,"providerCallsEnabled":false,"liveFirmwareChangesAllowed":false,"rawInventoryRowsAllowed":false,"hostIdentifiersAllowed":false,"serialNumbersAllowed":false,"exactFirmwareVersionsAllowed":false,"rawVendorPayloadsAllowed":false,"supportedProfiles":["hpe-dl360-msa","hpe-simplivity-dl380","lenovo-sr","lenovo-vx","lenovo-mx"],"exceptionTypes":["firmware-baseline-deviation","driver-baseline-deviation","hardware-support-deviation","compatibility-evidence-gap","maintenance-window-deferral","vendor-baseline-pending"],"riskLevels":["low","medium","high","emergency"],"requiredInputs":["site","hardwareProfile","platformRole","targetBaseline","observedBaselineSummary","exceptionReason","clusterCriticality","supportStatus","remediationWindow","expiryDate","reviewCadence","owner","evidenceManifest"],"requiredGuards":["site-known","hardware-profile-known","target-baseline-known","observed-baseline-summarized","compatibility-impact-reviewed","support-risk-reviewed","cluster-criticality-reviewed","maintenance-window-known","exception-owner-assigned","expiry-date-set","remediation-plan-ready","evidence-redacted"],"planSections":["exceptionSummary","baselineDecision","compatibilityImpact","supportRisk","clusterCriticality","remediationPlan","approvalRoute","expiryAndReview","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-firmware-change-disabled","raw-inventory-rows-disabled","host-identifiers-disabled","serial-numbers-disabled","exact-firmware-versions-disabled","raw-vendor-payloads-disabled","site-unknown","hardware-profile-unknown","target-baseline-missing","observed-baseline-missing","compatibility-impact-unknown","support-risk-unknown","cluster-criticality-unknown","expiry-missing","remediation-plan-missing","approval-missing","evidence-not-redacted"],"requiredEvidence":["Firmware exception summary","Target baseline summary","Observed baseline summary","Compatibility impact review","Support risk review","Cluster criticality review","Remediation plan","Approval route","Expiry and review date","Evidence references"],"rules":[{"id":"no-live-firmware-actions","decision":"block","requirement":"Firmware compliance exceptions report risk acceptance only and never patch firmware, remediate drivers, reconfigure hardware, or call live vendor tools.","evidence":"Firmware exception summary"},{"id":"baseline-evidence-required","decision":"block","requirement":"Target and observed baseline evidence must be summarized before a firmware exception can be reviewed.","evidence":"Baseline summary"},{"id":"compatibility-support-risk-required","decision":"block","requirement":"Compatibility impact, support status, and cluster criticality must be reviewed before exception approval.","evidence":"Support risk review"},{"id":"expiry-remediation-required","decision":"block","requirement":"Exceptions require owner, expiry date, remediation window, and review cadence before acceptance.","evidence":"Expiry and review date"},{"id":"raw-firmware-inventory-not-exposed","decision":"block","requirement":"Firmware exception evidence must use safe summaries only and must not expose host identifiers, endpoint names, private IPs, exact observed firmware versions, serials, asset tags, raw inventory rows, raw logs, or vendor payloads.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct PlatformHealthQuery {
+    component: Option<String>,
+    owner: Option<String>,
+    health_state: Option<String>,
+    stale_data_marker: Option<String>,
+    safe_remediation: Option<String>,
+    evidence_manifest: Option<String>,
+    health_signal: Option<String>,
+}
+
+/// Dry-run operations platform-health remediation readiness. Turns the static
+/// `operations/platform-health` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed health-remediation review and return
+/// `health-review-recorded` (all criteria met; the live remediation is a
+/// separately-approved step) or `block`. Never executes a remediation or exposes
+/// raw logs.
+async fn operations_platform_health_readiness(
+    Query(params): Query<PlatformHealthQuery>,
+) -> Json<Value> {
+    let input = platform_health::PlatformHealthInput {
+        component: params.component,
+        owner: params.owner,
+        health_state: params.health_state,
+        stale_data_marker: params.stale_data_marker,
+        safe_remediation: params.safe_remediation,
+        evidence_manifest: params.evidence_manifest,
+        health_signal: params.health_signal,
+    };
+    let result = platform_health::evaluate_platform_health(&input);
+    Json(json!(result))
 }
 
 async fn operations_platform_health() -> Json<Value> {
@@ -22318,6 +22356,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "comm-plan-recorded");
     }
+
+    /// operations platform-health readiness through the router: a complete request
+    /// records the review.
+    #[tokio::test]
+    async fn router_serves_operations_platform_health_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/platform-health-readiness?component=api-gw&owner=plat&health_state=degraded&stale_data_marker=fresh&safe_remediation=restart&evidence_manifest=ev&health_signal=p99",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "health-review-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22502,6 +22552,38 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "comm-plan-recorded");
+    }
+
+    /// The operations platform-health readiness endpoint blocks an incomplete
+    /// request and records the review for a complete one.
+    #[tokio::test]
+    async fn operations_platform_health_blocks_then_records() {
+        let Json(blocked) = operations_platform_health_readiness(Query(PlatformHealthQuery {
+            component: None,
+            owner: None,
+            health_state: None,
+            stale_data_marker: None,
+            safe_remediation: None,
+            evidence_manifest: None,
+            health_signal: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "component-unknown")));
+
+        let Json(ready) = operations_platform_health_readiness(Query(PlatformHealthQuery {
+            component: Some("api-gw".into()),
+            owner: Some("plat".into()),
+            health_state: Some("degraded".into()),
+            stale_data_marker: Some("fresh".into()),
+            safe_remediation: Some("restart".into()),
+            evidence_manifest: Some("ev".into()),
+            health_signal: Some("p99".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "health-review-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.

@@ -51,6 +51,7 @@ pub mod oob_access;
 pub mod os_baseline;
 pub mod outage_comms;
 pub mod patch_engine;
+pub mod platform_health;
 pub mod policy_engine;
 pub mod repository_capacity;
 pub mod request_lifecycle;
