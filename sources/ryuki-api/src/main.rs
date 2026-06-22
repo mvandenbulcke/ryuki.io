@@ -573,12 +573,72 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolves the permission for operational maker/checker APPROVAL sign-offs.
+///
+/// These routes sit under `execute`-tier families (`/api/ops`, `/api/maintain`,
+/// `/api/build`, …) but each transitions an entity into an `Approved`/decided
+/// state that gates further action — so, exactly like `/api/requests/{id}/approve`,
+/// they require the higher `approve` tier. Without this row an Operator (who holds
+/// `execute`, not `approve`) could self-approve work they created or validated,
+/// collapsing the platform's maker/checker separation of duties into a single
+/// operator capability. The handlers do their own `Approved`-state transition with
+/// no in-handler permission check, so the central gate is the only boundary.
+///
+/// The access-review family carries all three reviewer VERDICTS (approve / revoke /
+/// exempt) at the `approve` tier, mirroring how the request family routes both
+/// `approve` and `reject` (the inverse verdict) to `approve`.
+///
+/// NOT included — `/api/cmdb/servicenow/approve` and
+/// `/api/maintain/certificates/approve` carry the `approve` NAME but gate nothing
+/// (read-only acknowledgements: no `Approved` state exists in their domain and no
+/// downstream action requires them), so they stay operator-tier.
+///
+/// Returns `None` for non-approval paths so the caller falls through to the prefix
+/// table.
+fn approval_signoff_permission(path: &str) -> Option<&'static str> {
+    // id-at-end or no-id forms: a static prefix matches `{prefix}` exactly or
+    // `{prefix}/{id}`.
+    const APPROVE_SIGNOFF_PREFIXES: &[&str] = &[
+        "/api/ops/runbook/approve",
+        "/api/maintain/patch/approve",
+        "/api/maintain/software/approve",
+        "/api/protect/backup/restore-approve",
+        "/api/build/app-environment/approve",
+        "/api/retire/decommission/approve",
+    ];
+    if APPROVE_SIGNOFF_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        return Some("approve");
+    }
+    // Access-review reviewer verdicts put the id in the MIDDLE
+    // (`/api/identity/access-review/{id}/{approve|revoke|exempt}`), which a static
+    // prefix cannot express. Match exactly one id segment then the verdict.
+    if let Some(rest) = path.strip_prefix("/api/identity/access-review/") {
+        for verdict in ["approve", "revoke", "exempt"] {
+            if let Some(id) = rest.strip_suffix(&format!("/{verdict}")) {
+                if !id.is_empty() && !id.contains('/') {
+                    return Some("approve");
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Central resolver applied in `auth_middleware` for unsafe methods. `method`
 /// is accepted for forward-compatibility (per-method granularity is a later
 /// wave); this wave treats every unsafe method on a path family identically.
 /// Returns the required coarse permission, defaulting fail-closed to `admin`.
 fn route_permission_for(_method: &Method, path: &str) -> &'static str {
     if let Some(permission) = requests_route_permission(path) {
+        return permission;
+    }
+    // Maker/checker approval sign-offs that live under execute-tier families must
+    // be resolved BEFORE the prefix table, which would otherwise map them to
+    // `execute` via their family root.
+    if let Some(permission) = approval_signoff_permission(path) {
         return permission;
     }
     ROUTE_PERMISSIONS
@@ -3008,6 +3068,63 @@ mod tests {
         // a non-emergency ops route is operator-tier (after the emergency carve-out)
         assert_eq!(
             route_permission_for(&Method::POST, "/api/ops/runbook/start"),
+            "execute"
+        );
+    }
+
+    #[test]
+    fn test_operational_approval_signoffs_require_approver_tier() {
+        // Genuine maker/checker sign-offs that transition an entity to an Approved
+        // state: each must require the approver tier, not the execute tier of its
+        // family root — otherwise an Operator self-approves their own work.
+        for path in [
+            "/api/ops/runbook/approve/r1",
+            "/api/maintain/patch/approve",
+            "/api/maintain/software/approve/s1",
+            "/api/protect/backup/restore-approve",
+            "/api/build/app-environment/approve/e1",
+            "/api/retire/decommission/approve/d1",
+            // access-review carries all three reviewer verdicts (id is mid-path)
+            "/api/identity/access-review/ar1/approve",
+            "/api/identity/access-review/ar1/revoke",
+            "/api/identity/access-review/ar1/exempt",
+        ] {
+            assert_eq!(
+                route_permission_for(&Method::POST, path),
+                "approve",
+                "{path} is a maker/checker approval sign-off and must require the approver tier"
+            );
+        }
+
+        // Routes that carry the 'approve' NAME but gate nothing (read-only
+        // acknowledgements, no Approved state) stay operator-tier.
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/cmdb/servicenow/approve/sn1"),
+            "execute"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/maintain/certificates/approve/c1"),
+            "execute"
+        );
+
+        // Sibling operator actions in the same families are NOT bumped — only the
+        // approval verdict is.
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/maintain/patch/execute"),
+            "execute"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/maintain/patch/validate"),
+            "execute"
+        );
+
+        // Shape guard: a deeper path past the access-review verdict is not a
+        // verdict route and falls through to the family tier.
+        assert_eq!(
+            route_permission_for(
+                &Method::POST,
+                "/api/identity/access-review/ar1/approve/extra"
+            ),
             "execute"
         );
     }
