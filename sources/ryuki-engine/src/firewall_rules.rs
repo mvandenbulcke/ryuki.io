@@ -623,6 +623,53 @@ pub fn validate_rule(
     }))
 }
 
+/// Pure construction of a FirewallRuleSet — no store mutation.
+pub fn build_rule_set(
+    id: &str,
+    name: &str,
+    rules: Vec<String>,
+    site: &str,
+    applied_to: &str,
+) -> Result<FirewallRuleSet, String> {
+    if name.trim().is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if rules.is_empty() {
+        return Err("rules cannot be empty".into());
+    }
+    if site.trim().is_empty() {
+        return Err("site cannot be empty".into());
+    }
+    if applied_to.trim().is_empty() {
+        return Err("applied_to cannot be empty".into());
+    }
+    Ok(FirewallRuleSet {
+        id: id.into(),
+        name: name.into(),
+        rules,
+        site: site.into(),
+        applied_to: applied_to.into(),
+        status: RuleSetStatus::Draft,
+    })
+}
+
+/// Pure apply — preserves existing precondition: cannot apply a Revoked set.
+pub fn apply_rule_set_pure(rs: &FirewallRuleSet) -> Result<FirewallRuleSet, String> {
+    if rs.status == RuleSetStatus::Revoked {
+        return Err(format!("Cannot apply revoked rule set '{}'", rs.id));
+    }
+    let mut updated = rs.clone();
+    updated.status = RuleSetStatus::Applied;
+    Ok(updated)
+}
+
+/// Pure revoke — no precondition (always succeeds).
+pub fn revoke_rule_set_pure(rs: &FirewallRuleSet) -> Result<FirewallRuleSet, String> {
+    let mut updated = rs.clone();
+    updated.status = RuleSetStatus::Revoked;
+    Ok(updated)
+}
+
 pub fn create_rule_set(
     name: &str,
     rule_ids: Vec<String>,
@@ -742,6 +789,29 @@ pub fn get_conflicts(site: &str) -> Result<Value, String> {
         "conflicts": conflicts,
         "count": conflicts.len()
     }))
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn rule_set_status_serde_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&RuleSetStatus::Draft).unwrap(),
+            "\"draft\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuleSetStatus::Applied).unwrap(),
+            "\"applied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RuleSetStatus::Revoked).unwrap(),
+            "\"revoked\""
+        );
+        let d: RuleSetStatus = serde_json::from_str("\"draft\"").unwrap();
+        assert_eq!(d, RuleSetStatus::Draft);
+    }
 }
 
 #[cfg(test)]

@@ -390,7 +390,9 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/network/dns/records/{id}` |
 | GET | `/api/network/firewall-contract` |
 | GET | `/api/network/firewall/conflicts` |
+| GET | `/api/network/firewall/rule-sets` |
 | POST | `/api/network/firewall/rule-sets` |
+| GET | `/api/network/firewall/rule-sets/{id}` |
 | POST | `/api/network/firewall/rule-sets/{id}/apply` |
 | POST | `/api/network/firewall/rule-sets/{id}/revoke` |
 | GET | `/api/network/firewall/rules` |

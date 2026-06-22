@@ -1675,7 +1675,11 @@ pub fn routes() -> Router {
         )
         .route(
             "/api/network/firewall/rule-sets",
-            post(firewall_rule_set_create),
+            get(firewall_rule_set_list).post(firewall_rule_set_create),
+        )
+        .route(
+            "/api/network/firewall/rule-sets/{id}",
+            get(firewall_rule_set_get),
         )
         .route(
             "/api/network/firewall/rule-sets/{id}/apply",
@@ -20317,24 +20321,130 @@ async fn firewall_rule_validate(
 async fn firewall_rule_set_create(
     Json(b): Json<FwRuleSetCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firewall_rules::create_rule_set(&b.name, b.rule_ids, &b.site, &b.target)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let id = format!(
+        "fws-{}-{}",
+        b.site.to_lowercase(),
+        &Uuid::new_v4().to_string()[..8]
+    );
+    let rs = firewall_rules::build_rule_set(&id, &b.name, b.rule_ids, &b.site, &b.target)
+        .map_err(|e| status_400(&e))?;
+    // Validate all referenced rule IDs exist for this site in the DB (mirrors the
+    // in-memory check in the engine's stateful create_rule_set).
+    for rule_id in &rs.rules {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM firewall_rules WHERE id = $1 AND site = $2)",
+        )
+        .bind(rule_id)
+        .bind(&rs.site)
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        if !exists {
+            return Err(status_400(&format!(
+                "Firewall rule '{rule_id}' not found for site '{}'",
+                rs.site
+            )));
+        }
+    }
+    crate::repos::firewall_rule_sets::insert(pool, &rs)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
+    })))
 }
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct FwRuleSetListQuery {
+    site: Option<String>,
+}
+
+async fn firewall_rule_set_list(
+    Query(q): Query<FwRuleSetListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let sets = if let Some(site) = q.site.as_deref().filter(|s| !s.is_empty()) {
+        crate::repos::firewall_rule_sets::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?
+    } else {
+        crate::repos::firewall_rule_sets::list(pool)
+            .await
+            .map_err(db_error)?
+    };
+    let count = sets.len();
+    Ok(Json(json!({
+        "source": "database",
+        "rule_sets": sets,
+        "count": count,
+    })))
+}
+
+async fn firewall_rule_set_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::firewall_rule_sets::get(pool, &id)
+        .await
+        .map_err(db_error)?
+    {
+        Some((rs, _version)) => Ok(Json(json!({
+            "source": "database",
+            "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
+        }))),
+        None => Err(status_404(&id)),
+    }
+}
+
 async fn firewall_rule_set_apply(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firewall_rules::apply_rule_set(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (rs, version) = crate::repos::firewall_rule_sets::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated = firewall_rules::apply_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
+    let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !cas_ok {
+        return Err(status_409(
+            "rule set was modified concurrently; reload and retry",
+        ));
+    }
+    Ok(Json(json!({
+        "source": "database",
+        "rule_set": serde_json::to_value(&updated).unwrap_or_default(),
+    })))
 }
+
 async fn firewall_rule_set_revoke(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firewall_rules::revoke_rule_set(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (rs, version) = crate::repos::firewall_rule_sets::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated = firewall_rules::revoke_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
+    let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !cas_ok {
+        return Err(status_409(
+            "rule set was modified concurrently; reload and retry",
+        ));
+    }
+    Ok(Json(json!({
+        "source": "database",
+        "rule_set": serde_json::to_value(&updated).unwrap_or_default(),
+    })))
 }
+
 async fn firewall_conflicts(
     Query(q): Query<FwConflictsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
