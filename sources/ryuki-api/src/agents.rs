@@ -151,10 +151,13 @@ pub struct HeartbeatBody {
 pub type ApiResult<T> = Result<T, (StatusCode, Json<Value>)>;
 
 fn db_err<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+    // Log server-side; return a GENERIC body. The raw error (sqlx Display) can
+    // leak SQL/column/constraint internals, so it must NOT ride in the response
+    // `detail` (matches the generic-body path at the lease-query handler).
     tracing::error!(error = %e, "agent db error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": "database error", "detail": e.to_string()})),
+        Json(json!({"error": "database error"})),
     )
 }
 

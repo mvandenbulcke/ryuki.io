@@ -11843,9 +11843,14 @@ fn transition_conflict_409(request_id: &str) -> (StatusCode, Json<Value>) {
 /// lifecycle handlers where the request UPDATE and the audit INSERT commit
 /// together.
 pub(crate) fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+    // Log the real error server-side; return a GENERIC body. A raw sqlx error
+    // Display can carry SQL fragments, column/constraint names, and driver
+    // internals — never leak those to the client (matches the agents.rs and
+    // ApiError persistence-failure paths).
+    tracing::error!(error = %e, "database error");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": e.to_string()})),
+        Json(json!({"error": "database error"})),
     )
 }
 
@@ -23366,6 +23371,22 @@ mod router_tests {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// `db_error` must never echo the raw error to the client — a sqlx Display
+    /// can carry SQL fragments, column/constraint names, and driver internals.
+    #[test]
+    fn test_db_error_returns_generic_body_no_leak() {
+        let leaky = "error returned from database: column \"managed_secrets.vault_path\" \
+                     violates constraint secret_unique_idx";
+        let (status, Json(body)) = db_error(leaky);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"], "database error");
+        let rendered = body.to_string();
+        assert!(
+            !rendered.contains("managed_secrets") && !rendered.contains("constraint"),
+            "db_error body must not leak SQL/identifiers: {rendered}"
+        );
+    }
 
     /// The servicenow future-api readiness endpoint blocks an incomplete request
     /// and records readiness for a complete one.

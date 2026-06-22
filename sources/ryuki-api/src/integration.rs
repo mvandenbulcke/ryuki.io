@@ -438,7 +438,10 @@ fn integration_500(msg: &str) -> (axum::http::StatusCode, axum::Json<Value>) {
 }
 
 fn db_err(e: impl std::fmt::Display) -> (axum::http::StatusCode, axum::Json<Value>) {
-    integration_500(&e.to_string())
+    // Log server-side; return a GENERIC message. The raw sqlx error can leak
+    // SQL/column/constraint internals, so it must not reach the client.
+    tracing::error!(error = %e, "integration db error");
+    integration_500("database error")
 }
 
 fn now_iso() -> String {
