@@ -61,6 +61,7 @@ use ryuki_engine::health_monitor;
 use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
 use ryuki_engine::incident_context;
+use ryuki_engine::incident_readiness;
 use ryuki_engine::inventory_sync;
 use ryuki_engine::knowledge_suggestion;
 use ryuki_engine::legal_hold;
@@ -754,6 +755,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/incident-context-contract",
             get(operations_incident_context),
+        )
+        .route(
+            "/api/operations/incident-context-readiness",
+            get(operations_incident_context_readiness),
         )
         .route(
             "/api/operations/maintenance-communications-contract",
@@ -6575,6 +6580,45 @@ async fn operations_platform_health() -> Json<Value> {
     Json(
         json!({"source":"static-seed","healthMode":"degraded-read-only","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawLogsAllowed":false,"components":["portal-ui","platform-api","platform-worker","inventory-sync","adapters","queue","platform-db","platform-vault","ingress","object-storage"],"healthSignals":["readiness","liveness","stale-data","dependency-health","queue-depth","adapter-readiness","backup-state","secret-reference-readiness","evidence-export-readiness"],"healthStates":["healthy","degraded","stale","blocked","unknown"],"requiredInputs":["component","owner","healthSignal","healthState","staleDataMarker","safeRemediation","evidenceManifest"],"requiredGuards":["component-registered","owner-known","stale-data-marked","dependency-status-known","safe-remediation-set","evidence-redacted"],"blockedReasons":["component-unknown","owner-unknown","dependency-status-unknown","stale-data-unmarked","unsafe-remediation","raw-log-exposure","evidence-not-redacted"],"requiredEvidence":["Health summary","Component owner","Dependency state","Stale-data marker","Safe remediation","Handover notes","Evidence references"],"rules":[{"id":"no-live-health-remediation","decision":"block","requirement":"Platform health reporting can suggest safe remediation but must not execute live remediation.","evidence":"Safe remediation"},{"id":"raw-logs-not-exposed","decision":"block","requirement":"Dashboard health output must not expose raw logs, provider payloads, credentials, or endpoint details.","evidence":"Health summary"},{"id":"stale-data-must-be-marked","decision":"block","requirement":"Stale data must be explicit so operators do not mistake cached state for live health.","evidence":"Stale-data marker"},{"id":"owner-and-remediation-required","decision":"block","requirement":"Health items must identify an owner and safe next action before leaving triage.","evidence":"Component owner"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct IncidentReadinessQuery {
+    incident_context: Option<String>,
+    ci_identity: Option<String>,
+    owner: Option<String>,
+    support_group: Option<String>,
+    stale_data_marker: Option<String>,
+    safe_next_action: Option<String>,
+    evidence_manifest: Option<String>,
+    application: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+}
+
+/// Dry-run operations incident-context readiness. Turns the static
+/// `operations/incident-context` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed incident-context enrichment and return
+/// `incident-context-recorded` (all criteria met; the live action is a separately-
+/// approved step) or `block`. Never mutates an incident (distinct from the
+/// stateful incident_context engine).
+async fn operations_incident_context_readiness(
+    Query(params): Query<IncidentReadinessQuery>,
+) -> Json<Value> {
+    let input = incident_readiness::IncidentReadinessInput {
+        incident_context: params.incident_context,
+        ci_identity: params.ci_identity,
+        owner: params.owner,
+        support_group: params.support_group,
+        stale_data_marker: params.stale_data_marker,
+        safe_next_action: params.safe_next_action,
+        evidence_manifest: params.evidence_manifest,
+        application: params.application,
+        site: params.site,
+        environment: params.environment,
+    };
+    let result = incident_readiness::evaluate_incident_readiness(&input);
+    Json(json!(result))
 }
 
 async fn operations_incident_context() -> Json<Value> {
@@ -22461,6 +22505,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "degradation-review-recorded");
     }
+
+    /// operations incident-context readiness through the router: a complete request
+    /// records the context.
+    #[tokio::test]
+    async fn router_serves_operations_incident_context_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/incident-context-readiness?incident_context=INC-1&ci_identity=srv&owner=ops&support_group=sg&stale_data_marker=fresh&safe_next_action=notify&evidence_manifest=ev&application=app&site=DEFRA&environment=prod",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "incident-context-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22738,6 +22794,44 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "degradation-review-recorded");
+    }
+
+    /// The operations incident-context readiness endpoint blocks an incomplete
+    /// request and records the context for a complete one.
+    #[tokio::test]
+    async fn operations_incident_context_blocks_then_records() {
+        let Json(blocked) = operations_incident_context_readiness(Query(IncidentReadinessQuery {
+            incident_context: None,
+            ci_identity: None,
+            owner: None,
+            support_group: None,
+            stale_data_marker: None,
+            safe_next_action: None,
+            evidence_manifest: None,
+            application: None,
+            site: None,
+            environment: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "incident-missing")));
+
+        let Json(ready) = operations_incident_context_readiness(Query(IncidentReadinessQuery {
+            incident_context: Some("INC-1".into()),
+            ci_identity: Some("srv".into()),
+            owner: Some("ops".into()),
+            support_group: Some("sg".into()),
+            stale_data_marker: Some("fresh".into()),
+            safe_next_action: Some("notify".into()),
+            evidence_manifest: Some("ev".into()),
+            application: Some("app".into()),
+            site: Some("DEFRA".into()),
+            environment: Some("prod".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "incident-context-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.

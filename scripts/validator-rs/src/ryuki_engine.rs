@@ -44,6 +44,7 @@ const DECLARED_MODULES: &[&str] = &[
     "image_factory",
     "immutability_compliance",
     "incident_context",
+    "incident_readiness",
     "integration_connections",
     "inventory_sync",
     "knowledge_suggestion",

@@ -34,6 +34,7 @@ pub mod health_monitor;
 pub mod image_factory;
 pub mod immutability_compliance;
 pub mod incident_context;
+pub mod incident_readiness;
 pub mod integration_connections;
 pub mod inventory_sync;
 pub mod knowledge_suggestion;
