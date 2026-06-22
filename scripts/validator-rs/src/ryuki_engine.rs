@@ -50,6 +50,7 @@ const DECLARED_MODULES: &[&str] = &[
     "load_balancer",
     "log_forwarder",
     "maintenance_calendar",
+    "maintenance_comm",
     "models",
     "network_readiness",
     "network_vlan",

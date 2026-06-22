@@ -66,6 +66,7 @@ use ryuki_engine::linux_deployment;
 use ryuki_engine::load_balancer;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::maintenance_calendar;
+use ryuki_engine::maintenance_comm;
 use ryuki_engine::network_readiness;
 use ryuki_engine::network_vlan;
 use ryuki_engine::noise_remediation;
@@ -750,6 +751,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/maintenance-communications-contract",
             get(operations_maintenance_comm),
+        )
+        .route(
+            "/api/operations/maintenance-communications-readiness",
+            get(operations_maintenance_comm_readiness),
         )
         .route(
             "/api/operations/outage-comms/notices",
@@ -6528,6 +6533,42 @@ async fn operations_incident_context() -> Json<Value> {
     Json(
         json!({"source":"static-seed","panelMode":"aggregate-safe","providerCallsEnabled":false,"liveExecutionAllowed":false,"rawProviderPayloadsAllowed":false,"contextDomains":["ci","application","vm","change","backup","monitoring","cmdb","evidence"],"panelSections":["incidentSummary","serviceContext","assetContext","changeContext","backupContext","monitoringContext","cmdbContext","evidenceContext","safeNextActions"],"requiredInputs":["incidentContext","ciIdentity","application","owner","supportGroup","site","environment","evidenceManifest"],"requiredGuards":["incident-linked","ci-identity-known","owner-known","support-group-known","stale-data-marked","evidence-redacted","safe-next-action-set"],"blockedReasons":["incident-missing","ci-identity-unknown","owner-unknown","support-group-unknown","stale-data-unmarked","raw-provider-payload","evidence-not-redacted","missing-safe-next-action"],"requiredEvidence":["Incident summary","CI identity summary","Owner and support group","Change context","Backup state","Monitoring state","CMDB relationship summary","Safe next actions","Evidence references"],"rules":[{"id":"no-live-context-lookup","decision":"block","requirement":"Incident context panel uses existing platform state only and never performs live provider lookup.","evidence":"Incident summary"},{"id":"no-raw-provider-payloads","decision":"block","requirement":"Panel output must summarize context without raw provider payloads, logs, credentials, or identifiers.","evidence":"CI identity summary"},{"id":"stale-data-must-be-marked","decision":"block","requirement":"Stale or cached context must be marked before operators use it for incident decisions.","evidence":"Monitoring state"},{"id":"safe-next-action-required","decision":"block","requirement":"Incident context must include safe next actions for the assigned owner or support group.","evidence":"Safe next actions"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct MaintenanceCommQuery {
+    maintenance_window: Option<String>,
+    affected_services: Option<String>,
+    owner: Option<String>,
+    audience: Option<String>,
+    message_type: Option<String>,
+    approval_route: Option<String>,
+    evidence_manifest: Option<String>,
+    ci_relationship_summary: Option<String>,
+    support_group: Option<String>,
+}
+
+/// Dry-run operations maintenance-communication readiness. Turns the static
+/// `operations/maintenance-comm` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed maintenance notification and return
+/// `comm-plan-recorded` (all criteria met; live dispatch is a separately-approved
+/// step) or `block`. Never dispatches a notification or exposes recipient data.
+async fn operations_maintenance_comm_readiness(
+    Query(params): Query<MaintenanceCommQuery>,
+) -> Json<Value> {
+    let input = maintenance_comm::MaintenanceCommInput {
+        maintenance_window: params.maintenance_window,
+        affected_services: params.affected_services,
+        owner: params.owner,
+        audience: params.audience,
+        message_type: params.message_type,
+        approval_route: params.approval_route,
+        evidence_manifest: params.evidence_manifest,
+        ci_relationship_summary: params.ci_relationship_summary,
+        support_group: params.support_group,
+    };
+    let result = maintenance_comm::evaluate_maintenance_comm(&input);
+    Json(json!(result))
 }
 
 async fn operations_maintenance_comm() -> Json<Value> {
@@ -22265,6 +22306,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "vlan-plan-recorded");
     }
+
+    /// operations maintenance-communication readiness through the router: a
+    /// complete request records the plan.
+    #[tokio::test]
+    async fn router_serves_operations_maintenance_comm_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/maintenance-communications-readiness?maintenance_window=w&affected_services=auth&owner=ops&audience=internal&message_type=planned&approval_route=appr&evidence_manifest=ev&ci_relationship_summary=rel&support_group=sg",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "comm-plan-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22413,6 +22466,42 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "vlan-plan-recorded");
+    }
+
+    /// The operations maintenance-communication readiness endpoint blocks an
+    /// incomplete request and records the plan for a complete one.
+    #[tokio::test]
+    async fn operations_maintenance_comm_blocks_then_records() {
+        let Json(blocked) = operations_maintenance_comm_readiness(Query(MaintenanceCommQuery {
+            maintenance_window: None,
+            affected_services: None,
+            owner: None,
+            audience: None,
+            message_type: None,
+            approval_route: None,
+            evidence_manifest: None,
+            ci_relationship_summary: None,
+            support_group: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "audience-unapproved")));
+
+        let Json(ready) = operations_maintenance_comm_readiness(Query(MaintenanceCommQuery {
+            maintenance_window: Some("w".into()),
+            affected_services: Some("auth".into()),
+            owner: Some("ops".into()),
+            audience: Some("internal".into()),
+            message_type: Some("planned".into()),
+            approval_route: Some("appr".into()),
+            evidence_manifest: Some("ev".into()),
+            ci_relationship_summary: Some("rel".into()),
+            support_group: Some("sg".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "comm-plan-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
