@@ -67,6 +67,7 @@ use ryuki_engine::load_balancer;
 use ryuki_engine::log_forwarder;
 use ryuki_engine::maintenance_calendar;
 use ryuki_engine::network_readiness;
+use ryuki_engine::network_vlan;
 use ryuki_engine::noise_remediation;
 use ryuki_engine::object_placement;
 use ryuki_engine::oob_access;
@@ -711,6 +712,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/network-vlan-readiness-contract",
             get(operations_network_vlan),
+        )
+        .route(
+            "/api/operations/network-vlan-readiness",
+            get(operations_network_vlan_readiness),
         )
         .route(
             "/api/operations/hardware-lifecycle-contract",
@@ -6457,6 +6462,42 @@ async fn operations_oob_access() -> Json<Value> {
     Json(
         json!({"source":"static-seed","validationMode":"review-only","providerCallsEnabled":false,"liveAccessChecksAllowed":false,"liveCertificateChecksAllowed":false,"rawInventoryRowsAllowed":false,"endpointIdentifiersAllowed":false,"serialNumbersAllowed":false,"accountIdentifiersAllowed":false,"supportedConsoleTypes":["hpe-ilo","dell-idrac","lenovo-xcc"],"supportedWorkflows":["oob-access-readiness","hardware-console-review","oob-certificate-review","role-assignment-review","break-glass-readiness-review","incident-readiness-review"],"readinessDomains":["console-access","certificate-readiness","role-readiness","break-glass-readiness","network-reachability","hardware-cmdb","evidence-readiness"],"requiredInputs":["site","hardwareProfile","platformRole","owner","supportGroup","accessProfile","certificateProfile","breakGlassProfile","cmdbContext","evidenceManifest"],"requiredGuards":["site-known","hardware-profile-known","support-owner-known","access-profile-reviewed","certificate-profile-reviewed","role-model-reviewed","break-glass-procedure-reviewed","incident-runbook-linked","evidence-redacted"],"planSections":["readinessSummary","accessProfileReview","certificateReadiness","roleModelReview","breakGlassReadiness","incidentReadiness","exceptionDecision","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-access-checks-disabled","live-certificate-checks-disabled","raw-inventory-rows-disabled","endpoint-identifiers-disabled","serial-numbers-disabled","account-identifiers-disabled","site-unknown","hardware-profile-unknown","access-profile-missing","certificate-profile-missing","role-model-missing","break-glass-profile-missing","incident-runbook-missing","evidence-not-redacted"],"requiredEvidence":["OOB readiness summary","Access profile review","Certificate readiness review","Role model review","Break-glass readiness review","Incident readiness review","Exception decision","Evidence references"],"rules":[{"id":"no-live-oob-access-checks","decision":"block","requirement":"Out-of-band access validation reports review state only and never logs in to consoles, tests credentials, changes roles, or calls hardware controllers.","evidence":"OOB readiness summary"},{"id":"certificate-readiness-required","decision":"block","requirement":"Certificate profile and renewal readiness must be reviewed before incident readiness can be accepted.","evidence":"Certificate readiness review"},{"id":"role-model-review-required","decision":"block","requirement":"Role assignment intent and access profile must be reviewed without exposing account names or group identifiers.","evidence":"Role model review"},{"id":"break-glass-readiness-required","decision":"block","requirement":"Break-glass procedure, ownership, and incident runbook linkage must be reviewed before readiness is accepted.","evidence":"Break-glass readiness review"},{"id":"raw-oob-inventory-not-exposed","decision":"block","requirement":"OOB readiness evidence must use safe summaries only and must not expose endpoint names, hostnames, private IPs, serials, asset tags, account names, access group identifiers, raw inventory rows, or provider payloads.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct NetworkVlanQuery {
+    site: Option<String>,
+    network_scope: Option<String>,
+    workload_profile: Option<String>,
+    platform_profile: Option<String>,
+    vlan_policy: Option<String>,
+    portgroup_policy: Option<String>,
+    redundancy_requirement: Option<String>,
+    maintenance_window: Option<String>,
+    owner: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run operations network VLAN/port-group provisioning readiness. Turns the
+/// static `operations/network-vlan` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed provisioning request and return
+/// `vlan-plan-recorded` (all criteria met; the live network change is a
+/// separately-approved step) or `block`. Never changes live network state.
+async fn operations_network_vlan_readiness(Query(params): Query<NetworkVlanQuery>) -> Json<Value> {
+    let input = network_vlan::NetworkVlanInput {
+        site: params.site,
+        network_scope: params.network_scope,
+        workload_profile: params.workload_profile,
+        platform_profile: params.platform_profile,
+        vlan_policy: params.vlan_policy,
+        portgroup_policy: params.portgroup_policy,
+        redundancy_requirement: params.redundancy_requirement,
+        maintenance_window: params.maintenance_window,
+        owner: params.owner,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = network_vlan::evaluate_network_vlan(&input);
+    Json(json!(result))
 }
 
 async fn operations_network_vlan() -> Json<Value> {
@@ -22212,6 +22253,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "suggestion-recorded");
     }
+
+    /// operations network-vlan readiness through the router: a complete request
+    /// records the plan.
+    #[tokio::test]
+    async fn router_serves_operations_network_vlan_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/network-vlan-readiness?site=DEFRA&network_scope=prod&workload_profile=db&platform_profile=nsx&vlan_policy=vp&portgroup_policy=pg&redundancy_requirement=dual&maintenance_window=w&owner=net&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "vlan-plan-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22322,6 +22375,44 @@ mod unit_tests {
             }))
             .await;
         assert_eq!(ready["decision"], "suggestion-recorded");
+    }
+
+    /// The operations network-vlan readiness endpoint blocks an incomplete request
+    /// and records the plan for a complete one.
+    #[tokio::test]
+    async fn operations_network_vlan_blocks_then_records() {
+        let Json(blocked) = operations_network_vlan_readiness(Query(NetworkVlanQuery {
+            site: None,
+            network_scope: None,
+            workload_profile: None,
+            platform_profile: None,
+            vlan_policy: None,
+            portgroup_policy: None,
+            redundancy_requirement: None,
+            maintenance_window: None,
+            owner: None,
+            evidence_manifest: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "site-unknown")));
+
+        let Json(ready) = operations_network_vlan_readiness(Query(NetworkVlanQuery {
+            site: Some("DEFRA".into()),
+            network_scope: Some("prod".into()),
+            workload_profile: Some("db".into()),
+            platform_profile: Some("nsx".into()),
+            vlan_policy: Some("vp".into()),
+            portgroup_policy: Some("pg".into()),
+            redundancy_requirement: Some("dual".into()),
+            maintenance_window: Some("w".into()),
+            owner: Some("net".into()),
+            evidence_manifest: Some("ev".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "vlan-plan-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.

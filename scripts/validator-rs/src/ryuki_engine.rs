@@ -52,6 +52,7 @@ const DECLARED_MODULES: &[&str] = &[
     "maintenance_calendar",
     "models",
     "network_readiness",
+    "network_vlan",
     "noise_remediation",
     "notifications",
     "object_placement",

@@ -42,6 +42,7 @@ pub mod log_forwarder;
 pub mod maintenance_calendar;
 pub mod models;
 pub mod network_readiness;
+pub mod network_vlan;
 pub mod noise_remediation;
 pub mod notifications;
 pub mod object_placement;
