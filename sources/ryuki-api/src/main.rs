@@ -1487,6 +1487,30 @@ async fn main() {
         }
     }
 
+    // ── DR plans startup hydration ────────────────────────────────────────────
+    //
+    // DR plans are persisted in the DB, but the engine's static store is still the
+    // cross-domain read surface for test-run creation (start_test resolves a plan
+    // from it). Replay the persisted plans into the static so DB-created plans
+    // (and any that survived a restart) are visible to test-run creation.
+    // Guard: only when a pool is available. Non-fatal on error.
+    if let Some(pool) = crate::database::get_db() {
+        match crate::repos::dr_plans::list(pool).await {
+            Ok(plans) => {
+                for plan in &plans {
+                    ryuki_engine::dr_testing::upsert_plan(plan);
+                }
+                tracing::info!(count = plans.len(), "dr plans hydrated from DB");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dr plans hydration failed — falling back to seed defaults"
+                );
+            }
+        }
+    }
+
     // ── CP signing identity ───────────────────────────────────────────────────
     //
     // The control plane's Ed25519 keypair is used to sign `VerifiedLiveContext`

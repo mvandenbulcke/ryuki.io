@@ -20956,29 +20956,62 @@ struct DrTestCompleteRequest {
 async fn dr_plans_list(
     Query(q): Query<DrSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::list_plans(q.site.as_deref().unwrap_or(""))
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let site = q.site.as_deref().unwrap_or("");
+    let plans = if site.is_empty() {
+        crate::repos::dr_plans::list(pool).await.map_err(db_error)?
+    } else {
+        crate::repos::dr_plans::list_by_site(pool, site)
+            .await
+            .map_err(db_error)?
+    };
+    Ok(Json(serde_json::to_value(plans).unwrap_or_default()))
 }
 async fn dr_plan_create(
     Json(b): Json<DrPlanCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::create_plan(&b.name, &b.site, &b.target_site, b.systems, b.rpo, b.rto)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let plan = dr_testing::build_dr_plan(&b.name, &b.site, &b.target_site, b.systems, b.rpo, b.rto)
+        .map_err(|e| status_400(&e))?;
+    crate::repos::dr_plans::insert(pool, &plan)
+        .await
+        .map_err(db_error)?;
+    // Write-through: keep the in-memory store consistent so test-run creation
+    // (start_test resolves the plan from the static store) sees this new plan.
+    dr_testing::upsert_plan(&plan);
+    Ok(Json(serde_json::to_value(&plan).unwrap_or_default()))
 }
 async fn dr_plan_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::get_plan(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (plan, _version) = crate::repos::dr_plans::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&plan).unwrap_or_default()))
 }
 async fn dr_plan_update_rpo_rto(
     Path(id): Path<String>,
     Json(b): Json<DrRpoRtoRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::update_rpo_rto(&id, b.rpo, b.rto)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (plan, version) = crate::repos::dr_plans::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated =
+        dr_testing::update_rpo_rto_pure(&plan, b.rpo, b.rto).map_err(|e| status_409(&e))?;
+    let ok = crate::repos::dr_plans::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "plan was modified concurrently; reload and retry",
+        ));
+    }
+    // Write-through: mirror the persisted update into the in-memory store (only
+    // reached when the DB CAS won, so the static reflects the DB winner).
+    dr_testing::upsert_plan(&updated);
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 async fn dr_test_start(
     Json(b): Json<DrTestStartRequest>,
@@ -38333,6 +38366,263 @@ mod incident_contexts_db_tests {
         assert!(
             !ok_b,
             "second same-status writer with stale version must return false (xmin CAS catches it; status-only CAS would miss it)"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins dr_plans_db_tests -- --test-threads=1
+#[cfg(test)]
+mod dr_plans_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM dr_plans WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    fn make_plan(suffix: &str, site: &str) -> ryuki_engine::dr_testing::DrPlan {
+        ryuki_engine::dr_testing::build_dr_plan(
+            &format!("Test DR plan {suffix}"),
+            site,
+            "GBLON",
+            vec!["test-system-01".into()],
+            15,
+            60,
+        )
+        .expect("build_dr_plan must succeed for valid inputs")
+    }
+
+    /// create + get round-trip: inserted plan is found and fields match.
+    #[tokio::test]
+    async fn test_create_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        let (fetched, _version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("plan not found after insert");
+
+        assert_eq!(fetched.id, plan.id, "id must match");
+        assert_eq!(fetched.name, plan.name, "name must match");
+        assert_eq!(fetched.site, plan.site, "site must match");
+        assert_eq!(fetched.rpo_minutes, 15, "rpo must match");
+        assert_eq!(fetched.rto_minutes, 60, "rto must match");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::dr_testing::DrPlanStatus::Draft,
+            "status after create must be Draft"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// update_rpo_rto persists: rpo/rto change is reflected on re-get.
+    #[tokio::test]
+    async fn test_update_rpo_rto_persists() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "GBLON");
+        let id = plan.id.clone();
+
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        let (fetched, version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("plan not found after insert");
+
+        let updated = ryuki_engine::dr_testing::update_rpo_rto_pure(&fetched, 30, 90)
+            .expect("update_rpo_rto_pure must succeed");
+
+        let ok = crate::repos::dr_plans::transition(pool, &id, &version, &updated)
+            .await
+            .expect("transition failed");
+        assert!(ok, "transition must succeed");
+
+        let (re_fetched, _) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after update");
+
+        assert_eq!(re_fetched.rpo_minutes, 30, "rpo must be updated");
+        assert_eq!(re_fetched.rto_minutes, 90, "rto must be updated");
+        assert_eq!(
+            re_fetched.status,
+            ryuki_engine::dr_testing::DrPlanStatus::Draft,
+            "status must be unchanged after rpo/rto update"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Missing id returns None (handler maps to 404).
+    #[tokio::test]
+    async fn test_missing_id_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let result = crate::repos::dr_plans::get(pool, "drp-does-not-exist-00000000")
+            .await
+            .expect("get must not error on missing id");
+        assert!(result.is_none(), "missing id must return None");
+    }
+
+    /// CAS conflict: transition with stale row version returns Ok(false).
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "FRPAR");
+        let id = plan.id.clone();
+
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        let (original, stale_version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        // First update succeeds (bumps xmin).
+        let first_update = ryuki_engine::dr_testing::update_rpo_rto_pure(&original, 20, 80)
+            .expect("pure fn must succeed");
+        crate::repos::dr_plans::transition(pool, &id, &stale_version, &first_update)
+            .await
+            .expect("first transition must succeed");
+
+        // Second update with stale version must fail.
+        let stale_update = ryuki_engine::dr_testing::update_rpo_rto_pure(&original, 25, 100)
+            .expect("pure fn must succeed");
+        let applied = crate::repos::dr_plans::transition(pool, &id, &stale_version, &stale_update)
+            .await
+            .expect("transition query must not error");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with stale row version must return false"
+        );
+    }
+
+    /// Same-status race: two concurrent rpo/rto updates on the same plan.
+    /// First writer wins; second with stale xmin returns false.
+    /// Both operations produce Draft status (same-status) — xmin CAS is what guards.
+    #[tokio::test]
+    async fn test_same_status_race_rpo_rto() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // Both readers see the same xmin (same starting row).
+        let (plan_a, version_a) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+        let (plan_b, version_b) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        assert_eq!(version_a, version_b, "both readers must see the same xmin");
+
+        // Both produce Draft updates (same status, different rpo/rto).
+        let update_a = ryuki_engine::dr_testing::update_rpo_rto_pure(&plan_a, 45, 180)
+            .expect("pure fn must succeed");
+        let update_b = ryuki_engine::dr_testing::update_rpo_rto_pure(&plan_b, 55, 240)
+            .expect("pure fn must succeed");
+
+        assert_eq!(
+            update_a.status,
+            ryuki_engine::dr_testing::DrPlanStatus::Draft,
+            "update_a must keep Draft status"
+        );
+        assert_eq!(
+            update_b.status,
+            ryuki_engine::dr_testing::DrPlanStatus::Draft,
+            "update_b must keep Draft status"
+        );
+
+        // First writer wins.
+        let first_ok = crate::repos::dr_plans::transition(pool, &id, &version_a, &update_a)
+            .await
+            .expect("first transition must not error");
+        assert!(first_ok, "first writer must succeed");
+
+        // Second writer with the now-stale xmin must lose.
+        let second_ok = crate::repos::dr_plans::transition(pool, &id, &version_b, &update_b)
+            .await
+            .expect("second transition must not error");
+
+        // Verify the winner persisted (rpo=45).
+        let (final_plan, _) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after race");
+
+        cleanup(pool, &id).await;
+
+        assert!(
+            !second_ok,
+            "second writer with stale xmin must return false"
+        );
+        assert_eq!(final_plan.rpo_minutes, 45, "first writer's rpo=45 must win");
+        assert_eq!(
+            final_plan.status,
+            ryuki_engine::dr_testing::DrPlanStatus::Draft,
+            "status must remain Draft after same-status race"
         );
     }
 }

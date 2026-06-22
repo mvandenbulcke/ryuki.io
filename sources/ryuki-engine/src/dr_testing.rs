@@ -319,14 +319,16 @@ pub fn get_plan(id: &str) -> Result<Value, String> {
     }))
 }
 
-pub fn create_plan(
+/// Pure constructor: validates inputs + builds a DrPlan ready for persistence.
+/// Status is always Draft on creation. Called by the stateful create_plan.
+pub fn build_dr_plan(
     name: &str,
     site: &str,
     target_site: &str,
     systems: Vec<String>,
     rpo: u32,
     rto: u32,
-) -> Result<Value, String> {
+) -> Result<DrPlan, String> {
     if name.trim().is_empty() {
         return Err("name cannot be empty".into());
     }
@@ -353,8 +355,8 @@ pub fn create_plan(
             .unwrap_or("unknown")
     );
 
-    let plan = DrPlan {
-        id: id.clone(),
+    Ok(DrPlan {
+        id,
         name: name.to_string(),
         site: site.to_string(),
         target_site: target_site.to_string(),
@@ -364,10 +366,49 @@ pub fn create_plan(
         last_tested: None,
         next_test_due: (Utc::now() + Days::new(90)).to_rfc3339(),
         status: DrPlanStatus::Draft,
+    })
+}
+
+/// Pure update: returns a cloned DrPlan with rpo/rto updated.
+/// Status is UNCHANGED (this is a same-status mutation).
+pub fn update_rpo_rto_pure(plan: &DrPlan, rpo: u32, rto: u32) -> Result<DrPlan, String> {
+    if rpo == 0 || rto == 0 {
+        return Err("rpo and rto must be greater than zero".into());
+    }
+    let mut updated = plan.clone();
+    updated.rpo_minutes = rpo;
+    updated.rto_minutes = rto;
+    Ok(updated)
+}
+
+/// Insert-or-replace a plan in the in-memory store by id. The API layer is the
+/// durable source of truth for plans (DB), but the static store is still the
+/// cross-domain read surface for test-run creation (`start_test` resolves the
+/// plan from here). After a DB write, the API calls this to keep the static
+/// store consistent (write-through cache), and at startup it replays the
+/// persisted plans the same way. No I/O — only the in-memory store is touched.
+pub fn upsert_plan(plan: &DrPlan) {
+    let Ok(mut store) = dr_store().lock() else {
+        return;
     };
+    if let Some(existing) = store.0.iter_mut().find(|p| p.id == plan.id) {
+        *existing = plan.clone();
+    } else {
+        store.0.push(plan.clone());
+    }
+}
 
+pub fn create_plan(
+    name: &str,
+    site: &str,
+    target_site: &str,
+    systems: Vec<String>,
+    rpo: u32,
+    rto: u32,
+) -> Result<Value, String> {
+    let plan = build_dr_plan(name, site, target_site, systems, rpo, rto)?;
+    let id = plan.id.clone();
     dr_store().lock().unwrap().0.push(plan.clone());
-
     Ok(json!({
         "source": "dry-run",
         "plan_id": id,
@@ -565,26 +606,20 @@ pub fn list_scenarios(site: &str) -> Result<Value, String> {
 }
 
 pub fn update_rpo_rto(plan_id: &str, rpo: u32, rto: u32) -> Result<Value, String> {
-    if rpo == 0 || rto == 0 {
-        return Err("rpo and rto must be greater than zero".into());
-    }
-
     let mut store = dr_store().lock().unwrap();
-    let plan = store
+    let entry = store
         .0
         .iter_mut()
         .find(|p| p.id == plan_id)
         .ok_or_else(|| format!("DR plan '{}' not found", plan_id))?;
-
-    plan.rpo_minutes = rpo;
-    plan.rto_minutes = rto;
-
+    let updated = update_rpo_rto_pure(entry, rpo, rto)?;
+    *entry = updated;
     Ok(json!({
         "source": "dry-run",
         "plan_id": plan_id,
-        "rpo_minutes": plan.rpo_minutes,
-        "rto_minutes": plan.rto_minutes,
-        "plan": plan.clone(),
+        "rpo_minutes": entry.rpo_minutes,
+        "rto_minutes": entry.rto_minutes,
+        "plan": entry.clone(),
         "dry_run": true
     }))
 }
@@ -640,6 +675,40 @@ mod tests {
         let completed = complete_test(test_id, "Passed", vec![]).unwrap();
         assert_eq!(completed["test_run"]["result"], "passed");
         assert!(completed["test_run"]["completed_at"].is_string());
+    }
+
+    /// A plan built via the pure constructor (as the DB-backed create handler does)
+    /// is NOT in the static store until upsert_plan replays it — so start_test must
+    /// fail before the upsert and succeed after. This is the cross-domain
+    /// consistency the write-through cache provides (the API persists to DB and
+    /// upserts the static so test-run creation can resolve the plan).
+    #[test]
+    fn test_upsert_plan_makes_it_startable() {
+        let plan = build_dr_plan(
+            "FRMRS upsert DR",
+            "FRMRS",
+            "GBLON",
+            vec!["frmrs-app-01".into()],
+            20,
+            90,
+        )
+        .unwrap();
+        let id = plan.id.clone();
+
+        // Before the upsert, the plan exists only as a value (DB-only) — start_test
+        // resolves from the static store, so it must not find it.
+        assert!(
+            start_test(&id, "Tabletop", "qa.operator").is_err(),
+            "a plan not yet in the static store must not be startable"
+        );
+
+        upsert_plan(&plan);
+
+        // After the write-through upsert, the same plan id is resolvable.
+        assert!(
+            start_test(&id, "Tabletop", "qa.operator").is_ok(),
+            "an upserted plan must be startable"
+        );
     }
 
     #[test]
@@ -725,5 +794,25 @@ mod tests {
     fn test_list_scenarios() {
         let scenarios = list_scenarios("DEFRA").unwrap();
         assert!(scenarios["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_dr_plan_status_serde_strings() {
+        assert_eq!(
+            serde_json::to_value(&DrPlanStatus::Draft).unwrap(),
+            serde_json::Value::String("draft".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&DrPlanStatus::Approved).unwrap(),
+            serde_json::Value::String("approved".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&DrPlanStatus::Active).unwrap(),
+            serde_json::Value::String("active".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&DrPlanStatus::Expired).unwrap(),
+            serde_json::Value::String("expired".into())
+        );
     }
 }
