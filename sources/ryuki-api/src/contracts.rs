@@ -18299,20 +18299,68 @@ async fn site_registry_get(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
+/// Serializes site-registry toggles so each DB write + write-through static update
+/// applies as ONE unit. Without this, two concurrent OPPOSITE toggles of the same
+/// site could commit to the DB in one order but update the static in another,
+/// leaving the cache (which drives cross-engine `is_valid_site`) disagreeing with
+/// the DB until the next toggle/restart. Site toggles are rare admin actions, so a
+/// single global lock is adequate.
+static SITE_TOGGLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn site_toggle_lock() -> &'static Mutex<()> {
+    SITE_TOGGLE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Toggle a site's `active` flag with write-through-cache coherence. With a DB,
+/// holds the global toggle lock across the DB write AND the engine static update so
+/// the two never diverge, returning the engine site view tagged `source:database`.
+/// Without a DB, falls back to the engine static only (`source:dry-run`).
+async fn site_registry_set_active(
+    unlocode: &str,
+    active: bool,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let engine_toggle = |code: &str| {
+        if active {
+            site_registry::activate_site(code)
+        } else {
+            site_registry::deactivate_site(code)
+        }
+    };
+
+    if let Some(pool) = get_db() {
+        // One critical section for DB write + static update (see SITE_TOGGLE_LOCK).
+        let _guard = site_toggle_lock().lock().await;
+        let found = crate::repos::site_registry::set_active(pool, unlocode, active)
+            .await
+            .map_err(db_error)?;
+        if !found {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Site '{}' not found in reference list", unlocode)})),
+            ));
+        }
+        let mut result = engine_toggle(unlocode)
+            .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
+        result["source"] = json!("database");
+        Ok(Json(result))
+    } else {
+        // No DB: engine static only (dry-run fallback); the static is the sole
+        // store, so there is no DB/cache divergence to guard against.
+        engine_toggle(unlocode)
+            .map(Json)
+            .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    }
+}
+
 async fn site_registry_activate(
     Path(unlocode): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry::activate_site(&unlocode)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    site_registry_set_active(&unlocode, true).await
 }
 
 async fn site_registry_deactivate(
     Path(unlocode): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry::deactivate_site(&unlocode)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    site_registry_set_active(&unlocode, false).await
 }
 
 async fn site_registry_search(

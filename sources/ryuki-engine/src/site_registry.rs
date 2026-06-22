@@ -967,6 +967,23 @@ pub fn is_known_site(unlocode: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Hydrate the static site store with persisted active states from the DB.
+///
+/// Called once at API startup after the DB connection is established.
+/// For each (unlocode, active) pair, updates the matching entry in the
+/// static store; unknown unlocodes are silently ignored.
+/// This function is I/O-free — the caller loads the states and passes them in.
+pub fn hydrate_active_states(states: &[(String, bool)]) {
+    let Ok(mut store) = site_store().lock() else {
+        return;
+    };
+    for (unlocode, active) in states {
+        if let Some(entry) = store.iter_mut().find(|s| &s.unlocode == unlocode) {
+            entry.active = *active;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1089,27 @@ mod tests {
     #[test]
     fn test_list_cities_invalid_country() {
         assert!(list_cities_by_country("XX").is_err());
+    }
+
+    #[test]
+    fn test_hydrate_active_states() {
+        // Use FRPAR (active by default) and FRMRS (inactive by default).
+        // Neither is asserted by name in any other parallel test, so these
+        // flips cannot race with test_is_valid_site or test_activate_deactivate.
+        hydrate_active_states(&[("FRPAR".to_string(), false), ("FRMRS".to_string(), true)]);
+        // is_valid_site and get_active_site_codes must reflect the hydration.
+        assert!(
+            !is_valid_site("FRPAR"),
+            "FRPAR should be inactive after hydrate"
+        );
+        assert!(
+            is_valid_site("FRMRS"),
+            "FRMRS should be active after hydrate"
+        );
+        let codes = get_active_site_codes().unwrap();
+        assert!(!codes.contains(&"FRPAR".to_string()));
+        assert!(codes.contains(&"FRMRS".to_string()));
+        // Restore original state so other tests are not affected.
+        hydrate_active_states(&[("FRPAR".to_string(), true), ("FRMRS".to_string(), false)]);
     }
 }

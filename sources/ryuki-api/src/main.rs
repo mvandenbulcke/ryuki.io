@@ -1466,6 +1466,27 @@ async fn main() {
     .await;
     database::migrate_if_connected().await;
 
+    // ── Site registry startup hydration ──────────────────────────────────────
+    //
+    // Load persisted active/inactive toggles from the DB and apply them to the
+    // engine's static store (write-through cache). This makes cross-engine reads
+    // (is_valid_site, get_active_site_codes) reflect the persisted state on boot.
+    // Guard: only when a pool is available. Non-fatal on error.
+    if let Some(pool) = crate::database::get_db() {
+        match crate::repos::site_registry::list_active_states(pool).await {
+            Ok(states) => {
+                ryuki_engine::site_registry::hydrate_active_states(&states);
+                tracing::info!(count = states.len(), "site registry hydrated from DB");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "site registry hydration failed — falling back to seed defaults"
+                );
+            }
+        }
+    }
+
     // ── CP signing identity ───────────────────────────────────────────────────
     //
     // The control plane's Ed25519 keypair is used to sign `VerifiedLiveContext`
