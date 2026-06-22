@@ -298,14 +298,15 @@ fn is_terminal(status: &ExecutionStatus) -> bool {
     )
 }
 
-pub fn list_runbooks() -> Result<Value, String> {
-    Ok(json!({
-        "source": "dry-run",
-        "runbooks": runbook_catalog()
-    }))
-}
+// ─── Pure constructors and transition functions ────────────────────────────────
 
-pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<Value, String> {
+/// Pure constructor: validates inputs and builds a new `RunbookExecution` in
+/// `Draft` status without touching any shared state.
+pub fn build_execution(
+    runbook_id: &str,
+    site: &str,
+    started_by: &str,
+) -> Result<RunbookExecution, String> {
     if !valid_site(site) {
         return Err(format!(
             "Unsupported site '{}'. Must be DEFRA, GBLON, or DEBER",
@@ -318,7 +319,8 @@ pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<V
 
     let runbook =
         find_runbook(runbook_id).ok_or_else(|| format!("Runbook '{}' not found", runbook_id))?;
-    let execution = RunbookExecution {
+
+    Ok(RunbookExecution {
         id: make_execution_id(site),
         runbook_id: runbook.id.clone(),
         status: ExecutionStatus::Draft,
@@ -329,8 +331,126 @@ pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<V
             .iter()
             .map(|step| pending_step(step.order))
             .collect(),
-    };
+    })
+}
 
+/// Pure transition: approve an execution. Returns `Err` if the current status
+/// is not `Draft`. Returns a cloned entity with `status = Approved`.
+pub fn approve_execution_pure(
+    exec: &RunbookExecution,
+    approver: &str,
+) -> Result<RunbookExecution, String> {
+    if approver.trim().is_empty() {
+        return Err("approver cannot be empty".into());
+    }
+    if exec.status != ExecutionStatus::Draft {
+        return Err(format!(
+            "Execution '{}' must be in Draft status to approve (current: {:?})",
+            exec.id, exec.status
+        ));
+    }
+    let mut updated = exec.clone();
+    updated.status = ExecutionStatus::Approved;
+    Ok(updated)
+}
+
+/// Pure transition: complete an execution. Returns `Err` if the execution is
+/// already terminal.
+pub fn complete_execution_pure(exec: &RunbookExecution) -> Result<RunbookExecution, String> {
+    if is_terminal(&exec.status) {
+        return Err(format!(
+            "Execution '{}' is already terminal ({:?})",
+            exec.id, exec.status
+        ));
+    }
+    let mut updated = exec.clone();
+    updated.status = ExecutionStatus::Completed;
+    Ok(updated)
+}
+
+/// Pure transition: fail an execution. Returns `Err` if the execution is
+/// already terminal.
+pub fn fail_execution_pure(
+    exec: &RunbookExecution,
+    reason: &str,
+) -> Result<RunbookExecution, String> {
+    if reason.trim().is_empty() {
+        return Err("reason cannot be empty".into());
+    }
+    if is_terminal(&exec.status) {
+        return Err(format!(
+            "Execution '{}' is already terminal ({:?})",
+            exec.id, exec.status
+        ));
+    }
+    let timestamp = now_iso();
+    let mut updated = exec.clone();
+    updated.status = ExecutionStatus::Failed;
+    updated.steps_results.push(StepResult {
+        step_order: 0,
+        status: StepStatus::Failed,
+        output: reason.into(),
+        started_at: Some(timestamp.clone()),
+        completed_at: Some(timestamp),
+    });
+    Ok(updated)
+}
+
+/// Pure transition: rollback an execution. Returns `Err` if the execution is
+/// already terminal.
+pub fn rollback_execution_pure(exec: &RunbookExecution) -> Result<RunbookExecution, String> {
+    if is_terminal(&exec.status) {
+        return Err(format!(
+            "Execution '{}' is already terminal ({:?})",
+            exec.id, exec.status
+        ));
+    }
+    let mut updated = exec.clone();
+    updated.status = ExecutionStatus::RolledBack;
+    Ok(updated)
+}
+
+/// Pure transition: execute a step. Returns `Err` if the execution is terminal
+/// or the step is not found.
+pub fn execute_step_pure(
+    exec: &RunbookExecution,
+    step_order: u32,
+) -> Result<RunbookExecution, String> {
+    if is_terminal(&exec.status) {
+        return Err(format!("Execution '{}' is terminal", exec.id));
+    }
+    if !exec
+        .steps_results
+        .iter()
+        .any(|s| s.step_order == step_order)
+    {
+        return Err(format!("Step {} not found", step_order));
+    }
+    let timestamp = now_iso();
+    let mut updated = exec.clone();
+    updated.status = ExecutionStatus::Running;
+    for step in &mut updated.steps_results {
+        if step.step_order == step_order {
+            step.status = StepStatus::Completed;
+            step.output = format!("Step {} completed successfully in dry-run mode", step_order);
+            step.started_at = Some(timestamp.clone());
+            step.completed_at = Some(timestamp.clone());
+        }
+    }
+    Ok(updated)
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+pub fn list_runbooks() -> Result<Value, String> {
+    Ok(json!({
+        "source": "dry-run",
+        "runbooks": runbook_catalog()
+    }))
+}
+
+pub fn start_runbook(runbook_id: &str, site: &str, started_by: &str) -> Result<Value, String> {
+    let execution = build_execution(runbook_id, site, started_by)?;
     execution_store().lock().unwrap().push(execution.clone());
 
     Ok(json!({
@@ -359,43 +479,31 @@ pub fn execute_step(execution_id: &str, step_order: u32) -> Result<Value, String
         .find(|e| e.id == execution_id)
         .ok_or_else(|| format!("Execution '{}' not found", execution_id))?;
 
-    if is_terminal(&execution.status) {
-        return Err(format!("Execution '{}' is terminal", execution_id));
-    }
-
-    let step = execution
+    let updated = execute_step_pure(execution, step_order)?;
+    let step_result = updated
         .steps_results
-        .iter_mut()
+        .iter()
         .find(|s| s.step_order == step_order)
-        .ok_or_else(|| format!("Step {} not found", step_order))?;
-    let timestamp = now_iso();
-
-    step.status = StepStatus::Completed;
-    step.output = format!("Step {} completed successfully in dry-run mode", step_order);
-    step.started_at = Some(timestamp.clone());
-    step.completed_at = Some(timestamp);
-    execution.status = ExecutionStatus::Running;
+        .cloned();
+    *execution = updated;
 
     Ok(json!({
         "source": "dry-run",
         "execution_id": execution.id,
         "status": execution.status,
-        "step_result": step
+        "step_result": step_result
     }))
 }
 
 pub fn approve_execution(id: &str, approver: &str) -> Result<Value, String> {
-    if approver.trim().is_empty() {
-        return Err("approver cannot be empty".into());
-    }
-
     let mut store = execution_store().lock().unwrap();
     let execution = store
         .iter_mut()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("Execution '{}' not found", id))?;
 
-    execution.status = ExecutionStatus::Approved;
+    let updated = approve_execution_pure(execution, approver)?;
+    *execution = updated;
 
     Ok(json!({
         "source": "dry-run",
@@ -412,7 +520,8 @@ pub fn complete_execution(id: &str) -> Result<Value, String> {
         .find(|e| e.id == id)
         .ok_or_else(|| format!("Execution '{}' not found", id))?;
 
-    execution.status = ExecutionStatus::Completed;
+    let updated = complete_execution_pure(execution)?;
+    *execution = updated;
 
     Ok(json!({
         "source": "dry-run",
@@ -422,25 +531,14 @@ pub fn complete_execution(id: &str) -> Result<Value, String> {
 }
 
 pub fn fail_execution(id: &str, reason: &str) -> Result<Value, String> {
-    if reason.trim().is_empty() {
-        return Err("reason cannot be empty".into());
-    }
-
     let mut store = execution_store().lock().unwrap();
     let execution = store
         .iter_mut()
         .find(|e| e.id == id)
         .ok_or_else(|| format!("Execution '{}' not found", id))?;
-    let timestamp = now_iso();
 
-    execution.status = ExecutionStatus::Failed;
-    execution.steps_results.push(StepResult {
-        step_order: 0,
-        status: StepStatus::Failed,
-        output: reason.into(),
-        started_at: Some(timestamp.clone()),
-        completed_at: Some(timestamp),
-    });
+    let updated = fail_execution_pure(execution, reason)?;
+    *execution = updated;
 
     Ok(json!({
         "source": "dry-run",
@@ -457,7 +555,8 @@ pub fn rollback_execution(id: &str) -> Result<Value, String> {
         .find(|e| e.id == id)
         .ok_or_else(|| format!("Execution '{}' not found", id))?;
 
-    execution.status = ExecutionStatus::RolledBack;
+    let updated = rollback_execution_pure(execution)?;
+    *execution = updated;
 
     Ok(json!({
         "source": "dry-run",

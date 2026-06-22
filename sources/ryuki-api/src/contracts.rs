@@ -18382,82 +18382,199 @@ async fn runbook_catalog() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 
+/// Create a new runbook execution and persist it. Returns the entity (including
+/// the generated `id`) so the caller can drive subsequent lifecycle steps.
+/// 503 when no database is configured.
 async fn runbook_start(
     Extension(session): Extension<AuthSession>,
     Json(body): Json<RunbookStartRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
     // actor = authenticated caller (from request extensions), never a client
     // body field — the audit trail must name the real principal.
-    runbook_execution::start_runbook(&body.runbook_id, &body.site, &session.user_id)
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    let exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &session.user_id)
+        .map_err(|e| status_400(&e))?;
+
+    crate::repos::runbook_executions::insert(pool, &exec)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&exec).unwrap_or_default()))
 }
 
-async fn runbook_get_execution(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::get_execution(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+/// Fetch a persisted runbook execution by id. 503/404 as appropriate.
+async fn runbook_get_execution(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, _version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    Ok(Json(serde_json::to_value(&exec).unwrap_or_default()))
 }
 
-async fn runbook_execute_step(
-    Path(params): Path<(String, u32)>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (id, step) = params;
-    runbook_execution::execute_step(&id, step)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+/// Execute a step on a persisted runbook execution. 503/404/409 as appropriate.
+async fn runbook_execute_step(Path(params): Path<(String, u32)>) -> ApiResult {
+    let (id, step_order) = params;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let updated =
+        runbook_execution::execute_step_pure(&exec, step_order).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
+/// Approve a persisted runbook execution. Approver = authenticated caller.
+/// 503/404/409 as appropriate.
 async fn runbook_approve(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
     // Approver = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
-    runbook_execution::approve_execution(&id, &session.user_id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let updated = runbook_execution::approve_execution_pure(&exec, &session.user_id)
+        .map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
-async fn runbook_complete(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::complete_execution(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+/// Complete a persisted runbook execution. 503/404/409 as appropriate.
+async fn runbook_complete(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let updated = runbook_execution::complete_execution_pure(&exec).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
-async fn runbook_fail(
-    Path(id): Path<String>,
-    Json(body): Json<RunbookFailRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::fail_execution(&id, &body.reason)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+/// Fail a persisted runbook execution. 503/404/409 as appropriate.
+async fn runbook_fail(Path(id): Path<String>, Json(body): Json<RunbookFailRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let updated =
+        runbook_execution::fail_execution_pure(&exec, &body.reason).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
-async fn runbook_rollback(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::rollback_execution(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+/// Rollback a persisted runbook execution. 503/404/409 as appropriate.
+async fn runbook_rollback(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+
+    let updated = runbook_execution::rollback_execution_pure(&exec).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
-async fn runbook_executions_list(
-    Query(params): Query<RunbookListQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::list_executions(params.site.as_deref())
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+/// List runbook executions for a given site. 503 when no database is configured.
+async fn runbook_executions_list(Query(params): Query<RunbookListQuery>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let site = params.site.as_deref().unwrap_or("");
+
+    let executions = crate::repos::runbook_executions::list(pool, site)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&executions).unwrap_or_default()))
 }
 
-async fn runbook_active() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::get_active_executions()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+/// Return all non-terminal runbook executions across all sites.
+/// 503 when no database is configured.
+async fn runbook_active() -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // List all sites and merge; the engine's is_terminal classifier determines
+    // which executions are active. We query all rows and filter in Rust.
+    let rows: Vec<ryuki_engine::runbook_execution::RunbookExecution> =
+        sqlx::query_as::<_, crate::repos::runbook_executions::RunbookExecutionRow>(&format!(
+            "SELECT {} FROM runbook_executions ORDER BY created_at DESC, id DESC",
+            crate::repos::runbook_executions::COLUMNS
+        ))
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?
+        .into_iter()
+        .map(|r| r.into_model())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_error)?;
+
+    let active: Vec<_> = rows
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                e.status,
+                ryuki_engine::runbook_execution::ExecutionStatus::Completed
+                    | ryuki_engine::runbook_execution::ExecutionStatus::Failed
+                    | ryuki_engine::runbook_execution::ExecutionStatus::RolledBack
+            )
+        })
+        .collect();
+
+    Ok(Json(serde_json::to_value(&active).unwrap_or_default()))
 }
 
 async fn runbook_contract() -> Json<Value> {
@@ -37409,6 +37526,359 @@ mod linux_deployment_requests_db_tests {
             result.unwrap_err().0,
             axum::http::StatusCode::CONFLICT,
             "verify before execute must return 409"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins runbook_executions_db_tests -- --test-threads=1
+#[cfg(test)]
+mod runbook_executions_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM runbook_executions WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    fn make_exec(
+        suffix: &str,
+        runbook_id: &str,
+        site: &str,
+    ) -> ryuki_engine::runbook_execution::RunbookExecution {
+        ryuki_engine::runbook_execution::build_execution(
+            runbook_id,
+            site,
+            &format!("test.engineer-{suffix}"),
+        )
+        .expect("build_execution must succeed for known inputs")
+    }
+
+    /// Full lifecycle: start -> approve -> complete.
+    /// Each transition must be persisted; re-get returns the updated status.
+    #[tokio::test]
+    async fn test_full_lifecycle() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec = make_exec(&suffix, "restart-service", "DEFRA");
+        let id = exec.id.clone();
+
+        // 1. Insert (start)
+        crate::repos::runbook_executions::insert(pool, &exec)
+            .await
+            .expect("insert must succeed");
+
+        let (fetched, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("execution not found after insert");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Draft,
+            "status after start must be Draft"
+        );
+
+        // 2. Approve
+        let approved =
+            ryuki_engine::runbook_execution::approve_execution_pure(&fetched, "change.manager")
+                .expect("approve must succeed from Draft");
+        let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &approved)
+            .await
+            .expect("transition failed");
+        assert!(ok, "approve transition must succeed");
+
+        let (fetched, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after approve");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Approved,
+            "status after approve must be Approved"
+        );
+
+        // 3. Complete
+        let completed = ryuki_engine::runbook_execution::complete_execution_pure(&fetched)
+            .expect("complete must succeed from Approved");
+        let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &completed)
+            .await
+            .expect("transition failed");
+        assert!(ok, "complete transition must succeed");
+
+        let (fetched, _version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after complete");
+        assert_eq!(
+            fetched.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Completed,
+            "status after complete must be Completed"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Missing id must return None (mapped to 404 by handlers).
+    #[tokio::test]
+    async fn test_missing_id_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let missing_id = "rbx-defra-does-not-exist-00000000";
+
+        let result = crate::repos::runbook_executions::get(pool, missing_id)
+            .await
+            .expect("get must not error on missing id");
+        assert!(result.is_none(), "missing id must return None");
+    }
+
+    /// CAS: `transition` returns `Ok(false)` when DB status no longer matches
+    /// the expected `before` value.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec = make_exec(&suffix, "restart-service", "GBLON");
+        let id = exec.id.clone();
+
+        crate::repos::runbook_executions::insert(pool, &exec)
+            .await
+            .expect("insert must succeed");
+
+        // Capture the execution + its row version while it is still Draft.
+        let (draft, stale_version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+        assert_eq!(
+            draft.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Draft
+        );
+
+        // Advance it to Approved through the normal path (this bumps the row version).
+        let approved = ryuki_engine::runbook_execution::approve_execution_pure(&draft, "approver")
+            .expect("approve must succeed");
+        crate::repos::runbook_executions::transition(pool, &id, &stale_version, &approved)
+            .await
+            .expect("first transition must succeed");
+
+        // A transition presenting the STALE row version must NOT apply, even
+        // though it changes the status (the xmin token has advanced).
+        let stale_update = ryuki_engine::runbook_execution::complete_execution_pure(&draft)
+            .expect("complete_pure on draft must return Ok (not terminal)");
+        let applied =
+            crate::repos::runbook_executions::transition(pool, &id, &stale_version, &stale_update)
+                .await
+                .expect("transition query must not error");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with a stale row version must return false (CAS mismatch)"
+        );
+    }
+
+    /// Invalid state transition: attempting to approve a terminal execution --
+    /// pure fn returns Err -> handler returns 409.
+    #[tokio::test]
+    async fn test_invalid_transition_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec = make_exec(&suffix, "patch-windows-server", "DEBER");
+        let id = exec.id.clone();
+
+        crate::repos::runbook_executions::insert(pool, &exec)
+            .await
+            .expect("insert must succeed");
+
+        // Force the status to Completed via direct repo transition.
+        let (_loaded, version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+        let mut terminal = exec.clone();
+        terminal.status = ryuki_engine::runbook_execution::ExecutionStatus::Completed;
+        crate::repos::runbook_executions::transition(pool, &id, &version, &terminal)
+            .await
+            .expect("force-complete transition must succeed");
+
+        let (fetched, _version) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        // Attempting to approve a Completed execution must be rejected by the pure fn.
+        let err = ryuki_engine::runbook_execution::approve_execution_pure(&fetched, "approver");
+        cleanup(pool, &id).await;
+        assert!(
+            err.is_err(),
+            "approve_execution_pure on a terminal execution must return Err (-> 409)"
+        );
+    }
+
+    /// Same-status concurrency: two readers load the SAME running execution, both
+    /// run a step (which keeps status = Running). The first write wins; the second
+    /// presents a now-stale row version and MUST be rejected (Ok(false) -> 409),
+    /// instead of silently clobbering the first writer's step result. This is the
+    /// race a status-only CAS would miss (status stays "running" throughout).
+    #[tokio::test]
+    async fn test_same_status_step_race_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec = make_exec(&suffix, "patch-windows-server", "DEFRA");
+        let id = exec.id.clone();
+        crate::repos::runbook_executions::insert(pool, &exec)
+            .await
+            .expect("insert must succeed");
+
+        // Drive it to Running via a first step (Draft -> Running).
+        let (loaded, v0) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("found");
+        let running = ryuki_engine::runbook_execution::execute_step_pure(&loaded, 1)
+            .expect("step 1 must succeed");
+        assert!(
+            crate::repos::runbook_executions::transition(pool, &id, &v0, &running)
+                .await
+                .expect("transition")
+        );
+
+        // Two concurrent readers both observe the SAME running version.
+        let (reader_a, ver_running) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get a")
+            .expect("found a");
+        let (reader_b, ver_running_b) = crate::repos::runbook_executions::get(pool, &id)
+            .await
+            .expect("get b")
+            .expect("found b");
+        assert_eq!(
+            ver_running, ver_running_b,
+            "both readers see the same version"
+        );
+        assert_eq!(
+            reader_a.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Running
+        );
+
+        // Reader A completes step 2 (status stays Running) — first write wins.
+        let a_update =
+            ryuki_engine::runbook_execution::execute_step_pure(&reader_a, 2).expect("a step 2");
+        // Guard the test's own premise: both writes must keep status Running, else
+        // a future fixture change could silently turn this into a status-CHANGING
+        // case (which even the old status-only CAS would have caught).
+        assert_eq!(
+            a_update.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Running,
+            "A's step write must keep status Running (same-status race premise)"
+        );
+        assert!(
+            crate::repos::runbook_executions::transition(pool, &id, &ver_running, &a_update)
+                .await
+                .expect("a transition"),
+            "first same-status write must succeed"
+        );
+
+        // Reader B completes step 3 against the now-stale version — MUST be rejected,
+        // even though status is still Running (this is the bug a status-only CAS missed).
+        let b_update =
+            ryuki_engine::runbook_execution::execute_step_pure(&reader_b, 3).expect("b step 3");
+        assert_eq!(
+            b_update.status,
+            ryuki_engine::runbook_execution::ExecutionStatus::Running,
+            "B's step write must keep status Running (same-status race premise)"
+        );
+        let applied =
+            crate::repos::runbook_executions::transition(pool, &id, &ver_running_b, &b_update)
+                .await
+                .expect("b transition query must not error");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "second same-status writer with a stale version must return false (lost-update prevented)"
+        );
+    }
+
+    /// list_by_site: insert two executions for the same site, list by site,
+    /// assert both are returned and all belong to that site.
+    #[tokio::test]
+    async fn test_list_by_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "DEFRA");
+        let exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "DEFRA");
+        let id1 = exec1.id.clone();
+        let id2 = exec2.id.clone();
+
+        crate::repos::runbook_executions::insert(pool, &exec1)
+            .await
+            .expect("insert exec1 must succeed");
+        crate::repos::runbook_executions::insert(pool, &exec2)
+            .await
+            .expect("insert exec2 must succeed");
+
+        let listed = crate::repos::runbook_executions::list(pool, "DEFRA")
+            .await
+            .expect("list must succeed");
+
+        cleanup(pool, &id1).await;
+        cleanup(pool, &id2).await;
+
+        assert!(
+            listed.iter().any(|e| e.id == id1),
+            "exec1 must appear in DEFRA list"
+        );
+        assert!(
+            listed.iter().any(|e| e.id == id2),
+            "exec2 must appear in DEFRA list"
+        );
+        assert!(
+            listed.iter().all(|e| e.site == "DEFRA"),
+            "all listed executions must be for DEFRA"
         );
     }
 }
