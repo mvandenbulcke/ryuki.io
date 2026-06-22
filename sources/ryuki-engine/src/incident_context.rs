@@ -185,12 +185,14 @@ fn ci_type_for(ci_name: &str) -> String {
     }
 }
 
-pub fn assemble_context(
+/// Pure constructor — no I/O, no static store. Validates inputs and builds an
+/// `IncidentContext` with a uuid-based id. Suitable for DB-backed handlers.
+pub fn build_incident_context(
     incident_title: &str,
     severity: &str,
     affected_ci_names: Vec<String>,
     site: &str,
-) -> Result<Value, String> {
+) -> Result<IncidentContext, String> {
     if incident_title.trim().is_empty() {
         return Err("incident_title cannot be empty".into());
     }
@@ -224,8 +226,8 @@ pub fn assemble_context(
         })
         .collect::<Vec<_>>();
 
-    let context = IncidentContext {
-        incident_id: incident_id.clone(),
+    Ok(IncidentContext {
+        incident_id,
         title: incident_title.to_string(),
         severity: severity.to_string(),
         affected_ci,
@@ -237,7 +239,68 @@ pub fn assemble_context(
         assembled_at: now_iso(),
         status: "active".into(),
         resolution: None,
-    };
+    })
+}
+
+/// Pure resolver — clones `ctx`, sets status="resolved" and resolution. No I/O.
+pub fn resolve_incident_pure(
+    ctx: &IncidentContext,
+    resolution: &str,
+) -> Result<IncidentContext, String> {
+    if resolution.trim().is_empty() {
+        return Err("resolution cannot be empty".into());
+    }
+    let mut updated = ctx.clone();
+    updated.status = "resolved".into();
+    updated.resolution = Some(resolution.to_string());
+    Ok(updated)
+}
+
+/// Pure add-CI — clones `ctx`, appends AffectedCI, status stays "active". No I/O.
+pub fn add_affected_ci_pure(
+    ctx: &IncidentContext,
+    ci_name: &str,
+    ci_type: &str,
+) -> Result<IncidentContext, String> {
+    if ci_name.trim().is_empty() {
+        return Err("ci_name cannot be empty".into());
+    }
+    if ci_type.trim().is_empty() {
+        return Err("ci_type cannot be empty".into());
+    }
+    let site = ctx
+        .affected_ci
+        .first()
+        .map(|ci| ci.site.clone())
+        .unwrap_or_else(|| "UNKNOWN".into());
+    let mut updated = ctx.clone();
+    updated.affected_ci.push(AffectedCI {
+        ci_name: ci_name.to_string(),
+        ci_type: ci_type.to_string(),
+        site,
+        status: "impacted".into(),
+    });
+    Ok(updated)
+}
+
+/// Pure escalate — clones `ctx`, appends reason to on_call.escalation. Status stays "active". No I/O.
+pub fn escalate_pure(ctx: &IncidentContext, reason: &str) -> Result<IncidentContext, String> {
+    if reason.trim().is_empty() {
+        return Err("reason cannot be empty".into());
+    }
+    let mut updated = ctx.clone();
+    updated.on_call.escalation = format!("{} | escalated: {}", ctx.on_call.escalation, reason);
+    Ok(updated)
+}
+
+pub fn assemble_context(
+    incident_title: &str,
+    severity: &str,
+    affected_ci_names: Vec<String>,
+    site: &str,
+) -> Result<Value, String> {
+    let context = build_incident_context(incident_title, severity, affected_ci_names, site)?;
+    let incident_id = context.incident_id.clone();
 
     incident_context_store()
         .lock()
@@ -326,84 +389,65 @@ pub fn get_recent_changes(incident_id: &str) -> Result<Value, String> {
 }
 
 pub fn resolve_incident(incident_id: &str, resolution: &str) -> Result<Value, String> {
-    if resolution.trim().is_empty() {
-        return Err("resolution cannot be empty".into());
-    }
-
+    // Hold the store lock across the whole read-modify-write so the transition is
+    // atomic (a clone-then-relock would let a concurrent mutation be lost).
     let mut store = incident_context_store().lock().unwrap();
-    let context = store
+    let entry = store
         .iter_mut()
         .find(|incident| incident.incident_id == incident_id)
         .ok_or_else(|| format!("Incident context '{}' not found", incident_id))?;
-
-    context.status = "resolved".into();
-    context.resolution = Some(resolution.to_string());
-
+    let updated = resolve_incident_pure(entry, resolution)?;
+    let status = updated.status.clone();
+    let resolution_val = updated.resolution.clone();
+    *entry = updated;
     Ok(json!({
         "source": "dry-run",
         "action": "resolve_incident",
         "incident_id": incident_id,
-        "status": context.status,
-        "resolution": context.resolution,
+        "status": status,
+        "resolution": resolution_val,
     }))
 }
 
 pub fn add_affected_ci(incident_id: &str, ci_name: &str, ci_type: &str) -> Result<Value, String> {
-    if ci_name.trim().is_empty() {
-        return Err("ci_name cannot be empty".into());
-    }
-    if ci_type.trim().is_empty() {
-        return Err("ci_type cannot be empty".into());
-    }
-
+    // Hold the store lock across the whole read-modify-write so two concurrent
+    // add-ci calls cannot lose an append (the DB path is guarded by the xmin CAS;
+    // this keeps the no-DB static fallback equally atomic, as the original was).
     let mut store = incident_context_store().lock().unwrap();
-    let context = store
+    let entry = store
         .iter_mut()
         .find(|incident| incident.incident_id == incident_id)
         .ok_or_else(|| format!("Incident context '{}' not found", incident_id))?;
-
-    let site = context
-        .affected_ci
-        .first()
-        .map(|ci| ci.site.clone())
-        .unwrap_or_else(|| "UNKNOWN".into());
-    let affected_ci = AffectedCI {
-        ci_name: ci_name.to_string(),
-        ci_type: ci_type.to_string(),
-        site,
-        status: "impacted".into(),
-    };
-
-    context.affected_ci.push(affected_ci.clone());
-
+    let updated = add_affected_ci_pure(entry, ci_name, ci_type)?;
+    let new_ci = updated.affected_ci.last().cloned();
+    let affected_count = updated.affected_ci.len();
+    *entry = updated;
     Ok(json!({
         "source": "dry-run",
         "action": "add_affected_ci",
         "incident_id": incident_id,
-        "affected_ci": affected_ci,
-        "affected_count": context.affected_ci.len(),
+        "affected_ci": new_ci,
+        "affected_count": affected_count,
     }))
 }
 
 pub fn escalate(incident_id: &str, reason: &str) -> Result<Value, String> {
-    if reason.trim().is_empty() {
-        return Err("reason cannot be empty".into());
-    }
-
+    // Hold the store lock across the whole read-modify-write so two concurrent
+    // escalations cannot drop a reason (atomic, as the original was).
     let mut store = incident_context_store().lock().unwrap();
-    let context = store
+    let entry = store
         .iter_mut()
         .find(|incident| incident.incident_id == incident_id)
         .ok_or_else(|| format!("Incident context '{}' not found", incident_id))?;
-
-    context.on_call.escalation = format!("{} | escalated: {}", context.on_call.escalation, reason);
-
+    let updated = escalate_pure(entry, reason)?;
+    let on_call = updated.on_call.clone();
+    *entry = updated;
     Ok(json!({
         "source": "dry-run",
         "action": "escalate",
         "incident_id": incident_id,
         "reason": reason,
-        "on_call": context.on_call,
+        "on_call": on_call,
     }))
 }
 

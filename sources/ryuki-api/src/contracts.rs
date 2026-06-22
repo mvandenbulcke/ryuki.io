@@ -62,7 +62,9 @@ use ryuki_engine::hardware_readiness;
 use ryuki_engine::health_monitor;
 use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
-use ryuki_engine::incident_context;
+use ryuki_engine::incident_context::{
+    add_affected_ci_pure, build_incident_context, escalate_pure, resolve_incident_pure,
+};
 use ryuki_engine::incident_readiness;
 use ryuki_engine::inventory_sync;
 use ryuki_engine::knowledge_suggestion;
@@ -18935,78 +18937,135 @@ struct IncidentEscalateRequest {
     reason: String,
 }
 
-async fn incident_assemble(
-    Json(body): Json<IncidentAssembleRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::assemble_context(
+async fn incident_assemble(Json(body): Json<IncidentAssembleRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let ctx = build_incident_context(
         &body.incident_title,
         &body.severity,
         body.affected_ci_names,
         &body.site,
     )
-    .map(Json)
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
+    .map_err(|e| status_400(&e))?;
+    crate::repos::incident_contexts::insert(pool, &ctx)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&ctx).unwrap_or_default()))
 }
 
-async fn incident_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::get_context(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn incident_get(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, _version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::to_value(&ctx).unwrap_or_default()))
 }
 
-async fn incident_active() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::list_active_incidents()
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
+async fn incident_active() -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let incidents = crate::repos::incident_contexts::list_active(pool)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&incidents).unwrap_or_default()))
 }
 
-async fn incident_services(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::get_affected_services(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn incident_services(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, _version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::json!({
+        "source": "db",
+        "incident_id": id,
+        "affected_ci": ctx.affected_ci,
+        "upstream_deps": ctx.upstream_deps,
+        "downstream_deps": ctx.downstream_deps,
+    })))
 }
 
-async fn incident_oncall(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::get_on_call(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn incident_oncall(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, _version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::json!({
+        "source": "db",
+        "incident_id": id,
+        "on_call": ctx.on_call,
+    })))
 }
 
-async fn incident_changes(
-    Path(id): Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::get_recent_changes(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+async fn incident_changes(Path(id): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, _version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    Ok(Json(serde_json::json!({
+        "source": "db",
+        "incident_id": id,
+        "recent_changes": ctx.recent_changes,
+    })))
 }
 
 async fn incident_resolve(
     Path(id): Path<String>,
     Json(body): Json<IncidentResolveRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::resolve_incident(&id, &body.resolution)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated = resolve_incident_pure(&ctx, &body.resolution).map_err(|e| status_409(&e))?;
+    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 async fn incident_add_ci(
     Path(id): Path<String>,
     Json(body): Json<IncidentAddCiRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::add_affected_ci(&id, &body.ci_name, &body.ci_type)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated =
+        add_affected_ci_pure(&ctx, &body.ci_name, &body.ci_type).map_err(|e| status_409(&e))?;
+    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 async fn incident_escalate(
     Path(id): Path<String>,
     Json(body): Json<IncidentEscalateRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    incident_context::escalate(&id, &body.reason)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (ctx, version) = crate::repos::incident_contexts::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let updated = escalate_pure(&ctx, &body.reason).map_err(|e| status_409(&e))?;
+    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 async fn incident_context_contract() -> Json<Value> {
@@ -37879,6 +37938,353 @@ mod runbook_executions_db_tests {
         assert!(
             listed.iter().all(|e| e.site == "DEFRA"),
             "all listed executions must be for DEFRA"
+        );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins incident_contexts_db_tests -- --test-threads=1
+#[cfg(test)]
+mod incident_contexts_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM incident_contexts WHERE incident_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    fn make_incident(suffix: &str, site: &str) -> ryuki_engine::incident_context::IncidentContext {
+        ryuki_engine::incident_context::build_incident_context(
+            &format!("test incident {suffix}"),
+            "sev2",
+            vec![format!("{}-test-ci", site.to_lowercase())],
+            site,
+        )
+        .expect("build_incident_context must succeed")
+    }
+
+    /// Full lifecycle: assemble -> add-ci -> escalate -> resolve.
+    /// Asserts status after each step: add-ci and escalate keep "active", resolve sets "resolved".
+    #[tokio::test]
+    async fn test_full_lifecycle() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ctx = make_incident(&suffix, "DEFRA");
+        let id = ctx.incident_id.clone();
+
+        // 1. Insert (assemble)
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("insert must succeed");
+
+        let (fetched, version) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after insert");
+        assert_eq!(
+            fetched.status, "active",
+            "status after insert must be active"
+        );
+        let initial_ci_count = fetched.affected_ci.len();
+
+        // 2. Add CI (status stays "active")
+        let with_ci = ryuki_engine::incident_context::add_affected_ci_pure(
+            &fetched,
+            "defra-extra-host",
+            "server",
+        )
+        .expect("add_affected_ci_pure must succeed");
+        assert_eq!(with_ci.status, "active", "add_ci must keep status active");
+        assert_eq!(
+            with_ci.affected_ci.len(),
+            initial_ci_count + 1,
+            "affected_ci must grow by 1"
+        );
+
+        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &with_ci)
+            .await
+            .expect("transition failed");
+        assert!(ok, "add_ci transition must succeed");
+
+        let (fetched, version) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after add_ci");
+        assert_eq!(fetched.status, "active");
+        assert_eq!(
+            fetched.affected_ci.len(),
+            initial_ci_count + 1,
+            "re-get must persist the grown affected_ci"
+        );
+
+        // 3. Escalate (status stays "active")
+        let escalated =
+            ryuki_engine::incident_context::escalate_pure(&fetched, "customer impact exceeded")
+                .expect("escalate_pure must succeed");
+        assert_eq!(
+            escalated.status, "active",
+            "escalate must keep status active"
+        );
+        assert!(
+            escalated
+                .on_call
+                .escalation
+                .contains("customer impact exceeded"),
+            "escalation field must contain the reason"
+        );
+
+        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &escalated)
+            .await
+            .expect("transition failed");
+        assert!(ok, "escalate transition must succeed");
+
+        let (fetched, version) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after escalate");
+        assert_eq!(fetched.status, "active");
+        assert!(
+            fetched
+                .on_call
+                .escalation
+                .contains("customer impact exceeded"),
+            "re-get must persist the escalation reason"
+        );
+
+        // 4. Resolve (status changes to "resolved")
+        let resolved =
+            ryuki_engine::incident_context::resolve_incident_pure(&fetched, "service restored")
+                .expect("resolve_incident_pure must succeed");
+        assert_eq!(
+            resolved.status, "resolved",
+            "resolve must set status to resolved"
+        );
+
+        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &resolved)
+            .await
+            .expect("transition failed");
+        assert!(ok, "resolve transition must succeed");
+
+        let (fetched, _version) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after resolve");
+        assert_eq!(
+            fetched.status, "resolved",
+            "status after resolve must persist"
+        );
+        assert_eq!(
+            fetched.resolution,
+            Some("service restored".to_string()),
+            "resolution text must persist"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Missing id must return None (mapped to 404 by handlers).
+    #[tokio::test]
+    async fn test_missing_id_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let result = crate::repos::incident_contexts::get(pool, "inc-does-not-exist-00000000")
+            .await
+            .expect("get must not error on missing id");
+        assert!(result.is_none(), "missing id must return None");
+    }
+
+    /// CAS: transition returns Ok(false) when the row was modified after the read.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ctx = make_incident(&suffix, "GBLON");
+        let id = ctx.incident_id.clone();
+
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("insert must succeed");
+
+        let (original, stale_version) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        // First writer escalates — this bumps xmin.
+        let escalated =
+            ryuki_engine::incident_context::escalate_pure(&original, "escalation reason a")
+                .expect("escalate must succeed");
+        crate::repos::incident_contexts::transition(pool, &id, &stale_version, &escalated)
+            .await
+            .expect("first transition must succeed");
+
+        // Second writer presents stale version — must be rejected.
+        let stale_update =
+            ryuki_engine::incident_context::escalate_pure(&original, "escalation reason b")
+                .expect("second escalate must succeed");
+        let applied =
+            crate::repos::incident_contexts::transition(pool, &id, &stale_version, &stale_update)
+                .await
+                .expect("transition query must not error");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with stale row version must return false (CAS mismatch)"
+        );
+    }
+
+    /// Resolve twice: second resolve with fresh version after re-get SUCCEEDS.
+    /// Proves there is no guard on already-resolved (engine behavior: just overwrites).
+    #[tokio::test]
+    async fn test_resolve_twice_overwrites() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ctx = make_incident(&suffix, "DEFRA");
+        let id = ctx.incident_id.clone();
+
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("insert must succeed");
+
+        // First resolve
+        let (loaded, v1) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("found");
+        let resolved1 = ryuki_engine::incident_context::resolve_incident_pure(&loaded, "first fix")
+            .expect("resolve 1");
+        let ok = crate::repos::incident_contexts::transition(pool, &id, &v1, &resolved1)
+            .await
+            .expect("transition 1");
+        assert!(ok, "first resolve must succeed");
+
+        // Re-get to get fresh version, then resolve again
+        let (already_resolved, v2) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get 2")
+            .expect("found 2");
+        assert_eq!(already_resolved.status, "resolved");
+
+        let resolved2 =
+            ryuki_engine::incident_context::resolve_incident_pure(&already_resolved, "second fix")
+                .expect("resolve 2 — no guard on already-resolved");
+        let ok2 = crate::repos::incident_contexts::transition(pool, &id, &v2, &resolved2)
+            .await
+            .expect("transition 2");
+        assert!(
+            ok2,
+            "second resolve with fresh version must succeed (no already-resolved guard)"
+        );
+
+        let (final_ctx, _) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("final get")
+            .expect("found final");
+        assert_eq!(final_ctx.resolution, Some("second fix".to_string()));
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Same-status add-ci race: two concurrent readers both run add_affected_ci_pure
+    /// (status stays "active"). First write wins; second with stale version returns Ok(false).
+    /// A status-only CAS would miss this because status is "active" in both writes.
+    #[tokio::test]
+    async fn test_same_status_add_ci_race_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let ctx = make_incident(&suffix, "GBLON");
+        let id = ctx.incident_id.clone();
+
+        crate::repos::incident_contexts::insert(pool, &ctx)
+            .await
+            .expect("insert must succeed");
+
+        // Two readers load the SAME active incident simultaneously.
+        let (reader_a, ver_a) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get a")
+            .expect("found a");
+        let (reader_b, ver_b) = crate::repos::incident_contexts::get(pool, &id)
+            .await
+            .expect("get b")
+            .expect("found b");
+        assert_eq!(ver_a, ver_b, "both readers must see the same xmin version");
+        assert_eq!(reader_a.status, "active");
+
+        // Reader A adds CI — status stays "active" (this is the same-status race premise).
+        let a_update = ryuki_engine::incident_context::add_affected_ci_pure(
+            &reader_a,
+            "gblon-extra-a",
+            "server",
+        )
+        .expect("add_ci a");
+        assert_eq!(
+            a_update.status, "active",
+            "add_ci must keep status active (same-status race premise)"
+        );
+        let ok_a = crate::repos::incident_contexts::transition(pool, &id, &ver_a, &a_update)
+            .await
+            .expect("a transition");
+        assert!(ok_a, "first same-status write must succeed");
+
+        // Reader B adds a different CI with the now-stale version — must be rejected.
+        let b_update = ryuki_engine::incident_context::add_affected_ci_pure(
+            &reader_b,
+            "gblon-extra-b",
+            "server",
+        )
+        .expect("add_ci b");
+        assert_eq!(
+            b_update.status, "active",
+            "B's add_ci must also keep status active (same-status race premise)"
+        );
+        let ok_b = crate::repos::incident_contexts::transition(pool, &id, &ver_b, &b_update)
+            .await
+            .expect("b transition query must not error");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !ok_b,
+            "second same-status writer with stale version must return false (xmin CAS catches it; status-only CAS would miss it)"
         );
     }
 }
