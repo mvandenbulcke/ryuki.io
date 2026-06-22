@@ -29746,6 +29746,314 @@ mod secrets_rotation_db_tests {
     }
 }
 
+// ─── DB-gated integration tests for access-recertification persistence ────────
+//
+// Each test SKIPS when RYUKI_DATABASE_URL is unset.
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api access_recertification_db_tests
+//
+// The headline property is SECURITY: every review-decision handler (start /
+// approve / revoke) stamps the `reviewer` column from the AUTHENTICATED
+// session.user_id (Extension<AuthSession>), NEVER a client-supplied field — and
+// approve/revoke OVERWRITE any prior reviewer with the deciding session, so a
+// past reviewer cannot be impersonated on the audit trail. The repo-layer tests
+// call the repo fns directly and so cannot prove this handler→session wiring.
+#[cfg(test)]
+mod access_recertification_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Authenticated reviewing session — the decision handlers stamp `reviewer`
+    /// from `session.user_id`, so the persisted row must carry exactly this id.
+    fn caller_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
+    /// See secrets_rotation_db_tests::global_pool for the SKIP-vs-panic rationale.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but the DB connection failed");
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    async fn cleanup_review(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM access_reviews WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Seeds one access review, resetting any leaked fixture first (delete-then-
+    /// insert) so each run starts clean. `reviewer` is NULL when None.
+    async fn seed_review(pool: &PgPool, id: &str, status: &str, reviewer: Option<&str>) {
+        cleanup_review(pool, id).await;
+        sqlx::query(
+            "INSERT INTO access_reviews \
+             (id, review_type, target_name, owner, next_review_due, status, \
+              risk_level, site, reviewer, review_history) \
+             VALUES ($1::uuid, 'ADGroup', 'Domain Admins', 'owner.test', \
+                     NOW() + INTERVAL '30 days', $2, 'High', 'DBTEST', $3, '[]')",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(reviewer)
+        .execute(pool)
+        .await
+        .expect("seed access_review");
+    }
+
+    /// Returns (reviewer, status) for the row.
+    async fn review_row(pool: &PgPool, id: &str) -> Option<(Option<String>, String)> {
+        sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT reviewer, status FROM access_reviews WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read access_review")
+    }
+
+    async fn next_review_due(pool: &PgPool, id: &str) -> chrono::DateTime<chrono::Utc> {
+        sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT next_review_due FROM access_reviews WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read next_review_due")
+    }
+
+    // ── SECURITY: start stamps `reviewer` from the session, not a client field ──
+
+    #[tokio::test]
+    async fn test_start_records_session_user_as_reviewer() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "c0000200-d0d0-4000-8000-00000000a001";
+        let session_user = "dbtest-reviewer-start-3a7";
+        seed_review(pool, id, "Pending", None).await;
+
+        let result = access_review_start(
+            Path(id.to_string()),
+            Extension(caller_session(session_user)),
+        )
+        .await;
+
+        let row = review_row(pool, id).await;
+        cleanup_review(pool, id).await;
+
+        assert!(result.is_ok(), "start must succeed: {result:?}");
+        let (reviewer, status) = row.expect("row must exist");
+        assert_eq!(
+            reviewer.as_deref(),
+            Some(session_user),
+            "reviewer MUST be the session user_id, never a client value"
+        );
+        assert_eq!(status, "InProgress", "start must flip status to InProgress");
+    }
+
+    // ── SECURITY: approve OVERWRITES reviewer with the deciding session ──
+
+    #[tokio::test]
+    async fn test_approve_records_session_user_and_advances_due() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "c0000200-d0d0-4000-8000-00000000a002";
+        // A prior reviewer is already on the row; the approving session must
+        // REPLACE it — a past reviewer cannot be left on the audit trail.
+        seed_review(pool, id, "InProgress", Some("prior.reviewer.do-not-keep")).await;
+        let before_due = next_review_due(pool, id).await;
+        let session_user = "dbtest-approver-9d4";
+
+        let result = access_review_approve(
+            Path(id.to_string()),
+            Extension(caller_session(session_user)),
+            Json(AccessReviewActionRequest {
+                justification: Some("access confirmed appropriate".to_string()),
+                reason: None,
+            }),
+        )
+        .await;
+
+        let row = review_row(pool, id).await;
+        let after_due = next_review_due(pool, id).await;
+        cleanup_review(pool, id).await;
+
+        assert!(result.is_ok(), "approve must succeed: {result:?}");
+        let (reviewer, status) = row.expect("row must exist");
+        assert_eq!(
+            reviewer.as_deref(),
+            Some(session_user),
+            "approve MUST overwrite reviewer with the deciding session user"
+        );
+        assert_eq!(status, "Approved");
+        assert!(
+            after_due > before_due,
+            "approve must advance next_review_due (90-day reset)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revoke_records_session_user() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "c0000200-d0d0-4000-8000-00000000a003";
+        seed_review(pool, id, "InProgress", Some("prior.reviewer")).await;
+        let session_user = "dbtest-revoker-5f1";
+
+        let result = access_review_revoke(
+            Path(id.to_string()),
+            Extension(caller_session(session_user)),
+            Json(AccessReviewActionRequest {
+                justification: None,
+                reason: Some("entitlement no longer required".to_string()),
+            }),
+        )
+        .await;
+
+        let row = review_row(pool, id).await;
+        cleanup_review(pool, id).await;
+
+        assert!(result.is_ok(), "revoke must succeed: {result:?}");
+        let (reviewer, status) = row.expect("row must exist");
+        assert_eq!(reviewer.as_deref(), Some(session_user));
+        assert_eq!(status, "Revoked");
+    }
+
+    // ── error paths ──
+
+    #[tokio::test]
+    async fn test_start_returns_404_for_missing_review() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = access_review_start(
+            Path("c0000200-d0d0-4000-8000-0000000000ff".to_string()),
+            Extension(caller_session("nobody")),
+        )
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_start_guard_rejects_non_pending() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "c0000200-d0d0-4000-8000-00000000a004";
+        // Already Approved → start (Pending-only) must be rejected at the guard.
+        seed_review(pool, id, "Approved", Some("someone")).await;
+
+        let result = access_review_start(
+            Path(id.to_string()),
+            Extension(caller_session("late.reviewer")),
+        )
+        .await;
+
+        cleanup_review(pool, id).await;
+
+        let Err((status, _)) = result else {
+            panic!("expected Err 400, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_approve_rejects_empty_justification() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "c0000200-d0d0-4000-8000-00000000a005";
+        seed_review(pool, id, "InProgress", None).await;
+
+        let result = access_review_approve(
+            Path(id.to_string()),
+            Extension(caller_session("approver")),
+            Json(AccessReviewActionRequest {
+                justification: None,
+                reason: None,
+            }),
+        )
+        .await;
+
+        cleanup_review(pool, id).await;
+
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty justification, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── campaign create persists ──
+
+    #[tokio::test]
+    async fn test_campaign_create_persists() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let name = "dbtest-campaign-create-7e3";
+        sqlx::query("DELETE FROM recertification_campaigns WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .ok();
+
+        let result = access_campaign_create(Json(AccessCampaignCreateRequest {
+            name: name.to_string(),
+            review_type: "ADGroup".to_string(),
+            reviewer_group: "identity-governance".to_string(),
+            days: 30,
+        }))
+        .await;
+
+        let persisted: Option<(String, String)> = sqlx::query_as(
+            "SELECT name, reviewer_group FROM recertification_campaigns WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .expect("read campaign");
+        sqlx::query("DELETE FROM recertification_campaigns WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await
+            .ok();
+
+        assert!(result.is_ok(), "campaign create must succeed: {result:?}");
+        let (got_name, group) = persisted.expect("campaign row must exist");
+        assert_eq!(got_name, name);
+        assert_eq!(group, "identity-governance");
+    }
+}
+
 // ─── DB-gated integration tests for emergency change persistence ──────────────
 //
 // Each test SKIPS when RYUKI_DATABASE_URL is unset.
