@@ -21,32 +21,41 @@ pub async fn insert(
     state: &str,
     nonce: &str,
     pkce_verifier: &str,
+    binding: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO oidc_login_states (state, nonce, pkce_verifier) \
-         VALUES ($1, $2, $3)",
+        "INSERT INTO oidc_login_states (state, nonce, pkce_verifier, binding) \
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(state)
     .bind(nonce)
     .bind(pkce_verifier)
+    .bind(binding)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-/// Atomically consume a login-state row and return `(nonce, pkce_verifier)`.
+/// Atomically consume a login-state row and return `(nonce, pkce_verifier,
+/// binding)`.
 ///
 /// Returns `None` when the row is absent **or** expired (`expires_at <=
 /// NOW()`).  The `DELETE … RETURNING` is a single atomic statement: a
 /// concurrent second call with the same `state` will find no row and also
 /// return `None`, enforcing single-use without a separate SELECT.
-// Used by the callback handler in slice 2.
-#[allow(dead_code)]
-pub async fn take(pool: &PgPool, state: &str) -> Result<Option<(String, String)>, sqlx::Error> {
-    let row: Option<(String, String)> = sqlx::query_as(
+///
+/// `binding` is the per-browser CSRF token: the callback handler must compare it
+/// to the `oidc_login_csrf` cookie that the login-initiation handler set on the
+/// initiating browser, so a state stolen/forged by an attacker cannot be
+/// redeemed in a victim's browser (login-CSRF / session-swapping defense).
+pub async fn take(
+    pool: &PgPool,
+    state: &str,
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
+    let row: Option<(String, String, String)> = sqlx::query_as(
         "DELETE FROM oidc_login_states \
          WHERE state = $1 AND expires_at > NOW() \
-         RETURNING nonce, pkce_verifier",
+         RETURNING nonce, pkce_verifier, binding",
     )
     .bind(state)
     .fetch_optional(pool)
@@ -107,16 +116,18 @@ mod oidc_login_states_db_tests {
         let state = format!("st-test-{}", uuid::Uuid::new_v4());
         let nonce = "test-nonce-1".to_string();
         let pkce_verifier = "test-pkce-verifier-1".to_string();
+        let binding = "test-binding-1".to_string();
 
-        insert(&pool, &state, &nonce, &pkce_verifier)
+        insert(&pool, &state, &nonce, &pkce_verifier, &binding)
             .await
             .expect("insert should succeed");
 
         let result = take(&pool, &state).await.expect("take should not error");
         assert!(result.is_some(), "take should return the row");
-        let (got_nonce, got_pkce) = result.unwrap();
+        let (got_nonce, got_pkce, got_binding) = result.unwrap();
         assert_eq!(got_nonce, nonce);
         assert_eq!(got_pkce, pkce_verifier);
+        assert_eq!(got_binding, binding);
     }
 
     #[tokio::test]
@@ -127,7 +138,7 @@ mod oidc_login_states_db_tests {
         };
 
         let state = format!("st-su-{}", uuid::Uuid::new_v4());
-        insert(&pool, &state, "nonce-su", "pkce-su")
+        insert(&pool, &state, "nonce-su", "pkce-su", "binding-su")
             .await
             .expect("insert");
 

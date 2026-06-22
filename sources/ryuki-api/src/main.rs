@@ -10,6 +10,7 @@ pub mod cp_identity;
 pub mod database;
 mod entra_auth;
 mod integration;
+mod oidc_callback;
 mod repos;
 
 use axum::body::Body;
@@ -400,6 +401,8 @@ fn is_auth_exempt_path(path: &str) -> bool {
             | "/api/platform/summary"
             // OIDC browser sign-in (GET — runs before any session exists)
             | "/api/auth/oidc/login"
+            // OIDC authorization-code callback (GET — no session yet)
+            | "/api/auth/oidc/callback"
     )
 }
 
@@ -1647,6 +1650,38 @@ async fn main() {
         .merge(human_gated_app)
         .fallback(not_found)
         .layer(Extension(local_login_throttle))
+        .layer(Extension(
+            // OidcCallbackDeps: built once at startup.  When OIDC is disabled
+            // the handler gates on `oidc.enabled` before touching these deps, so
+            // a placeholder with a dummy exchanger and validator is fine.
+            if app_config.oidc.enabled {
+                let exchanger: std::sync::Arc<dyn oidc_callback::TokenExchanger + Send + Sync> =
+                    std::sync::Arc::new(oidc_callback::ReqwestTokenExchanger::new(
+                        app_config.oidc.token_endpoint.clone(),
+                    ));
+                let validator = std::sync::Arc::new(oidc_callback::OidcIdTokenValidator::new(
+                    app_config.oidc.jwks_uri.clone(),
+                    app_config.oidc.issuer.clone(),
+                    app_config.oidc.client_id.clone(),
+                    60, // 60-second leeway
+                ));
+                std::sync::Arc::new(oidc_callback::OidcCallbackDeps { exchanger, validator })
+            } else {
+                // Disabled placeholder: handler gates on oidc.enabled → 404
+                // before these are touched.
+                let exchanger: std::sync::Arc<dyn oidc_callback::TokenExchanger + Send + Sync> =
+                    std::sync::Arc::new(oidc_callback::ReqwestTokenExchanger::new(
+                        "https://disabled.invalid/token".to_string(),
+                    ));
+                let validator = std::sync::Arc::new(oidc_callback::OidcIdTokenValidator::new(
+                    "https://disabled.invalid/jwks".to_string(),
+                    "disabled".to_string(),
+                    "disabled".to_string(),
+                    60,
+                ));
+                std::sync::Arc::new(oidc_callback::OidcCallbackDeps { exchanger, validator })
+            },
+        ))
         .layer(ConcurrencyLimitLayer::new(
             app_config.server.max_concurrent_connections,
         ))
@@ -2314,6 +2349,7 @@ mod tests {
         assert!(!is_auth_exempt_path("/api/auth/local/me"));
         assert!(!is_auth_exempt_path("/api/requests"));
         assert!(is_auth_exempt_path("/api/auth/oidc/login"));
+        assert!(is_auth_exempt_path("/api/auth/oidc/callback"));
     }
 
     #[tokio::test]

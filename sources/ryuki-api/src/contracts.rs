@@ -1237,6 +1237,10 @@ pub fn routes() -> Router {
         .route("/api/auth/local/login", post(auth_local_login))
         .route("/api/auth/local/logout", post(auth_local_logout))
         .route("/api/auth/oidc/login", get(oidc_login_initiate))
+        .route(
+            "/api/auth/oidc/callback",
+            get(crate::oidc_callback::oidc_callback),
+        )
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/roles", get(auth_roles))
@@ -9900,7 +9904,7 @@ fn cookie_same_site_attribute(cookie_same_site: &str) -> &'static str {
 
 /// Builds the `Set-Cookie` value for the API-origin session cookie. The
 /// cookie is ALWAYS HttpOnly regardless of `session.cookie_http_only`.
-fn session_cookie_set_header(
+pub(crate) fn session_cookie_set_header(
     session_id: &str,
     session: &ryuki_core::config::SessionConfig,
 ) -> String {
@@ -10299,8 +10303,16 @@ async fn oidc_login_initiate() -> Result<Response, (StatusCode, Json<Value>)> {
     // PKCE S256: code_challenge = BASE64URL(SHA-256(ASCII(code_verifier)))
     let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
 
+    // Per-browser CSRF binding: stored with the state AND set as an HttpOnly
+    // cookie below. The callback redeems the state only when the cookie matches,
+    // so a state obtained from an attacker's own flow cannot be replayed in a
+    // victim's browser (login-CSRF / session-swapping defense).
+    let mut binding_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut binding_bytes);
+    let binding = URL_SAFE_NO_PAD.encode(binding_bytes);
+
     // ── Persist state (single-use, 10-minute TTL) ────────────────────────────
-    crate::repos::oidc_login_states::insert(pool, &state, &nonce, &pkce_verifier)
+    crate::repos::oidc_login_states::insert(pool, &state, &nonce, &pkce_verifier, &binding)
         .await
         .map_err(db_error)?;
 
@@ -10343,9 +10355,31 @@ async fn oidc_login_initiate() -> Result<Response, (StatusCode, Json<Value>)> {
             Json(json!({"error": format!("invalid redirect URL: {e}")})),
         )
     })?;
+    // Set the per-browser CSRF binding cookie. SameSite=Lax is REQUIRED so the
+    // browser sends it on the top-level redirect BACK from the IdP to the
+    // callback (a cross-site navigation); Secure follows the session policy.
+    // Short-lived to match the state TTL. The value is base64url (cookie-safe).
+    let binding_cookie = format!(
+        "oidc_login_csrf={}; Path=/; HttpOnly; Max-Age=600; SameSite=Lax{}",
+        binding,
+        if cfg.session.cookie_secure {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    let cookie_hv = axum::http::HeaderValue::from_str(&binding_cookie).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("cookie encoding failed: {e}")})),
+        )
+    })?;
     Ok((
         StatusCode::FOUND,
-        [(axum::http::header::LOCATION, location)],
+        [
+            (axum::http::header::LOCATION, location),
+            (axum::http::header::SET_COOKIE, cookie_hv),
+        ],
     )
         .into_response())
 }
@@ -10383,7 +10417,7 @@ fn auth_session_persistence_problem() -> (StatusCode, Json<ApiError>) {
     )
 }
 
-fn map_auth_session_persistence_result<T, E: std::fmt::Display>(
+pub(crate) fn map_auth_session_persistence_result<T, E: std::fmt::Display>(
     result: Result<T, E>,
     operation: &str,
 ) -> Result<T, (StatusCode, Json<ApiError>)> {
@@ -11808,7 +11842,7 @@ fn transition_conflict_409(request_id: &str) -> (StatusCode, Json<Value>) {
 /// Maps any database/transaction error to a 500. Used by the transactional
 /// lifecycle handlers where the request UPDATE and the audit INSERT commit
 /// together.
-fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+pub(crate) fn db_error<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({"error": e.to_string()})),
@@ -15140,7 +15174,7 @@ struct DecommissionPlanRequest {
 // ─── Server Decommission handlers ───
 
 /// 503 returned by handlers that require a database when no pool is available.
-fn status_503_no_db() -> (StatusCode, Json<Value>) {
+pub(crate) fn status_503_no_db() -> (StatusCode, Json<Value>) {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({"error": "persistence required: this operation requires a database"})),
