@@ -251,7 +251,14 @@ impl EntraTokenValidator {
             "{}/{}/discovery/v2.0/keys",
             instance_trimmed, config.tenant_id
         );
-        let http = reqwest::Client::new();
+        // A bounded timeout is essential: fetch_keys runs inside the JWKS
+        // write-lock on the token-validation hot path, so a slow/black-holed
+        // Entra JWKS endpoint without a timeout would stall ALL token validation.
+        // (Mirrors the OIDC id-token validator's client.)
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client build should not fail");
         let cache = JwksCache::new(http, jwks_uri, Duration::from_secs(jwks_ttl_secs));
         Self {
             config,

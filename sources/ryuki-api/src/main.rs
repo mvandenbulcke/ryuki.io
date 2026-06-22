@@ -3245,6 +3245,12 @@ mod tests {
             requests_route_permission("/api/requests/abc/reject"),
             Some("approve")
         );
+        // approve-live-apply mints a CP-signed live-mutation grant — admin-tier,
+        // never the execute fallback.
+        assert_eq!(
+            requests_route_permission("/api/requests/abc/approve-live-apply"),
+            Some("admin")
+        );
         // cancel is a requester-tier floor (handler enforces requester-owns-it
         // -or-admin SoD against the row)
         assert_eq!(
@@ -3564,6 +3570,11 @@ mod tests {
             (format!("/api/requests/{id}/verify"), "execute"),
             (format!("/api/requests/{id}/approve"), "approve"),
             (format!("/api/requests/{id}/reject"), "approve"),
+            // approve-live-apply mints a CP-signed grant authorising live
+            // infrastructure mutation — it MUST resolve to admin, not fall back
+            // to execute. Pinned so a gate-resolver refactor can't silently
+            // downgrade the most-privileged request-family branch.
+            (format!("/api/requests/{id}/approve-live-apply"), "admin"),
             (format!("/api/requests/{id}/cancel"), "request"),
             ("/api/requests".to_string(), "request"),
         ];
