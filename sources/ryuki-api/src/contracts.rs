@@ -2070,60 +2070,18 @@ struct LegalHoldActiveQuery {
 
 // ─── Linux deployment request types ───
 
+/// Action request for linux deployment lifecycle steps (validate / execute / verify).
+/// The `operation_id` is the UUID string returned by `linux_deploy_plan`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct LinuxDeployActionRequest {
+    #[serde(rename = "operationId")]
+    operation_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct LinuxDeployPlanRequest {
-    distro: String,
-    version: String,
-    site: String,
-    cpu: u32,
-    #[serde(rename = "memoryGb")]
-    memory_gb: u32,
-    #[serde(rename = "diskGb")]
-    disk_gb: u32,
-    hostname: String,
-    network: String,
-    #[serde(rename = "hardeningProfile")]
-    hardening_profile: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LinuxDeployValidateRequest {
-    distro: String,
-    version: String,
-    site: String,
-    cpu: u32,
-    #[serde(rename = "memoryGb")]
-    memory_gb: u32,
-    #[serde(rename = "diskGb")]
-    disk_gb: u32,
-    hostname: String,
-    network: String,
-    #[serde(rename = "hardeningProfile")]
-    hardening_profile: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LinuxDeployExecuteRequest {
-    distro: String,
-    version: String,
-    site: String,
-    cpu: u32,
-    #[serde(rename = "memoryGb")]
-    memory_gb: u32,
-    #[serde(rename = "diskGb")]
-    disk_gb: u32,
-    hostname: String,
-    network: String,
-    #[serde(rename = "hardeningProfile")]
-    hardening_profile: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LinuxDeployVerifyRequest {
     distro: String,
     version: String,
     site: String,
@@ -15309,69 +15267,11 @@ fn parse_hardening_profile(p: &str) -> ryuki_engine::models::HardeningProfile {
 }
 
 async fn linux_deploy_plan(Json(body): Json<LinuxDeployPlanRequest>) -> ApiResult {
-    let distro = parse_linux_distro(&body.distro);
-    let hardening = parse_hardening_profile(&body.hardening_profile);
-    match linux_deployment::plan_linux_deployment(
-        distro,
-        &body.version,
-        &body.site,
-        body.cpu,
-        body.memory_gb,
-        body.disk_gb,
-        &body.hostname,
-        &body.network,
-        hardening,
-    ) {
-        Ok(req) => Ok(Json(serde_json::to_value(req).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
+    let pool = get_db().ok_or_else(status_503_no_db)?;
 
-async fn linux_deploy_validate(Json(body): Json<LinuxDeployValidateRequest>) -> ApiResult {
     let distro = parse_linux_distro(&body.distro);
     let hardening = parse_hardening_profile(&body.hardening_profile);
-    let req = linux_deployment::plan_linux_deployment(
-        distro,
-        &body.version,
-        &body.site,
-        body.cpu,
-        body.memory_gb,
-        body.disk_gb,
-        &body.hostname,
-        &body.network,
-        hardening,
-    )
-    .map_err(|e| status_400(&e))?;
-    match linux_deployment::validate_linux_deployment(&req) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
 
-async fn linux_deploy_execute(Json(body): Json<LinuxDeployExecuteRequest>) -> ApiResult {
-    let distro = parse_linux_distro(&body.distro);
-    let hardening = parse_hardening_profile(&body.hardening_profile);
-    let req = linux_deployment::plan_linux_deployment(
-        distro,
-        &body.version,
-        &body.site,
-        body.cpu,
-        body.memory_gb,
-        body.disk_gb,
-        &body.hostname,
-        &body.network,
-        hardening,
-    )
-    .map_err(|e| status_400(&e))?;
-    match linux_deployment::execute_linux_deployment(&req) {
-        Ok(executed) => Ok(Json(serde_json::to_value(executed).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
-
-async fn linux_deploy_verify(Json(body): Json<LinuxDeployVerifyRequest>) -> ApiResult {
-    let distro = parse_linux_distro(&body.distro);
-    let hardening = parse_hardening_profile(&body.hardening_profile);
     let mut req = linux_deployment::plan_linux_deployment(
         distro,
         &body.version,
@@ -15384,11 +15284,118 @@ async fn linux_deploy_verify(Json(body): Json<LinuxDeployVerifyRequest>) -> ApiR
         hardening,
     )
     .map_err(|e| status_400(&e))?;
-    req.status = ryuki_engine::models::LinuxDeploymentStatus::Executed;
-    match linux_deployment::verify_linux_deployment(&req) {
-        Ok(verification) => Ok(Json(serde_json::to_value(verification).unwrap())),
-        Err(e) => Err(status_400(&e)),
+
+    // The engine generates a non-UUID id (e.g. "ldep-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    req.id = Uuid::new_v4().to_string();
+
+    crate::repos::linux_deployment_requests::insert(pool, &req)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&req).unwrap_or_default()))
+}
+
+async fn linux_deploy_validate(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle (Planned -> Validated -> Executed -> Verified): the
+    // engine does not enforce ordering, so the API does. Validate only from
+    // Planned, never regressing a later state back to Validated.
+    if req.status != ryuki_engine::models::LinuxDeploymentStatus::Planned {
+        return Err(status_409("operation must be in Planned state to validate"));
     }
+
+    let before = crate::repos::linux_deployment_requests::status_str(&req.status);
+
+    let result = linux_deployment::validate_linux_deployment(&req).map_err(|e| status_409(&e))?;
+
+    // Only ADVANCE to Validated when the check actually passed. A failed
+    // validation leaves the operation in Planned so the caller can remediate and
+    // re-validate; the failures travel back in the ValidationResult. (Recording a
+    // failed validation as durable Validated would let it proceed to execute.)
+    if result.passed {
+        let mut validated_req = req;
+        validated_req.status = ryuki_engine::models::LinuxDeploymentStatus::Validated;
+
+        let ok = crate::repos::linux_deployment_requests::transition(pool, before, &validated_req)
+            .await
+            .map_err(db_error)?;
+        if !ok {
+            return Err(status_409("state changed concurrently; reload and retry"));
+        }
+    }
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+async fn linux_deploy_execute(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle: execute only from Validated. This enforces
+    // validate-before-execute and prevents re-executing an already Executed or
+    // Verified operation.
+    if req.status != ryuki_engine::models::LinuxDeploymentStatus::Validated {
+        return Err(status_409("operation must be Validated before execute"));
+    }
+
+    let before = crate::repos::linux_deployment_requests::status_str(&req.status);
+
+    let executed = linux_deployment::execute_linux_deployment(&req).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::linux_deployment_requests::transition(pool, before, &executed)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
+}
+
+async fn linux_deploy_verify(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle: verify only from Executed.
+    if req.status != ryuki_engine::models::LinuxDeploymentStatus::Executed {
+        return Err(status_409("operation must be Executed before verify"));
+    }
+
+    let before = crate::repos::linux_deployment_requests::status_str(&req.status);
+
+    let verification =
+        linux_deployment::verify_linux_deployment(&req).map_err(|e| status_409(&e))?;
+
+    // Persist `Verified` status after successful evidence collection.
+    let mut verified_req = req;
+    verified_req.status = ryuki_engine::models::LinuxDeploymentStatus::Verified;
+
+    let ok = crate::repos::linux_deployment_requests::transition(pool, before, &verified_req)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(
+        serde_json::to_value(&verification).unwrap_or_default(),
+    ))
 }
 
 async fn linux_supported_distros() -> Json<Value> {
@@ -36945,6 +36952,453 @@ mod vm_day2_operations_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         let result = vm_day2_verify(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "verify before execute must return 409"
+        );
+    }
+}
+
+#[cfg(test)]
+mod linux_deployment_no_db_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    fn plan_body() -> LinuxDeployPlanRequest {
+        LinuxDeployPlanRequest {
+            distro: "ubuntu".into(),
+            version: "22.04 LTS".into(),
+            site: "DEFRA".into(),
+            cpu: 4,
+            memory_gb: 16,
+            disk_gb: 100,
+            hostname: "srv-test-01".into(),
+            network: "VLAN100".into(),
+            hardening_profile: "cis-level-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_returns_503_without_db() {
+        let result = linux_deploy_plan(Json(plan_body())).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_validate_returns_503_without_db() {
+        let body = LinuxDeployActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = linux_deploy_validate(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_execute_returns_503_without_db() {
+        let body = LinuxDeployActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = linux_deploy_execute(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_verify_returns_503_without_db() {
+        let body = LinuxDeployActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = linux_deploy_verify(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins linux_deployment_requests_db_tests -- --test-threads=1
+#[cfg(test)]
+mod linux_deployment_requests_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn plan_body() -> LinuxDeployPlanRequest {
+        LinuxDeployPlanRequest {
+            distro: "ubuntu".into(),
+            version: "22.04 LTS".into(),
+            site: "DEFRA".into(),
+            cpu: 4,
+            memory_gb: 16,
+            disk_gb: 100,
+            hostname: "srv-test-01".into(),
+            network: "VLAN100".into(),
+            hardening_profile: "cis-level-1".into(),
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM linux_deployment_requests WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// plan → repo get round-trip: deployment is persisted with a valid UUID id.
+    #[tokio::test]
+    async fn test_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found after insert");
+
+        assert_eq!(req.id, id, "id must round-trip");
+        assert_eq!(req.site, "DEFRA", "site must round-trip");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Planned,
+            "status after plan must be Planned"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Full lifecycle: plan → validate → execute → verify.
+    /// Each transition must be persisted; final status must be Verified.
+    #[tokio::test]
+    async fn test_full_lifecycle_status_transitions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // 1. plan
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // 2. validate
+        let Ok(Json(vr)) = linux_deploy_validate(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("linux_deploy_validate failed");
+        };
+        assert_eq!(
+            vr["passed"], true,
+            "validation must pass for valid ubuntu/DEFRA request"
+        );
+
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Validated,
+            "status after validate must be Validated"
+        );
+
+        // 3. execute
+        let Ok(Json(executed)) = linux_deploy_execute(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("linux_deploy_execute failed");
+        };
+        assert_eq!(
+            executed["status"], "Executed",
+            "execute must return Executed entity"
+        );
+
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Executed,
+            "status after execute must be Executed"
+        );
+
+        // 4. verify
+        let Ok(Json(verification)) = linux_deploy_verify(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("linux_deploy_verify failed");
+        };
+        assert!(
+            verification["deploymentId"].as_str().is_some(),
+            "verification must include deploymentId"
+        );
+
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Verified,
+            "status after verify must be Verified"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Missing id must return 404.
+    #[tokio::test]
+    async fn test_missing_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let missing_id = uuid::Uuid::new_v4().to_string();
+
+        let result = linux_deploy_validate(Json(LinuxDeployActionRequest {
+            operation_id: missing_id.clone(),
+        }))
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::NOT_FOUND,
+            "missing operation_id must return 404"
+        );
+    }
+
+    /// CAS: `transition` returns `Ok(false)` when DB status no longer matches
+    /// the expected `before` value.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the deployment while it is still Planned.
+        let planned = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found");
+        assert_eq!(
+            planned.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Planned
+        );
+
+        // Advance it to Validated through the normal path.
+        if linux_deploy_validate(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("validate failed");
+        }
+
+        // A transition that still expects the stale Planned status must NOT apply.
+        let applied =
+            crate::repos::linux_deployment_requests::transition(pool, "Planned", &planned)
+                .await
+                .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with stale expected status must return false (CAS mismatch)"
+        );
+    }
+
+    /// Execute from terminal status (`Completed`) must be rejected by the API
+    /// lifecycle guard (409). We force Completed via direct repo transition.
+    #[tokio::test]
+    async fn test_execute_from_completed_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Force the status to Completed via direct repo transition.
+        let mut req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("req");
+        let before = crate::repos::linux_deployment_requests::status_str(&req.status).to_string();
+        req.status = ryuki_engine::models::LinuxDeploymentStatus::Completed;
+        crate::repos::linux_deployment_requests::transition(pool, &before, &req)
+            .await
+            .expect("force-transition");
+
+        let result = linux_deploy_execute(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "execute from Completed status must return 409"
+        );
+    }
+
+    /// A FAILED validation must NOT advance the deployment to Validated — it stays
+    /// Planned so the caller can remediate and re-validate. We store a valid plan
+    /// then patch the entity (via transition) to have cpu=0, which passes plan but
+    /// fails validate ("CPU must be at least 1").
+    #[tokio::test]
+    async fn test_validate_failure_stays_planned() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a valid request.
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Patch the stored entity to have cpu=0 (plans fine, validate fails).
+        let mut req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("deployment not found");
+        let before = crate::repos::linux_deployment_requests::status_str(&req.status).to_string();
+        req.cpu = 0; // validate_linux_deployment rejects cpu==0
+        crate::repos::linux_deployment_requests::transition(pool, &before, &req)
+            .await
+            .expect("patch transition");
+
+        // Validate should return Ok(passed=false), not Err.
+        let Ok(Json(vr)) = linux_deploy_validate(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("linux_deploy_validate should return Ok with passed=false, not Err");
+        };
+        assert_eq!(vr["passed"], false, "validation must fail for cpu=0");
+
+        // Status must remain Planned — a failed validation is not a sign-off.
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("deployment not found");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Planned,
+            "failed validation must leave status at Planned, not Validated"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Forward-only lifecycle: execute before validate (status still Planned) must
+    /// be rejected with 409 — no skipping the validation gate.
+    #[tokio::test]
+    async fn test_execute_before_validate_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let result = linux_deploy_execute(Json(LinuxDeployActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "execute from Planned (not yet Validated) must return 409"
+        );
+    }
+
+    /// Forward-only lifecycle: verify before execute (status still Planned) must be
+    /// rejected with 409. Guards against regressing/re-ordering the lifecycle.
+    #[tokio::test]
+    async fn test_verify_before_execute_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let result = linux_deploy_verify(Json(LinuxDeployActionRequest {
             operation_id: id.clone(),
         }))
         .await;

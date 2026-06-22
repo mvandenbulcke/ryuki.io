@@ -93,6 +93,12 @@ pub async fn insert(pool: &PgPool, op: &VmDay2ChangeRequest) -> Result<(), sqlx:
     let change_type = op.change_type.to_string();
     let plan_json = serde_json::to_string(op).unwrap_or_else(|_| "{}".into());
 
+    // Checked u32 -> i32 so an out-of-range target value is rejected up front
+    // rather than silently wrapping to a negative scalar column (the queryable
+    // column must stay faithful to the JSONB plan_json).
+    let target_value =
+        i32::try_from(op.target_value).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+
     sqlx::query(
         "INSERT INTO vm_day2_operations \
          (id, target_ci_key, change_type, target_value, site, environment, \
@@ -102,7 +108,7 @@ pub async fn insert(pool: &PgPool, op: &VmDay2ChangeRequest) -> Result<(), sqlx:
     .bind(id)
     .bind(&op.target_ci_key)
     .bind(&change_type)
-    .bind(op.target_value as i32)
+    .bind(target_value)
     .bind(&op.site)
     .bind(&op.environment)
     .bind(&op.owner)
