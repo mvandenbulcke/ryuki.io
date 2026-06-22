@@ -1272,6 +1272,94 @@ impl LocalAuthConfig {
     }
 }
 
+/// Provider-agnostic OIDC Authorization Code + PKCE configuration.
+/// All fields are `#[serde(default)]` so existing configs parse without error
+/// when the `[oidc]` section is absent. Validation enforces required fields
+/// only when `oidc.enabled = true`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct OidcConfig {
+    /// When false (the default) the OIDC login endpoint returns 404.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OIDC Issuer URL (used for discovery verification in slice 2).
+    #[serde(default)]
+    pub issuer: String,
+    /// Full URL of the IdP's authorization endpoint.
+    #[serde(default)]
+    pub authorize_endpoint: String,
+    /// Full URL of the IdP's token endpoint (used in slice 2).
+    #[serde(default)]
+    pub token_endpoint: String,
+    /// JWKS URI for ID-token signature verification (used in slice 2).
+    #[serde(default)]
+    pub jwks_uri: String,
+    /// OAuth2 client identifier registered with the IdP.
+    #[serde(default)]
+    pub client_id: String,
+    /// OAuth2 client secret.
+    ///
+    /// # Security
+    /// This field is intentionally excluded from serialization to prevent
+    /// accidental exposure in API responses, debug output, or platform
+    /// summary endpoints. Never log this value.
+    #[serde(default, skip_serializing)]
+    pub client_secret: String,
+    /// Registered redirect URI that the IdP will send the auth code to.
+    #[serde(default)]
+    pub redirect_uri: String,
+    /// OAuth2 scopes to request. Defaults to ["openid", "profile", "email"].
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// JWT claim name containing the user's roles (default: "roles").
+    #[serde(default = "default_oidc_roles_claim")]
+    pub roles_claim: String,
+}
+
+// Manual `Debug` so `client_secret` is never printed. A derived `Debug` would
+// leak the secret through any `{:?}` formatting (tracing, panics, diagnostics) —
+// `skip_serializing` only guards serde, not `Debug`.
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("enabled", &self.enabled)
+            .field("issuer", &self.issuer)
+            .field("authorize_endpoint", &self.authorize_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("jwks_uri", &self.jwks_uri)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[redacted]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scopes", &self.scopes)
+            .field("roles_claim", &self.roles_claim)
+            .finish()
+    }
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into()]
+}
+
+fn default_oidc_roles_claim() -> String {
+    "roles".into()
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: String::new(),
+            authorize_endpoint: String::new(),
+            token_endpoint: String::new(),
+            jwks_uri: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            scopes: default_oidc_scopes(),
+            roles_claim: default_oidc_roles_claim(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RyukiConfig {
     #[serde(default)]
@@ -1346,6 +1434,8 @@ pub struct RyukiConfig {
     pub retention: RetentionConfig,
     #[serde(default)]
     pub maintenance_window: MaintenanceWindowConfig,
+    #[serde(default)]
+    pub oidc: OidcConfig,
 }
 
 fn default_database_url() -> String {
@@ -1409,6 +1499,7 @@ impl Default for RyukiConfig {
             session: SessionConfig::default(),
             retention: RetentionConfig::default(),
             maintenance_window: MaintenanceWindowConfig::default(),
+            oidc: OidcConfig::default(),
         }
     }
 }
@@ -1714,6 +1805,30 @@ impl RyukiConfig {
                     "maintenance_window.day_of_week must be one of: {:?}",
                     valid_days
                 ));
+            }
+        }
+
+        if self.oidc.enabled {
+            if self.oidc.issuer.is_empty() {
+                errors.push("oidc.issuer is required when oidc.enabled is true".into());
+            }
+            if self.oidc.client_id.is_empty() {
+                errors.push("oidc.client_id is required when oidc.enabled is true".into());
+            }
+            if self.oidc.authorize_endpoint.is_empty() {
+                errors.push("oidc.authorize_endpoint is required when oidc.enabled is true".into());
+            }
+            if self.oidc.redirect_uri.is_empty() {
+                errors.push("oidc.redirect_uri is required when oidc.enabled is true".into());
+            }
+            if self.oidc.token_endpoint.is_empty() {
+                errors.push("oidc.token_endpoint is required when oidc.enabled is true".into());
+            }
+            if self.oidc.jwks_uri.is_empty() {
+                errors.push("oidc.jwks_uri is required when oidc.enabled is true".into());
+            }
+            if self.oidc.client_secret.is_empty() {
+                errors.push("oidc.client_secret is required when oidc.enabled is true".into());
             }
         }
 
@@ -2389,6 +2504,107 @@ mod tests {
                 .validation_warnings()
                 .iter()
                 .any(|w| w.contains("local_auth.users"))
+        );
+    }
+
+    // ─── OIDC config ───
+
+    #[test]
+    fn test_oidc_disabled_by_default() {
+        let config = RyukiConfig::default();
+        assert!(!config.oidc.enabled);
+        assert!(config.oidc.client_id.is_empty());
+        assert_eq!(config.oidc.scopes, vec!["openid", "profile", "email"]);
+        assert_eq!(config.oidc.roles_claim, "roles");
+    }
+
+    #[test]
+    fn test_oidc_disabled_requires_no_fields() {
+        let config = RyukiConfig::default();
+        // disabled OIDC must not add any validation errors
+        let errors = config.validate();
+        assert!(
+            !errors.iter().any(|e| e.contains("oidc.")),
+            "disabled oidc should not produce validation errors; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_enabled_requires_all_fields() {
+        let mut config = RyukiConfig::default();
+        config.oidc.enabled = true;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("oidc.client_id")));
+        assert!(errors.iter().any(|e| e.contains("oidc.authorize_endpoint")));
+        assert!(errors.iter().any(|e| e.contains("oidc.redirect_uri")));
+        assert!(errors.iter().any(|e| e.contains("oidc.token_endpoint")));
+        assert!(errors.iter().any(|e| e.contains("oidc.jwks_uri")));
+        assert!(errors.iter().any(|e| e.contains("oidc.client_secret")));
+    }
+
+    #[test]
+    fn test_oidc_enabled_with_all_fields_valid() {
+        let mut config = RyukiConfig::default();
+        config.oidc.enabled = true;
+        config.oidc.issuer = "https://login.example.com/v2.0".into();
+        config.oidc.client_id = "my-client".into();
+        config.oidc.authorize_endpoint = "https://login.example.com/authorize".into();
+        config.oidc.redirect_uri = "https://app.example.com/api/auth/oidc/callback".into();
+        config.oidc.token_endpoint = "https://login.example.com/token".into();
+        config.oidc.jwks_uri = "https://login.example.com/.well-known/jwks.json".into();
+        config.oidc.client_secret = "s3cr3t".into();
+        let errors = config.validate();
+        assert!(
+            !errors.iter().any(|e| e.contains("oidc.")),
+            "fully-populated oidc config should not produce validation errors; got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_client_secret_not_serialized() {
+        let mut config = RyukiConfig::default();
+        config.oidc.client_secret = "super-secret".into();
+        let serialized = serde_json::to_string(&config.oidc).unwrap();
+        assert!(
+            !serialized.contains("super-secret"),
+            "client_secret must not appear in serialized OidcConfig: {serialized}"
+        );
+        assert!(
+            !serialized.contains("client_secret"),
+            "client_secret field name must not appear in serialized OidcConfig: {serialized}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_client_secret_not_in_debug() {
+        let mut config = OidcConfig::default();
+        config.client_secret = "super-secret".into();
+        let dbg = format!("{config:?}");
+        assert!(
+            !dbg.contains("super-secret"),
+            "client_secret value must not appear in Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("[redacted]"),
+            "Debug must mark client_secret as redacted: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_oidc_enabled_requires_issuer() {
+        let mut config = RyukiConfig::default();
+        config.oidc.enabled = true;
+        // Everything set EXCEPT issuer.
+        config.oidc.client_id = "cid".into();
+        config.oidc.client_secret = "sec".into();
+        config.oidc.authorize_endpoint = "https://idp/authorize".into();
+        config.oidc.token_endpoint = "https://idp/token".into();
+        config.oidc.jwks_uri = "https://idp/jwks".into();
+        config.oidc.redirect_uri = "https://app/callback".into();
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("oidc.issuer is required")),
+            "validation must require oidc.issuer when enabled: {errors:?}"
         );
     }
 }

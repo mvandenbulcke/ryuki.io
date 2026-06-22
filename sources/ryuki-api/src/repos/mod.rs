@@ -36,6 +36,7 @@ pub mod load_balancer;
 pub mod log_forwarders;
 pub mod network_readiness;
 pub mod notifications;
+pub mod oidc_login_states;
 pub mod os_baseline;
 pub mod outage_comms;
 pub mod patch_waves;

@@ -73,6 +73,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/auth/local/roles` |
 | POST | `/api/auth/login` |
 | POST | `/api/auth/logout` |
+| GET | `/api/auth/oidc/login` |
 | GET | `/api/auth/roles` |
 | GET | `/api/auth/session` |
 | GET | `/api/auth/status` |

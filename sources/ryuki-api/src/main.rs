@@ -398,6 +398,8 @@ fn is_auth_exempt_path(path: &str) -> bool {
             | "/api/auth/session"
             | "/api/auth/roles"
             | "/api/platform/summary"
+            // OIDC browser sign-in (GET — runs before any session exists)
+            | "/api/auth/oidc/login"
     )
 }
 
@@ -2311,6 +2313,7 @@ mod tests {
         assert!(is_auth_exempt_path("/api/auth/local/logout"));
         assert!(!is_auth_exempt_path("/api/auth/local/me"));
         assert!(!is_auth_exempt_path("/api/requests"));
+        assert!(is_auth_exempt_path("/api/auth/oidc/login"));
     }
 
     #[tokio::test]

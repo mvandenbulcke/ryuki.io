@@ -1236,6 +1236,7 @@ pub fn routes() -> Router {
         .route("/api/auth/local/decision", get(auth_local_decision))
         .route("/api/auth/local/login", post(auth_local_login))
         .route("/api/auth/local/logout", post(auth_local_logout))
+        .route("/api/auth/oidc/login", get(oidc_login_initiate))
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/roles", get(auth_roles))
@@ -10240,6 +10241,111 @@ async fn auth_local_logout(headers: HeaderMap) -> Result<Response, (StatusCode, 
     Ok((
         [(SET_COOKIE, cookie)],
         Json(json!({"status": "logged_out"})),
+    )
+        .into_response())
+}
+
+/// OIDC browser sign-in — login initiation (auth-code + PKCE, S256 only).
+///
+/// Generates a cryptographically random `state`, `nonce`, and PKCE
+/// `code_verifier` (all via OsRng / getrandom), persists them to the
+/// `oidc_login_states` table, then redirects the browser to the IdP's
+/// authorization endpoint with the full set of OAuth2/OIDC parameters.
+///
+/// # Security properties
+/// - `state` / `nonce` / `pkce_verifier`: 32 bytes from OsRng → ≥256-bit
+///   entropy; base64url-encoded (URL_SAFE_NO_PAD).
+/// - `code_challenge` = BASE64URL(SHA-256(pkce_verifier_bytes)); method = S256.
+/// - `state` is single-use and expires in 10 minutes (enforced by `take`
+///   in slice 2 and by the DB `expires_at` column).
+/// - All authorize-URL query parameters are percent-encoded by the `url` crate,
+///   preventing injection via `redirect_uri`, `scope`, or `client_id`.
+/// - No session cookie is set; no sensitive value is included in the redirect.
+async fn oidc_login_initiate() -> Result<Response, (StatusCode, Json<Value>)> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use rand::RngCore;
+    use url::Url;
+
+    let cfg = crate::config_store::get_app_config();
+    let oidc = &cfg.oidc;
+
+    // Gate: return 404 when OIDC is not configured, so callers cannot probe
+    // for the existence of the endpoint on instances that don't enable it.
+    if !oidc.enabled {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "OIDC login is not enabled"})),
+        ));
+    }
+
+    // Gate: a DB is required to persist the state (single-use, short-lived).
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    // ── Generate CSPRNG values ────────────────────────────────────────────────
+    // OsRng is backed by getrandom (OS entropy). 32 bytes = 256 bits of entropy.
+
+    let mut state_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut state_bytes);
+    let state = URL_SAFE_NO_PAD.encode(state_bytes);
+
+    let mut nonce_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+
+    let mut pkce_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut pkce_bytes);
+    let pkce_verifier = URL_SAFE_NO_PAD.encode(pkce_bytes);
+
+    // PKCE S256: code_challenge = BASE64URL(SHA-256(ASCII(code_verifier)))
+    let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce_verifier.as_bytes()));
+
+    // ── Persist state (single-use, 10-minute TTL) ────────────────────────────
+    crate::repos::oidc_login_states::insert(pool, &state, &nonce, &pkce_verifier)
+        .await
+        .map_err(db_error)?;
+
+    // Opportunistic, PROBABILISTIC sweep of expired rows (~1/64 of requests):
+    // keeps the index-backed cleanup off the hot path so a flood on this
+    // auth-exempt endpoint can't turn every login into a DELETE. The 10-minute
+    // TTL + the expires_at index bound the table; request-rate limiting itself is
+    // an infra-level (gateway) control, consistent with the rest of the auth
+    // surface. Failure is non-fatal.
+    if rand::random::<u8>() < 4 {
+        let _ = crate::repos::oidc_login_states::cleanup_expired(pool).await;
+    }
+
+    // ── Build the authorize URL ───────────────────────────────────────────────
+    // All parameter values are percent-encoded by url::Url::parse_with_params,
+    // preventing injection through any field (redirect_uri, scope, client_id).
+    let scope = oidc.scopes.join(" ");
+    let params: Vec<(&str, &str)> = vec![
+        ("response_type", "code"),
+        ("client_id", &oidc.client_id),
+        ("redirect_uri", &oidc.redirect_uri),
+        ("scope", &scope),
+        ("state", &state),
+        ("nonce", &nonce),
+        ("code_challenge", &code_challenge),
+        ("code_challenge_method", "S256"),
+    ];
+    let authorize_url = Url::parse_with_params(&oidc.authorize_endpoint, &params).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OIDC authorize URL");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to build authorization URL"})),
+        )
+    })?;
+
+    // 302 → IdP. No session cookie. No sensitive value in the Location header.
+    let location = axum::http::HeaderValue::from_str(authorize_url.as_str()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("invalid redirect URL: {e}")})),
+        )
+    })?;
+    Ok((
+        StatusCode::FOUND,
+        [(axum::http::header::LOCATION, location)],
     )
         .into_response())
 }
@@ -24607,6 +24713,21 @@ mod unit_tests {
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.error, "LOCAL_AUTH_DISABLED");
+    }
+
+    // ─── OIDC login initiation ───
+
+    #[test]
+    fn test_oidc_config_disabled_by_default() {
+        // The handler returns 404 when oidc.enabled is false (the default).
+        // This unit test verifies the guard condition without needing the
+        // OnceLock-initialized config store (which can only be set once per
+        // process and is owned by test_auth_local_login_rejects_wrong_auth_mode).
+        let cfg = ryuki_core::config::RyukiConfig::default();
+        assert!(
+            !cfg.oidc.enabled,
+            "oidc.enabled must be false by default so the 404 gate fires"
+        );
     }
 
     // ─── Local login brute-force throttle ───
