@@ -29386,6 +29386,390 @@ mod emergency_change_unit_tests {
     }
 }
 
+// ─── DB-gated integration tests for secrets-rotation persistence ──────────────
+//
+// Each test SKIPS when RYUKI_DATABASE_URL is unset.
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api secrets_rotation_db_tests
+//
+// The headline property is SECURITY: a rotation's `rotated_by` audit field must
+// name the AUTHENTICATED caller from the session extension — never a value the
+// client controls. force-rotate-all uses the fixed system actor "force-rotate-all".
+#[cfg(test)]
+mod secrets_rotation_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    /// Authenticated rotating session — secrets_rotate stamps `rotated_by` from
+    /// `session.user_id`, so the persisted run must carry exactly this id.
+    fn caller_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s
+    }
+
+    /// Initialises the PROCESS-GLOBAL `database::POOL` so handler calls routed
+    /// through `get_db()` hit the real DB. Returns `None` ONLY when the env var
+    /// is unset (the one legitimate SKIP). If the var IS set but the connection
+    /// fails, we PANIC rather than skip — a down DB must never masquerade as a
+    /// silent no-op that lets every assertion be skipped.
+    ///
+    /// Migrations are best-effort: the test-db job migrates the schema once up
+    /// front, and sqlx's repeated in-process `run()` calls can transiently fail
+    /// on advisory-lock contention against an already-migrated DB. We therefore
+    /// do NOT abort on a migration error — a genuinely missing table still fails
+    /// loudly at the first seed/query below, so there is no hidden no-op path.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but the DB connection failed");
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    /// Seeds one managed secret, RESETTING any leaked fixture first so each run
+    /// starts from a known-clean row (delete-then-insert, not ON CONFLICT — that
+    /// would keep stale columns from a prior failed run). `next_due` is RFC3339
+    /// TEXT — pass a PAST value to make it eligible for rotate-all
+    /// (`next_rotation_due <= now()`). Deleting the secret also cascades away any
+    /// orphaned rotation_runs (ON DELETE CASCADE), so the seeded secret starts
+    /// with zero runs.
+    async fn seed_secret(pool: &PgPool, id: &str, site: &str, next_due: &str) {
+        cleanup_secret(pool, id).await;
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, \
+              last_rotated, next_rotation_due, status, owner, site) \
+             VALUES ($1, $2, 'token', $3, 30, '2026-01-01T00:00:00+00:00', $4, 'active', \
+                     'test.owner', $5)",
+        )
+        .bind(id)
+        .bind(format!("test-{id}"))
+        .bind(format!("kv/test/{id}"))
+        .bind(next_due)
+        .bind(site)
+        .execute(pool)
+        .await
+        .expect("seed managed_secret");
+    }
+
+    /// Count of rotation runs recorded against a specific secret.
+    async fn run_count_for(pool: &PgPool, secret_id: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM rotation_runs WHERE secret_id = $1")
+            .bind(secret_id)
+            .fetch_one(pool)
+            .await
+            .expect("count rotation_runs")
+    }
+
+    /// Deletes the secret; rotation_runs cascade away (ON DELETE CASCADE).
+    async fn cleanup_secret(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM managed_secrets WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn run_status(pool: &PgPool, run_id: &str) -> Option<(String, Option<String>)> {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, error_message FROM rotation_runs WHERE id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .expect("read rotation_run")
+    }
+
+    async fn secret_status(pool: &PgPool, id: &str) -> Option<String> {
+        sqlx::query_scalar::<_, String>("SELECT status FROM managed_secrets WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .expect("read managed_secret status")
+    }
+
+    // ── SECURITY: rotate stamps rotated_by from the session, not a client field ──
+
+    #[tokio::test]
+    async fn test_rotate_records_session_user_as_rotated_by() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-rotate-001";
+        // A distinctive session principal: if attribution leaked from anywhere
+        // other than THIS session, the assertion below would not match.
+        let session_user = "dbtest-principal-rotate-7f3a";
+        seed_secret(pool, id, "DBTEST-RA", "2026-12-31T00:00:00+00:00").await;
+        // Freshly seeded → zero runs; rotate must create exactly one for it.
+        assert_eq!(run_count_for(pool, id).await, 0, "fixture must start clean");
+
+        let result = secrets_rotate(
+            Path(id.to_string()),
+            Extension(caller_session(session_user)),
+        )
+        .await;
+
+        let Ok(Json(body)) = &result else {
+            cleanup_secret(pool, id).await;
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        let run_id = body["rotation"]["id"]
+            .as_str()
+            .expect("rotation id in body")
+            .to_string();
+
+        // The persisted run must (a) belong to THIS secret and (b) attribute the
+        // AUTHENTICATED caller — verified against the DB row, not the response.
+        let (persisted_actor, persisted_secret) = sqlx::query_as::<_, (String, String)>(
+            "SELECT rotated_by, secret_id FROM rotation_runs WHERE id = $1",
+        )
+        .bind(&run_id)
+        .fetch_one(pool)
+        .await
+        .expect("rotation_run must exist");
+        let total_runs = run_count_for(pool, id).await;
+
+        cleanup_secret(pool, id).await;
+
+        assert_eq!(body["source"], "database");
+        assert_eq!(
+            total_runs, 1,
+            "rotate must create exactly one run for the secret"
+        );
+        assert_eq!(
+            persisted_secret, id,
+            "the run must belong to the rotated secret"
+        );
+        assert_eq!(
+            persisted_actor, session_user,
+            "rotated_by MUST be the session user_id, never a client value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rotate_returns_404_for_missing_secret() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = secrets_rotate(
+            Path("sr-dbtest-does-not-exist".to_string()),
+            Extension(caller_session("nobody")),
+        )
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ── rotate-all: persists every due secret for the site under the system actor ──
+
+    #[tokio::test]
+    async fn test_rotate_all_persists_and_uses_force_actor() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-rotateall-001";
+        // A dedicated site so rotate-all touches ONLY our fixture, and a past
+        // due date so it is eligible. seed_secret pre-cleans → zero runs.
+        let site = "DBTEST-FORCE-ONLY";
+        seed_secret(pool, id, site, "2020-01-01T00:00:00+00:00").await;
+        assert_eq!(run_count_for(pool, id).await, 0, "fixture must start clean");
+
+        let result = secrets_rotate_all(Query(SecretsSiteQuery {
+            site: Some(site.to_string()),
+        }))
+        .await;
+
+        let Ok(Json(body)) = &result else {
+            cleanup_secret(pool, id).await;
+            panic!("expected Ok, got Err: {result:?}");
+        };
+
+        // THIS invocation must have inserted exactly one run for our secret —
+        // proven by the pre-clean zero count above — and stamped the fixed
+        // system actor (never a caller-supplied principal).
+        let runs_after = run_count_for(pool, id).await;
+        let actor = sqlx::query_scalar::<_, String>(
+            "SELECT rotated_by FROM rotation_runs WHERE secret_id = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("rotation_run for the rotated secret");
+
+        cleanup_secret(pool, id).await;
+
+        assert_eq!(body["source"], "database");
+        assert_eq!(
+            body["rotated_count"].as_u64().unwrap_or(0),
+            1,
+            "exactly our one due secret must rotate (dedicated site): {body}"
+        );
+        assert_eq!(
+            runs_after, 1,
+            "rotate-all must insert exactly one new run for the seeded secret"
+        );
+        assert_eq!(
+            actor, "force-rotate-all",
+            "rotate-all must attribute the fixed system actor, not a caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rotate_all_empty_site_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = secrets_rotate_all(Query(SecretsSiteQuery {
+            site: Some("   ".to_string()),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty site, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── fail: after the call, BOTH the run and its parent secret read failed ──
+    // (asserts the observable end-state of both rows, not tx atomicity itself).
+
+    #[tokio::test]
+    async fn test_rotation_fail_marks_run_and_secret_failed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-fail-001";
+        seed_secret(pool, id, "DBTEST-FAIL", "2026-12-31T00:00:00+00:00").await;
+
+        // Create a run to fail.
+        let rotate = secrets_rotate(
+            Path(id.to_string()),
+            Extension(caller_session("bob.operator")),
+        )
+        .await
+        .expect("rotate must succeed");
+        let run_id = rotate.0["rotation"]["id"]
+            .as_str()
+            .expect("rotation id")
+            .to_string();
+
+        let result = secrets_rotation_fail(Json(SecretsFailRequest {
+            rotation_id: run_id.clone(),
+            error: "mock provider denied".to_string(),
+        }))
+        .await;
+
+        let run = run_status(pool, &run_id).await;
+        let sstatus = secret_status(pool, id).await;
+        cleanup_secret(pool, id).await;
+
+        let Ok(Json(body)) = result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+
+        let (rstatus, rerr) = run.expect("run row must exist");
+        assert_eq!(rstatus, "failed", "run status must be failed");
+        assert_eq!(
+            rerr.as_deref(),
+            Some("mock provider denied"),
+            "error_message must be persisted"
+        );
+        assert_eq!(
+            sstatus.as_deref(),
+            Some("failed"),
+            "the parent secret must also flip to failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rotation_fail_404_for_missing_run() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = secrets_rotation_fail(Json(SecretsFailRequest {
+            rotation_id: "rr-dbtest-missing".to_string(),
+            error: "whatever".to_string(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 404, got Ok");
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_fail_empty_error_returns_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = secrets_rotation_fail(Json(SecretsFailRequest {
+            rotation_id: "rr-anything".to_string(),
+            error: "   ".to_string(),
+        }))
+        .await;
+        let Err((status, _)) = result else {
+            panic!("expected Err 400 for empty error, got Ok");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // ── register: round-trips through the DB and is readable back ──
+
+    #[tokio::test]
+    async fn test_register_persists_and_is_readable() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let result = secrets_register(Json(SecretsRegisterRequest {
+            name: "dbtest-registered-secret".to_string(),
+            secret_type: "token".to_string(),
+            vault_path: "kv/dbtest/registered".to_string(),
+            interval_days: 30,
+            owner: "test.owner".to_string(),
+            site: "DBTEST-REG".to_string(),
+        }))
+        .await;
+
+        let Ok(Json(body)) = &result else {
+            panic!("expected Ok, got Err: {result:?}");
+        };
+        assert_eq!(body["source"], "database");
+        let new_id = body["secret"]["id"].as_str().expect("new secret id");
+
+        // It must be readable straight back from the DB.
+        let readback = secrets_get(Path(new_id.to_string())).await;
+        cleanup_secret(pool, new_id).await;
+
+        let Ok(Json(got)) = readback else {
+            panic!("expected the registered secret to be readable: {readback:?}");
+        };
+        assert_eq!(got["secret"]["name"], "dbtest-registered-secret");
+        assert_eq!(got["secret"]["site"], "DBTEST-REG");
+    }
+}
+
 // ─── DB-gated integration tests for emergency change persistence ──────────────
 //
 // Each test SKIPS when RYUKI_DATABASE_URL is unset.
