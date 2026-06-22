@@ -1962,6 +1962,15 @@ struct VmDay2PlanRequest {
     maintenance_window: String,
 }
 
+/// Action request for vm day-2 lifecycle steps (validate / execute / verify).
+/// The `operation_id` is the UUID string returned by `vm_day2_plan`.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct VmDay2ActionRequest {
+    #[serde(rename = "operationId")]
+    operation_id: String,
+}
+
 // ─── Snapshot request types ───
 
 #[derive(Debug, Deserialize)]
@@ -14534,31 +14543,12 @@ async fn activity_audit_feed(
 
 // ─── VM Day-2 Operations handlers ───
 
+/// Plan a new vm day-2 operation and persist it. Returns the entity (including
+/// the generated `id`) so the caller can drive subsequent lifecycle steps.
+/// 503 when no database is configured.
 async fn vm_day2_plan(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
-    let change_type = match body.change_type.as_str() {
-        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
-        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
-        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
-        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
-        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
-        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
-        _ => return Err(status_400("Invalid change type")),
-    };
-    match vm_operations::plan_vm_day2_change(
-        &body.target_ci_key,
-        change_type,
-        body.target_value,
-        &body.site,
-        &body.environment,
-        &body.owner,
-        &body.maintenance_window,
-    ) {
-        Ok(change) => Ok(Json(serde_json::to_value(change).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
-}
+    let pool = get_db().ok_or_else(status_503_no_db)?;
 
-async fn vm_day2_validate(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
     let change_type = match body.change_type.as_str() {
         "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
         "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
@@ -14568,7 +14558,8 @@ async fn vm_day2_validate(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
         "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
         _ => return Err(status_400("Invalid change type")),
     };
-    let change = vm_operations::plan_vm_day2_change(
+
+    let mut op = vm_operations::plan_vm_day2_change(
         &body.target_ci_key,
         change_type,
         body.target_value,
@@ -14578,62 +14569,124 @@ async fn vm_day2_validate(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
         &body.maintenance_window,
     )
     .map_err(|e| status_400(&e))?;
-    match vm_operations::validate_vm_day2_change(&change) {
-        Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
-        Err(e) => Err(status_400(&e)),
-    }
+
+    // The engine generates a non-UUID id (e.g. "vmch-abc12345") suitable for
+    // in-memory use but not for the UUID primary key column. Replace it with a
+    // proper UUID so the repo can bind it correctly.
+    op.id = Uuid::new_v4().to_string();
+
+    crate::repos::vm_day2_operations::insert(pool, &op)
+        .await
+        .map_err(db_error)?;
+
+    Ok(Json(serde_json::to_value(&op).unwrap_or_default()))
 }
 
-async fn vm_day2_execute(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
-    let change_type = match body.change_type.as_str() {
-        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
-        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
-        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
-        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
-        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
-        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
-        _ => return Err(status_400("Invalid change type")),
-    };
-    let change = vm_operations::plan_vm_day2_change(
-        &body.target_ci_key,
-        change_type,
-        body.target_value,
-        &body.site,
-        &body.environment,
-        &body.owner,
-        &body.maintenance_window,
-    )
-    .map_err(|e| status_400(&e))?;
-    match vm_operations::execute_vm_day2_change(&change) {
-        Ok(executed) => Ok(Json(serde_json::to_value(executed).unwrap())),
-        Err(e) => Err(status_400(&e)),
+/// Validate a persisted vm day-2 operation. Loads the operation by id, runs
+/// the engine validation check, persists `Validated` status on success, and
+/// returns the `ValidationResult`. 503/404/409 as appropriate.
+async fn vm_day2_validate(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle (Planned -> Validated -> Executed -> Verified): the
+    // engine does not enforce ordering, so the API does. Validate only from
+    // Planned, never regressing a later state back to Validated.
+    if op.status != ryuki_engine::models::VmChangeStatus::Planned {
+        return Err(status_409("operation must be in Planned state to validate"));
     }
+
+    let before = crate::repos::vm_day2_operations::status_str(&op.status);
+
+    let result = vm_operations::validate_vm_day2_change(&op).map_err(|e| status_409(&e))?;
+
+    // Only ADVANCE to Validated when the check actually passed. A failed
+    // validation leaves the operation in Planned so the caller can remediate and
+    // re-validate; the failures travel back in the ValidationResult. (Recording a
+    // failed validation as durable Validated would let it proceed to execute.)
+    if result.passed {
+        let mut validated_op = op;
+        validated_op.status = ryuki_engine::models::VmChangeStatus::Validated;
+
+        let ok = crate::repos::vm_day2_operations::transition(pool, before, &validated_op)
+            .await
+            .map_err(db_error)?;
+        if !ok {
+            return Err(status_409("state changed concurrently; reload and retry"));
+        }
+    }
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn vm_day2_verify(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
-    let change_type = match body.change_type.as_str() {
-        "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
-        "resize-memory" => ryuki_engine::models::VmChangeType::ResizeMemory,
-        "add-disk" => ryuki_engine::models::VmChangeType::AddDisk,
-        "extend-disk" => ryuki_engine::models::VmChangeType::ExtendDisk,
-        "migrate-host" => ryuki_engine::models::VmChangeType::MigrateHost,
-        "migrate-storage" => ryuki_engine::models::VmChangeType::MigrateStorage,
-        _ => return Err(status_400("Invalid change type")),
-    };
-    let change = vm_operations::plan_vm_day2_change(
-        &body.target_ci_key,
-        change_type,
-        body.target_value,
-        &body.site,
-        &body.environment,
-        &body.owner,
-        &body.maintenance_window,
-    )
-    .map_err(|e| status_400(&e))?;
-    match vm_operations::verify_vm_day2_change(&change) {
-        Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
-        Err(e) => Err(status_400(&e)),
+/// Execute a persisted vm day-2 operation. Loads the operation by id, runs the
+/// engine execution (which sets status to `Executed`), and persists the
+/// transitioned entity. 503/404/409 as appropriate.
+async fn vm_day2_execute(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle: execute only from Validated. This enforces
+    // validate-before-execute and prevents re-executing an already Executed or
+    // Verified operation (the engine alone only rejects terminal Completed/Failed).
+    if op.status != ryuki_engine::models::VmChangeStatus::Validated {
+        return Err(status_409("operation must be Validated before execute"));
     }
+
+    let before = crate::repos::vm_day2_operations::status_str(&op.status);
+
+    let executed = vm_operations::execute_vm_day2_change(&op).map_err(|e| status_409(&e))?;
+
+    let ok = crate::repos::vm_day2_operations::transition(pool, before, &executed)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
+}
+
+/// Verify a persisted vm day-2 operation. Loads the operation by id, collects
+/// evidence via the engine, persists `Verified` status, and returns the
+/// evidence list. 503/404/409 as appropriate.
+async fn vm_day2_verify(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+
+    let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Forward-only lifecycle: verify only from Executed.
+    if op.status != ryuki_engine::models::VmChangeStatus::Executed {
+        return Err(status_409("operation must be Executed before verify"));
+    }
+
+    let before = crate::repos::vm_day2_operations::status_str(&op.status);
+
+    let evidence = vm_operations::verify_vm_day2_change(&op).map_err(|e| status_409(&e))?;
+
+    // Persist `Verified` status after successful evidence collection.
+    let mut verified_op = op;
+    verified_op.status = ryuki_engine::models::VmChangeStatus::Verified;
+
+    let ok = crate::repos::vm_day2_operations::transition(pool, before, &verified_op)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+
+    Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
 async fn vm_day2_change_contract() -> Json<Value> {
@@ -36456,4 +36509,452 @@ async fn notifications_mark_all_read(AuthExtractor(session): AuthExtractor) -> A
         .await
         .map_err(db_error)?;
     Ok(Json(json!({ "source": "db", "marked": marked })))
+}
+
+// ─── VM Day-2 Operations — no-DB unit tests ───────────────────────────────────
+
+/// Verify that the DB-required handlers return 503 when no pool is configured.
+/// These run in the normal `cargo test` suite (no DB needed).
+#[cfg(test)]
+mod vm_day2_no_db_tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[tokio::test]
+    async fn test_plan_returns_503_without_db() {
+        let body = VmDay2PlanRequest {
+            target_ci_key: "ci-vm-001".into(),
+            change_type: "resize-cpu".into(),
+            target_value: 4,
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            owner: "test-owner".into(),
+            maintenance_window: "EU-Overnight".into(),
+        };
+        let result = vm_day2_plan(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_validate_returns_503_without_db() {
+        let body = VmDay2ActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = vm_day2_validate(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_execute_returns_503_without_db() {
+        let body = VmDay2ActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = vm_day2_execute(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_verify_returns_503_without_db() {
+        let body = VmDay2ActionRequest {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let result = vm_day2_verify(Json(body)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins vm_day2_operations_db_tests -- --test-threads=1
+#[cfg(test)]
+mod vm_day2_operations_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn plan_body(suffix: &str) -> VmDay2PlanRequest {
+        VmDay2PlanRequest {
+            target_ci_key: format!("ci-vm-{suffix}"),
+            change_type: "resize-cpu".into(),
+            target_value: 8,
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            owner: format!("test-owner-{suffix}"),
+            maintenance_window: "EU-Overnight".into(),
+        }
+    }
+
+    async fn cleanup(pool: &PgPool, id: &str) {
+        if let Ok(uid) = uuid::Uuid::parse_str(id) {
+            sqlx::query("DELETE FROM vm_day2_operations WHERE id = $1")
+                .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// plan → repo get round-trip: operation is persisted with a valid UUID id.
+    #[tokio::test]
+    async fn test_plan_get_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+
+        let id = created["id"].as_str().expect("id in response").to_string();
+        uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        let op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found after insert");
+
+        assert_eq!(op.id, id, "id must round-trip");
+        assert_eq!(op.site, "DEFRA", "site must round-trip");
+        assert_eq!(
+            op.status,
+            ryuki_engine::models::VmChangeStatus::Planned,
+            "status after plan must be Planned"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Full lifecycle: plan → validate → execute → verify.
+    /// Each transition must be persisted; final status must be Verified.
+    #[tokio::test]
+    async fn test_full_lifecycle_status_transitions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        // 1. plan
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // 2. validate
+        let Ok(Json(vr)) = vm_day2_validate(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("vm_day2_validate failed");
+        };
+        assert_eq!(
+            vr["passed"], true,
+            "validation must pass for DEFRA/resize-cpu"
+        );
+
+        let op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found");
+        assert_eq!(
+            op.status,
+            ryuki_engine::models::VmChangeStatus::Validated,
+            "status after validate must be Validated"
+        );
+
+        // 3. execute
+        let Ok(Json(executed)) = vm_day2_execute(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("vm_day2_execute failed");
+        };
+        assert_eq!(
+            executed["status"], "Executed",
+            "execute must return Executed entity"
+        );
+
+        let op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found");
+        assert_eq!(
+            op.status,
+            ryuki_engine::models::VmChangeStatus::Executed,
+            "status after execute must be Executed"
+        );
+
+        // 4. verify
+        let Ok(Json(evidence)) = vm_day2_verify(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("vm_day2_verify failed");
+        };
+        assert!(
+            evidence.as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "evidence must be non-empty"
+        );
+
+        let op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found");
+        assert_eq!(
+            op.status,
+            ryuki_engine::models::VmChangeStatus::Verified,
+            "status after verify must be Verified"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Missing id must return 404.
+    #[tokio::test]
+    async fn test_missing_id_returns_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let missing_id = uuid::Uuid::new_v4().to_string();
+
+        let result = vm_day2_validate(Json(VmDay2ActionRequest {
+            operation_id: missing_id.clone(),
+        }))
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::NOT_FOUND,
+            "missing operation_id must return 404"
+        );
+    }
+
+    /// CAS: `transition` returns `Ok(false)` when DB status no longer matches
+    /// the expected `before` value.
+    #[tokio::test]
+    async fn test_cas_conflict_returns_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Capture the operation while it is still Planned.
+        let planned = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found");
+        assert_eq!(
+            planned.status,
+            ryuki_engine::models::VmChangeStatus::Planned
+        );
+
+        // Advance it to Validated through the normal path.
+        if vm_day2_validate(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        .is_err()
+        {
+            cleanup(pool, &id).await;
+            panic!("validate failed");
+        }
+
+        // A transition that still expects the stale Planned status must NOT apply.
+        let applied = crate::repos::vm_day2_operations::transition(pool, "Planned", &planned)
+            .await
+            .expect("transition query failed");
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "transition with stale expected status must return false (CAS mismatch)"
+        );
+    }
+
+    /// Execute from terminal status (`Completed`) must be rejected by the engine
+    /// (409). We simulate this by directly inserting a Completed status via
+    /// `transition` after plan, then calling execute.
+    #[tokio::test]
+    async fn test_execute_from_completed_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // Force the status to Completed via direct repo transition.
+        let mut op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("op");
+        let before = crate::repos::vm_day2_operations::status_str(&op.status).to_string();
+        op.status = ryuki_engine::models::VmChangeStatus::Completed;
+        crate::repos::vm_day2_operations::transition(pool, &before, &op)
+            .await
+            .expect("force-transition");
+
+        let result = vm_day2_execute(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "execute from Completed status must return 409"
+        );
+    }
+
+    /// A FAILED validation must NOT advance the operation to Validated — it stays
+    /// Planned so the caller can remediate and re-validate. (A resize-cpu with
+    /// target_value 0 plans fine but fails validation: "CPU target value cannot be
+    /// zero".)
+    #[tokio::test]
+    async fn test_validate_failure_stays_planned() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let mut body = plan_body(&suffix);
+        body.target_value = 0; // makes resize-cpu validation fail
+
+        let Ok(Json(created)) = vm_day2_plan(Json(body)).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let Ok(Json(vr)) = vm_day2_validate(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await
+        else {
+            cleanup(pool, &id).await;
+            panic!("vm_day2_validate should return Ok with passed=false, not Err");
+        };
+        assert_eq!(
+            vr["passed"], false,
+            "validation must fail for target_value 0"
+        );
+
+        // Status must remain Planned — a failed validation is not a sign-off.
+        let op = crate::repos::vm_day2_operations::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("operation not found");
+        assert_eq!(
+            op.status,
+            ryuki_engine::models::VmChangeStatus::Planned,
+            "failed validation must leave status at Planned, not Validated"
+        );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// Forward-only lifecycle: execute before validate (status still Planned) must
+    /// be rejected with 409 — no skipping the validation gate.
+    #[tokio::test]
+    async fn test_execute_before_validate_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let result = vm_day2_execute(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "execute from Planned (not yet Validated) must return 409"
+        );
+    }
+
+    /// Forward-only lifecycle: verify before execute (status still Planned) must be
+    /// rejected with 409. Guards against regressing/re-ordering the lifecycle.
+    #[tokio::test]
+    async fn test_verify_before_execute_returns_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+            panic!("vm_day2_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let result = vm_day2_verify(Json(VmDay2ActionRequest {
+            operation_id: id.clone(),
+        }))
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::CONFLICT,
+            "verify before execute must return 409"
+        );
+    }
 }
