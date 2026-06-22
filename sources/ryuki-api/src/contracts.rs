@@ -6664,6 +6664,7 @@ const MW_COLUMNS: &str =
     "id, site, start_time, end_time, reason, affected_cis, status, created_by, created_at";
 
 async fn maintenance_calendar_schedule(
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<MaintenanceCalendarScheduleRequest>,
 ) -> ApiResult {
     if let Some(pool) = get_db() {
@@ -6718,7 +6719,7 @@ async fn maintenance_calendar_schedule(
         .bind(&window.end_time)
         .bind(&window.reason)
         .bind(&window.affected_cis)
-        .bind(&window.created_by)
+        .bind(&session.user_id)
         .fetch_one(pool)
         .await
         .map_err(db_error)?;
@@ -19458,6 +19459,7 @@ async fn firewall_rules_list(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn firewall_rule_create(
+    Extension(session): Extension<AuthSession>,
     Json(b): Json<FwCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -19470,7 +19472,7 @@ async fn firewall_rule_create(
         .fetch_one(pool)
         .await
         .map_err(db_error)?;
-        let rule = firewall_rules::build_rule(
+        let mut rule = firewall_rules::build_rule(
             &b.name,
             &b.source_ip,
             &b.dest_ip,
@@ -19482,6 +19484,9 @@ async fn firewall_rule_create(
             next_priority.max(0) as u32,
         )
         .map_err(|e| status_400(&e))?;
+        // created_by = authenticated caller (from request extensions), not the
+        // engine default — so the persisted row and response name the real creator.
+        rule.created_by = session.user_id.clone();
         sqlx::query(&format!(
             "INSERT INTO firewall_rules ({FIREWALL_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
@@ -25470,6 +25475,13 @@ mod db_lifecycle_tests {
 #[cfg(test)]
 mod maint_calendar_db_tests {
     use super::*;
+
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.provider_mode = "local".into();
+        s
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -25580,7 +25592,9 @@ mod maint_calendar_db_tests {
             reason: "Proof: DB conflict must be enforced".into(),
             affected_cis: vec![],
         };
-        let result = maintenance_calendar_schedule(Json(body)).await;
+        let result =
+            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
+                .await;
 
         cleanup_window(pool, seeded_id).await;
 
@@ -25611,7 +25625,9 @@ mod maint_calendar_db_tests {
             reason: "DB success test".into(),
             affected_cis: vec!["srv-test-01".into()],
         };
-        let result = maintenance_calendar_schedule(Json(body)).await;
+        let result =
+            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
+                .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err");
         };
@@ -25660,7 +25676,9 @@ mod maint_calendar_db_tests {
             reason: "Must not be rejected by ghost".into(),
             affected_cis: vec![],
         };
-        let result = maintenance_calendar_schedule(Json(body)).await;
+        let result =
+            maintenance_calendar_schedule(Extension(approver_session("maint-user")), Json(body))
+                .await;
         let Ok(Json(body)) = result else {
             panic!("ghost in-memory window must NOT false-reject DB-mode schedule; got Err");
         };
@@ -30548,6 +30566,13 @@ mod alert_routes_db_tests {
 #[cfg(test)]
 mod firewall_rules_db_tests {
     use super::*;
+
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.provider_mode = "local".into();
+        s
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -30590,7 +30615,12 @@ mod firewall_rules_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = firewall_rule_create(Json(create_body(&suffix))).await else {
+        let Ok(Json(created)) = firewall_rule_create(
+            Extension(approver_session("fw-user")),
+            Json(create_body(&suffix)),
+        )
+        .await
+        else {
             panic!("create failed");
         };
         let rule = &created["rule"];
@@ -30641,7 +30671,12 @@ mod firewall_rules_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = firewall_rule_create(Json(create_body(&suffix))).await else {
+        let Ok(Json(created)) = firewall_rule_create(
+            Extension(approver_session("fw-user")),
+            Json(create_body(&suffix)),
+        )
+        .await
+        else {
             panic!("create failed");
         };
         let id = created["rule"]["id"]
