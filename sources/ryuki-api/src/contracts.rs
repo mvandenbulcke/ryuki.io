@@ -45,6 +45,7 @@ use ryuki_engine::customization_spec_governance;
 use ryuki_engine::datacenter_readiness;
 use ryuki_engine::decommission_quarantine;
 use ryuki_engine::degradation_mode;
+use ryuki_engine::degradation_readiness;
 use ryuki_engine::delegation_boundary;
 use ryuki_engine::dns_ipam;
 use ryuki_engine::dr_testing;
@@ -813,6 +814,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/degradation-mode-contract",
             get(operations_degradation_mode),
+        )
+        .route(
+            "/api/operations/degradation-mode-readiness",
+            get(operations_degradation_mode_readiness),
         )
         .route(
             "/api/platform/degradation/check/{site}",
@@ -6618,6 +6623,39 @@ async fn operations_maintenance_comm() -> Json<Value> {
     Json(
         json!({"source":"static-seed","communicationMode":"draft-only","providerCallsEnabled":false,"liveNotificationAllowed":false,"rawRecipientDataAllowed":false,"messageTypes":["planned-maintenance","outage-advisory","degraded-service","completion-notice","extension-notice","cancellation-notice"],"communicationChannels":["portal-announcement","email-draft","service-desk-note","handover-note","cab-summary"],"requiredInputs":["maintenanceWindow","affectedServices","ciRelationshipSummary","owner","supportGroup","audience","messageType","approvalRoute","evidenceManifest"],"requiredGuards":["maintenance-window-known","affected-ci-known","owner-known","audience-approved","message-template-approved","approval-route-assigned","evidence-redacted"],"blockedReasons":["maintenance-window-missing","affected-ci-unknown","owner-unknown","audience-unapproved","message-template-missing","approval-missing","raw-recipient-data","evidence-not-redacted"],"requiredEvidence":["Communication draft","Affected CI summary","Audience decision","Owner approval","Maintenance window","Channel plan","Handover notes","Evidence references"],"rules":[{"id":"no-live-notification-send","decision":"block","requirement":"Maintenance communication contract creates drafts only and never sends live notifications.","evidence":"Communication draft"},{"id":"approved-audience-required","decision":"block","requirement":"Audience scope must be approved before communication can be published or exported.","evidence":"Audience decision"},{"id":"affected-ci-summary-required","decision":"block","requirement":"Affected CI and application relationship summary must exist before message generation.","evidence":"Affected CI summary"},{"id":"no-sensitive-recipient-data","decision":"block","requirement":"Drafts and channel plans must not expose raw recipient data, credentials, or provider payloads.","evidence":"Channel plan"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct DegradationReadinessQuery {
+    affected_scope: Option<String>,
+    dependency_status: Option<String>,
+    stale_data_marker: Option<String>,
+    safe_remediation: Option<String>,
+    owner: Option<String>,
+    evidence_manifest: Option<String>,
+    degradation_state: Option<String>,
+}
+
+/// Dry-run operations degradation-mode change readiness. Turns the static
+/// `operations/degradation-mode` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed degradation-mode change and return
+/// `degradation-review-recorded` (all criteria met; the live action is a
+/// separately-approved step) or `block`. Never changes live degradation state
+/// (distinct from the stateful degradation_mode engine).
+async fn operations_degradation_mode_readiness(
+    Query(params): Query<DegradationReadinessQuery>,
+) -> Json<Value> {
+    let input = degradation_readiness::DegradationReadinessInput {
+        affected_scope: params.affected_scope,
+        dependency_status: params.dependency_status,
+        stale_data_marker: params.stale_data_marker,
+        safe_remediation: params.safe_remediation,
+        owner: params.owner,
+        evidence_manifest: params.evidence_manifest,
+        degradation_state: params.degradation_state,
+    };
+    let result = degradation_readiness::evaluate_degradation_readiness(&input);
+    Json(json!(result))
 }
 
 async fn operations_degradation_mode() -> Json<Value> {
@@ -22411,6 +22449,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "governance-recorded");
     }
+
+    /// operations degradation-mode readiness through the router: a complete request
+    /// records the review.
+    #[tokio::test]
+    async fn router_serves_operations_degradation_mode_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/degradation-mode-readiness?affected_scope=site&dependency_status=degraded&stale_data_marker=fresh&safe_remediation=readonly&owner=ops&evidence_manifest=ev&degradation_state=partial",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "degradation-review-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22655,6 +22705,39 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "governance-recorded");
+    }
+
+    /// The operations degradation-mode readiness endpoint blocks an incomplete
+    /// request and records the review for a complete one.
+    #[tokio::test]
+    async fn operations_degradation_mode_blocks_then_records() {
+        let Json(blocked) =
+            operations_degradation_mode_readiness(Query(DegradationReadinessQuery {
+                affected_scope: None,
+                dependency_status: None,
+                stale_data_marker: None,
+                safe_remediation: None,
+                owner: None,
+                evidence_manifest: None,
+                degradation_state: None,
+            }))
+            .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "affected-scope-unknown")));
+
+        let Json(ready) = operations_degradation_mode_readiness(Query(DegradationReadinessQuery {
+            affected_scope: Some("site".into()),
+            dependency_status: Some("degraded".into()),
+            stale_data_marker: Some("fresh".into()),
+            safe_remediation: Some("readonly".into()),
+            owner: Some("ops".into()),
+            evidence_manifest: Some("ev".into()),
+            degradation_state: Some("partial".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "degradation-review-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
