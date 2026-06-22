@@ -33,6 +33,7 @@ const DECLARED_MODULES: &[&str] = &[
     "dr_testing",
     "emergency_change",
     "evidence_pipeline",
+    "feature_flag",
     "file_share_ntfs",
     "firewall_rules",
     "firmware_lifecycle",

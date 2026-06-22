@@ -50,6 +50,7 @@ use ryuki_engine::dns_ipam;
 use ryuki_engine::dr_testing;
 use ryuki_engine::emergency_change;
 use ryuki_engine::evidence_pipeline;
+use ryuki_engine::feature_flag;
 use ryuki_engine::file_share_ntfs;
 use ryuki_engine::firewall_rules;
 use ryuki_engine::firmware_lifecycle;
@@ -1165,6 +1166,10 @@ pub fn routes() -> Router {
         .route(
             "/api/admin/feature-flag-governance-contract",
             get(admin_feature_flag),
+        )
+        .route(
+            "/api/admin/feature-flag-governance-readiness",
+            get(admin_feature_flag_readiness),
         )
         .route(
             "/api/admin/approval-groups-contract",
@@ -9576,6 +9581,32 @@ async fn admin_worker_capability() -> Json<Value> {
     Json(
         json!({"source":"static-seed","routingMode":"metadata-only","providerCallsEnabled":false,"liveDispatchAllowed":false,"secretValuesAllowed":false,"capabilityTypes":["generic-worker","windows-gmsa","powercli","linux-ansible","protected-network"],"routingDimensions":["workflowType","osFamily","site","networkZone","providerDomain","riskLevel","approvalState"],"requiredInputs":["workflowType","requestedCapability","site","environment","networkZone","riskLevel","approvalRoute","evidenceManifest"],"requiredGuards":["worker-registered","capability-tag-known","identity-reference-ready","network-zone-approved","approval-route-assigned","dry-run-ready","evidence-redacted"],"blockedReasons":["worker-unknown","capability-missing","identity-reference-missing","protected-network-unapproved","route-ambiguous","approval-missing","worker-health-unknown","evidence-not-redacted"],"requiredEvidence":["Routing request summary","Capability match","Worker readiness","Identity reference decision","Network zone decision","Approval route","Dry-run readiness","Evidence references"],"rules":[{"id":"no-live-worker-dispatch","decision":"block","requirement":"Worker capability routing returns metadata decisions only and never dispatches live jobs.","evidence":"Routing request summary"},{"id":"secret-values-not-allowed","decision":"block","requirement":"Worker identity state must use secret references only and never expose credential values.","evidence":"Identity reference decision"},{"id":"protected-network-approval-required","decision":"block","requirement":"Protected network routes require explicit approval and network-zone decision evidence.","evidence":"Network zone decision"},{"id":"ambiguous-route-blocks-dispatch","decision":"block","requirement":"Ambiguous or missing capability matches block dispatch until reviewed.","evidence":"Capability match"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct FeatureFlagQuery {
+    owner: Option<String>,
+    approval_route: Option<String>,
+    blast_radius: Option<String>,
+    rollback_plan: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run admin feature-flag governance readiness. Turns the static
+/// `admin/feature-flag-governance` descriptor into a real decision: evaluate the
+/// governance guards over a proposed feature-flag change and return
+/// `governance-recorded` (all criteria met; the live toggle is a separately-
+/// approved step) or `block`. Never toggles a flag or mutates rollout/targeting.
+async fn admin_feature_flag_readiness(Query(params): Query<FeatureFlagQuery>) -> Json<Value> {
+    let input = feature_flag::FeatureFlagInput {
+        owner: params.owner,
+        approval_route: params.approval_route,
+        blast_radius: params.blast_radius,
+        rollback_plan: params.rollback_plan,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = feature_flag::evaluate_feature_flag(&input);
+    Json(json!(result))
 }
 
 async fn admin_feature_flag() -> Json<Value> {
@@ -22368,6 +22399,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "health-review-recorded");
     }
+
+    /// admin feature-flag governance readiness through the router: a complete
+    /// request records governance.
+    #[tokio::test]
+    async fn router_serves_admin_feature_flag_readiness() {
+        let (status, json) = get_json(
+            "/api/admin/feature-flag-governance-readiness?owner=plat&approval_route=appr&blast_radius=single&rollback_plan=runbook&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "governance-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22584,6 +22627,34 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "health-review-recorded");
+    }
+
+    /// The admin feature-flag governance readiness endpoint blocks an incomplete
+    /// request and records governance for a complete one.
+    #[tokio::test]
+    async fn admin_feature_flag_blocks_then_records() {
+        let Json(blocked) = admin_feature_flag_readiness(Query(FeatureFlagQuery {
+            owner: None,
+            approval_route: None,
+            blast_radius: None,
+            rollback_plan: None,
+            evidence_manifest: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "rollback-plan-missing")));
+
+        let Json(ready) = admin_feature_flag_readiness(Query(FeatureFlagQuery {
+            owner: Some("plat".into()),
+            approval_route: Some("appr".into()),
+            blast_radius: Some("single".into()),
+            rollback_plan: Some("runbook".into()),
+            evidence_manifest: Some("ev".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "governance-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
