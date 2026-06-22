@@ -22,6 +22,7 @@ pub mod cost_capacity;
 pub mod datacenter_readiness;
 pub mod decommissions;
 pub mod dr_plans;
+pub mod dr_test_runs;
 pub mod file_share_ntfs;
 pub mod firmware_lifecycle;
 pub mod gmsa_accounts;

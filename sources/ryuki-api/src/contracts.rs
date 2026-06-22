@@ -21016,21 +21016,108 @@ async fn dr_plan_update_rpo_rto(
 async fn dr_test_start(
     Json(b): Json<DrTestStartRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::start_test(&b.plan_id, &b.scenario_type, &b.tester)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Plan resolved from static store (DB-consistent via slice-1 write-through)
+    let plan = dr_testing::get_plan_from_store(&b.plan_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("DR plan '{}' not found", b.plan_id)})),
+        )
+    })?;
+    let run = dr_testing::build_test_run(&plan, &b.scenario_type, &b.tester)
+        .map_err(|e| status_400(&e))?;
+    crate::repos::dr_test_runs::insert(pool, &run)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
 }
 async fn dr_test_complete(
     Json(b): Json<DrTestCompleteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::complete_test(&b.test_id, &b.result, b.systems_failed)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (run, run_version) = crate::repos::dr_test_runs::get(pool, &b.test_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&b.test_id))?;
+    let completed_run = dr_testing::complete_test_run_pure(&run, &b.result, b.systems_failed)
+        .map_err(|e| status_409(&e))?;
+    let completed_at = completed_run.completed_at.clone().unwrap_or_default();
+    let (plan, plan_version) = crate::repos::dr_plans::get(pool, &run.plan_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&run.plan_id))?;
+    let updated_plan = dr_testing::mark_plan_tested_pure(&plan, &completed_at);
+    let run_json = serde_json::to_value(&completed_run)
+        .map_err(|e| db_error(sqlx::Error::Decode(format!("serialize run: {e}").into())))?;
+    let plan_json = serde_json::to_value(&updated_plan)
+        .map_err(|e| db_error(sqlx::Error::Decode(format!("serialize plan: {e}").into())))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let run_res = sqlx::query(
+        "UPDATE dr_test_runs SET completed = $2, run_json = $3, updated_at = NOW() \
+         WHERE id = $1 AND xmin = $4::xid",
+    )
+    .bind(&completed_run.id)
+    .bind(true)
+    .bind(&run_json)
+    .bind(&run_version)
+    .execute(&mut *tx)
+    .await;
+    let run_res = match run_res {
+        Ok(r) => r,
+        Err(e) => {
+            tx.rollback().await.ok();
+            return Err(db_error(e));
+        }
+    };
+    if run_res.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err(status_409(
+            "test run was modified concurrently; reload and retry",
+        ));
+    }
+    let plan_res = sqlx::query(
+        "UPDATE dr_plans SET plan_json = $2, updated_at = NOW() \
+         WHERE id = $1 AND xmin = $3::xid",
+    )
+    .bind(&updated_plan.id)
+    .bind(&plan_json)
+    .bind(&plan_version)
+    .execute(&mut *tx)
+    .await;
+    let plan_res = match plan_res {
+        Ok(r) => r,
+        Err(e) => {
+            tx.rollback().await.ok();
+            return Err(db_error(e));
+        }
+    };
+    if plan_res.rows_affected() == 0 {
+        tx.rollback().await.ok();
+        return Err(status_409(
+            "DR plan was modified concurrently; reload and retry",
+        ));
+    }
+    tx.commit().await.map_err(db_error)?;
+    dr_testing::upsert_plan(&updated_plan);
+    Ok(Json(
+        serde_json::to_value(&completed_run).unwrap_or_default(),
+    ))
 }
 async fn dr_test_results(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::get_test_results(&id)
-        .map(Json)
-        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Verify plan exists first (matches engine behavior returning error if plan missing)
+    crate::repos::dr_plans::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    let runs = crate::repos::dr_test_runs::list_by_plan(pool, &id)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(json!({
+        "plan_id": id,
+        "count": runs.len(),
+        "test_results": runs
+    })))
 }
 async fn dr_tests_due() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     dr_testing::list_due_tests()
@@ -38624,5 +38711,325 @@ mod dr_plans_db_tests {
             ryuki_engine::dr_testing::DrPlanStatus::Draft,
             "status must remain Draft after same-status race"
         );
+    }
+}
+
+// Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins dr_test_runs_db_tests -- --test-threads=1
+#[cfg(test)]
+mod dr_test_runs_db_tests {
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn make_plan(suffix: &str, site: &str) -> ryuki_engine::dr_testing::DrPlan {
+        ryuki_engine::dr_testing::build_dr_plan(
+            &format!("DR plan for run test {suffix}"),
+            site,
+            "GBLON",
+            vec!["sys-01".into()],
+            15,
+            60,
+        )
+        .expect("build_dr_plan must succeed")
+    }
+
+    async fn insert_plan(pool: &PgPool, plan: &ryuki_engine::dr_testing::DrPlan) {
+        crate::repos::dr_plans::insert(pool, plan)
+            .await
+            .expect("insert plan must succeed");
+        ryuki_engine::dr_testing::upsert_plan(plan);
+    }
+
+    async fn cleanup_run(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM dr_test_runs WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+    async fn cleanup_plan(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM dr_plans WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// A run started for a DB-created plan persists (proves the slice-1 write-through makes the plan resolvable).
+    #[tokio::test]
+    async fn test_start_for_db_plan_persists() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let plan_id = plan.id.clone();
+        insert_plan(pool, &plan).await;
+
+        // build_test_run resolves plan from static (upsert_plan above made it available)
+        let run = ryuki_engine::dr_testing::build_test_run(&plan, "Tabletop", "test.operator")
+            .expect("build_test_run must succeed");
+        let run_id = run.id.clone();
+
+        crate::repos::dr_test_runs::insert(pool, &run)
+            .await
+            .expect("insert run must succeed");
+
+        let (fetched, _version) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("get failed")
+            .expect("run not found after insert");
+        assert_eq!(fetched.plan_id, plan_id, "plan_id must match");
+        assert_eq!(fetched.site, "DEFRA", "site must match");
+        assert!(fetched.completed_at.is_none(), "run must start incomplete");
+
+        cleanup_run(pool, &run_id).await;
+        cleanup_plan(pool, &plan_id).await;
+    }
+
+    /// get/list_by_plan roundtrip.
+    #[tokio::test]
+    async fn test_get_and_list_by_plan() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "GBLON");
+        let plan_id = plan.id.clone();
+        insert_plan(pool, &plan).await;
+
+        let run1 = ryuki_engine::dr_testing::build_test_run(&plan, "Tabletop", "op.a")
+            .expect("build must succeed");
+        let run2 = ryuki_engine::dr_testing::build_test_run(&plan, "FullFailover", "op.b")
+            .expect("build must succeed");
+        let run1_id = run1.id.clone();
+        let run2_id = run2.id.clone();
+
+        crate::repos::dr_test_runs::insert(pool, &run1)
+            .await
+            .expect("insert run1");
+        crate::repos::dr_test_runs::insert(pool, &run2)
+            .await
+            .expect("insert run2");
+
+        let runs = crate::repos::dr_test_runs::list_by_plan(pool, &plan_id)
+            .await
+            .expect("list failed");
+        assert!(runs.len() >= 2, "must find at least 2 runs");
+        assert!(runs.iter().any(|r| r.id == run1_id), "run1 must be in list");
+        assert!(runs.iter().any(|r| r.id == run2_id), "run2 must be in list");
+
+        cleanup_run(pool, &run1_id).await;
+        cleanup_run(pool, &run2_id).await;
+        cleanup_plan(pool, &plan_id).await;
+    }
+
+    /// complete persists the run AND updates the plan's last_tested.
+    #[tokio::test]
+    async fn test_complete_persists_run_and_plan() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "FRPAR");
+        let plan_id = plan.id.clone();
+        insert_plan(pool, &plan).await;
+
+        let run = ryuki_engine::dr_testing::build_test_run(&plan, "Tabletop", "test.op")
+            .expect("build must succeed");
+        let run_id = run.id.clone();
+        crate::repos::dr_test_runs::insert(pool, &run)
+            .await
+            .expect("insert run");
+
+        // Read run + version for CAS
+        let (run_fetched, run_version) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("get run")
+            .expect("run not found");
+        let completed_run =
+            ryuki_engine::dr_testing::complete_test_run_pure(&run_fetched, "Passed", vec![])
+                .expect("complete_test_run_pure must succeed");
+        let completed_at = completed_run.completed_at.clone().unwrap();
+
+        // Transition run
+        let ok =
+            crate::repos::dr_test_runs::transition(pool, &run_id, &run_version, &completed_run)
+                .await
+                .expect("transition run");
+        assert!(ok, "run transition must succeed");
+
+        // Transition plan
+        let (plan_fetched, plan_version) = crate::repos::dr_plans::get(pool, &plan_id)
+            .await
+            .expect("get plan")
+            .expect("plan not found");
+        let updated_plan =
+            ryuki_engine::dr_testing::mark_plan_tested_pure(&plan_fetched, &completed_at);
+        let plan_ok =
+            crate::repos::dr_plans::transition(pool, &plan_id, &plan_version, &updated_plan)
+                .await
+                .expect("transition plan");
+        assert!(plan_ok, "plan transition must succeed");
+
+        // Assert BOTH the run completed_at and the plan's last_tested in DB
+        let (final_run, _) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("re-get run")
+            .expect("run not found");
+        assert!(final_run.completed_at.is_some(), "run must be completed");
+
+        let (final_plan, _) = crate::repos::dr_plans::get(pool, &plan_id)
+            .await
+            .expect("re-get plan")
+            .expect("plan not found");
+        assert!(
+            final_plan.last_tested.is_some(),
+            "plan.last_tested must be set"
+        );
+
+        cleanup_run(pool, &run_id).await;
+        cleanup_plan(pool, &plan_id).await;
+    }
+
+    /// Missing run id returns None (handler maps to 404).
+    #[tokio::test]
+    async fn test_missing_run_id_returns_none() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let result = crate::repos::dr_test_runs::get(pool, "drt-does-not-exist-00000000")
+            .await
+            .expect("get must not error on missing id");
+        assert!(result.is_none(), "missing id must return None");
+    }
+
+    /// Re-completing a completed run returns Err (-> 409).
+    #[tokio::test]
+    async fn test_recomplete_completed_run_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let plan_id = plan.id.clone();
+        insert_plan(pool, &plan).await;
+
+        let run = ryuki_engine::dr_testing::build_test_run(&plan, "Tabletop", "test.op")
+            .expect("build must succeed");
+        let run_id = run.id.clone();
+        crate::repos::dr_test_runs::insert(pool, &run)
+            .await
+            .expect("insert");
+
+        // Complete once
+        let (run_fetched, run_version) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("get")
+            .expect("not found");
+        let completed =
+            ryuki_engine::dr_testing::complete_test_run_pure(&run_fetched, "Passed", vec![])
+                .expect("first complete must succeed");
+        crate::repos::dr_test_runs::transition(pool, &run_id, &run_version, &completed)
+            .await
+            .expect("transition");
+
+        // Re-fetch and try to complete again -> Err
+        let (completed_run, _) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("re-get")
+            .expect("not found");
+        let result =
+            ryuki_engine::dr_testing::complete_test_run_pure(&completed_run, "Failed", vec![]);
+        assert!(
+            result.is_err(),
+            "re-completing a completed run must return Err"
+        );
+
+        cleanup_run(pool, &run_id).await;
+        cleanup_plan(pool, &plan_id).await;
+    }
+
+    /// CAS conflict on complete returns Ok(false).
+    #[tokio::test]
+    async fn test_cas_conflict_on_complete() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "GBLON");
+        let plan_id = plan.id.clone();
+        insert_plan(pool, &plan).await;
+
+        let run = ryuki_engine::dr_testing::build_test_run(&plan, "Tabletop", "test.op")
+            .expect("build must succeed");
+        let run_id = run.id.clone();
+        crate::repos::dr_test_runs::insert(pool, &run)
+            .await
+            .expect("insert");
+
+        // Both readers see the same xmin
+        let (run_a, version_a) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("get a")
+            .expect("not found");
+        let (run_b, version_b) = crate::repos::dr_test_runs::get(pool, &run_id)
+            .await
+            .expect("get b")
+            .expect("not found");
+        assert_eq!(version_a, version_b);
+
+        // Both produce completed runs
+        let completed_a =
+            ryuki_engine::dr_testing::complete_test_run_pure(&run_a, "Passed", vec![])
+                .expect("complete a");
+        let completed_b = ryuki_engine::dr_testing::complete_test_run_pure(
+            &run_b,
+            "Failed",
+            vec!["sys-01".into()],
+        )
+        .expect("complete b");
+
+        // First writer wins
+        let first_ok =
+            crate::repos::dr_test_runs::transition(pool, &run_id, &version_a, &completed_a)
+                .await
+                .expect("first transition");
+        assert!(first_ok, "first writer must succeed");
+
+        // Second writer with stale xmin must lose
+        let second_ok =
+            crate::repos::dr_test_runs::transition(pool, &run_id, &version_b, &completed_b)
+                .await
+                .expect("second transition must not error");
+        assert!(
+            !second_ok,
+            "second writer with stale xmin must return false"
+        );
+
+        cleanup_run(pool, &run_id).await;
+        cleanup_plan(pool, &plan_id).await;
     }
 }

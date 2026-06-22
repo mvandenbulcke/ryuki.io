@@ -285,6 +285,72 @@ fn seed_data() -> DrStore {
     (plans, test_runs, scenarios)
 }
 
+/// Returns a clone of the plan from the in-memory store (DB-consistent via write-through).
+/// Used by the DB-backed handler for `start_test` to resolve the plan without I/O.
+pub fn get_plan_from_store(plan_id: &str) -> Option<DrPlan> {
+    let store = dr_store().lock().ok()?;
+    store.0.iter().find(|p| p.id == plan_id).cloned()
+}
+
+/// Pure constructor: takes the resolved plan + inputs, returns a DrTestRun ready for DB insert.
+pub fn build_test_run(
+    plan: &DrPlan,
+    scenario_type: &str,
+    tester: &str,
+) -> Result<DrTestRun, String> {
+    parse_scenario_type(scenario_type)?; // validates; we don't need the value
+    if tester.trim().is_empty() {
+        return Err("tester cannot be empty".into());
+    }
+    let id = format!(
+        "drt-{}-{}",
+        plan.site.to_lowercase(),
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    );
+    let evidence_pack_id = format!("evp-{}", id);
+    Ok(DrTestRun {
+        id,
+        plan_id: plan.id.clone(),
+        site: plan.site.clone(),
+        started_at: now_iso(),
+        completed_at: None,
+        result: DrTestResult::Partial, // placeholder until complete
+        systems_tested: plan.systems.clone(),
+        systems_failed: vec![],
+        tester: tester.to_string(),
+        evidence_pack_id,
+    })
+}
+
+/// Pure transition: returns completed run. Returns Err if already completed (-> 409).
+pub fn complete_test_run_pure(
+    run: &DrTestRun,
+    result: &str,
+    systems_failed: Vec<String>,
+) -> Result<DrTestRun, String> {
+    if run.completed_at.is_some() {
+        return Err(format!("DR test '{}' is already completed", run.id));
+    }
+    let result = parse_test_result(result)?;
+    let mut updated = run.clone();
+    updated.completed_at = Some(now_iso());
+    updated.result = result;
+    updated.systems_failed = systems_failed;
+    Ok(updated)
+}
+
+/// Pure: returns updated plan with last_tested + next_test_due set.
+pub fn mark_plan_tested_pure(plan: &DrPlan, completed_at: &str) -> DrPlan {
+    let mut updated = plan.clone();
+    updated.last_tested = Some(completed_at.to_string());
+    updated.next_test_due = (Utc::now() + Days::new(90)).to_rfc3339();
+    updated
+}
+
 pub fn list_plans(site: &str) -> Result<Value, String> {
     let store = dr_store().lock().unwrap();
     let plans: Vec<DrPlan> = if site.is_empty() {
@@ -418,11 +484,6 @@ pub fn create_plan(
 }
 
 pub fn start_test(plan_id: &str, scenario_type: &str, tester: &str) -> Result<Value, String> {
-    let scenario = parse_scenario_type(scenario_type)?;
-    if tester.trim().is_empty() {
-        return Err("tester cannot be empty".into());
-    }
-
     let mut store = dr_store().lock().unwrap();
     let plan = store
         .0
@@ -430,33 +491,12 @@ pub fn start_test(plan_id: &str, scenario_type: &str, tester: &str) -> Result<Va
         .find(|p| p.id == plan_id)
         .cloned()
         .ok_or_else(|| format!("DR plan '{}' not found", plan_id))?;
-
-    let id = format!(
-        "drt-{}-{}",
-        plan.site.to_lowercase(),
-        Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-    );
-    let evidence_pack_id = format!("evp-{}", id);
-
-    let test_run = DrTestRun {
-        id: id.clone(),
-        plan_id: plan_id.to_string(),
-        site: plan.site,
-        started_at: now_iso(),
-        completed_at: None,
-        result: DrTestResult::Partial,
-        systems_tested: plan.systems,
-        systems_failed: vec![],
-        tester: tester.to_string(),
-        evidence_pack_id: evidence_pack_id.clone(),
-    };
-
+    // Hold the lock across build + push to avoid race on store.1
+    let test_run = build_test_run(&plan, scenario_type, tester)?;
+    let id = test_run.id.clone();
+    let evidence_pack_id = test_run.evidence_pack_id.clone();
+    let scenario = parse_scenario_type(scenario_type)?; // for response json
     store.1.push(test_run.clone());
-
     Ok(json!({
         "source": "dry-run",
         "test_id": id,
@@ -473,25 +513,23 @@ pub fn complete_test(
     result: &str,
     systems_failed: Vec<String>,
 ) -> Result<Value, String> {
-    let result = parse_test_result(result)?;
-    let completed_at = now_iso();
     let mut store = dr_store().lock().unwrap();
     let run = store
         .1
-        .iter_mut()
+        .iter()
         .find(|r| r.id == test_id)
+        .cloned()
         .ok_or_else(|| format!("DR test '{}' not found", test_id))?;
-
-    run.completed_at = Some(completed_at.clone());
-    run.result = result;
-    run.systems_failed = systems_failed;
-    let completed_run = run.clone();
-
-    if let Some(plan) = store.0.iter_mut().find(|p| p.id == completed_run.plan_id) {
-        plan.last_tested = Some(completed_at);
-        plan.next_test_due = (Utc::now() + Days::new(90)).to_rfc3339();
+    let completed_run = complete_test_run_pure(&run, result, systems_failed)?;
+    // Update in-place in the static store
+    if let Some(r) = store.1.iter_mut().find(|r| r.id == test_id) {
+        *r = completed_run.clone();
     }
-
+    // Update the plan in-place
+    let completed_at = completed_run.completed_at.as_deref().unwrap_or("");
+    if let Some(plan) = store.0.iter_mut().find(|p| p.id == completed_run.plan_id) {
+        *plan = mark_plan_tested_pure(plan, completed_at);
+    }
     Ok(json!({
         "source": "dry-run",
         "test_id": test_id,
@@ -794,6 +832,22 @@ mod tests {
     fn test_list_scenarios() {
         let scenarios = list_scenarios("DEFRA").unwrap();
         assert!(scenarios["count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_dr_test_result_serde_strings() {
+        assert_eq!(
+            serde_json::to_value(&DrTestResult::Passed).unwrap(),
+            serde_json::Value::String("passed".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&DrTestResult::Failed).unwrap(),
+            serde_json::Value::String("failed".into())
+        );
+        assert_eq!(
+            serde_json::to_value(&DrTestResult::Partial).unwrap(),
+            serde_json::Value::String("partial".into())
+        );
     }
 
     #[test]
