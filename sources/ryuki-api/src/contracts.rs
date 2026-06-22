@@ -5917,10 +5917,11 @@ async fn emergency_initiate(
         .execute(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_INITIATE_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -5971,10 +5972,11 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
         .execute(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_APPROVE_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -6033,10 +6035,11 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
         .fetch_optional(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_EXECUTE_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -6082,10 +6085,11 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
         .execute(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_EXECUTE_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -6143,10 +6147,11 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
         .execute(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_VERIFY_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -6223,10 +6228,11 @@ async fn emergency_close(
         .execute(pool)
         .await
         .map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
             problem_details(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "EMERGENCY_CLOSE_FAILED",
-                e.to_string(),
+                "database error",
                 None::<&str>,
             )
         })?;
@@ -12780,12 +12786,7 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
         // The durable lifecycle state (047): payload is authoritative for all
         // 14 types; stages/approval_route/plan/validation_results are the REAL
@@ -14557,12 +14558,7 @@ async fn request_evidence_pack(
         .bind(uid)
         .fetch_optional(pool)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?
+        .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
         db_row_to_request(&row, &request_id)
     } else {
@@ -19801,12 +19797,7 @@ async fn dns_records_list(
         .bind(record_type)
         .fetch_all(pool)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
+        .map_err(db_error)?;
         let records: Vec<Value> = rows.iter().map(DnsRecordRow::to_json).collect();
         return Ok(Json(json!({
             "source": "database",
@@ -19842,12 +19833,7 @@ async fn dns_record_create(
         .bind(dns_status_str(&record.status))
         .execute(pool)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
+        .map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "record": serde_json::to_value(&record).unwrap_or_default(),
@@ -19865,12 +19851,7 @@ async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
         .bind(&id)
         .fetch_optional(pool)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
+        .map_err(db_error)?;
         return match row {
             Some(record) => Ok(Json(
                 json!({"source": "database", "record": record.to_json()}),
@@ -19893,12 +19874,7 @@ async fn dns_record_delete(
             .bind(&id)
             .execute(pool)
             .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-            })?;
+            .map_err(db_error)?;
         if result.rows_affected() == 0 {
             return Err((
                 StatusCode::NOT_FOUND,
