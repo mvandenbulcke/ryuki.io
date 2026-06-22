@@ -18034,8 +18034,6 @@ struct FirmwareExceptionRequest {
     #[serde(rename = "deviceId")]
     device_id: String,
     reason: String,
-    #[serde(rename = "approvedBy")]
-    approved_by: String,
     #[serde(rename = "expiryDays")]
     expiry_days: i64,
 }
@@ -18147,12 +18145,15 @@ async fn firmware_eol() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 }
 
 async fn firmware_request_exception(
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<FirmwareExceptionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // approved_by = authenticated caller (from request extensions), never a client
+    // body field — the exception's approval must name the real principal.
     // Pure validation first (engine guard).
     firmware_lifecycle::validate_exception_request(
         &body.reason,
-        &body.approved_by,
+        &session.user_id,
         body.expiry_days,
     )
     .map_err(|e| status_400(&e))?;
@@ -18161,7 +18162,7 @@ async fn firmware_request_exception(
         pool,
         &body.device_id,
         &body.reason,
-        &body.approved_by,
+        &session.user_id,
         body.expiry_days,
     )
     .await
@@ -20376,8 +20377,6 @@ struct ComplianceResolveRequest {
 #[allow(dead_code)]
 struct ComplianceWaiveRequest {
     reason: String,
-    #[serde(rename = "approvedBy")]
-    approved_by: String,
     expiry: String,
 }
 #[derive(Debug, Deserialize)]
@@ -20607,13 +20606,13 @@ async fn compliance_finding_resolve(
 
 async fn compliance_finding_waive(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(b): Json<ComplianceWaiveRequest>,
 ) -> ApiResult {
+    // approved_by = authenticated caller (from request extensions), never a client
+    // body field — the waiver's approval must name the real principal.
     if b.reason.trim().is_empty() {
         return Err(status_400("reason cannot be empty"));
-    }
-    if b.approved_by.trim().is_empty() {
-        return Err(status_400("approved_by cannot be empty"));
     }
     if chrono::DateTime::parse_from_rfc3339(&b.expiry).is_err() {
         return Err(status_400(&format!("Invalid waiver expiry: {}", b.expiry)));
@@ -20624,7 +20623,7 @@ async fn compliance_finding_waive(
         pool,
         &id,
         &b.reason,
-        &b.approved_by,
+        &session.user_id,
         &b.expiry,
     )
     .await
@@ -20635,7 +20634,7 @@ async fn compliance_finding_waive(
             "waiver": {
                 "finding_id": &id,
                 "reason": &b.reason,
-                "approved_by": &b.approved_by,
+                "approved_by": &session.user_id,
                 "expiry": &b.expiry,
                 "created_at": chrono::Utc::now().to_rfc3339()
             },
