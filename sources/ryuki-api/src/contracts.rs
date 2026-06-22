@@ -1979,7 +1979,6 @@ struct LegalHoldPlaceRequest {
     #[serde(rename = "holdType")]
     hold_type: String,
     reason: String,
-    by: String,
     site: String,
 }
 
@@ -1988,13 +1987,6 @@ struct LegalHoldPlaceRequest {
 struct LegalHoldExtendRequest {
     #[serde(rename = "newExpiry")]
     new_expiry: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LegalHoldReleaseRequest {
-    #[serde(rename = "releasedBy")]
-    released_by: String,
 }
 
 // ─── Immutability compliance request types ───
@@ -7943,8 +7935,11 @@ async fn protect_legal_hold() -> Json<Value> {
 // ─── Legal Hold Engine Handlers ───
 
 async fn legal_hold_place(
+    Extension(session): Extension<AuthSession>,
     Json(req): Json<LegalHoldPlaceRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // initiated_by = authenticated caller (from request extensions), never a client
+    // body field — the hold audit must name the real principal.
     let hold_type = match req.hold_type.to_lowercase().as_str() {
         "investigation" => legal_hold::HoldType::Investigation,
         "litigation" => legal_hold::HoldType::Litigation,
@@ -7961,8 +7956,13 @@ async fn legal_hold_place(
     };
     // Validate + construct via the engine (enforces VALID_SITES; also pushes to
     // the static, which is the no-DB fallback).
-    let hold = match legal_hold::place_hold(&req.target, hold_type, &req.reason, &req.by, &req.site)
-    {
+    let hold = match legal_hold::place_hold(
+        &req.target,
+        hold_type,
+        &req.reason,
+        &session.user_id,
+        &req.site,
+    ) {
         Ok(hold) => hold,
         Err(e) => return Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     };
@@ -8165,20 +8165,18 @@ async fn legal_hold_extend(
 
 async fn legal_hold_release(
     Path(id): Path<String>,
-    Json(req): Json<LegalHoldReleaseRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // released_by = authenticated caller (from request extensions), never a client
+    // body field — the release audit must name the real principal.
     if let Some(pool) = get_db() {
-        // Releasing a hold must record who released it (parity with the engine).
-        if req.released_by.trim().is_empty() {
-            return Err(status_400("releasedBy must not be empty"));
-        }
         // DB path: CAS-UPDATE directly.  Do NOT call release_hold() which
         // mutates HOLD_STORE — absent for DB-seeded/restarted holds.
         let now = chrono::Utc::now().to_rfc3339();
         let audit_entry = serde_json::to_string(&serde_json::json!([{
             "timestamp": now,
             "action": "hold_released",
-            "by": req.released_by,
+            "by": session.user_id,
             "detail": "Hold released",
         }]))
         .unwrap_or_else(|_| "[]".into());
@@ -8191,7 +8189,7 @@ async fn legal_hold_release(
              RETURNING {LEGAL_HOLD_COLUMNS}"
         ))
         .bind(&id)
-        .bind(&req.released_by)
+        .bind(&session.user_id)
         .bind(&now)
         .bind(audit_entry)
         .fetch_optional(pool)
@@ -8206,7 +8204,7 @@ async fn legal_hold_release(
         };
     }
     // No-DB fallback: engine validates status=Active and records audit entry.
-    match legal_hold::release_hold(&id, &req.released_by) {
+    match legal_hold::release_hold(&id, &session.user_id) {
         Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
@@ -17903,8 +17901,6 @@ struct RunbookStartRequest {
     #[serde(rename = "runbookId")]
     runbook_id: String,
     site: String,
-    #[serde(rename = "startedBy")]
-    started_by: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -17926,9 +17922,12 @@ async fn runbook_catalog() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
 }
 
 async fn runbook_start(
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<RunbookStartRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    runbook_execution::start_runbook(&body.runbook_id, &body.site, &body.started_by)
+    // actor = authenticated caller (from request extensions), never a client
+    // body field — the audit trail must name the real principal.
+    runbook_execution::start_runbook(&body.runbook_id, &body.site, &session.user_id)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -18805,8 +18804,6 @@ struct IpamReserveRequest {
     subnet_id: String,
     hostname: String,
     purpose: String,
-    #[serde(rename = "reservedBy")]
-    reserved_by: String,
     #[serde(rename = "ttlDays")]
     ttl_days: u64,
 }
@@ -19148,6 +19145,7 @@ async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn ipam_reserve_ip(
+    Extension(session): Extension<AuthSession>,
     Json(b): Json<IpamReserveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -19182,7 +19180,7 @@ async fn ipam_reserve_ip(
             &existing,
             &b.hostname,
             &b.purpose,
-            &b.reserved_by,
+            &session.user_id,
             b.ttl_days,
         )
         .map_err(|e| status_400(&e))?;
@@ -19241,7 +19239,7 @@ async fn ipam_reserve_ip(
         &b.subnet_id,
         &b.hostname,
         &b.purpose,
-        &b.reserved_by,
+        &session.user_id,
         b.ttl_days,
     )
     .map(Json)
@@ -20350,8 +20348,6 @@ struct ComplianceControlsQuery {
 #[allow(dead_code)]
 struct ComplianceAssessRequest {
     status: String,
-    #[serde(rename = "assessedBy")]
-    assessed_by: String,
     #[serde(rename = "evidenceRef")]
     evidence_ref: String,
 }
@@ -20462,11 +20458,11 @@ async fn compliance_control_get(Path(id): Path<String>) -> ApiResult {
 
 async fn compliance_control_assess(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(b): Json<ComplianceAssessRequest>,
 ) -> ApiResult {
-    if b.assessed_by.trim().is_empty() {
-        return Err(status_400("assessed_by cannot be empty"));
-    }
+    // actor = authenticated caller (from request extensions), never a client
+    // body field — the audit trail must name the real principal.
     if b.evidence_ref.trim().is_empty() {
         return Err(status_400("evidence_ref cannot be empty"));
     }
@@ -20479,7 +20475,7 @@ async fn compliance_control_assess(
         pool,
         &id,
         &status,
-        &b.assessed_by,
+        &session.user_id,
         &b.evidence_ref,
     )
     .await
@@ -20693,12 +20689,6 @@ struct SecretsRegisterRequest {
     interval_days: u64,
     owner: String,
     site: String,
-}
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct SecretsRotateRequest {
-    #[serde(rename = "rotatedBy")]
-    rotated_by: String,
 }
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -20948,12 +20938,11 @@ async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
 }
 async fn secrets_rotate(
     Path(id): Path<String>,
-    Json(b): Json<SecretsRotateRequest>,
+    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // rotated_by = authenticated caller (from request extensions), never a client
+    // body field — the rotation audit must name the real principal.
     if let Some(pool) = get_db() {
-        if b.rotated_by.trim().is_empty() {
-            return Err(status_400("rotated_by cannot be empty"));
-        }
         let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
         ))
@@ -20972,7 +20961,7 @@ async fn secrets_rotate(
             .map_err(db_error)?;
         let (updated, run) = secrets_rotation::rotate_secret_record(
             &secret,
-            &b.rotated_by,
+            &session.user_id,
             run_count.max(0) as usize,
         );
 
@@ -21000,7 +20989,7 @@ async fn secrets_rotate(
             "rotation": serde_json::to_value(&run).unwrap_or_default(),
         })));
     }
-    secrets_rotation::rotate_secret(&id, &b.rotated_by)
+    secrets_rotation::rotate_secret(&id, &session.user_id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -30684,6 +30673,13 @@ mod firewall_rules_db_tests {
 #[cfg(test)]
 mod legal_hold_db_tests {
     use super::*;
+
+    fn approver_session(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.provider_mode = "local".into();
+        s
+    }
     use crate::database::DB_TEST_SERIAL;
     use sqlx::PgPool;
 
@@ -30708,7 +30704,6 @@ mod legal_hold_db_tests {
             target: format!("srv-test-{suffix}.example.local"),
             hold_type: "Litigation".into(),
             reason: "P2-12 DB test hold".into(),
-            by: "test-user".into(),
             site: "DEFRA".into(),
         }
     }
@@ -30723,7 +30718,12 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(placed)) = legal_hold_place(Json(place_body(&suffix))).await else {
+        let Ok(Json(placed)) = legal_hold_place(
+            Extension(approver_session("test-user")),
+            Json(place_body(&suffix)),
+        )
+        .await
+        else {
             panic!("place failed");
         };
         let id = placed["id"].as_str().expect("id").to_string();
@@ -30778,16 +30778,19 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(placed)) = legal_hold_place(Json(place_body(&suffix))).await else {
+        let Ok(Json(placed)) = legal_hold_place(
+            Extension(approver_session("test-user")),
+            Json(place_body(&suffix)),
+        )
+        .await
+        else {
             panic!("place failed");
         };
         let id = placed["id"].as_str().expect("id").to_string();
 
         let Ok(Json(released)) = legal_hold_release(
             Path(id.clone()),
-            Json(LegalHoldReleaseRequest {
-                released_by: "test-releaser".into(),
-            }),
+            Extension(approver_session("test-releaser")),
         )
         .await
         else {
@@ -30832,7 +30835,12 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(placed)) = legal_hold_place(Json(place_body(&suffix))).await else {
+        let Ok(Json(placed)) = legal_hold_place(
+            Extension(approver_session("test-user")),
+            Json(place_body(&suffix)),
+        )
+        .await
+        else {
             panic!("place failed");
         };
         let id = placed["id"].as_str().expect("id").to_string();
@@ -30860,32 +30868,27 @@ mod legal_hold_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(placed)) = legal_hold_place(Json(place_body(&suffix))).await else {
+        let Ok(Json(placed)) = legal_hold_place(
+            Extension(approver_session("test-user")),
+            Json(place_body(&suffix)),
+        )
+        .await
+        else {
             panic!("place failed");
         };
         let id = placed["id"].as_str().expect("id").to_string();
 
         // First release: OK.
-        let Ok(_) = legal_hold_release(
-            Path(id.clone()),
-            Json(LegalHoldReleaseRequest {
-                released_by: "releaser-1".into(),
-            }),
-        )
-        .await
+        let Ok(_) =
+            legal_hold_release(Path(id.clone()), Extension(approver_session("releaser-1"))).await
         else {
             cleanup_hold(pool, &id).await;
             panic!("first release failed");
         };
 
         // Second release: must conflict.
-        let Err((status, _)) = legal_hold_release(
-            Path(id.clone()),
-            Json(LegalHoldReleaseRequest {
-                released_by: "releaser-2".into(),
-            }),
-        )
-        .await
+        let Err((status, _)) =
+            legal_hold_release(Path(id.clone()), Extension(approver_session("releaser-2"))).await
         else {
             cleanup_hold(pool, &id).await;
             panic!("expected Err on double-release");
@@ -30945,9 +30948,7 @@ mod legal_hold_db_tests {
         // Release via handler.
         let Ok(Json(released)) = legal_hold_release(
             Path(id.clone()),
-            Json(LegalHoldReleaseRequest {
-                released_by: "direct-test-releaser".into(),
-            }),
+            Extension(approver_session("direct-test-releaser")),
         )
         .await
         else {
