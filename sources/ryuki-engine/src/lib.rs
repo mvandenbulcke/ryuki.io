@@ -18,6 +18,7 @@ pub mod customization_spec_governance;
 pub mod datacenter_readiness;
 pub mod decommission_quarantine;
 pub mod degradation_mode;
+pub mod delegation_boundary;
 pub mod dns_ipam;
 pub mod dr_testing;
 pub mod emergency_change;

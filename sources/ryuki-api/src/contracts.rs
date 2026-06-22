@@ -45,6 +45,7 @@ use ryuki_engine::customization_spec_governance;
 use ryuki_engine::datacenter_readiness;
 use ryuki_engine::decommission_quarantine;
 use ryuki_engine::degradation_mode;
+use ryuki_engine::delegation_boundary;
 use ryuki_engine::dns_ipam;
 use ryuki_engine::dr_testing;
 use ryuki_engine::emergency_change;
@@ -1173,6 +1174,10 @@ pub fn routes() -> Router {
         .route(
             "/api/admin/delegation-boundary-contract",
             get(admin_delegation_boundary),
+        )
+        .route(
+            "/api/admin/delegation-boundary-readiness",
+            get(admin_delegation_boundary_readiness),
         )
         .route("/api/auth/local/roles", get(auth_local_roles))
         .route("/api/auth/local/me", get(auth_local_me))
@@ -9424,6 +9429,38 @@ async fn admin_approval_groups() -> Json<Value> {
     Json(
         json!({"source":"static-seed","approvalGroupsMode":"static-admin-approval-groups","groupMappingReadOnly":true,"datacenterFallbackRequired":true,"delegationReviewRequired":true,"separationOfDutiesReviewRequired":true,"liveIdentityLookupAllowed":false,"graphCallsAllowed":false,"roleAssignmentMutationAllowed":false,"groupMembershipMutationAllowed":false,"approvalMutationAllowed":false,"policyMutationAllowed":false,"workflowMutationAllowed":false,"providerCallsAllowed":false,"notificationDispatchAllowed":false,"rawUserDataAllowed":false,"rawGroupDataAllowed":false,"rawMembershipRowsAllowed":false,"rawApprovalPayloadsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"principalIdentifiersAllowed":false,"groupIdentifiersAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"privateNetworkValuesAllowed":false,"groupScopes":["datacenter-final-approval","technical-approval","business-approval","risk-approval","emergency-approval","audit-review","service-specific-delegation"],"groupStates":["not-created","planned","pending-review","approved","delegated","expired","blocked"],"mappingDimensions":["role","site","service","workflow","criticality","emergency","separation-of-duties"],"requiredGuards":["default-datacenter-approver-reviewed","group-purpose-reviewed","delegation-boundary-reviewed","separation-of-duties-reviewed","break-glass-reviewed","expiry-review-set","evidence-redacted","live-identity-lookup-blocked"],"blockedReasons":["approval-groups-live-identity-lookup-disabled","approval-groups-graph-calls-disabled","approval-groups-role-assignment-disabled","approval-groups-group-membership-mutation-disabled","approval-groups-approval-mutation-disabled","approval-groups-policy-mutation-disabled","approval-groups-workflow-mutation-disabled","approval-groups-provider-calls-disabled","approval-groups-notification-dispatch-disabled","approval-groups-raw-user-data-disabled","approval-groups-raw-group-data-disabled","approval-groups-raw-membership-rows-disabled","approval-groups-raw-approval-payloads-disabled","approval-groups-raw-provider-payloads-disabled","approval-groups-raw-recipient-data-disabled","approval-groups-tenant-identifiers-disabled","approval-groups-object-identifiers-disabled","approval-groups-principal-identifiers-disabled","approval-groups-group-identifiers-disabled","approval-groups-credential-values-disabled","approval-groups-token-values-disabled","approval-groups-private-network-values-disabled","group-scope-missing","delegation-boundary-missing","separation-of-duties-missing","evidence-not-redacted"],"requiredEvidence":["Approval group mapping summary","Datacenter fallback summary","Delegation boundary summary","Separation of duties summary","Evidence references"],"rules":[{"id":"approval-groups-read-only","decision":"block","requirement":"Admin approval group mappings are static summaries and must not look up live identity groups, mutate membership, assign roles, or execute approvals.","evidence":"Approval group mapping summary"},{"id":"datacenter-fallback-required","decision":"block","requirement":"Datacenter final approval remains the default live-execution authority until delegated service-specific approval groups are formally reviewed.","evidence":"Datacenter fallback summary"},{"id":"delegation-boundary-required","decision":"block","requirement":"Approval group delegation requires group purpose, role, site, service, workflow, criticality, emergency scope, expiry, and separation-of-duties review.","evidence":"Delegation boundary summary"},{"id":"raw-approval-group-data-not-exposed","decision":"block","requirement":"Approval group evidence must not expose raw user data, raw group data, raw membership rows, raw approval payloads, raw provider payloads, raw recipient data, tenant identifiers, object identifiers, principal identifiers, group identifiers, credential values, token values, private network values, live endpoints, or URLs.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct DelegationBoundaryQuery {
+    delegate_role: Option<String>,
+    site_scope: Option<String>,
+    approval_route: Option<String>,
+    expiry: Option<String>,
+    separation_of_duties: Option<String>,
+    break_glass: Option<String>,
+    evidence_manifest: Option<String>,
+}
+
+/// Dry-run admin delegation-boundary readiness. Turns the static
+/// `admin/delegation-boundary` descriptor into a real decision: evaluate the
+/// boundary-review guards over a proposed delegation and return `boundary-recorded`
+/// (all criteria met; the live delegation change is a separately-approved step) or
+/// `block`. Never changes live delegation; evidence is referenced by summary only.
+async fn admin_delegation_boundary_readiness(
+    Query(params): Query<DelegationBoundaryQuery>,
+) -> Json<Value> {
+    let input = delegation_boundary::DelegationBoundaryInput {
+        delegate_role: params.delegate_role,
+        site_scope: params.site_scope,
+        approval_route: params.approval_route,
+        expiry: params.expiry,
+        separation_of_duties: params.separation_of_duties,
+        break_glass: params.break_glass,
+        evidence_manifest: params.evidence_manifest,
+    };
+    let result = delegation_boundary::evaluate_delegation_boundary(&input);
+    Json(json!(result))
 }
 
 async fn admin_delegation_boundary() -> Json<Value> {
@@ -22118,6 +22155,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "readiness-recorded");
     }
+
+    /// admin delegation-boundary readiness through the router: a complete request
+    /// records the boundary.
+    #[tokio::test]
+    async fn router_serves_admin_delegation_boundary_readiness() {
+        let (status, json) = get_json(
+            "/api/admin/delegation-boundary-readiness?delegate_role=site-approver&site_scope=DEFRA&approval_route=datacenter-final-approval&expiry=2026-12-31&separation_of_duties=sod1&break_glass=bg1&evidence_manifest=ev",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "boundary-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22160,6 +22209,38 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "readiness-recorded");
+    }
+
+    /// The admin delegation-boundary readiness endpoint blocks an incomplete
+    /// request and records the boundary for a complete one.
+    #[tokio::test]
+    async fn admin_delegation_boundary_blocks_then_records() {
+        let Json(blocked) = admin_delegation_boundary_readiness(Query(DelegationBoundaryQuery {
+            delegate_role: None,
+            site_scope: None,
+            approval_route: None,
+            expiry: None,
+            separation_of_duties: None,
+            break_glass: None,
+            evidence_manifest: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "approval-route-missing")));
+
+        let Json(ready) = admin_delegation_boundary_readiness(Query(DelegationBoundaryQuery {
+            delegate_role: Some("site-approver".into()),
+            site_scope: Some("DEFRA".into()),
+            approval_route: Some("datacenter-final-approval".into()),
+            expiry: Some("2026-12-31".into()),
+            separation_of_duties: Some("sod1".into()),
+            break_glass: Some("bg1".into()),
+            evidence_manifest: Some("ev".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "boundary-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
