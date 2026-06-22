@@ -44,6 +44,7 @@ const DECLARED_MODULES: &[&str] = &[
     "incident_context",
     "integration_connections",
     "inventory_sync",
+    "knowledge_suggestion",
     "legal_hold",
     "linux_deployment",
     "load_balancer",

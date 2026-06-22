@@ -34,6 +34,7 @@ pub mod immutability_compliance;
 pub mod incident_context;
 pub mod integration_connections;
 pub mod inventory_sync;
+pub mod knowledge_suggestion;
 pub mod legal_hold;
 pub mod linux_deployment;
 pub mod load_balancer;

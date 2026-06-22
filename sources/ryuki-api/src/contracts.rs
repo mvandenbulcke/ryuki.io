@@ -60,6 +60,7 @@ use ryuki_engine::image_factory;
 use ryuki_engine::immutability_compliance;
 use ryuki_engine::incident_context;
 use ryuki_engine::inventory_sync;
+use ryuki_engine::knowledge_suggestion;
 use ryuki_engine::legal_hold;
 use ryuki_engine::linux_deployment;
 use ryuki_engine::load_balancer;
@@ -826,6 +827,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/knowledge-suggestion-contract",
             get(operations_knowledge_suggestion),
+        )
+        .route(
+            "/api/operations/knowledge-suggestion-readiness",
+            get(operations_knowledge_suggestion_readiness),
         )
         .route("/api/images/factory-contract", get(images_factory))
         .route(
@@ -6545,6 +6550,41 @@ async fn operations_aiops_suggestion() -> Json<Value> {
     Json(
         json!({"source":"static-seed","suggestionMode":"recommendation-only","dryRunRequired":true,"providerCallsEnabled":false,"liveCorrelationAllowed":false,"liveRemediationAllowed":false,"liveTicketMutationAllowed":false,"automationDispatchAllowed":false,"rawOperationRowsAllowed":false,"rawHealthRowsAllowed":false,"rawLogPayloadsAllowed":false,"rawUserDataAllowed":false,"rawRecipientDataAllowed":false,"rawProviderPayloadsAllowed":false,"suggestionSources":["operation-health-pattern","platform-health-pattern","incident-context-pattern","shift-queue-pattern","failed-run-pattern","degradation-pattern","evidence-gap-pattern"],"suggestionSignals":["repeat-failure","blocked-workflow","correlated-degradation","rising-risk","stale-data","evidence-gap","owner-unknown"],"requiredInputs":["signalSummary","affectedWorkflow","healthDomain","impactBand","owner","supportGroup","reviewer","evidenceManifest"],"requiredGuards":["signal-summary-redacted","correlation-static-only","impact-band-known","owner-route-known","reviewer-assigned","recommendation-redacted","automation-disabled","evidence-redacted"],"planSections":["signalSummary","correlationSummary","impactAssessment","recommendationCandidate","ownerRoute","reviewRoute","safeNextAction","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-correlation-disabled","live-remediation-disabled","live-ticket-mutation-disabled","automation-dispatch-disabled","raw-operation-rows-disabled","raw-health-rows-disabled","raw-log-payloads-disabled","raw-user-data-disabled","raw-recipient-data-disabled","raw-provider-payloads-disabled","signal-summary-missing","reviewer-missing","recommendation-not-redacted","evidence-not-redacted"],"requiredEvidence":["AIOps signal summary","Static correlation summary","Impact assessment","Recommendation candidate","Owner route","Review route","Safe next action","Evidence references"],"rules":[{"id":"no-live-correlation","decision":"block","requirement":"AIOps suggestions use static, aggregate, or manually reviewed summaries only and never query live provider, ticket, monitoring, backup, inventory, or log systems.","evidence":"Static correlation summary"},{"id":"no-live-remediation","decision":"block","requirement":"AIOps suggestions recommend safe next actions only and never dispatch workers, mutate workflows, suppress alerts, restart services, remediate providers, or create tickets.","evidence":"Safe next action"},{"id":"reviewer-route-required","decision":"block","requirement":"Each suggestion requires a reviewer, owner route, support group, impact band, and redacted evidence before it can be exported or shown as actionable.","evidence":"Review route"},{"id":"raw-aiops-data-not-exposed","decision":"block","requirement":"AIOps suggestion evidence must use safe summaries only and must not expose raw operation rows, raw health rows, raw logs, raw user data, raw recipient data, ticket IDs, incident IDs, change IDs, tenant IDs, object IDs, private IPs, serial numbers, live endpoints, or provider payloads.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct KnowledgeSuggestionQuery {
+    failure_pattern_summary: Option<String>,
+    operation_taxonomy: Option<String>,
+    reviewer: Option<String>,
+    safe_recommendation: Option<String>,
+    evidence_manifest: Option<String>,
+    affected_workflow: Option<String>,
+    owner: Option<String>,
+    support_group: Option<String>,
+}
+
+/// Dry-run operations knowledge-suggestion readiness. Turns the static
+/// `operations/knowledge-suggestion` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed knowledge/runbook suggestion and return
+/// `suggestion-recorded` (all criteria met; publication is a separately-approved
+/// step) or `block`. Never publishes knowledge or mutates tickets; evidence is
+/// referenced by summary only.
+async fn operations_knowledge_suggestion_readiness(
+    Query(params): Query<KnowledgeSuggestionQuery>,
+) -> Json<Value> {
+    let input = knowledge_suggestion::KnowledgeSuggestionInput {
+        failure_pattern_summary: params.failure_pattern_summary,
+        operation_taxonomy: params.operation_taxonomy,
+        reviewer: params.reviewer,
+        safe_recommendation: params.safe_recommendation,
+        evidence_manifest: params.evidence_manifest,
+        affected_workflow: params.affected_workflow,
+        owner: params.owner,
+        support_group: params.support_group,
+    };
+    let result = knowledge_suggestion::evaluate_knowledge_suggestion(&input);
+    Json(json!(result))
 }
 
 async fn operations_knowledge_suggestion() -> Json<Value> {
@@ -22160,6 +22200,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "boundary-recorded");
     }
+
+    /// operations knowledge-suggestion readiness through the router: a complete
+    /// request records the suggestion.
+    #[tokio::test]
+    async fn router_serves_operations_knowledge_suggestion_readiness() {
+        let (status, json) = get_json(
+            "/api/operations/knowledge-suggestion-readiness?failure_pattern_summary=fps&operation_taxonomy=disk-pressure&reviewer=ops&safe_recommendation=rec&evidence_manifest=ev&affected_workflow=patch&owner=team&support_group=sg",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "suggestion-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22234,6 +22286,42 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "boundary-recorded");
+    }
+
+    /// The operations knowledge-suggestion readiness endpoint blocks an incomplete
+    /// request and records the suggestion for a complete one.
+    #[tokio::test]
+    async fn operations_knowledge_suggestion_blocks_then_records() {
+        let Json(blocked) =
+            operations_knowledge_suggestion_readiness(Query(KnowledgeSuggestionQuery {
+                failure_pattern_summary: None,
+                operation_taxonomy: None,
+                reviewer: None,
+                safe_recommendation: None,
+                evidence_manifest: None,
+                affected_workflow: None,
+                owner: None,
+                support_group: None,
+            }))
+            .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "reviewer-missing")));
+
+        let Json(ready) =
+            operations_knowledge_suggestion_readiness(Query(KnowledgeSuggestionQuery {
+                failure_pattern_summary: Some("fps".into()),
+                operation_taxonomy: Some("disk-pressure".into()),
+                reviewer: Some("ops".into()),
+                safe_recommendation: Some("rec".into()),
+                evidence_manifest: Some("ev".into()),
+                affected_workflow: Some("patch".into()),
+                owner: Some("team".into()),
+                support_group: Some("sg".into()),
+            }))
+            .await;
+        assert_eq!(ready["decision"], "suggestion-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.
