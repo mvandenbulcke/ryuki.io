@@ -43,6 +43,7 @@ use ryuki_engine::container_namespace;
 use ryuki_engine::cost_capacity;
 use ryuki_engine::customization_spec_governance;
 use ryuki_engine::datacenter_readiness;
+use ryuki_engine::dc_readiness;
 use ryuki_engine::decommission_quarantine;
 use ryuki_engine::degradation_mode;
 use ryuki_engine::degradation_readiness;
@@ -710,6 +711,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/datacenter-readiness-contract",
             get(operations_datacenter_readiness),
+        )
+        .route(
+            "/api/operations/datacenter-readiness-review",
+            get(operations_datacenter_readiness_review),
         )
         .route(
             "/api/operations/out-of-band-access-validation-contract",
@@ -6480,6 +6485,49 @@ async fn operations_run_state() -> Json<Value> {
     Json(
         json!({"source":"static-seed","operationRunStateMode":"static-operation-run-state","operationStateReadOnly":true,"childOperationStateReadOnly":true,"lockStateReadOnly":true,"retryStateReadOnly":true,"redactedLogSummaryOnly":true,"liveExecutionAllowed":false,"workerDispatchAllowed":false,"providerCallsAllowed":false,"operationMutationAllowed":false,"childOperationMutationAllowed":false,"lockMutationAllowed":false,"retryMutationAllowed":false,"workflowMutationAllowed":false,"rawOperationRowsAllowed":false,"rawChildOperationRowsAllowed":false,"rawExecutionLogsAllowed":false,"rawLockRowsAllowed":false,"rawRetryRowsAllowed":false,"rawProviderPayloadsAllowed":false,"rawRecipientDataAllowed":false,"credentialValuesAllowed":false,"tokenValuesAllowed":false,"tenantIdentifiersAllowed":false,"objectIdentifiersAllowed":false,"privateNetworkValuesAllowed":false,"serialNumbersAllowed":false,"operationStates":["queued","blocked","planning","approval-wait","locked","executing","verifying","succeeded","failed","cancelled","degraded"],"childOperationStates":["pending","blocked","ready","running","retry-wait","succeeded","failed","skipped"],"lockStates":["not-required","pending","active","conflict","expired","released"],"retryStates":["not-retryable","retry-pending","backoff-wait","retry-exhausted","manual-review"],"logStates":["not-started","redacted-summary-ready","redaction-pending","blocked"],"requiredGuards":["operation-scope-known","child-operations-summarized","lock-scope-reviewed","retry-policy-reviewed","redacted-log-summary-ready","evidence-redacted","live-execution-blocked"],"blockedReasons":["run-state-live-execution-disabled","run-state-worker-dispatch-disabled","run-state-provider-calls-disabled","run-state-operation-mutation-disabled","run-state-child-operation-mutation-disabled","run-state-lock-mutation-disabled","run-state-retry-mutation-disabled","run-state-workflow-mutation-disabled","run-state-raw-operation-rows-disabled","run-state-raw-child-operation-rows-disabled","run-state-raw-execution-logs-disabled","run-state-raw-lock-rows-disabled","run-state-raw-retry-rows-disabled","run-state-raw-provider-payloads-disabled","run-state-raw-recipient-data-disabled","run-state-credential-values-disabled","run-state-token-values-disabled","run-state-tenant-identifiers-disabled","run-state-object-identifiers-disabled","run-state-private-network-values-disabled","run-state-serials-disabled","operation-scope-missing","child-operation-state-unknown","lock-conflict","retry-policy-missing","redacted-log-missing","evidence-not-redacted"],"requiredEvidence":["Operation run summary","Child operation summary","Lock state summary","Retry state summary","Redacted log summary","Evidence references"],"rules":[{"id":"operation-run-state-read-only","decision":"block","requirement":"Operation run state summaries are read-only and must not execute, retry, cancel, close, or mutate operation runs.","evidence":"Operation run summary"},{"id":"child-lock-retry-state-read-only","decision":"block","requirement":"Child operation, lock, and retry state summaries are read-only and must not dispatch workers, acquire locks, release locks, or update retry state.","evidence":"Lock state summary"},{"id":"redacted-log-summary-required","decision":"block","requirement":"Run-state evidence must use redacted log summaries only and must not expose raw execution logs or provider payloads.","evidence":"Redacted log summary"},{"id":"raw-operation-run-data-not-exposed","decision":"block","requirement":"Operation run-state evidence must not expose raw operation rows, child operation rows, lock rows, retry rows, recipient data, credential values, token values, tenant identifiers, object identifiers, private network values, serial numbers, live endpoints, or URLs.","evidence":"Evidence references"}]}),
     )
+}
+
+#[derive(Deserialize)]
+struct DcReadinessQuery {
+    site: Option<String>,
+    owner: Option<String>,
+    rack_capacity: Option<String>,
+    power_cooling: Option<String>,
+    network_scope: Option<String>,
+    storage_scope: Option<String>,
+    firmware_baseline: Option<String>,
+    evidence_manifest: Option<String>,
+    requester: Option<String>,
+    cluster_profile: Option<String>,
+    hardware_profile: Option<String>,
+    capacity_need: Option<String>,
+}
+
+/// Dry-run operations datacenter-readiness review. Turns the static
+/// `operations/datacenter-readiness` descriptor into a real decision: evaluate the
+/// readiness guards over a proposed datacenter-readiness request and return
+/// `datacenter-readiness-recorded` (all criteria met; the live provisioning is a
+/// separately-approved step) or `block`. Never provisions (distinct from the
+/// stateful datacenter_readiness engine).
+async fn operations_datacenter_readiness_review(
+    Query(params): Query<DcReadinessQuery>,
+) -> Json<Value> {
+    let input = dc_readiness::DcReadinessInput {
+        site: params.site,
+        owner: params.owner,
+        rack_capacity: params.rack_capacity,
+        power_cooling: params.power_cooling,
+        network_scope: params.network_scope,
+        storage_scope: params.storage_scope,
+        firmware_baseline: params.firmware_baseline,
+        evidence_manifest: params.evidence_manifest,
+        requester: params.requester,
+        cluster_profile: params.cluster_profile,
+        hardware_profile: params.hardware_profile,
+        capacity_need: params.capacity_need,
+    };
+    let result = dc_readiness::evaluate_dc_readiness(&input);
+    Json(json!(result))
 }
 
 async fn operations_datacenter_readiness() -> Json<Value> {
@@ -22571,6 +22619,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "hardware-lifecycle-recorded");
     }
+
+    /// operations datacenter-readiness review through the router: a complete
+    /// request records readiness.
+    #[tokio::test]
+    async fn router_serves_operations_datacenter_readiness_review() {
+        let (status, json) = get_json(
+            "/api/operations/datacenter-readiness-review?site=DEFRA&owner=dc&rack_capacity=12U&power_cooling=ok&network_scope=prod&storage_scope=vsan&firmware_baseline=b26&evidence_manifest=ev&requester=r&cluster_profile=c&hardware_profile=h&capacity_need=8",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "datacenter-readiness-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -22923,6 +22983,48 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "hardware-lifecycle-recorded");
+    }
+
+    /// The operations datacenter-readiness review endpoint blocks an incomplete
+    /// request and records readiness for a complete one.
+    #[tokio::test]
+    async fn operations_datacenter_readiness_review_blocks_then_records() {
+        let Json(blocked) = operations_datacenter_readiness_review(Query(DcReadinessQuery {
+            site: None,
+            owner: None,
+            rack_capacity: None,
+            power_cooling: None,
+            network_scope: None,
+            storage_scope: None,
+            firmware_baseline: None,
+            evidence_manifest: None,
+            requester: None,
+            cluster_profile: None,
+            hardware_profile: None,
+            capacity_need: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "power-cooling-not-reviewed")));
+
+        let Json(ready) = operations_datacenter_readiness_review(Query(DcReadinessQuery {
+            site: Some("DEFRA".into()),
+            owner: Some("dc".into()),
+            rack_capacity: Some("12U".into()),
+            power_cooling: Some("ok".into()),
+            network_scope: Some("prod".into()),
+            storage_scope: Some("vsan".into()),
+            firmware_baseline: Some("b26".into()),
+            evidence_manifest: Some("ev".into()),
+            requester: Some("r".into()),
+            cluster_profile: Some("c".into()),
+            hardware_profile: Some("h".into()),
+            capacity_need: Some("8".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "datacenter-readiness-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.

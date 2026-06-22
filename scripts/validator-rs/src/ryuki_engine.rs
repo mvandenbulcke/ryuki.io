@@ -26,6 +26,7 @@ const DECLARED_MODULES: &[&str] = &[
     "cost_capacity",
     "customization_spec_governance",
     "datacenter_readiness",
+    "dc_readiness",
     "decommission_quarantine",
     "degradation_mode",
     "degradation_readiness",

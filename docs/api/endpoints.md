@@ -446,6 +446,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/operations/aiops-suggestion-contract` |
 | GET | `/api/operations/certificate-lifecycle-contract` |
 | GET | `/api/operations/datacenter-readiness-contract` |
+| GET | `/api/operations/datacenter-readiness-review` |
 | GET | `/api/operations/degradation-mode-contract` |
 | GET | `/api/operations/degradation-mode-readiness` |
 | GET | `/api/operations/dependency-replay-contract` |

@@ -16,6 +16,7 @@ pub mod container_namespace;
 pub mod cost_capacity;
 pub mod customization_spec_governance;
 pub mod datacenter_readiness;
+pub mod dc_readiness;
 pub mod decommission_quarantine;
 pub mod degradation_mode;
 pub mod degradation_readiness;
