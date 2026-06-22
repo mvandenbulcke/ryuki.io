@@ -1352,7 +1352,7 @@ impl Default for OidcConfig {
             token_endpoint: String::new(),
             jwks_uri: String::new(),
             client_id: String::new(),
-            client_secret: String::new(),
+            client_secret: String::new(), // secret-scan-allow: empty default, not a credential
             redirect_uri: String::new(),
             scopes: default_oidc_scopes(),
             roles_claim: default_oidc_roles_claim(),
@@ -2577,8 +2577,10 @@ mod tests {
 
     #[test]
     fn test_oidc_client_secret_not_in_debug() {
-        let mut config = OidcConfig::default();
-        config.client_secret = "super-secret".into();
+        let config = OidcConfig {
+            client_secret: "super-secret".into(),
+            ..OidcConfig::default()
+        };
         let dbg = format!("{config:?}");
         assert!(
             !dbg.contains("super-secret"),
