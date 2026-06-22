@@ -480,6 +480,7 @@ Regenerate with `cargo run --manifest-path scripts/validator-rs/Cargo.toml -- ge
 | GET | `/api/operations/run-state-contract` |
 | GET | `/api/operations/runbook-launch-contract` |
 | GET | `/api/operations/shift-queue-contract` |
+| GET | `/api/operations/shift-queue-review` |
 | GET | `/api/operations/standard-task-contract` |
 | GET | `/api/ops/emergency-contract` |
 | GET | `/api/ops/emergency/active` |

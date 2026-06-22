@@ -89,6 +89,7 @@ use ryuki_engine::server_decommission;
 use ryuki_engine::servicenow_api;
 use ryuki_engine::servicenow_future_api;
 use ryuki_engine::shift_queue;
+use ryuki_engine::shift_readiness;
 use ryuki_engine::site_registry;
 use ryuki_engine::snapshot_engine;
 use ryuki_engine::snapshot_governance;
@@ -676,6 +677,10 @@ pub fn routes() -> Router {
         .route(
             "/api/operations/shift-queue-contract",
             get(operations_shift_queue),
+        )
+        .route(
+            "/api/operations/shift-queue-review",
+            get(operations_shift_queue_review),
         )
         .route("/api/ops/shift/summary", get(shift_summary))
         .route("/api/ops/shift/acknowledge/{id}", post(shift_acknowledge))
@@ -5277,6 +5282,38 @@ async fn operations_emergency_change() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"modes":["break-glass","urgent-remediation","incident-containment","service-restoration"],"requiredGuards":["emergency-role-authorized","incident-or-ticket-linked","emergency-approver-assigned","scope-bounded","dry-run-ready","lock-record-ready","evidence-redacted"],"planSections":["emergencySummary","businessImpact","targetScope","riskJustification","approvalPath","rollbackNotes","verificationPlan","handoverNotes"],"blockedReasons":["live-execution-disabled","privileged-worker-disabled","role-not-authorized","incident-context-missing","approval-missing","scope-too-broad","lock-conflict","evidence-not-redacted"]}),
     )
+}
+
+#[derive(Deserialize)]
+struct ShiftReadinessQuery {
+    owner: Option<String>,
+    support_group: Option<String>,
+    safe_next_action: Option<String>,
+    stale_data_marker: Option<String>,
+    evidence_manifest: Option<String>,
+    severity: Option<String>,
+    queue_item_source: Option<String>,
+    handover_notes: Option<String>,
+}
+
+/// Dry-run operations shift-queue handover readiness review. Turns the static
+/// `operations/shift-queue` descriptor into a real decision: evaluate the readiness
+/// guards over a proposed handover item and return `shift-handover-recorded` (all
+/// criteria met; the live handover is a separately-approved step) or `block`. Never
+/// mutates the live queue (distinct from the stateful shift_queue engine).
+async fn operations_shift_queue_review(Query(params): Query<ShiftReadinessQuery>) -> Json<Value> {
+    let input = shift_readiness::ShiftReadinessInput {
+        owner: params.owner,
+        support_group: params.support_group,
+        safe_next_action: params.safe_next_action,
+        stale_data_marker: params.stale_data_marker,
+        evidence_manifest: params.evidence_manifest,
+        severity: params.severity,
+        queue_item_source: params.queue_item_source,
+        handover_notes: params.handover_notes,
+    };
+    let result = shift_readiness::evaluate_shift_readiness(&input);
+    Json(json!(result))
 }
 
 async fn operations_shift_queue() -> Json<Value> {
@@ -22631,6 +22668,18 @@ mod router_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["decision"], "datacenter-readiness-recorded");
     }
+
+    /// operations shift-queue handover readiness through the router: a complete
+    /// item records handover readiness.
+    #[tokio::test]
+    async fn router_serves_operations_shift_queue_review() {
+        let (status, json) = get_json(
+            "/api/operations/shift-queue-review?owner=ops&support_group=sg&safe_next_action=escalate&stale_data_marker=fresh&evidence_manifest=ev&severity=P2&queue_item_source=op&handover_notes=n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["decision"], "shift-handover-recorded");
+    }
 }
 
 #[cfg(test)]
@@ -23025,6 +23074,41 @@ mod unit_tests {
         }))
         .await;
         assert_eq!(ready["decision"], "datacenter-readiness-recorded");
+    }
+
+    /// The operations shift-queue review endpoint blocks an incomplete item and
+    /// records handover readiness for a complete one; severity is context-only.
+    #[tokio::test]
+    async fn operations_shift_queue_review_blocks_then_records() {
+        let Json(blocked) = operations_shift_queue_review(Query(ShiftReadinessQuery {
+            owner: None,
+            support_group: None,
+            safe_next_action: None,
+            stale_data_marker: None,
+            evidence_manifest: None,
+            severity: None,
+            queue_item_source: None,
+            handover_notes: None,
+        }))
+        .await;
+        assert_eq!(blocked["decision"], "block");
+        assert!(blocked["blocked_reasons"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x == "missing-safe-next-action")));
+
+        // severity absent must NOT block — it is context-only (no declared reason).
+        let Json(ready) = operations_shift_queue_review(Query(ShiftReadinessQuery {
+            owner: Some("ops".into()),
+            support_group: Some("sg".into()),
+            safe_next_action: Some("escalate".into()),
+            stale_data_marker: Some("fresh".into()),
+            evidence_manifest: Some("ev".into()),
+            severity: None,
+            queue_item_source: Some("op".into()),
+            handover_notes: Some("n".into()),
+        }))
+        .await;
+        assert_eq!(ready["decision"], "shift-handover-recorded");
     }
 
     /// The cmdb-file-row-validation action endpoint accepts a complete, valid row.

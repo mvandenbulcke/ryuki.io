@@ -77,6 +77,7 @@ const DECLARED_MODULES: &[&str] = &[
     "servicenow_api",
     "servicenow_future_api",
     "shift_queue",
+    "shift_readiness",
     "site_registry",
     "snapshot_engine",
     "snapshot_governance",

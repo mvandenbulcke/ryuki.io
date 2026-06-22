@@ -67,6 +67,7 @@ pub mod server_decommission;
 pub mod servicenow_api;
 pub mod servicenow_future_api;
 pub mod shift_queue;
+pub mod shift_readiness;
 pub mod site_registry;
 pub mod snapshot_engine;
 pub mod snapshot_governance;
