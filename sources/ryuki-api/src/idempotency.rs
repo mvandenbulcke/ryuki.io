@@ -135,6 +135,15 @@ fn replay_response(status: u16, body: String) -> Response {
 /// would silently drop — a redirect/resource `Location`, a `Set-Cookie`, an
 /// `ETag`/`Content-Location`, or a `Content-Encoding` (a gzipped body would be
 /// mangled by the lossy UTF-8 capture and replayed without its encoding header).
+///
+/// It is ALSO not deduped when the response is marked `Cache-Control: no-store`.
+/// That is the standard "do not persist this response" directive: handlers that
+/// reveal a one-time plaintext secret (a freshly minted API token, an enrollment
+/// credential) set it so the plaintext is never written to the dedup table.
+/// Releasing the claim means a retry re-runs rather than replaying a stored
+/// secret — the correct one-time semantic — and the credential never lands at
+/// rest in `idempotency_records`.
+///
 /// Such a response releases its claim and passes through unstored.
 fn is_replayable(response: &Response) -> bool {
     let headers = response.headers();
@@ -144,6 +153,19 @@ fn is_replayable(response: &Response) -> bool {
         .map(|ct| ct.starts_with("application/json"))
         .unwrap_or(false);
     if !is_json {
+        return false;
+    }
+    // `Cache-Control: no-store` → never persist (covers one-time secret reveals).
+    // Scan every Cache-Control header line and compare DIRECTIVES exactly (split
+    // on commas, trim, case-insensitive) so a second header line or an odd value
+    // can neither hide nor spoof the directive.
+    let no_store = headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|cc| cc.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"));
+    if no_store {
         return false;
     }
     const REPLAY_SIGNIFICANT: [header::HeaderName; 5] = [
@@ -802,6 +824,77 @@ mod db_tests {
         .unwrap();
         assert!(old.is_none(), "the expired record was deleted");
         assert!(fresh.is_some(), "the fresh record was retained");
+
+        sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
+            .bind(user)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// A `Cache-Control: no-store` response (a one-time secret reveal, e.g. a
+    /// freshly minted token) is NOT persisted or replayed: the claim is released,
+    /// so a retry re-runs and the secret never lands in idempotency_records.
+    #[tokio::test]
+    async fn no_store_response_is_not_persisted() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let user = "idem-test-nostore";
+        let key = "idem-test-nostore-key";
+        sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
+            .bind(user)
+            .execute(pool)
+            .await
+            .ok();
+
+        async fn no_store_handler() -> impl axum::response::IntoResponse {
+            static C: AtomicU64 = AtomicU64::new(0);
+            let n = C.fetch_add(1, Ordering::SeqCst);
+            (
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                axum::Json(serde_json::json!({ "call": n })),
+            )
+        }
+        let app = || {
+            Router::new()
+                .route("/s", post(no_store_handler))
+                .layer(axum::middleware::from_fn(idempotency_middleware))
+                .layer(Extension(session(user)))
+        };
+        let req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/s")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", key)
+                .body(Body::from("{\"x\":1}"))
+                .unwrap()
+        };
+
+        let (_, _, b1) = body_string(app().oneshot(req()).await.unwrap()).await;
+        let (_, r2, b2) = body_string(app().oneshot(req()).await.unwrap()).await;
+        assert!(!r2, "a no-store response is never replayed");
+        assert_ne!(
+            b1, b2,
+            "a no-store response is not deduped; the handler runs each time"
+        );
+
+        // Nothing for the key was persisted — the secret never lands at rest.
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT key FROM idempotency_records WHERE user_scope = $1 AND key = $2",
+        )
+        .bind(user)
+        .bind(key)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        assert!(
+            row.is_none(),
+            "a no-store response must not be stored in idempotency_records"
+        );
 
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)

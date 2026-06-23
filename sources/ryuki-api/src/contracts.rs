@@ -11490,7 +11490,14 @@ struct TokenListRow {
 async fn admin_tokens_create(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<CreateTokenRequest>,
-) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<ApiError>)> {
+) -> Result<
+    (
+        StatusCode,
+        [(axum::http::header::HeaderName, &'static str); 1],
+        Json<Value>,
+    ),
+    (StatusCode, Json<ApiError>),
+> {
     require_admin_permission(&session)?;
 
     // Only an interactive admin may mint tokens. A machine `api-token` passing
@@ -11592,6 +11599,11 @@ async fn admin_tokens_create(
 
     Ok((
         StatusCode::CREATED,
+        // `no-store` keeps the one-time plaintext out of any persisting
+        // intermediary — including the idempotency middleware, which skips
+        // storing/replaying a no-store response so the token never lands at rest
+        // in `idempotency_records`.
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "id": row.id,
             "name": row.name,

@@ -93,8 +93,20 @@ are NULL between the claim and the handler completing (the in-flight window the
 - **Slice 2b.** Require the header on the highest-risk routes (e.g.
   `emergency/initiate`) rather than leaving it optional.
 
+### One-time secrets are never stored (`Cache-Control: no-store`)
+
+A handler that reveals a one-time plaintext secret (e.g. `admin_tokens_create`
+returns a freshly minted token exactly once, persisting only its hash) sets
+`Cache-Control: no-store` on its response. The middleware honors that directive:
+a no-store response releases its claim and is **not** stored or replayed, so the
+plaintext never lands at rest in `idempotency_records`. The trade-off is that
+such an endpoint is not deduplicated — a retry re-runs (its pre-idempotency
+behavior) rather than replaying a stored secret, which is the correct one-time
+semantic. This is enforced centrally in `is_replayable`, not per handler.
+
 ## What this does NOT do
 
-It does not change any handler. Clients that do not send `Idempotency-Key` get
-exactly today's behavior (a retry still duplicates) — idempotency is opt-in per
-request, which is the standard HTTP contract.
+Clients that do not send `Idempotency-Key` get exactly today's behavior (a retry
+still duplicates) — idempotency is opt-in per request, the standard HTTP
+contract. The only handler change is the `no-store` header on one-time-secret
+responses (correct HTTP hardening, independent of this feature).
