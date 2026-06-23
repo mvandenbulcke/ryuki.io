@@ -360,7 +360,6 @@ pub struct CreateConnectionRequest {
     /// After encryption, this value is DISCARDED and never stored or returned.
     #[serde(default)]
     pub inline_secret: String,
-    pub created_by: Option<String>,
 }
 
 impl std::fmt::Debug for CreateConnectionRequest {
@@ -373,7 +372,6 @@ impl std::fmt::Debug for CreateConnectionRequest {
             .field("credential_source", &self.credential_source)
             .field("credential_ref", &self.credential_ref)
             .field("inline_secret", &"[REDACTED]")
-            .field("created_by", &self.created_by)
             .finish()
     }
 }
@@ -572,7 +570,10 @@ pub async fn integration_create(
 
     let now = now_iso();
     let id = ryuki_engine::integration_connections::new_connection_id(&body.vendor_type);
-    let created_by = body.created_by.unwrap_or_else(|| session.user_id.clone());
+    // created_by = the authenticated caller, never a client body field. This is
+    // an audit/attribution column (and feeds downstream ownership checks), so it
+    // must name the real principal and cannot be spoofed by the request body.
+    let created_by = session.user_id.clone();
 
     if let Some(pool) = get_db() {
         // FIX-6: validate env-var key names before any DB writes.
@@ -2636,7 +2637,6 @@ mod unit_tests {
             credential_source: "db-encrypted".to_string(),
             credential_ref: String::new(),
             inline_secret: "super-secret-value-that-must-not-appear-in-logs".to_string(),
-            created_by: None,
         };
         let debug = format!("{:?}", req);
         assert!(

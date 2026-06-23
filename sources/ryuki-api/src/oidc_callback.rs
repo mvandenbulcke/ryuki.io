@@ -241,11 +241,13 @@ impl JwksCache {
         let doc: OidcJwksDocument = resp.json().await.map_err(|_| ())?;
         let mut keys = HashMap::new();
         for jwk in doc.keys {
-            if let Some(kty) = &jwk.kty {
-                if kty != "RSA" {
-                    continue;
-                }
+            // `kty` is REQUIRED (RFC 7517 §4.1); only RSA keys are usable for the
+            // RS256 we enforce. Reject a key that omits it or is non-RSA — never
+            // build a decoding key from an untyped JWK.
+            if jwk.kty.as_deref() != Some("RSA") {
+                continue;
             }
+            // `use` is OPTIONAL (RFC 7517 §4.2); when present it must be "sig".
             if let Some(u) = &jwk.use_ {
                 if u != "sig" {
                     continue;

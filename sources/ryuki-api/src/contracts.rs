@@ -10150,8 +10150,9 @@ async fn auth_local_login(
         "create",
     )?;
 
-    // Success log: username + session creation only, never the password.
-    tracing::info!(username = %user.username, session_id = %session_id, "local login session created");
+    // Success log: username + session creation only. Never the password, and
+    // never the session_id — it IS the bearer cookie credential.
+    tracing::info!(username = %user.username, "local login session created");
 
     let response_body =
         local_login_response_body(&session_id, &user.username, &user.roles, &expires_at);
@@ -10207,7 +10208,8 @@ async fn logout_caller_session(headers: &HeaderMap) {
 
     match delete_result {
         Ok(_) => {
-            tracing::info!(session_id = %session_id, "logout deleted caller session");
+            // Never log the session_id — it is the bearer cookie credential.
+            tracing::info!("logout deleted caller session");
             let actor = match row {
                 Some(r) => AuthSession {
                     user_id: r.user_id,

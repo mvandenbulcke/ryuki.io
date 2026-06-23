@@ -482,6 +482,12 @@ pub async fn insert_campaign(
     .fetch_one(pool)
     .await?;
 
+    // Checked narrowing to the INT columns — never silently truncate a COUNT.
+    let reviews_count =
+        i32::try_from(reviews_count).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    let completed_count =
+        i32::try_from(completed_count).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+
     let row: CampaignRow = sqlx::query_as(&format!(
         "INSERT INTO recertification_campaigns \
          (id, name, start_date, end_date, review_type, reviewer_group, reviews_count, completed_count, status) \
@@ -494,8 +500,8 @@ pub async fn insert_campaign(
     .bind(end_date)
     .bind(&review_type_str)
     .bind(&campaign.reviewer_group)
-    .bind(reviews_count as i32)
-    .bind(completed_count as i32)
+    .bind(reviews_count)
+    .bind(completed_count)
     .bind(campaign.status.to_string())
     .fetch_one(pool)
     .await?;
