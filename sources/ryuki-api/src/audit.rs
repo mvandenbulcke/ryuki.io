@@ -94,6 +94,10 @@ fn redact_detail(value: &Value) -> Value {
     }
 }
 
+/// Cap on the process-local (no-DB / dry-run) audit store so a long-running
+/// instance cannot grow memory without bound. The most recent entries are kept.
+const MAX_LOCAL_AUDIT: usize = 10_000;
+
 static AUDIT_STORE: OnceLock<Mutex<Vec<AuditEntry>>> = OnceLock::new();
 
 fn audit_store() -> &'static Mutex<Vec<AuditEntry>> {
@@ -187,7 +191,13 @@ pub async fn record_audit(
 /// Append to the process-local audit store (no-DB / dry-run mode). Tagged
 /// non-durable when served so demo output is never mistaken for a real trail.
 pub async fn record_audit_local(session: &AuthSession, record: &AuditRecord<'_>) {
-    audit_store().lock().await.push(entry_from(session, record));
+    let mut store = audit_store().lock().await;
+    store.push(entry_from(session, record));
+    // Keep only the most recent MAX_LOCAL_AUDIT entries (bounded ring window).
+    if store.len() > MAX_LOCAL_AUDIT {
+        let excess = store.len() - MAX_LOCAL_AUDIT;
+        store.drain(0..excess);
+    }
 }
 
 /// Best-effort audit of a DENIED (403) attempt caught at the HANDLER level

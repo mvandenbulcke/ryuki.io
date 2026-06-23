@@ -719,7 +719,7 @@ impl Default for CorsConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SmtpConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -729,12 +729,35 @@ pub struct SmtpConfig {
     pub port: u16,
     #[serde(default)]
     pub username: String,
-    #[serde(default, rename = "password")]
+    /// SMTP password / credential.
+    ///
+    /// # Security
+    /// Excluded from serialization (`skip_serializing`) so it can never leak
+    /// into an API response or platform summary, and redacted by the manual
+    /// `Debug` impl below — a derived `Debug` would expose it through any
+    /// `{:?}` formatting (tracing, panics, diagnostics). Never log this value.
+    #[serde(default, rename = "password", skip_serializing)]
     pub credential: String,
     #[serde(default = "default_smtp_from")]
     pub from_address: String,
     #[serde(default)]
     pub use_tls: bool,
+}
+
+// Manual `Debug` so `credential` is never printed (mirrors OidcConfig).
+// `skip_serializing` only guards serde, not `Debug`.
+impl std::fmt::Debug for SmtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("enabled", &self.enabled)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("credential", &"[redacted]")
+            .field("from_address", &self.from_address)
+            .field("use_tls", &self.use_tls)
+            .finish()
+    }
 }
 
 fn default_smtp_host() -> String {
@@ -2589,6 +2612,36 @@ mod tests {
         assert!(
             dbg.contains("[redacted]"),
             "Debug must mark client_secret as redacted: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_smtp_credential_not_in_debug() {
+        let config = SmtpConfig {
+            credential: "smtp-super-secret".into(),
+            ..SmtpConfig::default()
+        };
+        let dbg = format!("{config:?}");
+        assert!(
+            !dbg.contains("smtp-super-secret"),
+            "SMTP credential value must not appear in Debug output: {dbg}"
+        );
+        assert!(
+            dbg.contains("[redacted]"),
+            "Debug must mark the SMTP credential as redacted: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_smtp_credential_not_serialized() {
+        let config = SmtpConfig {
+            credential: "smtp-super-secret".into(),
+            ..SmtpConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize SmtpConfig");
+        assert!(
+            !json.contains("smtp-super-secret"),
+            "SMTP credential must be skip_serializing'd out of JSON: {json}"
         );
     }
 

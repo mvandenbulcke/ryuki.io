@@ -156,6 +156,14 @@ struct JwksState {
 
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// Upper bound on cached JWKS signing keys. A real IdP publishes a small handful
+/// (current + rotating); this caps the retained key set.
+const MAX_JWKS_KEYS: usize = 32;
+
+/// Upper bound on the JWKS response body (declared length). A real JWKS is a few
+/// KiB; reject anything that claims to be larger before deserializing it.
+const MAX_JWKS_BYTES: u64 = 1 << 20;
+
 struct JwksCache {
     http: reqwest::Client,
     jwks_uri: String,
@@ -238,9 +246,20 @@ impl JwksCache {
         if !resp.status().is_success() {
             return Err(());
         }
+        // Reject an oversized body before buffering/deserializing it — a real
+        // JWKS is a few KiB. Guards the declared-length case; the cache cap below
+        // bounds the retained key set regardless.
+        if resp.content_length().is_some_and(|n| n > MAX_JWKS_BYTES) {
+            return Err(());
+        }
         let doc: OidcJwksDocument = resp.json().await.map_err(|_| ())?;
         let mut keys = HashMap::new();
         for jwk in doc.keys {
+            // Bound the retained cache: a real signing JWKS holds a handful of
+            // keys; cap the long-lived key set.
+            if keys.len() >= MAX_JWKS_KEYS {
+                break;
+            }
             // `kty` is REQUIRED (RFC 7517 §4.1); only RSA keys are usable for the
             // RS256 we enforce. Reject a key that omits it or is non-RSA — never
             // build a decoding key from an untyped JWK.

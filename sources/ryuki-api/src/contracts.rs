@@ -12378,6 +12378,14 @@ async fn requests_create(
         }
     }
 
+    // cpu/memory_gb arrive as u32 but persist to i32 columns. Reject values that
+    // would overflow i32 (and silently become negative) rather than corrupt the
+    // row — checked once here so both the DB and no-DB paths agree.
+    let cpu_i32 =
+        i32::try_from(body.cpu).map_err(|_| status_400("cpu exceeds the maximum allowed value"))?;
+    let memory_i32 = i32::try_from(body.memory_gb)
+        .map_err(|_| status_400("memory_gb exceeds the maximum allowed value"))?;
+
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_error)?;
         // CreateRequest has no criticality field; default "standard", matching
@@ -12404,8 +12412,8 @@ async fn requests_create(
         .bind(&body.site)
         .bind(&body.environment)
         .bind(&body.name)
-        .bind(body.cpu as i32)
-        .bind(body.memory_gb as i32)
+        .bind(cpu_i32)
+        .bind(memory_i32)
         .bind(&body.justification)
         .bind(&session.user_id)
         .bind(&payload)

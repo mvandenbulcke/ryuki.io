@@ -313,8 +313,10 @@ pub fn OperationsWorkspaceView() -> impl IntoView {
 #[component]
 pub fn AdminWorkspaceView() -> impl IntoView {
     // The admin workspace card is already role-gated to PlatformAdmin via the
-    // catalog; the token/session panels are gated again on the `admin`
-    // capability so non-admins never see them even if the route is reached.
+    // catalog; the mutating panels (platform settings, token/session admin) are
+    // gated again on the `admin` capability so non-admins never see or act on
+    // them even if the route is reached (defense in depth — the upstream API is
+    // the authoritative gate, this prevents rendering the controls at all).
     let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
     let is_admin = session_can(&auth_session, "admin");
 
@@ -322,10 +324,10 @@ pub fn AdminWorkspaceView() -> impl IntoView {
         <div class="workspace-area">
             <WorkspaceSummaryCards only="admin"/>
             <section class="workspace-detail-grid" aria-label="Admin workspace details">
-                <AdminSettingsDetail/>
                 <SecurityWorkspaceDetail/>
                 <SecretReferenceWorkspaceDetail/>
                 <Show when=move || is_admin fallback=|| ()>
+                    <AdminSettingsDetail/>
                     <TokenAdministrationDetail/>
                     <SessionAdministrationDetail/>
                 </Show>

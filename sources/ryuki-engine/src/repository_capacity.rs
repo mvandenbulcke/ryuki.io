@@ -133,6 +133,15 @@ pub fn forecast_capacity(repos: &[Repository], repository_id: &str, days: u32) -
     );
     let projected_status = compute_status(projected_days);
 
+    // Guard the divisor exactly as projected_pct does above: a repository with
+    // zero/absent total_capacity_tb would otherwise yield NaN/Inf, which serde
+    // serializes as null. Report 0% instead.
+    let current_pct = if repo.total_capacity_tb > 0.0 {
+        ((repo.used_capacity_tb / repo.total_capacity_tb * 100.0) * 10.0).round() / 10.0
+    } else {
+        0.0
+    };
+
     Some(json!({
         "repository_id": repo.id,
         "name": repo.name,
@@ -141,7 +150,7 @@ pub fn forecast_capacity(repos: &[Repository], repository_id: &str, days: u32) -
         "forecast_days": days,
         "current": {
             "used_capacity_tb": repo.used_capacity_tb,
-            "utilization_pct": ((repo.used_capacity_tb / repo.total_capacity_tb * 100.0) * 10.0).round() / 10.0,
+            "utilization_pct": current_pct,
             "days_until_full": repo_days(repo),
             "status": repo_status(repo)
         },
@@ -371,6 +380,31 @@ mod tests {
                 last_forecast: "2026-06-11T08:00:00Z".into(),
             },
         ]
+    }
+
+    #[test]
+    fn test_forecast_zero_capacity_does_not_divide_by_zero() {
+        // A repository with zero total capacity must not produce NaN/Inf (which
+        // serde would render as null) for utilization_pct — it reports 0%.
+        let repos = vec![Repository {
+            id: "repo-zero".into(),
+            name: "empty".into(),
+            repository_type: RepositoryType::StoreOnce,
+            site: "DEFRA".into(),
+            total_capacity_tb: 0.0,
+            used_capacity_tb: 0.0,
+            growth_rate_gb_per_day: 10.0,
+            last_forecast: "2026-06-11T08:00:00Z".into(),
+        }];
+        let result = forecast_capacity(&repos, "repo-zero", 30).expect("forecast present");
+        assert_eq!(
+            result["current"]["utilization_pct"], 0.0,
+            "zero-capacity current utilization must be 0, not null/NaN: {result}"
+        );
+        assert_eq!(
+            result["projected"]["utilization_pct"], 0.0,
+            "zero-capacity projected utilization must be 0: {result}"
+        );
     }
 
     #[test]
