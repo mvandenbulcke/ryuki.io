@@ -81,14 +81,17 @@ are NULL between the claim and the handler completing (the in-flight window the
 
 ## Slice plan
 
-- **Slice 1 (this change).** The `idempotency_records` table (`(user_scope, key)`
-  PK) + the middleware (claim / replay / conflict / in-flight / pass-through,
-  per-user scoping, in-flight TTL reclaim, JSON-only dedup) wired into the
-  router, with unit tests for the fingerprint and decision logic and DB-gated
-  integration tests for claim→replay, key-reuse→422, and cross-tenant isolation.
-- **Slice 2.** A background sweep for expired keys; require the header on the
-  highest-risk routes (e.g. `emergency/initiate`) rather than leaving it
-  optional.
+- **Slice 1.** The `idempotency_records` table (`(user_scope, key)` PK) + the
+  middleware (claim / replay / conflict / in-flight / pass-through, per-user
+  scoping, in-flight TTL reclaim, JSON-only dedup) wired into the router, with
+  unit tests for the fingerprint and decision logic and DB-gated integration
+  tests for claim→replay, key-reuse→422, and cross-tenant isolation.
+- **Slice 2a (this change).** The retention sweep: a background task
+  (`spawn_idempotency_sweep`) deletes records older than the 24h retention
+  window every hour, bounding the table and making a key reusable after the
+  window. DB-gated test for expired-deleted / fresh-retained.
+- **Slice 2b.** Require the header on the highest-risk routes (e.g.
+  `emergency/initiate`) rather than leaving it optional.
 
 ## What this does NOT do
 

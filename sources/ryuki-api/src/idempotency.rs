@@ -17,6 +17,8 @@ use axum::{
 };
 use ryuki_engine::auth::AuthSession;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use tokio::time::interval;
 
 use crate::database::get_db;
 
@@ -329,6 +331,51 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
         // concurrent sweep). Fail open — run the handler.
         None => next.run(request).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retention sweep — bounds the table and makes a key reusable after the window.
+// ---------------------------------------------------------------------------
+
+/// How long a record is retained for replay before the background sweep deletes
+/// it. After this window the same key is reusable (a fresh claim succeeds) and
+/// the table stays bounded. Far longer than any realistic create retry; far
+/// longer than the in-flight TTL, so a swept row is always long past any handler.
+const RETENTION_TTL_SECS: f64 = 86_400.0; // 24 hours
+
+/// Delete idempotency records older than the retention window. Idempotent and
+/// safe to run concurrently; returns the number of rows removed. A row older
+/// than the retention window is long past any in-flight handler, so this never
+/// races a finalizing write. Uses DB-server time only (no client clock).
+pub async fn sweep_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let removed = sqlx::query(
+        "DELETE FROM idempotency_records WHERE created_at < NOW() - make_interval(secs => $1)",
+    )
+    .bind(RETENTION_TTL_SECS)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if removed > 0 {
+        tracing::info!(removed, "idempotency records swept");
+    }
+    Ok(removed)
+}
+
+/// Spawn a background task that sweeps expired idempotency records every
+/// `interval_secs`. Call once at startup after the DB pool is available; the
+/// task runs until the runtime shuts down. The sweep is idempotent, so a
+/// duplicate spawn is harmless.
+pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
+        ticker.tick().await; // skip the immediate first tick (just started)
+        loop {
+            ticker.tick().await;
+            if let Err(e) = sweep_expired_records(&pool).await {
+                tracing::error!(error = %e, "idempotency sweep failed");
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +739,69 @@ mod db_tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             "a different request on a dead key is a 422 conflict, not a reclaim"
         );
+
+        sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
+            .bind(user)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// The retention sweep deletes records older than the window and keeps fresh
+    /// ones — bounding the table and freeing the key after the window.
+    #[tokio::test]
+    async fn sweep_deletes_only_expired_records() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let user = "idem-test-sweep";
+        sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
+            .bind(user)
+            .execute(pool)
+            .await
+            .ok();
+
+        // One record well past the retention window, one fresh.
+        sqlx::query(
+            "INSERT INTO idempotency_records \
+             (user_scope, key, fingerprint, claim_id, response_status, response_body, created_at) \
+             VALUES ($1, 'old', 'fp', 'c', 200, '{}', NOW() - INTERVAL '2 days')",
+        )
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO idempotency_records \
+             (user_scope, key, fingerprint, claim_id, response_status, response_body, created_at) \
+             VALUES ($1, 'new', 'fp', 'c', 200, '{}', NOW())",
+        )
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let removed = sweep_expired_records(pool).await.unwrap();
+        assert!(removed >= 1, "the expired record must be swept");
+
+        let old: Option<(String,)> = sqlx::query_as(
+            "SELECT key FROM idempotency_records WHERE user_scope = $1 AND key = 'old'",
+        )
+        .bind(user)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let fresh: Option<(String,)> = sqlx::query_as(
+            "SELECT key FROM idempotency_records WHERE user_scope = $1 AND key = 'new'",
+        )
+        .bind(user)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        assert!(old.is_none(), "the expired record was deleted");
+        assert!(fresh.is_some(), "the fresh record was retained");
 
         sqlx::query("DELETE FROM idempotency_records WHERE user_scope = $1")
             .bind(user)

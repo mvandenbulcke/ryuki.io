@@ -1549,12 +1549,14 @@ async fn main() {
         }
     }
 
-    // Spawn background lease-expiry sweep (Fix 4: DB-time deadlines + periodic
-    // expiry). Only spawns when a DB pool is available. The task is idempotent
-    // and cancelled automatically when the tokio runtime shuts down.
+    // Spawn background sweeps (lease-expiry + idempotency retention). Only when
+    // a DB pool is available. Both are idempotent and cancelled automatically
+    // when the tokio runtime shuts down.
     if let Some(pool) = crate::database::get_db() {
         agents::spawn_lease_expiry_sweep(pool.clone(), 30);
         tracing::info!("agent lease expiry sweep started (interval: 30s)");
+        idempotency::spawn_idempotency_sweep(pool.clone(), 3600);
+        tracing::info!("idempotency retention sweep started (interval: 3600s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
