@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ryuki — Governed Infrastructure Control Plane</title>
-<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable workflows through 17 provider adapters — VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
+<meta name="description" content="Ryuki is an open-source, Rust-powered control plane for multi-site datacenter infrastructure. Governed, auditable, dry-run-first workflows across a 17-provider catalogue — VMware, Hyper-V, Proxmox, Nutanix AHV, Xen, KVM, Veeam, Commvault, Rubrik, Cohesity, NetBackup, Zabbix, Prometheus, Datadog, Grafana, SolarWinds, and ServiceNow.">
 <link rel="canonical" href="https://ryuki.io/">
 <meta name="theme-color" content="#0b0d12">
 
@@ -757,7 +757,7 @@ section.alt .stage{background:var(--section-alt)}
       <span class="hero-pill fx" style="--d:.15s"><span class="dot"></span>Open source &middot; Rust-powered &middot; MIT licensed</span>
     </div>
     <h1 class="fx" style="--d:.25s">The <span class="grad">governed control plane</span> for multi&#8209;site infrastructure</h1>
-    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, operate, evidence, and retire infrastructure services &mdash; through a growing adapter framework: 17 providers spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow.</p>
+    <p class="tagline fx" style="--d:.4s">Ryuki gives system engineers an auditable way to request, govern, evidence, and retire infrastructure services across a 17&#8209;provider catalogue spanning virtualization, backup, monitoring, and ITSM, from VMware and Nutanix AHV to Zabbix and ServiceNow. Every change is planned, evidenced, and approved <strong>dry&#8209;run&#8209;first</strong> &mdash; live execution is operator&#8209;gated.</p>
     <div class="hero-links fx" style="--d:.55s">
       <a href="/getting-started.html" class="btn btn-primary">
         Get Started
@@ -799,7 +799,7 @@ section.alt .stage{background:var(--section-alt)}
     <div data-reveal>
       <div class="section-label">Features</div>
       <h2 class="section-title">Everything your platform team operates</h2>
-      <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure &mdash; governed by default, evidenced at every step.</p>
+      <p class="section-subtitle">Operational workflows for system engineering teams running multi-site datacenter infrastructure &mdash; governed by default, evidenced at every step. Each workflow plans, validates, and records its change against the named providers in a <strong>dry-run-first</strong> model; live provider execution is opt-in and operator-gated.</p>
     </div>
     <div class="features-grid">
 
@@ -835,7 +835,7 @@ section.alt .stage{background:var(--section-alt)}
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
         </div>
         <h3>CMDB &amp; Inventory</h3>
-        <p>ServiceNow CMDB integration with Excel import/export, CI reconciliation, and relationship graph visualization.</p>
+        <p>CMDB governance: CI reconciliation, drift tracking, and import/export &mdash; with dry-run publish to ServiceNow (no live CMDB write until the integration is enabled).</p>
         <div class="feature-tags"><span class="tag">ServiceNow</span><span class="tag">Excel</span><span class="tag">Graph</span></div>
       </div>
 
@@ -845,7 +845,7 @@ section.alt .stage{background:var(--section-alt)}
         </div>
         <h3>OS Patching &amp; Compliance</h3>
         <p>Windows and Linux deployment, scheduled patching with approval gates, and OS baseline compliance reporting across the fleet.</p>
-        <div class="feature-tags"><span class="tag">Windows</span><span class="tag">Linux</span><span class="tag">SQL Server</span></div>
+        <div class="feature-tags"><span class="tag">Windows</span><span class="tag">Linux</span></div>
       </div>
 
       <div class="feature-card" data-reveal style="--d:.07s">
@@ -884,8 +884,8 @@ section.alt .stage{background:var(--section-alt)}
   <div class="container">
     <div data-reveal>
       <div class="section-label">Request Lifecycle</div>
-      <h2 class="section-title">Nine governed stages. Zero blind spots.</h2>
-      <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover. Dashed stages are next on the roadmap.</p>
+      <h2 class="section-title">Thirteen governed stages. Zero blind spots.</h2>
+      <p class="section-subtitle">Every infrastructure request flows through the same governed pipeline — from draft through completion, then into the post-completion lifecycle of protect, publish, maintain, and retire. Each stage produces redacted evidence suitable for audit, CAB, incident review, and shift handover.</p>
     </div>
     <div class="pipeline-wrap" data-reveal>
       <ol class="pipeline">
@@ -899,12 +899,12 @@ section.alt .stage{background:var(--section-alt)}
         <li class="stage" style="--i:7"><span class="stage-num">08</span>Verify</li>
         <li class="stage" style="--i:8"><span class="stage-num">09</span>Complete</li>
       </ol>
-      <div class="roadmap-label" aria-hidden="true">Roadmap</div>
-      <ol class="pipeline roadmap-row" aria-label="Planned lifecycle stages">
-        <li class="stage planned"><span class="stage-num">10</span>Protect<span class="sr-only"> (planned)</span></li>
-        <li class="stage planned"><span class="stage-num">11</span>Publish<span class="sr-only"> (planned)</span></li>
-        <li class="stage planned"><span class="stage-num">12</span>Maintain<span class="sr-only"> (planned)</span></li>
-        <li class="stage planned"><span class="stage-num">13</span>Retire<span class="sr-only"> (planned)</span></li>
+      <div class="roadmap-label" aria-hidden="true">Post-completion lifecycle</div>
+      <ol class="pipeline roadmap-row" aria-label="Post-completion lifecycle stages">
+        <li class="stage"><span class="stage-num">10</span>Protect</li>
+        <li class="stage"><span class="stage-num">11</span>Publish</li>
+        <li class="stage"><span class="stage-num">12</span>Maintain</li>
+        <li class="stage"><span class="stage-num">13</span>Retire</li>
       </ol>
     </div>
     <div class="tour-wrap" data-reveal>
@@ -969,7 +969,7 @@ section.alt .stage{background:var(--section-alt)}
         </div>
       </div>
     </div>
-    <p class="arch-caption" data-reveal>Adapters reach only approved provider endpoints. Credentials never leave Vault.</p>
+    <p class="arch-caption" data-reveal>Provider access is brokered through the API alone &mdash; the portal never calls provider APIs. The architecture keeps provider credentials behind a secrets resolver (Vault-backed in production; a mock resolver by default) so they are referenced by handle, never embedded in requests or logs.</p>
 
     <div class="arch-wrap" data-reveal>
     <table class="arch-table">
@@ -1000,7 +1000,7 @@ section.alt .stage{background:var(--section-alt)}
         <tr>
           <td>ryuki-validator</td>
           <td>Rust</td>
-          <td>Self-contained static validation engine (352 slices) for pre-commit and CI guardrails.</td>
+          <td>Self-contained static validation engine (230 coverage checks across 121 modules) for pre-commit and CI guardrails.</td>
         </tr>
         <tr>
           <td>PostgreSQL</td>
@@ -1010,7 +1010,7 @@ section.alt .stage{background:var(--section-alt)}
         <tr>
           <td>Vault</td>
           <td>HashiCorp Vault</td>
-          <td>Secrets management &mdash; provider credentials never committed or logged.</td>
+          <td>Secrets resolver for provider credentials &mdash; referenced by handle, never committed or logged. Vault-backed in production; a mock resolver runs by default.</td>
         </tr>
       </tbody>
     </table>
@@ -1446,8 +1446,8 @@ section.alt .stage{background:var(--section-alt)}
     var outputFor=function(cmd){
       if(cmd.indexOf('docker compose')===0)return [' \u2714 Container platform-db  Started                0.4s'];
       if(cmd.indexOf('cargo build')===0)return ['   Compiling ryuki-core, ryuki-engine, ryuki-api \u2026','    Finished `dev` profile target(s) in 42.3s'];
-      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 352 passed; 0 failed; 0 ignored'];
-      if(cmd.indexOf('cargo run')===0)return ['352/352 validation slices passed \u00b7 evidence pack written'];
+      if(cmd.indexOf('cargo test')===0)return ['test result: ok. 1380 passed; 0 failed; 0 ignored'];
+      if(cmd.indexOf('cargo run')===0)return ['230/230 coverage checks passed \u00b7 evidence pack written'];
       return [];
     };
     var termTimers=[];

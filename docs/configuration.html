@@ -187,10 +187,14 @@ authentication modes
 project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
-network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link active" aria-current="page" data-sections="environment variables
+network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link active" aria-current="page" data-sections="load order
+core environment variables
+infrastructure providers
+nested configuration groups
+validation
 entra id app registration
 postgresql
-admin portal" href="/configuration.html">Configuration</a><ul class="sb-sections"><li><a href="#environment-variables">Environment Variables</a></li><li><a href="#entra-id-app-registration">Entra ID App Registration</a></li><li><a href="#postgresql">PostgreSQL</a></li><li><a href="#admin-portal">Admin Portal</a></li></ul></li><li><a class="sb-link" data-sections="overview
+admin portal" href="/configuration.html">Configuration</a><ul class="sb-sections"><li><a href="#load-order">Load Order</a></li><li><a href="#core-environment-variables">Core Environment Variables</a></li><li><a href="#infrastructure-providers">Infrastructure Providers</a></li><li><a href="#nested-configuration-groups">Nested Configuration Groups</a></li><li><a href="#validation">Validation</a></li><li><a href="#entra-id-app-registration">Entra ID App Registration</a></li><li><a href="#postgresql">PostgreSQL</a></li><li><a href="#admin-portal">Admin Portal</a></li></ul></li><li><a class="sb-link" data-sections="overview
 app roles definition
 how it works
 environment configuration
@@ -202,32 +206,74 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <main id="main">
 <nav class="crumb"><a href="/documentation.html">Documentation</a> <span>/ Configuration</span></nav>
 <h1 id="configuration">Configuration</h1>
-<h2 id="environment-variables">Environment Variables</h2>
-<p>Copy <code>.env.example</code> to <code>.env</code> and configure:</p>
+<p>Ryuki configuration is loaded by the typed Rust <code>RyukiConfig</code> contract. Use <code>.env.example</code> as the canonical reference for environment variable names and defaults.</p>
+<h2 id="load-order">Load Order</h2>
+<p>Configuration is merged in this order:</p>
+<ol>
+<li>Environment variables with the <code>RYUKI_</code> prefix.</li>
+<li>A local config file: <code>ryuki.toml</code>, <code>ryuki.json</code>, or <code>platform-config.json</code>.</li>
+<li>Rust defaults.</li>
+</ol>
+<p>Nested fields use <code>__</code> in environment variables. For example, <code>server.bind_address</code> becomes <code>RYUKI_SERVER__BIND_ADDRESS</code>.</p>
+<p><code>RyukiConfig::load()</code> does not parse <code>.env</code> files by itself. Use <code>.env</code> with Docker Compose, export variables into the host process environment, or use one of the supported config files for direct <code>cargo run</code> workflows.</p>
+<h2 id="core-environment-variables">Core Environment Variables</h2>
+<p>Copy <code>.env.example</code> to <code>.env</code> for Compose workflows, or export the same variables before running the API directly:</p>
 <h3 id="postgresql">PostgreSQL</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>RYUKI_DATABASE_URL</code></td><td>PostgreSQL connection string</td><td><code>postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform</code></td></tr>
 </tbody></table>
+<h3 id="server">Server</h3>
+<table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>RYUKI_SERVER__BIND_ADDRESS</code></td><td>API listen address</td><td><code>0.0.0.0:8080</code></td></tr>
+<tr><td><code>RYUKI_SERVER__REQUEST_TIMEOUT_SECS</code></td><td>Per-request timeout</td><td><code>30</code></td></tr>
+<tr><td><code>RYUKI_SERVER__MAX_BODY_SIZE_BYTES</code></td><td>Maximum request body size</td><td><code>10485760</code></td></tr>
+<tr><td><code>RYUKI_SERVER__MAX_CONCURRENT_CONNECTIONS</code></td><td>Connection concurrency limit</td><td><code>512</code></td></tr>
+</tbody></table>
 <h3 id="entra-id">Entra ID</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>RYUKI_ENTRA_TENANT_ID</code></td><td>Azure AD tenant ID</td><td>(required for Entra auth)</td></tr>
-<tr><td><code>RYUKI_ENTRA_CLIENT_ID</code></td><td>App registration client ID</td><td>(required for Entra auth)</td></tr>
+<tr><td><code>RYUKI_ENTRA_TENANT_ID</code></td><td>Entra tenant ID</td><td>Required for <code>entra-id</code> auth</td></tr>
+<tr><td><code>RYUKI_ENTRA_CLIENT_ID</code></td><td>App registration client ID</td><td>Required for <code>entra-id</code> auth</td></tr>
 <tr><td><code>RYUKI_ENTRA_AUTHORITY</code></td><td>OIDC authority URL</td><td><code>https://login.microsoftonline.com</code></td></tr>
 </tbody></table>
 <h3 id="platform">Platform</h3>
 <table><thead><tr><th>Variable</th><th>Description</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>RYUKI_PLATFORM_NAME</code></td><td>Display name for the platform</td><td><code>Ryuki Infrastructure Platform</code></td></tr>
-<tr><td><code>RYUKI_PLATFORM_URL</code></td><td>Base URL where the API is served</td><td><code>http://localhost:18080</code></td></tr>
+<tr><td><code>RYUKI_PLATFORM_URL</code></td><td>Public base URL for the API</td><td><code>http://localhost:18080</code></td></tr>
 <tr><td><code>RYUKI_AUTH_MODE</code></td><td><code>mock-dry-run</code>, <code>static-dry-run</code>, <code>entra-id</code>, or <code>local</code></td><td><code>mock-dry-run</code></td></tr>
 </tbody></table>
-<h3 id="infrastructure-providers-informational">Infrastructure Providers (informational)</h3>
-<table><thead><tr><th>Variable</th><th>Provider type</th><th>Default</th></tr></thead><tbody>
-<tr><td><code>RYUKI_DATABASE_PROVIDER</code></td><td>CNPG operator</td><td><code>cloudnativepg</code></td></tr>
-<tr><td><code>RYUKI_SECRET_PROVIDER</code></td><td>Secrets management</td><td><code>hashicorp-vault</code></td></tr>
-<tr><td><code>RYUKI_KUBERNETES_RUNTIME</code></td><td>Kubernetes runtime</td><td><code>vsphere-vks</code></td></tr>
-<tr><td><code>RYUKI_MONITORING_PROVIDER</code></td><td>Monitoring system</td><td><code>zabbix</code></td></tr>
-<tr><td><code>RYUKI_BACKUP_PROVIDER</code></td><td>Backup system</td><td><code>veeam</code></td></tr>
+<h2 id="infrastructure-providers">Infrastructure Providers</h2>
+<p>Provider settings are typed enums. They select the intended platform integration, but adapters remain mock/static/dry-run unless a live integration is explicitly approved and implemented.</p>
+<table><thead><tr><th>Variable</th><th>Values</th><th>Default</th></tr></thead><tbody>
+<tr><td><code>RYUKI_DATABASE_PROVIDER</code></td><td><code>cloudnativepg</code>, <code>postgres-local</code>, <code>aws-rds</code>, <code>azure-postgresql</code>, <code>gcp-cloud-sql</code></td><td><code>cloudnativepg</code></td></tr>
+<tr><td><code>RYUKI_SECRET_PROVIDER</code></td><td><code>hashicorp-vault</code>, <code>aws-secrets-manager</code>, <code>azure-key-vault</code>, <code>gcp-secret-manager</code>, <code>bitwarden-secrets-manager</code>, <code>none</code></td><td><code>hashicorp-vault</code></td></tr>
+<tr><td><code>RYUKI_KUBERNETES_RUNTIME</code></td><td><code>vsphere-vks</code>, <code>docker-compose</code>, <code>aks</code>, <code>eks</code>, <code>gke</code>, <code>openshift</code>, <code>rancher</code>, <code>none</code></td><td><code>vsphere-vks</code></td></tr>
+<tr><td><code>RYUKI_HYPERVISOR_PROVIDER</code></td><td><code>vmware</code>, <code>hyperv</code>, <code>proxmox</code>, <code>nutanix-ahv</code>, <code>xen</code>, <code>kvm</code>, <code>none</code></td><td><code>vmware</code></td></tr>
+<tr><td><code>RYUKI_MONITORING_PROVIDER</code></td><td><code>zabbix</code>, <code>prometheus</code>, <code>datadog</code>, <code>grafana</code>, <code>solarwinds</code>, <code>none</code></td><td><code>zabbix</code></td></tr>
+<tr><td><code>RYUKI_BACKUP_PROVIDER</code></td><td><code>veeam</code>, <code>commvault</code>, <code>rubrik</code>, <code>cohesity</code>, <code>netbackup</code>, <code>none</code></td><td><code>veeam</code></td></tr>
+<tr><td><code>RYUKI_STORAGE_PROVIDER</code></td><td><code>netapp</code>, <code>pure-storage</code>, <code>dell-powerstore</code>, <code>hpe-alletra</code>, <code>azure-blob</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_DNS_PROVIDER</code></td><td><code>infoblox</code>, <code>bluecat</code>, <code>windows-dns</code>, <code>route53</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_IPAM_PROVIDER</code></td><td><code>infoblox</code>, <code>phpipam</code>, <code>netbox</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_LOAD_BALANCER_PROVIDER</code></td><td><code>f5-bigip</code>, <code>citrix-adc</code>, <code>haproxy</code>, <code>nginx</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_FIREWALL_PROVIDER</code></td><td><code>palo-alto</code>, <code>checkpoint</code>, <code>fortinet</code>, <code>cisco-asa</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_BUILD_PROVIDER</code></td><td><code>jenkins</code>, <code>github-actions</code>, <code>azure-devops</code>, <code>argocd</code>, <code>none</code></td><td><code>none</code></td></tr>
+<tr><td><code>RYUKI_NETWORK_PROVIDER</code></td><td><code>cisco-aci</code>, <code>vmware-nsx</code>, <code>evpn</code>, <code>none</code></td><td><code>none</code></td></tr>
 </tbody></table>
+<h2 id="nested-configuration-groups">Nested Configuration Groups</h2>
+<p>Most operational settings are grouped under typed nested structs. Use double underscores when setting these through the environment.</p>
+<table><thead><tr><th>Group</th><th>Example variable</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>server</code></td><td><code>RYUKI_SERVER__POOL_MAX_CONNECTIONS</code></td><td>Bind address, timeouts, body size, TLS paths, DB pool, compression, keep-alive, concurrency.</td></tr>
+<tr><td><code>cors</code></td><td><code>RYUKI_CORS__ALLOWED_ORIGINS</code></td><td>Allowed origins and cache age.</td></tr>
+<tr><td><code>rate_limit</code></td><td><code>RYUKI_RATE_LIMIT__ENABLED</code></td><td>Global and per-path request limits.</td></tr>
+<tr><td><code>logging</code></td><td><code>RYUKI_LOGGING__LEVEL</code></td><td>Console log level and format.</td></tr>
+<tr><td><code>log_extended</code></td><td><code>RYUKI_LOG_EXTENDED__FILE_PATH</code></td><td>Optional file logging and retention.</td></tr>
+<tr><td><code>security</code></td><td><code>RYUKI_SECURITY__CONTENT_SECURITY_POLICY</code></td><td>CSP and optional HSTS settings.</td></tr>
+<tr><td><code>smtp</code></td><td><code>RYUKI_SMTP__ENABLED</code></td><td>Email notification transport.</td></tr>
+<tr><td><code>session</code></td><td><code>RYUKI_SESSION__COOKIE_SECURE</code></td><td>Session cookie security settings.</td></tr>
+<tr><td><code>retention</code></td><td><code>RYUKI_RETENTION__DAILY_BACKUPS</code></td><td>Backup retention windows.</td></tr>
+<tr><td><code>maintenance_window</code></td><td><code>RYUKI_MAINTENANCE_WINDOW__ENABLED</code></td><td>Scheduled maintenance window metadata.</td></tr>
+</tbody></table>
+<h2 id="validation">Validation</h2>
+<p><code>RyukiConfig::validate()</code> returns hard errors that should block startup or mark config invalid. <code>RyukiConfig::validation_warnings()</code> returns advisory operational guidance, such as reminding operators to configure Vault externally when <code>RYUKI_SECRET_PROVIDER=hashicorp-vault</code>.</p>
 <h2 id="entra-id-app-registration">Entra ID App Registration</h2>
 <p>See <code>docs/entra-app-registration.md</code> for the full app roles manifest and setup instructions.</p>
 <h3 id="summary">Summary</h3>
@@ -246,15 +292,23 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <li><strong>API permissions</strong>: No delegated permissions required — app roles only</li>
 </ul>
 <h2 id="postgresql">PostgreSQL</h2>
-<p>The platform expects a PostgreSQL database. The included <code>docker-compose.yml</code> provisions:</p>
+<p>The platform expects PostgreSQL 18. The local compose skeleton in <code>deploy/compose/compose.yaml</code> provisions:</p>
 <ul>
-<li>PostgreSQL 16 with user <code>ryuki</code> and database <code>ryuki_platform</code></li>
+<li>PostgreSQL 18 with user <code>ryuki</code> and database <code>ryuki_platform</code></li>
 <li>Port <code>5432</code> exposed locally</li>
 </ul>
-<p>For production, use a managed PostgreSQL service and set <code>RYUKI_DATABASE_URL</code> accordingly.</p>
+<p>For production, use CloudNativePG or a managed PostgreSQL service and set <code>RYUKI_DATABASE_URL</code> accordingly.</p>
+<h3 id="why-postgresql-only">Why PostgreSQL only</h3>
+<p>PostgreSQL is the <strong>only</strong> supported database — there is no MySQL, SQLite, or other backend, and there are no plans to add one. While the platform is built on <code>sqlx</code>, the schema and persistence layer depend on PostgreSQL-specific features that have no portable equivalent:</p>
+<ul>
+<li><strong><code>xmin</code>-based optimistic concurrency.</strong> Read-modify-write mutations guard against lost updates with <code>WHERE id = $1 AND xmin = $N::xid</code>. <code>xmin</code> is a PostgreSQL system column; MySQL and SQLite have no equivalent.</li>
+<li><strong><code>JSONB</code></strong> columns and operators (<code>to_jsonb</code>, <code>jsonb_set</code>, <code>jsonb_array_elements</code>) store full entity snapshots and audit history.</li>
+<li><strong><code>RETURNING</code></strong>, <code>ON CONFLICT</code> upserts, <code>gen_random_uuid()</code>, partial/<code>FILTER</code> aggregates, and <code>TIMESTAMPTZ</code> interval arithmetic are used throughout the migrations and queries.</li>
+</ul>
+<p><code>RYUKI_DATABASE_PROVIDER</code> selects the PostgreSQL *deployment* (CloudNativePG, a local container, AWS RDS, Azure Database for PostgreSQL, or GCP Cloud SQL) — every option is PostgreSQL.</p>
 <h2 id="admin-portal">Admin Portal</h2>
 <h3 id="logo-and-branding">Logo and Branding</h3>
-<p>The platform name is configured via <code>RYUKI_PLATFORM_NAME</code>. Logo and branding assets are uploaded through the admin portal UI after deployment — no branding files are stored in the repository.</p>
+<p>The platform name is configured via <code>RYUKI_PLATFORM_NAME</code>. Logo and branding assets are uploaded through the admin portal UI after deployment; no branding files are stored in the repository.</p>
 <h3 id="access-control">Access Control</h3>
 <p>Access is controlled by Entra ID app roles. The <code>PlatformAdmin</code> role grants full administrative access to the portal.</p>
 <nav class="foot-nav"><a href="/architecture.html">&larr; Architecture</a><a href="/entra-app-registration.html">Entra App Registration &rarr;</a></nav>

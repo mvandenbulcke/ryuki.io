@@ -118,6 +118,16 @@ The platform expects PostgreSQL 18. The local compose skeleton in `deploy/compos
 
 For production, use CloudNativePG or a managed PostgreSQL service and set `RYUKI_DATABASE_URL` accordingly.
 
+### Why PostgreSQL only
+
+PostgreSQL is the **only** supported database — there is no MySQL, SQLite, or other backend, and there are no plans to add one. While the platform is built on `sqlx`, the schema and persistence layer depend on PostgreSQL-specific features that have no portable equivalent:
+
+- **`xmin`-based optimistic concurrency.** Read-modify-write mutations guard against lost updates with `WHERE id = $1 AND xmin = $N::xid`. `xmin` is a PostgreSQL system column; MySQL and SQLite have no equivalent.
+- **`JSONB`** columns and operators (`to_jsonb`, `jsonb_set`, `jsonb_array_elements`) store full entity snapshots and audit history.
+- **`RETURNING`**, `ON CONFLICT` upserts, `gen_random_uuid()`, partial/`FILTER` aggregates, and `TIMESTAMPTZ` interval arithmetic are used throughout the migrations and queries.
+
+`RYUKI_DATABASE_PROVIDER` selects the PostgreSQL *deployment* (CloudNativePG, a local container, AWS RDS, Azure Database for PostgreSQL, or GCP Cloud SQL) — every option is PostgreSQL.
+
 ## Admin Portal
 
 ### Logo and Branding

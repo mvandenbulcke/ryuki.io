@@ -187,7 +187,11 @@ authentication modes
 project structure" href="/getting-started.html">Getting Started</a><ul class="sb-sections"><li><a href="#prerequisites">Prerequisites</a></li><li><a href="#quick-start">Quick Start</a></li><li><a href="#authentication-modes">Authentication Modes</a></li><li><a href="#project-structure">Project Structure</a></li></ul></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
-network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="environment variables
+network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+core environment variables
+infrastructure providers
+nested configuration groups
+validation
 entra id app registration
 postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
@@ -206,24 +210,25 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <ul>
 <li>Rust 1.85+ (edition 2024)</li>
 <li>Docker and Docker Compose</li>
-<li>PostgreSQL 16+</li>
+<li>PostgreSQL 18+</li>
 </ul>
 <h2 id="quick-start">Quick Start</h2>
 <h3 id="1-clone-and-set-up">1. Clone and set up</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">git</span> clone &lt;repo-url&gt; ryuki-platform
 <span class="hl-cmd">cd</span> ryuki-platform
 <span class="hl-cmd">cp</span> .env.example .env</code></pre>
-<p>Edit <code>.env</code> — set <code>RYUKI_DATABASE_URL</code> to match your local PostgreSQL.</p>
+<p>For Docker Compose workflows, edit <code>.env</code> and set <code>RYUKI_DATABASE_URL</code> to match your local PostgreSQL. For direct <code>cargo run</code>, export the needed <code>RYUKI_</code> variables or create <code>ryuki.toml</code>, <code>ryuki.json</code>, or <code>platform-config.json</code>; <code>.env</code> is not loaded automatically by the Rust config loader.</p>
 <h3 id="2-start-the-database">2. Start the database</h3>
-<pre><code class="lang-bash"><span class="hl-cmd">docker</span> compose up <span class="hl-f">-d</span></code></pre>
+<pre><code class="lang-bash"><span class="hl-cmd">docker</span> compose <span class="hl-f">-f</span> deploy/compose/compose.yaml up <span class="hl-f">-d</span> platform-db</code></pre>
 <h3 id="3-build-the-workspace">3. Build the workspace</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> build <span class="hl-f">--workspace</span></code></pre>
 <h3 id="4-run-the-api-server">4. Run the API server</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">-p</span> ryuki-api</code></pre>
-<p>The API starts at <code>http://localhost:18080</code>.</p>
+<p>The API listens on <code>http://localhost:8080</code> by default. The compose API service publishes container port <code>8080</code> as host port <code>18080</code>.</p>
 <h3 id="5-run-tests">5. Run tests</h3>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> test <span class="hl-f">--workspace</span></code></pre>
 <h3 id="6-run-validators">6. Run validators</h3>
+<p>Run from the repository root (the validator defaults <code>--root</code> to the current directory; pass <code>--root &lt;path&gt;</code> to validate another checkout):</p>
 <pre><code class="lang-bash"><span class="hl-cmd">cargo</span> run <span class="hl-f">--manifest-path</span> scripts/validator-rs/Cargo.toml <span class="hl-f">--</span> run-all</code></pre>
 <h2 id="authentication-modes">Authentication Modes</h2>
 <p>Default is <strong>mock-dry-run</strong> — no real Entra ID, all operations are simulated.</p>
