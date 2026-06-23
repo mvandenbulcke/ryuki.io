@@ -1519,10 +1519,18 @@ pub async fn create_live_apply_job(
     // the request-scoped status check entirely. A stale plan can therefore never
     // re-open a concluded request to infrastructure mutation. The exhaustive
     // is_concluded() classifier is the single source of truth.
+    // Lock the request row for the duration of the mint so it cannot CONCLUDE
+    // between this status check and the grant-minting INSERT below. Without the
+    // lock a concurrent retire/complete could slip in after the check, and a
+    // grant authorising infrastructure mutation would be minted for an
+    // already-concluded request — a TOCTOU against the invariant above. All
+    // statements below run on this transaction; any early `?` return drops it
+    // (rollback), so a grant is persisted only on the committed success path.
+    let mut tx = pool.begin().await?;
     let req_status: Option<String> =
-        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
             .bind(request_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
     match req_status {
         None => {
@@ -1597,11 +1605,14 @@ pub async fn create_live_apply_job(
     .bind(platform)
     .bind(&spec_json)
     .bind(&grant_json)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let id = id.ok_or(CreateLiveApplyJobError::Invalid(
         "a live-apply has already been approved for this request",
     ))?;
+    // Commit only the success path — the request row lock (and any rows) are
+    // released here; every early return above rolled back instead.
+    tx.commit().await?;
 
     tracing::info!(
         job_id = %id,

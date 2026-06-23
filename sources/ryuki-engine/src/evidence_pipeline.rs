@@ -123,8 +123,13 @@ pub fn should_redact(key: &str, value: &str) -> bool {
 
     if value_lower.contains("password:")
         || value_lower.contains("secret:")
+        || value_lower.contains("secret=")
         || value_lower.contains("token=")
         || value_lower.contains("api_key")
+        // HTTP Authorization bearer tokens (e.g. "Authorization: Bearer <jwt>")
+        // can ride in evidence values under a generic key like "execution_log"
+        // or "http_headers" — redact them by the token prefix, not just the key.
+        || value_lower.contains("bearer ")
     {
         return true;
     }
@@ -328,6 +333,48 @@ mod tests {
 
         redact_evidence(&mut pack).unwrap();
         assert!(pack.items[0].redacted);
+    }
+
+    #[test]
+    fn test_redact_evidence_redacts_bearer_token_under_generic_key() {
+        // A JWT rides in an Authorization header inside a GENERIC-keyed evidence
+        // value (the key is not sensitive), so only the value pattern can catch
+        // it. Regression for the Bearer-token redaction gap.
+        let mut pack = EvidencePack {
+            id: "ev-bearer".into(),
+            request_id: "req-bearer".into(),
+            items: vec![EvidenceItem {
+                key: "execution_log".into(),
+                value: "GET /api/x -> 200; Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"
+                    .into(),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::ExecutionLog,
+            }],
+            redacted: false,
+            created_at: Utc::now().to_rfc3339(),
+            format: "json".into(),
+            compliance_checks: Vec::new(),
+            metadata: HashMap::new(),
+        };
+        redact_evidence(&mut pack).unwrap();
+        assert!(
+            pack.items[0].redacted,
+            "an Authorization: Bearer token must be redacted even under a generic key"
+        );
+    }
+
+    #[test]
+    fn test_should_redact_bearer_and_secret_value_patterns() {
+        assert!(should_redact(
+            "execution_log",
+            "Authorization: Bearer eyJabc.def.ghi"
+        ));
+        assert!(should_redact("config", "client_secret=topsecret")); // secret-scan-allow: test fixture, fake value asserting the secret= pattern is caught
+        assert!(
+            !should_redact("status", "deployment ok, no credentials present"),
+            "benign evidence must not be over-redacted"
+        );
     }
 
     #[test]
