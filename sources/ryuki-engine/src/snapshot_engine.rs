@@ -97,7 +97,13 @@ pub fn validate_snapshot(record: &SnapshotRecord) -> Result<ValidationResult, St
 pub fn review_snapshot_policy(record: &SnapshotRecord) -> Result<SnapshotRecord, String> {
     let mut reviewed = record.clone();
 
-    if record.status == SnapshotStatus::Expired || record.status == SnapshotStatus::Completed {
+    // Failed is terminal too (see the flag/remediate guards below) — without it
+    // a Failed snapshot could be re-opened to ReviewRequested. Block all three
+    // terminal states.
+    if matches!(
+        record.status,
+        SnapshotStatus::Expired | SnapshotStatus::Completed | SnapshotStatus::Failed
+    ) {
         return Err(format!(
             "Cannot review snapshot in status: {:?}",
             record.status
@@ -224,6 +230,24 @@ mod tests {
         let record = make_test_snapshot();
         let reviewed = review_snapshot_policy(&record).unwrap();
         assert_eq!(reviewed.status, SnapshotStatus::ReviewRequested);
+    }
+
+    #[test]
+    fn test_review_snapshot_policy_rejects_terminal_states() {
+        // All three terminal states must refuse review — none may be re-opened.
+        for status in [
+            SnapshotStatus::Expired,
+            SnapshotStatus::Completed,
+            SnapshotStatus::Failed,
+        ] {
+            let mut record = make_test_snapshot();
+            record.status = status;
+            assert!(
+                review_snapshot_policy(&record).is_err(),
+                "review must be refused from terminal status {:?}",
+                record.status
+            );
+        }
     }
 
     #[test]
