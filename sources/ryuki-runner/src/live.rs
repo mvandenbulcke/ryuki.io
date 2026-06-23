@@ -265,7 +265,9 @@ pub(crate) fn live_terraform_plan(
     // durable, platform-local state backend (Postgres / S3 / Consul / …).
     // Written BEFORE init so terraform init picks it up.
     if let Some(backend_hcl) = backend_config {
-        ws.write_file("backend_override.tf", backend_hcl.as_bytes())?;
+        // 0600: backend HCL routinely carries state-backend credentials
+        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
     }
 
     // Write non-secret vars.
@@ -442,7 +444,9 @@ pub(crate) fn live_terraform_apply(
     }
 
     if let Some(backend_hcl) = backend_config {
-        ws.write_file("backend_override.tf", backend_hcl.as_bytes())?;
+        // 0600: backend HCL routinely carries state-backend credentials
+        // (Postgres DSN, S3/Consul tokens) — owner-only, like the vars file.
+        ws.write_file_0600("backend_override.tf", backend_hcl.as_bytes())?;
     }
 
     if !plan.vars.is_empty() {

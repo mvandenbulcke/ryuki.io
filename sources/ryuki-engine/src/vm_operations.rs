@@ -55,8 +55,10 @@ pub fn plan_vm_day2_change(
                 _ => 16,
             },
             disk_gb: match change_type {
-                VmChangeType::ExtendDisk => 100 + target_value,
-                VmChangeType::AddDisk => 100 + target_value,
+                // target_value is caller-supplied; saturate so a huge value can
+                // never overflow u32 (panic in debug / wrap in release).
+                VmChangeType::ExtendDisk => target_value.saturating_add(100),
+                VmChangeType::AddDisk => target_value.saturating_add(100),
                 _ => 100,
             },
         },

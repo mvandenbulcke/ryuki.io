@@ -646,9 +646,12 @@ pub fn get_trend_report(site: &str, metric: &str, vms: &[VmUtilization]) -> Resu
                     site_vms.iter().map(|v| v.memory_usage_pct).sum::<f64>() / site_vms.len() as f64
                 }
                 _ => {
+                    // Storage has no capacity denominator on the VM records, so
+                    // this synthetic-trend anchor reports full utilization when
+                    // any storage is present. Guard the empty case so it never
+                    // emits NaN (`0.0 / 0.0`), which serde would render as null.
                     let used = site_vms.iter().map(|v| v.storage_gb as f64).sum::<f64>();
-                    let total = used;
-                    (used / total * 100.0).max(0.0)
+                    if used > 0.0 { 100.0 } else { 0.0 }
                 }
             };
             let jitter = (i as f64 - 6.0) * 0.5;

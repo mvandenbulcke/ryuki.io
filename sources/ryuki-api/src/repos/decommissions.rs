@@ -83,7 +83,9 @@ impl DecommissionRow {
             server_type,
             reason: self.reason,
             final_backup_required: self.final_backup_required,
-            quarantine_days: self.quarantine_days as u32,
+            // Stored as i32; clamp a stray negative to 0 rather than wrapping to
+            // a huge u32 via `as`.
+            quarantine_days: u32::try_from(self.quarantine_days).unwrap_or(0),
             status,
             dependencies_identified,
             backup_confirmed: self.backup_confirmed,
