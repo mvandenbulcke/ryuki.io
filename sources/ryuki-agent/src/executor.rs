@@ -132,6 +132,21 @@ impl JobExecutor for RunnerExecutor {
         // All others default to Terraform.
         let runner_kind = offering_kind_from_slug(&offering_slug);
 
+        // Integrity gate: the IaC the runner is about to resolve and run must
+        // match the content digest the control plane approved. A real (non-stub)
+        // iac_digest that does not match the locally embedded bundle means a
+        // tampered or version-skewed bundle — refuse rather than run (and sign)
+        // IaC the CP did not approve. An all-zero stub means "nothing to verify".
+        if let Some(approved) = real_iac_digest(&spec.iac_digest) {
+            let resolved = ryuki_runner::iac::offering_iac_digest(&offering_slug);
+            if resolved.as_deref() != Some(approved) {
+                return Err(ExecError::PlanBuild(format!(
+                    "IaC digest mismatch for offering {offering_slug:?}: approved {approved} but \
+                     the locally resolved bundle does not match — refusing to run unapproved IaC"
+                )));
+            }
+        }
+
         // Build the run plan.  Non-secret vars from spec; no secrets for S4b
         // (credential injection is a separate concern resolved by the runner
         // from its own environment — empty material here means no TF_VAR_ injection).
@@ -215,6 +230,26 @@ impl JobExecutor for StubExecutor {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Returns the approved IaC digest to verify against, or `None` when there is
+/// nothing to check. A real digest is canonical lowercase-hex SHA-256 (exactly
+/// 64 chars, `0-9a-f`) and not the all-zero stub. The stub *and* any malformed /
+/// non-hex value yield `None` — we degrade to running without the check rather
+/// than refusing a legitimate job because of a corrupt `iac_digest` field (the
+/// digest is set by the trusted control plane, so a bad value is a CP bug, not
+/// an attack). `bundle_digest` always emits lowercase hex, so a genuine approved
+/// digest always satisfies this.
+fn real_iac_digest(digest: &str) -> Option<&str> {
+    let is_lower_hex = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if is_lower_hex && digest.bytes().any(|b| b != b'0') {
+        Some(digest)
+    } else {
+        None
+    }
+}
 
 /// Infer `RunnerKind` from an offering slug.
 ///
@@ -315,6 +350,117 @@ mod tests {
             matches!(result, Err(ExecError::UnsupportedMode(JobMode::LiveApply))),
             "RunnerExecutor must reject LiveApply"
         );
+    }
+
+    // --- IaC digest integrity gate ---
+
+    #[test]
+    fn real_iac_digest_recognizes_stub_and_real() {
+        assert!(
+            real_iac_digest(&"0".repeat(64)).is_none(),
+            "the all-zero stub is not a real digest"
+        );
+        assert!(
+            real_iac_digest("abc").is_none(),
+            "a wrong-length value is not a real digest"
+        );
+        assert!(
+            real_iac_digest(&"z".repeat(64)).is_none(),
+            "a 64-char non-hex value is not a real digest"
+        );
+        assert!(
+            real_iac_digest(&"A".repeat(64)).is_none(),
+            "uppercase hex is not canonical (bundle_digest emits lowercase)"
+        );
+        let real = "a".repeat(64);
+        assert_eq!(real_iac_digest(&real), Some(real.as_str()));
+    }
+
+    #[test]
+    fn runner_executor_refuses_iac_digest_mismatch() {
+        use std::sync::Arc;
+        let identity = Arc::new(crate::identity::AgentIdentity::generate());
+        let executor = RunnerExecutor::new(identity);
+        // A real (non-stub) digest that does NOT match patch-maintenance's bundle
+        // — the agent must refuse before running any IaC.
+        let mut spec = make_spec(JobMode::OfflineDryRun);
+        spec.iac_digest = "a".repeat(64);
+        match executor.execute(&spec) {
+            Err(ExecError::PlanBuild(msg)) => assert!(
+                msg.contains("digest mismatch"),
+                "must refuse with a digest-mismatch message, got: {msg}"
+            ),
+            other => panic!("expected a digest-mismatch refusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_executor_accepts_matching_iac_digest() {
+        use std::sync::Arc;
+        let identity = Arc::new(crate::identity::AgentIdentity::generate());
+        let executor = RunnerExecutor::new(identity);
+        // The REAL digest of patch-maintenance's bundle: the gate must pass. The
+        // run may then succeed or report RunnerUnavailable if terraform is
+        // absent, but it must NEVER fail with a digest mismatch.
+        let mut spec = make_spec(JobMode::OfflineDryRun);
+        spec.iac_digest = ryuki_runner::iac::offering_iac_digest("patch-maintenance")
+            .expect("patch-maintenance has embedded IaC");
+        if let Err(ExecError::PlanBuild(msg)) = &executor.execute(&spec) {
+            assert!(
+                !msg.contains("digest mismatch"),
+                "a matching digest must not be refused, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn runner_executor_matches_digest_across_versioned_iac_ref() {
+        use std::sync::Arc;
+        let identity = Arc::new(crate::identity::AgentIdentity::generate());
+        let executor = RunnerExecutor::new(identity);
+        // This proves CP/agent slug equality across the `@version` strip: the CP
+        // computes the digest from the bare slug (resolve_offering_id, which
+        // never adds a version) and stores it in iac_ref; the agent strips
+        // `@version` from iac_ref before recomputing. A VERSIONED iac_ref with
+        // the bare-slug digest must therefore PASS, and a wrong digest on the
+        // same versioned ref must be REFUSED.
+        let bare_digest = ryuki_runner::iac::offering_iac_digest("patch-maintenance").unwrap();
+
+        let mut ok = make_spec(JobMode::OfflineDryRun);
+        ok.iac_ref = "patch-maintenance@v9.9.9".to_string();
+        ok.iac_digest = bare_digest.clone();
+        if let Err(ExecError::PlanBuild(msg)) = &executor.execute(&ok) {
+            assert!(
+                !msg.contains("digest mismatch"),
+                "versioned iac_ref with the bare-slug digest must not be refused: {msg}"
+            );
+        }
+
+        let mut bad = make_spec(JobMode::OfflineDryRun);
+        bad.iac_ref = "patch-maintenance@v9.9.9".to_string();
+        bad.iac_digest = "b".repeat(64); // real-looking but wrong
+        match executor.execute(&bad) {
+            Err(ExecError::PlanBuild(msg)) => assert!(
+                msg.contains("digest mismatch"),
+                "a wrong digest on a versioned ref must be refused: {msg}"
+            ),
+            other => panic!("expected a digest-mismatch refusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_executor_allows_stub_digest() {
+        use std::sync::Arc;
+        let identity = Arc::new(crate::identity::AgentIdentity::generate());
+        let executor = RunnerExecutor::new(identity);
+        // The legacy all-zero stub means "nothing to verify" — never a refusal.
+        let spec = make_spec(JobMode::OfflineDryRun); // iac_digest is the stub
+        if let Err(ExecError::PlanBuild(msg)) = &executor.execute(&spec) {
+            assert!(
+                !msg.contains("digest mismatch"),
+                "the stub digest must not trigger a mismatch refusal, got: {msg}"
+            );
+        }
     }
 
     #[test]

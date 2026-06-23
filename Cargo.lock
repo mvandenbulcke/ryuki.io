@@ -2957,6 +2957,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zeroize",
 ]
@@ -3039,6 +3040,7 @@ dependencies = [
  "regex",
  "ryuki-engine",
  "serde_json",
+ "sha2",
  "tempfile",
  "wait-timeout",
 ]

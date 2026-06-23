@@ -23,6 +23,8 @@
 //! is attempted best-effort; failure without a live endpoint degrades
 //! gracefully to `RunStatus::Validated`.
 
+use sha2::{Digest, Sha256};
+
 /// A bundle of IaC files for one offering.
 ///
 /// Each entry is `(filename, utf8_content)` — the content is written verbatim
@@ -130,6 +132,57 @@ pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
         )]),
         _ => None,
     }
+}
+
+/// Canonical SHA-256 over a set of IaC files, independent of input order.
+///
+/// Files are sorted by name, then each contributes a length-prefixed name and
+/// length-prefixed content to the hash, so neither a filename nor a content
+/// boundary is ambiguous (e.g. `("ab", "c")` and `("a", "bc")` hash
+/// differently). Returns lowercase hex. Deterministic and pure — the same files
+/// always produce the same digest.
+pub fn bundle_digest(files: &[(&str, &str)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = files.to_vec();
+    // Sort by (name, content) for a TOTAL order — canonical even if a set ever
+    // contains the same filename twice (the embedded bundles do not, but the
+    // digest should not depend on input order in any case).
+    sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut hasher = Sha256::new();
+    for (name, content) in &sorted {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((content.len() as u64).to_le_bytes());
+        hasher.update(content.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Digest of an offering's COMPLETE embedded IaC — the union of its Terraform
+/// and Ansible bundles.
+///
+/// This is runner-kind agnostic on purpose: the control plane computes it at
+/// dispatch (the approved digest) and the agent recomputes it before running,
+/// so the integrity check holds regardless of which runner the agent ultimately
+/// invokes. Both sides derive it from the same embedded content in this crate,
+/// so in one build they match by construction; a control plane and an agent
+/// built from divergent IaC produce different digests. Returns `None` only when
+/// the offering has no embedded IaC at all.
+pub fn offering_iac_digest(offering_id: &str) -> Option<String> {
+    let mut files: Vec<(&str, &str)> = Vec::new();
+    if let Some(tf) = resolve(offering_id) {
+        files.extend(tf);
+    }
+    if let Some(ansible) = resolve_ansible(offering_id) {
+        files.extend(ansible);
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(bundle_digest(&files))
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +581,83 @@ mod tests {
         assert!(
             resolve_ansible("nonexistent-offering").is_none(),
             "unknown offering must return None"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // bundle_digest / offering_iac_digest
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn bundle_digest_is_deterministic_and_order_independent() {
+        let a = bundle_digest(&[("main.tf", "resource x"), ("vars.tf", "var y")]);
+        let b = bundle_digest(&[("vars.tf", "var y"), ("main.tf", "resource x")]);
+        assert_eq!(a, b, "digest must not depend on file order");
+        assert_eq!(a.len(), 64, "sha-256 hex is 64 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn bundle_digest_distinguishes_name_content_boundaries() {
+        // Length-prefixing means ("ab","c") and ("a","bc") must differ.
+        let a = bundle_digest(&[("ab", "c")]);
+        let b = bundle_digest(&[("a", "bc")]);
+        assert_ne!(a, b, "the name/content boundary must be unambiguous");
+    }
+
+    #[test]
+    fn bundle_digest_canonical_with_duplicate_filenames() {
+        // The (name, content) sort gives a total order, so a set containing the
+        // same filename twice hashes the same regardless of input order.
+        let a = bundle_digest(&[("dup.tf", "x"), ("dup.tf", "y")]);
+        let b = bundle_digest(&[("dup.tf", "y"), ("dup.tf", "x")]);
+        assert_eq!(a, b, "duplicate-name digest must not depend on input order");
+    }
+
+    #[test]
+    fn bundle_digest_changes_with_content() {
+        let a = bundle_digest(&[("main.tf", "resource x")]);
+        let b = bundle_digest(&[("main.tf", "resource z")]);
+        assert_ne!(a, b, "different content must change the digest");
+    }
+
+    #[test]
+    fn offering_iac_digest_present_for_wired_offering_and_stable() {
+        let d1 = offering_iac_digest("linux-server-deployment").expect("wired offering");
+        let d2 = offering_iac_digest("linux-server-deployment").expect("stable");
+        assert_eq!(d1, d2, "digest must be stable across calls");
+        assert_eq!(d1.len(), 64);
+    }
+
+    #[test]
+    fn offering_iac_digest_differs_between_offerings() {
+        let linux = offering_iac_digest("linux-server-deployment").unwrap();
+        let patch = offering_iac_digest("patch-maintenance").unwrap();
+        assert_ne!(
+            linux, patch,
+            "distinct offerings must have distinct digests"
+        );
+    }
+
+    #[test]
+    fn offering_iac_digest_none_for_unknown_offering() {
+        assert!(offering_iac_digest("nonexistent-offering").is_none());
+        assert!(
+            offering_iac_digest("server-deployment").is_none(),
+            "unmapped slug has no embedded IaC"
+        );
+        assert!(offering_iac_digest("").is_none());
+    }
+
+    #[test]
+    fn offering_iac_digest_covers_both_runners() {
+        // linux-server-deployment has BOTH a terraform main.tf and an ansible
+        // playbook — the union digest must differ from a terraform-only digest.
+        let combined = offering_iac_digest("linux-server-deployment").unwrap();
+        let tf_only = bundle_digest(&resolve("linux-server-deployment").unwrap());
+        assert_ne!(
+            combined, tf_only,
+            "combined digest must include the ansible bundle too"
         );
     }
 }

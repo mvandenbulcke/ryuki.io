@@ -90,10 +90,12 @@ pub trait Runner {
 /// sign and the control plane would record as `Succeeded`, a false positive. An
 /// agent that cannot resolve the approved IaC for an offering must refuse the job.
 ///
-/// NOTE (S5): this does not yet verify the resolved bundle against
-/// `JobSpec.iac_digest` (the digest is currently a stub with no producer). Once a
-/// real job-dispatch path computes `iac_digest`, the dispatcher must additionally
-/// reject a bundle whose digest does not match the approved digest.
+/// IaC-digest integrity is enforced one level up, in the agent's
+/// `RunnerExecutor::execute`: it recomputes `iac::offering_iac_digest(offering)`
+/// and refuses the job when a real (non-stub) `JobSpec.iac_digest` does not
+/// match, before this function is ever called. The control plane sets that
+/// digest at dispatch via `iac::offering_iac_digest`. This function therefore
+/// runs the bundle it resolves; the approval check has already passed.
 pub fn run_offline_dry_run(
     plan: &RunPlan,
     creds: &ResolvedCredentials,

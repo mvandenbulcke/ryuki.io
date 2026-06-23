@@ -13768,15 +13768,20 @@ async fn requests_execute(
         let executing = request_lifecycle::begin_execution(&request).map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&executing.stages).unwrap_or_else(|_| json!([]));
 
-        // Dry-run job spec from the request. iac_digest is a stub here; a real
-        // content digest is produced once a live IaC resolver computes it
-        // (operator-owned). vars carry the request's non-secret metadata.
+        // Dry-run job spec from the request. iac_digest is the SHA-256 of the
+        // offering's approved embedded IaC bundle (Terraform + Ansible) — the
+        // agent recomputes it and refuses to run a bundle that does not match
+        // (see RunnerExecutor::execute). Offerings with no embedded IaC keep the
+        // legacy all-zero stub (the agent treats that as "nothing to verify").
+        // vars carry the request's non-secret metadata.
         let offering = ryuki_runner::iac::resolve_offering_id(&request);
+        let iac_digest =
+            ryuki_runner::iac::offering_iac_digest(&offering).unwrap_or_else(|| "0".repeat(64));
         let spec = ryuki_protocol::JobSpec {
             request_id: uid,
             offering_id: Uuid::new_v4(),
             iac_ref: offering,
-            iac_digest: "0".repeat(64),
+            iac_digest,
             vars: request
                 .metadata
                 .iter()
