@@ -122,6 +122,60 @@ Define these roles in the app registration manifest (Entra admin center → App 
 4. Verified Entra role values are mapped to platform permissions.
 5. `check_permission()` maps verified role names to permissions for authorization decisions.
 
+## Permissions by Role
+
+The platform recognises **12** app roles. Each role grants one or more of five
+coarse permission tiers. Authorization is checked per route: a request must hold
+the permission tier the route requires.
+
+### Permission tiers
+
+| Tier | Grants |
+| --- | --- |
+| `admin` | Superuser — satisfies every other tier. Required for `/api/admin/*`, emergency-change mutations, `secrets/rotate-all`, **minting a live-apply grant** (`approve-live-apply`), dispatching a live terraform plan, and reading sensitive prefixes (`/api/protect/secrets`, `/api/ops/emergency`, `/api/admin`). |
+| `approve` | Approve or reject requests, and maker/checker signoffs (`runbook/approve`, `patch/approve`, `software/approve`, `restore-approve`, `app-environment/approve`, `decommission/approve`, access-review `approve`/`revoke`/`exempt`). |
+| `execute` | Operator-tier mutations across `/api/protect`, `/api/identity`, `/api/network`, `/api/build`, `/api/vm`, `/api/maintain`, `/api/observe`, `/api/datacenter`, `/api/inventory`, `/api/cmdb`, `/api/analytics`, `/api/evidence`, `/api/retire`. Dispatches **dry-run** jobs only. |
+| `request` | Submit and cancel requests (a Requester can cancel only their own). |
+| `audit` | Read the audit trail and evidence packs (`/api/requests/{id}/audit`, `/api/requests/{id}/evidence`, `/api/activity/audit`). |
+
+The **superuser rule**: a session holding `admin` passes every permission check.
+Ordinary (non-sensitive) GET reads require `audit` **or** `request`; sensitive
+reads require `admin`. Any unmatched state-changing route falls back to `admin`
+(fail-closed) — a newly added mutating route is never silently open.
+
+### Role → tier matrix
+
+| Role | admin | approve | execute | request | audit |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| `PlatformAdmin` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `BreakGlassAdmin` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `DatacenterApprover` | | ✓ | | | ✓ |
+| `VMwareOperator` | | | ✓ | | ✓ |
+| `HyperVOperator` | | | ✓ | | ✓ |
+| `ProxmoxOperator` | | | ✓ | | ✓ |
+| `WintelLinuxOperator` | | | ✓ | | ✓ |
+| `BackupOperator` | | | ✓ | | ✓ |
+| `MonitoringOperator` | | | ✓ | | ✓ |
+| `ServiceDesk` | | | | ✓ | ✓ |
+| `Requester` | | | | ✓ | |
+| `Auditor` | | | | | ✓ |
+
+(A ✓ in `admin` implies every other tier via the superuser rule; the table shows
+each role's effective access.)
+
+Notes:
+
+- **Live execution is admin-only.** Only `PlatformAdmin` and `BreakGlassAdmin`
+  can dispatch a live terraform plan or mint a live-apply grant. `execute`-tier
+  operators run dry-run jobs only. See the Execution Model in the
+  [Architecture](architecture.md) docs.
+- **DatacenterApprover** approves but cannot execute; **Auditor** is strictly
+  read-only; **Requester** can submit and cancel its own requests but cannot read
+  audit trails.
+- **BreakGlassAdmin** is the audited emergency role — same power as
+  `PlatformAdmin`, intended for break-glass use and called out in the
+  separation-of-duties controls.
+
 ## Environment Configuration
 
 Only the Entra tenant and client IDs are needed:

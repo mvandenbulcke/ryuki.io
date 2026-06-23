@@ -187,7 +187,8 @@ authentication modes
 project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link active" aria-current="page" data-sections="stack
 component diagram
 key decisions
-network policy" href="/architecture.html">Architecture</a><ul class="sb-sections"><li><a href="#stack">Stack</a></li><li><a href="#component-diagram">Component Diagram</a></li><li><a href="#key-decisions">Key Decisions</a></li><li><a href="#network-policy">Network Policy</a></li></ul></li><li><a class="sb-link" data-sections="load order
+network policy
+execution model" href="/architecture.html">Architecture</a><ul class="sb-sections"><li><a href="#stack">Stack</a></li><li><a href="#component-diagram">Component Diagram</a></li><li><a href="#key-decisions">Key Decisions</a></li><li><a href="#network-policy">Network Policy</a></li><li><a href="#execution-model">Execution Model</a></li></ul></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -197,6 +198,7 @@ postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link" data-sections="overview
 app roles definition
 how it works
+permissions by role
 environment configuration
 important security notes" href="/entra-app-registration.html">Entra App Registration</a></li><li><a class="sb-link" data-sections="un/locode
 site selection flow
@@ -253,7 +255,7 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <h2 id="key-decisions">Key Decisions</h2>
 <ul>
 <li><strong>Same-origin</strong>: Portal and API served from the same origin. CORS allows the Portal origin only.</li>
-<li><strong>Dry-run default</strong>: All provider operations default to mock/dry-run unless <code>RYUKI_AUTH_MODE</code> is set to <code>entra-id</code>.</li>
+<li><strong>Dry-run default</strong>: Provider operations default to mock/dry-run (<code>provider_calls_enabled = false</code>). Live infrastructure execution is a separate, operator-gated path — see <a href="#execution-model">Execution Model</a>. <code>RYUKI_AUTH_MODE</code> selects authentication (<code>entra-id</code> for real SSO, otherwise a static dev session); it does <strong>not</strong> enable live provider calls.</li>
 <li><strong>Vault secrets</strong>: Platform secrets (DB credentials, provider tokens) stored in HashiCorp Vault, never in environment or config files.</li>
 <li><strong>Entra app roles</strong>: RBAC via Entra ID app roles with <code>roles</code> claim in the access token. No group-name-to-role mapping.</li>
 </ul>
@@ -262,6 +264,42 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
                                         ├───► Vault
                                         └───► Adapters</code></pre>
 <p>Only the API server has access to the database, Vault, and provider adapters. The Portal communicates exclusively with the API.</p>
+<h2 id="execution-model">Execution Model</h2>
+<p>Ryuki is <strong>dry-run-first</strong>. Almost every operation plans, validates, and records evidence without touching live infrastructure: the provider catalogue entries are credential/endpoint registries whose connection test is a shape-check stub (no live vendor call), and most domains report <code>provider_calls_enabled = false</code>.</p>
+<p>There is exactly <strong>one</strong> live execution path, and it is operator-gated end to end: an operator-deployed agent runs Terraform/Ansible against real infrastructure under a control-plane-signed grant.</p>
+<h3 id="modes">Modes</h3>
+<table><thead><tr><th>Mode</th><th>Who can dispatch</th><th>What runs</th></tr></thead><tbody>
+<tr><td><code>OfflineDryRun</code> (default)</td><td><code>execute</code> tier</td><td><code>terraform validate</code> / <code>ansible-playbook --check</code> in an isolated workspace, embedded IaC only, no credentials.</td></tr>
+<tr><td><code>LivePlan</code></td><td><code>admin</code> tier</td><td>Real <code>terraform init</code> → <code>plan</code> → <code>show -json</code> against the backend. Produces a plan + a <code>plan_digest</code>; <strong>no mutation</strong>.</td></tr>
+<tr><td><code>LiveApply</code></td><td>minted by an <code>admin</code> via <code>approve-live-apply</code>, never dispatched directly</td><td><code>terraform apply</code> of the <strong>exact</strong> approved plan, on an agent that accepts the signed grant.</td></tr>
+</tbody></table>
+<h3 id="live-apply-trust-chain">Live-apply trust chain</h3>
+<ol>
+<li>An operator dispatches a <code>LivePlan</code> (admin-only). The agent runs the plan and</li>
+</ol>
+<p>   returns scrubbed evidence plus the plan digest.</p>
+<ol>
+<li>An <code>admin</code> approves via <code>POST /api/requests/{id}/approve-live-apply</code>. The</li>
+</ol>
+<p>   control plane mints a <code>LiveApply</code> grant <strong>signed with its Ed25519 key</strong>,    binding the request id, the approved plan digest, the approver, and a    short expiry (≤ 24 h). A unique constraint prevents a second live-apply per    request.</p>
+<ol>
+<li>The agent only acts if <code>RYUKI_AGENT_ALLOW_LIVE=true</code> and it has pinned the</li>
+</ol>
+<p>   control-plane public key. It re-plans, then refuses unless <strong>all</strong> hold:    the grant signature verifies against the pinned CP key; the grant is for this    request; it has not expired; and the freshly computed plan digest <strong>matches</strong>    the approved one. Any mismatch → a signed refusal is reported and <code>apply</code> is    never called.</p>
+<ol>
+<li>On success the agent applies the saved plan bytes (not a re-plan), so the</li>
+</ol>
+<p>   applied change is exactly what was approved (closes the plan-then-apply TOCTOU    gap). Terraform errors if live state has since drifted.</p>
+<p>Credentials never reach the control plane; the agent resolves them locally and all command output is scrubbed before it becomes signed evidence.</p>
+<h3 id="operator-flags">Operator flags</h3>
+<table><thead><tr><th>Flag</th><th>Side</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>RYUKI_AGENT_ALLOW_LIVE</code></td><td>Agent</td><td><code>true</code>/<code>1</code> unlocks <code>LivePlan</code>/<code>LiveApply</code>; anything else = dry-run only. Cleartext non-loopback URLs are rejected at startup.</td></tr>
+<tr><td><code>RYUKI_AGENT_CP_URL</code> / <code>RYUKI_AGENT_TOKEN</code> / <code>RYUKI_AGENT_KEY_PATH</code></td><td>Agent</td><td>CP endpoint (HTTPS for live), enrolment token, and the agent signing key.</td></tr>
+<tr><td><code>RYUKI_AGENT_BACKEND_HCL</code></td><td>Agent</td><td>Durable Terraform state backend for production applies.</td></tr>
+<tr><td><code>RYUKI_CP_SIGNING_KEY_PATH</code></td><td>Control plane</td><td>CP Ed25519 grant-signing key (created at <code>0600</code> on first boot).</td></tr>
+</tbody></table>
+<h3 id="maturity">Maturity</h3>
+<p>The dry-run pipeline and the full live trust gate (grant signing/verification, plan-digest integrity, refusal reporting, no-double-apply) are implemented and tested. Running a real apply against live infrastructure is operator-owned: it requires a deployed agent with <code>RYUKI_AGENT_ALLOW_LIVE=true</code>, real provider credentials, and a durable state backend. Provider vendor-API adapters and the production Vault credential resolver remain dry-run/mock placeholders today.</p>
 <nav class="foot-nav"><a href="/getting-started.html">&larr; Getting Started</a><a href="/configuration.html">Configuration &rarr;</a></nav>
 </main>
 </div>

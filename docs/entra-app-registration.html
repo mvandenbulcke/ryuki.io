@@ -187,7 +187,8 @@ authentication modes
 project structure" href="/getting-started.html">Getting Started</a></li><li><a class="sb-link" data-sections="stack
 component diagram
 key decisions
-network policy" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
+network policy
+execution model" href="/architecture.html">Architecture</a></li><li><a class="sb-link" data-sections="load order
 core environment variables
 infrastructure providers
 nested configuration groups
@@ -197,8 +198,9 @@ postgresql
 admin portal" href="/configuration.html">Configuration</a></li><li><a class="sb-link active" aria-current="page" data-sections="overview
 app roles definition
 how it works
+permissions by role
 environment configuration
-important security notes" href="/entra-app-registration.html">Entra App Registration</a><ul class="sb-sections"><li><a href="#overview">Overview</a></li><li><a href="#app-roles-definition">App Roles Definition</a></li><li><a href="#how-it-works">How It Works</a></li><li><a href="#environment-configuration">Environment Configuration</a></li><li><a href="#important-security-notes">Important Security Notes</a></li></ul></li><li><a class="sb-link" data-sections="un/locode
+important security notes" href="/entra-app-registration.html">Entra App Registration</a><ul class="sb-sections"><li><a href="#overview">Overview</a></li><li><a href="#app-roles-definition">App Roles Definition</a></li><li><a href="#how-it-works">How It Works</a></li><li><a href="#permissions-by-role">Permissions by Role</a></li><li><a href="#environment-configuration">Environment Configuration</a></li><li><a href="#important-security-notes">Important Security Notes</a></li></ul></li><li><a class="sb-link" data-sections="un/locode
 site selection flow
 managing sites
 current active sites
@@ -320,6 +322,46 @@ important notes" href="/site-management.html">Site Management</a></li></ul><p cl
 <li>Verified Entra role values are mapped to platform permissions.</li>
 <li><code>check_permission()</code> maps verified role names to permissions for authorization decisions.</li>
 </ol>
+<h2 id="permissions-by-role">Permissions by Role</h2>
+<p>The platform recognises <strong>12</strong> app roles. Each role grants one or more of five coarse permission tiers. Authorization is checked per route: a request must hold the permission tier the route requires.</p>
+<h3 id="permission-tiers">Permission tiers</h3>
+<table><thead><tr><th>Tier</th><th>Grants</th></tr></thead><tbody>
+<tr><td><code>admin</code></td><td>Superuser — satisfies every other tier. Required for <code>/api/admin/*</code>, emergency-change mutations, <code>secrets/rotate-all</code>, <strong>minting a live-apply grant</strong> (<code>approve-live-apply</code>), dispatching a live terraform plan, and reading sensitive prefixes (<code>/api/protect/secrets</code>, <code>/api/ops/emergency</code>, <code>/api/admin</code>).</td></tr>
+<tr><td><code>approve</code></td><td>Approve or reject requests, and maker/checker signoffs (<code>runbook/approve</code>, <code>patch/approve</code>, <code>software/approve</code>, <code>restore-approve</code>, <code>app-environment/approve</code>, <code>decommission/approve</code>, access-review <code>approve</code>/<code>revoke</code>/<code>exempt</code>).</td></tr>
+<tr><td><code>execute</code></td><td>Operator-tier mutations across <code>/api/protect</code>, <code>/api/identity</code>, <code>/api/network</code>, <code>/api/build</code>, <code>/api/vm</code>, <code>/api/maintain</code>, <code>/api/observe</code>, <code>/api/datacenter</code>, <code>/api/inventory</code>, <code>/api/cmdb</code>, <code>/api/analytics</code>, <code>/api/evidence</code>, <code>/api/retire</code>. Dispatches <strong>dry-run</strong> jobs only.</td></tr>
+<tr><td><code>request</code></td><td>Submit and cancel requests (a Requester can cancel only their own).</td></tr>
+<tr><td><code>audit</code></td><td>Read the audit trail and evidence packs (<code>/api/requests/{id}/audit</code>, <code>/api/requests/{id}/evidence</code>, <code>/api/activity/audit</code>).</td></tr>
+</tbody></table>
+<p>The <strong>superuser rule</strong>: a session holding <code>admin</code> passes every permission check. Ordinary (non-sensitive) GET reads require <code>audit</code> <strong>or</strong> <code>request</code>; sensitive reads require <code>admin</code>. Any unmatched state-changing route falls back to <code>admin</code> (fail-closed) — a newly added mutating route is never silently open.</p>
+<h3 id="role-tier-matrix">Role → tier matrix</h3>
+<table><thead><tr><th>Role</th><th>admin</th><th>approve</th><th>execute</th><th>request</th><th>audit</th></tr></thead><tbody>
+<tr><td><code>PlatformAdmin</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+<tr><td><code>BreakGlassAdmin</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td></tr>
+<tr><td><code>DatacenterApprover</code></td><td></td><td>✓</td><td></td><td></td><td>✓</td></tr>
+<tr><td><code>VMwareOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>HyperVOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>ProxmoxOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>WintelLinuxOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>BackupOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>MonitoringOperator</code></td><td></td><td></td><td>✓</td><td></td><td>✓</td></tr>
+<tr><td><code>ServiceDesk</code></td><td></td><td></td><td></td><td>✓</td><td>✓</td></tr>
+<tr><td><code>Requester</code></td><td></td><td></td><td></td><td>✓</td><td></td></tr>
+<tr><td><code>Auditor</code></td><td></td><td></td><td></td><td></td><td>✓</td></tr>
+</tbody></table>
+<p>(A ✓ in <code>admin</code> implies every other tier via the superuser rule; the table shows each role's effective access.)</p>
+<p>Notes:</p>
+<ul>
+<li><strong>Live execution is admin-only.</strong> Only <code>PlatformAdmin</code> and <code>BreakGlassAdmin</code></li>
+</ul>
+<p>  can dispatch a live terraform plan or mint a live-apply grant. <code>execute</code>-tier   operators run dry-run jobs only. See the Execution Model in the   <a href="architecture.html">Architecture</a> docs.</p>
+<ul>
+<li><strong>DatacenterApprover</strong> approves but cannot execute; <strong>Auditor</strong> is strictly</li>
+</ul>
+<p>  read-only; <strong>Requester</strong> can submit and cancel its own requests but cannot read   audit trails.</p>
+<ul>
+<li><strong>BreakGlassAdmin</strong> is the audited emergency role — same power as</li>
+</ul>
+<p>  <code>PlatformAdmin</code>, intended for break-glass use and called out in the   separation-of-duties controls.</p>
 <h2 id="environment-configuration">Environment Configuration</h2>
 <p>Only the Entra tenant and client IDs are needed:</p>
 <pre><code class="lang-env"><span class="hl-v">RYUKI_ENTRA_TENANT_ID</span>=&lt;your-tenant-id&gt;
