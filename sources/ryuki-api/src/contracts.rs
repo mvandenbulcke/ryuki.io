@@ -7321,7 +7321,10 @@ async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn patch_approve(Json(body): Json<PatchActionRequest>) -> ApiResult {
+async fn patch_approve(
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<PatchActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
@@ -7331,7 +7334,10 @@ async fn patch_approve(Json(body): Json<PatchActionRequest>) -> ApiResult {
 
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
-    let approved = patch_engine::approve_patch_wave(&wave).map_err(|e| status_409(&e))?;
+    // approver = the authenticated caller, recorded in the wave's approval audit
+    // trail (never a hardcoded string).
+    let approved =
+        patch_engine::approve_patch_wave(&wave, &session.user_id).map_err(|e| status_409(&e))?;
 
     let ok = crate::repos::patch_waves::transition(pool, before, &approved, None)
         .await
@@ -15640,13 +15646,17 @@ async fn app_env_validate(Json(body): Json<AppEnvValidateRequest>) -> ApiResult 
     })))
 }
 
-async fn app_env_approve(Path(id): Path<String>) -> ApiResult {
+async fn app_env_approve(
+    Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult {
     let tiers = app_environment::seed_examples();
     let target = tiers
         .iter()
         .find(|t| t.id == id)
         .ok_or_else(|| status_404(&id))?;
-    match app_environment::approve_environment(target) {
+    // approved_by = the authenticated caller, not a hardcoded string.
+    match app_environment::approve_environment(target, &session.user_id) {
         Ok(approved) => Ok(Json(serde_json::to_value(approved).unwrap())),
         Err(e) => Err(status_409(&e)),
     }
@@ -34332,16 +34342,25 @@ mod patch_waves_db_tests {
             "status after validate must be Validated"
         );
 
-        // 3. approve
-        let Ok(Json(approved)) = patch_approve(Json(PatchActionRequest {
-            wave_id: id.clone(),
-        }))
+        // 3. approve — the session principal must land in the approval trail.
+        let mut approver = AuthSession::static_dry_run();
+        approver.user_id = "patch-approver".into();
+        let Ok(Json(approved)) = patch_approve(
+            Extension(approver),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
             panic!("patch_approve failed");
         };
         assert_eq!(approved["status"], "Approved");
+        assert_eq!(
+            approved["metadata"]["approver"], "patch-approver",
+            "the persisted approver must be the session principal, not a hardcoded string"
+        );
 
         let wave = crate::repos::patch_waves::get(pool, &id)
             .await

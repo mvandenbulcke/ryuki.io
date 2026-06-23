@@ -325,7 +325,7 @@ pub fn validate_environment(env: &AppEnvironment) -> Result<ValidationResult, St
     })
 }
 
-pub fn approve_environment(env: &AppEnvironment) -> Result<AppEnvironment, String> {
+pub fn approve_environment(env: &AppEnvironment, approver: &str) -> Result<AppEnvironment, String> {
     if !matches!(env.status, EnvironmentStatus::Planned)
         && !matches!(env.status, EnvironmentStatus::Validated)
     {
@@ -338,9 +338,11 @@ pub fn approve_environment(env: &AppEnvironment) -> Result<AppEnvironment, Strin
     let mut approved = env.clone();
     approved.status = EnvironmentStatus::Approved;
     approved.updated_at = now_iso();
+    // approved_by = the authenticated caller, never a hardcoded string — the
+    // approval audit trail must name the real principal.
     approved
         .metadata
-        .insert("approved_by".into(), "admin".into());
+        .insert("approved_by".into(), approver.to_string());
     approved.metadata.insert("approved_at".into(), now_iso());
 
     Ok(approved)
@@ -628,9 +630,13 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        let approved = approve_environment(&env).unwrap();
+        let approved = approve_environment(&env, "env-approver").unwrap();
         assert_eq!(approved.status, EnvironmentStatus::Approved);
-        assert!(approved.metadata.contains_key("approved_by"));
+        // approved_by records the passed-in principal, not a hardcoded string.
+        assert_eq!(
+            approved.metadata.get("approved_by").map(String::as_str),
+            Some("env-approver")
+        );
     }
 
     #[test]
@@ -641,7 +647,7 @@ mod tests {
             .next()
             .unwrap();
         env.status = EnvironmentStatus::Deployed;
-        let result = approve_environment(&env);
+        let result = approve_environment(&env, "env-approver");
         assert!(result.is_err());
     }
 
