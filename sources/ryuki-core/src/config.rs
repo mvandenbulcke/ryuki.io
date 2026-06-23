@@ -1726,7 +1726,11 @@ impl RyukiConfig {
 
         if self.platform_url.is_empty() {
             errors.push("platform_url is required".into());
-        } else if !self.platform_url.starts_with("http") {
+        } else if !self.platform_url.starts_with("http://")
+            && !self.platform_url.starts_with("https://")
+        {
+            // Check the full scheme, not just "http" — a bare prefix check would
+            // accept "httpx://" / "https-evil://" despite the error message.
             errors.push(format!(
                 "platform_url '{}' must start with http:// or https://",
                 self.platform_url
@@ -1955,6 +1959,33 @@ mod tests {
         let errors = config.validate();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("platform_url")));
+    }
+
+    #[test]
+    fn test_validate_platform_url_rejects_malformed_scheme() {
+        // A bare `starts_with("http")` would wrongly accept these — the scheme
+        // must be exactly http:// or https://.
+        for bad in ["httpx://example.com", "https-evil://x", "httpfoo://y"] {
+            let config = RyukiConfig {
+                platform_url: bad.into(),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().iter().any(|e| e.contains("platform_url")),
+                "malformed scheme must be rejected: {bad}"
+            );
+        }
+        // The two valid schemes must still pass the platform_url check.
+        for ok in ["http://example.com", "https://example.com"] {
+            let config = RyukiConfig {
+                platform_url: ok.into(),
+                ..Default::default()
+            };
+            assert!(
+                !config.validate().iter().any(|e| e.contains("platform_url")),
+                "valid scheme must pass: {ok}"
+            );
+        }
     }
 
     #[test]

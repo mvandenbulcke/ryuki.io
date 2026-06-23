@@ -321,20 +321,34 @@ pub fn approve_request(request: &Request, approver: &str) -> Result<Request, Str
     approved.status = RequestStatus::Approved;
     approved.updated_at = Utc::now().to_rfc3339();
 
-    let has_approve_stage = approved.stages.iter().any(|s| s.name == "approve");
-    if !has_approve_stage {
+    // Complete the approve stage and record the decision evidence + approver.
+    // plan_request seeds a PENDING "approve" stage, so find-and-update it (the
+    // same pattern reject_request uses) — pushing only when absent would leave
+    // the stage Pending and DROP the approval evidence/approver from the trail.
+    let decision = EvidenceItem {
+        key: "approval-decision".into(),
+        value: format!("Approved by {}", approver),
+        redacted_value: None,
+        redacted: false,
+        evidence_type: EvidenceType::ApprovalDecision,
+    };
+    if let Some(stage) = approved.stages.iter_mut().find(|s| s.name == "approve") {
+        stage.status = StageStatus::Completed;
+        stage
+            .started_at
+            .get_or_insert_with(|| Utc::now().to_rfc3339());
+        stage.completed_at = Some(Utc::now().to_rfc3339());
+        stage.evidence.push(decision);
+        stage
+            .metadata
+            .insert("approver".into(), approver.to_string());
+    } else {
         approved.stages.push(Stage {
             name: "approve".into(),
             status: StageStatus::Completed,
             started_at: Some(Utc::now().to_rfc3339()),
             completed_at: Some(Utc::now().to_rfc3339()),
-            evidence: vec![EvidenceItem {
-                key: "approval-decision".into(),
-                value: format!("Approved by {}", approver),
-                redacted_value: None,
-                redacted: false,
-                evidence_type: EvidenceType::ApprovalDecision,
-            }],
+            evidence: vec![decision],
             metadata: HashMap::from([("approver".into(), approver.to_string())]),
         });
     }
@@ -1024,6 +1038,33 @@ mod tests {
         let req = make_planned_request();
         let result = approve_request(&req, "Datacenter Approver").unwrap();
         assert_eq!(result.status, RequestStatus::Approved);
+        // The approve stage that plan_request seeds (Pending) must be COMPLETED
+        // and carry the approval decision + approver — not left Pending, and not
+        // duplicated by a second pushed stage.
+        let approve_stages: Vec<_> = result
+            .stages
+            .iter()
+            .filter(|s| s.name == "approve")
+            .collect();
+        assert_eq!(approve_stages.len(), 1, "exactly one approve stage");
+        let stage = approve_stages[0];
+        assert_eq!(
+            stage.status,
+            StageStatus::Completed,
+            "approve stage must be Completed"
+        );
+        assert_eq!(
+            stage.metadata.get("approver").map(String::as_str),
+            Some("Datacenter Approver"),
+            "approver must be recorded on the stage"
+        );
+        assert!(
+            stage
+                .evidence
+                .iter()
+                .any(|e| e.value.contains("Approved by Datacenter Approver")),
+            "the approval decision evidence must be on the stage"
+        );
     }
 
     #[test]
