@@ -24,6 +24,7 @@
 //! gracefully to `RunStatus::Validated`.
 
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 
 /// A bundle of IaC files for one offering.
 ///
@@ -183,6 +184,69 @@ pub fn offering_iac_digest(offering_id: &str) -> Option<String> {
         return None;
     }
     Some(bundle_digest(&files))
+}
+
+/// Logical deployment inputs used to generate an offering's variables. These
+/// come from the request (the engine `Request` carries `id`/`site`/`environment`/
+/// `metadata`; `name`/`cpu`/`memory_gb` come from the request row).
+pub struct DeploymentInputs<'a> {
+    pub offering_id: &'a str,
+    pub request_id: &'a str,
+    pub name: &'a str,
+    pub site: &'a str,
+    pub environment: &'a str,
+    pub cpu: u32,
+    pub memory_gb: u32,
+    pub metadata: &'a HashMap<String, String>,
+}
+
+/// Metadata keys passed through to module variables of the same name for the
+/// server-deployment offerings (placement inputs the request may carry).
+const SERVER_DEPLOYMENT_PASSTHROUGH: &[&str] =
+    &["network", "datacenter", "cluster", "datastore", "template"];
+
+/// Render the Terraform variables (written as `ryuki.auto.tfvars.json`) for an
+/// offering from a request's logical inputs. PURE.
+///
+/// For the server-deployment offerings this maps the request inputs onto the
+/// Terraform variable names the embedded module declares (`vm_name`, `num_cpus`,
+/// `memory_mb`, …) — this is the "generation" step that makes a selected
+/// deployment's parameters actually reach the module. Values are plain JSON
+/// strings, so they cannot break the surrounding HCL structure (no raw-HCL
+/// templating). Offerings WITHOUT a declared binding fall back to the legacy
+/// raw-metadata passthrough so their behavior is unchanged.
+///
+/// Secret-valued variables (e.g. `vsphere_password`) are NEVER produced here;
+/// the runner injects those from `ResolvedCredentials` as `TF_VAR_*` at run time.
+pub fn render_vars(inputs: &DeploymentInputs) -> BTreeMap<String, String> {
+    match inputs.offering_id {
+        "linux-server-deployment" | "windows-server-deployment" => {
+            let mut vars = BTreeMap::new();
+            vars.insert("vm_name".to_string(), inputs.name.to_string());
+            vars.insert("num_cpus".to_string(), inputs.cpu.to_string());
+            // GB → MB for the module's `memory_mb`. Widen first so the ×1024
+            // cannot overflow.
+            vars.insert(
+                "memory_mb".to_string(),
+                (inputs.memory_gb as u64 * 1024).to_string(),
+            );
+            vars.insert("site".to_string(), inputs.site.to_string());
+            vars.insert("environment".to_string(), inputs.environment.to_string());
+            vars.insert("request_id".to_string(), inputs.request_id.to_string());
+            for key in SERVER_DEPLOYMENT_PASSTHROUGH {
+                if let Some(value) = inputs.metadata.get(*key) {
+                    vars.insert((*key).to_string(), value.clone());
+                }
+            }
+            vars
+        }
+        // No declared binding: preserve the existing raw-metadata passthrough.
+        _ => inputs
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +722,87 @@ mod tests {
         assert_ne!(
             combined, tf_only,
             "combined digest must include the ansible bundle too"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // render_vars
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn render_vars_binds_server_deployment_inputs() {
+        let metadata = HashMap::from([
+            ("network".to_string(), "VLAN-210".to_string()),
+            ("unmapped".to_string(), "ignored".to_string()),
+        ]);
+        let vars = render_vars(&DeploymentInputs {
+            offering_id: "linux-server-deployment",
+            request_id: "req-1",
+            name: "app-vm-01",
+            site: "DEFRA",
+            environment: "production",
+            cpu: 4,
+            memory_gb: 16,
+            metadata: &metadata,
+        });
+        assert_eq!(vars.get("vm_name").map(String::as_str), Some("app-vm-01"));
+        assert_eq!(vars.get("num_cpus").map(String::as_str), Some("4"));
+        assert_eq!(vars.get("memory_mb").map(String::as_str), Some("16384")); // 16 × 1024
+        assert_eq!(vars.get("site").map(String::as_str), Some("DEFRA"));
+        assert_eq!(
+            vars.get("environment").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(vars.get("request_id").map(String::as_str), Some("req-1"));
+        assert_eq!(vars.get("network").map(String::as_str), Some("VLAN-210"));
+        assert!(
+            !vars.contains_key("unmapped"),
+            "non-allow-listed metadata must not pass through for a bound offering"
+        );
+    }
+
+    #[test]
+    fn render_vars_falls_back_to_metadata_passthrough() {
+        let metadata = HashMap::from([
+            ("foo".to_string(), "bar".to_string()),
+            ("baz".to_string(), "qux".to_string()),
+        ]);
+        let vars = render_vars(&DeploymentInputs {
+            offering_id: "patch-maintenance",
+            request_id: "req-2",
+            name: "n",
+            site: "S",
+            environment: "E",
+            cpu: 1,
+            memory_gb: 1,
+            metadata: &metadata,
+        });
+        assert_eq!(vars.get("foo").map(String::as_str), Some("bar"));
+        assert_eq!(vars.get("baz").map(String::as_str), Some("qux"));
+        assert!(
+            !vars.contains_key("vm_name"),
+            "an unbound offering must not get server-deployment vars"
+        );
+        assert_eq!(vars.len(), 2, "fallback is the raw metadata, nothing added");
+    }
+
+    #[test]
+    fn render_vars_memory_conversion_does_not_overflow() {
+        let metadata = HashMap::new();
+        let vars = render_vars(&DeploymentInputs {
+            offering_id: "windows-server-deployment",
+            request_id: "r",
+            name: "n",
+            site: "S",
+            environment: "E",
+            cpu: 8,
+            memory_gb: u32::MAX,
+            metadata: &metadata,
+        });
+        // u32::MAX × 1024 must compute in u64 without panicking or wrapping.
+        assert_eq!(
+            vars.get("memory_mb").map(String::as_str),
+            Some((u32::MAX as u64 * 1024).to_string().as_str())
         );
     }
 }

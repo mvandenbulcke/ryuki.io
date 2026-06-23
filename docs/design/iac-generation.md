@@ -1,6 +1,6 @@
 # IaC generation & integrity
 
-Status: **design + slice 1 implemented**. Author: platform.
+Status: **design + slices 1 & 2 implemented**. Author: platform.
 
 ## Problem
 
@@ -93,9 +93,11 @@ touching that path; Slice 2 adds the binding.
   producer/verifier wiring (the integrity bridge). The control plane sets the
   real `iac_digest` at dispatch; the runner recomputes it and **refuses** a
   mismatch. Fully unit-tested.
-- **Slice 2.** `render_vars` with the server-deployment binding +
+- **Slice 2 (done).** `render_vars` with the server-deployment binding +
   metadata-passthrough fallback (the generation step), threading `cpu`/
-  `memory_gb`/`name` from the request row.
+  `memory_gb`/`name` from the request row; wired into dispatch so a selected
+  server deployment's inputs reach the module's `vm_name`/`num_cpus`/`memory_mb`
+  variables as JSON tfvars.
 - **Slice 3.** Move the per-offering bindings and the IaC template association
   into the catalog (`offering-catalog.yaml`) so any offering becomes deployable
   as data, not a `match` arm; verify the bundle against `iac_digest` at apply too.

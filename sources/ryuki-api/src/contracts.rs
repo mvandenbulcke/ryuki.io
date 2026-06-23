@@ -13773,20 +13773,29 @@ async fn requests_execute(
         // agent recomputes it and refuses to run a bundle that does not match
         // (see RunnerExecutor::execute). Offerings with no embedded IaC keep the
         // legacy all-zero stub (the agent treats that as "nothing to verify").
-        // vars carry the request's non-secret metadata.
+        // vars are generated from the request's logical inputs by the offering's
+        // binding (server-deployment offerings map name/cpu/memory_gb/… onto the
+        // module's Terraform variables; everything else falls back to raw
+        // metadata passthrough). Secret-valued vars are never produced here.
         let offering = ryuki_runner::iac::resolve_offering_id(&request);
         let iac_digest =
             ryuki_runner::iac::offering_iac_digest(&offering).unwrap_or_else(|| "0".repeat(64));
+        let vars = ryuki_runner::iac::render_vars(&ryuki_runner::iac::DeploymentInputs {
+            offering_id: &offering,
+            request_id: &request.id,
+            name: &current.name,
+            site: &request.site,
+            environment: &request.environment,
+            cpu: u32::try_from(current.cpu).unwrap_or(0),
+            memory_gb: u32::try_from(current.memory_gb).unwrap_or(0),
+            metadata: &request.metadata,
+        });
         let spec = ryuki_protocol::JobSpec {
             request_id: uid,
             offering_id: Uuid::new_v4(),
             iac_ref: offering,
             iac_digest,
-            vars: request
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            vars,
             mode,
         };
         let spec_json = serde_json::to_value(&spec).unwrap_or_default();
