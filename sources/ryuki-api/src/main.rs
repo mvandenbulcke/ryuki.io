@@ -9,6 +9,7 @@ mod contracts;
 pub mod cp_identity;
 pub mod database;
 mod entra_auth;
+mod idempotency;
 mod integration;
 mod oidc_callback;
 mod repos;
@@ -1634,6 +1635,10 @@ async fn main() {
         .merge(contracts::routes())
         .merge(boundary::routes())
         .merge(integration::routes())
+        // Idempotency runs INSIDE auth (auth gates first, then this), so an
+        // unauthorized request never claims a key. Opt-in per request via the
+        // Idempotency-Key header; no header / no DB → pass-through (unchanged).
+        .layer(middleware::from_fn(idempotency::idempotency_middleware))
         .layer(middleware::from_fn_with_state(
             entra_validator.clone(),
             auth_middleware,
