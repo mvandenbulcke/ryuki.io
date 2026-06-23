@@ -5332,6 +5332,7 @@ struct ShiftQueueRow {
     description: String,
     priority: String,
     assigned_to: Option<String>,
+    assigned_by: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     acknowledged: bool,
     acknowledged_by: Option<String>,
@@ -5347,9 +5348,10 @@ struct ShiftQueueRow {
 }
 
 const SHIFT_QUEUE_COLUMNS: &str =
-    "id::text AS id, item_type, title, description, priority, assigned_to, created_at, \
-     acknowledged, acknowledged_by, acknowledged_at, resolved, resolution, resolved_at, \
-     escalated, escalation_reason, escalated_at, metadata::text AS metadata, updated_at";
+    "id::text AS id, item_type, title, description, priority, assigned_to, assigned_by, \
+     created_at, acknowledged, acknowledged_by, acknowledged_at, resolved, resolution, \
+     resolved_at, escalated, escalation_reason, escalated_at, metadata::text AS metadata, \
+     updated_at";
 
 async fn shift_summary() -> Json<Value> {
     if let Some(pool) = get_db() {
@@ -5394,6 +5396,7 @@ async fn shift_summary() -> Json<Value> {
                 "title": row.title,
                 "priority": row.priority,
                 "assigned_to": row.assigned_to,
+                "assigned_by": row.assigned_by,
                 "acknowledged": row.acknowledged,
                 "escalated": row.escalated,
                 "created_at": row.created_at.to_rfc3339(),
@@ -5490,8 +5493,12 @@ async fn shift_acknowledge(
 
 async fn shift_assign(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<ShiftActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // assigned_to (body.user) is the ASSIGNEE; assigned_by is the actor that
+    // performed the assignment — taken from the authenticated session, never a
+    // client field, mirroring shift_acknowledge's acknowledged_by.
     if let Some(pool) = get_db() {
         // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
         let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
@@ -5519,14 +5526,17 @@ async fn shift_assign(
 
         let now = chrono::Utc::now();
         // CAS: only assign if still unresolved.
-        let result =
-            sqlx::query("UPDATE shift_queue SET assigned_to = $1, updated_at = $2 WHERE id = $3 AND resolved = false")
-                .bind(&body.user)
-                .bind(now)
-                .bind(uid)
-                .execute(pool)
-                .await
-                .map_err(db_error)?;
+        let result = sqlx::query(
+            "UPDATE shift_queue SET assigned_to = $1, assigned_by = $2, updated_at = $3 \
+             WHERE id = $4 AND resolved = false",
+        )
+        .bind(&body.user)
+        .bind(&session.user_id)
+        .bind(now)
+        .bind(uid)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
 
         if result.rows_affected() == 0 {
             return Err((
@@ -5539,6 +5549,7 @@ async fn shift_assign(
             "status": "assigned",
             "id": id,
             "assigned_to": body.user,
+            "assigned_by": session.user_id,
             "source": "database",
         })));
     }
@@ -28839,6 +28850,7 @@ mod shift_queue_db_tests {
 
         let result = shift_assign(
             Path(id.to_string()),
+            Extension(approver_session("shift-lead")),
             Json(ShiftActionRequest {
                 user: "network-team".to_string(),
             }),
@@ -28861,12 +28873,21 @@ mod shift_queue_db_tests {
         };
         assert_eq!(body["status"], "assigned");
         assert_eq!(body["source"], "database");
+        assert_eq!(body["assigned_to"], "network-team");
+        assert_eq!(body["assigned_by"], "shift-lead");
 
         let row = row.expect("row must exist after assign");
         assert_eq!(
             row.assigned_to.as_deref(),
             Some("network-team"),
             "assigned_to must be persisted in DB"
+        );
+        // SECURITY: assigned_by is the authenticated actor (session), distinct
+        // from the assignee — proven against the persisted row.
+        assert_eq!(
+            row.assigned_by.as_deref(),
+            Some("shift-lead"),
+            "assigned_by must be the session principal, not the assignee"
         );
     }
 
@@ -29226,6 +29247,7 @@ mod shift_queue_db_tests {
         // Assign → Escalate → Resolve.
         let _ = shift_assign(
             Path(id.to_string()),
+            Extension(approver_session("shift-lead")),
             Json(ShiftActionRequest {
                 user: "ops-a".to_string(),
             }),
