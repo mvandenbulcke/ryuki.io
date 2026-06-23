@@ -61,6 +61,81 @@ const WINDOWS_SERVER_DEPLOYMENT_MAIN_TF: &str =
 const CONTROLLED_RESTORE_REQUEST_PLAYBOOK: &str =
     include_str!("iac/controlled-restore-request/controlled-restore-request.yml");
 
+/// How a request's logical inputs map onto an offering's variables.
+#[derive(Clone, Copy)]
+enum VarBinding {
+    /// Map name/cpu/memory_gb/… onto a vSphere server-deployment module.
+    ServerDeployment,
+    /// Pass the request's raw metadata through unchanged (the legacy default).
+    MetadataPassthrough,
+}
+
+/// One offering's complete IaC wiring: its embedded Terraform and/or Ansible
+/// files and its variable binding. This is the SINGLE declarative source of
+/// truth — `resolve`, `resolve_ansible`, `render_vars`, and
+/// `offering_iac_digest` all derive from it, so an offering's IaC and its
+/// var-binding can never drift apart. Adding a wired offering is one entry here
+/// (plus the embedded template consts above) — no edits to the resolver/binder.
+struct OfferingIac {
+    id: &'static str,
+    /// Terraform files `(filename, content)`; empty = no Terraform.
+    terraform: &'static [(&'static str, &'static str)],
+    /// Ansible files `(filename, content)`; empty = no Ansible.
+    ansible: &'static [(&'static str, &'static str)],
+    binding: VarBinding,
+}
+
+/// The offering → IaC registry (the single source of truth, see `OfferingIac`).
+const OFFERINGS: &[OfferingIac] = &[
+    OfferingIac {
+        id: "patch-maintenance",
+        terraform: &[("main.tf", PATCH_MAINTENANCE_MAIN_TF)],
+        ansible: &[("patch-maintenance.yml", PATCH_MAINTENANCE_PLAYBOOK)],
+        binding: VarBinding::MetadataPassthrough,
+    },
+    OfferingIac {
+        id: "request-preflight",
+        terraform: &[("main.tf", REQUEST_PREFLIGHT_MAIN_TF)],
+        ansible: &[],
+        binding: VarBinding::MetadataPassthrough,
+    },
+    OfferingIac {
+        id: "zabbix-onboarding",
+        terraform: &[],
+        ansible: &[("zabbix-onboarding.yml", ZABBIX_ONBOARDING_PLAYBOOK)],
+        binding: VarBinding::MetadataPassthrough,
+    },
+    OfferingIac {
+        id: "linux-server-deployment",
+        terraform: &[("main.tf", LINUX_SERVER_DEPLOYMENT_MAIN_TF)],
+        ansible: &[(
+            "linux-server-deployment.yml",
+            LINUX_SERVER_DEPLOYMENT_PLAYBOOK,
+        )],
+        binding: VarBinding::ServerDeployment,
+    },
+    OfferingIac {
+        id: "windows-server-deployment",
+        terraform: &[("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF)],
+        ansible: &[],
+        binding: VarBinding::ServerDeployment,
+    },
+    OfferingIac {
+        id: "controlled-restore-request",
+        terraform: &[],
+        ansible: &[(
+            "controlled-restore-request.yml",
+            CONTROLLED_RESTORE_REQUEST_PLAYBOOK,
+        )],
+        binding: VarBinding::MetadataPassthrough,
+    },
+];
+
+/// Look up an offering's IaC wiring in the registry.
+fn lookup(offering_id: &str) -> Option<&'static OfferingIac> {
+    OFFERINGS.iter().find(|o| o.id == offering_id)
+}
+
 /// Resolve the effective offering ID for a request, applying OS-based
 /// discrimination for `server-deployment` and name normalization for
 /// `controlled-restore`.
@@ -103,13 +178,9 @@ pub fn resolve_offering_id(request: &ryuki_engine::models::Request) -> String {
 /// Callers that receive `None` MUST keep the existing simulated plan behavior
 /// unchanged — this function never returns an error.
 pub fn resolve(offering_id: &str) -> Option<IacBundle> {
-    match offering_id {
-        "patch-maintenance" => Some(vec![("main.tf", PATCH_MAINTENANCE_MAIN_TF)]),
-        "request-preflight" => Some(vec![("main.tf", REQUEST_PREFLIGHT_MAIN_TF)]),
-        "linux-server-deployment" => Some(vec![("main.tf", LINUX_SERVER_DEPLOYMENT_MAIN_TF)]),
-        "windows-server-deployment" => Some(vec![("main.tf", WINDOWS_SERVER_DEPLOYMENT_MAIN_TF)]),
-        _ => None,
-    }
+    lookup(offering_id)
+        .filter(|o| !o.terraform.is_empty())
+        .map(|o| o.terraform.to_vec())
 }
 
 /// Resolve the Ansible IaC bundle for the given offering ID.
@@ -120,19 +191,9 @@ pub fn resolve(offering_id: &str) -> Option<IacBundle> {
 /// line. Callers that receive `None` keep the existing simulated verify
 /// behavior unchanged — this function never returns an error.
 pub fn resolve_ansible(offering_id: &str) -> Option<IacBundle> {
-    match offering_id {
-        "patch-maintenance" => Some(vec![("patch-maintenance.yml", PATCH_MAINTENANCE_PLAYBOOK)]),
-        "zabbix-onboarding" => Some(vec![("zabbix-onboarding.yml", ZABBIX_ONBOARDING_PLAYBOOK)]),
-        "linux-server-deployment" => Some(vec![(
-            "linux-server-deployment.yml",
-            LINUX_SERVER_DEPLOYMENT_PLAYBOOK,
-        )]),
-        "controlled-restore-request" => Some(vec![(
-            "controlled-restore-request.yml",
-            CONTROLLED_RESTORE_REQUEST_PLAYBOOK,
-        )]),
-        _ => None,
-    }
+    lookup(offering_id)
+        .filter(|o| !o.ansible.is_empty())
+        .map(|o| o.ansible.to_vec())
 }
 
 /// Canonical SHA-256 over a set of IaC files, independent of input order.
@@ -219,8 +280,11 @@ const SERVER_DEPLOYMENT_PASSTHROUGH: &[&str] =
 /// Secret-valued variables (e.g. `vsphere_password`) are NEVER produced here;
 /// the runner injects those from `ResolvedCredentials` as `TF_VAR_*` at run time.
 pub fn render_vars(inputs: &DeploymentInputs) -> BTreeMap<String, String> {
-    match inputs.offering_id {
-        "linux-server-deployment" | "windows-server-deployment" => {
+    let binding = lookup(inputs.offering_id)
+        .map(|o| o.binding)
+        .unwrap_or(VarBinding::MetadataPassthrough);
+    match binding {
+        VarBinding::ServerDeployment => {
             let mut vars = BTreeMap::new();
             vars.insert("vm_name".to_string(), inputs.name.to_string());
             vars.insert("num_cpus".to_string(), inputs.cpu.to_string());
@@ -240,8 +304,8 @@ pub fn render_vars(inputs: &DeploymentInputs) -> BTreeMap<String, String> {
             }
             vars
         }
-        // No declared binding: preserve the existing raw-metadata passthrough.
-        _ => inputs
+        // No declared binding: preserve the legacy raw-metadata passthrough.
+        VarBinding::MetadataPassthrough => inputs
             .metadata
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -804,5 +868,71 @@ mod tests {
             vars.get("memory_mb").map(String::as_str),
             Some((u32::MAX as u64 * 1024).to_string().as_str())
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // OFFERINGS registry consistency
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn registry_entries_are_internally_consistent() {
+        let mut ids = std::collections::HashSet::new();
+        for o in OFFERINGS {
+            assert!(
+                ids.insert(o.id),
+                "duplicate offering id in registry: {}",
+                o.id
+            );
+            assert!(
+                !o.terraform.is_empty() || !o.ansible.is_empty(),
+                "offering {} has no Terraform AND no Ansible — it would not be deployable",
+                o.id
+            );
+            // A ServerDeployment binding produces Terraform vars (num_cpus, …), so
+            // the offering must actually have a Terraform module.
+            if matches!(o.binding, VarBinding::ServerDeployment) {
+                assert!(
+                    !o.terraform.is_empty(),
+                    "offering {} binds ServerDeployment vars but has no Terraform",
+                    o.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn registry_preserves_legacy_wiring() {
+        // The exact offering→runner wiring the resolver must keep.
+        for id in [
+            "patch-maintenance",
+            "request-preflight",
+            "linux-server-deployment",
+            "windows-server-deployment",
+        ] {
+            assert!(resolve(id).is_some(), "{id} must resolve to Terraform IaC");
+        }
+        for id in ["zabbix-onboarding", "controlled-restore-request"] {
+            assert!(
+                resolve(id).is_none(),
+                "{id} must NOT resolve to Terraform IaC"
+            );
+        }
+        for id in [
+            "patch-maintenance",
+            "zabbix-onboarding",
+            "linux-server-deployment",
+            "controlled-restore-request",
+        ] {
+            assert!(
+                resolve_ansible(id).is_some(),
+                "{id} must resolve to Ansible IaC"
+            );
+        }
+        for id in ["request-preflight", "windows-server-deployment"] {
+            assert!(
+                resolve_ansible(id).is_none(),
+                "{id} must NOT resolve to Ansible IaC"
+            );
+        }
     }
 }

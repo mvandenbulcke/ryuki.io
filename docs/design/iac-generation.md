@@ -98,9 +98,16 @@ touching that path; Slice 2 adds the binding.
   `memory_gb`/`name` from the request row; wired into dispatch so a selected
   server deployment's inputs reach the module's `vm_name`/`num_cpus`/`memory_mb`
   variables as JSON tfvars.
-- **Slice 3.** Move the per-offering bindings and the IaC template association
-  into the catalog (`offering-catalog.yaml`) so any offering becomes deployable
-  as data, not a `match` arm; verify the bundle against `iac_digest` at apply too.
+- **Slice 3 (done — binding registry).** The per-offering wiring is now a single
+  declarative `OFFERINGS` registry (`OfferingIac { id, terraform, ansible,
+  binding }`); `resolve`, `resolve_ansible`, `render_vars` and
+  `offering_iac_digest` all derive from it, so an offering's IaC and var-binding
+  can never drift apart (a consistency test enforces every entry has a runner).
+  Adding a wired offering is one registry entry plus the embedded template
+  consts. The *templates themselves* stay embedded at compile time to preserve
+  the offline/self-contained guarantee — making the templates fully
+  catalog-YAML-driven would need a runtime content-addressed template store and
+  is a separate future change.
 - **Slice 4 (operator-owned).** A real apply against live infrastructure, proven
   end-to-end with provider credentials and a durable state backend.
 
