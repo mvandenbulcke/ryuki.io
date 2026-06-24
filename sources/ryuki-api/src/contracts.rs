@@ -160,6 +160,7 @@ pub fn routes() -> Router {
         .route("/api/ops/scheduler/executions", get(scheduler_executions))
         .route("/api/metrics/samples", post(metrics_record_sample))
         .route("/api/metrics/series", get(metrics_series))
+        .route("/api/metrics/insights", get(metrics_insights))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -15097,6 +15098,36 @@ fn metric_scope_too_long(scope: &Option<String>) -> bool {
         .unwrap_or(false)
 }
 
+/// Fetch one COHERENT-scope metric series: the most-recent 10k samples for
+/// `metric_key` within the given scope, returned ascending by `observed_at`.
+/// `IS NOT DISTINCT FROM` means an omitted (`None`) site/environment selects the
+/// platform-wide rows where that column IS NULL — never "all scopes" — so the
+/// series is never a mix. Shared by the series and insights handlers so they
+/// read identical data.
+async fn fetch_metric_series_rows(
+    pool: &sqlx::PgPool,
+    metric_key: &str,
+    site: &Option<String>,
+    environment: &Option<String>,
+) -> Result<Vec<MetricSampleRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT value, observed_at FROM ( \
+             SELECT value, observed_at FROM metric_samples \
+             WHERE metric_key = $1 \
+               AND site IS NOT DISTINCT FROM $2 \
+               AND environment IS NOT DISTINCT FROM $3 \
+             ORDER BY observed_at DESC \
+             LIMIT 10000 \
+         ) recent \
+         ORDER BY observed_at ASC",
+    )
+    .bind(metric_key)
+    .bind(site)
+    .bind(environment)
+    .fetch_all(pool)
+    .await
+}
+
 /// POST /api/metrics/samples — record one time-series metric sample. Execute-tier
 /// (operators/collectors push samples). 503 when no database is configured.
 async fn metrics_record_sample(
@@ -15216,29 +15247,7 @@ async fn metrics_series(
     };
     let f_site = norm(&params.site);
     let f_env = norm(&params.environment);
-    // A series is ONE coherent scope: `IS NOT DISTINCT FROM` treats an omitted
-    // (NULL) site/environment as "the platform-wide rows where it IS NULL", NOT
-    // as "all sites" — so a forecast is never computed over a mix of scopes.
-    // The most-recent 10k samples are selected (DESC + LIMIT), then re-ordered
-    // ASC for the time series; a long history forecasts off its recent window,
-    // not its oldest rows.
-    let rows: Vec<MetricSampleRow> = match sqlx::query_as(
-        "SELECT value, observed_at FROM ( \
-             SELECT value, observed_at FROM metric_samples \
-             WHERE metric_key = $1 \
-               AND site IS NOT DISTINCT FROM $2 \
-               AND environment IS NOT DISTINCT FROM $3 \
-             ORDER BY observed_at DESC \
-             LIMIT 10000 \
-         ) recent \
-         ORDER BY observed_at ASC",
-    )
-    .bind(metric_key)
-    .bind(&f_site)
-    .bind(&f_env)
-    .fetch_all(pool)
-    .await
-    {
+    let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
         Ok(rows) => rows,
         Err(e) => {
             // Do NOT mask a DB failure as an empty (and falsely "flat") series —
@@ -15298,6 +15307,130 @@ async fn metrics_series(
         "summary": summary,
         "trend": trend,
         "forecast": forecast_json,
+    })))
+}
+
+/// Query params for metric insight detection (#35).
+#[derive(Debug, Deserialize, Default)]
+struct MetricInsightsParams {
+    metric_key: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    /// Anomaly z-score threshold (default 3.0).
+    z: Option<f64>,
+    /// Waste threshold: samples at or below this count toward waste (default 10.0).
+    waste_threshold: Option<f64>,
+    /// Fraction of samples at/below the threshold to flag waste (default 0.8).
+    waste_fraction: Option<f64>,
+}
+
+/// GET /api/metrics/insights — anomaly + waste detection over one metric series
+/// (pure `ryuki_engine::metric_anomaly`). `metric_key` is required; `site`/
+/// `environment` scope the (single, coherent) series; `z` is the anomaly
+/// z-threshold; `waste_threshold`/`waste_fraction` configure waste detection.
+/// Request-tier read. 503 when no database is configured; 500 on a query error
+/// (never a falsely-empty result).
+async fn metrics_insights(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricInsightsParams>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read metrics"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "metric_key is required"})),
+        ));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "querying metric series for insights failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not query metric series"})),
+            ));
+        }
+    };
+
+    let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+        .iter()
+        .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+            t: r.observed_at.timestamp() as f64,
+            value: r.value,
+        })
+        .collect();
+
+    // Reject a non-finite tuning param rather than letting NaN/Inf reach the
+    // detectors (sample values are already finite by ingest CHECK; these query
+    // params are a separate, untrusted input).
+    for (name, val) in [
+        ("z", params.z),
+        ("waste_threshold", params.waste_threshold),
+        ("waste_fraction", params.waste_fraction),
+    ] {
+        if val.is_some_and(|v| !v.is_finite()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("{name} must be a finite number") })),
+            ));
+        }
+    }
+    let z = params.z.unwrap_or(3.0);
+    let waste_threshold = params.waste_threshold.unwrap_or(10.0);
+    let waste_fraction = params.waste_fraction.unwrap_or(0.8);
+
+    let anomalies = ryuki_engine::metric_anomaly::detect_anomalies(&points, z);
+    let waste =
+        ryuki_engine::metric_anomaly::detect_waste(&points, waste_threshold, waste_fraction);
+    let summary = ryuki_engine::metric_forecast::summarize(&points);
+
+    // Map each anomaly's unix-seconds `t` back to an RFC3339 timestamp.
+    let anomalies_json: Vec<Value> = anomalies
+        .iter()
+        .map(|a| {
+            let ts = chrono::DateTime::from_timestamp(a.t as i64, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            json!({"observed_at": ts, "value": a.value, "z_score": a.z_score})
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "site": f_site,
+        "environment": f_env,
+        "sample_count": points.len(),
+        "summary": summary,
+        "anomalies": anomalies_json,
+        "waste": waste,
     })))
 }
 
@@ -27046,6 +27179,65 @@ mod db_lifecycle_tests {
         assert!(
             first_proj > 30.0,
             "an increasing series projects above the last observation, got {first_proj}"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #35: the insights endpoint detects an anomalous spike and flags an
+    /// under-utilized series. Four low samples + one big spike yields the spike
+    /// as the sole anomaly and an `underutilized` waste finding.
+    #[tokio::test]
+    async fn test_metric_insights_detects_anomaly_and_waste() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.insights.4w8";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        for (i, v) in [(0i64, 5.0f64), (1, 5.0), (2, 5.0), (3, 5.0), (4, 100.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: None,
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-02-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        let params = MetricInsightsParams {
+            metric_key: Some(key.to_string()),
+            site: None,
+            environment: None,
+            // Default threshold (None ⇒ 3.0): the leave-one-out z makes the
+            // spike detectable even in this 5-sample series.
+            z: None,
+            waste_threshold: None,
+            waste_fraction: None,
+        };
+        let Json(out) = metrics_insights(sess(), Query(params))
+            .await
+            .expect("insights");
+        let anomalies = out["anomalies"].as_array().unwrap();
+        assert_eq!(anomalies.len(), 1, "the spike is the only anomaly");
+        assert_eq!(anomalies[0]["value"].as_f64().unwrap(), 100.0);
+        assert_eq!(
+            out["waste"]["kind"], "underutilized",
+            "four of five low samples ⇒ underutilized"
         );
 
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
