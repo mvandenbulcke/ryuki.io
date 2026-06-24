@@ -82,7 +82,7 @@ implementing **all 66**. This file tracks execution.
 | 50 | [x] | Evidence pack file download / export | Portal | S | M | — |
 | 51 | [ ] | Per-vendor connection capability catalog | Integ | M | M | — |
 | 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
-| 53 | [ ] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
+| 53 | [x] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
 | 54 | [ ] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
 | 55 | [x] | DNS record update endpoint | API | S | M | — |
 | 56 | [ ] | IPAM subnet CRUD | API | M | M | — |
@@ -145,3 +145,9 @@ factor + ceiling-breach) + GET /api/metrics/what-if. Overflow registers as a
 breach (not silently dropped); headroom/timestamps null-guarded. AIOps chain
 now #34→#35→#36→#37 all shipped; remaining links #53/#54 (budgets) consume the
 forecast/what-if vs a threshold.
+
+**#53** (`e3a97c2`): `ryuki_engine::metric_budget` (above/below threshold,
+breach now + projected) + budgets CRUD + GET /api/metrics/budgets/status
+(alerting-safe: per-budget `error` status + `degraded`, never false-OK). Fixed
+a Postgres `NaN=NaN`-is-true CHECK bug in 096/097 (mig 098 back-corrects 096).
+Only #54 (commitment modeling) remains in the AIOps theme.
