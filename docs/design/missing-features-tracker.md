@@ -61,7 +61,7 @@ implementing **all 66**. This file tracks execution.
 | 29 | [ ] | DR failover orchestration (runbook-driven) | Resil | L | H | — |
 | 30 | [ ] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
 | 31 | [ ] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | ✓ |
-| 32 | [ ] | Per-notification mark-read + deep-link | Portal | S | M | — |
+| 32 | [x] | Per-notification mark-read + deep-link | Portal | S | M | — |
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
 | 34 | [ ] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
 | 35 | [ ] | Anomaly / waste detection engine | AIOps | M | H | — |
