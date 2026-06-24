@@ -62,7 +62,7 @@ implementing **all 66**. This file tracks execution.
 | 30 | [ ] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
 | 31 | [ ] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | ✓ |
 | 32 | [ ] | Per-notification mark-read + deep-link | Portal | S | M | — |
-| 33 | [ ] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
+| 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
 | 34 | [ ] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
 | 35 | [ ] | Anomaly / waste detection engine | AIOps | M | H | — |
 | 36 | [ ] | AIOps suggestion-generation engine | AIOps | M | H | — |
@@ -95,7 +95,7 @@ implementing **all 66**. This file tracks execution.
 | 63 | [x] | Observability deploy wiring | Roadmap | M | M | ✓ |
 | 64 | [ ] | OpenAPI / machine-readable API spec | Roadmap | M | M | ✓ |
 | 65 | [ ] | Optional gated AI narrative adapter | AIOps | M | M | — |
-| 66 | [ ] | Release engineering (versioning/tags/changelog) | Roadmap | M | M | ✓ |
+| 66 | [x] | Release engineering (versioning/tags/changelog) | Roadmap | M | M | ✓ |
 
 _Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`.
 `[x]` shipped · `[~]` partial (core shipped; follow-up tracked) · `[ ]` not started._
