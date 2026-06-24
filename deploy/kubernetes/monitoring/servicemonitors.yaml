@@ -1,0 +1,75 @@
+# Prometheus Operator ServiceMonitors for the ryuki platform apps.
+#
+# These objects require the Prometheus Operator CRDs
+# (monitoring.coreos.com/v1) to be installed in the cluster. They tell a
+# Prometheus instance which Services to scrape and on which port/path.
+#
+# Both apps serve their HTTP surface (and, for platform-api, the Prometheus
+# /metrics endpoint) on the Service port named `http` (8080) — there is no
+# dedicated metrics port, so the metrics scrape rides the same port. See
+# deploy/kubernetes/base/services.yaml and the `metrics` handler in
+# sources/ryuki-api/src/main.rs.
+#
+# The `release: <prometheus-release>` label on each ServiceMonitor is the
+# selector most kube-prometheus-stack installs use to adopt ServiceMonitors;
+# adjust it to match the `serviceMonitorSelector` of the target Prometheus.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: platform-api
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: platform-api
+    # Adoption label for kube-prometheus-stack; override per cluster.
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - ryuki-platform
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: ryuki-infrastructure-platform
+      app.kubernetes.io/name: platform-api
+  endpoints:
+    - port: http
+      path: /metrics
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s
+---
+# portal-ui does NOT currently expose a Prometheus /metrics endpoint
+# (portal/portal-ui has no metrics route — confirmed against its Cargo.toml and
+# router). This ServiceMonitor is shipped disabled-by-default via a label
+# selector that matches no endpoint path until the portal grows a /metrics
+# surface. Once portal-ui serves /metrics on the `http` port, flip `path` to
+# `/metrics` and remove this comment.
+# TODO: confirm portal-ui metrics endpoint + port before enabling this scrape.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: portal-ui
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: portal-ui
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - ryuki-platform
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: ryuki-infrastructure-platform
+      app.kubernetes.io/name: portal-ui
+  endpoints:
+    - port: http
+      # Placeholder path: portal-ui has no /metrics yet. The readiness probe
+      # surface (/readyz) is scraped only to keep target discovery wired; it
+      # returns non-Prometheus output and will not produce app metrics.
+      # TODO: change to /metrics once portal-ui exposes Prometheus metrics.
+      path: /readyz
+      scheme: http
+      interval: 30s
+      scrapeTimeout: 10s

@@ -1,0 +1,101 @@
+# Prometheus alerting rules for the ryuki platform.
+#
+# Requires the Prometheus Operator CRDs (monitoring.coreos.com/v1). The metric
+# names below come from the platform-api /metrics handler — see
+# sources/ryuki-api/src/main.rs (`metrics` fn) and
+# sources/ryuki-engine/src/health_monitor.rs (`metrics_text_with_api_requests`,
+# `append_duration_metrics`). Keep these expressions in sync with that source.
+#
+# Exported metric reference (platform-api):
+#   ryuki_platform_health{component="…"}            gauge  1=healthy 0=unhealthy
+#   ryuki_db_pool_connected                          gauge  1=connected 0=down
+#   ryuki_db_pool_connections{state="size|idle|active"} gauge
+#   ryuki_api_requests_total{method,path,status}     counter (status currently "ALL")
+#   ryuki_api_requests_per_endpoint_total{method,path} counter
+#   ryuki_api_request_duration_milliseconds{quantile} summary (+ _sum/_count)
+#   ryuki_platform_info{version}                     gauge  always 1
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ryuki-platform-alerts
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-alerts
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: ryuki-platform.availability
+      rules:
+        # The Prometheus scrape target for platform-api is down. `up` is the
+        # synthetic per-target metric Prometheus emits for every scrape; the
+        # job label is set by the ServiceMonitor (defaults to the Service name).
+        - alert: ApiDown
+          expr: up{job="platform-api"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "platform-api is not scrapeable"
+            description: >-
+              Prometheus has been unable to scrape platform-api
+              (job=platform-api) for more than 2 minutes. The API process is
+              down or its /metrics endpoint is unreachable.
+
+        # The platform-api database connection pool reports disconnected.
+        - alert: DbPoolDisconnected
+          expr: ryuki_db_pool_connected == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "platform-api database pool is disconnected"
+            description: >-
+              ryuki_db_pool_connected has been 0 for more than 1 minute.
+              platform-api cannot reach its PostgreSQL backend; database-backed
+              endpoints will fail or fall back to degraded behaviour.
+
+    - name: ryuki-platform.health
+      rules:
+        # One or more platform health components report unhealthy. The
+        # `component` label identifies which check (adapter, database, etc.).
+        - alert: ComponentUnhealthy
+          expr: ryuki_platform_health == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "platform component {{ $labels.component }} is unhealthy"
+            description: >-
+              ryuki_platform_health{component="{{ $labels.component }}"} has been
+              0 for more than 5 minutes, indicating a failed internal health
+              check for that component.
+
+    - name: ryuki-platform.traffic
+      rules:
+        # High HTTP error rate.
+        #
+        # NOTE: ryuki_api_requests_total currently carries a single
+        # status="ALL" series — the API does not yet split request counts by
+        # HTTP status class, so a true 5xx-ratio cannot be computed from the
+        # exported metrics. As a proxy we alert when the request-duration p99
+        # (ryuki_api_request_duration_milliseconds{quantile="0.99"}) crosses a
+        # latency budget, which is the strongest error/saturation signal
+        # available today.
+        # TODO: switch to a 5xx-ratio expression such as
+        #   sum(rate(ryuki_api_requests_total{status=~"5.."}[5m]))
+        #     / sum(rate(ryuki_api_requests_total[5m])) > 0.05
+        # once platform-api emits per-status request counters.
+        - alert: HighErrorRate
+          expr: ryuki_api_request_duration_milliseconds{quantile="0.99"} > 2000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "platform-api p99 latency is high"
+            description: >-
+              p99 request latency
+              (ryuki_api_request_duration_milliseconds{quantile="0.99"}) has
+              exceeded 2000ms for more than 5 minutes. Used as a stand-in for an
+              error-rate signal until per-status request counters exist.

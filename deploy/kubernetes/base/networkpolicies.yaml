@@ -181,6 +181,40 @@ spec:
         - protocol: TCP
           port: 5432
 ---
+# Monitoring scrape access: lets Prometheus (running in a `monitoring`
+# namespace) reach the /metrics endpoint on platform-api and portal-ui. The
+# apps expose /metrics on the same `http` port (8080) as their app traffic, so
+# this opens 8080 from the monitoring namespace only. The namespace must carry
+# the `kubernetes.io/metadata.name: monitoring` label (set automatically by the
+# NamespaceDefaultLabelName admission plugin on modern clusters). Pair with the
+# ServiceMonitors in deploy/kubernetes/monitoring/servicemonitors.yaml.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-ingress
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: allow-monitoring-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - platform-api
+          - portal-ui
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+---
 # CNPG intra-cluster traffic: replication on 5432 and the instance-manager
 # status port on 8000. Necessary but not sufficient under default-deny: the
 # instance manager also needs egress to the kube-apiserver (cluster-specific

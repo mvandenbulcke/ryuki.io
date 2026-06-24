@@ -37,6 +37,9 @@ const EXPECTED_NETWORK_POLICIES: &[&str] = &[
     "allow-ingress-to-db-from-platform-api",
     "allow-db-intra-cluster",
     "allow-ingress-to-db-from-cnpg-operator",
+    // Observability scrape access: lets a `monitoring` namespace reach the
+    // metrics port under default-deny (deploy/kubernetes/monitoring wiring).
+    "allow-monitoring-ingress",
 ];
 const APPROVED_KEYS: &[&str] = &[
     "apiVersion",

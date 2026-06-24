@@ -90,6 +90,7 @@ mod monitoring_review_queue;
 mod network_vlan_readiness;
 mod noise_flapping_remediation;
 mod object_storage_readiness;
+mod observability_deploy_wiring;
 mod offering_catalog_api;
 mod offering_recommendations;
 mod operation_dependency_replay;
@@ -986,6 +987,12 @@ fn run() -> Result<(), String> {
                         "local-container-readiness validation requires --context-json".to_string()
                     })?;
                     local_container_readiness::validate_context_file(&path)?
+                }
+                "observability-deploy-wiring" => {
+                    let path = context_json.ok_or_else(|| {
+                        "observability-deploy-wiring validation requires --context-json".to_string()
+                    })?;
+                    observability_deploy_wiring::validate_context_file(&path)?
                 }
                 "legal-hold-retention" => {
                     let path = context_json.ok_or_else(|| {
@@ -2446,6 +2453,7 @@ fn require_slice(args: &[String]) -> Result<&str, String> {
             | "site-catalog-contract"
             | "sql-server-deployment"
             | "object-storage-readiness"
+            | "observability-deploy-wiring"
             | "platform-database-readiness"
             | "network-vlan-readiness"
             | "out-of-band-access-validation"
@@ -3378,6 +3386,10 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
         object_storage_readiness::validate_context_file as ValidateFn,
     );
     m.insert(
+        "observability-deploy-wiring",
+        observability_deploy_wiring::validate_context_file as ValidateFn,
+    );
+    m.insert(
         "offering-catalog-api",
         offering_catalog_api::validate_context_file as ValidateFn,
     );
@@ -3999,6 +4011,12 @@ fn build_slice_context(
             }
         }
         "app-skeleton" => {
+            map.insert(
+                "root".to_string(),
+                serde_json::Value::String(root.to_string_lossy().to_string()),
+            );
+        }
+        "observability-deploy-wiring" => {
             map.insert(
                 "root".to_string(),
                 serde_json::Value::String(root.to_string_lossy().to_string()),
