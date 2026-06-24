@@ -18,18 +18,18 @@ use crate::models::{
     catalog_contract_fallbacks, catalog_readiness_fallbacks, condense_timestamp,
     normalize_api_stage, operation_run_fallbacks, platform_settings_summary_fallback,
     rbac_role_summary_fallbacks, request_intake_form_fallback, AdminSessionSummary,
-    AdminTokenSummary, AuditEventRow, AuthSession, CreateTokenPayload, PlatformSettingsSummary,
-    ALL_APP_ROLES,
+    AdminTokenSummary, AuditEventRow, AuthSession, CmdbActionResult, CreateTokenPayload,
+    PlatformSettingsSummary, ALL_APP_ROLES,
 };
 use crate::server_boundary::{
-    create_admin_token, get_activity_audit_feed, get_admin_platform_settings, get_auth_session,
-    get_boundary_status, get_platform_health, get_platform_status, load_admin_sessions,
-    load_admin_tokens, load_portal_activity_run_state, load_portal_evidence_summary_status,
-    load_portal_inventory_capacity_status, reset_platform_settings, revoke_admin_session,
-    revoke_admin_token, save_platform_settings, PortalActivityRunStateSnapshot,
-    PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot, PortalInventoryCapacitySnapshot,
-    PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot, PortalSecretReferenceSnapshot,
-    PortalServerBoundary,
+    cmdb_export, cmdb_import, cmdb_reconcile, create_admin_token, get_activity_audit_feed,
+    get_admin_platform_settings, get_auth_session, get_boundary_status, get_platform_health,
+    get_platform_status, load_admin_sessions, load_admin_tokens, load_portal_activity_run_state,
+    load_portal_evidence_summary_status, load_portal_inventory_capacity_status,
+    reset_platform_settings, revoke_admin_session, revoke_admin_token, save_platform_settings,
+    PortalActivityRunStateSnapshot, PortalCmdbWorkspaceSnapshot, PortalEvidenceSummarySnapshot,
+    PortalInventoryCapacitySnapshot, PortalPolicyGuardrailsSnapshot, PortalRouteStateSnapshot,
+    PortalSecretReferenceSnapshot, PortalServerBoundary,
 };
 use crate::views::agents::AgentListView;
 use crate::views::approvals::ApprovalsList;
@@ -1118,8 +1118,30 @@ fn InventoryWorkspaceDetail() -> impl IntoView {
     }
 }
 
+/// Maps a CMDB action outcome to a badge class + summary text. A failed
+/// action (API/transport rejection that did not raise a server error) is
+/// surfaced as a `bad` badge with the API's safe message; a success carries
+/// the relevant counts so the operator sees the import/export/reconcile result.
+fn cmdb_action_feedback(result: &CmdbActionResult) -> (&'static str, String) {
+    if !result.success {
+        return ("badge bad", result.message.clone());
+    }
+    let detail = match result.action.as_str() {
+        "Import preview" => format!(
+            "{} accepted, {} rejected, {} pending",
+            result.accepted, result.rejected, result.pending
+        ),
+        "Reconciliation" => format!("{} matched", result.matched),
+        _ => format!("{} record(s)", result.matched),
+    };
+    ("badge good", format!("{} — {}", result.message, detail))
+}
+
 #[component]
 fn CmdbWorkspaceDetail() -> impl IntoView {
+    let auth_session = use_context::<AuthSession>().unwrap_or_else(auth_session_fallback);
+    let is_admin = session_can(&auth_session, "admin");
+
     let snapshot =
         PortalCmdbWorkspaceSnapshot::static_dry_run().expect("CMDB status must be allowlisted");
     let _file_exchange_guard = resource_api_path(cmdb_file_exchange_resource());
@@ -1140,6 +1162,65 @@ fn CmdbWorkspaceDetail() -> impl IntoView {
     let file_exchange = snapshot.file_exchange;
     let reconciliation = snapshot.reconciliation;
     let relationships = snapshot.relationships;
+
+    // Live CMDB engine actions (admin-gated). The static panels above stay
+    // read-only; these buttons call the dry-run import/export/reconcile
+    // executors and surface the API's accepted/rejected/matched counts.
+    #[allow(deprecated)]
+    let (feedback, set_feedback) = create_signal(String::new());
+    #[allow(deprecated)]
+    let (feedback_class, set_feedback_class) = create_signal("badge neutral");
+    #[allow(deprecated)]
+    let (result_lines, set_result_lines) = create_signal(Vec::<String>::new());
+
+    let apply_result = move |result: CmdbActionResult| {
+        let (cls, msg) = cmdb_action_feedback(&result);
+        set_feedback.set(msg);
+        set_feedback_class.set(cls);
+        set_result_lines.set(result.lines);
+    };
+    let apply_error = move |error: ServerFnError| {
+        set_feedback.set(server_error_message(
+            &error,
+            "CMDB action failed; no changes were made",
+        ));
+        set_feedback_class.set("badge bad");
+        set_result_lines.set(Vec::new());
+    };
+
+    let import_action = Action::new(move |_: &()| {
+        set_feedback.set("Running import preview...".to_string());
+        set_feedback_class.set("badge neutral");
+        set_result_lines.set(Vec::new());
+        async move {
+            match cmdb_import(String::new()).await {
+                Ok(result) => apply_result(result),
+                Err(error) => apply_error(error),
+            }
+        }
+    });
+    let export_action = Action::new(move |_: &()| {
+        set_feedback.set("Exporting...".to_string());
+        set_feedback_class.set("badge neutral");
+        set_result_lines.set(Vec::new());
+        async move {
+            match cmdb_export().await {
+                Ok(result) => apply_result(result),
+                Err(error) => apply_error(error),
+            }
+        }
+    });
+    let reconcile_action = Action::new(move |_: &()| {
+        set_feedback.set("Running reconciliation...".to_string());
+        set_feedback_class.set("badge neutral");
+        set_result_lines.set(Vec::new());
+        async move {
+            match cmdb_reconcile().await {
+                Ok(result) => apply_result(result),
+                Err(error) => apply_error(error),
+            }
+        }
+    });
 
     view! {
         <article
@@ -1166,6 +1247,61 @@ fn CmdbWorkspaceDetail() -> impl IntoView {
                 </div>
                 <span class="badge bad">"File exchange blocked"</span>
             </div>
+            <Show when=move || is_admin fallback=|| ()>
+                <div
+                    class="workspace-detail-item"
+                    aria-label="CMDB actions"
+                    data-cmdb-actions="true"
+                >
+                    <div class="workspace-detail-head">
+                        <div>
+                            <span class="eyebrow">"Actions"</span>
+                            <strong>"Import, export, and reconcile"</strong>
+                        </div>
+                        <span class=feedback_class>{feedback}</span>
+                    </div>
+                    <div class="settings-actions">
+                        <button
+                            class="btn btn-primary"
+                            data-cmdb-action="import"
+                            on:click=move |_| {
+                                import_action.dispatch(());
+                            }
+                        >
+                            "Import preview"
+                        </button>
+                        <button
+                            class="btn btn-secondary"
+                            data-cmdb-action="export"
+                            on:click=move |_| {
+                                export_action.dispatch(());
+                            }
+                        >
+                            "Export"
+                        </button>
+                        <button
+                            class="btn btn-secondary"
+                            data-cmdb-action="reconcile"
+                            on:click=move |_| {
+                                reconcile_action.dispatch(());
+                            }
+                        >
+                            "Run reconciliation"
+                        </button>
+                    </div>
+                    <Show when=move || !result_lines.get().is_empty() fallback=|| ()>
+                        <ul class="table-note" aria-label="CMDB reconciliation results">
+                            {move || {
+                                result_lines
+                                    .get()
+                                    .into_iter()
+                                    .map(|line| view! { <li>{line}</li> })
+                                    .collect_view()
+                            }}
+                        </ul>
+                    </Show>
+                </div>
+            </Show>
             <div class="workspace-detail-columns">
                 <div class="workspace-detail-list" aria-label="CMDB file exchange readiness">
                     {file_exchange

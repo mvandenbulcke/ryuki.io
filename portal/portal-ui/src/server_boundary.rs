@@ -6,18 +6,18 @@ use crate::api::{
     approvals_pending_path, auth_local_login_path, auth_local_logout_path, auth_login_path,
     auth_logout_path, auth_session_path, auth_status_path, boundary_status_path,
     catalog_offerings_path, catalog_recommendations_path, catalog_request_form_path,
-    cluster_capacity_admission_path, cmdb_file_exchange_path, cmdb_reconciliation_path,
-    cmdb_relationship_graph_path, datacenter_check_cooling_path, datacenter_check_power_path,
-    datacenter_check_rack_space_path, datacenter_check_switchports_path,
-    datacenter_failing_checks_path, datacenter_full_readiness_path,
-    datacenter_readiness_score_path, datacenter_site_report_path, datacenter_sites_path,
-    dry_run_plan_path, emergency_change_path, evidence_compliance_dashboard_path,
-    evidence_export_retention_path, evidence_summary_path, integrations_path,
-    inventory_ownership_risk_path, inventory_resource_overview_path, notifications_path,
-    notifications_read_all_path, notifications_unread_count_path, operation_runs_path,
-    operations_platform_health_path, operations_runbook_launch_path, platform_health_path,
-    platform_status_path, platform_summary_path, policy_outcomes_path, request_create_path,
-    request_intake_form_preview_path, request_intake_path, request_list_path,
+    cluster_capacity_admission_path, cmdb_export_path, cmdb_file_exchange_path, cmdb_import_path,
+    cmdb_reconcile_path, cmdb_reconciliation_path, cmdb_relationship_graph_path,
+    datacenter_check_cooling_path, datacenter_check_power_path, datacenter_check_rack_space_path,
+    datacenter_check_switchports_path, datacenter_failing_checks_path,
+    datacenter_full_readiness_path, datacenter_readiness_score_path, datacenter_site_report_path,
+    datacenter_sites_path, dry_run_plan_path, emergency_change_path,
+    evidence_compliance_dashboard_path, evidence_export_retention_path, evidence_summary_path,
+    integrations_path, inventory_ownership_risk_path, inventory_resource_overview_path,
+    notifications_path, notifications_read_all_path, notifications_unread_count_path,
+    operation_runs_path, operations_platform_health_path, operations_runbook_launch_path,
+    platform_health_path, platform_status_path, platform_summary_path, policy_outcomes_path,
+    request_create_path, request_intake_form_preview_path, request_intake_path, request_list_path,
     request_preflight_path, same_origin_api_path, secret_references_path, shift_queue_path,
     site_catalog_path, ApiPathError,
 };
@@ -65,16 +65,17 @@ use crate::models::{
     inventory_resource_fallbacks, operation_run_fallbacks, policy_guardrail_fallbacks,
     policy_outcome_fallbacks, request_intake_fallbacks, secret_reference_catalog_fallback,
     secret_reference_fallbacks, ActivityQueueSummary, AdminSessionSummary, AdminTokenSummary,
-    AgentSummary, AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbFileExchangeSummary,
-    CmdbReconciliationSummary, CmdbRelationshipSummary, CreateIntegrationPayload,
-    CreateRequestPayload, CreateTokenPayload, CreateTokenResult, DatacenterFailingChecksSummary,
-    DatacenterFullReadiness, DatacenterReadinessScore, DatacenterSingleCheck, DatacenterSiteReport,
-    DatacenterSitesCatalog, DryRunPlanSummary, EvidencePackExport, EvidenceSummary, ExecutionJob,
-    IntegrationSummary, IntegrationTestResult, InventoryResourceSummary, NotificationSummary,
-    OperationRunSummary, PlatformHealth, PlatformSettingsSummary, PlatformStatus,
-    PlatformSummaryContext, PolicyGuardrailSummary, PolicyOutcome, RbacRoleSummary, RequestDetail,
-    RequestIntakeForm, RequestIntakeSummary, RequestSummary, RevokeResult, SecretReferenceSummary,
-    StageActionResponse, UpdateIntegrationPayload,
+    AgentSummary, AuditEventRow, AuthSession, CapacityAdmissionSummary, CmdbActionResult,
+    CmdbFileExchangeSummary, CmdbReconciliationSummary, CmdbRelationshipSummary,
+    CreateIntegrationPayload, CreateRequestPayload, CreateTokenPayload, CreateTokenResult,
+    DatacenterFailingChecksSummary, DatacenterFullReadiness, DatacenterReadinessScore,
+    DatacenterSingleCheck, DatacenterSiteReport, DatacenterSitesCatalog, DryRunPlanSummary,
+    EvidencePackExport, EvidenceSummary, ExecutionJob, IntegrationSummary, IntegrationTestResult,
+    InventoryResourceSummary, NotificationSummary, OperationRunSummary, PlatformHealth,
+    PlatformSettingsSummary, PlatformStatus, PlatformSummaryContext, PolicyGuardrailSummary,
+    PolicyOutcome, RbacRoleSummary, RequestDetail, RequestIntakeForm, RequestIntakeSummary,
+    RequestSummary, RevokeResult, SecretReferenceSummary, StageActionResponse,
+    UpdateIntegrationPayload,
 };
 #[cfg(feature = "ssr")]
 use crate::models::{admin_session_summary_fallbacks, admin_token_summary_fallbacks};
@@ -129,6 +130,9 @@ const ALLOWED_PORTAL_API_PATHS: &[fn() -> &'static str] = &[
     cmdb_file_exchange_path,
     cmdb_reconciliation_path,
     cmdb_relationship_graph_path,
+    cmdb_import_path,
+    cmdb_export_path,
+    cmdb_reconcile_path,
     evidence_export_retention_path,
     evidence_compliance_dashboard_path,
     operations_runbook_launch_path,
@@ -1254,6 +1258,218 @@ pub async fn load_portal_cmdb_workspace_status(
 ) -> Result<PortalCmdbWorkspaceSnapshot, ServerFnError> {
     PortalCmdbWorkspaceSnapshot::static_dry_run()
         .map_err(|_| ServerFnError::new("portal CMDB workspace status is unavailable"))
+}
+
+/// Counts the `import_status` discriminants in a CMDB import/export record
+/// array. The API serializes `ImportStatus` as the bare PascalCase variant
+/// (`"Accepted"`, `"Rejected"`, `"PendingReview"`); unknown values are ignored
+/// so a contract drift degrades the counts rather than the whole action.
+#[cfg(any(feature = "ssr", test))]
+fn count_cmdb_import_statuses(records: &serde_json::Value) -> (usize, usize, usize) {
+    let mut accepted = 0;
+    let mut rejected = 0;
+    let mut pending = 0;
+    if let Some(rows) = records.as_array() {
+        for row in rows {
+            match row.get("import_status").and_then(|s| s.as_str()) {
+                Some("Accepted") => accepted += 1,
+                Some("Rejected") => rejected += 1,
+                Some("PendingReview") => pending += 1,
+                _ => {}
+            }
+        }
+    }
+    (accepted, rejected, pending)
+}
+
+/// Extracts the matched (present-in-both) count from the reconciliation result
+/// summary line `"... N item(s) reconciled (present in both)"`. Returns 0 when
+/// the line is absent so a wording drift degrades gracefully.
+#[cfg(any(feature = "ssr", test))]
+fn cmdb_reconciled_matched_count(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .find_map(|line| {
+            let marker = "item(s) reconciled (present in both)";
+            if !line.contains(marker) {
+                return None;
+            }
+            line.split_whitespace()
+                .find_map(|token| token.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Import preview of a CMDB source (Theme: CMDB actions, #33). POST the
+/// `{"source"}` body to the dry-run import executor and derive the
+/// accepted/rejected/pending counts server-side. Defaults to the Excel export
+/// source. Mirrors `create_integration`: static allowlist guard, live-only
+/// dispatch, no raw payload leaks to the view.
+#[server(prefix = "/portal/api", endpoint = "cmdb-import")]
+pub async fn cmdb_import(source: String) -> Result<CmdbActionResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(cmdb_import_path())
+        .map_err(|_| ServerFnError::new("CMDB import API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    let source = {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            "cmdb-excel-export".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let body = serde_json::json!({ "source": source });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(cmdb_import_path(), Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Ok(CmdbActionResult {
+            action: "Import preview".to_string(),
+            success: false,
+            accepted: 0,
+            rejected: 0,
+            pending: 0,
+            matched: 0,
+            message: api_error_text(&response, "CMDB import was rejected by the API"),
+            lines: Vec::new(),
+        });
+    }
+    let records: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("CMDB import response was malformed"))?;
+    let total = records.as_array().map(|rows| rows.len()).unwrap_or(0);
+    let (accepted, rejected, pending) = count_cmdb_import_statuses(&records);
+    Ok(CmdbActionResult {
+        action: "Import preview".to_string(),
+        success: true,
+        accepted,
+        rejected,
+        pending,
+        matched: total,
+        message: format!("Imported {total} record(s) from {source}"),
+        lines: Vec::new(),
+    })
+}
+
+/// Export the CMDB records (Theme: CMDB actions, #33). GET the dry-run export
+/// executor and surface the record count and format without exposing the raw
+/// serialized payload to the browser. Mirrors the GET-fetch live pattern.
+#[server(prefix = "/portal/api", endpoint = "cmdb-export")]
+pub async fn cmdb_export() -> Result<CmdbActionResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(cmdb_export_path())
+        .map_err(|_| ServerFnError::new("CMDB export API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .get(cmdb_export_path(), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Ok(CmdbActionResult {
+            action: "Export".to_string(),
+            success: false,
+            accepted: 0,
+            rejected: 0,
+            pending: 0,
+            matched: 0,
+            message: api_error_text(&response, "CMDB export was rejected by the API"),
+            lines: Vec::new(),
+        });
+    }
+    let payload: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("CMDB export response was malformed"))?;
+    let format = payload
+        .get("format")
+        .and_then(|f| f.as_str())
+        .unwrap_or("json")
+        .to_string();
+    // The `data` field is the serialized record set; count exported records
+    // when it parses as a JSON array, otherwise fall back to byte size only.
+    let data = payload.get("data").and_then(|d| d.as_str()).unwrap_or("");
+    let exported = serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| value.as_array().map(|rows| rows.len()))
+        .unwrap_or(0);
+    let bytes = data.len();
+    Ok(CmdbActionResult {
+        action: "Export".to_string(),
+        success: true,
+        accepted: 0,
+        rejected: 0,
+        pending: 0,
+        matched: exported,
+        message: format!("Exported {exported} record(s) as {format} ({bytes} bytes)"),
+        lines: Vec::new(),
+    })
+}
+
+/// Run a CMDB reconciliation (Theme: CMDB actions, #33). POST the bodyless
+/// dry-run reconciliation executor and surface the matched (present-in-both)
+/// count plus the human-readable result lines. Mirrors the bodyless live POST
+/// pattern (`verify_request`).
+#[server(prefix = "/portal/api", endpoint = "cmdb-reconcile")]
+pub async fn cmdb_reconcile() -> Result<CmdbActionResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    boundary
+        .validate_platform_api_path(cmdb_reconcile_path())
+        .map_err(|_| ServerFnError::new("CMDB reconcile API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Err(ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE));
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(cmdb_reconcile_path(), None, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Ok(CmdbActionResult {
+            action: "Reconciliation".to_string(),
+            success: false,
+            accepted: 0,
+            rejected: 0,
+            pending: 0,
+            matched: 0,
+            message: api_error_text(&response, "CMDB reconcile was rejected by the API"),
+            lines: Vec::new(),
+        });
+    }
+    let payload: serde_json::Value = response
+        .json()
+        .map_err(|_| ServerFnError::new("CMDB reconcile response was malformed"))?;
+    let lines: Vec<String> = payload
+        .get("reconciliation_results")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let matched = cmdb_reconciled_matched_count(&lines);
+    Ok(CmdbActionResult {
+        action: "Reconciliation".to_string(),
+        success: true,
+        accepted: 0,
+        rejected: 0,
+        pending: 0,
+        matched,
+        message: format!("Reconciliation complete: {matched} CI(s) present in both"),
+        lines,
+    })
 }
 
 #[server(prefix = "/portal/api", endpoint = "policy-guardrails-status")]
@@ -4149,6 +4365,60 @@ mod tests {
                 .any(|(path, _)| path == "/portal/api/cmdb-workspace-status"),
             "CMDB workspace server function must stay under the portal-owned route"
         );
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn cmdb_action_server_functions_register_portal_routes() {
+        let registered: Vec<&str> = leptos::server_fn::axum::server_fn_paths()
+            .map(|(path, _)| path)
+            .collect();
+        for endpoint in [
+            "/portal/api/cmdb-import",
+            "/portal/api/cmdb-export",
+            "/portal/api/cmdb-reconcile",
+        ] {
+            assert!(
+                registered.contains(&endpoint),
+                "{endpoint} must register under the portal-owned route"
+            );
+        }
+    }
+
+    #[test]
+    fn cmdb_action_paths_are_in_allowlist() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        for path in [
+            cmdb_import_path(),
+            cmdb_export_path(),
+            cmdb_reconcile_path(),
+        ] {
+            assert_eq!(boundary.validate_platform_api_path(path), Ok(path));
+        }
+    }
+
+    #[test]
+    fn count_cmdb_import_statuses_tallies_each_discriminant() {
+        let records = serde_json::json!([
+            { "import_status": "Accepted" },
+            { "import_status": "Accepted" },
+            { "import_status": "Rejected" },
+            { "import_status": "PendingReview" },
+            { "import_status": "Unknown" },
+            {},
+        ]);
+        assert_eq!(count_cmdb_import_statuses(&records), (2, 1, 1));
+    }
+
+    #[test]
+    fn cmdb_reconciled_matched_count_reads_summary_line() {
+        let lines = vec![
+            "DRY-RUN: 1 item(s) in platform inventory but not in CMDB: [\"x\"]".to_string(),
+            "DRY-RUN: 3 item(s) reconciled (present in both)".to_string(),
+            "DRY-RUN: Import summary - 2 accepted, 1 rejected, 0 pending review".to_string(),
+        ];
+        assert_eq!(cmdb_reconciled_matched_count(&lines), 3);
+        assert_eq!(cmdb_reconciled_matched_count(&[]), 0);
     }
 
     #[cfg(feature = "ssr")]

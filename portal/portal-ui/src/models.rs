@@ -2006,6 +2006,25 @@ pub struct StageActionResponse {
     pub message: String,
 }
 
+/// Outcome of a live CMDB engine action (import preview, export, or
+/// reconciliation) surfaced in the CMDB workspace. The counts are derived
+/// server-side from the API response so the view never parses raw payloads.
+/// `success` distinguishes a completed action from an API/transport failure;
+/// `lines` carries the human-readable reconciliation results (empty for
+/// import/export).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CmdbActionResult {
+    pub action: String,
+    pub success: bool,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub pending: usize,
+    pub matched: usize,
+    pub message: String,
+    #[serde(default)]
+    pub lines: Vec<String>,
+}
+
 /// Canonical app roles assignable to an API token. Mirrors the engine's
 /// `ALL_APP_ROLES`; kept in lockstep with `rbac_role_summary_fallbacks` so the
 /// create-token role multiselect always offers the full set. The portal must

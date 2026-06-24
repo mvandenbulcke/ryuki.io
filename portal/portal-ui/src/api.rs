@@ -29,6 +29,12 @@ const EMERGENCY_CHANGE_PATH: &str = "/api/operations/emergency-change-contract";
 const CMDB_FILE_EXCHANGE_PATH: &str = "/api/integrations/servicenow/cmdb-file-contract";
 const CMDB_RECONCILIATION_PATH: &str = "/api/cmdb/reconciliation-contract";
 const CMDB_RELATIONSHIP_GRAPH_PATH: &str = "/api/cmdb/relationship-graph-contract";
+/// Live CMDB engine actions (dry-run executors): import preview, export, and
+/// reconciliation. Unlike the `*-contract` paths above (read-only metadata),
+/// these back the admin-gated action buttons in the CMDB workspace.
+const CMDB_IMPORT_PATH: &str = "/api/cmdb/import";
+const CMDB_EXPORT_PATH: &str = "/api/cmdb/export";
+const CMDB_RECONCILE_PATH: &str = "/api/cmdb/reconcile";
 const EVIDENCE_EXPORT_RETENTION_PATH: &str = "/api/evidence/export-retention-contract";
 const EVIDENCE_COMPLIANCE_DASHBOARD_PATH: &str = "/api/evidence/compliance-dashboard-contract";
 const OPERATIONS_RUNBOOK_LAUNCH_PATH: &str = "/api/operations/runbook-launch-contract";
@@ -205,6 +211,18 @@ pub fn cmdb_reconciliation_path() -> &'static str {
 
 pub fn cmdb_relationship_graph_path() -> &'static str {
     CMDB_RELATIONSHIP_GRAPH_PATH
+}
+
+pub fn cmdb_import_path() -> &'static str {
+    CMDB_IMPORT_PATH
+}
+
+pub fn cmdb_export_path() -> &'static str {
+    CMDB_EXPORT_PATH
+}
+
+pub fn cmdb_reconcile_path() -> &'static str {
+    CMDB_RECONCILE_PATH
 }
 
 pub fn evidence_export_retention_path() -> &'static str {
@@ -534,6 +552,13 @@ mod tests {
     #[test]
     fn notifications_read_all_path_matches_api_contract() {
         assert_eq!(notifications_read_all_path(), "/api/notifications/read-all");
+    }
+
+    #[test]
+    fn cmdb_action_paths_match_api_contract() {
+        assert_eq!(cmdb_import_path(), "/api/cmdb/import");
+        assert_eq!(cmdb_export_path(), "/api/cmdb/export");
+        assert_eq!(cmdb_reconcile_path(), "/api/cmdb/reconcile");
     }
 
     #[test]
