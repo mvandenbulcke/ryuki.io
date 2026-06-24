@@ -43,7 +43,7 @@ implementing **all 66**. This file tracks execution.
 | 11 | [ ] | Pre-dispatch policy gate for unsafe IaC | Exec | M | H | — |
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
 | 13 | [ ] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
-| 14 | [ ] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
+| 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
 | 15 | [ ] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
 | 16 | [ ] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [ ] | Bulk / batch operations | API | M | H | — |
@@ -102,3 +102,8 @@ _Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`.
 
 **Shipped:** #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`), #8 agent
 approve — revoke deferred (`6d6fb5b`), #63 observability deploy (`0ce0ed3`).
+
+**#14 slice 1** (`fa1df10`): server-side filters (status/site/environment/
+request_type/created_by/q) + allowlisted sort/direction on GET /api/requests,
+backward-compatible (bare-array response unchanged). Follow-up slice 2 =
+`{items,total}` envelope, paired with the portal #15 faceting work.
