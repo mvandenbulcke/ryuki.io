@@ -18,11 +18,119 @@
 //! runs in that mode and no provider calls are ever made.
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
 use ryuki_engine::auth::AuthSession;
+
+// ---------------------------------------------------------------------------
+// Tamper-evident hash chain (migration 094)
+//
+// Each chained row carries `entry_hash = sha256(prev_hash ++ canonical(content))`
+// linked to its predecessor's entry_hash. Re-verification (POST
+// /api/audit/log/verify) detects any altered content OR any insertion / deletion
+// / reordering of rows, even by a privileged operator who bypasses the
+// append-only trigger or restores a doctored backup. The hash covers the
+// app-known CONTENT only — NOT the DB-generated id/occurred_at, which are
+// unknown at insert time; the prev→entry link seals ordering.
+//
+// TRUST BOUNDARY: this is tamper-EVIDENT, not tamper-PROOF. The chain is an
+// UNKEYED hash chain, so an attacker with arbitrary write access who can also
+// recompute every entry_hash from the tampered row forward can forge a chain
+// that re-verifies. It defends against the realistic threats — accidental
+// mutation, a doctored-backup restore, and any mutation that does not rebuild
+// the whole tail — and lets an external observer who has recorded the latest
+// entry_hash detect any rewrite. Stronger guarantees (an HMAC keyed outside
+// Postgres, or periodically anchoring the head entry_hash to external storage)
+// are a documented hardening follow-up.
+//
+// LOCK ORDER: record_audit_tx takes AUDIT_CHAIN_LOCK_KEY only AFTER any
+// `UPDATE requests` row lock its caller already holds (request row → audit lock,
+// always), so concurrent transitions cannot deadlock on the two.
+// ---------------------------------------------------------------------------
+
+/// Predecessor hash of the first row in the chain.
+const AUDIT_CHAIN_GENESIS: &str = "GENESIS";
+
+/// Key for the Postgres transaction-scoped advisory lock that serializes chain
+/// appends, so two concurrent inserts cannot read the same predecessor and fork
+/// the chain. Released automatically on commit/rollback.
+const AUDIT_CHAIN_LOCK_KEY: i64 = 0x4155_4449_5400; // "AUDIT\0"
+
+/// Deterministic, canonical JSON: object keys are sorted, arrays keep order,
+/// scalars use serde's stable encoding. The SAME logical value hashes
+/// identically whether it comes from the app at insert time or from a jsonb
+/// round-trip at verify time (jsonb does not preserve key order or whitespace).
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let inner: Vec<String> = keys
+                .into_iter()
+                .map(|k| {
+                    let key = serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string());
+                    format!("{key}:{}", canonical_json(&map[k]))
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// The canonical content string an entry's hash is computed over. Built
+/// identically at insert (from the session + record) and at verify (from the
+/// stored row), so the two must agree field-for-field. `request_id` is the
+/// STORED uuid string (not the raw input), matching what verify reads back.
+#[allow(clippy::too_many_arguments)]
+fn audit_canonical_payload(
+    request_id: Option<&str>,
+    actor_principal: &str,
+    actor_display: &str,
+    actor_roles: &[String],
+    provider_mode: &str,
+    action: &str,
+    from_stage: Option<&str>,
+    to_stage: &str,
+    from_status: Option<&str>,
+    to_status: &str,
+    detail: &Value,
+    outcome: &str,
+) -> String {
+    canonical_json(&json!({
+        "request_id": request_id,
+        "actor_principal": actor_principal,
+        "actor_display": actor_display,
+        "actor_roles": actor_roles,
+        "provider_mode": provider_mode,
+        "action": action,
+        "from_stage": from_stage,
+        "to_stage": to_stage,
+        "from_status": from_status,
+        "to_status": to_status,
+        "detail": detail,
+        "outcome": outcome,
+    }))
+}
+
+/// `sha256(len(prev_hash)‖prev_hash‖len(payload)‖payload)`, lowercase hex. The
+/// length prefixes make the encoding unambiguous (no value can forge a field
+/// boundary). Pure + deterministic.
+fn chain_hash(prev_hash: &str, payload: &str) -> String {
+    let mut h = Sha256::new();
+    h.update((prev_hash.len() as u64).to_le_bytes());
+    h.update(prev_hash.as_bytes());
+    h.update((payload.len() as u64).to_le_bytes());
+    h.update(payload.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Process-local audit entry used only in no-DB (dry-run) mode. The durable
 /// trail lives in the `audit_log` table; this mirrors it for demo output and
@@ -150,11 +258,43 @@ pub async fn record_audit_tx(
         .request_id
         .and_then(|id| uuid::Uuid::parse_str(id).ok());
 
+    // Serialize chain appends: hold a transaction-scoped advisory lock while we
+    // read the predecessor's hash and insert, so two concurrent transitions
+    // cannot both chain off the same predecessor and fork the chain.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUDIT_CHAIN_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    let prev_hash: String = sqlx::query_scalar(
+        "SELECT entry_hash FROM audit_log WHERE entry_hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or_else(|| AUDIT_CHAIN_GENESIS.to_string());
+
+    let request_id_str = request_uuid.map(|u| u.to_string());
+    let payload = audit_canonical_payload(
+        request_id_str.as_deref(),
+        &session.user_id,
+        &session.display_name,
+        &session.roles,
+        &session.provider_mode,
+        record.action,
+        record.from_stage,
+        record.to_stage,
+        record.from_status,
+        record.to_status,
+        &record.detail,
+        record.outcome,
+    );
+    let entry_hash = chain_hash(&prev_hash, &payload);
+
     sqlx::query(
         "INSERT INTO audit_log \
             (request_id, actor_principal, actor_display, actor_roles, provider_mode, \
-             action, from_stage, to_stage, from_status, to_status, detail, outcome) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12)",
+             action, from_stage, to_stage, from_status, to_status, detail, outcome, \
+             prev_hash, entry_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14)",
     )
     .bind(request_uuid)
     .bind(&session.user_id)
@@ -168,6 +308,8 @@ pub async fn record_audit_tx(
     .bind(record.to_status)
     .bind(record.detail.to_string())
     .bind(record.outcome)
+    .bind(&prev_hash)
+    .bind(&entry_hash)
     .execute(&mut **tx)
     .await?;
 
@@ -369,9 +511,159 @@ impl AuditLogRow {
     }
 }
 
+/// Result of re-verifying the audit hash chain.
+pub struct ChainVerification {
+    /// True when every chained row's content hash and prev→entry link are intact.
+    pub verified: bool,
+    /// Number of chained rows checked.
+    pub checked: i64,
+    /// The id of the first row where the chain diverged (None when verified).
+    pub first_divergent_id: Option<i64>,
+    /// A human-readable reason for the divergence (None when verified).
+    pub reason: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChainRow {
+    id: i64,
+    request_id: Option<uuid::Uuid>,
+    actor_principal: String,
+    actor_display: Option<String>,
+    actor_roles: Vec<String>,
+    provider_mode: String,
+    action: String,
+    from_stage: Option<String>,
+    to_stage: String,
+    from_status: Option<String>,
+    to_status: String,
+    detail: Option<String>,
+    outcome: String,
+    prev_hash: Option<String>,
+    entry_hash: Option<String>,
+}
+
+/// Re-verify the audit hash chain over all chained rows (id order). Recomputes
+/// each row's content hash from its stored columns and checks both the content
+/// hash and the prev→entry linkage; reports the first divergent row. A clean
+/// chain returns `verified: true`. Rows written before migration 094 (NULL
+/// entry_hash) are not part of the chain and are skipped.
+pub async fn verify_audit_chain(pool: &PgPool) -> Result<ChainVerification, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ChainRow>(
+        "SELECT id, request_id, actor_principal, actor_display, actor_roles, provider_mode, \
+                action, from_stage, to_stage, from_status, to_status, detail::text AS detail, \
+                outcome, prev_hash, entry_hash \
+         FROM audit_log WHERE entry_hash IS NOT NULL ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut expected_prev = AUDIT_CHAIN_GENESIS.to_string();
+    let mut checked = 0i64;
+    for row in &rows {
+        // Linkage: this row must chain off the predecessor's entry_hash.
+        if row.prev_hash.as_deref() != Some(expected_prev.as_str()) {
+            return Ok(ChainVerification {
+                verified: false,
+                checked,
+                first_divergent_id: Some(row.id),
+                reason: Some("broken chain link (prev_hash does not match predecessor)".into()),
+            });
+        }
+        let detail: Value = row
+            .detail
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        let request_id_str = row.request_id.map(|u| u.to_string());
+        let payload = audit_canonical_payload(
+            request_id_str.as_deref(),
+            &row.actor_principal,
+            row.actor_display.as_deref().unwrap_or(""),
+            &row.actor_roles,
+            &row.provider_mode,
+            &row.action,
+            row.from_stage.as_deref(),
+            &row.to_stage,
+            row.from_status.as_deref(),
+            &row.to_status,
+            &detail,
+            &row.outcome,
+        );
+        let recomputed = chain_hash(&expected_prev, &payload);
+        if row.entry_hash.as_deref() != Some(recomputed.as_str()) {
+            return Ok(ChainVerification {
+                verified: false,
+                checked,
+                first_divergent_id: Some(row.id),
+                reason: Some("content hash mismatch (row was altered)".into()),
+            });
+        }
+        expected_prev = recomputed;
+        checked += 1;
+    }
+
+    Ok(ChainVerification {
+        verified: true,
+        checked,
+        first_divergent_id: None,
+        reason: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_json_is_order_independent_and_deterministic() {
+        // Same logical content, different key insertion order → same canonical
+        // string (so an app-built value and a jsonb round-trip hash identically).
+        let a: Value = serde_json::from_str(r#"{"b":1,"a":{"y":2,"x":3},"c":[1,2]}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"c":[1,2],"a":{"x":3,"y":2},"b":1}"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+        assert_eq!(canonical_json(&a), r#"{"a":{"x":3,"y":2},"b":1,"c":[1,2]}"#);
+    }
+
+    #[test]
+    fn chain_hash_detects_any_change() {
+        let base = audit_canonical_payload(
+            Some("r1"),
+            "alice",
+            "Alice",
+            &["approve".into()],
+            "entra-id",
+            "request.approve",
+            Some("plan"),
+            "approve",
+            Some("planned"),
+            "approved",
+            &json!({"k": "v"}),
+            "applied",
+        );
+        let h = chain_hash("GENESIS", &base);
+        assert_eq!(h, chain_hash("GENESIS", &base), "deterministic");
+        assert_eq!(h.len(), 64);
+        // A different predecessor (reordering) changes the hash.
+        assert_ne!(h, chain_hash("other-prev", &base));
+        // A changed content field (the outcome) changes the hash.
+        let tampered = audit_canonical_payload(
+            Some("r1"),
+            "alice",
+            "Alice",
+            &["approve".into()],
+            "entra-id",
+            "request.approve",
+            Some("plan"),
+            "approve",
+            Some("planned"),
+            "approved",
+            &json!({"k": "v"}),
+            "denied",
+        );
+        assert_ne!(h, chain_hash("GENESIS", &tampered));
+        // A length-boundary collision is prevented by length-prefixing.
+        assert_ne!(chain_hash("ab", "c"), chain_hash("a", "bc"));
+    }
 
     #[test]
     fn redact_detail_scrubs_secret_bearing_values() {
@@ -412,5 +704,83 @@ mod tests {
         assert_eq!(value["detail"]["reason"], "***REDACTED***");
         // Non-detail attribution is untouched.
         assert_eq!(value["actor_display"], "Approver");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-gated: the insert→verify round trip must agree (this catches any field
+// canonicalization mismatch between record_audit_tx and verify_audit_chain).
+// SKIPS when RYUKI_DATABASE_URL is unset.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod audit_chain_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but the DB connection failed");
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn record_then_verify_round_trips_clean() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = "audit-chain-tester".into();
+        session.provider_mode = "entra-id".into();
+        session.roles = vec!["approver".into(), "request".into()];
+
+        // Append a few chained rows with varied content (incl. a nested detail,
+        // which exercises the jsonb-canonicalization round trip).
+        for (i, detail) in [
+            json!({"reason": "first", "nested": {"b": 2, "a": 1}}),
+            json!({}),
+            json!({"note": "third", "list": [1, 2, 3]}),
+            // Numeric forms that jsonb might normalize (float, integer, exponent,
+            // large decimal) — the round trip must still verify, proving the
+            // canonicalization survives jsonb numeric representation.
+            json!({"f": 1.0, "i": 1, "exp": 1e3, "big": 1234567890.5, "neg": -2.50}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record_audit(
+                pool,
+                &session,
+                &AuditRecord {
+                    action: "request.approve",
+                    request_id: None,
+                    from_status: Some("planned"),
+                    to_status: "approved",
+                    from_stage: Some("plan"),
+                    to_stage: "approve",
+                    detail,
+                    outcome: if i == 1 { "denied" } else { "applied" },
+                },
+            )
+            .await
+            .expect("record audit");
+        }
+
+        // The whole chain (these rows plus any from earlier transitions) verifies.
+        let result = verify_audit_chain(pool).await.expect("verify");
+        assert!(
+            result.verified,
+            "clean chain must verify; first divergence at {:?}: {:?}",
+            result.first_divergent_id, result.reason
+        );
+        assert!(
+            result.checked >= 3,
+            "at least the three rows just appended are chained (checked={})",
+            result.checked
+        );
     }
 }

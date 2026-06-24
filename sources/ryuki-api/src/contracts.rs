@@ -155,6 +155,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/audit", get(requests_audit))
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
+        .route("/api/audit/log/verify", post(audit_log_verify))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -14844,6 +14845,43 @@ async fn activity_audit_feed(
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
     Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
+}
+
+/// POST /api/audit/log/verify — re-verify the audit-log hash chain and report
+/// whether history is intact (and the first divergent row id if not). Audit-tier
+/// gated. In dry-run / no-DB mode the chain does not exist, so this is a no-op
+/// that reports verified with a non-durable note.
+async fn audit_log_verify(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to verify the audit chain"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "verified": true,
+            "checked": 0,
+            "durable": false,
+            "note": "no database configured; the hash chain only exists in durable mode"
+        })));
+    };
+    match audit::verify_audit_chain(pool).await {
+        Ok(v) => Ok(Json(json!({
+            "verified": v.verified,
+            "checked": v.checked,
+            "first_divergent_id": v.first_divergent_id,
+            "reason": v.reason,
+            "durable": true,
+        }))),
+        Err(e) => {
+            tracing::error!(error = %e, "audit chain verification query failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "audit chain verification failed"})),
+            ))
+        }
+    }
 }
 
 // ─── VM Day-2 Operations handlers ───
