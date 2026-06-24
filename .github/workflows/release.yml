@@ -1,0 +1,200 @@
+name: Release
+
+# Cuts a release on a semver tag. Re-runs the CI gate (build, test, lint,
+# secret scan) so a tag can never ship code that would not pass main's CI
+# (.github/workflows/ci.yml), then builds both app images, pushes them to GHCR
+# pinned by digest, and publishes a GitHub release whose notes are the
+# changelog section for this tag.
+#
+# Trigger: push a tag shaped like v1.2.3 (see cliff.toml `tag_pattern`).
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+# Default token reads the repo. Per-job overrides below widen this only where
+# needed: the image job needs `packages: write` to push to GHCR, and the
+# release job needs `contents: write` to create the GitHub release.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # GHCR namespace. Owner-portable: resolves to ghcr.io/<owner>/<image>.
+  # GHCR until the Harbor registry of catalog/registry-readiness-contract.yaml
+  # is approved (see docs/design/missing-features.md F-block).
+  REGISTRY: ghcr.io
+  API_IMAGE: ryuki-platform-api
+  PORTAL_IMAGE: ryuki-portal-ui
+
+jobs:
+  # ── CI gate ───────────────────────────────────────────────────────────────
+  # Mirrors .github/workflows/ci.yml so a release tag is held to the same bar
+  # as main. Image build/push only runs once these pass (see `needs:` below).
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      # rust-toolchain.toml pins the stable channel with rustfmt + clippy.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Test workspace
+        run: cargo test --workspace
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check --all
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  security:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Run secret scan
+        run: ./scripts/no-secret-scan.sh
+
+  # ── Image build & push (digest-pinned) ────────────────────────────────────
+  images:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [build-test, lint, security]
+    permissions:
+      contents: read
+      # Required to push images to GitHub Container Registry (GHCR).
+      packages: write
+    outputs:
+      api-digest: ${{ steps.api.outputs.digest }}
+      portal-digest: ${{ steps.portal.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # Logs in with the workflow's GITHUB_TOKEN (no extra secret needed for
+      # GHCR pushes from this repo). To push to a different registry, replace
+      # `password` with a registry PAT stored as a repo secret and add a clear
+      # comment marking it required.
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The leading `v` is part of the git tag but not of the image version.
+      - name: Derive version tags
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "version=${version}"
+            echo "sha_short=$(git rev-parse --short HEAD)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build & push platform-api (digest-pinned)
+        id: api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sources/ryuki-api/Dockerfile
+          push: true
+          # Both Dockerfiles build from the repository root context (see the
+          # Dockerfile headers); release_image_builds enforces this.
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}:sha-${{ steps.version.outputs.sha_short }}
+      - name: Build & push portal-ui (digest-pinned)
+        id: portal
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: portal/portal-ui/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}:sha-${{ steps.version.outputs.sha_short }}
+      # The build-push-action `digest` output is the immutable image digest;
+      # surface both so consumers can pin by digest, not by mutable tag.
+      - name: Summarize pushed digests
+        run: |
+          {
+            echo "## Pushed images (digest-pinned)"
+            echo ""
+            echo "| Image | Tag | Digest |"
+            echo "| --- | --- | --- |"
+            echo "| ${API_IMAGE} | ${VERSION} | ${API_DIGEST} |"
+            echo "| ${PORTAL_IMAGE} | ${VERSION} | ${PORTAL_DIGEST} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          API_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}
+          PORTAL_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}
+          VERSION: ${{ steps.version.outputs.version }}
+          API_DIGEST: ${{ steps.api.outputs.digest }}
+          PORTAL_DIGEST: ${{ steps.portal.outputs.digest }}
+
+  # ── GitHub release with changelog notes ───────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: images
+    permissions:
+      # Required to create the GitHub release.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # git-cliff needs the full history to build the changelog section.
+          fetch-depth: 0
+      # Renders the changelog section for THIS tag only, used as release notes.
+      - name: Generate release notes from changelog
+        uses: orhun/git-cliff-action@v4
+        id: changelog
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
+      - name: Create GitHub release
+        env:
+          # GITHUB_TOKEN is provided automatically; no extra secret required.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          API_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.API_IMAGE }}
+          PORTAL_REF: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.PORTAL_IMAGE }}
+          API_DIGEST: ${{ needs.images.outputs.api-digest }}
+          PORTAL_DIGEST: ${{ needs.images.outputs.portal-digest }}
+        run: |
+          {
+            cat "${{ steps.changelog.outputs.changelog || 'RELEASE_NOTES.md' }}" 2>/dev/null || true
+            echo ""
+            echo "### Images (digest-pinned)"
+            echo ""
+            echo "- \`${API_REF}@${API_DIGEST}\`"
+            echo "- \`${PORTAL_REF}@${PORTAL_DIGEST}\`"
+          } > release-body.md
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes-file release-body.md \
+            --verify-tag

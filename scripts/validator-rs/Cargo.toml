@@ -10,3 +10,4 @@ ryuki-core = { workspace = true }
 serde_yaml = { workspace = true }
 figment = { workspace = true }
 rayon = "1"
+toml = "0.8"

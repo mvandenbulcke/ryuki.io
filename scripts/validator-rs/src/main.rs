@@ -110,6 +110,7 @@ mod portal_information_architecture;
 mod rbac_approval_model;
 mod reboot_orchestration;
 mod registry_readiness;
+mod release_engineering;
 mod release_image_builds;
 mod repository_capacity_forecast;
 mod request_execution_timeline;
@@ -564,6 +565,12 @@ fn run() -> Result<(), String> {
                         "control-plane-db-backup validation requires --context-json".to_string()
                     })?;
                     control_plane_db_backup::validate_context_file(&path)?
+                }
+                "release-engineering" => {
+                    let path = context_json.ok_or_else(|| {
+                        "release-engineering validation requires --context-json".to_string()
+                    })?;
+                    release_engineering::validate_context_file(&path)?
                 }
                 "approved-software-deployment" => {
                     let path = context_json.ok_or_else(|| {
@@ -2452,6 +2459,7 @@ fn require_slice(args: &[String]) -> Result<&str, String> {
             | "restore-testing"
             | "controlled-restore"
             | "control-plane-db-backup"
+            | "release-engineering"
             | "vcenter-object-placement"
             | "security-baseline"
             | "sensitive-output-guardrails"
@@ -3231,6 +3239,10 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
     m.insert(
         "control-plane-db-backup",
         control_plane_db_backup::validate_context_file as ValidateFn,
+    );
+    m.insert(
+        "release-engineering",
+        release_engineering::validate_context_file as ValidateFn,
     );
     m.insert(
         "cost-capacity-analytics",
@@ -4035,6 +4047,12 @@ fn build_slice_context(
             );
         }
         "control-plane-db-backup" => {
+            map.insert(
+                "root".to_string(),
+                serde_json::Value::String(root.to_string_lossy().to_string()),
+            );
+        }
+        "release-engineering" => {
             map.insert(
                 "root".to_string(),
                 serde_json::Value::String(root.to_string_lossy().to_string()),
