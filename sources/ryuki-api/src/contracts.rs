@@ -171,6 +171,7 @@ pub fn routes() -> Router {
             post(metrics_budget_create).get(metrics_budget_list),
         )
         .route("/api/metrics/budgets/status", get(metrics_budget_status))
+        .route("/api/metrics/commitment", get(metrics_commitment))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -16038,6 +16039,146 @@ async fn metrics_budget_status(AuthExtractor(session): AuthExtractor) -> ApiResu
     })))
 }
 
+/// Query params for commitment/reserved-capacity modeling (#54).
+#[derive(Debug, Deserialize, Default)]
+struct MetricCommitmentParams {
+    metric_key: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    on_demand_rate: Option<f64>,
+    commitment_rate: Option<f64>,
+    committed_units: Option<f64>,
+    /// Optional usage override; when absent, the series mean is used.
+    usage: Option<f64>,
+}
+
+/// GET /api/metrics/commitment — model the cost of a reserved/committed capacity
+/// level vs pure on-demand for a metric. `metric_key`, `on_demand_rate`,
+/// `commitment_rate`, and `committed_units` are required; `usage` defaults to the
+/// metric's mean. Request-tier read. 503 when no database is configured.
+async fn metrics_commitment(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricCommitmentParams>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to model commitments"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "metric_key is required"})),
+        ));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    let (Some(on_demand_rate), Some(commitment_rate), Some(committed_units)) = (
+        params.on_demand_rate,
+        params.commitment_rate,
+        params.committed_units,
+    ) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "on_demand_rate, commitment_rate, and committed_units are required"
+            })),
+        ));
+    };
+    for (name, val) in [
+        ("on_demand_rate", Some(on_demand_rate)),
+        ("commitment_rate", Some(commitment_rate)),
+        ("committed_units", Some(committed_units)),
+        ("usage", params.usage),
+    ] {
+        // Reject non-finite OR negative before any DB work — a cost rate, a
+        // committed level, or a usage cannot be negative.
+        if val.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("{name} must be a finite, non-negative number") })),
+            ));
+        }
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    // Usage = the explicit override (no DB needed), else the series mean. Only
+    // query the series on the fallback path, so an explicit-usage model never
+    // fails on an empty series or a DB outage.
+    let usage = match params.usage {
+        Some(u) => u,
+        None => {
+            let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = %e, "querying metric series for commitment failed");
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": "could not query metric series"})),
+                    ));
+                }
+            };
+            let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+                .iter()
+                .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+                    t: r.observed_at.timestamp() as f64,
+                    value: r.value,
+                })
+                .collect();
+            match ryuki_engine::metric_forecast::summarize(&points) {
+                Some(s) => s.mean,
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "no usage data for this metric; record samples or pass a usage override"
+                        })),
+                    ));
+                }
+            }
+        }
+    };
+    let Some(model) = ryuki_engine::metric_commitment::model_commitment(
+        usage,
+        on_demand_rate,
+        commitment_rate,
+        committed_units,
+    ) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "rates, committed_units, and usage must be non-negative"})),
+        ));
+    };
+
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "site": f_site,
+        "environment": f_env,
+        "usage_source": if params.usage.is_some() { "override" } else { "series_mean" },
+        "model": model,
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -28070,6 +28211,62 @@ mod db_lifecycle_tests {
             .await
             .ok();
         sqlx::query("DELETE FROM metric_budgets WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #54: commitment modeling derives usage from the series mean and reports a
+    /// recommended commitment when it saves money.
+    #[tokio::test]
+    async fn test_metric_commitment_uses_series_mean_and_recommends() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.commit.6h2";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        // Mean of [80, 100, 120] = 100.
+        for (i, v) in [(0i64, 80.0f64), (1, 100.0), (2, 120.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: None,
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-06-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        // usage=100 (series mean), commit 100 units at 0.6 vs 1.0 on-demand →
+        // 60 vs 100 → save 40, recommended.
+        let params = MetricCommitmentParams {
+            metric_key: Some(key.to_string()),
+            site: None,
+            environment: None,
+            on_demand_rate: Some(1.0),
+            commitment_rate: Some(0.6),
+            committed_units: Some(100.0),
+            usage: None,
+        };
+        let Json(out) = metrics_commitment(sess(), Query(params))
+            .await
+            .expect("commitment");
+        assert_eq!(out["usage_source"], "series_mean");
+        assert_eq!(out["model"]["recommended"], true);
+        assert!((out["model"]["savings"].as_f64().unwrap() - 40.0).abs() < 1e-6);
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
             .bind(key)
             .execute(pool)
             .await
