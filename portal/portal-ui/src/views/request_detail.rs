@@ -3,8 +3,8 @@ use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
     approve_live_apply_request, approve_request, cancel_request, execute_request,
     execute_request_live_plan, get_request_audit, get_request_detail, get_request_evidence,
-    get_request_execution_job, lock_request, plan_request, reject_request, validate_request,
-    verify_request,
+    get_request_execution_job, lock_request, plan_request, protect_request, publish_request,
+    reject_request, retire_request, validate_request, verify_request,
 };
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
@@ -232,6 +232,10 @@ fn action_label(action: &str) -> &'static str {
         "run-live-plan" => "Run live plan",
         "approve-live-apply" => "Approve & apply",
         "verify" => "Verify",
+        // Post-completion governed lifecycle (Theme 8).
+        "protect" => "Protect",
+        "publish" => "Publish",
+        "retire" => "Retire",
         &_ => "Unknown",
     }
 }
@@ -241,7 +245,9 @@ fn action_label(action: &str) -> &'static str {
 fn action_button_class(action: &str) -> &'static str {
     match action {
         "approve" => "btn btn-primary",
-        "reject" => "btn btn-danger",
+        // reject and retire are the destructive acts (say-no / governed
+        // end-of-life), styled as danger to signal their weight.
+        "reject" | "retire" => "btn btn-danger",
         _ => "btn btn-secondary",
     }
 }
@@ -258,6 +264,10 @@ pub(crate) fn audit_action_label(action: &str) -> &'static str {
         "request.lock" => "Locked",
         "request.execute" => "Executed",
         "request.verify" => "Verified",
+        // Post-completion governed lifecycle (Theme 8).
+        "request.protect" => "Protected",
+        "request.publish" => "Published",
+        "request.retire" => "Retired",
         _ => "Updated",
     }
 }
@@ -465,6 +475,77 @@ pub fn RequestDetail() -> impl IntoView {
         set_action_class.set("badge neutral");
         async move {
             match verify_request(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    // Post-completion governed lifecycle (Theme 8): protect -> publish -> retire.
+    // Each is a bodyless forward transition that mirrors `verify_action`.
+    let protect_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        set_action_feedback.set("Protecting...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match protect_request(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    let publish_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        set_action_feedback.set("Publishing...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match publish_request(id).await {
+                Ok(resp) => {
+                    let succeeded = resp.success;
+                    set_action_feedback.set(resp.message);
+                    set_action_class.set(if succeeded { "badge good" } else { "badge bad" });
+                    if succeeded {
+                        detail_resource.refetch();
+                        audit_resource.refetch();
+                    }
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    let retire_action = Action::new(move |id: &String| {
+        let id = id.clone();
+        set_action_feedback.set("Retiring...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match retire_request(id).await {
                 Ok(resp) => {
                     let succeeded = resp.success;
                     set_action_feedback.set(resp.message);
@@ -981,6 +1062,9 @@ pub fn RequestDetail() -> impl IntoView {
                                                                 "lock" => { lock_action.dispatch(id.clone()); }
                                                                 "execute" => { execute_action.dispatch(id.clone()); }
                                                                 "verify" => { verify_action.dispatch(id.clone()); }
+                                                                "protect" => { protect_action.dispatch(id.clone()); }
+                                                                "publish" => { publish_action.dispatch(id.clone()); }
+                                                                "retire" => { retire_action.dispatch(id.clone()); }
                                                                 _ => {}
                                                             }
                                                         }
@@ -1386,6 +1470,20 @@ mod tests {
     fn execute_requires_execute_capability() {
         // Regression guard: execute must NOT require admin (operator-tier mechanics).
         assert_eq!(action_capability("execute"), "execute");
+    }
+
+    #[test]
+    fn post_completion_actions_require_execute_capability() {
+        // Theme 8: protect/publish/retire are operator-tier, matching the API
+        // route gate (requests_route_permission `_ => execute`). They must NOT
+        // require approve or admin.
+        for action in ["protect", "publish", "retire"] {
+            assert_eq!(
+                action_capability(action),
+                "execute",
+                "{action} must be gated on the execute capability"
+            );
+        }
     }
 
     // ── stage_step_state ────────────────────────────────────────────────────

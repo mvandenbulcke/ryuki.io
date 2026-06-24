@@ -1580,13 +1580,22 @@ pub fn actions_for_stage(stage: &str) -> Vec<String> {
         "locked" => vec!["execute".to_string(), "cancel".to_string()],
         "executed" => vec!["verify".to_string()],
         "failed" => vec!["validate".to_string(), "plan".to_string()],
-        // Terminal states offer no further lifecycle actions. `verified` is the
-        // resting stage of a fully-completed request (verify is the last action,
-        // stamped stage='verify' -> normalized 'verified'); `completed` covers a
-        // status-driven completed display. Neither offers further actions —
-        // without these arms they fell through to the wildcard and wrongly
-        // offered "validate" on a finished request.
-        "verified" | "completed" | "rejected" | "cancelled" => vec![],
+        // Post-completion governed lifecycle (Theme 8). A fully-completed request
+        // is the entry point of the post-completion lifecycle: `protect` is valid
+        // only from Completed, `publish` only from Protecting, `retire` only from
+        // Operational (mirrors ryuki_engine::request_lifecycle). `verified` and
+        // `completed` are both the resting display of a completed request, so both
+        // offer `protect`. The DB path stamps `to_stage` = protect/publish/retire
+        // (passed through by normalize_api_stage); the milestone aliases
+        // protecting/operational cover the in-memory/status-driven display.
+        "verified" | "completed" => vec!["protect".to_string()],
+        "protect" | "protecting" => vec!["publish".to_string()],
+        "publish" | "operational" => vec!["retire".to_string()],
+        // Terminal states offer no further lifecycle actions. `retired` is the
+        // governed end-of-life resting state. Without these arms they fell
+        // through to the wildcard and wrongly offered "validate" on a finished
+        // request.
+        "retire" | "retired" | "rejected" | "cancelled" => vec![],
         _ => vec!["validate".to_string()],
     }
 }
@@ -2911,11 +2920,26 @@ mod tests {
         assert!(!actions_for_stage("executed").contains(&"cancel".to_string()));
         assert!(actions_for_stage("rejected").is_empty());
         assert!(actions_for_stage("cancelled").is_empty());
-        // A fully-verified/completed request is terminal: no stray actions.
-        // Regression guard — these previously fell through to the wildcard and
-        // wrongly offered "validate" on a finished request.
-        assert!(actions_for_stage("verified").is_empty());
-        assert!(actions_for_stage("completed").is_empty());
+        // A fully-verified/completed request enters the post-completion governed
+        // lifecycle (Theme 8): the only forward action it offers is `protect`,
+        // never a stray pre-execution action. Regression guard — these previously
+        // fell through to the wildcard and wrongly offered "validate".
+        assert_eq!(actions_for_stage("verified"), vec!["protect".to_string()]);
+        assert_eq!(actions_for_stage("completed"), vec!["protect".to_string()]);
+    }
+
+    #[test]
+    fn actions_for_stage_drives_post_completion_lifecycle() {
+        // Theme 8: protect -> publish -> retire, each offered only at its own
+        // stage, with the same stage advertised under both the DB to_stage name
+        // and the milestone alias.
+        assert_eq!(actions_for_stage("protect"), vec!["publish".to_string()]);
+        assert_eq!(actions_for_stage("protecting"), vec!["publish".to_string()]);
+        assert_eq!(actions_for_stage("publish"), vec!["retire".to_string()]);
+        assert_eq!(actions_for_stage("operational"), vec!["retire".to_string()]);
+        // Retired is the governed end-of-life state: terminal, no actions.
+        assert!(actions_for_stage("retire").is_empty());
+        assert!(actions_for_stage("retired").is_empty());
     }
 
     #[test]

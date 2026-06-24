@@ -411,6 +411,22 @@ pub fn request_verify_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, Some("verify"))
 }
 
+// Post-completion governed lifecycle (Theme 8). Each is a bodyless POST, gated
+// server-side on the `execute` permission, valid only from its predecessor
+// status: protect from Completed, publish from Protecting, retire from
+// Operational.
+pub fn request_protect_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("protect"))
+}
+
+pub fn request_publish_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("publish"))
+}
+
+pub fn request_retire_path(request_id: &str) -> Result<String, ApiPathError> {
+    request_lifecycle_path(request_id, Some("retire"))
+}
+
 const INTEGRATIONS_PATH: &str = "/api/integrations";
 
 pub fn integrations_path() -> &'static str {
@@ -559,6 +575,18 @@ mod tests {
         assert_eq!(
             request_verify_path(request_id),
             Ok("/api/requests/REQ-123/verify".to_string())
+        );
+        assert_eq!(
+            request_protect_path(request_id),
+            Ok("/api/requests/REQ-123/protect".to_string())
+        );
+        assert_eq!(
+            request_publish_path(request_id),
+            Ok("/api/requests/REQ-123/publish".to_string())
+        );
+        assert_eq!(
+            request_retire_path(request_id),
+            Ok("/api/requests/REQ-123/retire".to_string())
         );
         assert_eq!(
             request_audit_path(request_id),

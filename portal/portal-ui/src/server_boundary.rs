@@ -26,7 +26,8 @@ use crate::api::{
     admin_agent_approve_path, admin_session_revoke_path, admin_token_revoke_path,
     request_approve_path, request_audit_path, request_cancel_path, request_detail_path,
     request_evidence_path, request_execute_path, request_lock_path, request_plan_path,
-    request_reject_path, request_validate_path, request_verify_path,
+    request_protect_path, request_publish_path, request_reject_path, request_retire_path,
+    request_validate_path, request_verify_path,
 };
 // Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
 // `test` build (no ssr feature) free of unused-import warnings.
@@ -264,6 +265,9 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | "lock"
             | "execute"
             | "verify"
+            | "protect"
+            | "publish"
+            | "retire"
             | "audit"
             | "evidence"
     ) {
@@ -280,6 +284,10 @@ fn is_allowed_request_lifecycle_path(path: &str) -> bool {
             | (Some("lock"), None)
             | (Some("execute"), None)
             | (Some("verify"), None)
+            // Post-completion governed lifecycle (Theme 8).
+            | (Some("protect"), None)
+            | (Some("publish"), None)
+            | (Some("retire"), None)
             | (Some("audit"), None)
             | (Some("evidence"), None)
             | (Some("execution-job"), None)
@@ -2348,6 +2356,59 @@ pub async fn verify_request(request_id: String) -> Result<StageActionResponse, S
     dispatch_stage_action_live(request_id, "verification", &path).await
 }
 
+/// Post-completion Protect stage (Theme 8). Bodyless POST gated server-side on
+/// `execute`; valid only from a Completed request. Mirrors `verify_request`.
+#[server(prefix = "/portal/api", endpoint = "request-protect")]
+pub async fn protect_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_protect_path(&request_id)
+        .map_err(|_| ServerFnError::new("request protect API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request protect API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "protection");
+    }
+    dispatch_stage_action_live(request_id, "protection", &path).await
+}
+
+/// Post-completion Publish stage (Theme 8). Bodyless POST gated server-side on
+/// `execute`; valid only from a Protecting request. Mirrors `verify_request`.
+#[server(prefix = "/portal/api", endpoint = "request-publish")]
+pub async fn publish_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_publish_path(&request_id)
+        .map_err(|_| ServerFnError::new("request publish API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request publish API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "publication");
+    }
+    dispatch_stage_action_live(request_id, "publication", &path).await
+}
+
+/// Post-completion Retire stage (Theme 8). Bodyless POST gated server-side on
+/// `execute`; valid only from an Operational request. Note: unlike
+/// reject/cancel, the API retire handler takes no reason body, so this mirrors
+/// the bodyless `verify_request` path, not the reason-bearing decisions.
+#[server(prefix = "/portal/api", endpoint = "request-retire")]
+pub async fn retire_request(request_id: String) -> Result<StageActionResponse, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = request_retire_path(&request_id)
+        .map_err(|_| ServerFnError::new("request retire API path failed same-origin guard"))?;
+    boundary
+        .validate_request_lifecycle_api_path(&path)
+        .map_err(|_| ServerFnError::new("request retire API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_request_action(request_id, "retirement");
+    }
+    dispatch_stage_action_live(request_id, "retirement", &path).await
+}
+
 /// Live POST of a reason-bearing lifecycle decision (reject/cancel). Unlike
 /// `dispatch_stage_action_live` (which posts no body), this sends a
 /// `{"reason": ...}` JSON body — these transitions are never bodyless. 2xx
@@ -3532,6 +3593,9 @@ mod tests {
             "locking",
             "execution",
             "verification",
+            "protection",
+            "publication",
+            "retirement",
         ] {
             let result = reject_static_preview_request_action("REQ-123".to_string(), action);
 
@@ -3580,6 +3644,9 @@ mod tests {
             request_lock_path(request_id),
             request_execute_path(request_id),
             request_verify_path(request_id),
+            request_protect_path(request_id),
+            request_publish_path(request_id),
+            request_retire_path(request_id),
             request_audit_path(request_id),
             request_evidence_path(request_id),
         ] {
