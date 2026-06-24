@@ -23,10 +23,10 @@ use crate::api::{
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    admin_session_revoke_path, admin_token_revoke_path, request_approve_path, request_audit_path,
-    request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
-    request_lock_path, request_plan_path, request_reject_path, request_validate_path,
-    request_verify_path,
+    admin_agent_approve_path, admin_session_revoke_path, admin_token_revoke_path,
+    request_approve_path, request_audit_path, request_cancel_path, request_detail_path,
+    request_evidence_path, request_execute_path, request_lock_path, request_plan_path,
+    request_reject_path, request_validate_path, request_verify_path,
 };
 // Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
 // `test` build (no ssr feature) free of unused-import warnings.
@@ -324,6 +324,37 @@ fn is_allowed_admin_resource_revoke_path(path: &str) -> bool {
     segments.next().is_none()
 }
 
+/// Validates `/api/admin/agents/{id}/approve` — the enrollment-approval path,
+/// which carries an agent id and a static `approve` suffix and so cannot live
+/// in the static allowlist. Only a single safe id segment is accepted, and the
+/// suffix must be exactly `approve` with no trailing segments.
+fn is_allowed_admin_agent_approve_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/admin/agents/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(agent_id) = segments.next() else {
+        return false;
+    };
+    if agent_id.is_empty()
+        || agent_id == "."
+        || agent_id == ".."
+        || agent_id.contains("..")
+        || agent_id.contains('\\')
+        || agent_id.contains('?')
+        || agent_id.contains('#')
+        || agent_id.contains("://")
+        || agent_id.starts_with("//")
+        || !agent_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return false;
+    }
+    // Exactly `/agents/{id}/approve` — the suffix is `approve` and nothing else.
+    matches!((segments.next(), segments.next()), (Some("approve"), None))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalBoundaryError {
     ApiPath(ApiPathError),
@@ -396,6 +427,19 @@ impl PortalServerBoundary {
     ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if is_allowed_admin_resource_revoke_path(guarded) {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    /// Validates the id-bearing agent enrollment approval path
+    /// (`/api/admin/agents/{id}/approve`) before a POST is dispatched.
+    pub fn validate_admin_agent_approve_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_admin_agent_approve_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -1496,6 +1540,13 @@ fn reject_static_preview_revoke(action: &str) -> Result<RevokeResult, ServerFnEr
     Err(ServerFnError::new(format!(
         "Portal {action} revoke is preview-only in static dry-run mode; nothing was revoked"
     )))
+}
+
+#[cfg(any(feature = "ssr", test))]
+fn reject_static_preview_agent_approve() -> Result<RevokeResult, ServerFnError> {
+    Err(ServerFnError::new(
+        "Portal agent approval is preview-only in static dry-run mode; no agent was approved",
+    ))
 }
 
 /// `GET /api/admin/tokens` — list API token metadata (hash redacted). The
@@ -2831,6 +2882,52 @@ pub async fn get_admin_agents() -> Result<Vec<AgentSummary>, ServerFnError> {
     }
 }
 
+/// `POST /api/admin/agents/{id}/approve` — approve a pending agent enrollment.
+///
+/// The API's approve body REQUIRES an authoritative `platform`; the portal
+/// re-affirms the agent's currently displayed platform so a PlatformAdmin can
+/// approve in one click. Capabilities are intentionally omitted, so the API
+/// resets them to empty (its documented secure default): the admin must grant
+/// capabilities explicitly rather than trust the agent's self-declared set.
+/// Mutations never degrade to a fallback — a static/unreachable upstream errors.
+#[server(prefix = "/portal/api", endpoint = "admin-agents-approve")]
+pub async fn approve_agent(
+    agent_id: String,
+    platform: String,
+) -> Result<RevokeResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = admin_agent_approve_path(&agent_id)
+        .map_err(|_| ServerFnError::new("admin agent approve API path failed same-origin guard"))?;
+    boundary
+        .validate_admin_agent_approve_path(&path)
+        .map_err(|_| ServerFnError::new("admin agent approve API path failed same-origin guard"))?;
+    if platform.trim().is_empty() {
+        return Err(ServerFnError::new(
+            "agent approval requires a non-empty platform",
+        ));
+    }
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_agent_approve();
+    }
+    let body = serde_json::json!({ "platform": platform });
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(&path, Some(&body), session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "agent approval was rejected by the API",
+        )));
+    }
+    Ok(RevokeResult {
+        status: "approved".to_string(),
+        id: agent_id,
+    })
+}
+
 #[server(prefix = "/portal/api", endpoint = "integration-create")]
 pub async fn create_integration(
     payload: CreateIntegrationPayload,
@@ -3307,6 +3404,50 @@ mod tests {
                 "path {path} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn boundary_validates_admin_agent_approve_path_and_rejects_traversal() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let id = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+
+        let path = admin_agent_approve_path(id).expect("agent approve path must build");
+        assert_eq!(
+            path,
+            "/api/admin/agents/3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b/approve"
+        );
+        assert_eq!(
+            boundary.validate_admin_agent_approve_path(&path),
+            Ok(path.as_str())
+        );
+
+        for path in [
+            "/api/admin/agents",
+            "/api/admin/agents/id",
+            "/api/admin/agents/id/revoke",
+            "/api/admin/agents/id/approve/extra",
+            "/api/admin/agents/../platform-settings/approve",
+            "/api/admin/agents/id?x=1/approve",
+            "/api/admin/tokens/id/approve",
+        ] {
+            assert_eq!(
+                boundary.validate_admin_agent_approve_path(path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {path} must be rejected"
+            );
+        }
+
+        // An empty / traversal id never even builds a path.
+        assert!(admin_agent_approve_path("").is_err());
+        assert!(admin_agent_approve_path("..").is_err());
+        assert!(admin_agent_approve_path("a/b").is_err());
+    }
+
+    #[test]
+    fn agent_approve_refuses_static_preview_persistence() {
+        let result = reject_static_preview_agent_approve();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("preview-only"));
     }
 
     #[test]

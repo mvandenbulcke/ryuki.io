@@ -423,6 +423,16 @@ pub fn admin_agents_path() -> &'static str {
     ADMIN_AGENTS_PATH
 }
 
+/// Builds `/api/admin/agents/{id}/approve` after validating the id as a single
+/// safe URL path segment (rejects traversal, slashes, query/fragment markers).
+/// Mirrors `admin_resource_revoke_path` but carries the static `approve` suffix.
+pub fn admin_agent_approve_path(agent_id: &str) -> Result<String, ApiPathError> {
+    let agent_id = safe_request_id(agent_id)?;
+    let path = format!("/api/admin/agents/{agent_id}/approve");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 fn safe_integration_id(integration_id: &str) -> Result<&str, ApiPathError> {
     let integration_id = integration_id.trim();
     if integration_id.is_empty() {
