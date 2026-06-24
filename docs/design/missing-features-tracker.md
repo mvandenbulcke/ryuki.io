@@ -30,7 +30,7 @@ implementing **all 66**. This file tracks execution.
 
 | # | ✓ | Feature | Area | E | V | 📋 |
 |---|---|---|---|---|---|---|
-| 1 | [ ] | Durable scheduler / background job engine | Roadmap | L | H | ✓ |
+| 1 | [x] | Durable scheduler / background job engine | Roadmap | L | H | ✓ |
 | 2 | [ ] | Administrable, site/env-scoped RBAC | Security | L | H | ✓ |
 | 3 | [x] | Separation-of-duties on approval (no self-approve) | Security | S | H | ✓ |
 | 4 | [ ] | Multi-role approval quorum | Security | M | H | ✓ |
@@ -107,3 +107,11 @@ approve — revoke deferred (`6d6fb5b`), #63 observability deploy (`0ce0ed3`).
 request_type/created_by/q) + allowlisted sort/direction on GET /api/requests,
 backward-compatible (bare-array response unchanged). Follow-up slice 2 =
 `{items,total}` envelope, paired with the portal #15 faceting work.
+
+**#1** (`29564f5`): durable leader-elected scheduler/job engine — `schedules`
++ `job_executions` (mig 095), pure `ryuki_engine::scheduler`, a 60s
+advisory-lock-elected tick (savepoint-isolated per schedule, clock_timestamp
+advance, read-only job boundary), seeded hourly self-health probe, and
+read-only `/api/ops/scheduler` views. UNBLOCKS #31/#39/#40/#45/#52 (and feeds
+#19/#22): each adds its own job kind + seeded schedule. Follow-up (non-blocking):
+operator CRUD endpoints to create/enable/disable schedules from the API/portal.
