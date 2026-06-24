@@ -158,6 +158,8 @@ pub fn routes() -> Router {
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/ops/scheduler/schedules", get(scheduler_schedules))
         .route("/api/ops/scheduler/executions", get(scheduler_executions))
+        .route("/api/metrics/samples", post(metrics_record_sample))
+        .route("/api/metrics/series", get(metrics_series))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -15040,6 +15042,265 @@ async fn scheduler_executions(AuthExtractor(session): AuthExtractor) -> ApiResul
     }
 }
 
+// ─── Metric history + forecasting handlers (#34) ───
+
+/// Body for recording one metric sample. `observed_at` is optional (defaults to
+/// the server clock); `site`/`environment` are optional scope.
+#[derive(Debug, Deserialize)]
+struct MetricSampleRequest {
+    metric_key: String,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    value: f64,
+    #[serde(default)]
+    observed_at: Option<String>,
+}
+
+/// Query params for reading a metric series + its forecast.
+#[derive(Debug, Deserialize, Default)]
+struct MetricSeriesParams {
+    metric_key: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    horizon: Option<usize>,
+}
+
+/// One stored sample as queried for the series.
+#[derive(sqlx::FromRow)]
+struct MetricSampleRow {
+    value: f64,
+    observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Reject a malformed `metric_key`: it must be 1..=200 chars and free of
+/// control characters (it is a dotted identifier, e.g. `cost.monthly_usd`).
+/// Returns the human message on rejection, `None` when valid. Shared by the
+/// record and series handlers so the two cannot diverge.
+fn metric_key_rejection(key: &str) -> Option<&'static str> {
+    if key.is_empty() || key.len() > 200 {
+        return Some("metric_key must be 1..=200 characters");
+    }
+    if key.chars().any(char::is_control) {
+        return Some("metric_key must not contain control characters");
+    }
+    None
+}
+
+/// True when an optional scope value (site/environment) exceeds the 200-char
+/// bound. A blank/absent scope is fine.
+fn metric_scope_too_long(scope: &Option<String>) -> bool {
+    scope
+        .as_deref()
+        .map(|s| s.trim().len() > 200)
+        .unwrap_or(false)
+}
+
+/// POST /api/metrics/samples — record one time-series metric sample. Execute-tier
+/// (operators/collectors push samples). 503 when no database is configured.
+async fn metrics_record_sample(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<MetricSampleRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to record metrics"})),
+        ));
+    }
+    let metric_key = body.metric_key.trim();
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&body.site) || metric_scope_too_long(&body.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    if !body.value.is_finite() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "value must be a finite number"})),
+        ));
+    }
+    // Parse an explicit observed_at if given; reject a malformed one rather than
+    // silently substituting the server clock.
+    let observed_at = match body.observed_at.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "observed_at must be an RFC3339 timestamp"})),
+                ));
+            }
+        },
+        _ => None,
+    };
+
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = sqlx::query(
+        "INSERT INTO metric_samples (id, metric_key, site, environment, value, observed_at) \
+         VALUES ($1, $2, $3, $4, $5, COALESCE($6, NOW()))",
+    )
+    .bind(&id)
+    .bind(metric_key)
+    .bind(norm(&body.site))
+    .bind(norm(&body.environment))
+    .bind(body.value)
+    .bind(observed_at)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(_) => Ok(Json(json!({"id": id, "recorded": true}))),
+        Err(e) => {
+            tracing::error!(error = %e, "recording metric sample failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not record metric sample"})),
+            ))
+        }
+    }
+}
+
+/// GET /api/metrics/series — return one metric's ordered series plus a summary,
+/// trend, and a linear forecast (pure `ryuki_engine::metric_forecast`).
+/// `metric_key` is required; `site`/`environment` narrow the scope; `horizon`
+/// (default 3, capped 100) is the number of points to project. Request-tier read
+/// (metrics are non-sensitive aggregates). 503 when no database is configured.
+async fn metrics_series(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricSeriesParams>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read metrics"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "metric_key is required"})),
+        ));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    // A series is ONE coherent scope: `IS NOT DISTINCT FROM` treats an omitted
+    // (NULL) site/environment as "the platform-wide rows where it IS NULL", NOT
+    // as "all sites" — so a forecast is never computed over a mix of scopes.
+    // The most-recent 10k samples are selected (DESC + LIMIT), then re-ordered
+    // ASC for the time series; a long history forecasts off its recent window,
+    // not its oldest rows.
+    let rows: Vec<MetricSampleRow> = match sqlx::query_as(
+        "SELECT value, observed_at FROM ( \
+             SELECT value, observed_at FROM metric_samples \
+             WHERE metric_key = $1 \
+               AND site IS NOT DISTINCT FROM $2 \
+               AND environment IS NOT DISTINCT FROM $3 \
+             ORDER BY observed_at DESC \
+             LIMIT 10000 \
+         ) recent \
+         ORDER BY observed_at ASC",
+    )
+    .bind(metric_key)
+    .bind(&f_site)
+    .bind(&f_env)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Do NOT mask a DB failure as an empty (and falsely "flat") series —
+            // forecasting/budget consumers must not act on phantom data.
+            tracing::error!(error = %e, "querying metric series failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not query metric series"})),
+            ));
+        }
+    };
+
+    let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+        .iter()
+        .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+            t: r.observed_at.timestamp() as f64,
+            value: r.value,
+        })
+        .collect();
+
+    let summary = ryuki_engine::metric_forecast::summarize(&points);
+    let trend = ryuki_engine::metric_forecast::trend(&points, 1e-9);
+    // Step the forecast at the series' own average cadence; fall back to 1h.
+    let step = if points.len() >= 2 {
+        let span = points.last().unwrap().t - points.first().unwrap().t;
+        let s = span / (points.len() - 1) as f64;
+        if s > 0.0 {
+            s
+        } else {
+            3600.0
+        }
+    } else {
+        3600.0
+    };
+    let horizon = params.horizon.unwrap_or(3).clamp(0, 100);
+    let forecast = ryuki_engine::metric_forecast::project_forward(&points, step, horizon);
+
+    let series_json: Vec<Value> = rows
+        .iter()
+        .map(|r| json!({"observed_at": r.observed_at.to_rfc3339(), "value": r.value}))
+        .collect();
+    let forecast_json: Vec<Value> = forecast
+        .iter()
+        .map(|p| {
+            let ts = chrono::DateTime::from_timestamp(p.t as i64, 0)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            json!({"observed_at": ts, "value": p.value})
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "site": f_site,
+        "environment": f_env,
+        "series": series_json,
+        "summary": summary,
+        "trend": trend,
+        "forecast": forecast_json,
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -26725,6 +26986,73 @@ mod db_lifecycle_tests {
         let pool = crate::database::get_db()?;
         crate::database::run_migrations(pool).await.ok()?;
         Some(pool)
+    }
+
+    /// #34: metric samples round-trip through the record + series handlers and
+    /// the pure forecast. An increasing series must yield an `increasing` trend
+    /// and a forecast that projects above the last observation. Also exercises
+    /// the migration's column types (DOUBLE PRECISION value, TIMESTAMPTZ
+    /// observed_at) against the FromRow decode — guarding the bind/decode bug
+    /// class.
+    #[tokio::test]
+    async fn test_metric_series_records_and_forecasts() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.forecast.7q2";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        // Three increasing samples at 1h spacing, with explicit timestamps so the
+        // series and its forecast are deterministic.
+        for (i, v) in [(0i64, 10.0f64), (1, 20.0), (2, 30.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: None,
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-01-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        let params = MetricSeriesParams {
+            metric_key: Some(key.to_string()),
+            site: None,
+            environment: None,
+            horizon: Some(2),
+        };
+        let Json(out) = metrics_series(sess(), Query(params)).await.expect("series");
+        assert_eq!(
+            out["series"].as_array().unwrap().len(),
+            3,
+            "all three samples are returned in the series"
+        );
+        assert_eq!(
+            out["trend"], "increasing",
+            "an increasing series reads as increasing"
+        );
+        let forecast = out["forecast"].as_array().unwrap();
+        assert_eq!(forecast.len(), 2, "the horizon is honored");
+        let first_proj = forecast[0]["value"].as_f64().unwrap();
+        assert!(
+            first_proj > 30.0,
+            "an increasing series projects above the last observation, got {first_proj}"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// B4 (a)+(c): logout deletes ONLY the caller's own session and writes a

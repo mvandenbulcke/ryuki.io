@@ -46,6 +46,7 @@ pub mod load_balancer;
 pub mod log_forwarder;
 pub mod maintenance_calendar;
 pub mod maintenance_comm;
+pub mod metric_forecast;
 pub mod models;
 pub mod network_readiness;
 pub mod network_vlan;

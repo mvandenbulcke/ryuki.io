@@ -518,6 +518,10 @@ static ROUTE_PERMISSIONS: &[RoutePermission] = &[
         permission: "execute",
     },
     RoutePermission {
+        prefix: "/api/metrics",
+        permission: "execute",
+    },
+    RoutePermission {
         prefix: "/api/evidence",
         permission: "execute",
     },
