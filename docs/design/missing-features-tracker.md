@@ -84,7 +84,7 @@ implementing **all 66**. This file tracks execution.
 | 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
 | 53 | [ ] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
 | 54 | [ ] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
-| 55 | [ ] | DNS record update endpoint | API | S | M | — |
+| 55 | [x] | DNS record update endpoint | API | S | M | — |
 | 56 | [ ] | IPAM subnet CRUD | API | M | M | — |
 | 57 | [ ] | Load-balancer virtual-server delete/update | API | M | M | — |
 | 58 | [ ] | Connection usage audit trail | Integ | M | M | — |

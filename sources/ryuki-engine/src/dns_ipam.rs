@@ -389,6 +389,11 @@ pub fn build_dns_record(
     if site.trim().is_empty() {
         return Err("site cannot be empty".into());
     }
+    // RFC 2181 caps a DNS TTL at i32::MAX; reject anything larger so it can never
+    // wrap to a negative value when persisted to the INTEGER `ttl` column.
+    if ttl > i32::MAX as u32 {
+        return Err(format!("ttl {ttl} exceeds the maximum {}", i32::MAX));
+    }
 
     let record_type = parse_record_type(record_type)?;
     let id = format!(

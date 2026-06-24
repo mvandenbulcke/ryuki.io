@@ -1660,6 +1660,7 @@ pub fn routes() -> Router {
         .route("/api/network/dns/records", get(dns_records_list))
         .route("/api/network/dns/records", post(dns_record_create))
         .route("/api/network/dns/records/{id}", get(dns_record_get))
+        .route("/api/network/dns/records/{id}", put(dns_record_update))
         .route("/api/network/dns/records/{id}", delete(dns_record_delete))
         .route("/api/network/ipam/subnets", get(ipam_subnets_list))
         .route("/api/network/ipam/subnets/{id}", get(ipam_subnet_get))
@@ -20133,6 +20134,81 @@ async fn dns_record_delete(
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
+
+/// Mutable fields of a DNS record. The identity (name, zone, site) is NOT here —
+/// changing those is a different record (delete + create). Any omitted field
+/// keeps its current value.
+#[derive(Debug, Deserialize)]
+struct DnsUpdateRequest {
+    value: Option<String>,
+    ttl: Option<u32>,
+    #[serde(rename = "recordType")]
+    record_type: Option<String>,
+}
+
+/// PUT /api/network/dns/records/{id} — update a record's mutable fields in place
+/// (no id churn, unlike delete + recreate). The resulting record is re-validated
+/// through the same pure engine builder as create, so an invalid type/value/ttl
+/// is a 400. DB-backed: a record must be persisted to be updated.
+async fn dns_record_update(
+    Path(id): Path<String>,
+    Json(b): Json<DnsUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let existing: DnsRecordRow = sqlx::query_as(&format!(
+        "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("DNS record '{}' not found", id)})),
+        )
+    })?;
+
+    let new_type = b.record_type.as_deref().unwrap_or(&existing.record_type);
+    let new_value = b.value.as_deref().unwrap_or(&existing.value);
+    let new_ttl = b.ttl.unwrap_or(existing.ttl as u32);
+
+    // Re-validate the whole record (immutable identity + new mutable fields)
+    // through the pure engine path. A bad type/value/ttl is a 400.
+    let validated = dns_ipam::build_dns_record(
+        &existing.name,
+        new_type,
+        new_value,
+        &existing.zone,
+        new_ttl,
+        &existing.site,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+
+    sqlx::query(
+        "UPDATE dns_records SET record_type = $1, value = $2, ttl = $3, status = $4 WHERE id = $5",
+    )
+    .bind(validated.record_type.to_string())
+    .bind(&validated.value)
+    .bind(validated.ttl as i32)
+    .bind(dns_status_str(&validated.status))
+    .bind(&id)
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+
+    let updated: DnsRecordRow = sqlx::query_as(&format!(
+        "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(
+        json!({"source": "database", "record": updated.to_json()}),
+    ))
+}
+
 async fn ipam_subnets_list(
     Query(q): Query<IpamSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -27328,6 +27404,88 @@ mod db_lifecycle_tests {
 /// code paths and fail (they expect no-DB mode and reference synthetic
 /// `req-test-*` IDs that do not exist in the DB).  The Makefile `test-unit`
 /// and `test-db` targets enforce this split.
+#[cfg(test)]
+mod dns_records_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn dns_record_update_changes_mutable_fields_and_revalidates() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        // Create a record, then update its value + TTL in place.
+        let Json(created) = dns_record_create(Json(DnsCreateRequest {
+            name: "www".into(),
+            record_type: "A".into(),
+            value: "10.0.0.1".into(),
+            zone: "example.test".into(),
+            ttl: 3600,
+            site: "DEFRA".into(),
+        }))
+        .await
+        .expect("create");
+        let id = created["record"]["id"].as_str().expect("id").to_string();
+
+        let Json(updated) = dns_record_update(
+            Path(id.clone()),
+            Json(DnsUpdateRequest {
+                value: Some("10.0.0.99".into()),
+                ttl: Some(7200),
+                record_type: None,
+            }),
+        )
+        .await
+        .expect("update");
+        assert_eq!(updated["record"]["value"], "10.0.0.99");
+        assert_eq!(updated["record"]["ttl"], 7200);
+        // Identity (name/zone) is unchanged; same id (no churn).
+        assert_eq!(updated["record"]["id"], id);
+
+        // A bad value is a 400 (re-validated through the engine builder).
+        let bad = dns_record_update(
+            Path(id.clone()),
+            Json(DnsUpdateRequest {
+                value: Some(String::new()),
+                ttl: None,
+                record_type: None,
+            }),
+        )
+        .await;
+        assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))));
+
+        // Updating a missing record is a 404.
+        let missing = dns_record_update(
+            Path("dns-nonexistent".into()),
+            Json(DnsUpdateRequest {
+                value: Some("1.1.1.1".into()),
+                ttl: None,
+                record_type: None,
+            }),
+        )
+        .await;
+        assert!(matches!(missing, Err((StatusCode::NOT_FOUND, _))));
+
+        sqlx::query("DELETE FROM dns_records WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+}
+
 #[cfg(test)]
 mod maint_calendar_db_tests {
     use super::*;
