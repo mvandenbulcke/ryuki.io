@@ -44,7 +44,7 @@ implementing **all 66**. This file tracks execution.
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
 | 13 | [ ] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
-| 15 | [ ] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
+| 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
 | 16 | [ ] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [ ] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
@@ -65,7 +65,7 @@ implementing **all 66**. This file tracks execution.
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
 | 34 | [x] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
 | 35 | [x] | Anomaly / waste detection engine | AIOps | M | H | — |
-| 36 | [ ] | AIOps suggestion-generation engine | AIOps | M | H | — |
+| 36 | [x] | AIOps suggestion-generation engine | AIOps | M | H | — |
 | 37 | [ ] | What-if capacity & cost planning | AIOps | M | H | — |
 | 38 | [ ] | Storage array registration / lifecycle | API | M | M | — |
 | 39 | [ ] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | ✓ |
@@ -127,3 +127,15 @@ each consumes the series summary (mean/stddev) and/or the forecast.
 anomalies — avoids the in-sample sqrt(n-1) ceiling that would mute small-series
 detection — + waste detection Idle/Underutilized) and GET /api/metrics/insights.
 Feeds #36 (suggestions) and #53/#54 (budgets).
+
+**#36** (`8392ac7`): `ryuki_engine::metric_suggestions` (waste→RightSizing/
+CostOptimization, anomalies→RiskReduction) + POST /api/metrics/insights/generate
+persisting into the existing `aiops_suggestions` table — stable dedup key
+(scope+type+metric_key, NOT title), transactional batch, scope-label folds in
+environment, metric_key charset locked to `[A-Za-z0-9._:-]` (HTML-safe).
+
+**#15** (`1ff463d`, swarm: worktree agent + Codex integration review): portal
+faceted filter bar (name search/status/site + Clear) + sortable columns, URL as
+single source of truth, wired to the #14 API. Integration review fixed a `q`
+name-only/5-field mismatch (would break old `?q=` deep links) + whitespace-only
+facets. Follow-up [~]: surface environment/request_type/created_by + pagination.
