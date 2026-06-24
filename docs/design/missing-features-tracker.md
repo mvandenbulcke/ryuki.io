@@ -36,7 +36,7 @@ implementing **all 66**. This file tracks execution.
 | 4 | [ ] | Multi-role approval quorum | Security | M | H | ✓ |
 | 5 | [x] | Tamper-evident audit hash chain + verify | Security | M | H | ✓ |
 | 6 | [ ] | Dependency-backed platform self-health probes | Roadmap | L | H | ✓ |
-| 7 | [ ] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
+| 7 | [x] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
 | 8 | [~] | Agent enrollment approve/revoke from portal | Portal | M | H | — |
 | 9 | [ ] | Outbound notifications (email/webhook/callback/chat) | Roadmap | L | H | ✓ |
 | 10 | [ ] | Destroy/teardown execution mode (live decommission) | Exec | L | H | — |
@@ -55,7 +55,7 @@ implementing **all 66**. This file tracks execution.
 | 23 | [ ] | CP-side poison-job cap / dead-letter | Resil | M | H | — |
 | 24 | [ ] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
 | 25 | [ ] | SLO / error-budget tracking | Observ | M | H | — |
-| 26 | [ ] | CP database backup/restore + DR runbook | Roadmap | M | H | ✓ |
+| 26 | [x] | CP database backup/restore + DR runbook | Roadmap | M | H | ✓ |
 | 27 | [ ] | Bidirectional CMDB reconciliation + drift | Integ | L | H | ✓ |
 | 28 | [ ] | Active Directory / Entra integration adapter | Integ | L | H | — |
 | 29 | [ ] | DR failover orchestration (runbook-driven) | Resil | L | H | — |
