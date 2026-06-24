@@ -79,7 +79,7 @@ implementing **all 66**. This file tracks execution.
 | 47 | [ ] | Backup verification + restore-test recency | Resil | M | M | — |
 | 48 | [ ] | Enforced access recertification w/ revocation | Security | L | M | — |
 | 49 | [ ] | Secret update & deregistration | API | S | M | — |
-| 50 | [ ] | Evidence pack file download / export | Portal | S | M | — |
+| 50 | [x] | Evidence pack file download / export | Portal | S | M | — |
 | 51 | [ ] | Per-vendor connection capability catalog | Integ | M | M | — |
 | 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
 | 53 | [ ] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
