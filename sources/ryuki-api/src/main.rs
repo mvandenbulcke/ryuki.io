@@ -13,6 +13,7 @@ mod idempotency;
 mod integration;
 mod oidc_callback;
 mod repos;
+mod scheduler;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -1557,6 +1558,8 @@ async fn main() {
         tracing::info!("agent lease expiry sweep started (interval: 30s)");
         idempotency::spawn_idempotency_sweep(pool.clone(), 3600);
         tracing::info!("idempotency retention sweep started (interval: 3600s)");
+        scheduler::spawn_scheduler(pool.clone(), 60);
+        tracing::info!("durable scheduler started (tick interval: 60s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);

@@ -72,6 +72,7 @@ const DECLARED_MODULES: &[&str] = &[
     "request_lifecycle",
     "runbook_execution",
     "runners",
+    "scheduler",
     "secrets_rotation",
     "server_decommission",
     "servicenow_api",

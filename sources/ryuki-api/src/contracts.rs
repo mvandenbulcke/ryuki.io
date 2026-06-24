@@ -156,6 +156,8 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/audit/log/verify", post(audit_log_verify))
+        .route("/api/ops/scheduler/schedules", get(scheduler_schedules))
+        .route("/api/ops/scheduler/executions", get(scheduler_executions))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -14983,6 +14985,56 @@ async fn audit_log_verify(AuthExtractor(session): AuthExtractor) -> ApiResult {
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "audit chain verification failed"})),
+            ))
+        }
+    }
+}
+
+/// GET /api/ops/scheduler/schedules — list the durable scheduler's registered
+/// recurring jobs (the registry of what runs and when it next/last ran).
+/// Execute-tier gated; read-only. 200 with an empty list in dry-run / no-DB mode.
+async fn scheduler_schedules(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to view scheduler state"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"schedules": [], "durable": false})));
+    };
+    match crate::scheduler::list_schedules(pool).await {
+        Ok(schedules) => Ok(Json(json!({"schedules": schedules, "durable": true}))),
+        Err(e) => {
+            tracing::error!(error = %e, "listing scheduler schedules failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list scheduler schedules"})),
+            ))
+        }
+    }
+}
+
+/// GET /api/ops/scheduler/executions — list recent durable-scheduler job runs
+/// (when each started/finished, its status, and a short detail). Execute-tier
+/// gated; read-only. 200 with an empty list in dry-run / no-DB mode.
+async fn scheduler_executions(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to view scheduler state"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"executions": [], "durable": false})));
+    };
+    match crate::scheduler::list_recent_executions(pool, 100).await {
+        Ok(executions) => Ok(Json(json!({"executions": executions, "durable": true}))),
+        Err(e) => {
+            tracing::error!(error = %e, "listing scheduler executions failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list scheduler executions"})),
             ))
         }
     }
