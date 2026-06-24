@@ -185,6 +185,17 @@ pub fn notifications_read_all_path() -> &'static str {
     NOTIFICATIONS_READ_ALL_PATH
 }
 
+/// Builds `/api/notifications/{id}/read` after validating the id as a single
+/// safe URL path segment (rejects traversal, slashes, query/fragment markers).
+/// Mirrors `admin_agent_approve_path` but carries the `read` suffix; backs the
+/// per-item mark-read action from the notification bell.
+pub fn notifications_read_path(id: &str) -> Result<String, ApiPathError> {
+    let id = safe_request_id(id)?;
+    let path = format!("/api/notifications/{id}/read");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 pub fn activity_operation_queue_path() -> &'static str {
     ACTIVITY_OPERATION_QUEUE_PATH
 }
@@ -552,6 +563,19 @@ mod tests {
     #[test]
     fn notifications_read_all_path_matches_api_contract() {
         assert_eq!(notifications_read_all_path(), "/api/notifications/read-all");
+    }
+
+    #[test]
+    fn notifications_read_path_matches_api_contract_and_rejects_unsafe_ids() {
+        assert_eq!(
+            notifications_read_path("pn-7c9e6679").expect("safe id must build"),
+            "/api/notifications/pn-7c9e6679/read"
+        );
+        // Traversal, slashes, and query markers never build a path.
+        assert!(notifications_read_path("").is_err());
+        assert!(notifications_read_path("..").is_err());
+        assert!(notifications_read_path("a/b").is_err());
+        assert!(notifications_read_path("pn-1?x=1").is_err());
     }
 
     #[test]

@@ -24,10 +24,10 @@ use crate::api::{
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
     admin_agent_approve_path, admin_session_revoke_path, admin_token_revoke_path,
-    request_approve_path, request_audit_path, request_cancel_path, request_detail_path,
-    request_evidence_path, request_execute_path, request_lock_path, request_plan_path,
-    request_protect_path, request_publish_path, request_reject_path, request_retire_path,
-    request_validate_path, request_verify_path,
+    notifications_read_path, request_approve_path, request_audit_path, request_cancel_path,
+    request_detail_path, request_evidence_path, request_execute_path, request_lock_path,
+    request_plan_path, request_protect_path, request_publish_path, request_reject_path,
+    request_retire_path, request_validate_path, request_verify_path,
 };
 // Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
 // `test` build (no ssr feature) free of unused-import warnings.
@@ -367,6 +367,39 @@ fn is_allowed_admin_agent_approve_path(path: &str) -> bool {
     matches!((segments.next(), segments.next()), (Some("approve"), None))
 }
 
+/// Validates `/api/notifications/{id}/read` — the per-item mark-read path, which
+/// carries a notification id and a static `read` suffix and so cannot live in the
+/// static allowlist. Only a single safe id segment is accepted, and the suffix
+/// must be exactly `read` with no trailing segments.
+fn is_allowed_notifications_read_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/notifications/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(notification_id) = segments.next() else {
+        return false;
+    };
+    if notification_id.is_empty()
+        || notification_id == "."
+        || notification_id == ".."
+        || notification_id.contains("..")
+        || notification_id.contains('\\')
+        || notification_id.contains('?')
+        || notification_id.contains('#')
+        || notification_id.contains("://")
+        || notification_id.starts_with("//")
+        || !notification_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return false;
+    }
+    // Exactly `/notifications/{id}/read` — the suffix is `read` and nothing else.
+    // Guard against the collection-level `read-all` route accidentally matching:
+    // that path has no second segment, so it can never reach here as `{id}/read`.
+    matches!((segments.next(), segments.next()), (Some("read"), None))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortalBoundaryError {
     ApiPath(ApiPathError),
@@ -452,6 +485,19 @@ impl PortalServerBoundary {
     ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if is_allowed_admin_agent_approve_path(guarded) {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    /// Validates the id-bearing per-item notification read path
+    /// (`/api/notifications/{id}/read`) before a POST is dispatched.
+    pub fn validate_notifications_read_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_notifications_read_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -2202,6 +2248,37 @@ pub async fn mark_all_notifications_read() -> Result<i64, ServerFnError> {
     }
 }
 
+/// Live POST marking ONE of the current user's notifications read. Mirrors
+/// `mark_all_notifications_read` but targets the id-bearing
+/// `/api/notifications/{id}/read` path (validated through the dedicated
+/// id allowlist, reusing the same id sanitisation as other id routes).
+///
+/// Returns `Ok(())` on success. The API self-scopes to the caller (404 for a
+/// non-recipient — no existence leak), and the call is idempotent server-side.
+/// In static/degraded mode there is nothing to mark, so this is a no-op `Ok(())`.
+#[server(prefix = "/portal/api", endpoint = "notifications-mark-read")]
+pub async fn mark_notification_read(id: String) -> Result<(), ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = notifications_read_path(&id)
+        .map_err(|_| ServerFnError::new("notification read API path failed same-origin guard"))?;
+    boundary
+        .validate_notifications_read_path(&path)
+        .map_err(|_| ServerFnError::new("notification read API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return Ok(());
+    }
+    let session_id = session_id_from_request().await;
+    match upstream.post(&path, None, session_id.as_deref()).await {
+        Ok(response) if response.is_success() => Ok(()),
+        Ok(response) => Err(ServerFnError::new(api_error_text(
+            &response,
+            "notification mark-read failed",
+        ))),
+        Err(_) => Err(ServerFnError::new("API unreachable")),
+    }
+}
+
 /// Live GET of a single request detail through the allowlisted lifecycle
 /// path; shared by detail reads, create follow-ups, and stage transitions.
 #[cfg(feature = "ssr")]
@@ -3719,6 +3796,52 @@ mod tests {
         assert!(admin_agent_approve_path("").is_err());
         assert!(admin_agent_approve_path("..").is_err());
         assert!(admin_agent_approve_path("a/b").is_err());
+    }
+
+    #[test]
+    fn boundary_validates_notifications_read_path_and_rejects_traversal() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let id = "pn-3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+
+        let path = notifications_read_path(id).expect("notification read path must build");
+        assert_eq!(
+            path,
+            "/api/notifications/pn-3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b/read"
+        );
+        assert_eq!(
+            boundary.validate_notifications_read_path(&path),
+            Ok(path.as_str())
+        );
+
+        // A path outside the `/api/` prefix is rejected by the same-origin guard
+        // before the allowlist is even consulted (a different error variant).
+        assert!(
+            boundary.validate_notifications_read_path("/foo").is_err(),
+            "path /foo must be rejected"
+        );
+
+        // In-prefix paths that are not exactly `/api/notifications/{id}/read`
+        // fall through to the allowlist rejection.
+        for path in [
+            "/api/notifications",
+            "/api/notifications/read-all",
+            "/api/notifications/id",
+            "/api/notifications/id/unread",
+            "/api/notifications/id/read/extra",
+            "/api/notifications/../platform-settings/read",
+            "/api/notifications/id?x=1/read",
+        ] {
+            assert_eq!(
+                boundary.validate_notifications_read_path(path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {path} must be rejected"
+            );
+        }
+
+        // An empty / traversal id never even builds a path.
+        assert!(notifications_read_path("").is_err());
+        assert!(notifications_read_path("..").is_err());
+        assert!(notifications_read_path("a/b").is_err());
     }
 
     #[test]

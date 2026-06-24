@@ -2402,9 +2402,6 @@ tbody tr:hover {
 }
 
 .notif-item {
-  display: flex;
-  gap: 10px;
-  padding: 11px 14px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -2414,6 +2411,31 @@ tbody tr:hover {
 
 .notif-item.unread {
   background: var(--accent-bg);
+}
+
+/* The whole item is an activatable control: marks the notification read and,
+   when it references a request, deep-links to /requests/{id}. Reset the button
+   chrome so it reads as a list row, and keep it keyboard-reachable. */
+.notif-item-activate {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 14px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.notif-item-activate:hover {
+  background: var(--accent-bg);
+}
+
+.notif-item-activate:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .notif-sev {

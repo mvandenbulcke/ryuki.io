@@ -5,7 +5,12 @@
 /// feature set is empty, so `cargo test --workspace` skips this module.  The
 /// explicit gate is required for the CI PR check:
 ///   `cargo test -p ryuki-portal-ui --features ssr`
+// This module is `views::tests::tests`; the inner name mirrors the file. The
+// nesting is only visible under `--features ssr` (the portal default feature
+// set is empty), so CI's default-feature clippy never surfaced it. Allow it so
+// the required `--features ssr` test gate passes without renaming the module.
 #[cfg(all(test, feature = "ssr"))]
+#[allow(clippy::module_inception)]
 mod tests {
     use std::collections::HashMap;
 

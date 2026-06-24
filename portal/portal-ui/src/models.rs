@@ -1074,10 +1074,17 @@ pub struct RequestSummary {
 // are fabricated.
 
 /// Portal-facing summary of one notification.
+///
+/// `request_id` is the related request UUID (as a string) when the notification
+/// concerns a specific request, enabling a deep-link to `/requests/{id}` from
+/// the bell. It is `None` for notifications with no request context. Defaults to
+/// `None` if absent so a contract drift degrades the deep-link, not the feed.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct NotificationSummary {
     pub id: String,
     pub event: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub severity: String,
     pub title: String,
     pub body: String,
