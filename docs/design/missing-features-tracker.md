@@ -63,7 +63,7 @@ implementing **all 66**. This file tracks execution.
 | 31 | [ ] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | ✓ |
 | 32 | [x] | Per-notification mark-read + deep-link | Portal | S | M | — |
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
-| 34 | [ ] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
+| 34 | [x] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
 | 35 | [ ] | Anomaly / waste detection engine | AIOps | M | H | — |
 | 36 | [ ] | AIOps suggestion-generation engine | AIOps | M | H | — |
 | 37 | [ ] | What-if capacity & cost planning | AIOps | M | H | — |
@@ -115,3 +115,10 @@ advance, read-only job boundary), seeded hourly self-health probe, and
 read-only `/api/ops/scheduler` views. UNBLOCKS #31/#39/#40/#45/#52 (and feeds
 #19/#22): each adds its own job kind + seeded schedule. Follow-up (non-blocking):
 operator CRUD endpoints to create/enable/disable schedules from the API/portal.
+
+**#34** (`4a6be3c`): general time-series substrate — `metric_samples` (mig 096,
+finite-CHECKed) + pure `ryuki_engine::metric_forecast` (least-squares fit,
+summary, trend, centered projection) + POST /api/metrics/samples (record) and
+GET /api/metrics/series (series+summary+trend+forecast, single-scope via IS NOT
+DISTINCT FROM, recent-10k window). ROOTS the AIOps chain #35→#36→#37→#53/#54:
+each consumes the series summary (mean/stddev) and/or the forecast.
