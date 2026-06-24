@@ -13596,6 +13596,15 @@ async fn requests_approve(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
+        // Separation of duties: the approver must not be the request's creator.
+        check_sod(
+            &session,
+            &request_id,
+            "request.approve",
+            current.created_by.as_deref(),
+        )
+        .await?;
+
         let request = db_row_to_request(&current, &request_id);
         // Attribution: the REAL verified approver from the session, never a
         // literal. The engine threads this into the approval-decision evidence
@@ -13634,6 +13643,25 @@ async fn requests_approve(
 
         return Ok(Json(serde_json::to_value(&approved).unwrap_or_default()));
     }
+
+    // Separation of duties: the approver must not be the request's creator. Read
+    // the creator (the in-memory `requester`) under a brief lock, release it, then
+    // run the gate — never hold the store lock across the await.
+    let requester = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].requester.clone()
+    };
+    check_sod(
+        &session,
+        &request_id,
+        "request.approve",
+        Some(requester.as_str()),
+    )
+    .await?;
 
     let mut store = request_store().lock().await;
     let idx = store
@@ -14404,6 +14432,16 @@ async fn requests_reject(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
 
+        // Separation of duties: the rejecting approver must not be the creator
+        // (the creator withdraws via cancel, not a self-rejection).
+        check_sod(
+            &session,
+            &request_id,
+            "request.reject",
+            current.created_by.as_deref(),
+        )
+        .await?;
+
         let request = db_row_to_request(&current, &request_id);
         let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
@@ -14436,6 +14474,25 @@ async fn requests_reject(
 
         return Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()));
     }
+
+    // Separation of duties: the rejecting approver must not be the creator. Read
+    // the creator under a brief lock, release it, then run the gate — never hold
+    // the store lock across the await.
+    let requester = {
+        let store = request_store().lock().await;
+        let idx = store
+            .iter()
+            .position(|r| r.id == request_id)
+            .ok_or_else(|| status_404(&request_id))?;
+        store[idx].requester.clone()
+    };
+    check_sod(
+        &session,
+        &request_id,
+        "request.reject",
+        Some(requester.as_str()),
+    )
+    .await?;
 
     let mut store = request_store().lock().await;
     let idx = store
@@ -14564,6 +14621,88 @@ async fn requests_cancel(
 fn cancel_permitted(session: &AuthSession, created_by: Option<&str>) -> bool {
     check_permission(session, "admin")
         || (check_permission(session, "request") && created_by == Some(session.user_id.as_str()))
+}
+
+/// Separation-of-duties outcome for an approve/reject decision (see
+/// [`sod_decision`]).
+#[derive(Debug, PartialEq, Eq)]
+enum SodDecision {
+    /// The approver differs from the creator — proceed.
+    Allow,
+    /// Self-approval, but in a dry-run mode (every caller is the shared
+    /// `static-user` principal, so the rule is not meaningful) — allow, but log.
+    Warn,
+    /// Self-approval under live identity — block (403) and audit.
+    Block,
+}
+
+/// Separation of duties: a request's creator must not also be its approver. The
+/// hard `Block` applies only under live identity (`EntraId`/`Local`); in the
+/// dry-run modes every caller shares the `static-user` principal, so a self-match
+/// is not a real SoD violation and yields `Warn`. Pure — the mode is passed in.
+fn sod_decision(session: &AuthSession, created_by: Option<&str>, mode: &AuthMode) -> SodDecision {
+    if created_by != Some(session.user_id.as_str()) {
+        return SodDecision::Allow;
+    }
+    match mode {
+        AuthMode::EntraId | AuthMode::Local => SodDecision::Block,
+        AuthMode::MockDryRun | AuthMode::StaticDryRun => SodDecision::Warn,
+    }
+}
+
+/// Enforce separation of duties on an approve/reject. Returns `Err(403)` (and
+/// audits the denial as `outcome: "denied"`) when the principal is acting on
+/// their OWN request under live identity; logs a warning and allows in dry-run;
+/// allows otherwise. `created_by` is the request's creator (the DB `created_by`
+/// column, or the in-memory `requester`). Called BEFORE the lifecycle mutation.
+async fn check_sod(
+    session: &AuthSession,
+    request_id: &str,
+    action: &'static str,
+    created_by: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match sod_decision(
+        session,
+        created_by,
+        &crate::config_store::auth_mode_or_default(),
+    ) {
+        SodDecision::Allow => Ok(()),
+        SodDecision::Warn => {
+            tracing::warn!(
+                actor = %session.user_id,
+                request = %request_id,
+                action,
+                "SoD: self-approval permitted in dry-run mode; would be denied under live identity"
+            );
+            Ok(())
+        }
+        SodDecision::Block => {
+            audit::record_denied(
+                get_db(),
+                session,
+                &AuditRecord {
+                    action,
+                    request_id: Some(request_id),
+                    from_status: None,
+                    to_status: "unknown",
+                    from_stage: None,
+                    to_stage: "unknown",
+                    detail: json!({
+                        "note": "separation of duties: a requester may not approve or reject \
+                                 their own request; cancel it instead to withdraw"
+                    }),
+                    outcome: "denied",
+                },
+            )
+            .await;
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "separation of duties: you may not approve or reject your own request"
+                })),
+            ))
+        }
+    }
 }
 
 /// GET /api/requests/{id}/audit — the ordered, actor-attributed audit trail for
@@ -25327,6 +25466,52 @@ mod unit_tests {
         let _ = requests_plan(Path(id.to_string()), AuthExtractor(operator))
             .await
             .expect("plan");
+    }
+
+    #[test]
+    fn sod_decision_blocks_self_approval_only_under_live_identity() {
+        let alice = single_role_session("alice", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        // A different creator (or unknown creator) is never a self-approval.
+        assert_eq!(
+            sod_decision(&alice, Some("bob"), &AuthMode::EntraId),
+            SodDecision::Allow
+        );
+        assert_eq!(
+            sod_decision(&alice, None, &AuthMode::Local),
+            SodDecision::Allow
+        );
+        // Self-approval under live identity → hard block.
+        assert_eq!(
+            sod_decision(&alice, Some("alice"), &AuthMode::EntraId),
+            SodDecision::Block
+        );
+        assert_eq!(
+            sod_decision(&alice, Some("alice"), &AuthMode::Local),
+            SodDecision::Block
+        );
+        // Self-approval in dry-run → warn-only (every caller is `static-user`).
+        assert_eq!(
+            sod_decision(&alice, Some("alice"), &AuthMode::MockDryRun),
+            SodDecision::Warn
+        );
+        assert_eq!(
+            sod_decision(&alice, Some("alice"), &AuthMode::StaticDryRun),
+            SodDecision::Warn
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_approve_self_in_dry_run_is_permitted_warn_only() {
+        // Default test mode is a dry-run, where every principal is the shared
+        // static user, so a self-approval is allowed (warn-only) — existing
+        // single-principal demo flows must remain unaffected by the SoD gate.
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "alice").await;
+        let alice = single_role_session("alice", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(approved) = requests_approve(Path(id.clone()), AuthExtractor(alice))
+            .await
+            .expect("self-approval is permitted in dry-run (warn-only)");
+        assert_eq!(approved["status"], "Approved");
     }
 
     #[tokio::test]

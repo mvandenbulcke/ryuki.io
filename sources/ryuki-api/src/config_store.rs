@@ -62,6 +62,16 @@ pub fn get_app_config() -> &'static RyukiConfig {
     APP_CONFIG.get().expect("app config not initialized")
 }
 
+/// The configured auth mode, or the default (`MockDryRun`) when the config store
+/// is not initialized (e.g. unit tests). Never panics — use this on hot paths
+/// (like the separation-of-duties gate) that can run before/without init.
+pub fn auth_mode_or_default() -> ryuki_core::config::AuthMode {
+    APP_CONFIG
+        .get()
+        .map(|c| c.auth_mode.clone())
+        .unwrap_or_default()
+}
+
 pub async fn load_config() -> Result<PlatformConfig, String> {
     let store = STORE.get().expect("config store not initialized");
     store.lock().await.load_config()
