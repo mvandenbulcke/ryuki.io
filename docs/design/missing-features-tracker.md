@@ -64,7 +64,7 @@ implementing **all 66**. This file tracks execution.
 | 32 | [x] | Per-notification mark-read + deep-link | Portal | S | M | — |
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
 | 34 | [x] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
-| 35 | [ ] | Anomaly / waste detection engine | AIOps | M | H | — |
+| 35 | [x] | Anomaly / waste detection engine | AIOps | M | H | — |
 | 36 | [ ] | AIOps suggestion-generation engine | AIOps | M | H | — |
 | 37 | [ ] | What-if capacity & cost planning | AIOps | M | H | — |
 | 38 | [ ] | Storage array registration / lifecycle | API | M | M | — |
@@ -122,3 +122,8 @@ summary, trend, centered projection) + POST /api/metrics/samples (record) and
 GET /api/metrics/series (series+summary+trend+forecast, single-scope via IS NOT
 DISTINCT FROM, recent-10k window). ROOTS the AIOps chain #35→#36→#37→#53/#54:
 each consumes the series summary (mean/stddev) and/or the forecast.
+
+**#35** (`7b55563`): `ryuki_engine::metric_anomaly` (leave-one-out z-score
+anomalies — avoids the in-sample sqrt(n-1) ceiling that would mute small-series
+detection — + waste detection Idle/Underutilized) and GET /api/metrics/insights.
+Feeds #36 (suggestions) and #53/#54 (budgets).
