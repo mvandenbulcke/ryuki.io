@@ -162,6 +162,10 @@ pub fn routes() -> Router {
         .route("/api/metrics/series", get(metrics_series))
         .route("/api/metrics/insights", get(metrics_insights))
         .route(
+            "/api/metrics/insights/generate",
+            post(metrics_generate_suggestions),
+        )
+        .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
         )
@@ -15075,18 +15079,36 @@ struct MetricSampleRow {
     observed_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Reject a malformed `metric_key`: it must be 1..=200 chars and free of
-/// control characters (it is a dotted identifier, e.g. `cost.monthly_usd`).
-/// Returns the human message on rejection, `None` when valid. Shared by the
-/// record and series handlers so the two cannot diverge.
+/// Reject a malformed `metric_key`: it must be 1..=200 chars from the dotted
+/// identifier alphabet `[A-Za-z0-9._:-]` (e.g. `cost.monthly_usd`). The strict
+/// allowlist also means the key can never carry HTML/script characters, so it is
+/// safe to embed in a generated suggestion's title/description that a UI may
+/// later render. Returns the human message on rejection, `None` when valid.
+/// Shared by every metric handler so they cannot diverge.
 fn metric_key_rejection(key: &str) -> Option<&'static str> {
     if key.is_empty() || key.len() > 200 {
         return Some("metric_key must be 1..=200 characters");
     }
-    if key.chars().any(char::is_control) {
-        return Some("metric_key must not contain control characters");
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'))
+    {
+        return Some("metric_key may contain only letters, digits, and . _ - :");
     }
     None
+}
+
+/// A single scope label for a generated suggestion's `site` field, combining the
+/// (optional) site and environment so two different scopes never collide in the
+/// dedup. `aiops_suggestions` has no environment column, so the env is folded
+/// into this label rather than silently dropped.
+fn metric_scope_label(site: &Option<String>, environment: &Option<String>) -> String {
+    match (site.as_deref(), environment.as_deref()) {
+        (Some(s), Some(e)) => format!("{s}/{e}"),
+        (Some(s), None) => s.to_string(),
+        (None, Some(e)) => format!("platform/{e}"),
+        (None, None) => "platform".to_string(),
+    }
 }
 
 /// True when an optional scope value (site/environment) exceeds the 200-char
@@ -15324,6 +15346,22 @@ struct MetricInsightsParams {
     waste_fraction: Option<f64>,
 }
 
+/// The first non-finite tuning param (`z`/`waste_threshold`/`waste_fraction`),
+/// or `None` when all present params are finite. These are untrusted query
+/// inputs (unlike sample values, which the ingest CHECK already keeps finite).
+fn nonfinite_insight_param(params: &MetricInsightsParams) -> Option<&'static str> {
+    for (name, val) in [
+        ("z", params.z),
+        ("waste_threshold", params.waste_threshold),
+        ("waste_fraction", params.waste_fraction),
+    ] {
+        if val.is_some_and(|v| !v.is_finite()) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// GET /api/metrics/insights — anomaly + waste detection over one metric series
 /// (pure `ryuki_engine::metric_anomaly`). `metric_key` is required; `site`/
 /// `environment` scope the (single, coherent) series; `z` is the anomaly
@@ -15391,17 +15429,11 @@ async fn metrics_insights(
     // Reject a non-finite tuning param rather than letting NaN/Inf reach the
     // detectors (sample values are already finite by ingest CHECK; these query
     // params are a separate, untrusted input).
-    for (name, val) in [
-        ("z", params.z),
-        ("waste_threshold", params.waste_threshold),
-        ("waste_fraction", params.waste_fraction),
-    ] {
-        if val.is_some_and(|v| !v.is_finite()) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("{name} must be a finite number") })),
-            ));
-        }
+    if let Some(name) = nonfinite_insight_param(&params) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("{name} must be a finite number") })),
+        ));
     }
     let z = params.z.unwrap_or(3.0);
     let waste_threshold = params.waste_threshold.unwrap_or(10.0);
@@ -15431,6 +15463,174 @@ async fn metrics_insights(
         "summary": summary,
         "anomalies": anomalies_json,
         "waste": waste,
+    })))
+}
+
+/// POST /api/metrics/insights/generate — run detection over a metric series and
+/// PERSIST the resulting suggestions into `aiops_suggestions` (the existing
+/// suggestion surface). Execute-tier (it writes). Each suggestion is deduped: it
+/// is skipped when an OPEN (New/Reviewed) suggestion with the same site+title
+/// already exists, so repeated calls do not pile up duplicates. Returns the
+/// suggestions that were newly persisted. 503 when no database is configured.
+async fn metrics_generate_suggestions(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricInsightsParams>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to generate suggestions"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "metric_key is required"})),
+        ));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    if let Some(name) = nonfinite_insight_param(&params) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("{name} must be a finite number") })),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "querying metric series for suggestion generation failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not query metric series"})),
+            ));
+        }
+    };
+
+    let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+        .iter()
+        .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+            t: r.observed_at.timestamp() as f64,
+            value: r.value,
+        })
+        .collect();
+
+    let z = params.z.unwrap_or(3.0);
+    let waste_threshold = params.waste_threshold.unwrap_or(10.0);
+    let waste_fraction = params.waste_fraction.unwrap_or(0.8);
+    let anomalies = ryuki_engine::metric_anomaly::detect_anomalies(&points, z);
+    let waste =
+        ryuki_engine::metric_anomaly::detect_waste(&points, waste_threshold, waste_fraction);
+    let summary = ryuki_engine::metric_forecast::summarize(&points);
+    let generated = ryuki_engine::metric_suggestions::suggest_from_findings(
+        metric_key,
+        summary.as_ref(),
+        &anomalies,
+        waste.as_ref(),
+    );
+
+    // Full scope label (site + env) so different scopes never collide in dedup;
+    // aiops_suggestions.site is NOT NULL, so an unscoped metric maps to
+    // "platform".
+    let site = metric_scope_label(&f_site, &f_env);
+    let affected = vec![metric_key.to_string()];
+
+    // All inserts share one transaction: a failure on any one rolls back the
+    // whole batch (no partial state), and the batch commits atomically.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, "opening suggestion-persist transaction failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not persist generated suggestions"})),
+            ));
+        }
+    };
+    let mut persisted: Vec<Value> = Vec::new();
+    for g in &generated {
+        let id = uuid::Uuid::new_v4().to_string();
+        // Dedup on a STABLE key — scope + suggestion_type + the metric_key in
+        // affected_components — NOT the title (the anomaly title embeds a count
+        // that changes between runs and would defeat dedup). Skip when an OPEN
+        // (New/Reviewed) suggestion already covers this metric+type+scope.
+        let result = sqlx::query(
+            "INSERT INTO aiops_suggestions \
+             (id, suggestion_type, title, description, affected_components, \
+              estimated_savings, confidence_score, status, site) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, 'New', $8 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM aiops_suggestions \
+                 WHERE site = $8 AND suggestion_type = $2 \
+                   AND $9 = ANY(affected_components) \
+                   AND status IN ('New', 'Reviewed') \
+             )",
+        )
+        .bind(&id)
+        .bind(&g.suggestion_type)
+        .bind(&g.title)
+        .bind(&g.description)
+        .bind(&affected)
+        .bind(g.estimated_savings)
+        .bind(g.confidence_score)
+        .bind(&site)
+        .bind(metric_key)
+        .execute(&mut *tx)
+        .await;
+        match result {
+            Ok(r) if r.rows_affected() > 0 => persisted.push(json!({
+                "id": id,
+                "suggestion_type": g.suggestion_type,
+                "title": g.title,
+                "confidence_score": g.confidence_score,
+            })),
+            // Deduped (an open suggestion already exists) — not an error.
+            Ok(_) => {}
+            Err(e) => {
+                // Returning drops `tx`, rolling the whole batch back.
+                tracing::error!(error = %e, "persisting generated suggestion failed");
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not persist generated suggestions"})),
+                ));
+            }
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = %e, "committing generated suggestions failed");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not persist generated suggestions"})),
+        ));
+    }
+
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "site": site,
+        "generated": generated.len(),
+        "persisted": persisted.len(),
+        "suggestions": persisted,
     })))
 }
 
@@ -27242,6 +27442,96 @@ mod db_lifecycle_tests {
 
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
             .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #36: generating suggestions from a metric series persists them into
+    /// aiops_suggestions, and a repeat call dedups (no new rows for the same
+    /// open site+title).
+    #[tokio::test]
+    async fn test_metric_generate_suggestions_persists_and_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.suggest.5z3";
+        let site = "test-suggest-site";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM aiops_suggestions WHERE site = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        // Under-utilized series with a spike, scoped to the test site.
+        for (i, v) in [(0i64, 5.0f64), (1, 5.0), (2, 5.0), (3, 5.0), (4, 100.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: Some(site.to_string()),
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-03-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        let params = || MetricInsightsParams {
+            metric_key: Some(key.to_string()),
+            site: Some(site.to_string()),
+            environment: None,
+            z: None,
+            waste_threshold: None,
+            waste_fraction: None,
+        };
+        let Json(out1) = metrics_generate_suggestions(sess(), Query(params()))
+            .await
+            .expect("generate");
+        assert!(
+            out1["persisted"].as_u64().unwrap() >= 1,
+            "at least one suggestion is persisted"
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM aiops_suggestions WHERE site = $1")
+                .bind(site)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(count >= 1, "the suggestion landed in aiops_suggestions");
+
+        // A second identical call dedups — nothing new persisted.
+        let Json(out2) = metrics_generate_suggestions(sess(), Query(params()))
+            .await
+            .expect("generate again");
+        assert_eq!(
+            out2["persisted"].as_u64().unwrap(),
+            0,
+            "a repeat call dedups open suggestions"
+        );
+        let count2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM aiops_suggestions WHERE site = $1")
+                .bind(site)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(count, count2, "no new rows on the deduped call");
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM aiops_suggestions WHERE site = $1")
+            .bind(site)
             .execute(pool)
             .await
             .ok();
