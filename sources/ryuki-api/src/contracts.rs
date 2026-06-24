@@ -12521,19 +12521,97 @@ fn current_stage_name(request: &ryuki_engine::models::Request) -> String {
         .unwrap_or_else(|| "intake".to_string())
 }
 
-async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
+/// Optional server-side filtering + sort for the request list (additive over
+/// the existing limit/offset; the response shape is unchanged — a bare array).
+#[derive(Debug, Deserialize, Default)]
+struct RequestListParams {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    status: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    request_type: Option<String>,
+    created_by: Option<String>,
+    /// Case-insensitive substring on the request name.
+    q: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
+}
+
+/// Map a client `sort` value to an ALLOWLISTED column name. Never interpolate a
+/// raw client string into SQL — an unknown value falls back to `created_at`, so
+/// the ORDER BY clause can never be an injection vector.
+fn request_sort_column(sort: Option<&str>) -> &'static str {
+    match sort {
+        Some("updated_at") => "updated_at",
+        Some("name") => "name",
+        Some("status") => "status",
+        Some("site") => "site",
+        Some("request_type") => "request_type",
+        _ => "created_at",
+    }
+}
+
+/// Allowlisted sort direction (default DESC). Returns a literal constant only.
+fn request_sort_direction(direction: Option<&str>) -> &'static str {
+    match direction {
+        Some(d) if d.eq_ignore_ascii_case("asc") => "ASC",
+        _ => "DESC",
+    }
+}
+
+async fn requests_list(Query(params): Query<RequestListParams>) -> Json<Value> {
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
+    let sort_col = request_sort_column(params.sort.as_deref());
+    let dir = request_sort_direction(params.direction.as_deref());
+    // Blank filters are treated as "no filter".
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_status = norm(&params.status);
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    let f_type = norm(&params.request_type);
+    let f_creator = norm(&params.created_by);
+    let f_q = norm(&params.q);
 
     if let Some(pool) = get_db() {
-        let rows: Vec<DbRequestRow> = sqlx::query_as(&format!(
-            "SELECT {REQUEST_COLUMNS} FROM requests ORDER BY created_at DESC LIMIT $1 OFFSET $2"
-        ))
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+        // sort_col/dir are allowlisted constants (never client text); every
+        // value filter is a bound parameter, NULL = no filter on that column.
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests \
+             WHERE ($1::text IS NULL OR status = $1) \
+               AND ($2::text IS NULL OR site = $2) \
+               AND ($3::text IS NULL OR environment = $3) \
+               AND ($4::text IS NULL OR request_type = $4) \
+               AND ($5::text IS NULL OR created_by = $5) \
+               AND ($6::text IS NULL OR name ILIKE '%' || $6 || '%' ESCAPE '\\') \
+             ORDER BY {sort_col} {dir} LIMIT $7 OFFSET $8"
+        );
+        // Escape LIKE metacharacters so `q` is a literal substring match, not a
+        // wildcard pattern. The bound param keeps it injection-safe; ESCAPE '\'
+        // makes the backslash the escape char. Order matters: escape '\' first.
+        let f_q_like = f_q.as_deref().map(|s| {
+            s.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        });
+        let rows: Vec<DbRequestRow> = sqlx::query_as(&sql)
+            .bind(&f_status)
+            .bind(&f_site)
+            .bind(&f_env)
+            .bind(&f_type)
+            .bind(&f_creator)
+            .bind(&f_q_like)
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
         let summaries: Vec<Value> = rows
             .iter()
             .map(|r| {
@@ -12552,8 +12630,32 @@ async fn requests_list(Query(params): Query<PaginationParams>) -> Json<Value> {
         return Json(json!(summaries));
     }
 
+    // No-DB (dry-run) path: apply the same filters in-memory. The in-memory
+    // record carries the requester as the display name.
+    let q_lower = f_q.as_deref().map(str::to_lowercase);
     let store = request_store().lock().await;
-    let summaries: Vec<Value> = store
+    let mut matched: Vec<&_> = store
+        .iter()
+        .filter(|r| {
+            f_status.as_deref().is_none_or(|s| r.status.as_str() == s)
+                && f_site.as_deref().is_none_or(|s| r.site == s)
+                && f_env.as_deref().is_none_or(|s| r.environment == s)
+                && f_type
+                    .as_deref()
+                    .is_none_or(|s| r.request_type.to_string() == s)
+                && f_creator.as_deref().is_none_or(|s| r.requester == s)
+                && q_lower
+                    .as_deref()
+                    .is_none_or(|s| r.requester.to_lowercase().contains(s))
+        })
+        .collect();
+    // In-memory honors created_at ordering + direction (the demo path does not
+    // sort by every column; the DB path above does).
+    matched.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    if dir == "DESC" {
+        matched.reverse();
+    }
+    let summaries: Vec<Value> = matched
         .iter()
         .skip(offset)
         .take(limit)
@@ -25416,9 +25518,10 @@ mod unit_tests {
         let request = test_request("requests-list-seam-test");
         request_store().lock().await.push(request);
 
-        let Json(body) = requests_list(Query(PaginationParams {
+        let Json(body) = requests_list(Query(RequestListParams {
             limit: Some(100),
             offset: Some(0),
+            ..Default::default()
         }))
         .await;
 
@@ -25447,6 +25550,78 @@ mod unit_tests {
         assert_eq!(item["site"], "DEFRA");
         assert_eq!(item["environment"], "production");
         assert_eq!(item["stage"], "intake");
+    }
+
+    #[test]
+    fn request_sort_is_allowlisted_and_injection_safe() {
+        // Known columns map through; everything unknown (incl. an injection
+        // attempt) falls back to created_at — never interpolated raw.
+        assert_eq!(request_sort_column(Some("name")), "name");
+        assert_eq!(request_sort_column(Some("updated_at")), "updated_at");
+        assert_eq!(request_sort_column(None), "created_at");
+        assert_eq!(
+            request_sort_column(Some("created_at; DROP TABLE requests--")),
+            "created_at"
+        );
+        // Direction is ASC only on an explicit case-insensitive "asc"; else DESC.
+        assert_eq!(request_sort_direction(Some("asc")), "ASC");
+        assert_eq!(request_sort_direction(Some("ASC")), "ASC");
+        assert_eq!(request_sort_direction(Some("desc")), "DESC");
+        assert_eq!(request_sort_direction(Some("garbage")), "DESC");
+        assert_eq!(request_sort_direction(None), "DESC");
+    }
+
+    #[tokio::test]
+    async fn requests_list_filters_in_memory_by_status_site_and_q() {
+        let mut a = test_request("rl-filter-a");
+        a.site = "DEFRA".into();
+        a.requester = "alice-deploy".into();
+        let mut b = test_request("rl-filter-b");
+        b.site = "GBLON".into();
+        b.requester = "bob-deploy".into();
+        {
+            let mut store = request_store().lock().await;
+            store.push(a);
+            store.push(b);
+        }
+
+        let ids = |body: &Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["request_id"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        // Filter by site → only the DEFRA row.
+        let Json(by_site) = requests_list(Query(RequestListParams {
+            site: Some("DEFRA".into()),
+            ..Default::default()
+        }))
+        .await;
+        let site_ids = ids(&by_site);
+        assert!(site_ids.contains(&"rl-filter-a".to_string()));
+        assert!(!site_ids.contains(&"rl-filter-b".to_string()));
+
+        // Case-insensitive substring on the (requester) name.
+        let Json(by_q) = requests_list(Query(RequestListParams {
+            q: Some("BOB".into()),
+            ..Default::default()
+        }))
+        .await;
+        let q_ids = ids(&by_q);
+        assert!(q_ids.contains(&"rl-filter-b".to_string()));
+        assert!(!q_ids.contains(&"rl-filter-a".to_string()));
+
+        // A blank filter is ignored (both rows listed).
+        let Json(blank) = requests_list(Query(RequestListParams {
+            site: Some("   ".into()),
+            ..Default::default()
+        }))
+        .await;
+        let blank_ids = ids(&blank);
+        assert!(blank_ids.contains(&"rl-filter-a".to_string()));
+        assert!(blank_ids.contains(&"rl-filter-b".to_string()));
     }
 
     // ─── API token & session administration ───
