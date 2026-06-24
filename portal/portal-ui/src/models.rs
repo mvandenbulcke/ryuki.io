@@ -1928,6 +1928,10 @@ pub struct EvidencePackItem {
 /// evident digest seal, its metadata, the redacted items, and a pretty-printed
 /// JSON copy for export. `durable=false` flags a static-preview pack that was
 /// not sealed against persisted data.
+///
+/// `pack_json` is carried verbatim from the sealed wire body so the JSON
+/// download is byte-faithful to what the digest sealed — never reserialize it.
+/// `audit_rows` is the flattened audit trail used to build the CSV export.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EvidencePackExport {
     pub request_id: String,
@@ -1940,6 +1944,9 @@ pub struct EvidencePackExport {
     pub redacted: bool,
     pub items: Vec<EvidencePackItem>,
     pub pack_json: String,
+    /// Flattened audit trail embedded in the pack, surfaced for the CSV export.
+    #[serde(default)]
+    pub audit_rows: Vec<AuditEventRow>,
 }
 
 impl ApiEvidencePack {
@@ -1966,6 +1973,39 @@ impl ApiEvidencePack {
                 }
             })
             .collect();
+        let audit_count = self.content.audit_trail.len();
+        // The audit trail is sealed inside the pack as raw JSON values matching
+        // the audit wire shape; flatten each through the same row mapping the
+        // timeline uses so the CSV export and the rendered trail agree. Pack
+        // rows are durable (sealed against persisted data).
+        // Map every sealed row 1:1 — NEVER silently drop one. A row that fails to
+        // parse (schema drift) becomes a clearly-marked error row that preserves
+        // the raw sealed bytes, so the CSV row count always equals the sealed
+        // count and an auditor sees the discrepancy instead of a missing row.
+        let audit_rows = self
+            .content
+            .audit_trail
+            .into_iter()
+            .map(
+                |value| match serde_json::from_value::<ApiAuditEventRow>(value.clone()) {
+                    Ok(row) => row.into_audit_event(true),
+                    Err(error) => AuditEventRow {
+                        action: "UNPARSEABLE_SEALED_AUDIT_ROW".to_string(),
+                        actor_display: String::new(),
+                        actor_principal: String::new(),
+                        from_stage: None,
+                        to_stage: String::new(),
+                        to_status: String::new(),
+                        occurred_at: String::new(),
+                        reason: Some(format!("parse error: {error}; raw: {value}")),
+                        durable: true,
+                        request_id: None,
+                        actor_roles: Vec::new(),
+                        outcome: Some("parse-error".to_string()),
+                    },
+                },
+            )
+            .collect();
         EvidencePackExport {
             request_id: self.request_id,
             generated_at: self.generated_at,
@@ -1973,12 +2013,95 @@ impl ApiEvidencePack {
             digest: self.digest,
             durable: self.durable,
             item_count: self.item_count,
-            audit_count: self.content.audit_trail.len(),
+            audit_count,
             redacted: self.redacted,
             items,
             pack_json,
+            audit_rows,
         }
     }
+}
+
+/// Column header for the audit-CSV export, in stable column order. Kept beside
+/// [`audit_row_to_csv_fields`] so the header and rows can never drift.
+pub const AUDIT_CSV_HEADER: &[&str] = &[
+    "occurred_at",
+    "action",
+    "actor_display",
+    "actor_principal",
+    "actor_roles",
+    "from_stage",
+    "to_stage",
+    "to_status",
+    "outcome",
+    "reason",
+    "durable",
+];
+
+/// Projects one audit row onto the CSV column order declared by
+/// [`AUDIT_CSV_HEADER`]. Optional fields render as the empty string; the role
+/// list joins with `;` so it survives a single CSV cell.
+fn audit_row_to_csv_fields(row: &AuditEventRow) -> Vec<String> {
+    vec![
+        row.occurred_at.clone(),
+        row.action.clone(),
+        row.actor_display.clone(),
+        row.actor_principal.clone(),
+        row.actor_roles.join(";"),
+        row.from_stage.clone().unwrap_or_default(),
+        row.to_stage.clone(),
+        row.to_status.clone(),
+        row.outcome.clone().unwrap_or_default(),
+        row.reason.clone().unwrap_or_default(),
+        row.durable.to_string(),
+    ]
+}
+
+/// RFC 4180 field escaping: a field is quoted when it contains a comma, double
+/// quote, CR, or LF, and any embedded quote is doubled. Fields with none of
+/// these are emitted verbatim. CRLF is used as the record separator so the
+/// output round-trips through strict RFC 4180 parsers (e.g. Excel).
+fn csv_escape_field(field: &str) -> String {
+    // Spreadsheet formula-injection guard (OWASP): a cell beginning with one of
+    // these is interpreted as a formula by Excel/Sheets and can execute on open.
+    // Prefix with a single quote so the value renders literally and never runs.
+    // Applied BEFORE RFC4180 quoting. Audit fields are strings/timestamps, so a
+    // leading '-' is never a legitimate negative number here.
+    let guarded = match field.chars().next() {
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{field}"),
+        _ => field.to_string(),
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// Builds a deterministic RFC 4180 CSV for the pack's audit trail: a header row
+/// followed by one record per audit entry, in the order the pack sealed them.
+/// Records are separated by CRLF and every field is escaped via
+/// [`csv_escape_field`]. An empty trail still yields the header row so the file
+/// is always a well-formed, self-describing CSV.
+pub fn audit_rows_to_csv(rows: &[AuditEventRow]) -> String {
+    let mut out = String::new();
+    let header = AUDIT_CSV_HEADER
+        .iter()
+        .map(|h| csv_escape_field(h))
+        .collect::<Vec<_>>()
+        .join(",");
+    out.push_str(&header);
+    out.push_str("\r\n");
+    for row in rows {
+        let line = audit_row_to_csv_fields(row)
+            .iter()
+            .map(|f| csv_escape_field(f))
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push_str(&line);
+        out.push_str("\r\n");
+    }
+    out
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -3407,5 +3530,156 @@ mod tests {
         assert_eq!(job.result_status, "");
         assert_eq!(job.evidence_digest_short, "");
         assert_eq!(job.completed_at, "");
+    }
+
+    // ── evidence-pack audit CSV export (#50) ─────────────────────────────────
+
+    fn sample_audit_row() -> AuditEventRow {
+        AuditEventRow {
+            action: "approve".to_string(),
+            actor_display: "Ada Lovelace".to_string(),
+            actor_principal: "user:ada".to_string(),
+            from_stage: Some("validated".to_string()),
+            to_stage: "approved".to_string(),
+            to_status: "approved".to_string(),
+            occurred_at: "2026-06-13T08:00:00Z".to_string(),
+            reason: None,
+            durable: true,
+            request_id: None,
+            actor_roles: vec!["DatacenterApprover".to_string()],
+            outcome: Some("applied".to_string()),
+        }
+    }
+
+    #[test]
+    fn csv_escape_passes_plain_fields_through_verbatim() {
+        // No comma/quote/CR/LF → no quoting, no transformation.
+        assert_eq!(csv_escape_field("approve"), "approve");
+        assert_eq!(csv_escape_field("user:ada"), "user:ada");
+        assert_eq!(csv_escape_field(""), "");
+    }
+
+    #[test]
+    fn csv_escape_quotes_fields_with_commas() {
+        assert_eq!(
+            csv_escape_field("DatacenterApprover, PlatformAdmin"),
+            "\"DatacenterApprover, PlatformAdmin\""
+        );
+    }
+
+    #[test]
+    fn csv_escape_doubles_embedded_quotes() {
+        // RFC 4180: a literal " inside a quoted field is doubled, and the field
+        // is wrapped in quotes.
+        assert_eq!(
+            csv_escape_field("said \"approve\" now"),
+            "\"said \"\"approve\"\" now\""
+        );
+    }
+
+    #[test]
+    fn csv_escape_quotes_fields_with_newlines() {
+        assert_eq!(csv_escape_field("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_escape_field("line1\r\nline2"), "\"line1\r\nline2\"");
+    }
+
+    #[test]
+    fn audit_csv_emits_header_only_for_empty_trail() {
+        let csv = audit_rows_to_csv(&[]);
+        assert_eq!(
+            csv,
+            "occurred_at,action,actor_display,actor_principal,actor_roles,\
+             from_stage,to_stage,to_status,outcome,reason,durable\r\n"
+        );
+    }
+
+    #[test]
+    fn audit_csv_renders_a_row_in_column_order() {
+        let csv = audit_rows_to_csv(&[sample_audit_row()]);
+        let lines: Vec<&str> = csv.split("\r\n").collect();
+        // header, one data row, trailing empty after final CRLF.
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "");
+        assert_eq!(
+            lines[1],
+            "2026-06-13T08:00:00Z,approve,Ada Lovelace,user:ada,\
+             DatacenterApprover,validated,approved,approved,applied,,true"
+        );
+    }
+
+    #[test]
+    fn audit_csv_escapes_dangerous_field_values() {
+        let mut row = sample_audit_row();
+        row.actor_display = "Doe, John".to_string();
+        row.reason = Some("contains \"quote\" and\nnewline".to_string());
+        row.actor_roles = vec!["RoleA".to_string(), "RoleB".to_string()];
+        let csv = audit_rows_to_csv(&[row]);
+        let data_line = csv.split("\r\n").nth(1).expect("a data row exists");
+        // Comma-bearing name is quoted; multi-role list is joined with ';' in a
+        // single cell; quote+newline reason is quoted with the quote doubled.
+        assert!(data_line.contains("\"Doe, John\""));
+        assert!(data_line.contains("RoleA;RoleB"));
+        assert!(data_line.contains("\"contains \"\"quote\"\" and\nnewline\""));
+    }
+
+    #[test]
+    fn csv_neutralizes_spreadsheet_formula_injection() {
+        // A cell beginning with a formula trigger (= + - @ tab) must be prefixed
+        // with an apostrophe so it can never execute when opened in a spreadsheet.
+        assert_eq!(
+            csv_escape_field("=HYPERLINK(\"http://evil\")"),
+            "\"'=HYPERLINK(\"\"http://evil\"\")\""
+        );
+        assert_eq!(csv_escape_field("+1"), "'+1");
+        assert_eq!(csv_escape_field("-cmd"), "'-cmd");
+        assert_eq!(csv_escape_field("@SUM(A1)"), "'@SUM(A1)");
+        // A plain field is passed through verbatim.
+        assert_eq!(csv_escape_field("approve"), "approve");
+    }
+
+    #[test]
+    fn into_export_flattens_sealed_audit_trail_for_csv() {
+        // The pack seals the audit trail as raw JSON values; into_export must
+        // surface them as typed rows so the CSV export and the panel agree.
+        let body = r#"{
+            "request_id": "REQ-9",
+            "generated_at": "2026-06-13T08:00:00Z",
+            "algorithm": "sha256",
+            "digest": "sha256:deadbeefcafe",
+            "durable": true,
+            "item_count": 0,
+            "redacted": true,
+            "content": {
+                "pack": { "items": [] },
+                "audit_trail": [
+                    {
+                        "action": "approve",
+                        "actor_display": "Ada",
+                        "actor_principal": "user:ada",
+                        "from_stage": "validated",
+                        "to_stage": "approved",
+                        "to_status": "approved",
+                        "occurred_at": "2026-06-13T08:00:00Z",
+                        "outcome": "applied",
+                        "detail": { "reason": "looks good" }
+                    }
+                ]
+            }
+        }"#;
+        let pack: ApiEvidencePack = serde_json::from_str(body).expect("pack decodes");
+        let export = pack.into_export("{}".to_string());
+
+        assert_eq!(export.audit_count, 1);
+        assert_eq!(export.audit_rows.len(), 1);
+        let row = &export.audit_rows[0];
+        assert_eq!(row.action, "approve");
+        assert_eq!(row.actor_display, "Ada");
+        assert_eq!(row.outcome.as_deref(), Some("applied"));
+        // detail.reason is lifted onto the typed row.
+        assert_eq!(row.reason.as_deref(), Some("looks good"));
+
+        let csv = audit_rows_to_csv(&export.audit_rows);
+        assert!(csv.contains("approve"));
+        assert!(csv.contains("looks good"));
     }
 }

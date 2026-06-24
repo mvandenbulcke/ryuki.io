@@ -1599,6 +1599,19 @@ tbody tr:hover {
   gap: 12px;
 }
 
+/* Download affordances for the sealed pack (JSON, verbatim) and the audit CSV.
+   The anchors reuse the .btn button styling; reset the default link underline
+   so they read as buttons, not links. */
+.evidence-downloads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.evidence-downloads .btn {
+  text-decoration: none;
+}
+
 .evidence-export > summary {
   cursor: pointer;
   font-size: 12px;

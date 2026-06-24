@@ -1,5 +1,5 @@
 use crate::api::{platform_summary_path, request_detail_path};
-use crate::models::{condense_timestamp, AuthSession, EvidencePackExport};
+use crate::models::{audit_rows_to_csv, condense_timestamp, AuthSession, EvidencePackExport};
 use crate::server_boundary::{
     approve_live_apply_request, approve_request, cancel_request, execute_request,
     execute_request_live_plan, get_request_audit, get_request_detail, get_request_evidence,
@@ -1301,6 +1301,57 @@ pub fn RequestDetail() -> impl IntoView {
     }
 }
 
+/// Short, filename-safe slug of the digest used to disambiguate downloaded
+/// files. Takes the hex/identifier tail (after any `sha256:` prefix) and keeps
+/// the first 8 alphanumeric characters; falls back to `pack` when the digest
+/// carries no usable characters (e.g. a preview placeholder).
+fn digest_slug(digest: &str) -> String {
+    let tail = digest.rsplit(':').next().unwrap_or(digest);
+    let slug: String = tail
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    if slug.is_empty() {
+        "pack".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Builds an RFC 3986 `data:` URL that carries `body` verbatim as the file
+/// content for an `<a download>` anchor. The body is percent-encoded so it
+/// survives transport untouched — critically, this does NOT reparse or
+/// reserialize the payload, so a sealed pack JSON downloads byte-for-byte and
+/// its digest stays valid. Same-origin `data:` downloads via the `download`
+/// attribute are not subject to the page CSP's fetch directives.
+fn data_url(mime: &str, body: &str) -> String {
+    // Encode every byte that is not an RFC 3986 unreserved character. This is a
+    // superset-safe encoding (it also escapes reserved chars), guaranteeing the
+    // exact bytes are reproduced on download regardless of the payload.
+    let mut encoded = String::with_capacity(body.len());
+    for byte in body.as_bytes() {
+        let b = *byte;
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            encoded.push(b as char);
+        } else {
+            encoded.push('%');
+            encoded.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            encoded.push(
+                char::from_digit((b & 0x0f) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    format!("data:{mime};charset=utf-8,{encoded}")
+}
+
 /// Renders a loaded, digest-sealed compliance evidence pack: the tamper-evident
 /// seal, its metadata, the redacted evidence items, and a JSON export.
 fn render_evidence_pack(pack: EvidencePackExport) -> impl IntoView {
@@ -1321,6 +1372,17 @@ fn render_evidence_pack(pack: EvidencePackExport) -> impl IntoView {
     let audit_count = pack.audit_count;
     let pack_json = pack.pack_json.clone();
     let items = pack.items.clone();
+
+    // Download affordances. The sealed pack JSON is carried verbatim into a
+    // data: URL (no reserialization → digest-faithful); the audit trail is
+    // exported as a deterministic RFC 4180 CSV. Filenames embed the digest slug
+    // so distinct exports never collide in the auditor's downloads folder.
+    let slug = digest_slug(&pack.digest);
+    let json_href = data_url("application/json", &pack.pack_json);
+    let json_name = format!("evidence-pack-{slug}.json");
+    let audit_csv = audit_rows_to_csv(&pack.audit_rows);
+    let csv_href = data_url("text/csv", &audit_csv);
+    let csv_name = format!("evidence-audit-{slug}.csv");
 
     view! {
         <article class="workspace-detail-panel evidence-panel-card" aria-labelledby="evidence-panel-title">
@@ -1363,6 +1425,24 @@ fn render_evidence_pack(pack: EvidencePackExport) -> impl IntoView {
                         }
                     })
                     .collect_view()}
+            </div>
+            <div class="evidence-downloads" aria-label="Evidence pack downloads">
+                <a
+                    class="btn btn-secondary"
+                    href=json_href
+                    download=json_name
+                    type="application/json"
+                >
+                    "Download evidence pack (JSON)"
+                </a>
+                <a
+                    class="btn btn-secondary"
+                    href=csv_href
+                    download=csv_name
+                    type="text/csv"
+                >
+                    "Download audit CSV"
+                </a>
             </div>
             <details class="evidence-export">
                 <summary>"Export pack (JSON)"</summary>
@@ -1442,7 +1522,85 @@ fn RequestEvidencePanel() -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::{action_capability, effective_stage_for_rail, stage_step_state, STAGE_MILESTONES};
+    use super::{
+        action_capability, data_url, digest_slug, effective_stage_for_rail, stage_step_state,
+        STAGE_MILESTONES,
+    };
+
+    // ── evidence-pack download wiring (#50) ──────────────────────────────────
+
+    #[test]
+    fn digest_slug_takes_eight_alnum_after_prefix() {
+        // Strips the algorithm prefix and keeps the first 8 hex characters.
+        assert_eq!(digest_slug("sha256:deadbeefcafe1234"), "deadbeef");
+        // Already prefix-free.
+        assert_eq!(digest_slug("0123456789abcdef"), "01234567");
+    }
+
+    #[test]
+    fn digest_slug_falls_back_when_no_alnum() {
+        // Hyphens are non-alnum and dropped, so the slug keeps gathering across
+        // word boundaries: "preview" (7) + the "n" of "not" = 8 chars.
+        assert_eq!(digest_slug("sha256:preview-not-sealed"), "previewn");
+        // Strings with no alphanumeric characters at all fall back to "pack".
+        assert_eq!(digest_slug("::::"), "pack");
+        assert_eq!(digest_slug(""), "pack");
+    }
+
+    #[test]
+    fn data_url_carries_json_bytes_verbatim() {
+        // CRITICAL: the sealed pack JSON must survive byte-for-byte so the
+        // digest stays valid. Encoding then decoding the data: body must yield
+        // the exact original bytes — no reserialization, no reordering.
+        let sealed = "{\"digest\":\"sha256:abc\",\"items\":[{\"k\":\"v, w\"}],\"n\":1}\n";
+        let url = data_url("application/json", sealed);
+        let prefix = "data:application/json;charset=utf-8,";
+        assert!(
+            url.starts_with(prefix),
+            "data url must carry the MIME prefix"
+        );
+        let decoded = percent_decode(&url[prefix.len()..]);
+        assert_eq!(
+            decoded, sealed,
+            "decoded body must equal the original sealed bytes verbatim"
+        );
+    }
+
+    #[test]
+    fn data_url_percent_encodes_reserved_and_unicode() {
+        // Reserved/structural characters and multi-byte UTF-8 are escaped so the
+        // URL parses, yet still decode back to the source string.
+        let body = "a,b \"q\"\n— café & <x>";
+        let url = data_url("text/csv", body);
+        let prefix = "data:text/csv;charset=utf-8,";
+        let encoded = &url[prefix.len()..];
+        // No raw comma/space/quote/newline leak into the URL.
+        assert!(!encoded.contains(' '));
+        assert!(!encoded.contains(','));
+        assert!(!encoded.contains('"'));
+        assert!(!encoded.contains('\n'));
+        assert_eq!(percent_decode(encoded), body);
+    }
+
+    /// Minimal percent-decoder used only by these tests to prove the encoder is
+    /// lossless and reversible.
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hi = (bytes[i + 1] as char).to_digit(16).unwrap() as u8;
+                let lo = (bytes[i + 2] as char).to_digit(16).unwrap() as u8;
+                out.push((hi << 4) | lo);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("decoded bytes are valid utf-8")
+    }
 
     // ── action_capability ───────────────────────────────────────────────────
 

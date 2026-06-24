@@ -2831,6 +2831,7 @@ fn static_preview_evidence_pack(request_id: &str) -> EvidencePackExport {
         redacted: true,
         items,
         pack_json,
+        audit_rows: Vec::new(),
     }
 }
 
