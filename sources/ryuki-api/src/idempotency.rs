@@ -11,7 +11,7 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::{header, Method, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -89,6 +89,16 @@ fn is_mutating(method: &Method) -> bool {
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     )
+}
+
+/// The usable `Idempotency-Key` on a request: present, non-empty, and at most
+/// 200 bytes. Shared by the dedup middleware and the [`require_idempotency_key`]
+/// guard so the two can never drift on what counts as a valid key.
+pub fn usable_idempotency_key(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|k| !k.is_empty() && k.len() <= 200)
 }
 
 fn conflict_response() -> Response {
@@ -186,13 +196,8 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
     if !is_mutating(&method) {
         return next.run(request).await;
     }
-    let key = match request
-        .headers()
-        .get("Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(k) if !k.is_empty() && k.len() <= 200 => k.to_string(),
-        _ => return next.run(request).await,
+    let Some(key) = usable_idempotency_key(request.headers()).map(str::to_string) else {
+        return next.run(request).await;
     };
     // Scope every record to the authenticated principal so one tenant's key can
     // never collide with — or replay — another's. The middleware runs inside
@@ -356,6 +361,34 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// Require-key guard — opt-in per route for the highest-risk creates.
+// ---------------------------------------------------------------------------
+
+/// Per-route guard that REJECTS a request lacking a usable `Idempotency-Key`
+/// with `400 IDEMPOTENCY_KEY_REQUIRED`, instead of the layer's default optional
+/// pass-through. Apply only to the highest-risk create routes via
+/// `post(handler).layer(middleware::from_fn(require_idempotency_key))`.
+///
+/// It composes with the dedup middleware: a present key was already claimed by
+/// that (outer) middleware, so the route still deduplicates; this guard only
+/// turns an ABSENT key into a hard error. Its accept rule is exactly
+/// [`usable_idempotency_key`], so the guard and the dedup layer cannot diverge.
+pub async fn require_idempotency_key(request: Request, next: Next) -> Response {
+    if usable_idempotency_key(request.headers()).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "IDEMPOTENCY_KEY_REQUIRED",
+                "message": "this endpoint requires an Idempotency-Key header \
+                            (a unique, unguessable key per logical request)"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
 // Retention sweep — bounds the table and makes a key reusable after the window.
 // ---------------------------------------------------------------------------
 
@@ -474,6 +507,18 @@ mod tests {
         assert!(is_mutating(&Method::DELETE));
         assert!(!is_mutating(&Method::GET));
         assert!(!is_mutating(&Method::HEAD));
+    }
+
+    #[test]
+    fn usable_idempotency_key_accepts_only_present_nonempty_bounded() {
+        let mut h = HeaderMap::new();
+        assert!(usable_idempotency_key(&h).is_none(), "absent → none");
+        h.insert("Idempotency-Key", "".parse().unwrap());
+        assert!(usable_idempotency_key(&h).is_none(), "empty → none");
+        h.insert("Idempotency-Key", "abc-123".parse().unwrap());
+        assert_eq!(usable_idempotency_key(&h), Some("abc-123"));
+        h.insert("Idempotency-Key", "x".repeat(201).parse().unwrap());
+        assert!(usable_idempotency_key(&h).is_none(), ">200 bytes → none");
     }
 }
 
@@ -901,5 +946,35 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// The require-key guard rejects a missing/empty key with 400 and lets a
+    /// usable key through to the handler. Pure middleware — needs no DB.
+    #[tokio::test]
+    async fn require_idempotency_key_guard_rejects_missing_header() {
+        let app = || {
+            Router::new()
+                .route("/g", post(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(require_idempotency_key))
+        };
+        let post_to_g = |key: Option<&str>| {
+            let mut b = Request::builder().method("POST").uri("/g");
+            if let Some(k) = key {
+                b = b.header("Idempotency-Key", k);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // Missing key → 400.
+        let resp = app().oneshot(post_to_g(None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Empty key → 400 (same rule as the dedup layer).
+        let resp = app().oneshot(post_to_g(Some(""))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Usable key → passes through to the handler.
+        let resp = app().oneshot(post_to_g(Some("k-123"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

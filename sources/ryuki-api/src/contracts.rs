@@ -694,7 +694,15 @@ pub fn routes() -> Router {
         .route("/api/ops/shift/stale", get(shift_stale))
         .route("/api/ops/shift-contract", get(shift_contract))
         // ─── Emergency Change (Break-Glass) Engine ───
-        .route("/api/ops/emergency/initiate", post(emergency_initiate))
+        // Break-glass initiation is irreversible and high-blast-radius, so the
+        // Idempotency-Key is REQUIRED here (400 if absent) rather than optional —
+        // a double-submit must never open two concurrent emergency changes.
+        .route(
+            "/api/ops/emergency/initiate",
+            post(emergency_initiate).layer(axum::middleware::from_fn(
+                crate::idempotency::require_idempotency_key,
+            )),
+        )
         .route("/api/ops/emergency/approve/{id}", post(emergency_approve))
         .route("/api/ops/emergency/execute/{id}", post(emergency_execute))
         .route("/api/ops/emergency/verify/{id}", post(emergency_verify))

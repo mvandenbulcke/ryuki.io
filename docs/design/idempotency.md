@@ -90,8 +90,15 @@ are NULL between the claim and the handler completing (the in-flight window the
   (`spawn_idempotency_sweep`) deletes records older than the 24h retention
   window every hour, bounding the table and making a key reusable after the
   window. DB-gated test for expired-deleted / fresh-retained.
-- **Slice 2b.** Require the header on the highest-risk routes (e.g.
-  `emergency/initiate`) rather than leaving it optional.
+- **Slice 2b (this change).** Require the header on the highest-risk routes
+  rather than leaving it optional: a `require_idempotency_key` route-layer guard
+  returns `400 IDEMPOTENCY_KEY_REQUIRED` when the header is absent. Applied first
+  to `POST /api/ops/emergency/initiate` (break-glass, irreversible). The guard
+  shares `usable_idempotency_key` with the dedup middleware so they cannot drift,
+  and composes inside it (a present key is already claimed, so the route still
+  dedups). Extending to the portal-called high-risk routes (live-apply approve,
+  token mint) first requires teaching the portal's single egress
+  (`UpstreamClient`) to generate and send a key — otherwise those flows 400.
 
 ### One-time secrets are never stored (`Cache-Control: no-store`)
 
