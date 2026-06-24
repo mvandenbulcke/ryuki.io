@@ -37,7 +37,7 @@ implementing **all 66**. This file tracks execution.
 | 5 | [x] | Tamper-evident audit hash chain + verify | Security | M | H | ✓ |
 | 6 | [ ] | Dependency-backed platform self-health probes | Roadmap | L | H | ✓ |
 | 7 | [ ] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
-| 8 | [ ] | Agent enrollment approve/revoke from portal | Portal | M | H | — |
+| 8 | [~] | Agent enrollment approve/revoke from portal | Portal | M | H | — |
 | 9 | [ ] | Outbound notifications (email/webhook/callback/chat) | Roadmap | L | H | ✓ |
 | 10 | [ ] | Destroy/teardown execution mode (live decommission) | Exec | L | H | — |
 | 11 | [ ] | Pre-dispatch policy gate for unsafe IaC | Exec | M | H | — |
@@ -92,9 +92,13 @@ implementing **all 66**. This file tracks execution.
 | 60 | [ ] | Evidence blob store for large artifacts | Exec | M | M | — |
 | 61 | [ ] | On-call / escalation contact registry | Observ | M | M | — |
 | 62 | [ ] | audit_log retention / partitioning / archival | Resil | M | M | ✓ |
-| 63 | [ ] | Observability deploy wiring | Roadmap | M | M | ✓ |
+| 63 | [x] | Observability deploy wiring | Roadmap | M | M | ✓ |
 | 64 | [ ] | OpenAPI / machine-readable API spec | Roadmap | M | M | ✓ |
 | 65 | [ ] | Optional gated AI narrative adapter | AIOps | M | M | — |
 | 66 | [ ] | Release engineering (versioning/tags/changelog) | Roadmap | M | M | ✓ |
 
-_Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`._
+_Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`.
+`[x]` shipped · `[~]` partial (core shipped; follow-up tracked) · `[ ]` not started._
+
+**Shipped:** #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`), #8 agent
+approve — revoke deferred (`6d6fb5b`), #63 observability deploy (`0ce0ed3`).
