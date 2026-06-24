@@ -66,7 +66,7 @@ implementing **all 66**. This file tracks execution.
 | 34 | [x] | Time-series metric history + forecasting | AIOps | L | H | ✓ |
 | 35 | [x] | Anomaly / waste detection engine | AIOps | M | H | — |
 | 36 | [x] | AIOps suggestion-generation engine | AIOps | M | H | — |
-| 37 | [ ] | What-if capacity & cost planning | AIOps | M | H | — |
+| 37 | [x] | What-if capacity & cost planning | AIOps | M | H | — |
 | 38 | [ ] | Storage array registration / lifecycle | API | M | M | — |
 | 39 | [ ] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | ✓ |
 | 40 | [ ] | Scheduled/recurring synthetic health checks | Observ | S | M | ✓ |
@@ -139,3 +139,9 @@ faceted filter bar (name search/status/site + Clear) + sortable columns, URL as
 single source of truth, wired to the #14 API. Integration review fixed a `q`
 name-only/5-field mismatch (would break old `?q=` deep links) + whitespace-only
 facets. Follow-up [~]: surface environment/request_type/created_by + pagination.
+
+**#37** (`dfb77c0`): `ryuki_engine::metric_planning::what_if` (project + growth
+factor + ceiling-breach) + GET /api/metrics/what-if. Overflow registers as a
+breach (not silently dropped); headroom/timestamps null-guarded. AIOps chain
+now #34→#35→#36→#37 all shipped; remaining links #53/#54 (budgets) consume the
+forecast/what-if vs a threshold.
