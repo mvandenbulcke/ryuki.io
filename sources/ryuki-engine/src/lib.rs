@@ -48,6 +48,7 @@ pub mod maintenance_calendar;
 pub mod maintenance_comm;
 pub mod metric_anomaly;
 pub mod metric_forecast;
+pub mod metric_planning;
 pub mod metric_suggestions;
 pub mod models;
 pub mod network_readiness;

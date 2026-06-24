@@ -12,7 +12,7 @@
 //! seconds, f64); only differences and ordering matter to the math.
 
 /// One observed sample: a time coordinate and its value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct MetricPoint {
     pub t: f64,
     pub value: f64,

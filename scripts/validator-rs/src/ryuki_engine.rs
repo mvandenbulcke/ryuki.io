@@ -58,6 +58,7 @@ const DECLARED_MODULES: &[&str] = &[
     "maintenance_comm",
     "metric_anomaly",
     "metric_forecast",
+    "metric_planning",
     "metric_suggestions",
     "models",
     "network_readiness",

@@ -165,6 +165,7 @@ pub fn routes() -> Router {
             "/api/metrics/insights/generate",
             post(metrics_generate_suggestions),
         )
+        .route("/api/metrics/what-if", get(metrics_what_if))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -15111,6 +15112,23 @@ fn metric_scope_label(site: &Option<String>, environment: &Option<String>) -> St
     }
 }
 
+/// The forecast step for a series: its own average sample cadence, or one hour
+/// when there are fewer than two points to measure a cadence from. Shared by the
+/// series and what-if handlers so their projections step identically.
+fn metric_series_step(points: &[ryuki_engine::metric_forecast::MetricPoint]) -> f64 {
+    if points.len() >= 2 {
+        let span = points.last().unwrap().t - points.first().unwrap().t;
+        let s = span / (points.len() - 1) as f64;
+        if s > 0.0 {
+            s
+        } else {
+            3600.0
+        }
+    } else {
+        3600.0
+    }
+}
+
 /// True when an optional scope value (site/environment) exceeds the 200-char
 /// bound. A blank/absent scope is fine.
 fn metric_scope_too_long(scope: &Option<String>) -> bool {
@@ -15292,18 +15310,7 @@ async fn metrics_series(
 
     let summary = ryuki_engine::metric_forecast::summarize(&points);
     let trend = ryuki_engine::metric_forecast::trend(&points, 1e-9);
-    // Step the forecast at the series' own average cadence; fall back to 1h.
-    let step = if points.len() >= 2 {
-        let span = points.last().unwrap().t - points.first().unwrap().t;
-        let s = span / (points.len() - 1) as f64;
-        if s > 0.0 {
-            s
-        } else {
-            3600.0
-        }
-    } else {
-        3600.0
-    };
+    let step = metric_series_step(&points);
     let horizon = params.horizon.unwrap_or(3).clamp(0, 100);
     let forecast = ryuki_engine::metric_forecast::project_forward(&points, step, horizon);
 
@@ -15631,6 +15638,135 @@ async fn metrics_generate_suggestions(
         "generated": generated.len(),
         "persisted": persisted.len(),
         "suggestions": persisted,
+    })))
+}
+
+/// Query params for what-if capacity/cost planning (#37).
+#[derive(Debug, Deserialize, Default)]
+struct MetricWhatIfParams {
+    metric_key: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    /// Periods to project forward (default 6, capped 100).
+    horizon: Option<usize>,
+    /// Hypothetical load/cost multiplier on the projection (default 1.0).
+    growth: Option<f64>,
+    /// Capacity/cost ceiling to test the projection against (required).
+    ceiling: Option<f64>,
+}
+
+/// GET /api/metrics/what-if — project a metric forward under a hypothetical
+/// growth factor and report whether/when it would breach a capacity/cost
+/// ceiling (pure `ryuki_engine::metric_planning`). `metric_key` and `ceiling`
+/// are required. Request-tier read. 503 when no database is configured; 500 on a
+/// query error.
+async fn metrics_what_if(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricWhatIfParams>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read metrics"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "metric_key is required"})),
+        ));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    let Some(ceiling) = params.ceiling else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "ceiling is required for what-if planning"})),
+        ));
+    };
+    for (name, val) in [("growth", params.growth), ("ceiling", Some(ceiling))] {
+        if val.is_some_and(|v| !v.is_finite()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("{name} must be a finite number") })),
+            ));
+        }
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let f_site = norm(&params.site);
+    let f_env = norm(&params.environment);
+    let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "querying metric series for what-if failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not query metric series"})),
+            ));
+        }
+    };
+    let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+        .iter()
+        .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+            t: r.observed_at.timestamp() as f64,
+            value: r.value,
+        })
+        .collect();
+
+    let step = metric_series_step(&points);
+    let horizon = params.horizon.unwrap_or(6).clamp(0, 100);
+    let growth = params.growth.unwrap_or(1.0);
+    let result = ryuki_engine::metric_planning::what_if(&points, step, horizon, growth, ceiling);
+
+    // Map projected unix-seconds `t` back to RFC3339 timestamps. An out-of-range
+    // timestamp or a non-finite (overflowed) value serialize as `null` rather
+    // than an empty string / invalid JSON number.
+    let projected_json: Vec<Value> = result
+        .projected
+        .iter()
+        .map(|p| {
+            let ts = chrono::DateTime::from_timestamp(p.t as i64, 0).map(|d| d.to_rfc3339());
+            let value = if p.value.is_finite() {
+                json!(p.value)
+            } else {
+                Value::Null
+            };
+            json!({"observed_at": ts, "value": value})
+        })
+        .collect();
+    let first_breach_at = result
+        .first_breach_t
+        .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0).map(|d| d.to_rfc3339()));
+
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "site": f_site,
+        "environment": f_env,
+        "ceiling": result.ceiling,
+        "growth_factor": result.growth_factor,
+        "breaches": result.breaches,
+        "first_breach_at": first_breach_at,
+        "peak_projected": result.peak_projected,
+        "headroom": result.headroom,
+        "projected": projected_json,
     })))
 }
 
@@ -27532,6 +27668,71 @@ mod db_lifecycle_tests {
             .ok();
         sqlx::query("DELETE FROM aiops_suggestions WHERE site = $1")
             .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #37: what-if projects a rising series forward and flags a ceiling breach,
+    /// reporting the first breach time and the projected peak.
+    #[tokio::test]
+    async fn test_metric_what_if_detects_ceiling_breach() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.whatif.8x4";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        // A perfectly rising series (10 per hour) → projection extends the line.
+        for (i, v) in [(0i64, 10.0f64), (1, 20.0), (2, 30.0), (3, 40.0), (4, 50.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: None,
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-04-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        // Project 3 steps (→ ~60, 70, 80); ceiling 65 must breach.
+        let params = MetricWhatIfParams {
+            metric_key: Some(key.to_string()),
+            site: None,
+            environment: None,
+            horizon: Some(3),
+            growth: Some(1.0),
+            ceiling: Some(65.0),
+        };
+        let Json(out) = metrics_what_if(sess(), Query(params))
+            .await
+            .expect("what-if");
+        assert_eq!(out["breaches"], true, "the rising projection breaches 65");
+        assert!(
+            out["first_breach_at"].is_string(),
+            "the first breach time is reported"
+        );
+        assert!(
+            out["peak_projected"].as_f64().unwrap() > 65.0,
+            "the projected peak is above the ceiling"
+        );
+        assert_eq!(
+            out["projected"].as_array().unwrap().len(),
+            3,
+            "horizon honored"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
             .execute(pool)
             .await
             .ok();
