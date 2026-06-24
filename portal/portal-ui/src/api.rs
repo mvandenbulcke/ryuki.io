@@ -404,6 +404,156 @@ pub fn request_create_path() -> &'static str {
     REQUEST_CREATE_PATH
 }
 
+/// Sort keys the request-list endpoint accepts. Mirrors the API contract
+/// (commit fa1df10): `GET /api/requests?sort=<key>`. The portal only ever
+/// emits a key from this allowlist, so an out-of-range value can never reach
+/// the upstream.
+pub const REQUEST_LIST_SORT_KEYS: &[&str] = &[
+    "created_at",
+    "updated_at",
+    "name",
+    "status",
+    "site",
+    "request_type",
+];
+
+/// Sort directions the request-list endpoint accepts (`direction=asc|desc`).
+pub const REQUEST_LIST_SORT_DIRECTIONS: &[&str] = &["asc", "desc"];
+
+/// Faceted filter/sort/pagination inputs for `GET /api/requests`. Every field
+/// is optional; an all-`None`/empty value reproduces the unfiltered default
+/// list (backward compatible with the pre-facet behavior).
+///
+/// String facets (`status`, `site`, `q`) carry caller-supplied values and are
+/// percent-encoded when serialized. `sort`/`direction` are validated against
+/// the API allowlists and silently dropped when out of range, so a malformed
+/// value degrades to the default ordering rather than reaching the upstream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestListQuery {
+    pub status: Option<String>,
+    pub site: Option<String>,
+    pub q: Option<String>,
+    pub sort: Option<String>,
+    pub direction: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+impl RequestListQuery {
+    /// True when no facet narrows the list — the unfiltered default view.
+    pub fn is_empty(&self) -> bool {
+        self.normalized_status().is_none()
+            && self.normalized_site().is_none()
+            && self.normalized_q().is_none()
+            && self.normalized_sort().is_none()
+            && self.normalized_direction().is_none()
+            && self.limit.is_none()
+            && self.offset.is_none()
+    }
+
+    fn normalized_status(&self) -> Option<&str> {
+        non_empty(self.status.as_deref())
+    }
+
+    fn normalized_site(&self) -> Option<&str> {
+        non_empty(self.site.as_deref())
+    }
+
+    fn normalized_q(&self) -> Option<&str> {
+        non_empty(self.q.as_deref())
+    }
+
+    fn normalized_sort(&self) -> Option<&str> {
+        non_empty(self.sort.as_deref()).filter(|v| REQUEST_LIST_SORT_KEYS.contains(v))
+    }
+
+    fn normalized_direction(&self) -> Option<&str> {
+        non_empty(self.direction.as_deref()).filter(|v| REQUEST_LIST_SORT_DIRECTIONS.contains(v))
+    }
+
+    /// Builds the `?key=value&...` suffix for the request-list path. Returns an
+    /// empty string when no facet is active so the path stays byte-identical to
+    /// the default list endpoint. Reserved characters in caller-supplied values
+    /// are percent-encoded; `sort`/`direction` outside the allowlists are
+    /// dropped.
+    pub fn to_query_string(&self) -> String {
+        let mut pairs: Vec<(&str, String)> = Vec::new();
+        if let Some(status) = self.normalized_status() {
+            pairs.push(("status", percent_encode_query_value(status)));
+        }
+        if let Some(site) = self.normalized_site() {
+            pairs.push(("site", percent_encode_query_value(site)));
+        }
+        if let Some(q) = self.normalized_q() {
+            pairs.push(("q", percent_encode_query_value(q)));
+        }
+        if let Some(sort) = self.normalized_sort() {
+            pairs.push(("sort", sort.to_string()));
+        }
+        if let Some(direction) = self.normalized_direction() {
+            pairs.push(("direction", direction.to_string()));
+        }
+        if let Some(limit) = self.limit {
+            pairs.push(("limit", limit.to_string()));
+        }
+        if let Some(offset) = self.offset {
+            pairs.push(("offset", offset.to_string()));
+        }
+        if pairs.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("?");
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                out.push('&');
+            }
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+        }
+        out
+    }
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// Percent-encodes every byte that is not an RFC 3986 unreserved character so a
+/// caller-supplied facet value (e.g. a search term with spaces or `&`) cannot
+/// inject extra query parameters or break the URL. Mirrors the download
+/// encoder in `request_detail.rs`.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        let b = *byte;
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            encoded.push(b as char);
+        } else {
+            encoded.push('%');
+            encoded.push(
+                char::from_digit((b >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            encoded.push(
+                char::from_digit((b & 0x0f) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    encoded
+}
+
+/// Appends the validated facet query string to the request-list path. With an
+/// empty query the result equals `request_list_path()`, keeping the default
+/// (unfiltered) request identical to the pre-facet behavior.
+pub fn request_list_path_with_query(query: &RequestListQuery) -> String {
+    format!("{}{}", request_list_path(), query.to_query_string())
+}
+
 pub fn request_detail_path(request_id: &str) -> Result<String, ApiPathError> {
     request_lifecycle_path(request_id, None)
 }
@@ -756,6 +906,96 @@ mod tests {
                 "{id:?} must be rejected by integration_test_path"
             );
         }
+    }
+
+    #[test]
+    fn empty_request_list_query_reproduces_default_path() {
+        let query = RequestListQuery::default();
+        assert!(query.is_empty());
+        assert_eq!(query.to_query_string(), "");
+        assert_eq!(request_list_path_with_query(&query), "/api/requests");
+    }
+
+    #[test]
+    fn blank_and_whitespace_facets_are_dropped() {
+        let query = RequestListQuery {
+            status: Some(String::new()),
+            site: Some("   ".to_string()),
+            q: Some("\t".to_string()),
+            ..Default::default()
+        };
+        assert!(query.is_empty());
+        assert_eq!(request_list_path_with_query(&query), "/api/requests");
+    }
+
+    #[test]
+    fn request_list_query_serializes_facets_in_canonical_order() {
+        let query = RequestListQuery {
+            status: Some("approved".to_string()),
+            site: Some("ams1".to_string()),
+            q: Some("web".to_string()),
+            sort: Some("name".to_string()),
+            direction: Some("asc".to_string()),
+            limit: Some(25),
+            offset: Some(50),
+        };
+        assert!(!query.is_empty());
+        assert_eq!(
+            query.to_query_string(),
+            "?status=approved&site=ams1&q=web&sort=name&direction=asc&limit=25&offset=50"
+        );
+        assert_eq!(
+            request_list_path_with_query(&query),
+            "/api/requests?status=approved&site=ams1&q=web&sort=name&direction=asc&limit=25&offset=50"
+        );
+    }
+
+    #[test]
+    fn request_list_query_percent_encodes_unsafe_facet_values() {
+        // A search term with a space and an `&` must not inject extra params.
+        let query = RequestListQuery {
+            q: Some("web & db".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query.to_query_string(), "?q=web%20%26%20db");
+    }
+
+    #[test]
+    fn request_list_query_drops_out_of_range_sort_and_direction() {
+        let query = RequestListQuery {
+            sort: Some("'; DROP TABLE requests; --".to_string()),
+            direction: Some("sideways".to_string()),
+            ..Default::default()
+        };
+        // Invalid sort/direction are silently dropped — they never reach upstream.
+        assert!(query.is_empty());
+        assert_eq!(query.to_query_string(), "");
+    }
+
+    #[test]
+    fn request_list_query_keeps_only_valid_sort_when_direction_invalid() {
+        let query = RequestListQuery {
+            sort: Some("status".to_string()),
+            direction: Some("nope".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(query.to_query_string(), "?sort=status");
+    }
+
+    #[test]
+    fn request_list_sort_allowlists_match_api_contract() {
+        assert_eq!(
+            REQUEST_LIST_SORT_KEYS,
+            &[
+                "created_at",
+                "updated_at",
+                "name",
+                "status",
+                "site",
+                "request_type"
+            ]
+        );
+        assert_eq!(REQUEST_LIST_SORT_DIRECTIONS, &["asc", "desc"]);
     }
 
     #[test]

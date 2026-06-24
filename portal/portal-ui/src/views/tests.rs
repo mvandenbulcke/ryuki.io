@@ -311,20 +311,8 @@ mod tests {
         );
     }
 
-    /// filter_requests matches against the request id (case-insensitive).
-    #[test]
-    fn filter_requests_matches_by_id() {
-        let all = make_requests();
-        let filtered = filter_requests(&all, "ABC");
-        assert_eq!(
-            filtered.len(),
-            1,
-            "expected 1 match for 'ABC', got: {filtered:?}"
-        );
-        assert_eq!(filtered[0].id, "abc-1234");
-    }
-
-    /// filter_requests matches against the name field (case-insensitive).
+    /// filter_requests matches against the name field (case-insensitive). `q`
+    /// is name-scoped, matching the API's server-side `q` facet.
     #[test]
     fn filter_requests_matches_by_name() {
         let all = make_requests();
@@ -333,35 +321,19 @@ mod tests {
         assert_eq!(filtered[0].id, "def-5678");
     }
 
-    /// filter_requests matches against request_type (case-insensitive).
+    /// `q` is NAME-ONLY: it must NOT match id, request_type, status, or site —
+    /// those have their own dedicated facets, and the server filters `q` on name
+    /// alone, so the client must agree. Each value below appears only in a
+    /// non-name field and must therefore yield no match.
     #[test]
-    fn filter_requests_matches_by_request_type() {
+    fn filter_requests_q_is_name_only() {
         let all = make_requests();
-        let filtered = filter_requests(&all, "server-build");
-        assert_eq!(
-            filtered.len(),
-            1,
-            "expected 1 match for 'server-build' type"
-        );
-        assert_eq!(filtered[0].id, "abc-1234");
-    }
-
-    /// filter_requests matches against status (case-insensitive).
-    #[test]
-    fn filter_requests_matches_by_status() {
-        let all = make_requests();
-        let filtered = filter_requests(&all, "failed");
-        assert_eq!(filtered.len(), 1, "expected 1 match for status 'failed'");
-        assert_eq!(filtered[0].id, "ghi-9012");
-    }
-
-    /// filter_requests matches against site (case-insensitive).
-    #[test]
-    fn filter_requests_matches_by_site() {
-        let all = make_requests();
-        // Both abc-1234 and ghi-9012 are in dc-west.
-        let filtered = filter_requests(&all, "dc-west");
-        assert_eq!(filtered.len(), 2, "expected 2 matches for site 'dc-west'");
+        for needle in ["abc", "server-build", "failed", "dc-west"] {
+            assert!(
+                filter_requests(&all, needle).is_empty(),
+                "q='{needle}' appears only in a non-name field and must not match"
+            );
+        }
     }
 
     /// A non-matching query returns an empty vec.

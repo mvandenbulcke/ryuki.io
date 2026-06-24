@@ -1059,6 +1059,94 @@ tbody tr:hover {
   align-items: center;
 }
 
+/* ── Faceted filter bar (request list, #15) ─────────────────────
+   A single cohesive row of filter controls; wraps on narrow viewports.
+   Reuses the .form-field control styling so the inputs/selects match the
+   rest of the portal. */
+.request-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.filter-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.filter-field label {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.filter-field input,
+.filter-field select {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 9px 12px;
+  font: inherit;
+  min-width: 180px;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.filter-field input:focus,
+.filter-field select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+  outline: none;
+}
+
+/* Push the clear button to the trailing edge and align it to the control row. */
+.filter-clear {
+  margin-left: auto;
+}
+
+/* Sortable column header: a borderless button filling the cell so the whole
+   header is clickable, keyboard-focusable, and shows a direction arrow. */
+.sortable-col {
+  padding: 0;
+}
+
+.sort-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sort-header:hover {
+  color: var(--accent);
+}
+
+.sort-header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sort-arrow {
+  font-size: 10px;
+  color: var(--accent);
+}
+
 .request-list-empty {
   padding: 32px 16px;
   text-align: center;

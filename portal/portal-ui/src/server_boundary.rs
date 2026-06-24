@@ -2088,18 +2088,116 @@ pub async fn perform_logout() -> Result<(), ServerFnError> {
     Ok(())
 }
 
+/// Applies the request-list facets to the synthetic fallback rows so the
+/// filter/sort UI stays interactive in static/degraded mode. Mirrors the
+/// upstream semantics (commit fa1df10): case-insensitive exact match on
+/// `status`/`site`, case-insensitive substring on the request `name` for `q`,
+/// and `sort`+`direction` ordering. `created_at` maps to the `created` field.
+///
+/// Only compiled for the SSR (and test) builds: the sole caller lives inside
+/// the `get_request_list` server-fn body, which the `#[server]` macro keeps
+/// SSR-only — so the hydrate build would otherwise see it as dead code.
+#[cfg(any(feature = "ssr", test))]
+fn filter_request_summaries(
+    rows: Vec<RequestSummary>,
+    query: &crate::api::RequestListQuery,
+) -> Vec<RequestSummary> {
+    // Normalize each facet to a lowercased, non-empty needle (or None).
+    let normalize = |value: &Option<String>| -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_ascii_lowercase)
+    };
+    let status = normalize(&query.status);
+    let site = normalize(&query.site);
+    let needle = normalize(&query.q);
+    let mut filtered: Vec<RequestSummary> = rows
+        .into_iter()
+        .filter(|row| match &status {
+            Some(s) => row.status.to_ascii_lowercase() == *s,
+            None => true,
+        })
+        .filter(|row| match &site {
+            Some(s) => row.site.to_ascii_lowercase() == *s,
+            None => true,
+        })
+        .filter(|row| match &needle {
+            Some(n) => row.name.to_ascii_lowercase().contains(n),
+            None => true,
+        })
+        .collect();
+
+    if let Some(sort) = query
+        .sort
+        .as_deref()
+        .filter(|s| crate::api::REQUEST_LIST_SORT_KEYS.contains(s))
+    {
+        filtered.sort_by(|a, b| {
+            let key = |row: &RequestSummary| match sort {
+                "name" => row.name.to_ascii_lowercase(),
+                "status" => row.status.to_ascii_lowercase(),
+                "site" => row.site.to_ascii_lowercase(),
+                "request_type" => row.request_type.to_ascii_lowercase(),
+                // `created_at`/`updated_at` both order by the only timestamp the
+                // summary carries; the fallback rows have no separate update ts.
+                _ => row.created.to_ascii_lowercase(),
+            };
+            key(a).cmp(&key(b))
+        });
+        if query.direction.as_deref() == Some("desc") {
+            filtered.reverse();
+        }
+    }
+    filtered
+}
+
+/// Faceted request-list read (#15). Optional `status`/`site`/`q` filters and
+/// `sort`/`direction` ordering are forwarded to the upstream
+/// `GET /api/requests` endpoint (API contract fa1df10). All-`None` arguments
+/// reproduce the unfiltered default list, so existing call sites are
+/// unaffected.
+///
+/// The same-origin allowlist validates the *base* path; the query suffix is
+/// appended only after validation and carries solely allowlist-validated keys
+/// and percent-encoded values (see `RequestListQuery::to_query_string`), so no
+/// caller input ever reaches the upstream unescaped.
 #[server(prefix = "/portal/api", endpoint = "request-list-data")]
-pub async fn get_request_list() -> Result<Vec<RequestSummary>, ServerFnError> {
+pub async fn get_request_list(
+    status: Option<String>,
+    site: Option<String>,
+    q: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
+) -> Result<Vec<RequestSummary>, ServerFnError> {
+    use crate::api::{request_list_path_with_query, RequestListQuery};
+
     let boundary = PortalServerBoundary::static_dry_run();
-    let path = boundary
+    // Validate the base path against the same-origin allowlist BEFORE appending
+    // the facet query string. The allowlist matches the path without a query.
+    boundary
         .validate_platform_api_path(request_list_path())
         .map_err(|_| ServerFnError::new("request list API path failed same-origin guard"))?;
+    let query = RequestListQuery {
+        status,
+        site,
+        q,
+        sort,
+        direction,
+        limit: None,
+        offset: None,
+    };
+    let path = request_list_path_with_query(&query);
     let upstream = upstream_context();
     if !upstream.live() {
-        return Ok(request_summary_fallbacks());
+        // Static/degraded mode filters the synthetic fallback rows locally so
+        // the facet UI stays interactive even without an upstream.
+        let rows = request_summary_fallbacks();
+        return Ok(filter_request_summaries(rows, &query));
     }
     let session_id = session_id_from_request().await;
-    match upstream.get(path, session_id.as_deref()).await {
+    match upstream.get(&path, session_id.as_deref()).await {
         Ok(response) if response.is_success() => {
             let list: Vec<ApiRequestSummary> = response
                 .json()
@@ -3615,6 +3713,81 @@ pub async fn test_integration(id: String) -> Result<IntegrationTestResult, Serve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::RequestListQuery;
+
+    fn summary_row(name: &str, site: &str, status: &str, created: &str) -> RequestSummary {
+        RequestSummary {
+            id: format!("REQ-{name}"),
+            request_type: "server".to_string(),
+            name: name.to_string(),
+            site: site.to_string(),
+            environment: "prod".to_string(),
+            status: status.to_string(),
+            stage: status.to_string(),
+            created: created.to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_request_summaries_empty_query_is_identity() {
+        let rows = vec![
+            summary_row("Web", "ams1", "intake", "2026-01-02"),
+            summary_row("Db", "fra1", "approved", "2026-01-01"),
+        ];
+        let out = filter_request_summaries(rows.clone(), &RequestListQuery::default());
+        assert_eq!(out, rows);
+    }
+
+    #[test]
+    fn filter_request_summaries_applies_status_site_and_q_case_insensitively() {
+        let rows = vec![
+            summary_row("Web Server", "ams1", "approved", "2026-01-03"),
+            summary_row("Web Cache", "fra1", "approved", "2026-01-02"),
+            summary_row("Database", "ams1", "intake", "2026-01-01"),
+        ];
+        let query = RequestListQuery {
+            status: Some("APPROVED".to_string()),
+            site: Some("AMS1".to_string()),
+            q: Some("web".to_string()),
+            ..Default::default()
+        };
+        let out = filter_request_summaries(rows, &query);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "Web Server");
+    }
+
+    #[test]
+    fn filter_request_summaries_sorts_by_name_with_direction() {
+        let rows = vec![
+            summary_row("Charlie", "ams1", "intake", "2026-01-01"),
+            summary_row("alpha", "ams1", "intake", "2026-01-02"),
+            summary_row("Bravo", "ams1", "intake", "2026-01-03"),
+        ];
+        let asc = filter_request_summaries(
+            rows.clone(),
+            &RequestListQuery {
+                sort: Some("name".to_string()),
+                direction: Some("asc".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            asc.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "Bravo", "Charlie"]
+        );
+        let desc = filter_request_summaries(
+            rows,
+            &RequestListQuery {
+                sort: Some("name".to_string()),
+                direction: Some("desc".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            desc.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["Charlie", "Bravo", "alpha"]
+        );
+    }
 
     #[test]
     fn boundary_allows_only_same_origin_platform_contracts() {
