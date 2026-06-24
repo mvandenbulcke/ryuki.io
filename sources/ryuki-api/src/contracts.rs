@@ -1002,6 +1002,7 @@ pub fn routes() -> Router {
         .route("/api/protect/secrets", get(secrets_list))
         .route("/api/protect/secrets", post(secrets_register))
         .route("/api/protect/secrets/{id}", get(secrets_get))
+        .route("/api/protect/secrets/{id}", put(secrets_update))
         .route("/api/protect/secrets/{id}/rotate", post(secrets_rotate))
         .route(
             "/api/protect/secrets/{id}/history",
@@ -22321,6 +22322,96 @@ async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
+
+/// Mutable METADATA of a managed secret. The credential itself is never here —
+/// this table holds a vault_path REFERENCE, not a value. id / secret_type /
+/// vault_path are immutable identity. Omitted fields keep their current value.
+#[derive(Debug, Deserialize)]
+struct SecretsUpdateRequest {
+    name: Option<String>,
+    owner: Option<String>,
+    site: Option<String>,
+    #[serde(rename = "intervalDays")]
+    interval_days: Option<u64>,
+}
+
+/// PUT /api/protect/secrets/{id} — update a tracked secret's metadata (name /
+/// owner / site / rotation cadence) in place, instead of DB surgery. Never
+/// accepts or returns a credential value. Changing the interval reschedules
+/// next_rotation_due from the existing last_rotated. 404 on a missing secret.
+async fn secrets_update(
+    Path(id): Path<String>,
+    Json(b): Json<SecretsUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let existing: ManagedSecretRow = sqlx::query_as(&format!(
+        "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| secrets_not_found(format!("Secret '{id}' not found")))?;
+
+    let name = b
+        .name
+        .as_deref()
+        .unwrap_or(&existing.name)
+        .trim()
+        .to_string();
+    let owner = b
+        .owner
+        .as_deref()
+        .unwrap_or(&existing.owner)
+        .trim()
+        .to_string();
+    let site = b
+        .site
+        .as_deref()
+        .unwrap_or(&existing.site)
+        .trim()
+        .to_string();
+    let interval = b
+        .interval_days
+        .unwrap_or(existing.rotation_interval_days as u64);
+    if name.is_empty() || owner.is_empty() || site.is_empty() {
+        return Err(status_400("name, owner, and site cannot be empty"));
+    }
+    // 1..=36500 days (100y). The upper bound also keeps `interval as i64` below,
+    // and the BIGINT column, from ever wrapping on a hostile u64.
+    if interval == 0 || interval > 36_500 {
+        return Err(status_400(
+            "rotation interval must be between 1 and 36500 days",
+        ));
+    }
+    let next_due = secrets_rotation::next_rotation_due_from(&existing.last_rotated, interval);
+
+    sqlx::query(
+        "UPDATE managed_secrets SET name = $1, owner = $2, site = $3, \
+         rotation_interval_days = $4, next_rotation_due = $5 WHERE id = $6",
+    )
+    .bind(&name)
+    .bind(&owner)
+    .bind(&site)
+    .bind(interval as i64)
+    .bind(&next_due)
+    .bind(&id)
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+
+    let updated: ManagedSecretRow = sqlx::query_as(&format!(
+        "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(
+        json!({"source": "database", "secret": updated.to_value()}),
+    ))
+}
+
 async fn secrets_rotate(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -29923,6 +30014,78 @@ mod secrets_rotation_db_tests {
             .fetch_optional(pool)
             .await
             .expect("read managed_secret status")
+    }
+
+    #[tokio::test]
+    async fn secrets_update_changes_metadata_and_reschedules() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // seed_secret stamps last_rotated = 2026-01-01.
+        let id = "sr-dbtest-update-9c1";
+        seed_secret(pool, id, "DEFRA", "2099-01-01T00:00:00+00:00").await;
+
+        let _ = secrets_update(
+            Path(id.into()),
+            Json(SecretsUpdateRequest {
+                name: Some("renamed-secret".into()),
+                owner: Some("new.owner".into()),
+                site: None,
+                interval_days: Some(90),
+            }),
+        )
+        .await
+        .expect("update");
+
+        let row: ManagedSecretRow = sqlx::query_as(&format!(
+            "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("re-read");
+        assert_eq!(row.name, "renamed-secret");
+        assert_eq!(row.owner, "new.owner");
+        assert_eq!(row.site, "DEFRA", "site omitted → unchanged");
+        assert_eq!(row.rotation_interval_days, 90);
+        // Rescheduled from the existing last_rotated (2026-01-01) + 90 days.
+        assert!(
+            row.next_rotation_due.starts_with("2026-04-01"),
+            "next_due rescheduled from last_rotated, got {}",
+            row.next_rotation_due
+        );
+
+        // Blank owner → 400; missing secret → 404.
+        assert!(matches!(
+            secrets_update(
+                Path(id.into()),
+                Json(SecretsUpdateRequest {
+                    name: None,
+                    owner: Some("   ".into()),
+                    site: None,
+                    interval_days: None,
+                }),
+            )
+            .await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+        assert!(matches!(
+            secrets_update(
+                Path("sr-does-not-exist".into()),
+                Json(SecretsUpdateRequest {
+                    name: Some("x".into()),
+                    owner: None,
+                    site: None,
+                    interval_days: None,
+                }),
+            )
+            .await,
+            Err((StatusCode::NOT_FOUND, _))
+        ));
+
+        cleanup_secret(pool, id).await;
     }
 
     // ── SECURITY: rotate stamps rotated_by from the session, not a client field ──

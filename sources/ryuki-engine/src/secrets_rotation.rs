@@ -374,6 +374,17 @@ pub fn build_secret(
     })
 }
 
+/// PURE: the next rotation-due timestamp = `last_rotated` + `interval_days`,
+/// RFC3339. Falls back to `now` when `last_rotated` is unparseable. Matches
+/// `build_secret`'s scheduling, so changing the cadence reschedules from the real
+/// last rotation rather than resetting the clock.
+pub fn next_rotation_due_from(last_rotated: &str, interval_days: u64) -> String {
+    let base = chrono::DateTime::parse_from_rfc3339(last_rotated)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now());
+    (base + Days::new(interval_days)).to_rfc3339()
+}
+
 /// PURE: produce the rotated secret state AND its completed rotation run, given
 /// the existing run count (for the `v{n}` version label) — no store access.
 pub fn rotate_secret_record(
@@ -658,6 +669,20 @@ pub fn mark_rotation_failed(rotation_id: &str, error: &str) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_rotation_due_from_reschedules_off_last_rotated() {
+        // 2026-01-01 + 90 days = 2026-04-01 (rescheduled from the real last
+        // rotation, NOT from now).
+        let due = next_rotation_due_from("2026-01-01T00:00:00+00:00", 90);
+        assert!(due.starts_with("2026-04-01"), "got {due}");
+        // An unparseable timestamp falls back to now()+interval (never panics).
+        let fallback = next_rotation_due_from("not-a-date", 7);
+        assert!(
+            fallback.len() >= 20,
+            "produces a valid rfc3339, got {fallback}"
+        );
+    }
 
     #[test]
     fn build_secret_and_transition_helpers_are_pure() {
