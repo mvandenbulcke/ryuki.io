@@ -48,6 +48,7 @@ mod cmdb_impact_analysis;
 mod cmdb_reconciliation;
 mod cmdb_relationship_graph;
 pub(crate) mod compose;
+mod control_plane_db_backup;
 mod controlled_restore;
 mod cost_capacity;
 mod customization_spec_governance;
@@ -557,6 +558,12 @@ fn run() -> Result<(), String> {
                         "app-skeleton validation requires --context-json".to_string()
                     })?;
                     app_skeleton::validate_context_file(&path)?
+                }
+                "control-plane-db-backup" => {
+                    let path = context_json.ok_or_else(|| {
+                        "control-plane-db-backup validation requires --context-json".to_string()
+                    })?;
+                    control_plane_db_backup::validate_context_file(&path)?
                 }
                 "approved-software-deployment" => {
                     let path = context_json.ok_or_else(|| {
@@ -2444,6 +2451,7 @@ fn require_slice(args: &[String]) -> Result<&str, String> {
             | "docker-image"
             | "restore-testing"
             | "controlled-restore"
+            | "control-plane-db-backup"
             | "vcenter-object-placement"
             | "security-baseline"
             | "sensitive-output-guardrails"
@@ -3219,6 +3227,10 @@ fn validate_dispatch_table() -> std::collections::HashMap<&'static str, Validate
     m.insert(
         "controlled-restore",
         controlled_restore::validate_context_file as ValidateFn,
+    );
+    m.insert(
+        "control-plane-db-backup",
+        control_plane_db_backup::validate_context_file as ValidateFn,
     );
     m.insert(
         "cost-capacity-analytics",
@@ -4017,6 +4029,12 @@ fn build_slice_context(
             );
         }
         "observability-deploy-wiring" => {
+            map.insert(
+                "root".to_string(),
+                serde_json::Value::String(root.to_string_lossy().to_string()),
+            );
+        }
+        "control-plane-db-backup" => {
             map.insert(
                 "root".to_string(),
                 serde_json::Value::String(root.to_string_lossy().to_string()),

@@ -1,0 +1,72 @@
+# CloudNativePG ScheduledBackup for the control-plane database — static skeleton.
+#
+# Defines the recurring, Barman-based backup of the `ryuki-platform-db` CNPG
+# Cluster (see cnpg-cluster.yaml). This manifest is never applied directly; it
+# declares the backup contract that deployment tooling must satisfy. No
+# credentials, endpoints, or bucket names live here — the object-store target
+# and its secret references are owned by the Cluster's `backup.barmanObjectStore`
+# block and the Vault Secrets Operator.
+#
+# Retention intent (deploy/kubernetes/base/configmap.yaml RYUKI_RETENTION__*):
+#   daily=30, weekly=12, monthly=12, yearly=7
+# CloudNativePG's `retentionPolicy` is a SINGLE Barman retention window, not a
+# grandfather-father-son (GFS) tiered policy. We set it to the daily floor (30d)
+# so at least 30 days of base backups + WAL are always recoverable for PITR.
+# The longer weekly/monthly/yearly tiers are expressed as object-store lifecycle
+# rules on the bucket itself — see the TODO below.
+#
+# Prerequisites:
+#   - CloudNativePG operator installed (postgresql.cnpg.io/v1 CRD).
+#   - The `ryuki-platform-db` Cluster exists with a working
+#     `backup.barmanObjectStore` target (real bucket/endpoint/credentials).
+#   - The backup S3 credentials secret `ryuki-platform-db-backup-s3` is
+#     synchronized into the namespace by the Vault Secrets Operator.
+
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: ryuki-platform-db-scheduled-backup
+  namespace: ryuki-platform
+  labels:
+    app.kubernetes.io/part-of: ryuki-infrastructure-platform
+    app.kubernetes.io/name: ryuki-platform-db
+spec:
+  # Daily full base backup at 02:30 UTC. CNPG cron is a 6-field Quartz-style
+  # expression: "seconds minutes hours day-of-month month day-of-week".
+  # WAL archiving runs continuously (configured on the Cluster), so PITR
+  # granularity is independent of this base-backup cadence.
+  schedule: "0 30 2 * * *"
+
+  # Keep the schedule active. Set to true only to pause backups during a
+  # planned maintenance freeze (re-enable explicitly afterwards).
+  suspend: false
+
+  # Take the first backup immediately when this resource is first applied so
+  # the DR posture is established without waiting for the next cron tick.
+  immediate: true
+
+  # Back up from a replica to avoid load on the primary. CNPG falls back to the
+  # primary automatically when no standby is available.
+  target: prefer-standby
+
+  # Use the Barman object-store method declared on the Cluster's
+  # `backup.barmanObjectStore` (cnpg-cluster.yaml).
+  method: barmanObjectStore
+
+  # Reference to the CNPG Cluster these backups belong to.
+  cluster:
+    name: ryuki-platform-db
+# NOTE: retention is NOT a ScheduledBackup field in CloudNativePG — it is
+# configured ONCE on `Cluster.spec.backup.retentionPolicy` (cnpg-cluster.yaml,
+# set to "30d", the daily=30 floor). The longer weekly=12 / monthly=12 /
+# yearly=7 tiers from RYUKI_RETENTION__* cannot be expressed by that single
+# Barman window — see TODO(retention-tiers) in cnpg-cluster.yaml; they belong on
+# the object-store bucket as lifecycle / object-lock rules.
+#
+# TODO(object-store): the real backup target (bucket name, endpoint URL, region,
+# and the s3Credentials secret) is configured on the Cluster's
+# `backup.barmanObjectStore` block in cnpg-cluster.yaml. Today that block holds
+# placeholder values (s3://placeholder-bucket/, https://placeholder-s3-endpoint.invalid).
+# Replace them with the real, deployment-time object-store coordinates before
+# this ScheduledBackup can produce recoverable backups. Do NOT commit real
+# bucket names, endpoints, or credentials to this repository.

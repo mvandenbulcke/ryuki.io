@@ -1,4 +1,4 @@
-.PHONY: build test test-unit test-db lint validate clean run-api run-portal compose-up compose-down docker-build release-check
+.PHONY: build test test-unit test-db lint validate clean run-api run-portal compose-up compose-down docker-build release-check db-backup db-restore
 
 build:
 	cargo build --workspace
@@ -58,6 +58,36 @@ run-api:
 
 run-portal:
 	cargo leptos serve --manifest-path portal/portal-ui/Cargo.toml
+
+# Local-dev logical backup of the compose database. Writes a timestamped,
+# custom-format (-Fc) dump under ./backups/ that `db-restore` can replay. This
+# is the local developer / drill path only — production recovery is the CNPG
+# Barman object store (see docs/runbooks/db-restore-runbook.md).
+DB_URL ?= postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform
+db-backup:
+	mkdir -p backups
+	pg_dump --format=custom --no-owner --no-privileges \
+	  --dbname=$(DB_URL) \
+	  --file=backups/ryuki_platform-$$(date -u +%Y%m%dT%H%M%SZ).dump
+	@echo "Wrote backup to backups/ (newest):"
+	@ls -1t backups/*.dump | head -1
+
+# Restore a dump produced by `db-backup` into the LOCAL compose database.
+# Usage: make db-restore FILE=backups/<dump-file> CONFIRM_RESTORE=local-ryuki
+# --clean --if-exists DROPS existing objects first, so this is destructive and
+# guarded: it refuses any non-localhost DB_URL and requires an explicit
+# CONFIRM_RESTORE token; --single-transaction makes it all-or-nothing. Production
+# recovery is the CNPG path (docs/runbooks/db-restore-runbook.md), never this.
+db-restore:
+	@test -n "$(FILE)" || { echo "error: set FILE=backups/<dump-file>"; exit 2; }
+	@case "$(DB_URL)" in \
+	  *@localhost:*|*@127.0.0.1:*) ;; \
+	  *) echo "refusing: db-restore is a LOCAL-DEV drill only; DB_URL must target localhost (got: $(DB_URL))"; exit 2;; \
+	esac
+	@test "$(CONFIRM_RESTORE)" = "local-ryuki" || { echo "refusing: db-restore DROPS and replaces objects in $(DB_URL). Re-run with CONFIRM_RESTORE=local-ryuki to proceed."; exit 2; }
+	pg_restore --clean --if-exists --no-owner --no-privileges --single-transaction \
+	  --dbname=$(DB_URL) \
+	  $(FILE)
 
 compose-up:
 	docker compose -f deploy/compose/compose.yaml up --build

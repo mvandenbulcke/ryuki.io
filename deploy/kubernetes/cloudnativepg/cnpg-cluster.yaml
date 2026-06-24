@@ -54,9 +54,21 @@ spec:
   primaryUpdateStrategy: unsupervised
   primaryUpdateMethod: switchover
 
-  # Backup configuration — placeholder, real Barman object store resolved at deploy-time
+  # Backup configuration — placeholder, real Barman object store resolved at deploy-time.
+  # The recurring base backup that uses this target is defined in
+  # scheduled-backup.yaml (CNPG ScheduledBackup). WAL archiving below runs
+  # continuously and is what enables point-in-time recovery (PITR).
   backup:
+    # Single Barman retention window for base backups + archived WAL. 30d
+    # matches the daily=30 retention floor from RYUKI_RETENTION__DAILY_BACKUPS
+    # (deploy/kubernetes/base/configmap.yaml) and bounds the PITR window.
+    # TODO(retention-tiers): weekly/monthly/yearly GFS tiers are object-store
+    # lifecycle rules on the bucket, not this single window.
+    retentionPolicy: "30d"
     barmanObjectStore:
+      # TODO(object-store): replace with the real bucket and S3-compatible
+      # endpoint at deploy time. These placeholders are syntactically valid but
+      # non-functional; do NOT commit real bucket names or endpoints here.
       destinationPath: s3://placeholder-bucket/
       endpointURL: https://placeholder-s3-endpoint.invalid
       s3Credentials:
@@ -66,6 +78,13 @@ spec:
         secretAccessKeySecret:
           name: ryuki-platform-db-backup-s3
           key: secret_access_key
+      # Continuous WAL archiving — required for PITR. Compression keeps the
+      # object store small; maxParallel speeds up archive/restore throughput.
+      wal:
+        compression: gzip
+        maxParallel: 8
+      data:
+        compression: gzip
 
   # Monitoring integration — placeholder
   monitoring:
