@@ -167,6 +167,11 @@ pub fn routes() -> Router {
         )
         .route("/api/metrics/what-if", get(metrics_what_if))
         .route(
+            "/api/metrics/budgets",
+            post(metrics_budget_create).get(metrics_budget_list),
+        )
+        .route("/api/metrics/budgets/status", get(metrics_budget_status))
+        .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
         )
@@ -15770,6 +15775,269 @@ async fn metrics_what_if(
     })))
 }
 
+// ─── Metric budget thresholds (#53) ───
+
+/// Body for creating a metric budget.
+#[derive(Debug, Deserialize)]
+struct MetricBudgetCreateRequest {
+    metric_key: String,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+    threshold: f64,
+    /// "above" (cost/usage cap, default) or "below" (capacity floor).
+    #[serde(default)]
+    comparison: Option<String>,
+}
+
+/// A budget row as stored.
+#[derive(sqlx::FromRow)]
+struct MetricBudgetRow {
+    id: String,
+    metric_key: String,
+    site: Option<String>,
+    environment: Option<String>,
+    threshold: f64,
+    comparison: String,
+    enabled: bool,
+}
+
+/// POST /api/metrics/budgets — define a budget threshold on a metric. Execute-tier.
+/// 503 when no database is configured.
+async fn metrics_budget_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<MetricBudgetCreateRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to define budgets"})),
+        ));
+    }
+    let metric_key = body.metric_key.trim();
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    if metric_scope_too_long(&body.site) || metric_scope_too_long(&body.environment) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "site/environment must be at most 200 characters"})),
+        ));
+    }
+    if !body.threshold.is_finite() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "threshold must be a finite number"})),
+        ));
+    }
+    let comparison = match body.comparison.as_deref() {
+        None | Some("above") => "above",
+        Some("below") => "below",
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "comparison must be 'above' or 'below'"})),
+            ));
+        }
+    };
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let result = sqlx::query(
+        "INSERT INTO metric_budgets \
+         (id, metric_key, site, environment, threshold, comparison) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&id)
+    .bind(metric_key)
+    .bind(norm(&body.site))
+    .bind(norm(&body.environment))
+    .bind(body.threshold)
+    .bind(comparison)
+    .execute(pool)
+    .await;
+    match result {
+        Ok(_) => Ok(Json(json!({"id": id, "created": true}))),
+        Err(e) => {
+            tracing::error!(error = %e, "creating metric budget failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not create budget"})),
+            ))
+        }
+    }
+}
+
+/// GET /api/metrics/budgets — list all defined budgets. Request-tier read.
+async fn metrics_budget_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read budgets"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"budgets": [], "durable": false})));
+    };
+    let rows: Vec<MetricBudgetRow> = match sqlx::query_as(
+        "SELECT id, metric_key, site, environment, threshold, comparison, enabled \
+         FROM metric_budgets ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing budgets failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list budgets"})),
+            ));
+        }
+    };
+    let budgets: Vec<Value> = rows
+        .iter()
+        .map(|b| {
+            json!({
+                "id": b.id,
+                "metric_key": b.metric_key,
+                "site": b.site,
+                "environment": b.environment,
+                "threshold": b.threshold,
+                "comparison": b.comparison,
+                "enabled": b.enabled,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"budgets": budgets, "durable": true})))
+}
+
+/// GET /api/metrics/budgets/status — evaluate every ENABLED budget against its
+/// metric series, reporting current and projected breaches. Request-tier read.
+/// 503 when no database is configured.
+async fn metrics_budget_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read budget status"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Do NOT swallow a failure of the budget query into "no budgets" — for an
+    // alerting surface that would silently hide every budget. Fail loud.
+    let budgets: Vec<MetricBudgetRow> = match sqlx::query_as(
+        "SELECT id, metric_key, site, environment, threshold, comparison, enabled \
+         FROM metric_budgets WHERE enabled ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing budgets for status failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not evaluate budget status"})),
+            ));
+        }
+    };
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut breached_count = 0u64;
+    let mut errored_count = 0u64;
+    for b in &budgets {
+        let comparison =
+            ryuki_engine::metric_budget::BudgetComparison::from_str_or_above(&b.comparison);
+        // A per-budget series-query failure must NOT read as "not breached" — a
+        // breached budget would falsely report OK. Mark it `error` and surface
+        // it; never set its breach flags to false off a failed read.
+        let rows =
+            match fetch_metric_series_rows(pool, &b.metric_key, &b.site, &b.environment).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::error!(error = %e, budget = %b.id, "evaluating budget series failed");
+                    errored_count += 1;
+                    results.push(json!({
+                        "id": b.id,
+                        "metric_key": b.metric_key,
+                        "site": b.site,
+                        "environment": b.environment,
+                        "status": "error",
+                        "error": "could not evaluate this budget's series",
+                    }));
+                    continue;
+                }
+            };
+        let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+            .iter()
+            .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+                t: r.observed_at.timestamp() as f64,
+                value: r.value,
+            })
+            .collect();
+        let summary = ryuki_engine::metric_forecast::summarize(&points);
+        // The forecast extreme that matters for this comparison: the projected
+        // MAX for an `above` cap, the projected MIN for a `below` floor.
+        let step = metric_series_step(&points);
+        let projection = ryuki_engine::metric_forecast::project_forward(&points, step, 6);
+        let projected_extreme: Option<f64> = if projection.is_empty() {
+            None
+        } else {
+            let extreme = match comparison {
+                ryuki_engine::metric_budget::BudgetComparison::Below => projection
+                    .iter()
+                    .map(|p| p.value)
+                    .filter(|v| v.is_finite())
+                    .fold(f64::INFINITY, f64::min),
+                ryuki_engine::metric_budget::BudgetComparison::Above => projection
+                    .iter()
+                    .map(|p| p.value)
+                    .filter(|v| v.is_finite())
+                    .fold(f64::NEG_INFINITY, f64::max),
+            };
+            if extreme.is_finite() {
+                Some(extreme)
+            } else {
+                None
+            }
+        };
+        let eval = ryuki_engine::metric_budget::evaluate_budget(
+            b.threshold,
+            comparison,
+            summary.as_ref(),
+            projected_extreme,
+        );
+        let breached = eval.breached_now || eval.breached_projected;
+        if breached {
+            breached_count += 1;
+        }
+        results.push(json!({
+            "id": b.id,
+            "metric_key": b.metric_key,
+            "site": b.site,
+            "environment": b.environment,
+            "status": if breached { "breached" } else { "ok" },
+            "evaluation": eval,
+        }));
+    }
+
+    // `degraded` whenever any budget could not be evaluated — the caller must not
+    // read a clean `breached_count` as "all budgets are healthy".
+    let overall_status = if errored_count > 0 { "degraded" } else { "ok" };
+    Ok(Json(json!({
+        "budgets": results,
+        "breached_count": breached_count,
+        "errored_count": errored_count,
+        "overall_status": overall_status,
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -27732,6 +28000,76 @@ mod db_lifecycle_tests {
         );
 
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #53: a budget whose metric's latest value exceeds the threshold is
+    /// reported as breached-now by the status endpoint.
+    #[tokio::test]
+    async fn test_metric_budget_create_and_status_detects_breach() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = "test.metric.budget.2k9";
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM metric_budgets WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        // Latest value 80, well above a threshold of 50.
+        for (i, v) in [(0i64, 60.0f64), (1, 70.0), (2, 80.0)] {
+            let body = MetricSampleRequest {
+                metric_key: key.to_string(),
+                site: None,
+                environment: None,
+                value: v,
+                observed_at: Some(format!("2026-05-01T0{i}:00:00+00:00")),
+            };
+            let _ = metrics_record_sample(sess(), Json(body))
+                .await
+                .expect("record sample");
+        }
+
+        let create = MetricBudgetCreateRequest {
+            metric_key: key.to_string(),
+            site: None,
+            environment: None,
+            threshold: 50.0,
+            comparison: Some("above".to_string()),
+        };
+        let _ = metrics_budget_create(sess(), Json(create))
+            .await
+            .expect("create budget");
+
+        let Json(status) = metrics_budget_status(sess()).await.expect("budget status");
+        let budgets = status["budgets"].as_array().unwrap();
+        let mine = budgets
+            .iter()
+            .find(|b| b["metric_key"] == key)
+            .expect("our budget appears in the status report");
+        assert_eq!(
+            mine["evaluation"]["breached_now"], true,
+            "latest value 80 breaches the above-50 budget"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM metric_budgets WHERE metric_key = $1")
             .bind(key)
             .execute(pool)
             .await

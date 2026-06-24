@@ -57,6 +57,7 @@ const DECLARED_MODULES: &[&str] = &[
     "maintenance_calendar",
     "maintenance_comm",
     "metric_anomaly",
+    "metric_budget",
     "metric_forecast",
     "metric_planning",
     "metric_suggestions",
