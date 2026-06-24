@@ -83,7 +83,7 @@ implementing **all 66**. This file tracks execution.
 | 51 | [ ] | Per-vendor connection capability catalog | Integ | M | M | — |
 | 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
 | 53 | [x] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
-| 54 | [ ] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
+| 54 | [x] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
 | 55 | [x] | DNS record update endpoint | API | S | M | — |
 | 56 | [ ] | IPAM subnet CRUD | API | M | M | — |
 | 57 | [ ] | Load-balancer virtual-server delete/update | API | M | M | — |
@@ -150,4 +150,11 @@ forecast/what-if vs a threshold.
 breach now + projected) + budgets CRUD + GET /api/metrics/budgets/status
 (alerting-safe: per-budget `error` status + `degraded`, never false-OK). Fixed
 a Postgres `NaN=NaN`-is-true CHECK bug in 096/097 (mig 098 back-corrects 096).
-Only #54 (commitment modeling) remains in the AIOps theme.
+
+**#54** (`22dc496`): `ryuki_engine::metric_commitment::model_commitment`
+(committed vs on-demand cost, savings, recommendation) + GET
+/api/metrics/commitment. Numerically-stable savings (committed-scale, not
+usage-scale cancellation); rejects overflow. **AIOps theme COMPLETE:
+#34→#35→#36→#37→#53→#54 all shipped.** The whole `metric_*` engine family is
+PURE; all IO is in thin `/api/metrics/*` handlers over one shared injection-safe
+query helper.
