@@ -35,7 +35,7 @@ implementing **all 66**. This file tracks execution.
 | 3 | [x] | Separation-of-duties on approval (no self-approve) | Security | S | H | ✓ |
 | 4 | [ ] | Multi-role approval quorum | Security | M | H | ✓ |
 | 5 | [x] | Tamper-evident audit hash chain + verify | Security | M | H | ✓ |
-| 6 | [ ] | Dependency-backed platform self-health probes | Roadmap | L | H | ✓ |
+| 6 | [x] | Dependency-backed platform self-health probes | Roadmap | L | H | ✓ |
 | 7 | [x] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
 | 8 | [~] | Agent enrollment approve/revoke from portal | Portal | M | H | — |
 | 9 | [ ] | Outbound notifications (email/webhook/callback/chat) | Roadmap | L | H | ✓ |
