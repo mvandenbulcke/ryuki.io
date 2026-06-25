@@ -30846,7 +30846,10 @@ mod db_lifecycle_tests {
             return;
         };
         let site = "TESTCHARGE-3k";
-        let rtype = "test-charge-deploy";
+        // A VALID request_type (mig 109 CHECK); the chargeback math is independent
+        // of which type. cost_rates has no seed data + the DB-test serial lock, so
+        // setting/clearing this type's rate cannot collide.
+        let rtype = "server-deployment";
         sqlx::query("DELETE FROM requests WHERE site = $1")
             .bind(site)
             .execute(pool)
@@ -32033,6 +32036,53 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// Swarm finding #1/#2: the requests enum CHECK constraints (mig 109) reject
+    /// an invalid request_type/status on write and accept valid values.
+    #[tokio::test]
+    async fn requests_enum_check_constraints_enforced() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        async fn try_insert(pool: &PgPool, rt: &str, status: &str) -> Result<Uuid, sqlx::Error> {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO requests \
+                 (id, request_type, status, stage, site, environment, name, cpu, \
+                  memory_gb, created_by, approval_route) \
+                 VALUES ($1, $2, $3, 'intake', 'DEFRA', 'production', 'check-test', \
+                         2, 4, 'requester-db', '[]'::jsonb)",
+            )
+            .bind(id)
+            .bind(rt)
+            .bind(status)
+            .execute(pool)
+            .await?;
+            Ok(id)
+        }
+
+        // Valid values insert cleanly.
+        let id = try_insert(pool, "server-deployment", "intake")
+            .await
+            .expect("valid request_type/status must insert");
+        cleanup_request(pool, id).await;
+
+        // An invalid request_type is rejected by the CHECK (no row created).
+        assert!(
+            try_insert(pool, "bogus-type", "intake").await.is_err(),
+            "invalid request_type must be rejected"
+        );
+        // An invalid status is rejected by the CHECK.
+        assert!(
+            try_insert(pool, "server-deployment", "bogus-status")
+                .await
+                .is_err(),
+            "invalid status must be rejected"
+        );
     }
 }
 
