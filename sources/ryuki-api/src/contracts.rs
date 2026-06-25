@@ -194,9 +194,11 @@ pub fn routes() -> Router {
             post(metrics_budget_create).get(metrics_budget_list),
         )
         .route("/api/metrics/budgets/status", get(metrics_budget_status))
+        .route("/api/metrics/budgets/{id}", delete(metrics_budget_delete))
         .route("/api/metrics/commitment", get(metrics_commitment))
         .route("/api/metrics/slo", post(slo_create).get(slo_list))
         .route("/api/metrics/slo/status", get(slo_status))
+        .route("/api/metrics/slo/{id}", delete(slo_delete))
         .route("/api/metering/usage", get(metering_usage))
         .route(
             "/api/metering/chargeback/rates",
@@ -17414,6 +17416,53 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
     })))
 }
 
+/// DELETE /api/metrics/budgets/{id} — remove a budget definition (swarm #19,
+/// CRUD completion). Execute-tier (same as create). 404 if absent; 503 no DB.
+async fn metrics_budget_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to delete budgets"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deleted: Option<(String,)> =
+        sqlx::query_as("DELETE FROM metric_budgets WHERE id = $1 RETURNING id")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+    match deleted {
+        Some((deleted_id,)) => Ok(Json(json!({"deleted": deleted_id}))),
+        None => Err(status_404(&id)),
+    }
+}
+
+/// DELETE /api/metrics/slo/{id} — remove an SLO definition (swarm #20, CRUD
+/// completion). Execute-tier. 404 if absent; 503 no DB.
+async fn slo_delete(AuthExtractor(session): AuthExtractor, Path(id): Path<String>) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to delete SLO definitions"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let deleted: Option<(String,)> =
+        sqlx::query_as("DELETE FROM slo_definitions WHERE id = $1 RETURNING id")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+    match deleted {
+        Some((deleted_id,)) => Ok(Json(json!({"deleted": deleted_id}))),
+        None => Err(status_404(&id)),
+    }
+}
+
 // ─── Per-site usage metering (#45) ───
 
 /// Query params for usage metering: an optional `[since, until]` window and an
@@ -29842,6 +29891,55 @@ mod unit_tests {
             "unknown field on token-create must be rejected"
         );
     }
+
+    // ── swarm #19/#20: budget/SLO DELETE — auth + no-DB ──
+
+    #[tokio::test]
+    async fn metric_budget_and_slo_delete_require_execute_and_db() {
+        let no_perm = || AuthSession {
+            user_id: "u".into(),
+            display_name: "U".into(),
+            roles: vec![],
+            token_valid: true,
+            provider_mode: "test".into(),
+        };
+        // Non-execute principal is forbidden on both.
+        assert_eq!(
+            metrics_budget_delete(AuthExtractor(no_perm()), Path("b1".into()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            slo_delete(AuthExtractor(no_perm()), Path("s1".into()))
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        // Execute principal with no DB -> 503 (never a faked success).
+        assert_eq!(
+            metrics_budget_delete(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path("b1".into())
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            slo_delete(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path("s1".into())
+            )
+            .await
+            .unwrap_err()
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
 
 /// Live-DB integration tests for the transactional/CAS lifecycle (B2), logout
@@ -32115,6 +32213,49 @@ mod db_lifecycle_tests {
                 .is_err(),
             "invalid status must be rejected"
         );
+    }
+
+    /// Swarm #19: budget DELETE removes the row and 404s a second delete.
+    #[tokio::test]
+    async fn metric_budget_delete_removes_and_404s() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO metric_budgets (id, metric_key, threshold, comparison) \
+             VALUES ($1, 'swarm.delete.test', 1.0, 'above')",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("seed budget");
+
+        let Ok(Json(out)) = metrics_budget_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
+            sqlx::query("DELETE FROM metric_budgets WHERE id = $1")
+                .bind(&id)
+                .execute(pool)
+                .await
+                .ok();
+            panic!("delete failed");
+        };
+        assert_eq!(out["deleted"], serde_json::json!(id));
+
+        // A second delete of the now-absent budget is a 404.
+        let err = metrics_budget_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect_err("deleting an absent budget must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 }
 
