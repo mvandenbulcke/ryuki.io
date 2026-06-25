@@ -88,6 +88,7 @@ pub mod software_deployment;
 pub mod sql_deployment;
 pub mod storage_provisioning;
 pub mod synthetic_health;
+pub mod vendor_catalog;
 pub mod vm_operations;
 pub mod vsan_esxi_lifecycle;
 pub mod zabbix_drift;

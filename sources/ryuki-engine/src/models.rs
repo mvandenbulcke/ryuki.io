@@ -409,7 +409,13 @@ pub struct AdapterConfig {
     pub metadata: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Supported integration vendor types.
+///
+/// `EnumIter` lets the capability catalog (#51) enumerate EVERY variant, so a
+/// new vendor automatically appears there; the exhaustive matches in
+/// `vendor_catalog::category_of`/`label_of` then force it to be categorised
+/// (compile error until done). Adding a variant cannot silently omit it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, strum::EnumIter)]
 pub enum AdapterType {
     VMware,
     HyperV,

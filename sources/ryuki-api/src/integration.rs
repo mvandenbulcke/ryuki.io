@@ -1595,6 +1595,56 @@ pub async fn integration_circuit_reset(
 }
 
 // ---------------------------------------------------------------------------
+// Per-vendor capability catalog (#51)
+// ---------------------------------------------------------------------------
+
+/// GET /api/integrations/capabilities — the supported integration vendor types
+/// grouped by category, plus the framework operations every adapter implements
+/// (#51). Static (no DB); reflects the real `AdapterType` catalog, all dry-run.
+/// Admin-gated, consistent with the rest of the integration surface.
+pub async fn integration_capabilities(Extension(session): Extension<AuthSession>) -> ApiResult {
+    require_admin(&session)?;
+    let vendors: Vec<Value> = ryuki_engine::vendor_catalog::catalog()
+        .into_iter()
+        .map(|c| {
+            json!({
+                "vendor_type": c.vendor_type,
+                "label": c.label,
+                "category": c.category.as_str(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "operations": ryuki_engine::vendor_catalog::OPERATIONS,
+        "execution_mode": "dry-run",
+        "count": vendors.len(),
+        "vendors": vendors,
+    })))
+}
+
+/// GET /api/integrations/capabilities/{vendor_type} — one vendor's capability
+/// (#51). 404 for an unknown vendor type. Admin-gated.
+pub async fn integration_capability_get(
+    Extension(session): Extension<AuthSession>,
+    Path(vendor_type): Path<String>,
+) -> ApiResult {
+    require_admin(&session)?;
+    let Some(c) = ryuki_engine::vendor_catalog::capability_for(&vendor_type) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown vendor type '{vendor_type}'")})),
+        ));
+    };
+    Ok(Json(json!({
+        "vendor_type": c.vendor_type,
+        "label": c.label,
+        "category": c.category.as_str(),
+        "operations": ryuki_engine::vendor_catalog::OPERATIONS,
+        "execution_mode": "dry-run",
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
 
@@ -1632,6 +1682,16 @@ pub fn routes() -> axum::Router {
         .route(
             "/api/integrations/{id}/circuit/reset",
             post(integration_circuit_reset),
+        )
+        // Static `capabilities` in the `{id}` slot — matchit routes the literal
+        // over the param, so it does not shadow `/{id}`.
+        .route(
+            "/api/integrations/capabilities",
+            get(integration_capabilities),
+        )
+        .route(
+            "/api/integrations/capabilities/{vendor_type}",
+            get(integration_capability_get),
         )
 }
 
@@ -3421,6 +3481,46 @@ mod unit_tests {
         .await
         .expect_err("a reset with no DB must be a 503");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── #51 vendor capability catalog (static, no DB) ──
+
+    #[tokio::test]
+    async fn capabilities_catalog_lists_every_vendor() {
+        let resp = integration_capabilities(Extension(AuthSession::static_dry_run()))
+            .await
+            .expect("catalog");
+        let expected = ryuki_engine::vendor_catalog::catalog().len();
+        assert_eq!(resp.0["count"], serde_json::json!(expected));
+        assert_eq!(resp.0["execution_mode"], serde_json::json!("dry-run"));
+        let vendors = resp.0["vendors"].as_array().expect("vendors array");
+        assert_eq!(vendors.len(), expected);
+        assert!(
+            vendors
+                .iter()
+                .any(|v| v["vendor_type"] == serde_json::json!("veeam")
+                    && v["category"] == serde_json::json!("backup")),
+            "veeam must be catalogued as backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_get_known_and_unknown() {
+        let ok = integration_capability_get(
+            Extension(AuthSession::static_dry_run()),
+            Path("zabbix".to_string()),
+        )
+        .await
+        .expect("known vendor");
+        assert_eq!(ok.0["category"], serde_json::json!("monitoring"));
+
+        let err = integration_capability_get(
+            Extension(AuthSession::static_dry_run()),
+            Path("not-a-vendor".to_string()),
+        )
+        .await
+        .expect_err("unknown vendor must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[test]
