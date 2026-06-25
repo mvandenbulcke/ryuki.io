@@ -35,6 +35,10 @@ pub enum SecretStatus {
     Expired,
     Rotating,
     Failed,
+    /// Soft-retired (deregistered): the secret record and its rotation history are
+    /// PRESERVED, but it no longer rotates (excluded from due/expiring/rotate-all,
+    /// and a direct rotate is refused). DB form is `retired` (serde kebab-case).
+    Retired,
 }
 
 impl std::fmt::Display for SecretStatus {
@@ -44,6 +48,7 @@ impl std::fmt::Display for SecretStatus {
             SecretStatus::Expired => write!(f, "Expired"),
             SecretStatus::Rotating => write!(f, "Rotating"),
             SecretStatus::Failed => write!(f, "Failed"),
+            SecretStatus::Retired => write!(f, "Retired"),
         }
     }
 }
@@ -463,6 +468,10 @@ pub fn rotate_secret(id: &str, rotated_by: &str) -> Result<Value, String> {
         .position(|secret| secret.id == id)
         .ok_or_else(|| format!("Secret '{}' not found", id))?;
 
+    if store.0[index].status == SecretStatus::Retired {
+        return Err(format!("Secret '{}' is retired and cannot be rotated", id));
+    }
+
     let (updated, run) = rotate_secret_record(&store.0[index], rotated_by, run_count);
     store.0[index] = updated;
     store.1.push(run.clone());
@@ -504,6 +513,8 @@ pub fn list_due_rotations() -> Result<Value, String> {
     let secrets: Vec<ManagedSecret> = store
         .0
         .iter()
+        // Retired secrets no longer rotate — never "due".
+        .filter(|secret| secret.status != SecretStatus::Retired)
         .filter(|secret| match parse_iso_time(&secret.next_rotation_due) {
             Some(next_due) => next_due <= now,
             None => false,
@@ -526,6 +537,8 @@ pub fn list_expiring(days: u64) -> Result<Value, String> {
     let secrets: Vec<ManagedSecret> = store
         .0
         .iter()
+        // Retired secrets no longer rotate — never "expiring".
+        .filter(|secret| secret.status != SecretStatus::Retired)
         .filter(|secret| match parse_iso_time(&secret.next_rotation_due) {
             Some(next_due) => next_due >= now && next_due <= cutoff,
             None => false,
@@ -553,6 +566,8 @@ pub fn force_rotate_all(site: &str) -> Result<Value, String> {
         .0
         .iter()
         .filter(|secret| secret.site == site)
+        // Retired secrets are skipped by a force-rotate-all.
+        .filter(|secret| secret.status != SecretStatus::Retired)
         .filter(|secret| match parse_iso_time(&secret.next_rotation_due) {
             Some(next_due) => next_due <= now,
             None => false,
@@ -617,6 +632,9 @@ pub fn get_rotation_summary(site: &str) -> Result<Value, String> {
         .count();
     let due = secrets
         .iter()
+        // Retired secrets no longer rotate — they are not "due" (consistent with
+        // list_due_rotations / force_rotate_all).
+        .filter(|secret| secret.status != SecretStatus::Retired)
         .filter(|secret| match parse_iso_time(&secret.next_rotation_due) {
             Some(next_due) => next_due <= now,
             None => false,
@@ -656,7 +674,11 @@ pub fn mark_rotation_failed(rotation_id: &str, error: &str) -> Result<Value, Str
     let run = run.clone();
 
     if let Some(secret) = store.0.iter_mut().find(|secret| secret.id == secret_id) {
-        secret.status = SecretStatus::Failed;
+        // A retired secret stays RETIRED — failing a (preserved) historical run
+        // must never re-arm it for rotation.
+        if secret.status != SecretStatus::Retired {
+            secret.status = SecretStatus::Failed;
+        }
     }
 
     Ok(json!({
@@ -903,5 +925,19 @@ mod tests {
         let expiring = list_expiring(7).unwrap();
         let secrets = expiring["secrets"].as_array().unwrap();
         assert!(secrets.iter().any(|secret| secret["id"] == "sr-defra-003"));
+    }
+
+    #[test]
+    fn retired_status_display_and_serde_round_trip() {
+        // Display is PascalCase (human); the DB/serde form is kebab-case.
+        assert_eq!(SecretStatus::Retired.to_string(), "Retired");
+        assert_eq!(
+            serde_json::to_value(SecretStatus::Retired).unwrap(),
+            serde_json::json!("retired")
+        );
+        assert_eq!(
+            serde_json::from_value::<SecretStatus>(serde_json::json!("retired")).unwrap(),
+            SecretStatus::Retired
+        );
     }
 }

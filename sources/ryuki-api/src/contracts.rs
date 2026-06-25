@@ -1052,6 +1052,7 @@ pub fn routes() -> Router {
         .route("/api/protect/secrets", post(secrets_register))
         .route("/api/protect/secrets/{id}", get(secrets_get))
         .route("/api/protect/secrets/{id}", put(secrets_update))
+        .route("/api/protect/secrets/{id}", delete(secrets_deregister))
         .route("/api/protect/secrets/{id}/rotate", post(secrets_rotate))
         .route(
             "/api/protect/secrets/{id}/history",
@@ -25763,6 +25764,37 @@ async fn secrets_update(
     ))
 }
 
+/// DELETE /api/protect/secrets/{id} — soft-RETIRE (deregister) a managed secret
+/// (#49 deregister half). Sets status=retired so it STOPS rotating (excluded
+/// from due/expiring/rotate-all and a direct rotate is refused), while PRESERVING
+/// the row and its rotation_runs history — this is NOT a hard delete. Idempotent:
+/// re-retiring an already-retired secret is a no-op success. 404 if missing; 503
+/// with no DB.
+async fn secrets_deregister(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // DB form is the serde (kebab-case) string, like every other status write.
+    let retired = serde_enum_str(&secrets_rotation::SecretStatus::Retired);
+    let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
+        "UPDATE managed_secrets SET status = $1 WHERE id = $2 \
+         RETURNING {MANAGED_SECRET_COLUMNS}"
+    ))
+    .bind(&retired)
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+    match row {
+        Some(secret) => Ok(Json(json!({
+            "source": "database",
+            "retired": true,
+            "secret": secret.to_value(),
+        }))),
+        None => Err(secrets_not_found(format!("Secret '{id}' not found"))),
+    }
+}
+
 async fn secrets_rotate(
     Path(id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -25781,6 +25813,13 @@ async fn secrets_rotate(
             Some(r) => r.to_engine(),
             None => return Err(secrets_not_found(format!("Secret '{id}' not found"))),
         };
+        // A retired secret no longer rotates — refuse a direct rotate.
+        if secret.status == secrets_rotation::SecretStatus::Retired {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!("Secret '{id}' is retired and cannot be rotated")})),
+            ));
+        }
         // Version label is the next sequential run number across all runs.
         let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rotation_runs")
             .fetch_one(pool)
@@ -25793,9 +25832,13 @@ async fn secrets_rotate(
         );
 
         let mut tx = pool.begin().await.map_err(db_error)?;
-        sqlx::query(
+        // Guard `status <> 'retired'` INSIDE the write so a deregister that
+        // commits between the pre-check above and here cannot be overwritten
+        // (TOCTOU): if it was concurrently retired the update affects 0 rows, we
+        // record NO run, and refuse.
+        let res = sqlx::query(
             "UPDATE managed_secrets SET status = $1, last_rotated = $2, next_rotation_due = $3 \
-             WHERE id = $4",
+             WHERE id = $4 AND status <> 'retired'",
         )
         .bind(serde_enum_str(&updated.status))
         .bind(&updated.last_rotated)
@@ -25804,6 +25847,13 @@ async fn secrets_rotate(
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        if res.rows_affected() == 0 {
+            // Rolls back on drop; the secret was retired concurrently.
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": format!("Secret '{id}' is retired and cannot be rotated")})),
+            ));
+        }
         insert_rotation_run(&mut tx, &run).await?;
         tx.commit().await.map_err(db_error)?;
 
@@ -25831,7 +25881,8 @@ async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>
     if let Some(pool) = get_db() {
         let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
-             WHERE next_rotation_due::timestamptz <= now() ORDER BY site, id"
+             WHERE status <> 'retired' AND next_rotation_due::timestamptz <= now() \
+             ORDER BY site, id"
         ))
         .fetch_all(pool)
         .await
@@ -25855,7 +25906,8 @@ async fn secrets_expiring(
     if let Some(pool) = get_db() {
         let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
-             WHERE next_rotation_due::timestamptz >= now() \
+             WHERE status <> 'retired' \
+               AND next_rotation_due::timestamptz >= now() \
                AND next_rotation_due::timestamptz <= now() + make_interval(days => $1) \
              ORDER BY next_rotation_due, id"
         ))
@@ -25888,7 +25940,8 @@ async fn secrets_rotate_all(
         // labels continue sequentially from the current run count.
         let due: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
-             WHERE site = $1 AND next_rotation_due::timestamptz <= now() ORDER BY id"
+             WHERE site = $1 AND status <> 'retired' \
+               AND next_rotation_due::timestamptz <= now() ORDER BY id"
         ))
         .bind(site)
         .fetch_all(pool)
@@ -25902,13 +25955,22 @@ async fn secrets_rotate_all(
 
         let mut tx = pool.begin().await.map_err(db_error)?;
         let mut rotations = Vec::new();
-        for (offset, row) in due.iter().enumerate() {
+        for row in &due {
             let secret = row.to_engine();
-            let (updated, run) =
-                secrets_rotation::rotate_secret_record(&secret, "force-rotate-all", base + offset);
-            sqlx::query(
+            // Version index is keyed on runs ACTUALLY inserted so far (not the
+            // due-list offset), so a skipped (concurrently-retired) row leaves no
+            // gap that a later rotate could reuse.
+            let (updated, run) = secrets_rotation::rotate_secret_record(
+                &secret,
+                "force-rotate-all",
+                base + rotations.len(),
+            );
+            // Guard `status <> 'retired'` in the write: a secret retired between
+            // the SELECT and here is skipped (0 rows), so it is neither rotated
+            // nor given a run — no re-arming under concurrency.
+            let res = sqlx::query(
                 "UPDATE managed_secrets SET status = $1, last_rotated = $2, \
-                 next_rotation_due = $3 WHERE id = $4",
+                 next_rotation_due = $3 WHERE id = $4 AND status <> 'retired'",
             )
             .bind(serde_enum_str(&updated.status))
             .bind(&updated.last_rotated)
@@ -25917,8 +25979,10 @@ async fn secrets_rotate_all(
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
-            insert_rotation_run(&mut tx, &run).await?;
-            rotations.push(serde_json::to_value(&run).unwrap_or_default());
+            if res.rows_affected() == 1 {
+                insert_rotation_run(&mut tx, &run).await?;
+                rotations.push(serde_json::to_value(&run).unwrap_or_default());
+            }
         }
         tx.commit().await.map_err(db_error)?;
 
@@ -25980,7 +26044,10 @@ async fn secrets_rotation_fail(
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
-        sqlx::query("UPDATE managed_secrets SET status = $1 WHERE id = $2")
+        // A RETIRED secret stays retired — failing a (preserved) historical run
+        // must NOT flip it back to 'failed' and re-arm rotation. The run row is
+        // still marked failed above (history); only the parent is guarded.
+        sqlx::query("UPDATE managed_secrets SET status = $1 WHERE id = $2 AND status <> 'retired'")
             .bind(serde_enum_str(&secrets_rotation::SecretStatus::Failed))
             .bind(&failed.secret_id)
             .execute(&mut *tx)
@@ -26000,7 +26067,7 @@ async fn secrets_rotation_fail(
 }
 async fn secrets_contract() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/secrets"},{"method":"POST","path":"/api/protect/secrets"},{"method":"GET","path":"/api/protect/secrets/{id}"},{"method":"POST","path":"/api/protect/secrets/{id}/rotate"},{"method":"GET","path":"/api/protect/secrets/{id}/history"},{"method":"GET","path":"/api/protect/secrets/due"},{"method":"GET","path":"/api/protect/secrets/expiring"},{"method":"POST","path":"/api/protect/secrets/rotate-all"},{"method":"GET","path":"/api/protect/secrets/summary"},{"method":"POST","path":"/api/protect/secrets/fail"}]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/secrets"},{"method":"POST","path":"/api/protect/secrets"},{"method":"GET","path":"/api/protect/secrets/{id}"},{"method":"DELETE","path":"/api/protect/secrets/{id}"},{"method":"POST","path":"/api/protect/secrets/{id}/rotate"},{"method":"GET","path":"/api/protect/secrets/{id}/history"},{"method":"GET","path":"/api/protect/secrets/due"},{"method":"GET","path":"/api/protect/secrets/expiring"},{"method":"POST","path":"/api/protect/secrets/rotate-all"},{"method":"GET","path":"/api/protect/secrets/summary"},{"method":"POST","path":"/api/protect/secrets/fail"}]}),
     )
 }
 
@@ -34838,6 +34905,161 @@ mod secrets_rotation_db_tests {
             .fetch_optional(pool)
             .await
             .expect("read managed_secret status")
+    }
+
+    /// #49 deregister: DELETE soft-retires a secret — status becomes `retired`,
+    /// the row + history survive, and it stops rotating (excluded from due /
+    /// rotate-all, a direct rotate is refused, PUT keeps it retired). Idempotent;
+    /// 404 for a missing secret.
+    #[tokio::test]
+    async fn secrets_deregister_soft_retires_and_stops_rotation() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-retire-7a2";
+        let site = "RETTEST-z9";
+        // Active + OVERDUE (next_due in the past) at a UNIQUE site.
+        seed_secret(pool, id, site, "2020-01-01T00:00:00+00:00").await;
+        // A pre-existing rotation run, so we can prove HISTORY survives retire.
+        let run_id = "run-ret-hist-1";
+        sqlx::query(
+            "INSERT INTO rotation_runs \
+             (id, secret_id, started_at, completed_at, status, rotated_by, new_version) \
+             VALUES ($1, $2, '2025-01-01T00:00:00+00:00', '2025-01-01T00:00:02+00:00', \
+                     'completed', 'tester', 'v1')",
+        )
+        .bind(run_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed rotation_run");
+        assert_eq!(
+            run_count_for(pool, id).await,
+            1,
+            "one historical run seeded"
+        );
+
+        let has = |body: &Value, id: &str| -> bool {
+            body["secrets"]
+                .as_array()
+                .map(|a| a.iter().any(|s| s["id"] == serde_json::json!(id)))
+                .unwrap_or(false)
+        };
+
+        // Due before retiring.
+        let Ok(Json(due_before)) = secrets_due_rotations().await else {
+            cleanup_secret(pool, id).await;
+            panic!("due query failed");
+        };
+        assert!(has(&due_before, id), "overdue secret is due before retire");
+
+        // Soft retire.
+        let Ok(Json(out)) = secrets_deregister(Path(id.into())).await else {
+            cleanup_secret(pool, id).await;
+            panic!("deregister failed");
+        };
+        assert_eq!(out["retired"], serde_json::json!(true));
+        assert_eq!(secret_status(pool, id).await.as_deref(), Some("retired"));
+        // Soft retire is NON-destructive: the historical run survives.
+        assert_eq!(
+            run_count_for(pool, id).await,
+            1,
+            "retire must preserve rotation history"
+        );
+
+        // No longer due; rotate-all for the site skips it.
+        let Ok(Json(due_after)) = secrets_due_rotations().await else {
+            panic!("due query failed");
+        };
+        assert!(!has(&due_after, id), "retired secret is excluded from due");
+        let Ok(Json(ra)) = secrets_rotate_all(Query(SecretsSiteQuery {
+            site: Some(site.into()),
+        }))
+        .await
+        else {
+            panic!("rotate-all failed");
+        };
+        assert_eq!(
+            ra["rotated_count"],
+            serde_json::json!(0),
+            "rotate-all skips retired"
+        );
+
+        // A direct rotate is refused (409) and records NO run (history preserved).
+        let before_runs = run_count_for(pool, id).await;
+        let err = secrets_rotate(Path(id.into()), Extension(AuthSession::static_dry_run()))
+            .await
+            .expect_err("rotating a retired secret must be refused");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            run_count_for(pool, id).await,
+            before_runs,
+            "a refused rotate must not add a rotation run"
+        );
+
+        // REGRESSION: failing the preserved run must NOT un-retire the secret
+        // (a fail must never re-arm a retired secret for rotation).
+        let _ = secrets_rotation_fail(Json(SecretsFailRequest {
+            rotation_id: run_id.into(),
+            error: "post-retire failure".into(),
+        }))
+        .await
+        .expect("fail-run on a retired secret");
+        assert_eq!(
+            secret_status(pool, id).await.as_deref(),
+            Some("retired"),
+            "failing a run must NOT un-retire the secret"
+        );
+        let Ok(Json(due_post_fail)) = secrets_due_rotations().await else {
+            panic!("due query failed");
+        };
+        assert!(
+            !has(&due_post_fail, id),
+            "still excluded from due after a fail"
+        );
+        assert_eq!(
+            secrets_rotate(Path(id.into()), Extension(AuthSession::static_dry_run()))
+                .await
+                .expect_err("still refused")
+                .0,
+            StatusCode::CONFLICT
+        );
+
+        // Re-deregister is idempotent.
+        let Ok(Json(again)) = secrets_deregister(Path(id.into())).await else {
+            panic!("idempotent re-deregister failed");
+        };
+        assert_eq!(again["retired"], serde_json::json!(true));
+        assert_eq!(secret_status(pool, id).await.as_deref(), Some("retired"));
+
+        // PUT metadata-update on a retired secret is allowed (record corrections)
+        // and must NOT un-retire it.
+        let _ = secrets_update(
+            Path(id.into()),
+            Json(SecretsUpdateRequest {
+                name: Some("corrected-name".into()),
+                owner: None,
+                site: None,
+                interval_days: None,
+            }),
+        )
+        .await
+        .expect("update on a retired secret");
+        assert_eq!(
+            secret_status(pool, id).await.as_deref(),
+            Some("retired"),
+            "PUT must not un-retire"
+        );
+
+        // Deregistering a missing secret is a 404.
+        let err = secrets_deregister(Path("sr-not-a-real-secret-xyz".into()))
+            .await
+            .expect_err("deregistering a missing secret must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        cleanup_secret(pool, id).await;
     }
 
     #[tokio::test]
