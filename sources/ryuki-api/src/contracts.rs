@@ -159,6 +159,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/audit/log/verify", post(audit_log_verify))
+        .route("/api/audit/export", get(audit_export))
         .route("/api/ops/scheduler/schedules", get(scheduler_schedules))
         .route("/api/ops/scheduler/executions", get(scheduler_executions))
         .route("/api/metrics/samples", post(metrics_record_sample))
@@ -15247,6 +15248,79 @@ async fn activity_audit_feed(
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
     Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
+}
+
+/// Query params for the SIEM audit export.
+#[derive(Debug, Deserialize, Default)]
+struct AuditExportParams {
+    /// Inclusive lower time bound (RFC3339).
+    since: Option<String>,
+    /// Inclusive upper time bound (RFC3339).
+    until: Option<String>,
+    /// Cursor: return rows with id strictly greater than this (default 0).
+    after_id: Option<i64>,
+    /// Max rows per page (default 500, capped 5000).
+    limit: Option<i64>,
+}
+
+/// GET /api/audit/export — export the audit trail for SIEM ingestion. Audit-tier.
+/// Cursor-paginated by the monotonic row id (`after_id` → `next_after_id`), with
+/// an optional `[since, until]` time window. Detail is redacted; each entry
+/// carries its hash-chain `entry_hash` so the SIEM can correlate with the verify
+/// endpoint. In dry-run / no-DB mode there is no durable chain, so this returns
+/// an empty export. The cursor yields no duplicates; for guaranteed completeness
+/// (no gaps under concurrency) periodically re-export a CLOSED time window — see
+/// `audit::export_audit`. Use the cursor with a stable window, or id-only.
+async fn audit_export(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AuditExportParams>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to export the audit trail"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "durable": false,
+            "entries": [],
+            "count": 0,
+            "next_after_id": null,
+            "note": "no database configured; the durable audit log only exists in DB mode"
+        })));
+    };
+    // Parse the optional time bounds; reject a malformed one rather than ignore it.
+    let parse_ts = |raw: &Option<String>| -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| Some(d.with_timezone(&chrono::Utc)))
+                .map_err(|_| ()),
+            None => Ok(None),
+        }
+    };
+    let since =
+        parse_ts(&params.since).map_err(|_| status_400("since must be an RFC3339 timestamp"))?;
+    let until =
+        parse_ts(&params.until).map_err(|_| status_400("until must be an RFC3339 timestamp"))?;
+    let after_id = params.after_id.unwrap_or(0).max(0);
+    let limit = params.limit.unwrap_or(500).clamp(1, 5000);
+
+    match audit::export_audit(pool, since, until, after_id, limit).await {
+        Ok(export) => Ok(Json(json!({
+            "durable": true,
+            "entries": export.entries,
+            "count": export.entries.len(),
+            "next_after_id": export.next_after_id,
+        }))),
+        Err(e) => {
+            tracing::error!(error = %e, "audit export query failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not export the audit trail"})),
+            ))
+        }
+    }
 }
 
 /// POST /api/audit/log/verify — re-verify the audit-log hash chain and report

@@ -511,6 +511,113 @@ impl AuditLogRow {
     }
 }
 
+/// One audit row for SIEM export — like [`AuditLogRow`] plus the chain
+/// `entry_hash` so a SIEM can correlate and verify integrity.
+#[derive(sqlx::FromRow)]
+struct AuditExportRow {
+    id: i64,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+    request_id: Option<uuid::Uuid>,
+    actor_principal: String,
+    actor_display: Option<String>,
+    actor_roles: Vec<String>,
+    provider_mode: String,
+    action: String,
+    from_stage: Option<String>,
+    to_stage: String,
+    from_status: Option<String>,
+    to_status: String,
+    detail: Option<String>,
+    outcome: String,
+    entry_hash: Option<String>,
+}
+
+impl AuditExportRow {
+    fn to_json(&self) -> Value {
+        let detail: Value = self
+            .detail
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_else(|| json!({}));
+        json!({
+            "id": self.id,
+            "occurred_at": self.occurred_at.to_rfc3339(),
+            "request_id": self.request_id.map(|u| u.to_string()),
+            "actor_principal": self.actor_principal,
+            "actor_display": self.actor_display,
+            "actor_roles": self.actor_roles,
+            "provider_mode": self.provider_mode,
+            "action": self.action,
+            "from_stage": self.from_stage,
+            "to_stage": self.to_stage,
+            "from_status": self.from_status,
+            "to_status": self.to_status,
+            // Redacted (same as the feed) — a SIEM export must never carry a
+            // secret that slipped into the detail blob.
+            "detail": redact_detail(&detail),
+            "outcome": self.outcome,
+            "entry_hash": self.entry_hash,
+        })
+    }
+}
+
+/// A page of exported audit entries plus the cursor for the next page.
+pub struct AuditExport {
+    pub entries: Vec<Value>,
+    /// Pass as `after_id` to fetch the next page; `None` when nothing was
+    /// returned (the caller has reached the end of the available rows).
+    pub next_after_id: Option<i64>,
+}
+
+/// Export audit entries for SIEM ingestion: FORWARD (ascending id) from
+/// `after_id`, optionally bounded to `[since, until]`, up to `limit` rows.
+/// Cursor-based on the monotonic BIGSERIAL id so a SIEM pulls incrementally and
+/// never sees a DUPLICATE (`id > after_id`).
+///
+/// CAVEAT — gaps under concurrency: a BIGSERIAL id is allocated at insert time,
+/// not commit time, so a long-running transaction that obtained a LOWER id can
+/// commit AFTER a higher id the export already advanced past — that lower row is
+/// then skipped (a gap, not a duplicate). Audit inserts run inside short
+/// request-transition transactions, so this is rare, but for guaranteed
+/// completeness a SIEM should periodically RE-EXPORT a CLOSED time window
+/// (`since`+`until` both set, comfortably in the past) and reconcile by id; the
+/// chain `entry_hash` verify endpoint independently detects any true tampering.
+/// Use the `after_id` cursor with a STABLE window (or id-only, no window) — do
+/// NOT advance the cursor while changing the window, or rows below the cursor in
+/// the new window are missed.
+///
+/// The detail is redacted; the chain `entry_hash` is included for integrity.
+pub async fn export_audit(
+    pool: &PgPool,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    after_id: i64,
+    limit: i64,
+) -> Result<AuditExport, sqlx::Error> {
+    let rows = sqlx::query_as::<_, AuditExportRow>(
+        "SELECT id, occurred_at, request_id, actor_principal, actor_display, actor_roles, \
+                provider_mode, action, from_stage, to_stage, from_status, to_status, \
+                detail::text AS detail, outcome, entry_hash \
+         FROM audit_log \
+         WHERE id > $1 \
+           AND ($2::timestamptz IS NULL OR occurred_at >= $2) \
+           AND ($3::timestamptz IS NULL OR occurred_at <= $3) \
+         ORDER BY id ASC LIMIT $4",
+    )
+    .bind(after_id)
+    .bind(since)
+    .bind(until)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let next_after_id = rows.last().map(|r| r.id);
+    let entries: Vec<Value> = rows.iter().map(AuditExportRow::to_json).collect();
+    Ok(AuditExport {
+        entries,
+        next_after_id,
+    })
+}
+
 /// Result of re-verifying the audit hash chain.
 pub struct ChainVerification {
     /// True when every chained row's content hash and prev→entry link are intact.
@@ -782,5 +889,83 @@ mod audit_chain_db_tests {
             "at least the three rows just appended are chained (checked={})",
             result.checked
         );
+    }
+
+    #[tokio::test]
+    async fn export_audit_paginates_by_cursor() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // audit_log is append-only (DELETE raises), so use a UNIQUE actor per run
+        // — our rows are then the newest and isolated, no cleanup needed.
+        let actor = format!("audit-export-{}", uuid::Uuid::new_v4());
+        let actor = actor.as_str();
+
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = actor.into();
+        session.provider_mode = "entra-id".into();
+        session.roles = vec!["approver".into()];
+        for i in 0..3 {
+            record_audit(
+                pool,
+                &session,
+                &AuditRecord {
+                    action: "request.approve",
+                    request_id: None,
+                    from_status: Some("planned"),
+                    to_status: "approved",
+                    from_stage: Some("plan"),
+                    to_stage: "approve",
+                    detail: json!({ "n": i }),
+                    outcome: "applied",
+                },
+            )
+            .await
+            .expect("record");
+        }
+
+        // Our three rows are the newest (serial lock), so a cursor just below our
+        // MIN(id) yields exactly them in order.
+        let min_id: i64 =
+            sqlx::query_scalar("SELECT MIN(id) FROM audit_log WHERE actor_principal = $1")
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let start = min_id - 1;
+
+        // Page 1: 2 of 3, with a forward cursor + chained entry_hash present.
+        let p1 = export_audit(pool, None, None, start, 2).await.expect("p1");
+        assert_eq!(p1.entries.len(), 2, "first page is limit-bounded");
+        assert!(
+            p1.entries.iter().all(|e| e["actor_principal"] == actor),
+            "only our rows are in this id window"
+        );
+        assert!(
+            p1.entries.iter().all(|e| e["entry_hash"].is_string()),
+            "chained rows carry an entry_hash for integrity"
+        );
+        let cursor = p1.next_after_id.expect("a next cursor");
+
+        // Page 2: the remaining row, then the cursor is exhausted.
+        let p2 = export_audit(pool, None, None, cursor, 2).await.expect("p2");
+        assert_eq!(p2.entries.len(), 1, "second page has the last row");
+        let end = p2.next_after_id.expect("cursor");
+        let p3 = export_audit(pool, None, None, end, 2).await.expect("p3");
+        assert!(
+            p3.entries.is_empty() && p3.next_after_id.is_none(),
+            "exhausted"
+        );
+
+        // A time window in the far past returns nothing.
+        let past = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let windowed = export_audit(pool, None, Some(past), start, 100)
+            .await
+            .expect("windowed");
+        assert!(windowed.entries.is_empty(), "no rows before 2000");
     }
 }
