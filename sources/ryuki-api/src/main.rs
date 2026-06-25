@@ -745,6 +745,30 @@ fn is_notifications_self_service_path(path: &str) -> bool {
     false
 }
 
+/// The user's own scope-preferences endpoint (#59) is self-service: the PUT is
+/// authorized at the ordinary read tier (`audit` OR `request`) rather than the
+/// fail-closed `admin` default, because every authenticated user holds one of
+/// those tiers and the handler's keying on the VERIFIED `session.user_id` (never
+/// a client-supplied id) is the real authorization boundary — exactly like the
+/// notifications self-service mutations. Scoped to the exact path so nothing
+/// else is affected.
+fn is_user_preferences_path(path: &str) -> bool {
+    path == "/api/me/preferences"
+}
+
+/// Whether a MUTATION is a self-service action gated at the read tier (audit OR
+/// request) rather than the fail-closed admin default. Method-AND-path exact:
+/// notification mark-read, and PUT of the user's own preferences. Anything else
+/// (a different method on the preferences path, a deeper path) falls through to
+/// the ordinary mutation gate.
+fn is_self_service_mutation(method: &Method, path: &str) -> bool {
+    if !is_unsafe_method(method) {
+        return false;
+    }
+    is_notifications_self_service_path(path)
+        || (*method == Method::PUT && is_user_preferences_path(path))
+}
+
 /// Builds the 403 ProblemDetails response for a missing mutating permission.
 fn forbidden(required: &str) -> Response {
     let body = serde_json::to_string(&ApiError::with_detail(
@@ -860,21 +884,22 @@ async fn auth_middleware(
     // read prefixes). Handler-level check_permission calls stay as
     // defense-in-depth.
     if !is_auth_exempt_path(&path) {
-        // Notification self-service mutations are gated like reads (audit OR
-        // request), not as ordinary mutations (which would fall to the admin
-        // default); the repo's recipient filter is the real boundary.
-        let notif_self_service =
-            is_unsafe_method(&method) && is_notifications_self_service_path(&path);
-        let required = if is_unsafe_method(&method) && !notif_self_service {
+        // Self-service mutations (notification mark-read, the user's own scope
+        // preferences) are gated like reads (audit OR request), not as ordinary
+        // mutations (which would fall to the admin default); the handler's keying
+        // on the verified session.user_id is the real boundary.
+        let self_service = is_self_service_mutation(&method, &path);
+        let required = if is_unsafe_method(&method) && !self_service {
             route_permission_for(&method, &path)
         } else {
             read_permission_for(&path)
         };
-        // Mutations require the exact route permission; reads — and notification
-        // self-service mutations — use the shared read_authorized tier (sensitive
-        // -> admin; ordinary -> audit OR request) so a recipient can manage their
-        // own feed and a Requester can view their own requests.
-        let authorized = if is_unsafe_method(&method) && !notif_self_service {
+        // Mutations require the exact route permission; reads — and self-service
+        // mutations — use the shared read_authorized tier (sensitive -> admin;
+        // ordinary -> audit OR request) so a recipient can manage their own feed,
+        // a user can set their own preferences, and a Requester can view their
+        // own requests.
+        let authorized = if is_unsafe_method(&method) && !self_service {
             ryuki_engine::auth::check_permission(&session, required)
         } else {
             read_authorized(&session, &path)
@@ -2540,6 +2565,46 @@ mod tests {
             "/api/notifications/read"
         )); // missing id
         assert!(!is_notifications_self_service_path("/api/other/pn-1/read"));
+    }
+
+    #[test]
+    fn user_preferences_self_service_matcher_is_exact() {
+        // Only the exact preferences path gets the relaxed (read-tier) mutation
+        // gate; nothing adjacent inherits it.
+        assert!(is_user_preferences_path("/api/me/preferences"));
+        assert!(!is_user_preferences_path("/api/me/preferences/extra"));
+        assert!(!is_user_preferences_path("/api/me/preferences/"));
+        assert!(!is_user_preferences_path("/api/me"));
+        assert!(!is_user_preferences_path("/api/me/other"));
+        assert!(!is_user_preferences_path("/api/users/preferences"));
+    }
+
+    #[test]
+    fn self_service_mutation_is_method_and_path_exact() {
+        // PUT preferences IS self-service; any OTHER method on that path is NOT
+        // (it falls through to the fail-closed admin default).
+        assert!(is_self_service_mutation(
+            &Method::PUT,
+            "/api/me/preferences"
+        ));
+        for m in [Method::POST, Method::PATCH, Method::DELETE] {
+            assert!(
+                !is_self_service_mutation(&m, "/api/me/preferences"),
+                "{m} on the preferences path must NOT be self-service"
+            );
+        }
+        // A safe method is never a "mutation" exemption (reads use read_authorized).
+        assert!(!is_self_service_mutation(
+            &Method::GET,
+            "/api/me/preferences"
+        ));
+        // Notification mark-read stays self-service for its unsafe method.
+        assert!(is_self_service_mutation(
+            &Method::POST,
+            "/api/notifications/read-all"
+        ));
+        // An unrelated mutation is not self-service.
+        assert!(!is_self_service_mutation(&Method::POST, "/api/requests"));
     }
 
     #[test]

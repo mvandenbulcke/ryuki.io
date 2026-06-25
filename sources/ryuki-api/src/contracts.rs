@@ -166,6 +166,10 @@ pub fn routes() -> Router {
         .route("/api/audit/export", get(audit_export))
         .route("/api/audit/retention", get(audit_retention_report))
         .route(
+            "/api/me/preferences",
+            get(user_preferences_get).put(user_preferences_put),
+        )
+        .route(
             "/api/observe/oncall/contacts",
             get(on_call_contact_list).post(on_call_contact_create),
         )
@@ -15159,6 +15163,108 @@ async fn requests_audit(
     ))
 }
 
+// ─── Per-user scope preferences (#59 backend) ───
+
+/// Body for PUT /api/me/preferences. A full replace: an absent or null field
+/// clears that preference. `deny_unknown_fields` rejects typos.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserPreferencesRequest {
+    preferred_site: Option<String>,
+    preferred_environment: Option<String>,
+}
+
+/// Normalise a scope-preference value: reject control characters in the RAW
+/// input, then trim, treat empty as "no preference" (None), bound to 64 chars.
+fn normalize_scope_value(v: Option<String>) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    match v {
+        None => Ok(None),
+        Some(s) => {
+            // Reject ANY control character in the RAW input (BEFORE trimming), so
+            // a stray newline/tab is rejected, not silently swallowed by trim().
+            if s.chars().any(|c| c.is_control()) {
+                return Err(status_400(
+                    "scope value must not contain control characters",
+                ));
+            }
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(None);
+            }
+            if t.chars().count() > 64 {
+                return Err(status_400("scope value must be at most 64 characters"));
+            }
+            Ok(Some(t.to_string()))
+        }
+    }
+}
+
+/// GET /api/me/preferences — the CURRENT user's scope preferences (#59).
+/// Keyed on the verified `session.user_id`; returns nulls when none are set.
+/// Self-service (any authenticated user); empty + `durable:false` with no DB.
+async fn user_preferences_get(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "preferred_site": null,
+            "preferred_environment": null,
+            "durable": false,
+        })));
+    };
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT preferred_site, preferred_environment FROM user_preferences WHERE user_id = $1",
+    )
+    .bind(&session.user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+    let (site, env) = row.unwrap_or((None, None));
+    Ok(Json(json!({
+        "preferred_site": site,
+        "preferred_environment": env,
+        "durable": true,
+    })))
+}
+
+/// PUT /api/me/preferences — set the CURRENT user's scope preferences (#59).
+/// Full replace (absent/null/empty clears a field). Keyed on the verified
+/// `session.user_id` — a client cannot write another user's preferences.
+/// Self-service; 503 with no DB.
+async fn user_preferences_put(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<UserPreferencesRequest>,
+) -> ApiResult {
+    let site = normalize_scope_value(body.preferred_site)?;
+    let env = normalize_scope_value(body.preferred_environment)?;
+
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "database not configured; cannot persist preferences"})),
+        ));
+    };
+    sqlx::query(
+        "INSERT INTO user_preferences \
+         (user_id, preferred_site, preferred_environment, updated_at) \
+         VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (user_id) DO UPDATE SET \
+           preferred_site = EXCLUDED.preferred_site, \
+           preferred_environment = EXCLUDED.preferred_environment, \
+           updated_at = NOW()",
+    )
+    .bind(&session.user_id)
+    .bind(&site)
+    .bind(&env)
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+
+    Ok(Json(json!({
+        "preferred_site": site,
+        "preferred_environment": env,
+        "durable": true,
+    })))
+}
+
 /// Query for GET /api/requests/{id}/approval-quorum.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29651,6 +29757,59 @@ mod unit_tests {
         .expect_err("a malformed request_id must 404, not return an empty 200");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
+
+    // ── #59 user scope preferences — no-DB handler paths ──
+
+    #[tokio::test]
+    async fn user_preferences_get_without_db_is_not_durable() {
+        let Ok(Json(body)) =
+            user_preferences_get(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
+            panic!("no-DB get should be 200");
+        };
+        assert_eq!(body["durable"], serde_json::json!(false));
+        assert_eq!(body["preferred_site"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn user_preferences_put_validates_value() {
+        let too_long = "x".repeat(65);
+        let err = user_preferences_put(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(UserPreferencesRequest {
+                preferred_site: Some(too_long),
+                preferred_environment: None,
+            }),
+        )
+        .await
+        .expect_err("an over-long value must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = user_preferences_put(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(UserPreferencesRequest {
+                preferred_site: Some("bad\nvalue".into()),
+                preferred_environment: None,
+            }),
+        )
+        .await
+        .expect_err("a control character must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn user_preferences_put_without_db_is_503() {
+        let err = user_preferences_put(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(UserPreferencesRequest {
+                preferred_site: Some("GBLON".into()),
+                preferred_environment: None,
+            }),
+        )
+        .await
+        .expect_err("a write with no DB must be 503");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 /// Live-DB integration tests for the transactional/CAS lifecycle (B2), logout
@@ -31808,6 +31967,72 @@ mod db_lifecycle_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         cleanup(pool).await;
+    }
+
+    /// #59: a user's scope preferences round-trip (set → read → clear), keyed on
+    /// the verified session.user_id (a unique user so it never collides).
+    #[tokio::test]
+    async fn user_preferences_set_get_clear_roundtrip() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let uid = format!("pref-user-{}", Uuid::new_v4());
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = uid.clone();
+
+        // Set both.
+        let Ok(Json(set)) = user_preferences_put(
+            AuthExtractor(session.clone()),
+            Json(UserPreferencesRequest {
+                preferred_site: Some(" GBLON ".into()), // trims to GBLON
+                preferred_environment: Some("production".into()),
+            }),
+        )
+        .await
+        else {
+            sqlx::query("DELETE FROM user_preferences WHERE user_id = $1")
+                .bind(&uid)
+                .execute(pool)
+                .await
+                .ok();
+            panic!("put failed");
+        };
+        assert_eq!(set["preferred_site"], serde_json::json!("GBLON"));
+        assert_eq!(set["durable"], serde_json::json!(true));
+
+        // Read back.
+        let Ok(Json(got)) = user_preferences_get(AuthExtractor(session.clone())).await else {
+            panic!("get failed");
+        };
+        assert_eq!(got["preferred_site"], serde_json::json!("GBLON"));
+        assert_eq!(
+            got["preferred_environment"],
+            serde_json::json!("production")
+        );
+
+        // Clear (null + whitespace-only both clear).
+        let _ = user_preferences_put(
+            AuthExtractor(session.clone()),
+            Json(UserPreferencesRequest {
+                preferred_site: None,
+                preferred_environment: Some("   ".into()),
+            }),
+        )
+        .await
+        .expect("clear");
+        let Ok(Json(cleared)) = user_preferences_get(AuthExtractor(session.clone())).await else {
+            panic!("get after clear failed");
+        };
+        assert_eq!(cleared["preferred_site"], serde_json::Value::Null);
+        assert_eq!(cleared["preferred_environment"], serde_json::Value::Null);
+
+        sqlx::query("DELETE FROM user_preferences WHERE user_id = $1")
+            .bind(&uid)
+            .execute(pool)
+            .await
+            .ok();
     }
 }
 
