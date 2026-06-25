@@ -1665,19 +1665,7 @@ async fn main() {
     // before the agent-router split (auth_middleware ran on them; they are NOT in
     // is_auth_exempt_path) — they expose metrics and config/status that must
     // require a session, so they stay inside the human-gated router.
-    let human_gated_app = Router::new()
-        .route("/metrics", get(metrics))
-        .route("/api/validation/run", get(validation_run))
-        .route("/api/platform/status", get(platform_status))
-        .route("/api/platform/uptime", get(uptime))
-        .route(
-            "/api/platform/health/dependencies",
-            get(platform_self_health),
-        )
-        .merge(agents::admin_routes())
-        .merge(contracts::routes())
-        .merge(boundary::routes())
-        .merge(integration::routes())
+    let human_gated_app = build_human_gated_routes()
         // Idempotency runs INSIDE auth (auth gates first, then this), so an
         // unauthorized request never claims a key. Opt-in per request via the
         // Idempotency-Key header; no header / no DB → pass-through (unchanged).
@@ -2195,6 +2183,29 @@ fn format_uptime(seconds: u64) -> String {
     format!("{days}d {hours}h {minutes}m {secs}s")
 }
 
+/// The route SKELETON for the human-session-gated app — every `.route()`/
+/// `.merge()` for the inner router, WITHOUT the auth/idempotency layers (which
+/// need runtime deps). Extracted so a test can CONSTRUCT it: building the merged
+/// matchit tree validates every route path, so a bad path syntax (e.g. the
+/// axum-0.7 `:id` that once crashed startup) or a route overlap panics in a
+/// test instead of only at server boot. `main()` calls this, then applies the
+/// layers — behaviour is identical.
+fn build_human_gated_routes() -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .route("/api/validation/run", get(validation_run))
+        .route("/api/platform/status", get(platform_status))
+        .route("/api/platform/uptime", get(uptime))
+        .route(
+            "/api/platform/health/dependencies",
+            get(platform_self_health),
+        )
+        .merge(agents::admin_routes())
+        .merge(contracts::routes())
+        .merge(boundary::routes())
+        .merge(integration::routes())
+}
+
 async fn not_found() -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::NOT_FOUND,
@@ -2565,6 +2576,21 @@ mod tests {
             "/api/notifications/read"
         )); // missing id
         assert!(!is_notifications_self_service_path("/api/other/pn-1/read"));
+    }
+
+    #[test]
+    fn full_app_route_tree_builds_without_panic() {
+        // Regression guard for the whole app: constructing the merged route tree
+        // runs matchit's path validation across EVERY merged router (infra,
+        // agent-token, and all human-gated routers — agents/contracts/boundary/
+        // integration). A bad route-path syntax (the axum-0.7 `:id` that once
+        // crashed server startup) or a route overlap panics HERE — in a test —
+        // instead of only when the server boots. main() merges this same set.
+        let _app = Router::new()
+            .route("/health", get(health))
+            .route("/ready", get(ready))
+            .merge(agents::agent_routes())
+            .merge(build_human_gated_routes());
     }
 
     #[test]
