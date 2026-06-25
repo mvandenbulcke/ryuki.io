@@ -100,6 +100,16 @@ implementing **all 66**. This file tracks execution.
 _Legend: E = effort (S/M/L), V = value (H/M), 📋 = in `missing-features.md`.
 `[x]` shipped · `[~]` partial (core shipped; follow-up tracked) · `[ ]` not started._
 
+## Swarm review (2026-06-25)
+
+After the clean/additive items above were shipped, a 61-agent multi-lens swarm
+review surfaced **41 confirmed new gaps** (real + not-already-covered) — see
+[swarm-findings-2026-06-25.md](swarm-findings-2026-06-25.md). These are the
+refreshed work queue; the cleanest (High/Small/CI-validatable) are being worked
+first. Top: missing CHECK constraints on `requests` enum columns
+(request_type/status/criticality/stage), false-healthy `health_monitor`
+hardcoded-Healthy checks, dead `site_status`/`component_status` persistence.
+
 **Shipped:** #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`), #8 agent
 approve — revoke deferred (`6d6fb5b`), #63 observability deploy (`0ce0ed3`).
 
