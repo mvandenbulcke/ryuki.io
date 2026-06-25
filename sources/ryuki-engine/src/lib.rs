@@ -76,6 +76,7 @@ pub mod servicenow_future_api;
 pub mod shift_queue;
 pub mod shift_readiness;
 pub mod site_registry;
+pub mod slo;
 pub mod snapshot_engine;
 pub mod snapshot_governance;
 pub mod software_deployment;

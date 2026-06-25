@@ -186,6 +186,8 @@ pub fn routes() -> Router {
         )
         .route("/api/metrics/budgets/status", get(metrics_budget_status))
         .route("/api/metrics/commitment", get(metrics_commitment))
+        .route("/api/metrics/slo", post(slo_create).get(slo_list))
+        .route("/api/metrics/slo/status", get(slo_status))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -16856,6 +16858,283 @@ async fn metrics_commitment(
     })))
 }
 
+// ─── SLO / error-budget tracking (#25) ───
+
+const SLO_COLUMNS: &str =
+    "id, name, target, window_days, good_metric_key, total_metric_key, site, environment, enabled";
+
+/// One persisted slo_definitions row.
+#[derive(sqlx::FromRow)]
+struct SloDefRow {
+    id: String,
+    name: String,
+    target: f64,
+    window_days: i32,
+    good_metric_key: String,
+    total_metric_key: String,
+    site: Option<String>,
+    environment: Option<String>,
+    enabled: bool,
+}
+
+/// Body for creating an SLO definition.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SloCreateRequest {
+    name: String,
+    target: f64,
+    #[serde(default)]
+    window_days: Option<i32>,
+    good_metric_key: String,
+    total_metric_key: String,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    environment: Option<String>,
+}
+
+/// Sum a metric's values over the CLOSED window `[since, until]` within a
+/// coherent scope (omitted site/env = the platform-wide IS NULL rows). The upper
+/// bound matters: without it a future-dated sample would leak into the window
+/// and skew the SLO. SLO good/total metrics are COUNTER-style event counts — a
+/// SUM is meaningful only for additive (incrementing) samples, NOT a gauge.
+/// Returns 0.0 when there are no samples.
+async fn sum_metric_in_window(
+    pool: &sqlx::PgPool,
+    metric_key: &str,
+    site: &Option<String>,
+    environment: &Option<String>,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Result<f64, sqlx::Error> {
+    let sum: Option<f64> = sqlx::query_scalar(
+        "SELECT SUM(value) FROM metric_samples \
+         WHERE metric_key = $1 \
+           AND site IS NOT DISTINCT FROM $2 \
+           AND environment IS NOT DISTINCT FROM $3 \
+           AND observed_at >= $4 \
+           AND observed_at <= $5",
+    )
+    .bind(metric_key)
+    .bind(site)
+    .bind(environment)
+    .bind(since)
+    .bind(until)
+    .fetch_one(pool)
+    .await?;
+    Ok(sum.unwrap_or(0.0))
+}
+
+/// POST /api/metrics/slo — define an SLO. Execute-tier. 503 when no DB.
+/// `good_metric_key`/`total_metric_key` MUST be COUNTER-style event-count
+/// metrics — the status endpoint SUMs them over the window, which is only
+/// meaningful for additive samples (a gauge would produce nonsense compliance).
+async fn slo_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<SloCreateRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to define SLOs"})),
+        ));
+    }
+    let name = b.name.trim();
+    if name.is_empty() || name.len() > 200 {
+        return Err(status_400("name must be 1..=200 characters"));
+    }
+    if !(b.target.is_finite() && b.target > 0.0 && b.target < 1.0) {
+        return Err(status_400(
+            "target must be a fraction in the open interval (0, 1)",
+        ));
+    }
+    let window = b.window_days.unwrap_or(30);
+    if !(1..=365).contains(&window) {
+        return Err(status_400("window_days must be between 1 and 365"));
+    }
+    let good_key = b.good_metric_key.trim();
+    let total_key = b.total_metric_key.trim();
+    if let Some(msg) = metric_key_rejection(good_key).or_else(|| metric_key_rejection(total_key)) {
+        return Err(status_400(msg));
+    }
+    if metric_scope_too_long(&b.site) || metric_scope_too_long(&b.environment) {
+        return Err(status_400(
+            "site/environment must be at most 200 characters",
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO slo_definitions \
+         (id, name, target, window_days, good_metric_key, total_metric_key, site, environment) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(b.target)
+    .bind(window)
+    .bind(good_key)
+    .bind(total_key)
+    .bind(norm(&b.site))
+    .bind(norm(&b.environment))
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(json!({ "id": id, "created": true })))
+}
+
+/// GET /api/metrics/slo — list SLO definitions. Request-tier read.
+async fn slo_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read SLOs"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"slos": [], "durable": false})));
+    };
+    let rows: Vec<SloDefRow> = match sqlx::query_as(&format!(
+        "SELECT {SLO_COLUMNS} FROM slo_definitions ORDER BY created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing SLOs failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list SLOs"})),
+            ));
+        }
+    };
+    let slos: Vec<Value> = rows
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id, "name": s.name, "target": s.target,
+                "window_days": s.window_days, "good_metric_key": s.good_metric_key,
+                "total_metric_key": s.total_metric_key, "site": s.site,
+                "environment": s.environment, "enabled": s.enabled,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "slos": slos, "durable": true })))
+}
+
+/// GET /api/metrics/slo/status — evaluate every enabled SLO over its window
+/// (sum good/total from metric_samples, compute attainment + error-budget burn).
+/// Request-tier. Alerting-safe: a per-SLO query failure marks it `error` (never
+/// a false `compliant`), and a window with no events is `insufficient-data`.
+async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read SLO status"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let slos: Vec<SloDefRow> = match sqlx::query_as(&format!(
+        "SELECT {SLO_COLUMNS} FROM slo_definitions WHERE enabled ORDER BY created_at DESC"
+    ))
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing SLOs for status failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not evaluate SLO status"})),
+            ));
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let mut results: Vec<Value> = Vec::new();
+    let mut breached_count = 0u64;
+    let mut errored_count = 0u64;
+    for s in &slos {
+        let since = now - chrono::Duration::days(i64::from(s.window_days));
+        let good = sum_metric_in_window(
+            pool,
+            &s.good_metric_key,
+            &s.site,
+            &s.environment,
+            since,
+            now,
+        )
+        .await;
+        let total = sum_metric_in_window(
+            pool,
+            &s.total_metric_key,
+            &s.site,
+            &s.environment,
+            since,
+            now,
+        )
+        .await;
+        let (good, total) = match (good, total) {
+            (Ok(g), Ok(t)) => (g, t),
+            _ => {
+                errored_count += 1;
+                results.push(json!({
+                    "id": s.id, "name": s.name, "status": "error",
+                    "error": "could not sum this SLO's metrics",
+                }));
+                continue;
+            }
+        };
+        // No events yet (total 0) is benign — not a breach, not an error.
+        if total <= 0.0 {
+            results.push(json!({
+                "id": s.id, "name": s.name, "status": "insufficient-data",
+                "good": good, "total": total,
+            }));
+            continue;
+        }
+        match ryuki_engine::slo::compute_slo(good, total, s.target) {
+            Some(status) => {
+                if !status.compliant {
+                    breached_count += 1;
+                }
+                results.push(json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "window_days": s.window_days,
+                    "status": if status.compliant { "compliant" } else { "breached" },
+                    "slo": status,
+                }));
+            }
+            // total > 0 but the SLO is still unevaluable (good > total, or a
+            // negative sum) — a DATA inconsistency, NOT "no data". Flag it as
+            // errored so a clean breached_count is never mistaken for healthy.
+            None => {
+                errored_count += 1;
+                results.push(json!({
+                    "id": s.id, "name": s.name, "status": "invalid-data",
+                    "good": good, "total": total,
+                }));
+            }
+        }
+    }
+
+    let overall_status = if errored_count > 0 { "degraded" } else { "ok" };
+    Ok(Json(json!({
+        "slos": results,
+        "breached_count": breached_count,
+        "errored_count": errored_count,
+        "overall_status": overall_status,
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -29569,6 +29848,87 @@ mod db_lifecycle_tests {
             on_call_contact_get(Path(id.clone())).await.is_err(),
             "the contact is gone after delete"
         );
+    }
+
+    /// #25: an SLO over recorded good/total metrics reports its attainment and
+    /// compliance via the status endpoint (999/1000 meets a 0.999 target).
+    #[tokio::test]
+    async fn test_slo_status_computes_attainment() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let good_key = "test.slo.good.7p4";
+        let total_key = "test.slo.total.7p4";
+        for k in [good_key, total_key] {
+            sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+                .bind(k)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM slo_definitions WHERE good_metric_key = $1")
+            .bind(good_key)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        for (k, v) in [(good_key, 999.0f64), (total_key, 1000.0)] {
+            let _ = metrics_record_sample(
+                sess(),
+                Json(MetricSampleRequest {
+                    metric_key: k.to_string(),
+                    site: None,
+                    environment: None,
+                    value: v,
+                    observed_at: None,
+                }),
+            )
+            .await
+            .expect("record sample");
+        }
+        let _ = slo_create(
+            sess(),
+            Json(SloCreateRequest {
+                name: "test-slo".to_string(),
+                target: 0.999,
+                window_days: Some(7),
+                good_metric_key: good_key.to_string(),
+                total_metric_key: total_key.to_string(),
+                site: None,
+                environment: None,
+            }),
+        )
+        .await
+        .expect("create slo");
+
+        let Json(out) = slo_status(sess()).await.expect("status");
+        let slos = out["slos"].as_array().unwrap();
+        let mine = slos
+            .iter()
+            .find(|s| s["name"] == "test-slo")
+            .expect("our slo is in the status report");
+        assert_eq!(mine["status"], "compliant", "999/1000 meets a 0.999 target");
+        let attainment = mine["slo"]["attainment"].as_f64().unwrap();
+        assert!(
+            (attainment - 0.999).abs() < 1e-6,
+            "attainment ~0.999, got {attainment}"
+        );
+
+        for k in [good_key, total_key] {
+            sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+                .bind(k)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM slo_definitions WHERE good_metric_key = $1")
+            .bind(good_key)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// B4 (a)+(c): logout deletes ONLY the caller's own session and writes a
