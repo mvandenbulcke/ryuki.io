@@ -67,7 +67,7 @@ implementing **all 66**. This file tracks execution.
 | 35 | [x] | Anomaly / waste detection engine | AIOps | M | H | — |
 | 36 | [x] | AIOps suggestion-generation engine | AIOps | M | H | — |
 | 37 | [x] | What-if capacity & cost planning | AIOps | M | H | — |
-| 38 | [ ] | Storage array registration / lifecycle | API | M | M | — |
+| 38 | [x] | Storage array registration / lifecycle | API | M | M | — |
 | 39 | [ ] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | ✓ |
 | 40 | [ ] | Scheduled/recurring synthetic health checks | Observ | S | M | ✓ |
 | 41 | [ ] | Integration credential rotation / expiry | Integ | M | M | — |
