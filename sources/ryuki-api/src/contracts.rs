@@ -156,6 +156,10 @@ pub fn routes() -> Router {
             get(requests_execution_job),
         )
         .route("/api/requests/{id}/audit", get(requests_audit))
+        .route(
+            "/api/requests/{id}/approval-quorum",
+            get(requests_approval_quorum),
+        )
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/audit/log/verify", post(audit_log_verify))
@@ -15155,6 +15159,90 @@ async fn requests_audit(
     ))
 }
 
+/// Query for GET /api/requests/{id}/approval-quorum.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalQuorumQuery {
+    required_roles: Option<usize>,
+    required_approvers: Option<usize>,
+}
+
+/// GET /api/requests/{id}/approval-quorum — multi-role approval quorum status for
+/// one request (#4). Reads the recorded `request_approval_decisions` and reports
+/// whether they meet a breadth quorum: distinct approving ROLES and distinct
+/// APPROVERS (default 2/2, bounded 1..=10), with any rejection blocking it.
+/// Audit-tier (approval identities, like the audit trail). 404 unknown request.
+/// READ-ONLY: reports the quorum; it does not yet ENFORCE it in the approval
+/// flow (that is a tracked follow-up). Empty + `durable:false` with no DB.
+async fn requests_approval_quorum(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+    Query(q): Query<ApprovalQuorumQuery>,
+) -> ApiResult {
+    use ryuki_engine::approval_quorum::{evaluate_quorum, ApprovalDecision};
+
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read approval quorum"})),
+        ));
+    }
+    let required_roles = q.required_roles.unwrap_or(2);
+    let required_approvers = q.required_approvers.unwrap_or(2);
+    if !(1..=10).contains(&required_roles) || !(1..=10).contains(&required_approvers) {
+        return Err(status_400(
+            "required_roles and required_approvers must be between 1 and 10",
+        ));
+    }
+
+    // Same shape both paths so clients never special-case no-DB.
+    let render = |status: &ryuki_engine::approval_quorum::QuorumStatus, durable: bool| -> Value {
+        let mut body = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
+        body["durable"] = json!(durable);
+        body
+    };
+
+    // Validate the id format UP FRONT so a malformed request_id is a 404 in BOTH
+    // the DB and no-DB paths (consistent contract regardless of DB availability).
+    let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+
+    let Some(pool) = get_db() else {
+        let status = evaluate_quorum(&[], required_roles, required_approvers);
+        return Ok(Json(render(&status, false)));
+    };
+
+    // 404 an unknown request so "no approvals yet" is distinguishable from "no
+    // such request".
+    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM requests WHERE id = $1")
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+    if exists.is_none() {
+        return Err(status_404(&request_id));
+    }
+
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT role, decision, actor FROM request_approval_decisions \
+         WHERE request_id = $1 ORDER BY decided_at",
+    )
+    .bind(uid)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let decisions: Vec<ApprovalDecision> = rows
+        .into_iter()
+        .map(|(role, decision, actor)| ApprovalDecision {
+            role,
+            decision,
+            actor,
+        })
+        .collect();
+
+    let status = evaluate_quorum(&decisions, required_roles, required_approvers);
+    Ok(Json(render(&status, true)))
+}
+
 /// GET /api/requests/{id}/evidence — a tamper-evident compliance evidence pack
 /// for ONE persisted request: the redacted evidence pack (from the pure engine
 /// pipeline, built off the REAL persisted request state) plus the durable,
@@ -29483,6 +29571,86 @@ mod unit_tests {
     //
     // T4: Same request after a decision row is inserted → request ABSENT.
     //     [db test: test_approvals_pending_excludes_decided_request — in db_lifecycle_tests]
+
+    // ── #4 approval quorum — auth/bounds/no-DB (no global pool here) ──
+
+    #[tokio::test]
+    async fn approval_quorum_requires_audit_permission() {
+        let no_perm = AuthSession {
+            user_id: "u".into(),
+            display_name: "U".into(),
+            roles: vec![],
+            token_valid: true,
+            provider_mode: "test".into(),
+        };
+        let err = requests_approval_quorum(
+            AuthExtractor(no_perm),
+            Path("r1".into()),
+            Query(ApprovalQuorumQuery {
+                required_roles: None,
+                required_approvers: None,
+            }),
+        )
+        .await
+        .expect_err("non-audit must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn approval_quorum_rejects_bad_thresholds() {
+        for (r, a) in [(0_usize, 2_usize), (2, 0), (11, 2)] {
+            let err = requests_approval_quorum(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path("r1".into()),
+                Query(ApprovalQuorumQuery {
+                    required_roles: Some(r),
+                    required_approvers: Some(a),
+                }),
+            )
+            .await
+            .expect_err("out-of-range thresholds must 400");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{r}/{a} must 400");
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_quorum_without_db_is_empty_not_durable() {
+        // A well-formed UUID reaches the no-DB empty-quorum path (a malformed id
+        // is a 404 in BOTH paths — see approval_quorum_malformed_id_is_404).
+        let Ok(Json(body)) = requests_approval_quorum(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(uuid::Uuid::new_v4().to_string()),
+            Query(ApprovalQuorumQuery {
+                required_roles: None,
+                required_approvers: None,
+            }),
+        )
+        .await
+        else {
+            panic!("no-DB quorum should be 200, not an error");
+        };
+        assert_eq!(body["durable"], serde_json::json!(false));
+        assert_eq!(body["quorum_met"], serde_json::json!(false));
+        assert_eq!(body["approved_roles"], serde_json::json!(0));
+        assert_eq!(body["required_roles"], serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn approval_quorum_malformed_id_is_404() {
+        // The id is validated UP FRONT, so a malformed request_id is a 404 even
+        // with no DB (consistent with the DB path — not a 200).
+        let err = requests_approval_quorum(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("not-a-uuid".into()),
+            Query(ApprovalQuorumQuery {
+                required_roles: None,
+                required_approvers: None,
+            }),
+        )
+        .await
+        .expect_err("a malformed request_id must 404, not return an empty 200");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
 }
 
 /// Live-DB integration tests for the transactional/CAS lifecycle (B2), logout
@@ -31562,6 +31730,84 @@ mod db_lifecycle_tests {
         );
 
         cleanup_request(pool, id).await;
+    }
+
+    /// #4: approval quorum evaluates the real `request_approval_decisions` ledger —
+    /// met with two distinct approving roles+actors, not met when short of the
+    /// role threshold, and 404 for an unknown request.
+    #[tokio::test]
+    async fn approval_quorum_evaluates_real_decisions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned_empty_route(pool).await;
+
+        sqlx::query(
+            "INSERT INTO request_approval_decisions (request_id, role, decision, actor) \
+             VALUES ($1, 'DatacenterApprover', 'approved', 'alice'), \
+                    ($1, 'SecurityApprover', 'approved', 'bob')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed decisions");
+
+        let session = AuthSession::static_dry_run();
+        let q = |rr: usize, ra: usize| ApprovalQuorumQuery {
+            required_roles: Some(rr),
+            required_approvers: Some(ra),
+        };
+        let cleanup = |pool: &'static PgPool| async move {
+            sqlx::query("DELETE FROM request_approval_decisions WHERE request_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+            cleanup_request(pool, id).await;
+        };
+
+        // 2 roles / 2 approvers → met.
+        let Ok(Json(body)) = requests_approval_quorum(
+            AuthExtractor(session.clone()),
+            Path(id.to_string()),
+            Query(q(2, 2)),
+        )
+        .await
+        else {
+            cleanup(pool).await;
+            panic!("quorum handler failed");
+        };
+        assert_eq!(body["quorum_met"], serde_json::json!(true));
+        assert_eq!(body["approved_roles"], serde_json::json!(2));
+        assert_eq!(body["distinct_approvers"], serde_json::json!(2));
+        assert_eq!(body["durable"], serde_json::json!(true));
+
+        // Require 3 distinct roles → not met.
+        let Ok(Json(body3)) = requests_approval_quorum(
+            AuthExtractor(session.clone()),
+            Path(id.to_string()),
+            Query(q(3, 2)),
+        )
+        .await
+        else {
+            cleanup(pool).await;
+            panic!("quorum handler failed");
+        };
+        assert_eq!(body3["quorum_met"], serde_json::json!(false));
+
+        // Unknown request → 404.
+        let err = requests_approval_quorum(
+            AuthExtractor(session.clone()),
+            Path(Uuid::new_v4().to_string()),
+            Query(q(2, 2)),
+        )
+        .await
+        .expect_err("unknown request must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        cleanup(pool).await;
     }
 }
 

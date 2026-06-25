@@ -15,6 +15,7 @@ const DECLARED_MODULES: &[&str] = &[
     "aiops",
     "alert_routing_engine",
     "app_environment",
+    "approval_quorum",
     "audit_retention",
     "auth",
     "backup_engine",

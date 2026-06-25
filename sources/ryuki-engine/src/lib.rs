@@ -5,6 +5,7 @@ pub mod agent_liveness;
 pub mod aiops;
 pub mod alert_routing_engine;
 pub mod app_environment;
+pub mod approval_quorum;
 pub mod audit_retention;
 pub mod auth;
 pub mod backup_engine;
