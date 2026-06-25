@@ -510,6 +510,83 @@ pub async fn update_vs_status(
     row.map(|r| r.into_model()).transpose()
 }
 
+/// Update a VS's structural fields, leaving its identity (vip/site/name/pool)
+/// and live status untouched. PARTIAL and atomic: each of port/protocol/
+/// persistence updates ONLY when its argument is `Some` (`COALESCE` keeps the
+/// column otherwise), so two concurrent partial updates cannot clobber each
+/// other's omitted fields (no read-modify-write). `ssl_profile` is three-state:
+/// `update_ssl == false` keeps it, `true` sets it to `ssl_value` (which may be
+/// `None` to clear). Returns the updated VS, or `Ok(None)` when no such VS
+/// exists.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_virtual_server(
+    pool: &PgPool,
+    id: &str,
+    port: Option<u16>,
+    protocol: Option<&LbProtocol>,
+    persistence: Option<&PersistenceMethod>,
+    update_ssl: bool,
+    ssl_value: Option<&str>,
+) -> Result<Option<LbVirtualServer>, sqlx::Error> {
+    let row: Option<LbVirtualServerRow> = sqlx::query_as(&format!(
+        "UPDATE lb_virtual_servers SET \
+            port = COALESCE($2, port), \
+            protocol = COALESCE($3, protocol), \
+            persistence_method = COALESCE($4, persistence_method), \
+            ssl_profile = CASE WHEN $5 THEN $6 ELSE ssl_profile END, \
+            updated_at = NOW() \
+         WHERE id = $1 \
+         RETURNING {VS_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(port.map(i32::from))
+    .bind(protocol.map(enum_to_db))
+    .bind(persistence.map(enum_to_db))
+    .bind(update_ssl)
+    .bind(ssl_value)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.into_model()).transpose()
+}
+
+/// Delete a VS and orphan-clean its backing pool. Runs in ONE transaction: the
+/// VS row AND its parent pool row are locked (`FOR UPDATE`) — the pool lock is
+/// what serializes a concurrent provision adding another VS to the same pool
+/// (its FK insert takes a KEY SHARE lock on the pool row, which conflicts), so
+/// the orphan check cannot race. The pool is deleted only if no other VS still
+/// references it (members cascade). Returns `false` when the VS did not exist.
+pub async fn delete_virtual_server(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT pool_id FROM lb_virtual_servers WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((pool_id,)) = row else {
+        return Ok(false);
+    };
+    // Lock the parent pool row so a concurrent provision referencing it
+    // serializes against our orphan check below.
+    sqlx::query("SELECT id FROM lb_pools WHERE id = $1 FOR UPDATE")
+        .bind(&pool_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM lb_virtual_servers WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // Drop the backing pool only when nothing references it anymore.
+    sqlx::query(
+        "DELETE FROM lb_pools WHERE id = $1 \
+         AND NOT EXISTS (SELECT 1 FROM lb_virtual_servers WHERE pool_id = $1)",
+    )
+    .bind(&pool_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 // ─── DB integration tests ─────────────────────────────────────────────────────
 //
 // Run with:
@@ -691,6 +768,136 @@ mod load_balancer_db_tests {
             .await
             .ok();
         // members deleted by CASCADE when pool deleted
+        sqlx::query("DELETE FROM lb_pools WHERE id = $1")
+            .bind(&pool_id)
+            .execute(&db)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn test_update_and_delete_virtual_server() {
+        let Some(db) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let sfx = suffix();
+        let site = format!("TESTSITE{}", sfx.to_ascii_uppercase());
+        let pool_id = format!("pool-upd-{sfx}");
+        let vs_id = format!("vs-upd-{sfx}");
+        let req_id = format!("lbr-upd-{sfx}");
+
+        let lb_pool = LbPool {
+            id: pool_id.clone(),
+            name: format!("upd-pool-{sfx}"),
+            site: site.clone(),
+            members: vec![PoolMember {
+                hostname: format!("m-{sfx}"),
+                ip: "10.99.2.1".into(),
+                port: 8080,
+                weight: 1,
+                status: PoolMemberStatus::Up,
+            }],
+            algorithm: PoolAlgorithm::RoundRobin,
+            health_monitor: None,
+        };
+        let vs = LbVirtualServer {
+            id: vs_id.clone(),
+            name: format!("upd-vs-{sfx}"),
+            vip: format!("10.99.98.{}", u8::MAX),
+            port: 80,
+            protocol: LbProtocol::Http,
+            pool_id: pool_id.clone(),
+            site: site.clone(),
+            ssl_profile: None,
+            persistence_method: PersistenceMethod::None,
+            status: VirtualServerStatus::Online,
+        };
+        let request = LbRequest {
+            id: req_id.clone(),
+            requester: "t".into(),
+            virtual_server_name: vs.name.clone(),
+            vip: vs.vip.clone(),
+            port: 80,
+            protocol: LbProtocol::Http,
+            site: site.clone(),
+            pool_members: vec![format!("m-{sfx}")],
+            status: LbRequestStatus::Provisioned,
+        };
+        provision_lb(&db, &vs, &lb_pool, &request)
+            .await
+            .expect("provision");
+
+        // UPDATE: http→https, 80→443, set ssl + cookie persistence.
+        let updated = update_virtual_server(
+            &db,
+            &vs_id,
+            Some(443),
+            Some(&LbProtocol::Https),
+            Some(&PersistenceMethod::Cookie),
+            true,
+            Some("std-tls"),
+        )
+        .await
+        .expect("update")
+        .expect("vs present");
+        assert_eq!(updated.port, 443);
+        assert_eq!(updated.protocol, LbProtocol::Https);
+        assert_eq!(updated.persistence_method, PersistenceMethod::Cookie);
+        assert_eq!(updated.ssl_profile.as_deref(), Some("std-tls"));
+
+        // A partial update (only persistence) leaves the other fields intact —
+        // proving COALESCE keeps omitted columns (no read-modify-write clobber).
+        let partial = update_virtual_server(
+            &db,
+            &vs_id,
+            None,
+            None,
+            Some(&PersistenceMethod::None),
+            false,
+            None,
+        )
+        .await
+        .expect("partial update")
+        .expect("vs present");
+        assert_eq!(partial.port, 443, "port preserved");
+        assert_eq!(partial.protocol, LbProtocol::Https, "protocol preserved");
+        assert_eq!(
+            partial.persistence_method,
+            PersistenceMethod::None,
+            "persistence changed"
+        );
+        assert_eq!(
+            partial.ssl_profile.as_deref(),
+            Some("std-tls"),
+            "ssl preserved"
+        );
+
+        // DELETE removes the VS and orphan-cleans the (now unreferenced) pool.
+        assert!(delete_virtual_server(&db, &vs_id).await.expect("delete"));
+        assert!(
+            get_virtual_server(&db, &vs_id)
+                .await
+                .expect("get")
+                .is_none(),
+            "VS is gone"
+        );
+        let pool_gone: Option<(String,)> = sqlx::query_as("SELECT id FROM lb_pools WHERE id = $1")
+            .bind(&pool_id)
+            .fetch_optional(&db)
+            .await
+            .unwrap();
+        assert!(pool_gone.is_none(), "the orphaned pool was cleaned");
+        // Deleting an absent VS returns false, not an error.
+        assert!(!delete_virtual_server(&db, &vs_id)
+            .await
+            .expect("delete-absent"));
+
+        sqlx::query("DELETE FROM lb_requests WHERE id = $1")
+            .bind(&req_id)
+            .execute(&db)
+            .await
+            .ok();
         sqlx::query("DELETE FROM lb_pools WHERE id = $1")
             .bind(&pool_id)
             .execute(&db)

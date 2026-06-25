@@ -1734,7 +1734,10 @@ pub fn routes() -> Router {
         // ─── Load Balancer Engine ───
         .route("/api/network/loadbalancer/vs", get(lb_vs_list))
         .route("/api/network/loadbalancer/vs", post(lb_provision))
-        .route("/api/network/loadbalancer/vs/{id}", get(lb_vs_get))
+        .route(
+            "/api/network/loadbalancer/vs/{id}",
+            get(lb_vs_get).put(lb_vs_update).delete(lb_vs_delete),
+        )
         .route(
             "/api/network/loadbalancer/vs/{id}/member",
             post(lb_pool_member_add),
@@ -24247,6 +24250,87 @@ async fn lb_vs_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, J
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     Ok(Json(load_balancer::get_virtual_server(&vs, &pool)))
+}
+
+/// Mutable structural fields of a virtual server. Identity (vip/site/name/pool)
+/// and live status are NOT here — status has its own drain/enable/disable
+/// endpoints. `deny_unknown_fields` so a PUT carrying an immutable field is a
+/// hard 422. `ssl_profile`: omitted keeps the current value, empty clears it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LbVsUpdateRequest {
+    port: Option<u16>,
+    protocol: Option<String>,
+    persistence_method: Option<String>,
+    ssl_profile: Option<String>,
+}
+
+/// PUT /api/network/loadbalancer/vs/{id} — update a VS's structural fields
+/// (validated through the pure engine parsers). 404 when unknown; 503 when no DB.
+async fn lb_vs_update(
+    Path(id): Path<String>,
+    Json(b): Json<LbVsUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    // Validate ONLY the provided fields and pass them through as Options — the
+    // repo UPDATE is partial (COALESCE), so there is no read-modify-write that a
+    // concurrent partial update could clobber.
+    let port = match b.port {
+        Some(0) => return Err(status_400("port must be greater than zero")),
+        other => other,
+    };
+    let protocol = match b.protocol.as_deref() {
+        Some(s) => Some(load_balancer::parse_protocol(s).map_err(|e| status_400(&e))?),
+        None => None,
+    };
+    let persistence = match b.persistence_method.as_deref() {
+        Some(s) => Some(load_balancer::parse_persistence(s).map_err(|e| status_400(&e))?),
+        None => None,
+    };
+    // ssl_profile three-state: omitted = keep; empty = clear (NULL); value = set.
+    let (update_ssl, ssl_value): (bool, Option<String>) = match b.ssl_profile {
+        None => (false, None),
+        Some(ref s) if s.trim().is_empty() => (true, None),
+        Some(s) => (true, Some(s)),
+    };
+
+    let updated = crate::repos::load_balancer::update_virtual_server(
+        db,
+        &id,
+        port,
+        protocol.as_ref(),
+        persistence.as_ref(),
+        update_ssl,
+        ssl_value.as_deref(),
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+
+    let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &updated.pool_id)
+        .await
+        .map_err(db_error)?;
+    match pool {
+        Some(p) => Ok(Json(load_balancer::get_virtual_server(&updated, &p))),
+        None => Ok(Json(json!({ "source": "db", "virtual_server": updated }))),
+    }
+}
+
+/// DELETE /api/network/loadbalancer/vs/{id} — decommission a VS (and orphan-clean
+/// its backing pool). 404 when unknown; 503 when no DB.
+async fn lb_vs_delete(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let deleted = crate::repos::load_balancer::delete_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?;
+    if !deleted {
+        return Err(status_404(&id));
+    }
+    Ok(Json(json!({
+        "source": "db",
+        "deleted": true,
+        "virtual_server_id": id,
+    })))
 }
 async fn lb_pool_member_add(
     Path(id): Path<String>,

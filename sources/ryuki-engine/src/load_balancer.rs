@@ -129,6 +129,19 @@ pub fn parse_algorithm(algorithm: &str) -> Result<PoolAlgorithm, String> {
     }
 }
 
+/// Parse a session-persistence method string (case-insensitive, `_` or `-`
+/// accepted as the separator). Pure.
+pub fn parse_persistence(method: &str) -> Result<PersistenceMethod, String> {
+    match method.to_ascii_lowercase().replace('_', "-").as_str() {
+        "cookie" => Ok(PersistenceMethod::Cookie),
+        "source-ip" => Ok(PersistenceMethod::SourceIp),
+        "none" => Ok(PersistenceMethod::None),
+        other => Err(format!(
+            "Invalid persistence_method: {other}. Must be cookie, source-ip, or none"
+        )),
+    }
+}
+
 pub fn member_from_input(member: &str, default_port: u16) -> Result<PoolMember, String> {
     let parts: Vec<&str> = member.split(':').collect();
     let hostname = parts
@@ -610,5 +623,23 @@ mod tests {
             PoolAlgorithm::Weighted
         );
         assert!(parse_algorithm("bad").is_err());
+    }
+
+    #[test]
+    fn test_parse_persistence_variants() {
+        assert_eq!(
+            parse_persistence("cookie").unwrap(),
+            PersistenceMethod::Cookie
+        );
+        assert_eq!(
+            parse_persistence("source-ip").unwrap(),
+            PersistenceMethod::SourceIp
+        );
+        assert_eq!(
+            parse_persistence("source_ip").unwrap(),
+            PersistenceMethod::SourceIp
+        );
+        assert_eq!(parse_persistence("NONE").unwrap(), PersistenceMethod::None);
+        assert!(parse_persistence("bogus").is_err());
     }
 }
