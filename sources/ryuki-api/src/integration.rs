@@ -1191,6 +1191,182 @@ pub async fn integration_health_history(
 }
 
 // ---------------------------------------------------------------------------
+// Credential rotation / expiry (#41)
+// ---------------------------------------------------------------------------
+
+/// Distinguish an ABSENT field (`None`) from an explicit JSON `null`
+/// (`Some(None)`) from a value (`Some(Some(_))`). Serde's plain `Option` folds
+/// the first two together, which would let an empty `{}` body silently CLEAR the
+/// expiry — so we wrap with this "double option" deserializer instead.
+fn deserialize_present_option<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
+/// Body for POST /api/integrations/{id}/credential-expiry.
+///
+/// `expires_at` is the RFC3339 instant the connection's credential lapses, or
+/// `null` to clear tracking (e.g. after rotating to a non-expiring credential).
+/// The field is REQUIRED: an absent field (empty `{}` body) is rejected so a
+/// clear is always explicit (`{"expires_at": null}`), never an accident.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialExpiryRequest {
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    expires_at: Option<Option<String>>,
+}
+
+/// Query for GET /api/integrations/credentials/expiring.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpiringCredentialsQuery {
+    within_days: Option<i64>,
+}
+
+/// One row of the expiring-credentials scan.
+#[derive(sqlx::FromRow)]
+struct ExpiringCredentialRow {
+    id: String,
+    name: String,
+    vendor_type: String,
+    credential_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// POST /api/integrations/{id}/credential-expiry — set (or clear) when this
+/// connection's credential expires, so it can be surfaced for rotation before
+/// it lapses. Admin-gated. 404 if the connection does not exist; 503 with no DB
+/// (a write cannot be faked as success).
+pub async fn integration_set_credential_expiry(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+    Json(body): Json<CredentialExpiryRequest>,
+) -> ApiResult {
+    require_admin(&session)?;
+
+    // Parse up front so a bad/absent value is a 400 BEFORE we touch the DB.
+    //   absent field   -> 400 (clearing must be explicit)
+    //   explicit null  -> clear tracking
+    //   value          -> set, must be RFC3339
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = match body.expires_at {
+        None => {
+            return Err(integration_400(
+                "expires_at is required (an RFC3339 timestamp, or null to clear)",
+            ));
+        }
+        Some(None) => None,
+        Some(Some(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Err(integration_400(
+                    "expires_at must be an RFC3339 timestamp or null",
+                ));
+            }
+            Some(
+                chrono::DateTime::parse_from_rfc3339(trimmed)
+                    .map_err(|_| integration_400("expires_at must be an RFC3339 timestamp"))?
+                    .with_timezone(&chrono::Utc),
+            )
+        }
+    };
+
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "database not configured; cannot persist credential expiry"})),
+        ));
+    };
+
+    // UPDATE ... RETURNING makes existence + write atomic — no check-then-write
+    // TOCTOU window. A missing row yields no RETURNING and is a clean 404. The
+    // response reflects the PERSISTED value (the column, at its storage
+    // precision) rather than echoing the caller's input.
+    let updated: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "UPDATE integration_connections SET credential_expires_at = $1 \
+         WHERE id = $2 RETURNING id, credential_expires_at",
+    )
+    .bind(expires_at)
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+
+    let Some((row_id, row_expires_at)) = updated else {
+        return Err(integration_not_found(&id));
+    };
+
+    Ok(Json(json!({
+        "connection_id": row_id,
+        "credential_expires_at": row_expires_at.map(|d| d.to_rfc3339()),
+    })))
+}
+
+/// GET /api/integrations/credentials/expiring?within_days=N — connections whose
+/// tracked credential expires within N days (default 30, bounded), INCLUDING
+/// already-expired ones (`expired: true`). Connections with no tracked expiry
+/// are excluded — absence of an expiry is not "expiring soon". Admin-gated.
+pub async fn integration_expiring_credentials(
+    Extension(session): Extension<AuthSession>,
+    Query(q): Query<ExpiringCredentialsQuery>,
+) -> ApiResult {
+    require_admin(&session)?;
+
+    // Bound the horizon: <= 0 is meaningless (would only ever return already
+    // expired), and an unbounded value invites absurd cutoffs.
+    let within_days = q.within_days.unwrap_or(30);
+    if !(1..=3650).contains(&within_days) {
+        return Err(integration_400("within_days must be between 1 and 3650"));
+    }
+
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "within_days": within_days,
+            "count": 0,
+            "items": [],
+            "durable": false,
+        })));
+    };
+
+    let now = chrono::Utc::now();
+    let cutoff = now + chrono::Duration::days(within_days);
+
+    // IS NOT NULL is implied by the `<=` comparison (NULL compares to nothing),
+    // but stated for clarity and to match the partial index predicate.
+    let rows: Vec<ExpiringCredentialRow> = sqlx::query_as(
+        "SELECT id, name, vendor_type, credential_expires_at \
+         FROM integration_connections \
+         WHERE credential_expires_at IS NOT NULL AND credential_expires_at <= $1 \
+         ORDER BY credential_expires_at ASC LIMIT 500",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let expired = r.credential_expires_at <= now;
+            json!({
+                "connection_id": r.id,
+                "name": r.name,
+                "vendor_type": r.vendor_type,
+                "credential_expires_at": r.credential_expires_at.to_rfc3339(),
+                "expired": expired,
+                "days_until_expiry": (r.credential_expires_at - now).num_days(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "within_days": within_days,
+        "count": items.len(),
+        "items": items,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
 
@@ -1199,13 +1375,23 @@ pub fn routes() -> axum::Router {
     axum::Router::new()
         .route("/api/integrations", post(integration_create))
         .route("/api/integrations", get(integration_list))
-        .route("/api/integrations/:id", get(integration_get))
-        .route("/api/integrations/:id", put(integration_update))
-        .route("/api/integrations/:id", delete(integration_delete))
-        .route("/api/integrations/:id/test", post(integration_test))
+        .route("/api/integrations/{id}", get(integration_get))
+        .route("/api/integrations/{id}", put(integration_update))
+        .route("/api/integrations/{id}", delete(integration_delete))
+        .route("/api/integrations/{id}/test", post(integration_test))
         .route(
-            "/api/integrations/:id/health",
+            "/api/integrations/{id}/health",
             get(integration_health_history),
+        )
+        .route(
+            "/api/integrations/{id}/credential-expiry",
+            post(integration_set_credential_expiry),
+        )
+        // Static segment in the `:id` slot — matchit (axum 0.8) routes the
+        // literal over the param, so this does not shadow `/:id`.
+        .route(
+            "/api/integrations/credentials/expiring",
+            get(integration_expiring_credentials),
         )
 }
 
@@ -1324,6 +1510,73 @@ pub mod integration_db_tests {
             after, 0,
             "health history cascade-deleted with the connection"
         );
+    }
+
+    /// #41: credential_expires_at persists, and the expiring-scan predicate the
+    /// handler uses selects expired + within-window connections while excluding
+    /// far-future and untracked (NULL) ones.
+    #[tokio::test]
+    async fn credential_expiry_filter_selects_expiring_and_excludes_others() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let now = chrono::Utc::now();
+        let suffix = uuid::Uuid::new_v4();
+        // (label, expiry offset in days from now — None = no tracked expiry).
+        let fixtures: [(&str, Option<i64>); 4] = [
+            ("expired", Some(-1)),
+            ("soon", Some(10)),
+            ("far", Some(100)),
+            ("untracked", None),
+        ];
+        let mut ids = Vec::new();
+        for (label, off) in fixtures {
+            let id = format!("ic-exp-{label}-{suffix}");
+            let nows = now.to_rfc3339();
+            sqlx::query(
+                "INSERT INTO integration_connections \
+                 (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+                  status, readiness, execution_mode, created_by, created_at, updated_at, \
+                  credential_expires_at) \
+                 VALUES ($1, 'servicenow', $2, 'https://x.example', 'vault', 'p', \
+                         'configured', 'configured', 'static-dry-run', 'sys', $3, $3, $4)",
+            )
+            .bind(&id)
+            .bind(label)
+            .bind(&nows)
+            .bind(off.map(|d| now + chrono::Duration::days(d)))
+            .execute(&pool)
+            .await
+            .expect("insert connection");
+            ids.push(id);
+        }
+
+        let cutoff = now + chrono::Duration::days(30);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM integration_connections \
+             WHERE credential_expires_at IS NOT NULL AND credential_expires_at <= $1 \
+               AND id = ANY($2) \
+             ORDER BY credential_expires_at ASC",
+        )
+        .bind(cutoff)
+        .bind(&ids)
+        .fetch_all(&pool)
+        .await
+        .expect("expiring scan");
+
+        let got: Vec<&str> = rows.iter().map(|(id,)| id.as_str()).collect();
+        assert_eq!(got.len(), 2, "only expired + soon match; got {got:?}");
+        assert!(
+            got[0].contains("expired"),
+            "soonest (already-expired) first"
+        );
+        assert!(got[1].contains("soon"), "then the within-window one");
+
+        for id in &ids {
+            cleanup_connection(&pool, id).await;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2681,6 +2934,122 @@ mod unit_tests {
 
         // Clean up.
         std::env::remove_var("RYUKI_INTEGRATION__ENCRYPTION_KEY");
+    }
+
+    // -----------------------------------------------------------------------
+    // #41 credential expiry — validation paths that run BEFORE any DB access,
+    // so they are exercisable in the no-DB (`--bins`) test run.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn routes_build_without_panic() {
+        // axum 0.8 / matchit validates every path at build time. Regression guard:
+        // these routes once used the axum-0.7 `:id` syntax, which PANICS in 0.8
+        // (it requires `{id}`) — so `routes()` (merged into the live app in
+        // main.rs) would crash the server at startup. This also exercises the
+        // static `credentials/expiring` segment overlapping the `{id}` param.
+        let _ = routes();
+    }
+
+    #[tokio::test]
+    async fn expiring_rejects_out_of_range_within_days() {
+        // Below the floor: <= 0 would only ever match already-expired creds.
+        let err = integration_expiring_credentials(
+            Extension(AuthSession::static_dry_run()),
+            Query(ExpiringCredentialsQuery {
+                within_days: Some(0),
+            }),
+        )
+        .await
+        .expect_err("within_days=0 must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        // Above the ceiling.
+        let err = integration_expiring_credentials(
+            Extension(AuthSession::static_dry_run()),
+            Query(ExpiringCredentialsQuery {
+                within_days: Some(10_000),
+            }),
+        )
+        .await
+        .expect_err("within_days=10000 must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn expiring_without_db_reports_not_durable() {
+        let resp = integration_expiring_credentials(
+            Extension(AuthSession::static_dry_run()),
+            Query(ExpiringCredentialsQuery {
+                within_days: Some(30),
+            }),
+        )
+        .await
+        .expect("default window with no DB returns 200, not an error");
+        assert_eq!(resp.0["durable"], serde_json::json!(false));
+        assert_eq!(resp.0["count"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn credential_expiry_request_distinguishes_absent_from_null() {
+        // The double-option deserializer must keep these three cases apart, so an
+        // empty `{}` body can be rejected instead of silently clearing tracking.
+        let absent: CredentialExpiryRequest = serde_json::from_str("{}").unwrap();
+        assert!(absent.expires_at.is_none(), "absent field -> None");
+
+        let null: CredentialExpiryRequest =
+            serde_json::from_str(r#"{"expires_at": null}"#).unwrap();
+        assert_eq!(null.expires_at, Some(None), "explicit null -> Some(None)");
+
+        let value: CredentialExpiryRequest =
+            serde_json::from_str(r#"{"expires_at": "2030-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!(
+            value.expires_at,
+            Some(Some("2030-01-01T00:00:00Z".to_string())),
+            "value -> Some(Some(_))"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_credential_expiry_rejects_absent_field() {
+        // An empty body must NOT be treated as "clear" — clearing is explicit.
+        let err = integration_set_credential_expiry(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+            Json(CredentialExpiryRequest { expires_at: None }),
+        )
+        .await
+        .expect_err("absent expires_at must be rejected, not silently clear it");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_credential_expiry_rejects_bad_timestamp() {
+        let err = integration_set_credential_expiry(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+            Json(CredentialExpiryRequest {
+                expires_at: Some(Some("not-a-timestamp".to_string())),
+            }),
+        )
+        .await
+        .expect_err("a non-RFC3339 expiry must be rejected before any DB access");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn set_credential_expiry_without_db_is_503() {
+        // A write that cannot be persisted must NOT report success.
+        let err = integration_set_credential_expiry(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+            Json(CredentialExpiryRequest {
+                expires_at: Some(Some("2030-01-01T00:00:00Z".to_string())),
+            }),
+        )
+        .await
+        .expect_err("a valid expiry with no DB must be a 503");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
