@@ -188,6 +188,7 @@ pub fn routes() -> Router {
         .route("/api/metrics/commitment", get(metrics_commitment))
         .route("/api/metrics/slo", post(slo_create).get(slo_list))
         .route("/api/metrics/slo/status", get(slo_status))
+        .route("/api/metering/usage", get(metering_usage))
         .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
@@ -17135,6 +17136,111 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
     })))
 }
 
+// ─── Per-site usage metering (#45) ───
+
+/// Query params for usage metering: an optional `[since, until]` window and an
+/// optional site filter.
+#[derive(Debug, Deserialize, Default)]
+struct MeteringQuery {
+    since: Option<String>,
+    until: Option<String>,
+    site: Option<String>,
+}
+
+/// GET /api/metering/usage — per-site usage, metered as the count of requests
+/// raised in the window, broken down by status. AUDIT-tier: this exposes
+/// cross-site operational/chargeback volume, so it sits with the read-only
+/// reporting role, not every operator. The window defaults to the last 90 days
+/// when no `since` is given, so the query is always bounded (never a full-table
+/// scan an arbitrary caller could trigger). 503 when no database is configured.
+async fn metering_usage(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<MeteringQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read usage metering"})),
+        ));
+    }
+    let parse_ts = |raw: &Option<String>| -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| Some(d.with_timezone(&chrono::Utc)))
+                .map_err(|_| ()),
+            None => Ok(None),
+        }
+    };
+    let since = parse_ts(&q.since).map_err(|_| status_400("since must be an RFC3339 timestamp"))?;
+    let until = parse_ts(&q.until).map_err(|_| status_400("until must be an RFC3339 timestamp"))?;
+    // Always bound the lower edge: default to the last 90 days so the aggregate
+    // is never an unbounded full-table scan.
+    let since = since.or_else(|| Some(chrono::Utc::now() - chrono::Duration::days(90)));
+    let f_site = q
+        .site
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // One pass: count requests grouped by (site, status); a NULL bound disables
+    // that predicate. Aggregated into a per-site shape in Rust.
+    let rows: Vec<(String, String, i64)> = match sqlx::query_as(
+        "SELECT site, status, COUNT(*) FROM requests \
+         WHERE ($1::timestamptz IS NULL OR created_at >= $1) \
+           AND ($2::timestamptz IS NULL OR created_at <= $2) \
+           AND ($3::text IS NULL OR site = $3) \
+         GROUP BY site, status",
+    )
+    .bind(since)
+    .bind(until)
+    .bind(&f_site)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "usage metering query failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not compute usage metering"})),
+            ));
+        }
+    };
+
+    // site -> (total, status -> count). BTreeMap for stable, sorted output.
+    let mut by_site: std::collections::BTreeMap<
+        String,
+        (i64, std::collections::BTreeMap<String, i64>),
+    > = std::collections::BTreeMap::new();
+    for (site, status, n) in rows {
+        let entry = by_site.entry(site).or_default();
+        entry.0 += n;
+        *entry.1.entry(status).or_insert(0) += n;
+    }
+    let total_requests: i64 = by_site.values().map(|(t, _)| *t).sum();
+    let sites: Vec<Value> = by_site
+        .iter()
+        .map(|(site, (total, by_status))| {
+            json!({
+                "site": site,
+                "request_count": total,
+                "by_status": by_status,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "sites": sites,
+        "site_count": sites.len(),
+        "total_requests": total_requests,
+        // The effective window actually queried (since defaults to 90d ago).
+        "window_since": since.map(|d| d.to_rfc3339()),
+        "window_until": until.map(|d| d.to_rfc3339()),
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -29926,6 +30032,57 @@ mod db_lifecycle_tests {
         }
         sqlx::query("DELETE FROM slo_definitions WHERE good_metric_key = $1")
             .bind(good_key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #45: usage metering aggregates requests per site, broken down by status,
+    /// over the window.
+    #[tokio::test]
+    async fn test_metering_usage_aggregates_by_site() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let site = "TESTMETER-9q";
+        sqlx::query("DELETE FROM requests WHERE site = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+        for status in ["intake", "intake", "completed"] {
+            sqlx::query(
+                "INSERT INTO requests (id, request_type, status, stage, site, environment, name) \
+                 VALUES ($1, 'server-deployment', $2, 'intake', $3, 'production', 'metering-test')",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(status)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("insert request");
+        }
+
+        let Json(out) = metering_usage(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: Some(site.to_string()),
+            }),
+        )
+        .await
+        .expect("metering");
+        let sites = out["sites"].as_array().unwrap();
+        assert_eq!(sites.len(), 1, "one site");
+        assert_eq!(sites[0]["request_count"], 3, "three requests");
+        assert_eq!(sites[0]["by_status"]["intake"], 2);
+        assert_eq!(sites[0]["by_status"]["completed"], 1);
+
+        sqlx::query("DELETE FROM requests WHERE site = $1")
+            .bind(site)
             .execute(pool)
             .await
             .ok();
