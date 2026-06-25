@@ -85,7 +85,7 @@ implementing **all 66**. This file tracks execution.
 | 53 | [x] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
 | 54 | [x] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
 | 55 | [x] | DNS record update endpoint | API | S | M | — |
-| 56 | [ ] | IPAM subnet CRUD | API | M | M | — |
+| 56 | [x] | IPAM subnet CRUD | API | M | M | — |
 | 57 | [ ] | Load-balancer virtual-server delete/update | API | M | M | — |
 | 58 | [ ] | Connection usage audit trail | Integ | M | M | — |
 | 59 | [ ] | Scope (site/env) selector + user preferences | Portal | M | M | ✓ |
