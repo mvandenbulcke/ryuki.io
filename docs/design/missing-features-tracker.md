@@ -80,7 +80,7 @@ implementing **all 66**. This file tracks execution.
 | 48 | [ ] | Enforced access recertification w/ revocation | Security | L | M | — |
 | 49 | [~] | Secret update & deregistration | API | S | M | — |
 | 50 | [x] | Evidence pack file download / export | Portal | S | M | — |
-| 51 | [ ] | Per-vendor connection capability catalog | Integ | M | M | — |
+| 51 | [x] | Per-vendor connection capability catalog | Integ | M | M | — |
 | 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
 | 53 | [x] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
 | 54 | [x] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
