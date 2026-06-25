@@ -91,7 +91,7 @@ implementing **all 66**. This file tracks execution.
 | 59 | [ ] | Scope (site/env) selector + user preferences | Portal | M | M | ✓ |
 | 60 | [ ] | Evidence blob store for large artifacts | Exec | M | M | — |
 | 61 | [x] | On-call / escalation contact registry | Observ | M | M | — |
-| 62 | [ ] | audit_log retention / partitioning / archival | Resil | M | M | ✓ |
+| 62 | [~] | audit_log retention / partitioning / archival | Resil | M | M | ✓ |
 | 63 | [x] | Observability deploy wiring | Roadmap | M | M | ✓ |
 | 64 | [ ] | OpenAPI / machine-readable API spec | Roadmap | M | M | ✓ |
 | 65 | [ ] | Optional gated AI narrative adapter | AIOps | M | M | — |
