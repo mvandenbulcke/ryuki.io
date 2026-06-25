@@ -9988,8 +9988,10 @@ async fn auth_local_decision() -> Json<Value> {
 }
 
 /// Login request body. Deliberately no Debug/Display so the password can
-/// never leak through logging.
+/// never leak through logging. `deny_unknown_fields` so a typo'd field (e.g.
+/// `passwrod`) is a hard 4xx, never a silently-dropped credential field.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LocalLoginRequest {
     username: String,
     password: String,
@@ -11493,6 +11495,7 @@ fn generate_api_token() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTokenRequest {
     name: String,
     owner_principal: String,
@@ -29809,6 +29812,35 @@ mod unit_tests {
         .await
         .expect_err("a write with no DB must be 503");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
+
+    #[test]
+    fn auth_request_structs_reject_unknown_fields() {
+        // Valid bodies still deserialize.
+        assert!(
+            serde_json::from_str::<LocalLoginRequest>(r#"{"username":"u","password":"p"}"#).is_ok()
+        );
+        assert!(serde_json::from_str::<CreateTokenRequest>(
+            r#"{"name":"n","owner_principal":"o"}"#
+        )
+        .is_ok());
+        // An extra/typo'd field is a HARD error, never silently dropped.
+        assert!(
+            serde_json::from_str::<LocalLoginRequest>(
+                r#"{"username":"u","password":"p","extra":"x"}"#
+            )
+            .is_err(),
+            "unknown field on login must be rejected"
+        );
+        assert!(
+            serde_json::from_str::<CreateTokenRequest>(
+                r#"{"name":"n","owner_principal":"o","evil":1}"#
+            )
+            .is_err(),
+            "unknown field on token-create must be rejected"
+        );
     }
 }
 
