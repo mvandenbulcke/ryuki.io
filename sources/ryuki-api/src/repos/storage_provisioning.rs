@@ -251,6 +251,100 @@ pub async fn get_array(pool: &PgPool, id: &str) -> Result<Option<StorageArray>, 
     row.map(|r| r.into_model()).transpose()
 }
 
+/// Outcome of a storage-array delete.
+pub enum ArrayDeleteResult {
+    Deleted,
+    NotFound,
+    /// The array still has `0` < N volumes referencing it; it was not deleted.
+    Blocked(i64),
+}
+
+/// Register (insert) a freshly-built storage array.
+pub async fn create_array(pool: &PgPool, array: &StorageArray) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "INSERT INTO storage_arrays ({ARRAY_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+    ))
+    .bind(&array.id)
+    .bind(&array.name)
+    .bind(enum_to_db(&array.vendor))
+    .bind(&array.model)
+    .bind(&array.site)
+    .bind(i64::try_from(array.total_capacity_gb).unwrap_or(i64::MAX))
+    .bind(i64::try_from(array.used_capacity_gb).unwrap_or(0))
+    .bind(i32::try_from(array.pool_count).unwrap_or(i32::MAX))
+    .bind(enum_to_db(&array.status))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update an array's mutable fields. PARTIAL/atomic (`COALESCE` keeps a column
+/// when its argument is `None`), so concurrent partial updates do not clobber.
+/// The `used <= total` CHECK is the guard against lowering capacity below use —
+/// the handler maps that DB check-violation to a 400. Returns the updated array,
+/// or `Ok(None)` when no such array exists.
+pub async fn update_array(
+    pool: &PgPool,
+    id: &str,
+    model: Option<&str>,
+    total_capacity_gb: Option<u64>,
+    pool_count: Option<u32>,
+    status: Option<&ArrayStatus>,
+) -> Result<Option<StorageArray>, sqlx::Error> {
+    let row: Option<StorageArrayRow> = sqlx::query_as(&format!(
+        "UPDATE storage_arrays SET \
+            model = COALESCE($2, model), \
+            total_capacity_gb = COALESCE($3, total_capacity_gb), \
+            pool_count = COALESCE($4, pool_count), \
+            status = COALESCE($5, status), \
+            updated_at = NOW() \
+         WHERE id = $1 \
+         RETURNING {ARRAY_COLUMNS}"
+    ))
+    .bind(id)
+    .bind(model)
+    .bind(total_capacity_gb.map(|v| i64::try_from(v).unwrap_or(i64::MAX)))
+    .bind(pool_count.map(|v| i32::try_from(v).unwrap_or(i32::MAX)))
+    .bind(status.map(enum_to_db))
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.into_model()).transpose()
+}
+
+/// Decommission (delete) an array. Refuses (without deleting) when any volume
+/// still references it. Runs in a transaction with `FOR UPDATE` on the array
+/// row: with the `fk_storage_volumes_array` FK (migration 100), a concurrent
+/// volume INSERT takes a KEY SHARE lock on that row which conflicts with this
+/// lock, so the count check cannot be raced — and `ON DELETE RESTRICT` is the
+/// DB-level backstop. The explicit count gives a clean 409 instead of a raw FK
+/// violation.
+pub async fn delete_array(pool: &PgPool, id: &str) -> Result<ArrayDeleteResult, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM storage_arrays WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if exists.is_none() {
+        return Ok(ArrayDeleteResult::NotFound);
+    }
+    let volume_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM storage_volumes WHERE storage_array = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if volume_count > 0 {
+        return Ok(ArrayDeleteResult::Blocked(volume_count));
+    }
+    sqlx::query("DELETE FROM storage_arrays WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ArrayDeleteResult::Deleted)
+}
+
 pub async fn get_storage_report(
     pool: &PgPool,
     site: &str,
@@ -607,6 +701,78 @@ mod storage_provisioning_db_tests {
             .await
             .expect("must not error for absent");
         assert!(absent.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_array_register_update_delete_lifecycle() {
+        let Some(db) = test_pool().await else {
+            return;
+        };
+        let sfx = Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("x")
+            .to_owned();
+        let array = ryuki_engine::storage_provisioning::build_storage_array(
+            &format!("test-array-{sfx}"),
+            "PureStorage",
+            "FlashArray//X",
+            "TESTSITE",
+            50_000,
+        )
+        .expect("build");
+        let id = array.id.clone();
+        create_array(&db, &array).await.expect("create");
+
+        // Partial update: model + capacity + status; pool_count omitted stays 0.
+        let updated = update_array(
+            &db,
+            &id,
+            Some("FlashArray//XL"),
+            Some(80_000),
+            None,
+            Some(&ArrayStatus::Degraded),
+        )
+        .await
+        .expect("update")
+        .expect("present");
+        assert_eq!(updated.model, "FlashArray//XL");
+        assert_eq!(updated.total_capacity_gb, 80_000);
+        assert_eq!(updated.status, ArrayStatus::Degraded);
+        assert_eq!(updated.pool_count, 0, "omitted field preserved");
+
+        // A volume referencing the array blocks the delete.
+        let vol_id = format!("vol-test-{sfx}");
+        sqlx::query(
+            "INSERT INTO storage_volumes \
+             (id, name, volume_type, size_gb, storage_array, pool, site, protection, status) \
+             VALUES ($1, 'v', 'lun', 10, $2, 'p', 'TESTSITE', 'none', 'available')",
+        )
+        .bind(&vol_id)
+        .bind(&id)
+        .execute(&db)
+        .await
+        .unwrap();
+        match delete_array(&db, &id).await.expect("delete-blocked") {
+            ArrayDeleteResult::Blocked(n) => assert_eq!(n, 1),
+            _ => panic!("delete must be blocked while a volume references the array"),
+        }
+
+        // Retire the volume, then the delete succeeds.
+        sqlx::query("DELETE FROM storage_volumes WHERE id = $1")
+            .bind(&vol_id)
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            delete_array(&db, &id).await.expect("delete"),
+            ArrayDeleteResult::Deleted
+        ));
+        assert!(matches!(
+            delete_array(&db, &id).await.expect("delete-absent"),
+            ArrayDeleteResult::NotFound
+        ));
     }
 
     #[tokio::test]

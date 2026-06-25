@@ -187,6 +187,92 @@ pub fn available_capacity_gb(array: &StorageArray) -> u64 {
         .saturating_sub(array.used_capacity_gb)
 }
 
+/// Parse a storage vendor string (case-insensitive; separators ignored). Pure.
+pub fn parse_vendor(vendor: &str) -> Result<StorageVendor, String> {
+    match vendor
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "")
+        .as_str()
+    {
+        "purestorage" | "pure" => Ok(StorageVendor::PureStorage),
+        "dellemc" | "dell" => Ok(StorageVendor::DellEmc),
+        "netapp" => Ok(StorageVendor::NetApp),
+        "hpe" => Ok(StorageVendor::Hpe),
+        other => Err(format!(
+            "Invalid vendor: {other}. Must be PureStorage, DellEMC, NetApp, or HPE"
+        )),
+    }
+}
+
+/// Parse an array health status (case-insensitive). Pure.
+pub fn parse_array_status(status: &str) -> Result<ArrayStatus, String> {
+    match status.to_ascii_lowercase().as_str() {
+        "healthy" => Ok(ArrayStatus::Healthy),
+        "degraded" => Ok(ArrayStatus::Degraded),
+        "critical" => Ok(ArrayStatus::Critical),
+        other => Err(format!(
+            "Invalid array status: {other}. Must be healthy, degraded, or critical"
+        )),
+    }
+}
+
+/// Validate and construct a newly-registered storage array. It starts empty
+/// (used 0, no pools) and `Healthy`. `total_capacity_gb` is bounded to i64 (the
+/// BIGINT storage column). The caller persists it. Pure.
+pub fn build_storage_array(
+    name: &str,
+    vendor: &str,
+    model: &str,
+    site: &str,
+    total_capacity_gb: u64,
+) -> Result<StorageArray, String> {
+    let name = name.trim();
+    let model = model.trim();
+    let site = site.trim();
+    if name.is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if model.is_empty() {
+        return Err("model cannot be empty".into());
+    }
+    if site.is_empty() {
+        return Err("site cannot be empty".into());
+    }
+    if site.len() > 100 {
+        return Err("site must be at most 100 characters".into());
+    }
+    let vendor = parse_vendor(vendor)?;
+    if total_capacity_gb > i64::MAX as u64 {
+        return Err("total_capacity_gb is too large to persist".into());
+    }
+    let slug: String = site
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let slug = if slug.is_empty() {
+        "site".to_string()
+    } else {
+        slug
+    };
+    let id = format!(
+        "array-{}-{}",
+        slug,
+        Uuid::new_v4().to_string().split('-').next().unwrap_or("x")
+    );
+    Ok(StorageArray {
+        id,
+        name: name.to_string(),
+        vendor,
+        model: model.to_string(),
+        site: site.to_string(),
+        total_capacity_gb,
+        used_capacity_gb: 0,
+        pool_count: 0,
+        status: ArrayStatus::Healthy,
+    })
+}
+
 /// Build a new StorageVolume without persisting. Called by the provision handler
 /// before delegating to the repo layer.
 pub fn build_volume(
@@ -387,5 +473,57 @@ mod tests {
         assert_eq!(parse_volume_type("CIFS").unwrap(), VolumeType::Cifs);
         assert_eq!(parse_volume_type("Object").unwrap(), VolumeType::Object);
         assert!(parse_volume_type("invalid").is_err());
+    }
+
+    #[test]
+    fn test_parse_vendor_and_array_status() {
+        assert_eq!(
+            parse_vendor("PureStorage").unwrap(),
+            StorageVendor::PureStorage
+        );
+        assert_eq!(
+            parse_vendor("pure-storage").unwrap(),
+            StorageVendor::PureStorage
+        );
+        assert_eq!(parse_vendor("DellEMC").unwrap(), StorageVendor::DellEmc);
+        assert_eq!(parse_vendor("net-app").unwrap(), StorageVendor::NetApp);
+        assert_eq!(parse_vendor("HPE").unwrap(), StorageVendor::Hpe);
+        assert!(parse_vendor("bogus").is_err());
+
+        assert_eq!(parse_array_status("healthy").unwrap(), ArrayStatus::Healthy);
+        assert_eq!(
+            parse_array_status("DEGRADED").unwrap(),
+            ArrayStatus::Degraded
+        );
+        assert!(parse_array_status("on-fire").is_err());
+    }
+
+    #[test]
+    fn test_build_storage_array_validates_and_constructs() {
+        let a = build_storage_array("Prod SAN", "PureStorage", "FlashArray//X", "FRPAR", 100_000)
+            .expect("valid array builds");
+        assert!(a.id.starts_with("array-frpar-"));
+        assert_eq!(a.vendor, StorageVendor::PureStorage);
+        assert_eq!(a.total_capacity_gb, 100_000);
+        assert_eq!(a.used_capacity_gb, 0);
+        assert_eq!(a.pool_count, 0);
+        assert_eq!(a.status, ArrayStatus::Healthy);
+
+        assert!(
+            build_storage_array("", "Pure", "m", "S", 1).is_err(),
+            "empty name"
+        );
+        assert!(
+            build_storage_array("n", "Pure", "", "S", 1).is_err(),
+            "empty model"
+        );
+        assert!(
+            build_storage_array("n", "bogus", "m", "S", 1).is_err(),
+            "bad vendor"
+        );
+        assert!(
+            build_storage_array("n", "Pure", "m", "S", u64::MAX).is_err(),
+            "capacity overflows i64"
+        );
     }
 }

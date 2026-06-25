@@ -1836,10 +1836,15 @@ pub fn routes() -> Router {
             "/api/datacenter/storage/volumes/{id}/retire",
             post(storage_volume_retire),
         )
-        .route("/api/datacenter/storage/arrays", get(storage_arrays_list))
+        .route(
+            "/api/datacenter/storage/arrays",
+            get(storage_arrays_list).post(storage_array_register),
+        )
         .route(
             "/api/datacenter/storage/arrays/{id}",
-            get(storage_array_get),
+            get(storage_array_get)
+                .put(storage_array_update)
+                .delete(storage_array_delete),
         )
         .route(
             "/api/datacenter/storage/check-capacity",
@@ -22655,6 +22660,129 @@ async fn storage_array_get(
         ryuki_engine::storage_provisioning::get_array_response(&array),
     ))
 }
+
+/// Body for registering a storage array.
+#[derive(Debug, Deserialize)]
+struct StorageArrayRegisterRequest {
+    name: String,
+    vendor: String,
+    model: String,
+    site: String,
+    total_capacity_gb: u64,
+}
+
+/// POST /api/datacenter/storage/arrays — register a new storage array. It is
+/// validated and constructed by the pure engine builder, then persisted.
+/// Execute-tier. 503 when no database is configured.
+async fn storage_array_register(
+    Json(b): Json<StorageArrayRegisterRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let array = ryuki_engine::storage_provisioning::build_storage_array(
+        &b.name,
+        &b.vendor,
+        &b.model,
+        &b.site,
+        b.total_capacity_gb,
+    )
+    .map_err(|e| status_400(&e))?;
+    crate::repos::storage_provisioning::create_array(db, &array)
+        .await
+        .map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "array": ryuki_engine::storage_provisioning::get_array_response(&array),
+    })))
+}
+
+/// Mutable fields of a storage array. Identity (vendor/name/site) is NOT here.
+/// `deny_unknown_fields` makes an immutable-field PUT a hard 422.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageArrayUpdateRequest {
+    model: Option<String>,
+    total_capacity_gb: Option<u64>,
+    pool_count: Option<u32>,
+    status: Option<String>,
+}
+
+/// PUT /api/datacenter/storage/arrays/{id} — update an array's mutable fields
+/// (partial). Lowering total capacity below the used capacity is a 400 (the DB
+/// `used <= total` invariant). 404 when unknown; 503 when no DB.
+async fn storage_array_update(
+    Path(id): Path<String>,
+    Json(b): Json<StorageArrayUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    let status = match b.status.as_deref() {
+        Some(s) => Some(
+            ryuki_engine::storage_provisioning::parse_array_status(s)
+                .map_err(|e| status_400(&e))?,
+        ),
+        None => None,
+    };
+    // Validate the provided mutable fields BEFORE SQL — reject rather than let an
+    // out-of-range value silently clamp or an empty model slip through.
+    if b.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
+        return Err(status_400("model cannot be empty"));
+    }
+    if b.total_capacity_gb.is_some_and(|v| v > i64::MAX as u64) {
+        return Err(status_400("total_capacity_gb is too large to persist"));
+    }
+    if b.pool_count.is_some_and(|v| v > i32::MAX as u32) {
+        return Err(status_400("pool_count is too large"));
+    }
+    let updated = crate::repos::storage_provisioning::update_array(
+        db,
+        &id,
+        b.model.as_deref(),
+        b.total_capacity_gb,
+        b.pool_count,
+        status.as_ref(),
+    )
+    .await
+    .map_err(|e| {
+        // ONLY the used<=total invariant maps to a 400; match the SPECIFIC
+        // constraint name, not the broad check-violation class (which would
+        // mis-attribute any future CHECK on the table).
+        if e.as_database_error().and_then(|d| d.constraint())
+            == Some("storage_arrays_used_le_total")
+        {
+            status_400("total_capacity_gb cannot be set below the array's used capacity")
+        } else {
+            db_error(e)
+        }
+    })?
+    .ok_or_else(|| status_404(&id))?;
+    Ok(Json(json!({
+        "source": "database",
+        "array": ryuki_engine::storage_provisioning::get_array_response(&updated),
+    })))
+}
+
+/// DELETE /api/datacenter/storage/arrays/{id} — decommission an array. REFUSES
+/// (409) when volumes still reference it. 404 when unknown; 503 when no DB.
+async fn storage_array_delete(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let db = get_db().ok_or_else(status_503_no_db)?;
+    use crate::repos::storage_provisioning::ArrayDeleteResult;
+    match crate::repos::storage_provisioning::delete_array(db, &id)
+        .await
+        .map_err(db_error)?
+    {
+        ArrayDeleteResult::Deleted => Ok(Json(json!({
+            "source": "database",
+            "deleted": true,
+            "array_id": id,
+        }))),
+        ArrayDeleteResult::NotFound => Err(status_404(&id)),
+        ArrayDeleteResult::Blocked(n) => Err(status_409(&format!(
+            "array '{id}' has {n} volume(s); retire them before decommissioning"
+        ))),
+    }
+}
+
 async fn storage_check_capacity(
     Json(b): Json<StorageCapacityRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
