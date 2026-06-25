@@ -190,6 +190,11 @@ pub fn routes() -> Router {
         .route("/api/metrics/slo/status", get(slo_status))
         .route("/api/metering/usage", get(metering_usage))
         .route(
+            "/api/metering/chargeback/rates",
+            post(chargeback_rate_set).get(chargeback_rates_list),
+        )
+        .route("/api/metering/chargeback", get(chargeback_report))
+        .route(
             "/api/platform/security-baseline-contract",
             get(platform_security_baseline),
         )
@@ -17241,6 +17246,256 @@ async fn metering_usage(
     })))
 }
 
+// ─── Chargeback / showback cost allocation (#46) ───
+
+/// Body for setting a per-request-type cost rate (UPSERT).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostRateRequest {
+    request_type: String,
+    unit_cost: f64,
+    #[serde(default)]
+    currency: Option<String>,
+}
+
+/// POST /api/metering/chargeback/rates — set (upsert) a request-type unit cost.
+/// ADMIN-tier: billing rates must not be rewritable by any operator who can run
+/// workload. 503 when no DB.
+async fn chargeback_rate_set(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<CostRateRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "admin") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Admin-tier access is required to set cost rates"})),
+        ));
+    }
+    let request_type = b.request_type.trim();
+    if request_type.is_empty() || request_type.len() > 200 {
+        return Err(status_400("request_type must be 1..=200 characters"));
+    }
+    if !(b.unit_cost.is_finite() && b.unit_cost >= 0.0) {
+        return Err(status_400(
+            "unit_cost must be a finite, non-negative number",
+        ));
+    }
+    // Currencies are stored uppercase (ISO-style), e.g. USD.
+    let currency = b
+        .currency
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("USD")
+        .to_ascii_uppercase();
+    if currency.len() > 8 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
+        return Err(status_400(
+            "currency must be a short alphabetic code (e.g. USD)",
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    // Setting a rate ENABLES it — re-enable on conflict so a previously disabled
+    // row is not silently excluded from reporting after an update.
+    sqlx::query(
+        "INSERT INTO cost_rates (id, request_type, unit_cost, currency) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (request_type) DO UPDATE \
+            SET unit_cost = EXCLUDED.unit_cost, currency = EXCLUDED.currency, \
+                enabled = TRUE, updated_at = NOW()",
+    )
+    .bind(&id)
+    .bind(request_type)
+    .bind(b.unit_cost)
+    .bind(&currency)
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(json!({
+        "request_type": request_type,
+        "unit_cost": b.unit_cost,
+        "currency": currency,
+        "set": true,
+    })))
+}
+
+/// GET /api/metering/chargeback/rates — list the configured cost rates. Audit-tier.
+async fn chargeback_rates_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read cost rates"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"rates": [], "durable": false})));
+    };
+    let rows: Vec<(String, f64, String, bool)> = match sqlx::query_as(
+        "SELECT request_type, unit_cost, currency, enabled FROM cost_rates ORDER BY request_type",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing cost rates failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not list cost rates"})),
+            ));
+        }
+    };
+    let rates: Vec<Value> = rows
+        .iter()
+        .map(|(rt, cost, cur, enabled)| {
+            json!({"request_type": rt, "unit_cost": cost, "currency": cur, "enabled": enabled})
+        })
+        .collect();
+    Ok(Json(json!({ "rates": rates, "durable": true })))
+}
+
+/// GET /api/metering/chargeback — allocate cost per site by applying the
+/// per-request-type rates to the usage in the window. AUDIT-tier (cross-site
+/// cost data). The window defaults to the last 90 days. NOTE: the totals assume
+/// a SINGLE currency across the active rates; a request type with no rate
+/// contributes 0 cost. 503 when no DB.
+async fn chargeback_report(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<MeteringQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read chargeback"})),
+        ));
+    }
+    let parse_ts = |raw: &Option<String>| -> Result<Option<chrono::DateTime<chrono::Utc>>, ()> {
+        match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| Some(d.with_timezone(&chrono::Utc)))
+                .map_err(|_| ()),
+            None => Ok(None),
+        }
+    };
+    let since = parse_ts(&q.since).map_err(|_| status_400("since must be an RFC3339 timestamp"))?;
+    let until = parse_ts(&q.until).map_err(|_| status_400("until must be an RFC3339 timestamp"))?;
+    let since = since.or_else(|| Some(chrono::Utc::now() - chrono::Duration::days(90)));
+    let f_site = q
+        .site
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let counts: Vec<(String, String, i64)> = match sqlx::query_as(
+        "SELECT site, request_type, COUNT(*) FROM requests \
+         WHERE ($1::timestamptz IS NULL OR created_at >= $1) \
+           AND ($2::timestamptz IS NULL OR created_at <= $2) \
+           AND ($3::text IS NULL OR site = $3) \
+         GROUP BY site, request_type",
+    )
+    .bind(since)
+    .bind(until)
+    .bind(&f_site)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "chargeback usage query failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not compute chargeback"})),
+            ));
+        }
+    };
+    let rate_rows: Vec<(String, f64, String)> = match sqlx::query_as(
+        "SELECT request_type, unit_cost, currency FROM cost_rates WHERE enabled",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "chargeback rates query failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not compute chargeback"})),
+            ));
+        }
+    };
+    // Mixed currencies make a single summed total meaningless — refuse rather
+    // than emit misleading financial data. (A future slice could group by
+    // currency.)
+    let distinct_currencies: std::collections::BTreeSet<&str> =
+        rate_rows.iter().map(|(_, _, cur)| cur.as_str()).collect();
+    if distinct_currencies.len() > 1 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "cost rates mix currencies; chargeback requires a single currency",
+                "currencies": distinct_currencies.into_iter().collect::<Vec<_>>(),
+            })),
+        ));
+    }
+    let currency = distinct_currencies
+        .into_iter()
+        .next()
+        .map(str::to_string)
+        .unwrap_or_else(|| "USD".to_string());
+    let rates: std::collections::HashMap<String, f64> = rate_rows
+        .into_iter()
+        .map(|(rt, cost, _)| (rt, cost))
+        .collect();
+
+    // site -> (total_cost, request_type -> line item).
+    let mut by_site: std::collections::BTreeMap<
+        String,
+        (f64, std::collections::BTreeMap<String, Value>),
+    > = std::collections::BTreeMap::new();
+    // Request types seen in usage but with NO configured rate — these contribute
+    // 0 cost, which is "unconfigured", NOT "free": surface them so an incomplete
+    // chargeback is never mistaken for a complete one.
+    let mut unrated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (site, request_type, n) in counts {
+        let rated = rates.contains_key(&request_type);
+        let unit_cost = rates.get(&request_type).copied().unwrap_or(0.0);
+        if !rated {
+            unrated.insert(request_type.clone());
+        }
+        let cost = n as f64 * unit_cost;
+        let entry = by_site.entry(site).or_default();
+        entry.0 += cost;
+        entry.1.insert(
+            request_type,
+            json!({"request_count": n, "unit_cost": unit_cost, "cost": cost, "rated": rated}),
+        );
+    }
+    let total_cost: f64 = by_site.values().map(|(t, _)| *t).sum();
+    let sites: Vec<Value> = by_site
+        .iter()
+        .map(|(site, (total, breakdown))| {
+            json!({"site": site, "total_cost": total, "by_request_type": breakdown})
+        })
+        .collect();
+    let unrated: Vec<String> = unrated.into_iter().collect();
+
+    Ok(Json(json!({
+        "sites": sites,
+        "total_cost": total_cost,
+        "currency": currency,
+        "unrated_request_types": unrated,
+        "complete": unrated.is_empty(),
+        // Showback estimate using the CURRENT rates (not effective-dated, so a
+        // past-window report changes when a rate is updated) and f64 arithmetic —
+        // informational, NOT billing-grade.
+        "basis": "showback-current-rates",
+        "window_since": since.map(|d| d.to_rfc3339()),
+        "window_until": until.map(|d| d.to_rfc3339()),
+    })))
+}
+
 // ─── VM Day-2 Operations handlers ───
 
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
@@ -30083,6 +30338,82 @@ mod db_lifecycle_tests {
 
         sqlx::query("DELETE FROM requests WHERE site = $1")
             .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #46: chargeback applies a per-request-type rate to the per-site usage —
+    /// 4 requests at $2.50 each allocates $10.00 to the site.
+    #[tokio::test]
+    async fn test_chargeback_allocates_cost_by_rate() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let site = "TESTCHARGE-3k";
+        let rtype = "test-charge-deploy";
+        sqlx::query("DELETE FROM requests WHERE site = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM cost_rates WHERE request_type = $1")
+            .bind(rtype)
+            .execute(pool)
+            .await
+            .ok();
+
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        let _ = chargeback_rate_set(
+            sess(),
+            Json(CostRateRequest {
+                request_type: rtype.to_string(),
+                unit_cost: 2.5,
+                currency: None,
+            }),
+        )
+        .await
+        .expect("set rate");
+        for _ in 0..4 {
+            sqlx::query(
+                "INSERT INTO requests (id, request_type, status, stage, site, environment, name) \
+                 VALUES ($1, $2, 'intake', 'intake', $3, 'production', 'charge-test')",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(rtype)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("insert request");
+        }
+
+        let Json(out) = chargeback_report(
+            sess(),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: Some(site.to_string()),
+            }),
+        )
+        .await
+        .expect("chargeback");
+        let sites = out["sites"].as_array().unwrap();
+        assert_eq!(sites.len(), 1, "one site");
+        assert!(
+            (sites[0]["total_cost"].as_f64().unwrap() - 10.0).abs() < 1e-9,
+            "4 x $2.50 = $10.00"
+        );
+        assert_eq!(out["currency"], "USD");
+
+        sqlx::query("DELETE FROM requests WHERE site = $1")
+            .bind(site)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM cost_rates WHERE request_type = $1")
+            .bind(rtype)
             .execute(pool)
             .await
             .ok();
