@@ -42,7 +42,7 @@ implementing **all 66**. This file tracks execution.
 | 10 | [ ] | Destroy/teardown execution mode (live decommission) | Exec | L | H | — |
 | 11 | [ ] | Pre-dispatch policy gate for unsafe IaC | Exec | M | H | — |
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
-| 13 | [ ] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
+| 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
 | 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
 | 16 | [ ] | Enforced site degradation mode (write gating) | Resil | L | H | — |
