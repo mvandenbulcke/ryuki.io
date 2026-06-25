@@ -160,6 +160,7 @@ pub fn routes() -> Router {
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
+        .route("/api/audit/retention", get(audit_retention_report))
         .route(
             "/api/observe/oncall/contacts",
             get(on_call_contact_list).post(on_call_contact_create),
@@ -15343,6 +15344,77 @@ async fn audit_export(
             ))
         }
     }
+}
+
+/// Query for GET /api/audit/retention.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditRetentionQuery {
+    retention_days: Option<i64>,
+}
+
+/// Retention counts query. `$1` = retention window in seconds. Returns
+/// (total, entries-older-than-window, oldest-entry-age-secs|NULL). Shared with
+/// the DB test so it validates the EXACT SQL the handler runs.
+const AUDIT_RETENTION_SQL: &str = "SELECT count(*), \
+     count(*) FILTER (WHERE occurred_at \
+         < now() - make_interval(secs => $1::double precision)), \
+     EXTRACT(EPOCH FROM (now() - min(occurred_at)))::bigint \
+     FROM audit_log";
+
+/// GET /api/audit/retention?retention_days=N — audit-log retention/growth report
+/// (#62). The append-only, hash-chained trail only grows; this surfaces how many
+/// entries have aged past a retention window (default 365d, bounded) and whether
+/// archival/partitioning is due — the read input to that SEPARATE, hash-chain-
+/// preserving step. Audit-tier; empty + `durable:false` with no DB.
+async fn audit_retention_report(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<AuditRetentionQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required for the retention report"})),
+        ));
+    }
+    let retention_days = q.retention_days.unwrap_or(365);
+    if !(1..=3650).contains(&retention_days) {
+        return Err(status_400("retention_days must be between 1 and 3650"));
+    }
+
+    use ryuki_engine::audit_retention::{build_audit_retention, AuditRetentionReport};
+    // Same JSON shape for both paths so a client never has to special-case no-DB.
+    let to_json = |report: AuditRetentionReport, durable: bool| -> Value {
+        json!({
+            "durable": durable,
+            "retention_days": report.retention_days,
+            "total_entries": report.total_entries,
+            "within_retention": report.within_retention,
+            "beyond_retention": report.beyond_retention,
+            "oldest_age_days": report.oldest_age_days,
+            "status": report.status.as_str(),
+        })
+    };
+
+    let Some(pool) = get_db() else {
+        // Uniform shape: an EMPTY report, marked non-durable.
+        let mut body = to_json(build_audit_retention(0, 0, None, retention_days), false);
+        body["note"] =
+            json!("no database configured; the durable audit log only exists in DB mode");
+        return Ok(Json(body));
+    };
+
+    // total, entries older than the window, and the oldest entry's age in seconds
+    // (NULL ⇒ empty log ⇒ Option None). All from one DB clock.
+    let (total, beyond, oldest_age_secs): (i64, i64, Option<i64>) =
+        sqlx::query_as(AUDIT_RETENTION_SQL)
+            .bind((retention_days * 86_400) as f64)
+            .fetch_one(pool)
+            .await
+            .map_err(db_error)?;
+
+    let report = build_audit_retention(total, beyond, oldest_age_secs, retention_days);
+    Ok(Json(to_json(report, true)))
 }
 
 // ─── On-call / escalation contact registry (#61) ───
@@ -39354,6 +39426,121 @@ mod snapshots_db_tests {
         );
 
         cleanup(pool, &id).await;
+    }
+}
+
+// #62 audit retention — no-DB handler paths (auth/bounds/durable). NOT a
+// `*_db_tests` module so the DB-filtered run excludes it.
+#[cfg(test)]
+mod audit_retention_unit_tests {
+    use super::*;
+
+    fn no_perm_session() -> AuthSession {
+        // An authenticated session with no roles holds no permissions.
+        let mut s = AuthSession::static_dry_run();
+        s.roles = vec![];
+        s
+    }
+
+    #[tokio::test]
+    async fn retention_requires_audit_permission() {
+        let err = audit_retention_report(
+            AuthExtractor(no_perm_session()),
+            Query(AuditRetentionQuery {
+                retention_days: None,
+            }),
+        )
+        .await
+        .expect_err("a session without audit permission must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn retention_rejects_out_of_range_window() {
+        for bad in [0_i64, 99_999] {
+            let err = audit_retention_report(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Query(AuditRetentionQuery {
+                    retention_days: Some(bad),
+                }),
+            )
+            .await
+            .expect_err("out-of-range retention_days must be rejected");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad} must 400");
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_without_db_reports_not_durable() {
+        let Ok(Json(body)) = audit_retention_report(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(AuditRetentionQuery {
+                retention_days: None,
+            }),
+        )
+        .await
+        else {
+            panic!("no-DB retention should be 200, not an error");
+        };
+        assert_eq!(body["durable"], serde_json::json!(false));
+        assert_eq!(body["retention_days"], serde_json::json!(365));
+        // Uniform shape with the DB path: a full (empty) report, not a stub.
+        assert_eq!(body["status"], serde_json::json!("empty"));
+        assert_eq!(body["total_entries"], serde_json::json!(0));
+        assert_eq!(body["oldest_age_days"], serde_json::Value::Null);
+    }
+}
+
+// #62 audit retention — DB-gated SQL validity. audit_log is append-only (no
+// cleanup possible) and the report counts globally, so this validates the EXACT
+// shared query + the build() integration against the live DB WITHOUT inserting
+// rows it could never delete.
+#[cfg(test)]
+mod audit_retention_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()?;
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply");
+        Some(pool)
+    }
+
+    #[tokio::test]
+    async fn audit_retention_query_is_valid_and_consistent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let (total, beyond, oldest_age_secs): (i64, i64, Option<i64>) =
+            sqlx::query_as(AUDIT_RETENTION_SQL)
+                .bind((365_i64 * 86_400) as f64)
+                .fetch_one(&pool)
+                .await
+                .expect("audit retention SQL must be valid");
+        assert!(total >= 0, "count is non-negative");
+        assert!(beyond <= total, "beyond cannot exceed total");
+
+        let report = ryuki_engine::audit_retention::build_audit_retention(
+            total,
+            beyond,
+            oldest_age_secs,
+            365,
+        );
+        assert_eq!(
+            report.within_retention + report.beyond_retention,
+            report.total_entries,
+            "within + beyond == total"
+        );
     }
 }
 
