@@ -21671,8 +21671,31 @@ async fn evidence_verify_compliance(
 
 // ─── Health Monitor handlers ───
 
-async fn platform_health_all_checks() -> Json<ryuki_engine::health_monitor::PlatformHealth> {
-    Json(health_monitor::run_all_checks())
+/// GET /api/platform/health/all — component health checks. These are SIMULATED
+/// (the health_monitor engine is pure / IO-free), so the overall status is NOT a
+/// live truth signal. The response is marked `advisory` and points at the real
+/// dependency-backed probe (#6) so a monitoring system can never mistake a
+/// hardcoded `healthy` for a live one (swarm finding #4). Additive: the original
+/// PlatformHealth fields are unchanged.
+async fn platform_health_all_checks() -> Json<Value> {
+    let health = health_monitor::run_all_checks();
+    let mut body = serde_json::to_value(&health).unwrap_or_else(|_| json!({}));
+    if let Value::Object(ref mut m) = body {
+        m.insert("advisory".into(), json!(true));
+        m.insert(
+            "note".into(),
+            json!(
+                "Component checks are SIMULATED (dry-run posture), NOT live probes — \
+                 not authoritative for alerting. For real dependency health use \
+                 GET /api/platform/health/dependencies."
+            ),
+        );
+        m.insert(
+            "authoritative_endpoint".into(),
+            json!("/api/platform/health/dependencies"),
+        );
+    }
+    Json(body)
 }
 
 async fn platform_health_check_adapter(
@@ -29889,6 +29912,28 @@ mod unit_tests {
             )
             .is_err(),
             "unknown field on token-create must be rejected"
+        );
+    }
+
+    // ── swarm #4: the simulated health-all endpoint is marked advisory ──
+
+    #[tokio::test]
+    async fn platform_health_all_is_marked_advisory() {
+        let Json(body) = platform_health_all_checks().await;
+        assert_eq!(body["advisory"], serde_json::json!(true));
+        assert_eq!(
+            body["authoritative_endpoint"],
+            serde_json::json!("/api/platform/health/dependencies")
+        );
+        assert!(
+            body["note"].as_str().unwrap_or("").contains("SIMULATED"),
+            "note must flag the checks as simulated"
+        );
+        // Additive: the original PlatformHealth fields are still present (more
+        // keys than just the 3 advisory markers added).
+        assert!(
+            body.as_object().map(|o| o.len() > 3).unwrap_or(false),
+            "original health fields must be preserved"
         );
     }
 
