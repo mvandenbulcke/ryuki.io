@@ -6,6 +6,7 @@ pub mod alert_routing_engine;
 pub mod app_environment;
 pub mod auth;
 pub mod backup_engine;
+pub mod backup_recency;
 pub mod certificate_lifecycle;
 pub mod circuit_breaker;
 pub mod cluster_capacity_admission;

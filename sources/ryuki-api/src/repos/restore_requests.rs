@@ -218,6 +218,51 @@ pub async fn list(pool: &PgPool) -> Result<Vec<RestoreRequest>, sqlx::Error> {
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// One protected system's restore-test recency aggregate (#47).
+#[derive(sqlx::FromRow)]
+pub struct RestoreTestRecencyRow {
+    pub source_ci_key: String,
+    /// `updated_at` of the most recent request in a SUCCESSFUL state
+    /// (`Verified`/`Completed`); `None` ⇒ never successfully tested.
+    pub last_successful_test: Option<DateTime<Utc>>,
+    pub successful_test_count: i64,
+    pub total_requests: i64,
+}
+
+/// Per system that has restore-request history (`source_ci_key`): when its last
+/// SUCCESSFUL restore test (status `Verified`/`Completed`) ran, how many
+/// succeeded, and how many restore requests exist in total. Ordered most-at-risk
+/// first — never-succeeded (`NULL`) then oldest. Pure over the pool.
+///
+/// `last_successful_test` uses `max(updated_at)` over rows CURRENTLY in a success
+/// state. `transition()` stamps `updated_at = NOW()` on every CAS write, and
+/// today it is only ever invoked to CHANGE status — so for a row resting in
+/// `Verified`/`Completed` `updated_at` is the instant it entered that state, the
+/// success time. CAVEAT: this is an advisory recency signal, not an audited
+/// success timestamp. If future code ever updates a success-state row WITHOUT a
+/// status change (e.g. editing metadata), `updated_at` would drift and an old
+/// test could read as recent; the precise fix would be a dedicated `succeeded_at`
+/// column. Systems that have NEVER had a restore request do not appear (that is a
+/// coverage question, not a recency one).
+pub async fn restore_test_recency(
+    pool: &PgPool,
+) -> Result<Vec<RestoreTestRecencyRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT source_ci_key, \
+                max(updated_at) FILTER (WHERE status IN ('Verified', 'Completed')) \
+                    AS last_successful_test, \
+                count(*) FILTER (WHERE status IN ('Verified', 'Completed')) \
+                    AS successful_test_count, \
+                count(*) AS total_requests \
+         FROM restore_requests \
+         GROUP BY source_ci_key \
+         ORDER BY max(updated_at) FILTER (WHERE status IN ('Verified', 'Completed')) \
+                  ASC NULLS FIRST, source_ci_key ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Atomically transition a restore request to its new state IFF its current DB
 /// status still equals `expected_status` (optimistic lock). Returns `Ok(None)`
 /// when the row is absent or its status had already changed (caller → 409), or

@@ -16,6 +16,7 @@ const DECLARED_MODULES: &[&str] = &[
     "app_environment",
     "auth",
     "backup_engine",
+    "backup_recency",
     "certificate_lifecycle",
     "circuit_breaker",
     "cluster_capacity_admission",

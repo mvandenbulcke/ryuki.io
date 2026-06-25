@@ -1518,6 +1518,10 @@ pub fn routes() -> Router {
         .route("/api/protect/backup/restores", get(backup_restores_list))
         .route("/api/protect/backup/restores/{id}", get(backup_restore_get))
         .route(
+            "/api/protect/backup/restore-tests/recency",
+            get(backup_restore_test_recency),
+        )
+        .route(
             "/api/protect/backup/coverage-reports",
             get(backup_coverage_reports_list),
         )
@@ -17963,6 +17967,96 @@ async fn backup_restore_get(Path(id): Path<String>) -> ApiResult {
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
+}
+
+/// Query for GET /api/protect/backup/restore-tests/recency.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreTestRecencyQuery {
+    overdue_after_days: Option<i64>,
+}
+
+/// GET /api/protect/backup/restore-tests/recency?overdue_after_days=N — restore
+/// test recency (#47). A backup is only proven by a successful restore test;
+/// this reports, per `source_ci_key` THAT HAS RESTORE-REQUEST HISTORY, the last
+/// successful test (status Verified/Completed) and classifies it
+/// `current`/`overdue`/`never_tested` against the policy window (default 90
+/// days, bounded). Systems with no restore request at all are out of scope (a
+/// coverage question — see coverage reports); the response carries a `scope` +
+/// `note` saying so. Read-only; empty + `durable:false` when no DB.
+async fn backup_restore_test_recency(Query(q): Query<RestoreTestRecencyQuery>) -> ApiResult {
+    use ryuki_engine::backup_recency::{classify_restore_recency, RestoreTestRecency};
+
+    let overdue_after_days = q.overdue_after_days.unwrap_or(90);
+    if !(1..=3650).contains(&overdue_after_days) {
+        return Err(status_400("overdue_after_days must be between 1 and 3650"));
+    }
+
+    // The report covers systems that HAVE restore-request history; a system that
+    // never had a restore request at all is a backup-coverage gap, not a recency
+    // one, so `never_tested` here means "requested but never proven".
+    let scope = "systems-with-restore-requests";
+    let note = "Covers systems with restore-request history only; \
+                'never_tested' = requested but never reached Verified/Completed. \
+                Systems with no restore request at all are a coverage concern \
+                (see backup coverage reports), not surfaced here. \
+                'last_successful_test' is the request's last-transition time, used \
+                as an advisory success time.";
+
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "overdue_after_days": overdue_after_days,
+            "systems": [],
+            "summary": {"total_systems": 0, "current": 0, "overdue": 0, "never_tested": 0},
+            "scope": scope,
+            "note": note,
+            "durable": false,
+        })));
+    };
+
+    let rows = crate::repos::restore_requests::restore_test_recency(pool)
+        .await
+        .map_err(db_error)?;
+
+    let now_unix = chrono::Utc::now().timestamp();
+    let overdue_after_secs = overdue_after_days * 86_400;
+    let (mut current, mut overdue, mut never) = (0_i64, 0_i64, 0_i64);
+    let systems: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let last_unix = r.last_successful_test.map(|d| d.timestamp());
+            let recency = classify_restore_recency(last_unix, now_unix, overdue_after_secs);
+            match recency {
+                RestoreTestRecency::Current => current += 1,
+                RestoreTestRecency::Overdue => overdue += 1,
+                RestoreTestRecency::NeverTested => never += 1,
+            }
+            json!({
+                "source_ci_key": r.source_ci_key,
+                "last_successful_test": r.last_successful_test.map(|d| d.to_rfc3339()),
+                "successful_test_count": r.successful_test_count,
+                "total_requests": r.total_requests,
+                "recency": recency.as_str(),
+                "at_risk": recency.is_at_risk(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "overdue_after_days": overdue_after_days,
+        "systems": systems,
+        "summary": {
+            "total_systems": systems.len(),
+            "current": current,
+            "overdue": overdue,
+            "never_tested": never,
+        },
+        "scope": scope,
+        "note": note,
+        // Uniform with the no-DB path's `durable:false`, so a client can always
+        // tell a persisted result from a graceful no-DB degradation.
+        "durable": true,
+    })))
 }
 
 /// GET /api/protect/backup/coverage-reports — list all persisted coverage reports.
@@ -39263,6 +39357,45 @@ mod snapshots_db_tests {
     }
 }
 
+// #47 restore-test recency — no-DB handler paths. NOT a `*_db_tests` module, so
+// the DB-filtered run excludes it (it must run in the no-DB bins gate, where the
+// global pool is never set, to exercise the durable:false branch).
+#[cfg(test)]
+mod backup_recency_unit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recency_rejects_out_of_range_window() {
+        let err = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
+            overdue_after_days: Some(0),
+        }))
+        .await
+        .expect_err("overdue_after_days=0 must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
+            overdue_after_days: Some(10_000),
+        }))
+        .await
+        .expect_err("overdue_after_days=10000 must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn recency_without_db_reports_not_durable() {
+        let Ok(Json(body)) = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
+            overdue_after_days: None,
+        }))
+        .await
+        else {
+            panic!("no-DB recency should be 200, not an error");
+        };
+        assert_eq!(body["durable"], serde_json::json!(false));
+        assert_eq!(body["overdue_after_days"], serde_json::json!(90));
+        assert_eq!(body["summary"]["total_systems"], serde_json::json!(0));
+    }
+}
+
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api backup_restore_db_tests
 #[cfg(test)]
 mod backup_restore_db_tests {
@@ -39305,6 +39438,79 @@ mod backup_restore_db_tests {
         if let Ok(uid) = uuid::Uuid::parse_str(id) {
             sqlx::query("DELETE FROM restore_requests WHERE id = $1")
                 .bind(uid)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// #47: restore-test recency classifies each system from its last successful
+    /// (Verified/Completed) restore — current / overdue / never_tested — driven
+    /// end-to-end through the handler against a live DB.
+    #[tokio::test]
+    async fn test_restore_test_recency_classifies_systems() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        // (ci_key_label, status, updated_at offset days) — unique keys so the
+        // global GROUP BY only matches our fixtures.
+        let now = chrono::Utc::now();
+        let fixtures: [(&str, &str, i64); 3] = [
+            ("cur", "Completed", -10), // tested 10d ago -> current
+            ("old", "Verified", -200), // tested 200d ago -> overdue (90d window)
+            ("never", "Draft", -1),    // never reached success -> never_tested
+        ];
+        let mut keys = Vec::new();
+        for (label, status, off) in fixtures {
+            let key = format!("ci-rtr-{label}-{suffix}");
+            let updated = now + chrono::Duration::days(off);
+            sqlx::query(
+                "INSERT INTO restore_requests \
+                 (source_ci_key, restore_type, restore_point, target_site, \
+                  target_environment, owner, status, updated_at) \
+                 VALUES ($1, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $2, $3)",
+            )
+            .bind(&key)
+            .bind(status)
+            .bind(updated)
+            .execute(pool)
+            .await
+            .expect("insert restore request");
+            keys.push(key);
+        }
+
+        let Ok(Json(body)) = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
+            overdue_after_days: Some(90),
+        }))
+        .await
+        else {
+            panic!("recency handler failed");
+        };
+
+        // Contract: a persisted result is uniformly marked durable:true.
+        assert_eq!(body["durable"], serde_json::json!(true));
+        let systems = body["systems"].as_array().expect("systems array");
+        let find = |key: &str| -> serde_json::Value {
+            systems
+                .iter()
+                .find(|s| s["source_ci_key"] == serde_json::json!(key))
+                .cloned()
+                .unwrap_or_else(|| panic!("system {key} missing from recency report"))
+        };
+        assert_eq!(find(&keys[0])["recency"], serde_json::json!("current"));
+        assert_eq!(find(&keys[1])["recency"], serde_json::json!("overdue"));
+        let never = find(&keys[2]);
+        assert_eq!(never["recency"], serde_json::json!("never_tested"));
+        assert_eq!(never["successful_test_count"], serde_json::json!(0));
+        assert_eq!(never["at_risk"], serde_json::json!(true));
+
+        // Clean up by deleting the rows for our unique keys.
+        for key in &keys {
+            sqlx::query("DELETE FROM restore_requests WHERE source_ci_key = $1")
+                .bind(key)
                 .execute(pool)
                 .await
                 .ok();
