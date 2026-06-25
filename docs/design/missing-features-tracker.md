@@ -76,7 +76,7 @@ implementing **all 66**. This file tracks execution.
 | 44 | [ ] | Agent liveness sweep + offline detection | Exec | M | M | — |
 | 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
 | 46 | [x] | Chargeback / showback cost allocation | AIOps | M | M | — |
-| 47 | [ ] | Backup verification + restore-test recency | Resil | M | M | — |
+| 47 | [x] | Backup verification + restore-test recency | Resil | M | M | — |
 | 48 | [ ] | Enforced access recertification w/ revocation | Security | L | M | — |
 | 49 | [~] | Secret update & deregistration | API | S | M | — |
 | 50 | [x] | Evidence pack file download / export | Portal | S | M | — |
