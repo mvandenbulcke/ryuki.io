@@ -233,6 +233,37 @@ pub fn check_permission(session: &AuthSession, permission: &str) -> bool {
     held.contains("admin") || held.contains(permission)
 }
 
+/// Whether a principal whose authorized scopes are `scopes` may act on the
+/// `requested` scope value (a site or an environment). The verified building
+/// block for site/env-scoped RBAC (#2): the API persists per-token
+/// site_scope/environment_scope but does not yet enforce them, letting a
+/// scoped operator read another scope's data via `?site=`.
+///
+/// Rules (deny-by-default once a scope is set):
+/// - EMPTY `scopes` ⇒ UNRESTRICTED — permits any request (the common
+///   admin/operator case with no scoping configured).
+/// - `requested == None` ⇒ permitted — a request that does not name a scope is
+///   not constrained by this check (the handler may still apply its own
+///   default-scope logic).
+/// - otherwise the (trimmed) requested value must be one of the (trimmed)
+///   authorized scopes; the match is case-SENSITIVE (site/env identifiers are
+///   canonical, e.g. `GBLON`, `production`).
+///
+/// Pure; the API resolves the principal's scopes and the requested value and
+/// passes them in.
+pub fn scope_permits(scopes: &[String], requested: Option<&str>) -> bool {
+    if scopes.is_empty() {
+        return true;
+    }
+    match requested {
+        None => true,
+        Some(req) => {
+            let req = req.trim();
+            scopes.iter().any(|s| s.trim() == req)
+        }
+    }
+}
+
 pub fn get_entra_config_from_env(tenant_id: &str, client_id: &str, instance: &str) -> EntraConfig {
     let enabled = !tenant_id.is_empty() && !client_id.is_empty();
     EntraConfig {
@@ -527,5 +558,29 @@ mod tests {
         assert!(!check_permission(&session, "execute"));
         assert!(!check_permission(&session, "request"));
         assert!(!check_permission(&session, "admin"));
+    }
+
+    #[test]
+    fn scope_permits_matrix() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // EMPTY scopes => unrestricted (the common no-scoping case).
+        assert!(scope_permits(&[], Some("GBLON")));
+        assert!(scope_permits(&[], None));
+
+        // A request that names no scope is not constrained by this check.
+        assert!(scope_permits(&s(&["GBLON"]), None));
+
+        // In-scope is permitted; out-of-scope is denied (THE cross-tenant gap).
+        assert!(scope_permits(&s(&["GBLON", "DEFRA"]), Some("DEFRA")));
+        assert!(!scope_permits(&s(&["GBLON", "DEFRA"]), Some("FRPAR")));
+
+        // Whitespace is trimmed on both sides; the match is case-SENSITIVE.
+        assert!(scope_permits(&s(&[" GBLON "]), Some("GBLON")));
+        assert!(scope_permits(&s(&["GBLON"]), Some("  GBLON  ")));
+        assert!(
+            !scope_permits(&s(&["GBLON"]), Some("gblon")),
+            "site identifiers are canonical/case-sensitive"
+        );
     }
 }
