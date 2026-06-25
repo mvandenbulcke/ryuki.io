@@ -1367,6 +1367,234 @@ pub async fn integration_expiring_credentials(
 }
 
 // ---------------------------------------------------------------------------
+// Circuit breaker (#30)
+// ---------------------------------------------------------------------------
+
+use ryuki_engine::circuit_breaker::{self, Breaker, BreakerConfig, BreakerState};
+
+/// Body for POST /api/integrations/{id}/circuit/record.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CircuitOutcomeRequest {
+    /// Whether the guarded call SUCCEEDED.
+    success: bool,
+}
+
+/// One persisted circuit_breakers row.
+#[derive(sqlx::FromRow)]
+struct BreakerRow {
+    state: String,
+    consecutive_failures: i32,
+    consecutive_successes: i32,
+    opened_at_unix: Option<i64>,
+}
+
+/// Counts are tiny and bounded by the thresholds, but clamp the u32→i32 store so
+/// a pathological value can never wrap negative and trip the `>= 0` CHECK.
+fn clamp_i32(n: u32) -> i32 {
+    i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+fn breaker_from_row(row: BreakerRow) -> Breaker {
+    let state = match row.state.as_str() {
+        "open" => BreakerState::Open,
+        "half_open" => BreakerState::HalfOpen,
+        _ => BreakerState::Closed,
+    };
+    Breaker {
+        state,
+        consecutive_failures: row.consecutive_failures.max(0) as u32,
+        consecutive_successes: row.consecutive_successes.max(0) as u32,
+        opened_at_unix: row.opened_at_unix,
+    }
+}
+
+/// Render a breaker as the API response. `allow_now` is derived READ-ONLY (it
+/// never persists the Open→HalfOpen transition that `allow()` would apply).
+fn breaker_json(b: &Breaker, cfg: &BreakerConfig, now_unix: i64) -> Value {
+    let allow_now = match b.state {
+        BreakerState::Closed | BreakerState::HalfOpen => true,
+        BreakerState::Open => circuit_breaker::cooldown_remaining_secs(b, cfg, now_unix) == 0,
+    };
+    json!({
+        "state": b.state.as_str(),
+        "consecutive_failures": b.consecutive_failures,
+        "consecutive_successes": b.consecutive_successes,
+        "opened_at_unix": b.opened_at_unix,
+        "allow_now": allow_now,
+        "cooldown_remaining_secs": circuit_breaker::cooldown_remaining_secs(b, cfg, now_unix),
+    })
+}
+
+const BREAKER_SELECT: &str = "SELECT state, consecutive_failures, consecutive_successes, \
+     opened_at_unix FROM circuit_breakers WHERE connection_id = $1";
+
+/// Current time as unix seconds FROM THE DATABASE — the single clock all API
+/// workers share, so `opened_at_unix` and cooldown math never skew between
+/// workers with drifting local clocks. Uses `clock_timestamp()` (real wall-clock
+/// at statement time), NOT `now()`/`transaction_timestamp()` which is frozen at
+/// tx start: sampled AFTER the parent-row `FOR UPDATE`, it reflects the true
+/// post-lock-wait time, so a queued recorder can't persist a stale cooldown.
+const DB_NOW_UNIX: &str = "SELECT EXTRACT(EPOCH FROM clock_timestamp())::bigint";
+
+/// GET /api/integrations/{id}/circuit — current breaker state for a connection
+/// (default healthy `closed` when no outcome has been recorded). Admin-gated;
+/// 404 for an unknown connection.
+pub async fn integration_circuit_get(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&session)?;
+    let cfg = BreakerConfig::DEFAULT;
+
+    let Some(pool) = get_db() else {
+        // No DB: report a default healthy breaker (now is irrelevant for Closed).
+        let mut body = breaker_json(&Breaker::closed(), &cfg, 0);
+        body["durable"] = json!(false);
+        return Ok(Json(body));
+    };
+
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+    if exists.is_none() {
+        return Err(integration_not_found(&id));
+    }
+
+    let now_unix: i64 = sqlx::query_scalar(DB_NOW_UNIX)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+    let row: Option<BreakerRow> = sqlx::query_as(BREAKER_SELECT)
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+    let breaker = row.map(breaker_from_row).unwrap_or_default();
+    Ok(Json(breaker_json(&breaker, &cfg, now_unix)))
+}
+
+/// POST /api/integrations/{id}/circuit/record — fold one guarded-call outcome
+/// into the breaker and persist it. Admin-gated; 404 unknown connection; 503 no
+/// DB (a state change must not be faked). The read-modify-write is serialized on
+/// the PARENT connection row (FOR UPDATE) so concurrent records never lose an
+/// update.
+pub async fn integration_circuit_record(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+    Json(body): Json<CircuitOutcomeRequest>,
+) -> ApiResult {
+    require_admin(&session)?;
+    let cfg = BreakerConfig::DEFAULT;
+
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "database not configured; cannot persist circuit state"})),
+        ));
+    };
+
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    // Lock the parent connection: serializes concurrent record() for this
+    // connection AND yields a clean 404 for an unknown one. tx rolls back on drop.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if exists.is_none() {
+        return Err(integration_not_found(&id));
+    }
+
+    // DB clock inside the tx — shared across workers (no local-clock skew on the
+    // persisted opened_at_unix / cooldown).
+    let now_unix: i64 = sqlx::query_scalar(DB_NOW_UNIX)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+    let cur: Option<BreakerRow> = sqlx::query_as(BREAKER_SELECT)
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    let breaker = cur.map(breaker_from_row).unwrap_or_default();
+    // Advance the TIME-based transition first: an Open breaker past its cooldown
+    // becomes HalfOpen, so this recorded probe outcome is judged against HalfOpen
+    // and a success can actually CLOSE the breaker. Without this gating,
+    // record(Open, success) ignores the probe and an Open breaker could never
+    // recover through this endpoint.
+    let (_allowed, gated) = circuit_breaker::allow(&breaker, &cfg, now_unix);
+    let next = circuit_breaker::record(&gated, &cfg, body.success, now_unix);
+
+    sqlx::query(
+        "INSERT INTO circuit_breakers \
+         (connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, NOW()) \
+         ON CONFLICT (connection_id) DO UPDATE SET \
+           state = EXCLUDED.state, \
+           consecutive_failures = EXCLUDED.consecutive_failures, \
+           consecutive_successes = EXCLUDED.consecutive_successes, \
+           opened_at_unix = EXCLUDED.opened_at_unix, \
+           updated_at = NOW()",
+    )
+    .bind(&id)
+    .bind(next.state.as_str())
+    .bind(clamp_i32(next.consecutive_failures))
+    .bind(clamp_i32(next.consecutive_successes))
+    .bind(next.opened_at_unix)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    Ok(Json(breaker_json(&next, &cfg, now_unix)))
+}
+
+/// POST /api/integrations/{id}/circuit/reset — operator override forcing the
+/// breaker back to healthy `closed` (clears the persisted row). Admin-gated;
+/// 404 unknown connection; 503 no DB.
+pub async fn integration_circuit_reset(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&session)?;
+    let cfg = BreakerConfig::DEFAULT;
+
+    let Some(pool) = get_db() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "database not configured; cannot reset circuit"})),
+        ));
+    };
+
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if exists.is_none() {
+        return Err(integration_not_found(&id));
+    }
+    // Absence of a row IS the healthy default, so a reset just clears it.
+    sqlx::query("DELETE FROM circuit_breakers WHERE connection_id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    // Healthy default (now is irrelevant for a Closed breaker).
+    Ok(Json(breaker_json(&Breaker::closed(), &cfg, 0)))
+}
+
+// ---------------------------------------------------------------------------
 // Route builder
 // ---------------------------------------------------------------------------
 
@@ -1387,11 +1615,23 @@ pub fn routes() -> axum::Router {
             "/api/integrations/{id}/credential-expiry",
             post(integration_set_credential_expiry),
         )
-        // Static segment in the `:id` slot — matchit (axum 0.8) routes the
-        // literal over the param, so this does not shadow `/:id`.
+        // Static segment in the `{id}` slot — matchit (axum 0.8) routes the
+        // literal over the param, so this does not shadow `/{id}`.
         .route(
             "/api/integrations/credentials/expiring",
             get(integration_expiring_credentials),
+        )
+        .route(
+            "/api/integrations/{id}/circuit",
+            get(integration_circuit_get),
+        )
+        .route(
+            "/api/integrations/{id}/circuit/record",
+            post(integration_circuit_record),
+        )
+        .route(
+            "/api/integrations/{id}/circuit/reset",
+            post(integration_circuit_reset),
         )
 }
 
@@ -1577,6 +1817,97 @@ pub mod integration_db_tests {
         for id in &ids {
             cleanup_connection(&pool, id).await;
         }
+    }
+
+    /// #30: the DB_NOW_UNIX clock query is valid SQL and returns a sane epoch.
+    /// Nothing else executes this string (the handlers use the global pool), so
+    /// this guards against a typo shipping unnoticed.
+    #[tokio::test]
+    async fn db_now_unix_is_valid_sql() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let now: i64 = sqlx::query_scalar(super::DB_NOW_UNIX)
+            .fetch_one(&pool)
+            .await
+            .expect("DB_NOW_UNIX must be valid SQL");
+        assert!(now > 1_700_000_000, "epoch seconds look sane: {now}");
+    }
+
+    /// #30: a circuit_breakers row persists, round-trips through breaker_from_row,
+    /// cascade-deletes with its connection, and the open-has-timestamp CHECK
+    /// rejects an inconsistent (open without opened_at) row.
+    #[tokio::test]
+    async fn circuit_breaker_persists_cascades_and_enforces_check() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-cb-{}", uuid::Uuid::new_v4());
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              status, readiness, execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 't', 'https://x.example', 'vault', 'p', \
+                     'configured', 'configured', 'static-dry-run', 'sys', $2, $2)",
+        )
+        .bind(&conn_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert connection");
+
+        // Persist an Open breaker, then read it back through the row decoder.
+        sqlx::query(
+            "INSERT INTO circuit_breakers \
+             (connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix) \
+             VALUES ($1, 'open', 5, 0, 12345)",
+        )
+        .bind(&conn_id)
+        .execute(&pool)
+        .await
+        .expect("insert breaker");
+
+        let row: BreakerRow = sqlx::query_as(BREAKER_SELECT)
+            .bind(&conn_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read breaker");
+        let breaker = breaker_from_row(row);
+        assert_eq!(breaker.state, BreakerState::Open);
+        assert_eq!(breaker.consecutive_failures, 5);
+        assert_eq!(breaker.opened_at_unix, Some(12345));
+
+        // The open-has-timestamp CHECK rejects an open row with no opened_at.
+        let bad = sqlx::query(
+            "INSERT INTO circuit_breakers (connection_id, state, opened_at_unix) \
+             VALUES ($1, 'open', NULL)",
+        )
+        .bind(format!("{conn_id}-bad"))
+        .execute(&pool)
+        .await;
+        assert!(
+            bad.is_err(),
+            "open without opened_at must violate the CHECK"
+        );
+
+        // Deleting the connection cascades its breaker.
+        sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+            .bind(&conn_id)
+            .execute(&pool)
+            .await
+            .expect("delete connection");
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM circuit_breakers WHERE connection_id = $1")
+                .bind(&conn_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0, "breaker cascade-deleted with the connection");
     }
 
     // -----------------------------------------------------------------------
@@ -3049,6 +3380,46 @@ mod unit_tests {
         )
         .await
         .expect_err("a valid expiry with no DB must be a 503");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // -----------------------------------------------------------------------
+    // #30 circuit breaker — no-DB handler paths.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn circuit_get_without_db_reports_default_closed() {
+        let resp = integration_circuit_get(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+        )
+        .await
+        .expect("no DB returns a default healthy breaker, not an error");
+        assert_eq!(resp.0["state"], serde_json::json!("closed"));
+        assert_eq!(resp.0["allow_now"], serde_json::json!(true));
+        assert_eq!(resp.0["durable"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn circuit_record_without_db_is_503() {
+        let err = integration_circuit_record(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+            Json(CircuitOutcomeRequest { success: false }),
+        )
+        .await
+        .expect_err("a state change with no DB must be a 503");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn circuit_reset_without_db_is_503() {
+        let err = integration_circuit_reset(
+            Extension(AuthSession::static_dry_run()),
+            Path("ic-unit".to_string()),
+        )
+        .await
+        .expect_err("a reset with no DB must be a 503");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
