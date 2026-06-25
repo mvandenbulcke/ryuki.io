@@ -70,7 +70,7 @@ implementing **all 66**. This file tracks execution.
 | 38 | [x] | Storage array registration / lifecycle | API | M | M | — |
 | 39 | [ ] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | ✓ |
 | 40 | [ ] | Scheduled/recurring synthetic health checks | Observ | S | M | ✓ |
-| 41 | [ ] | Integration credential rotation / expiry | Integ | M | M | — |
+| 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
 | 43 | [ ] | Post-apply verification (re-plan → Verified) | Exec | M | M | — |
 | 44 | [ ] | Agent liveness sweep + offline detection | Exec | M | M | — |
