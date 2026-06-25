@@ -11,6 +11,7 @@ const DECLARED_MODULES: &[&str] = &[
     "access_recertification",
     "ad_computer_lifecycle",
     "adapter_framework",
+    "agent_liveness",
     "aiops",
     "alert_routing_engine",
     "app_environment",

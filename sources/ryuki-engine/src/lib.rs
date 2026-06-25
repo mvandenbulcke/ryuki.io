@@ -1,6 +1,7 @@
 pub mod access_recertification;
 pub mod ad_computer_lifecycle;
 pub mod adapter_framework;
+pub mod agent_liveness;
 pub mod aiops;
 pub mod alert_routing_engine;
 pub mod app_environment;

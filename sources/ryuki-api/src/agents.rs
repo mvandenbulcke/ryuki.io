@@ -20,7 +20,7 @@
 //!   LiveApply → ReconcileRequired (never auto-redispatched).
 
 use axum::{
-    extract::{Extension, Path},
+    extract::{Extension, Path, Query},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -1948,6 +1948,138 @@ pub async fn admin_list_agents(
     list_agents_with(pool).await
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/admin/agents/liveness — operational liveness of approved agents (#44)
+// ---------------------------------------------------------------------------
+
+/// Query for the liveness endpoint.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLivenessQuery {
+    offline_after_secs: Option<i64>,
+}
+
+/// One approved agent projected for liveness. No secrets.
+#[derive(sqlx::FromRow)]
+struct LivenessAgentRow {
+    agent_id: String,
+    platform: String,
+    last_seen_at: Option<chrono::DateTime<Utc>>,
+}
+
+/// Maximum approved agents enumerated in the detail list of one liveness
+/// response (the summary counts the full scanned fleet regardless).
+const LIVENESS_LIST_LIMIT: usize = 1000;
+/// Safety bound on the approved-agent scan so the summary can never trigger an
+/// unbounded fetch. Far above any realistic approved fleet; `scan_capped` flags
+/// the (pathological) case where it is hit.
+const LIVENESS_SCAN_CAP: i64 = 100_000;
+
+/// Testable core for `admin_agents_liveness` — no axum Extension, no auth check.
+///
+/// Classifies the OPERATIONAL liveness of every APPROVED agent from its
+/// `last_seen_at` heartbeat (pending/revoked agents are not expected to
+/// heartbeat, so they are excluded). `now_unix` is injected for determinism.
+/// Secret hygiene: selects only `agent_id`, `platform`, `last_seen_at`.
+///
+/// The `summary` totals are computed by classifying the WHOLE approved set (one
+/// snapshot, the same engine + `now_unix` as the per-agent detail), so they are
+/// correct even when the detail list is capped at [`LIVENESS_LIST_LIMIT`];
+/// `truncated` flags a capped detail list and `scan_capped` the pathological
+/// case where the approved fleet exceeds [`LIVENESS_SCAN_CAP`].
+pub async fn agents_liveness_with(
+    pool: &PgPool,
+    offline_after_secs: i64,
+    now_unix: i64,
+) -> ApiResult<Json<Value>> {
+    use ryuki_engine::agent_liveness::classify_agent_liveness;
+
+    // ONE snapshot, ONE classifier: fetch all approved agents (safety-capped) and
+    // classify every one with the pure engine using a single `now_unix`. The
+    // summary and the per-agent detail therefore share one source of truth — no
+    // SQL-vs-engine duplication, no cross-time-source boundary disagreement.
+    let rows: Vec<LivenessAgentRow> = sqlx::query_as(
+        "SELECT agent_id, platform, last_seen_at \
+         FROM agents \
+         WHERE status = 'approved' \
+         ORDER BY last_seen_at ASC NULLS FIRST \
+         LIMIT $1",
+    )
+    // Fetch one MORE than the cap so we can tell "exactly cap" from ">cap".
+    .bind(LIVENESS_SCAN_CAP + 1)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    // Pathological backstop: if the approved fleet exceeds the scan cap, even the
+    // summary is over a partial set — surface it rather than report a wrong total.
+    let scan_capped = rows.len() as i64 > LIVENESS_SCAN_CAP;
+    let total_approved = rows.len() as i64;
+
+    let (mut online, mut offline) = (0_i64, 0_i64);
+    let mut agents: Vec<Value> = Vec::new();
+    for a in &rows {
+        let last_unix = a.last_seen_at.map(|d| d.timestamp());
+        let liveness = classify_agent_liveness(last_unix, now_unix, offline_after_secs);
+        if liveness.is_online() {
+            online += 1;
+        } else {
+            offline += 1;
+        }
+        // Summary counts the whole fleet; the detail list is capped for response size.
+        if agents.len() < LIVENESS_LIST_LIMIT {
+            // age clamped to >= 0 so a future heartbeat never reports negative.
+            let age_secs = last_unix.map(|t| now_unix.saturating_sub(t).max(0));
+            agents.push(json!({
+                "agent_id": a.agent_id,
+                "platform": a.platform,
+                "last_seen_at": a.last_seen_at,
+                "age_secs": age_secs,
+                "liveness": liveness.as_str(),
+            }));
+        }
+    }
+
+    let listed = agents.len() as i64;
+    Ok(Json(json!({
+        "offline_after_secs": offline_after_secs,
+        "agents": agents,
+        "listed": listed,
+        // The detail list is capped; the summary spans the whole approved fleet
+        // (up to the scan cap, flagged by `scan_capped`).
+        "truncated": listed < total_approved,
+        "scan_capped": scan_capped,
+        "summary": {
+            "total_approved": total_approved,
+            "online": online,
+            "offline": offline,
+        },
+    })))
+}
+
+/// GET /api/admin/agents/liveness?offline_after_secs=N — operational liveness of
+/// approved agents (#44). Admin-gated; 503 with no DB. Read-only: this surfaces
+/// which approved agents have gone silent (offline detection) WITHOUT mutating
+/// the enrollment status, so it can never accidentally revoke an agent.
+pub async fn admin_agents_liveness(
+    Extension(session): Extension<AuthSession>,
+    Query(q): Query<AgentLivenessQuery>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission required"));
+    }
+    let offline_after_secs = q.offline_after_secs.unwrap_or(300);
+    if !(30..=86_400).contains(&offline_after_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "offline_after_secs must be between 30 and 86400"})),
+        ));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let now_unix = Utc::now().timestamp();
+    agents_liveness_with(pool, offline_after_secs, now_unix).await
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -1955,6 +2087,9 @@ pub async fn admin_list_agents(
 pub fn admin_routes() -> Router {
     Router::new()
         .route("/api/admin/agents", get(admin_list_agents))
+        // Static `liveness` in the `{agent_id}` slot — matchit routes the literal
+        // over the param, so it does not shadow `/{agent_id}/approve`.
+        .route("/api/admin/agents/liveness", get(admin_agents_liveness))
         .route(
             "/api/admin/agents/{agent_id}/approve",
             post(admin_approve_agent),
@@ -2000,6 +2135,43 @@ mod tests {
         let a = generate_agent_token();
         let b = generate_agent_token();
         assert_ne!(a, b, "tokens must be unique");
+    }
+
+    // ── #44 agent liveness — auth + bounds (run before any pool access) ──
+
+    #[tokio::test]
+    async fn liveness_requires_admin() {
+        let non_admin = AuthSession {
+            user_id: "u".into(),
+            display_name: "U".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "test".into(),
+        };
+        let err = admin_agents_liveness(
+            Extension(non_admin),
+            Query(AgentLivenessQuery {
+                offline_after_secs: None,
+            }),
+        )
+        .await
+        .expect_err("non-admin must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn liveness_rejects_out_of_range_window() {
+        for bad in [10_i64, 999_999] {
+            let err = admin_agents_liveness(
+                Extension(AuthSession::static_dry_run()),
+                Query(AgentLivenessQuery {
+                    offline_after_secs: Some(bad),
+                }),
+            )
+            .await
+            .expect_err("out-of-range window must be rejected");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "window {bad} must 400");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2145,6 +2317,100 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
 
         cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── #44 liveness: classifies APPROVED agents, excludes pending/revoked ──
+
+    #[tokio::test]
+    async fn db_agents_liveness_classifies_approved() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let now = Utc::now();
+        let suffix = Uuid::new_v4();
+        let online_id = format!("live-online-{suffix}");
+        let stale_id = format!("live-stale-{suffix}");
+        let never_id = format!("live-never-{suffix}");
+        let boundary_id = format!("live-boundary-{suffix}");
+        let pending_id = format!("live-pending-{suffix}");
+        let revoked_id = format!("live-revoked-{suffix}");
+
+        // approved + heartbeat now -> online
+        seed_agent(&pool, &online_id, "ci", "approved").await;
+        // approved + heartbeat 1000s ago -> offline (window 300)
+        seed_agent(&pool, &stale_id, "ci", "approved").await;
+        // approved + never seen -> offline
+        seed_agent(&pool, &never_id, "ci", "approved").await;
+        // approved + heartbeat EXACTLY at the window edge (age == window) -> online
+        seed_agent(&pool, &boundary_id, "ci", "approved").await;
+        // pending + revoked -> excluded entirely
+        seed_agent(&pool, &pending_id, "ci", "pending").await;
+        seed_agent(&pool, &revoked_id, "ci", "revoked").await;
+
+        for (id, secs_ago) in [(&online_id, 0_i64), (&stale_id, 1_000), (&boundary_id, 300)] {
+            sqlx::query("UPDATE agents SET last_seen_at = $1 WHERE agent_id = $2")
+                .bind(now - Duration::seconds(secs_ago))
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("set last_seen_at");
+        }
+
+        let Ok(Json(body)) = agents_liveness_with(&pool, 300, now.timestamp()).await else {
+            panic!("liveness core failed");
+        };
+        let agents = body["agents"].as_array().expect("agents array");
+        let liveness_of = |id: &str| -> Option<String> {
+            agents
+                .iter()
+                .find(|a| a["agent_id"] == serde_json::json!(id))
+                .map(|a| a["liveness"].as_str().unwrap_or("").to_string())
+        };
+
+        assert_eq!(liveness_of(&online_id).as_deref(), Some("online"));
+        assert_eq!(liveness_of(&stale_id).as_deref(), Some("offline"));
+        assert_eq!(liveness_of(&never_id).as_deref(), Some("offline"));
+        // age == window is online (boundary is inclusive, matching the engine).
+        assert_eq!(liveness_of(&boundary_id).as_deref(), Some("online"));
+        assert!(liveness_of(&pending_id).is_none(), "pending excluded");
+        assert!(liveness_of(&revoked_id).is_none(), "revoked excluded");
+
+        // The fleet-wide SQL summary must be internally consistent and include
+        // our approved fixtures.
+        let summary = &body["summary"];
+        let total = summary["total_approved"].as_i64().expect("total_approved");
+        let online_c = summary["online"].as_i64().expect("online");
+        let offline_c = summary["offline"].as_i64().expect("offline");
+        assert_eq!(total, online_c + offline_c, "online + offline == total");
+        assert!(total >= 4, "summary counts at least our 4 approved agents");
+
+        // Alignment guard: when the detail list is NOT truncated it holds EVERY
+        // approved agent, so summary.online (counted over the full scan) MUST
+        // equal the detail online count. Both come from one classification pass
+        // over one snapshot with one now_unix, so they can never disagree.
+        if body["truncated"] == serde_json::json!(false) {
+            let detail_online = agents
+                .iter()
+                .filter(|a| a["liveness"] == serde_json::json!("online"))
+                .count() as i64;
+            assert_eq!(
+                detail_online, online_c,
+                "SQL summary.online must match engine detail when not truncated"
+            );
+        }
+
+        for id in [
+            &online_id,
+            &stale_id,
+            &never_id,
+            &boundary_id,
+            &pending_id,
+            &revoked_id,
+        ] {
+            cleanup_agent(&pool, id).await;
+        }
         pool.close().await;
     }
 
