@@ -1087,6 +1087,32 @@ pub async fn integration_test(
         .execute(pool)
         .await
         .ok(); // best-effort, don't fail the test call on a result-write error
+
+        // Append a durable health-check history row (#19) — best-effort (never
+        // fail the probe on a history-write error), but LOG on failure so a bad
+        // table/permission/FK race does not silently drop every record and leave
+        // operators staring at an empty history with no clue. The stored
+        // `message` is the stub's secret-free output (it names the credential
+        // SOURCE type, never the ref/secret/endpoint) — keep it that way.
+        if let Err(e) = sqlx::query(
+            "INSERT INTO connection_health_checks \
+             (id, connection_id, endpoint_status, credential_status, message) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&id)
+        .bind(&test_result.status)
+        .bind(cred_status)
+        .bind(&test_result.message)
+        .execute(pool)
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                connection_id = %id,
+                "failed to record connection health-check history (probe still succeeded)"
+            );
+        }
     }
 
     Ok(Json(json!({
@@ -1097,6 +1123,70 @@ pub async fn integration_test(
         "credential_message": cred_message,
         "tested_at": now,
         // NEVER include resolved credentials or secret material.
+    })))
+}
+
+/// One persisted connection_health_checks row (#19).
+#[derive(sqlx::FromRow)]
+struct HealthCheckRow {
+    id: String,
+    checked_at: chrono::DateTime<chrono::Utc>,
+    endpoint_status: String,
+    credential_status: String,
+    message: Option<String>,
+}
+
+/// GET /api/integrations/{id}/health — the connection's health-check HISTORY
+/// (most-recent 100), recorded by each `/test`. Admin-tier. 404 when the
+/// connection does not exist; empty (durable:false) in no-DB mode.
+pub async fn integration_health_history(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&session)?;
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({
+            "connection_id": id,
+            "history": [],
+            "durable": false,
+        })));
+    };
+    // Confirm the connection exists, so an unknown id is a 404 (not an
+    // empty-history 200 that looks like a healthy-but-unchecked connection).
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1")
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+    if exists.is_none() {
+        return Err(integration_not_found(&id));
+    }
+    let rows: Vec<HealthCheckRow> = sqlx::query_as(
+        "SELECT id, checked_at, endpoint_status, credential_status, message \
+         FROM connection_health_checks WHERE connection_id = $1 \
+         ORDER BY checked_at DESC LIMIT 100",
+    )
+    .bind(&id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    let history: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "checked_at": r.checked_at.to_rfc3339(),
+                "endpoint_status": r.endpoint_status,
+                "credential_status": r.credential_status,
+                "message": r.message,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "connection_id": id,
+        "count": history.len(),
+        "history": history,
     })))
 }
 
@@ -1113,6 +1203,10 @@ pub fn routes() -> axum::Router {
         .route("/api/integrations/:id", put(integration_update))
         .route("/api/integrations/:id", delete(integration_delete))
         .route("/api/integrations/:id/test", post(integration_test))
+        .route(
+            "/api/integrations/:id/health",
+            get(integration_health_history),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1258,72 @@ pub mod integration_db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #19: a connection's health-check history rows persist and cascade-delete
+    /// with the connection (the FK from migration 102).
+    #[tokio::test]
+    async fn connection_health_checks_record_and_cascade() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-health-{}", uuid::Uuid::new_v4());
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              status, readiness, execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 't', 'https://x.example', 'vault', 'p', \
+                     'configured', 'configured', 'static-dry-run', 'sys', $2, $2)",
+        )
+        .bind(&conn_id)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .expect("insert connection");
+
+        for status in ["reachable-stub", "unreachable"] {
+            sqlx::query(
+                "INSERT INTO connection_health_checks \
+                 (id, connection_id, endpoint_status, credential_status, message) \
+                 VALUES ($1, $2, $3, 'resolved', 'probe')",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&conn_id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert health check");
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM connection_health_checks WHERE connection_id = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 2, "both checks recorded");
+
+        // Deleting the connection cascades its health history.
+        sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+            .bind(&conn_id)
+            .execute(&pool)
+            .await
+            .expect("delete connection");
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM connection_health_checks WHERE connection_id = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            after, 0,
+            "health history cascade-deleted with the connection"
+        );
     }
 
     // -----------------------------------------------------------------------
