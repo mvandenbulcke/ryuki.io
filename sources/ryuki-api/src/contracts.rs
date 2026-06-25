@@ -1679,8 +1679,16 @@ pub fn routes() -> Router {
         .route("/api/network/dns/records/{id}", get(dns_record_get))
         .route("/api/network/dns/records/{id}", put(dns_record_update))
         .route("/api/network/dns/records/{id}", delete(dns_record_delete))
-        .route("/api/network/ipam/subnets", get(ipam_subnets_list))
-        .route("/api/network/ipam/subnets/{id}", get(ipam_subnet_get))
+        .route(
+            "/api/network/ipam/subnets",
+            get(ipam_subnets_list).post(ipam_subnet_create),
+        )
+        .route(
+            "/api/network/ipam/subnets/{id}",
+            get(ipam_subnet_get)
+                .put(ipam_subnet_update)
+                .delete(ipam_subnet_delete),
+        )
         .route("/api/network/ipam/reserve", post(ipam_reserve_ip))
         .route("/api/network/ipam/release/{id}", post(ipam_release_ip))
         .route("/api/network/ipam/summary", get(ipam_summary))
@@ -21566,6 +21574,189 @@ async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
+
+/// The canonical serde string for a subnet status ("Available"/"Exhausted"/
+/// "Reserved"), for binding to the `status` column.
+fn subnet_status_str(status: &dns_ipam::IpamSubnetStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "Available".to_string())
+}
+
+/// Body for creating an IPAM subnet.
+#[derive(Debug, Deserialize)]
+struct IpamSubnetCreateRequest {
+    cidr: String,
+    gateway: String,
+    vlan_id: u16,
+    site: String,
+}
+
+/// POST /api/network/ipam/subnets — create a subnet (validated + counters
+/// derived from the CIDR by the pure engine builder, then persisted).
+/// Execute-tier (the /api/network family). 503 when no database is configured.
+async fn ipam_subnet_create(
+    Json(b): Json<IpamSubnetCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let subnet = dns_ipam::build_ipam_subnet(&b.cidr, &b.gateway, b.vlan_id, &b.site)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    // total/available persist to INTEGER columns; reject a subnet whose host
+    // count would overflow i32 (e.g. a /0).
+    if subnet.total_ips > i32::MAX as u32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "subnet is too large to persist (host count exceeds i32)"})),
+        ));
+    }
+    sqlx::query(&format!(
+        "INSERT INTO ipam_subnets ({IPAM_SUBNET_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+    ))
+    .bind(&subnet.id)
+    .bind(&subnet.cidr)
+    .bind(&subnet.gateway)
+    .bind(subnet.vlan_id as i32)
+    .bind(&subnet.site)
+    .bind(subnet.total_ips as i32)
+    .bind(subnet.used_ips as i32)
+    .bind(subnet.available_ips as i32)
+    .bind(subnet_status_str(&subnet.status))
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "subnet": serde_json::to_value(&subnet).unwrap_or_default(),
+    })))
+}
+
+/// Mutable fields of a subnet. The CIDR is the subnet identity and is NOT here —
+/// changing the network is a new subnet. `deny_unknown_fields` so a PUT carrying
+/// `cidr` (or any immutable field) is a hard 422, not a silent no-op. Any omitted
+/// field keeps its value.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpamSubnetUpdateRequest {
+    gateway: Option<String>,
+    vlan_id: Option<u16>,
+    status: Option<String>,
+}
+
+/// PUT /api/network/ipam/subnets/{id} — update a subnet's mutable fields
+/// (gateway, vlan_id, status), preserving the reservation counters. The new
+/// gateway/vlan are revalidated against the immutable CIDR through the same pure
+/// engine path as create. 404 when the subnet is unknown; 503 when no DB.
+async fn ipam_subnet_update(
+    Path(id): Path<String>,
+    Json(b): Json<IpamSubnetUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let existing: IpamSubnetRow = sqlx::query_as(&format!(
+        "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| ipam_not_found(format!("Subnet '{id}' not found")))?;
+
+    let new_gateway = b.gateway.as_deref().unwrap_or(&existing.gateway);
+    // Clamp the stored vlan to the valid range before the `as u16` so a corrupt
+    // DB value cannot wrap; a valid row (CHECK-constrained) is unchanged.
+    let new_vlan = b
+        .vlan_id
+        .unwrap_or_else(|| existing.vlan_id.clamp(1, 4094) as u16);
+    dns_ipam::validate_subnet_fields(&existing.cidr, new_gateway, new_vlan)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    // A status, if provided, must be one of the canonical values — a typo must
+    // NOT silently coerce to Available.
+    let new_status = match b.status.as_deref() {
+        None => existing.status.clone(),
+        Some(s @ ("Available" | "Exhausted" | "Reserved")) => s.to_string(),
+        Some(other) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("invalid status '{other}' (Available/Exhausted/Reserved)")
+                })),
+            ));
+        }
+    };
+
+    sqlx::query("UPDATE ipam_subnets SET gateway = $1, vlan_id = $2, status = $3 WHERE id = $4")
+        .bind(new_gateway)
+        .bind(new_vlan as i32)
+        .bind(&new_status)
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+    let updated: IpamSubnetRow = sqlx::query_as(&format!(
+        "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "subnet": serde_json::to_value(updated.to_engine()).unwrap_or_default(),
+    })))
+}
+
+/// DELETE /api/network/ipam/subnets/{id} — delete a subnet. REFUSES with 409 when
+/// the subnet still has IP reservations (deleting it would silently drop live
+/// allocations via the FK cascade); release them first. 404 when unknown.
+async fn ipam_subnet_delete(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // Lock the subnet row FIRST. A concurrent reservation insert needs a SHARE
+    // lock on this parent row (the FK), so it blocks until we commit — closing
+    // the count-then-delete TOCTOU window where a new reservation could be
+    // silently cascade-deleted.
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM ipam_subnets WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    if exists.is_none() {
+        return Err(ipam_not_found(format!("Subnet '{id}' not found")));
+    }
+    let reservations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ip_reservations WHERE subnet_id = $1")
+            .bind(&id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    if reservations > 0 {
+        // Returning drops `tx`, rolling back (releasing the lock); nothing deleted.
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "subnet '{id}' has {reservations} active reservation(s); release them before deleting"
+                )
+            })),
+        ));
+    }
+    sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "deleted": true,
+        "subnet_id": id,
+    })))
+}
+
 async fn ipam_reserve_ip(
     Extension(session): Extension<AuthSession>,
     Json(b): Json<IpamReserveRequest>,
@@ -28268,6 +28459,93 @@ mod db_lifecycle_tests {
 
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
             .bind(key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #56: IPAM subnet CRUD — create (counters derived from the CIDR), update
+    /// mutable fields (preserving counters), reject an invalid status, refuse a
+    /// delete while reservations exist, then delete once released.
+    #[tokio::test]
+    async fn test_ipam_subnet_crud_lifecycle() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // CREATE — a /24 yields 254 usable hosts.
+        let Json(created) = ipam_subnet_create(Json(IpamSubnetCreateRequest {
+            cidr: "10.99.0.0/24".to_string(),
+            gateway: "10.99.0.1".to_string(),
+            vlan_id: 999,
+            site: "TESTSITE".to_string(),
+        }))
+        .await
+        .expect("create subnet");
+        let id = created["subnet"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created["subnet"]["total_ips"], 254);
+        assert_eq!(created["subnet"]["available_ips"], 254);
+
+        // UPDATE gateway + status; the reservation counters are preserved.
+        let Json(updated) = ipam_subnet_update(
+            Path(id.clone()),
+            Json(IpamSubnetUpdateRequest {
+                gateway: Some("10.99.0.254".to_string()),
+                vlan_id: None,
+                status: Some("Reserved".to_string()),
+            }),
+        )
+        .await
+        .expect("update subnet");
+        assert_eq!(updated["subnet"]["gateway"], "10.99.0.254");
+        assert_eq!(updated["subnet"]["status"], "Reserved");
+        assert_eq!(updated["subnet"]["total_ips"], 254, "counters preserved");
+
+        // An invalid status is a 400, never a silent coercion.
+        assert!(
+            ipam_subnet_update(
+                Path(id.clone()),
+                Json(IpamSubnetUpdateRequest {
+                    gateway: None,
+                    vlan_id: None,
+                    status: Some("Bogus".to_string()),
+                }),
+            )
+            .await
+            .is_err(),
+            "an invalid status is rejected"
+        );
+
+        // DELETE is refused (409) while a reservation exists.
+        sqlx::query(
+            "INSERT INTO ip_reservations \
+             (id, ip_address, subnet_id, hostname, purpose, reserved_by, reserved_at, expiry) \
+             VALUES ('res-test-ipam-1', '10.99.0.10', $1, 'h', 'p', 'u', '2026-01-01', '2027-01-01')",
+        )
+        .bind(&id)
+        .execute(pool)
+        .await
+        .unwrap();
+        match ipam_subnet_delete(Path(id.clone())).await {
+            Err((status, _)) => assert_eq!(status, StatusCode::CONFLICT),
+            Ok(_) => panic!("delete must be refused while reservations exist"),
+        }
+
+        // Release the reservation, then the delete succeeds.
+        sqlx::query("DELETE FROM ip_reservations WHERE subnet_id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let Json(deleted) = ipam_subnet_delete(Path(id.clone()))
+            .await
+            .expect("delete subnet");
+        assert_eq!(deleted["deleted"], true);
+
+        sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+            .bind(&id)
             .execute(pool)
             .await
             .ok();

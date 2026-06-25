@@ -418,6 +418,131 @@ pub fn build_dns_record(
     })
 }
 
+/// Parse an IPv4 CIDR `a.b.c.d/N` into its address and prefix. Uses
+/// `Ipv4Addr` (canonical — rejects leading-zero octets and out-of-range bytes).
+/// Pure helper.
+fn parse_cidr(cidr: &str) -> Result<(std::net::Ipv4Addr, u32), String> {
+    use std::str::FromStr;
+    let (network, prefix_str) = cidr
+        .split_once('/')
+        .ok_or_else(|| format!("CIDR '{cidr}' must be in a.b.c.d/N form"))?;
+    let addr = std::net::Ipv4Addr::from_str(network)
+        .map_err(|_| format!("CIDR network '{network}' is not a valid IPv4 address"))?;
+    let prefix: u32 = prefix_str
+        .parse()
+        .map_err(|_| format!("CIDR prefix '{prefix_str}' is not a number"))?;
+    if prefix > 32 {
+        return Err(format!("CIDR prefix /{prefix} must be 0..=32"));
+    }
+    Ok((addr, prefix))
+}
+
+/// Usable host count for a prefix length — `2^(32-N) - 2` (excluding the network
+/// and broadcast addresses), saturating to 0 for /31 and /32. Computed in u64 so
+/// a /0 cannot overflow.
+fn usable_hosts(prefix: u32) -> u32 {
+    let host_bits = 32 - prefix;
+    let total: u64 = 1u64 << host_bits; // host_bits is 0..=32, fits u64
+    u32::try_from(total.saturating_sub(2)).unwrap_or(u32::MAX)
+}
+
+/// Usable host count for an IPv4 CIDR `a.b.c.d/N`. Errors on a malformed CIDR or
+/// an out-of-range prefix. Pure.
+pub fn usable_hosts_from_cidr(cidr: &str) -> Result<u32, String> {
+    let (_, prefix) = parse_cidr(cidr)?;
+    Ok(usable_hosts(prefix))
+}
+
+/// Validate the user-settable fields of a subnet and return its usable-host
+/// count. The gateway must be a valid IPv4 address WITHIN the subnet, and not
+/// the network or broadcast address (for /0../30). Shared by create and update
+/// so the two cannot diverge. Pure.
+pub fn validate_subnet_fields(cidr: &str, gateway: &str, vlan_id: u16) -> Result<u32, String> {
+    use std::str::FromStr;
+    // 0 and 4095 are reserved VLAN ids; usable range is 1..=4094.
+    if vlan_id == 0 || vlan_id > 4094 {
+        return Err(format!("vlan_id {vlan_id} must be in 1..=4094"));
+    }
+    let (addr, prefix) = parse_cidr(cidr)?;
+    let gw = std::net::Ipv4Addr::from_str(gateway)
+        .map_err(|_| format!("gateway '{gateway}' is not a valid IPv4 address"))?;
+    // Mask for the prefix (guarding the prefix==0 shift-by-32, which is UB).
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    let network = u32::from(addr) & mask; // canonicalize whatever host bits were given
+    let gw_u = u32::from(gw);
+    if gw_u & mask != network {
+        return Err(format!("gateway '{gateway}' is not within {cidr}"));
+    }
+    // For a subnet with usable hosts, the gateway cannot be the network or
+    // broadcast address.
+    if prefix <= 30 {
+        let broadcast = network | !mask;
+        if gw_u == network {
+            return Err(format!(
+                "gateway '{gateway}' cannot be the network address of {cidr}"
+            ));
+        }
+        if gw_u == broadcast {
+            return Err(format!(
+                "gateway '{gateway}' cannot be the broadcast address of {cidr}"
+            ));
+        }
+    }
+    Ok(usable_hosts(prefix))
+}
+
+/// Validate and construct a fresh IPAM subnet (no static mutation — the caller
+/// persists it). `total_ips`/`available_ips` are derived from the CIDR; the
+/// subnet starts empty (`used_ips = 0`) and `Available`. Mirrors
+/// [`build_dns_record`]'s validate-then-construct contract.
+pub fn build_ipam_subnet(
+    cidr: &str,
+    gateway: &str,
+    vlan_id: u16,
+    site: &str,
+) -> Result<IpamSubnet, String> {
+    if site.trim().is_empty() {
+        return Err("site cannot be empty".into());
+    }
+    let total_ips = validate_subnet_fields(cidr, gateway, vlan_id)?;
+    // Slug the site into the id so it is always URL-path-safe (the id appears in
+    // /api/network/ipam/subnets/{id}); fall back to "site" if it slugs empty.
+    let slug: String = site
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let slug = if slug.is_empty() {
+        "site".to_string()
+    } else {
+        slug
+    };
+    let id = format!(
+        "subnet-{}-{}",
+        slug,
+        Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+    );
+    Ok(IpamSubnet {
+        id,
+        cidr: cidr.to_string(),
+        gateway: gateway.to_string(),
+        vlan_id,
+        site: site.to_string(),
+        total_ips,
+        used_ips: 0,
+        available_ips: total_ips,
+        status: IpamSubnetStatus::Available,
+    })
+}
+
 pub fn create_dns_record(
     name: &str,
     record_type: &str,
@@ -677,6 +802,61 @@ mod tests {
         // Validation rejects empties and bad record types.
         assert!(build_dns_record("", "A", "v", "z", 1, "S").is_err());
         assert!(build_dns_record("n", "BOGUS", "v", "z", 1, "S").is_err());
+    }
+
+    #[test]
+    fn usable_hosts_from_cidr_computes_and_validates() {
+        assert_eq!(usable_hosts_from_cidr("10.0.0.0/24"), Ok(254));
+        assert_eq!(usable_hosts_from_cidr("10.0.0.0/30"), Ok(2));
+        assert_eq!(usable_hosts_from_cidr("10.0.0.0/31"), Ok(0));
+        assert_eq!(usable_hosts_from_cidr("10.0.0.0/32"), Ok(0));
+        // /0 is 2^32-2, which fits a u32.
+        assert_eq!(usable_hosts_from_cidr("0.0.0.0/0"), Ok(4_294_967_294));
+        assert!(usable_hosts_from_cidr("10.0.0.0").is_err(), "no prefix");
+        assert!(
+            usable_hosts_from_cidr("not-an-ip/24").is_err(),
+            "bad network"
+        );
+        assert!(
+            usable_hosts_from_cidr("10.0.0.0/33").is_err(),
+            "prefix > 32"
+        );
+        assert!(
+            usable_hosts_from_cidr("10.0.0.0/x").is_err(),
+            "non-numeric prefix"
+        );
+    }
+
+    #[test]
+    fn build_ipam_subnet_validates_and_constructs() {
+        let s = build_ipam_subnet("10.20.30.0/24", "10.20.30.1", 100, "DEFRA")
+            .expect("valid subnet builds");
+        assert!(s.id.starts_with("subnet-defra-"));
+        assert_eq!(s.total_ips, 254);
+        assert_eq!(s.available_ips, 254);
+        assert_eq!(s.used_ips, 0);
+        assert_eq!(s.status, IpamSubnetStatus::Available);
+
+        // Rejections: empty site, bad gateway, out-of-range VLAN, bad CIDR.
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.1", 100, "").is_err());
+        assert!(build_ipam_subnet("10.0.0.0/24", "not-an-ip", 100, "S").is_err());
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.1", 0, "S").is_err());
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.1", 5000, "S").is_err());
+        assert!(build_ipam_subnet("bogus", "10.0.0.1", 100, "S").is_err());
+    }
+
+    #[test]
+    fn gateway_must_be_inside_the_subnet() {
+        // Outside the CIDR.
+        assert!(build_ipam_subnet("10.0.0.0/24", "192.168.1.1", 100, "S").is_err());
+        // The network address itself.
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.0", 100, "S").is_err());
+        // The broadcast address.
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.255", 100, "S").is_err());
+        // A valid interior host is accepted.
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.42", 100, "S").is_ok());
+        // Leading-zero octets are rejected (non-canonical).
+        assert!(build_ipam_subnet("10.0.0.0/24", "10.0.0.01", 100, "S").is_err());
     }
 
     #[test]
