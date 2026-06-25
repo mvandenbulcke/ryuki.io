@@ -73,7 +73,7 @@ implementing **all 66**. This file tracks execution.
 | 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
 | 43 | [ ] | Post-apply verification (re-plan → Verified) | Exec | M | M | — |
-| 44 | [ ] | Agent liveness sweep + offline detection | Exec | M | M | — |
+| 44 | [~] | Agent liveness sweep + offline detection | Exec | M | M | — |
 | 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
 | 46 | [x] | Chargeback / showback cost allocation | AIOps | M | M | — |
 | 47 | [x] | Backup verification + restore-test recency | Resil | M | M | — |
