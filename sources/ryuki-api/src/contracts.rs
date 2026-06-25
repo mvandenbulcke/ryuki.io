@@ -160,6 +160,16 @@ pub fn routes() -> Router {
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
+        .route(
+            "/api/observe/oncall/contacts",
+            get(on_call_contact_list).post(on_call_contact_create),
+        )
+        .route(
+            "/api/observe/oncall/contacts/{id}",
+            get(on_call_contact_get)
+                .put(on_call_contact_update)
+                .delete(on_call_contact_delete),
+        )
         .route("/api/ops/scheduler/schedules", get(scheduler_schedules))
         .route("/api/ops/scheduler/executions", get(scheduler_executions))
         .route("/api/metrics/samples", post(metrics_record_sample))
@@ -15323,6 +15333,317 @@ async fn audit_export(
     }
 }
 
+// ─── On-call / escalation contact registry (#61) ───
+
+const ON_CALL_COLUMNS: &str = "id, name, role, site, escalation_tier, email, phone, enabled";
+
+/// One persisted on_call_contacts row.
+#[derive(sqlx::FromRow)]
+struct OnCallContactRow {
+    id: String,
+    name: String,
+    role: String,
+    site: Option<String>,
+    escalation_tier: i32,
+    email: Option<String>,
+    phone: Option<String>,
+    enabled: bool,
+}
+
+impl OnCallContactRow {
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "site": self.site,
+            "escalation_tier": self.escalation_tier,
+            "email": self.email,
+            "phone": self.phone,
+            "enabled": self.enabled,
+        })
+    }
+}
+
+/// Validate the FINAL contact fields (after any update is applied). Shared by
+/// create and update so they cannot diverge. Returns the human message on
+/// rejection, `None` when valid.
+fn on_call_contact_rejection(
+    name: &str,
+    role: &str,
+    site: &Option<String>,
+    tier: i32,
+    email: &Option<String>,
+    phone: &Option<String>,
+) -> Option<&'static str> {
+    // Reject control characters in every field (incl. CR/LF), so a value can
+    // never carry a header-injection or log-forging payload downstream.
+    let has_control = |s: &str| s.chars().any(char::is_control);
+    if has_control(name)
+        || has_control(role)
+        || site.as_deref().is_some_and(has_control)
+        || email.as_deref().is_some_and(has_control)
+        || phone.as_deref().is_some_and(has_control)
+    {
+        return Some("contact fields must not contain control characters");
+    }
+    if name.trim().is_empty() || name.len() > 200 {
+        return Some("name must be 1..=200 characters");
+    }
+    if role.trim().is_empty() || role.len() > 200 {
+        return Some("role must be 1..=200 characters");
+    }
+    if site.as_deref().is_some_and(|s| s.len() > 200) {
+        return Some("site must be at most 200 characters");
+    }
+    if !(1..=5).contains(&tier) {
+        return Some("escalation_tier must be between 1 and 5");
+    }
+    let has_email = email.as_deref().is_some_and(|e| !e.trim().is_empty());
+    let has_phone = phone.as_deref().is_some_and(|p| !p.trim().is_empty());
+    if !has_email && !has_phone {
+        return Some("at least one of email or phone is required");
+    }
+    if let Some(e) = email.as_deref().filter(|e| !e.trim().is_empty()) {
+        if !e.contains('@') || e.len() > 320 {
+            return Some("email must be a valid address (at most 320 characters)");
+        }
+    }
+    None
+}
+
+/// Body for creating an on-call contact. `deny_unknown_fields` so a typo'd field
+/// (e.g. `enabld`) is a hard 422, not silently dropped from admin config.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnCallContactCreateRequest {
+    name: String,
+    role: String,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    escalation_tier: Option<i32>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    phone: Option<String>,
+}
+
+/// Mutable fields of an on-call contact (all optional; omitted = keep). For
+/// email/phone, an empty string clears it. `deny_unknown_fields` rejects typos.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnCallContactUpdateRequest {
+    name: Option<String>,
+    role: Option<String>,
+    site: Option<String>,
+    escalation_tier: Option<i32>,
+    email: Option<String>,
+    phone: Option<String>,
+    enabled: Option<bool>,
+}
+
+/// List-filter query for on-call contacts.
+#[derive(Debug, Deserialize, Default)]
+struct OnCallListQuery {
+    site: Option<String>,
+    tier: Option<i32>,
+}
+
+/// Trim an optional string to `None` when blank.
+fn norm_opt(o: &Option<String>) -> Option<String> {
+    o.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// POST /api/observe/oncall/contacts — register an on-call contact. Execute-tier.
+async fn on_call_contact_create(
+    Json(b): Json<OnCallContactCreateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let tier = b.escalation_tier.unwrap_or(1);
+    if let Some(msg) =
+        on_call_contact_rejection(&b.name, &b.role, &b.site, tier, &b.email, &b.phone)
+    {
+        return Err(status_400(msg));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(&format!(
+        "INSERT INTO on_call_contacts ({ON_CALL_COLUMNS}) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)"
+    ))
+    .bind(&id)
+    .bind(b.name.trim())
+    .bind(b.role.trim())
+    .bind(norm_opt(&b.site))
+    .bind(tier)
+    .bind(norm_opt(&b.email))
+    .bind(norm_opt(&b.phone))
+    .execute(pool)
+    .await
+    .map_err(db_error)?;
+    Ok(Json(
+        json!({ "source": "database", "id": id, "created": true }),
+    ))
+}
+
+/// GET /api/observe/oncall/contacts — list contacts, optionally filtered by site
+/// and/or escalation tier, in escalation order.
+async fn on_call_contact_list(
+    Query(q): Query<OnCallListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({ "contacts": [], "durable": false })));
+    };
+    let f_site = norm_opt(&q.site);
+    let rows: Vec<OnCallContactRow> = sqlx::query_as(&format!(
+        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts \
+         WHERE ($1::text IS NULL OR site = $1) \
+           AND ($2::int IS NULL OR escalation_tier = $2) \
+         ORDER BY escalation_tier ASC, name ASC"
+    ))
+    .bind(&f_site)
+    .bind(q.tier)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let contacts: Vec<Value> = rows.iter().map(OnCallContactRow::to_json).collect();
+    Ok(Json(json!({
+        "source": "database",
+        "contacts": contacts,
+        "count": contacts.len(),
+    })))
+}
+
+/// GET /api/observe/oncall/contacts/{id} — fetch one contact.
+async fn on_call_contact_get(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let row: Option<OnCallContactRow> = sqlx::query_as(&format!(
+        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+    match row {
+        Some(r) => Ok(Json(
+            json!({ "source": "database", "contact": r.to_json() }),
+        )),
+        None => Err(status_404(&id)),
+    }
+}
+
+/// PUT /api/observe/oncall/contacts/{id} — update a contact's mutable fields.
+/// 404 when unknown; 503 when no DB.
+async fn on_call_contact_update(
+    Path(id): Path<String>,
+    Json(b): Json<OnCallContactUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Lock the row for the read-modify-write so two concurrent partial PUTs
+    // cannot clobber each other's omitted fields (the resolve reads `existing`).
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let existing: OnCallContactRow = sqlx::query_as(&format!(
+        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(&id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+
+    // Resolve final values: omitted = keep; for site/email/phone an empty string
+    // clears it. The combined email/phone is then validated for the has-method
+    // rule (which a pure COALESCE could not check without the existing row).
+    let final_name = b
+        .name
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| existing.name.clone());
+    let final_role = b
+        .role
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| existing.role.clone());
+    let final_site: Option<String> = match b.site {
+        None => existing.site.clone(),
+        Some(ref s) => norm_opt(&Some(s.clone())),
+    };
+    let final_tier = b.escalation_tier.unwrap_or(existing.escalation_tier);
+    let final_email: Option<String> = match b.email {
+        None => existing.email.clone(),
+        Some(ref s) => norm_opt(&Some(s.clone())),
+    };
+    let final_phone: Option<String> = match b.phone {
+        None => existing.phone.clone(),
+        Some(ref s) => norm_opt(&Some(s.clone())),
+    };
+    let final_enabled = b.enabled.unwrap_or(existing.enabled);
+
+    if let Some(msg) = on_call_contact_rejection(
+        &final_name,
+        &final_role,
+        &final_site,
+        final_tier,
+        &final_email,
+        &final_phone,
+    ) {
+        return Err(status_400(msg));
+    }
+
+    sqlx::query(
+        "UPDATE on_call_contacts SET \
+            name = $2, role = $3, site = $4, escalation_tier = $5, \
+            email = $6, phone = $7, enabled = $8, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(&id)
+    .bind(&final_name)
+    .bind(&final_role)
+    .bind(&final_site)
+    .bind(final_tier)
+    .bind(&final_email)
+    .bind(&final_phone)
+    .bind(final_enabled)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    let updated: OnCallContactRow = sqlx::query_as(&format!(
+        "SELECT {ON_CALL_COLUMNS} FROM on_call_contacts WHERE id = $1"
+    ))
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(
+        json!({ "source": "database", "contact": updated.to_json() }),
+    ))
+}
+
+/// DELETE /api/observe/oncall/contacts/{id} — remove a contact. 404 when unknown.
+async fn on_call_contact_delete(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let result = sqlx::query("DELETE FROM on_call_contacts WHERE id = $1")
+        .bind(&id)
+        .execute(pool)
+        .await
+        .map_err(db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(status_404(&id));
+    }
+    Ok(Json(
+        json!({ "source": "database", "deleted": true, "id": id }),
+    ))
+}
+
 /// POST /api/audit/log/verify — re-verify the audit-log hash chain and report
 /// whether history is intact (and the first divergent row id if not). Audit-tier
 /// gated. In dry-run / no-DB mode the chain does not exist, so this is a no-op
@@ -29146,6 +29467,107 @@ mod db_lifecycle_tests {
             .await
             .is_err(),
             "an over-100 batch is rejected"
+        );
+    }
+
+    #[test]
+    fn on_call_contact_validation_rules() {
+        // empty name, bad tiers, no method, bad email → rejected; a full valid
+        // contact → accepted.
+        assert!(on_call_contact_rejection("", "r", &None, 1, &Some("a@b".into()), &None).is_some());
+        assert!(
+            on_call_contact_rejection("n", "r", &None, 0, &Some("a@b".into()), &None).is_some()
+        );
+        assert!(
+            on_call_contact_rejection("n", "r", &None, 6, &Some("a@b".into()), &None).is_some()
+        );
+        assert!(on_call_contact_rejection("n", "r", &None, 1, &None, &None).is_some());
+        assert!(
+            on_call_contact_rejection("n", "r", &None, 1, &Some("noat".into()), &None).is_some()
+        );
+        assert!(on_call_contact_rejection(
+            "n",
+            "r",
+            &Some("DEFRA".into()),
+            3,
+            &Some("a@b.com".into()),
+            &Some("123".into())
+        )
+        .is_none());
+    }
+
+    /// #61: on-call contact registry CRUD — create, get, partial update (keeps
+    /// the email while adding a phone), the has-method rule (clearing both
+    /// methods is rejected), delete, and 404-after-delete.
+    #[tokio::test]
+    async fn test_on_call_contact_crud() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let Json(created) = on_call_contact_create(Json(OnCallContactCreateRequest {
+            name: "Alice".to_string(),
+            role: "SRE".to_string(),
+            site: Some("DEFRA".to_string()),
+            escalation_tier: Some(1),
+            email: Some("alice@example.com".to_string()),
+            phone: None,
+        }))
+        .await
+        .expect("create");
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let Json(got) = on_call_contact_get(Path(id.clone())).await.expect("get");
+        assert_eq!(got["contact"]["name"], "Alice");
+        assert_eq!(got["contact"]["escalation_tier"], 1);
+
+        // Partial update: bump tier + add a phone; the email is kept.
+        let Json(updated) = on_call_contact_update(
+            Path(id.clone()),
+            Json(OnCallContactUpdateRequest {
+                name: None,
+                role: None,
+                site: None,
+                escalation_tier: Some(2),
+                email: None,
+                phone: Some("+15550000".to_string()),
+                enabled: None,
+            }),
+        )
+        .await
+        .expect("update");
+        assert_eq!(updated["contact"]["escalation_tier"], 2);
+        assert_eq!(updated["contact"]["phone"], "+15550000");
+        assert_eq!(updated["contact"]["email"], "alice@example.com");
+
+        // Clearing BOTH methods violates the has-method rule → 400.
+        assert!(
+            on_call_contact_update(
+                Path(id.clone()),
+                Json(OnCallContactUpdateRequest {
+                    name: None,
+                    role: None,
+                    site: None,
+                    escalation_tier: None,
+                    email: Some("".to_string()),
+                    phone: Some("".to_string()),
+                    enabled: None,
+                }),
+            )
+            .await
+            .is_err(),
+            "clearing both methods is rejected"
+        );
+
+        let Json(del) = on_call_contact_delete(Path(id.clone()))
+            .await
+            .expect("delete");
+        assert_eq!(del["deleted"], true);
+        assert!(
+            on_call_contact_get(Path(id.clone())).await.is_err(),
+            "the contact is gone after delete"
         );
     }
 
