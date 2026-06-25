@@ -146,6 +146,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/rework", post(requests_rework))
         .route("/api/requests/{id}/fail", post(requests_fail))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
+        .route("/api/requests/batch/cancel", post(requests_batch_cancel))
         .route(
             "/api/requests/{id}/approve-live-apply",
             post(requests_approve_live_apply),
@@ -14857,9 +14858,26 @@ async fn requests_cancel(
     if reason.is_empty() {
         return Err(status_400("Cancellation reason is required"));
     }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Cancellation reason is too long (max 2000 characters)",
+        ));
+    }
+    cancel_one(&session, &request_id, reason).await.map(Json)
+}
 
+/// Cancel a SINGLE request: SoD-gated (admin, or the requester who owns the
+/// row), engine transition, persisted + audited. `reason` must already be
+/// validated non-empty. Returns the cancelled entity JSON, or an (status, body)
+/// error. Extracted so the single-cancel and batch-cancel handlers share ONE
+/// copy of the SoD rule (a security-sensitive check must not be duplicated).
+async fn cancel_one(
+    session: &AuthSession,
+    request_id: &str,
+    reason: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
         ))
@@ -14867,15 +14885,15 @@ async fn requests_cancel(
         .fetch_optional(pool)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
 
         // SoD: admin OR (requester AND owns the row).
-        if !cancel_permitted(&session, current.created_by.as_deref()) {
-            record_transition_denied(&session, &request_id, "request.cancel").await;
+        if !cancel_permitted(session, current.created_by.as_deref()) {
+            record_transition_denied(session, request_id, "request.cancel").await;
             return Err(status_403());
         }
 
-        let request = db_row_to_request(&current, &request_id);
+        let request = db_row_to_request(&current, request_id);
         let cancelled = request_lifecycle::cancel_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
@@ -14883,7 +14901,7 @@ async fn requests_cancel(
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Cancelled);
         apply_transition_audited(
             pool,
-            &session,
+            session,
             uid,
             &current,
             "request.cancel",
@@ -14895,19 +14913,19 @@ async fn requests_cancel(
         )
         .await?;
 
-        return Ok(Json(serde_json::to_value(&cancelled).unwrap_or_default()));
+        return Ok(serde_json::to_value(&cancelled).unwrap_or_default());
     }
 
     let mut store = request_store().lock().await;
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
 
     // In-memory records carry the requester in `requester`; honor the same SoD.
-    if !cancel_permitted(&session, Some(store[idx].requester.as_str())) {
+    if !cancel_permitted(session, Some(store[idx].requester.as_str())) {
         drop(store);
-        record_transition_denied(&session, &request_id, "request.cancel").await;
+        record_transition_denied(session, request_id, "request.cancel").await;
         return Err(status_403());
     }
 
@@ -14918,10 +14936,10 @@ async fn requests_cancel(
     let from_stage = current_stage_name(&store[idx]);
     store[idx] = cancelled.clone();
     audit::record_audit_local(
-        &session,
+        session,
         &AuditRecord {
             action: "request.cancel",
-            request_id: Some(&request_id),
+            request_id: Some(request_id),
             from_status: Some(&from_status),
             to_status: "cancelled",
             from_stage: Some(&from_stage),
@@ -14932,7 +14950,73 @@ async fn requests_cancel(
     )
     .await;
 
-    Ok(Json(serde_json::to_value(&cancelled).unwrap_or_default()))
+    Ok(serde_json::to_value(&cancelled).unwrap_or_default())
+}
+
+/// Body for a batch cancel: the request ids and a shared reason.
+#[derive(Debug, Deserialize)]
+struct BatchCancelRequest {
+    ids: Vec<String>,
+    reason: String,
+}
+
+/// POST /api/requests/batch/cancel — cancel up to 100 requests in one call (#17).
+/// Each id is cancelled INDEPENDENTLY through the same `cancel_one` core (so the
+/// SoD rule and the per-item transaction are identical to a single cancel);
+/// partial success is normal and the response reports a per-id outcome. Items
+/// are NOT atomic with each other — a failure on one does not roll back the rest.
+/// NOTE: even an all-failed batch returns HTTP 200; clients MUST inspect
+/// `failed`/`results`. Duplicate ids are deduped (each request is acted on once).
+async fn requests_batch_cancel(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<BatchCancelRequest>,
+) -> ApiResult {
+    let reason = b.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Cancellation reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Cancellation reason is too long (max 2000 characters)",
+        ));
+    }
+    if b.ids.is_empty() {
+        return Err(status_400("ids cannot be empty"));
+    }
+    if b.ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    // Dedupe (preserving order) so the same request is never processed twice in
+    // one batch — otherwise the second attempt fails the state transition and
+    // the counts become "attempts", not unique requests.
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<&String> = b.ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for id in unique_ids {
+        match cancel_one(&session, id, reason).await {
+            Ok(_) => {
+                succeeded += 1;
+                results.push(json!({ "id": id, "ok": true }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
 }
 
 /// SoD gate for cancel: an admin may cancel any request; a requester may cancel
@@ -28943,6 +29027,52 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #17: the batch-cancel handler rejects an empty batch, an empty reason,
+    /// and an over-100 batch BEFORE touching any request (pure guard rails — no
+    /// DB needed). The per-item cancel logic is covered by the single-cancel
+    /// tests via the shared `cancel_one`.
+    #[tokio::test]
+    async fn test_batch_cancel_validates_inputs() {
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+        assert!(
+            requests_batch_cancel(
+                sess(),
+                Json(BatchCancelRequest {
+                    ids: vec![],
+                    reason: "cleanup".to_string()
+                })
+            )
+            .await
+            .is_err(),
+            "empty ids is rejected"
+        );
+        assert!(
+            requests_batch_cancel(
+                sess(),
+                Json(BatchCancelRequest {
+                    ids: vec!["x".to_string()],
+                    reason: "   ".to_string()
+                })
+            )
+            .await
+            .is_err(),
+            "empty reason is rejected"
+        );
+        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        assert!(
+            requests_batch_cancel(
+                sess(),
+                Json(BatchCancelRequest {
+                    ids: many,
+                    reason: "cleanup".to_string()
+                })
+            )
+            .await
+            .is_err(),
+            "an over-100 batch is rejected"
+        );
     }
 
     /// B4 (a)+(c): logout deletes ONLY the caller's own session and writes a
