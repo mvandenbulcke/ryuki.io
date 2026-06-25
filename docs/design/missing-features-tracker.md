@@ -86,7 +86,7 @@ implementing **all 66**. This file tracks execution.
 | 54 | [x] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
 | 55 | [x] | DNS record update endpoint | API | S | M | — |
 | 56 | [x] | IPAM subnet CRUD | API | M | M | — |
-| 57 | [ ] | Load-balancer virtual-server delete/update | API | M | M | — |
+| 57 | [x] | Load-balancer virtual-server delete/update | API | M | M | — |
 | 58 | [ ] | Connection usage audit trail | Integ | M | M | — |
 | 59 | [ ] | Scope (site/env) selector + user preferences | Portal | M | M | ✓ |
 | 60 | [ ] | Evidence blob store for large artifacts | Exec | M | M | — |
