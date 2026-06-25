@@ -74,7 +74,7 @@ implementing **all 66**. This file tracks execution.
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
 | 43 | [ ] | Post-apply verification (re-plan → Verified) | Exec | M | M | — |
 | 44 | [ ] | Agent liveness sweep + offline detection | Exec | M | M | — |
-| 45 | [ ] | Per-site / per-tenant usage metering | Observ | M | M | — |
+| 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
 | 46 | [ ] | Chargeback / showback cost allocation | AIOps | M | M | — |
 | 47 | [ ] | Backup verification + restore-test recency | Resil | M | M | — |
 | 48 | [ ] | Enforced access recertification w/ revocation | Security | L | M | — |
