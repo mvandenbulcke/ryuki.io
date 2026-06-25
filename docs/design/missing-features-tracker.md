@@ -53,7 +53,7 @@ implementing **all 66**. This file tracks execution.
 | 21 | [ ] | Live secret rotation (Vault) + break-glass | Security | L | H | ✓ |
 | 22 | [ ] | Domain-event alert generation | Observ | M | H | — |
 | 23 | [ ] | CP-side poison-job cap / dead-letter | Resil | M | H | — |
-| 24 | [ ] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
+| 24 | [x] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
 | 25 | [ ] | SLO / error-budget tracking | Observ | M | H | — |
 | 26 | [x] | CP database backup/restore + DR runbook | Roadmap | M | H | ✓ |
 | 27 | [ ] | Bidirectional CMDB reconciliation + drift | Integ | L | H | ✓ |
