@@ -59,7 +59,7 @@ implementing **all 66**. This file tracks execution.
 | 27 | [ ] | Bidirectional CMDB reconciliation + drift | Integ | L | H | ✓ |
 | 28 | [ ] | Active Directory / Entra integration adapter | Integ | L | H | — |
 | 29 | [ ] | DR failover orchestration (runbook-driven) | Resil | L | H | — |
-| 30 | [ ] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
+| 30 | [x] | Circuit breaker for provider/adapter calls | Resil | M | H | — |
 | 31 | [ ] | Scheduled/recurring agent jobs (drift-scan) | Exec | L | H | ✓ |
 | 32 | [x] | Per-notification mark-read + deep-link | Portal | S | M | — |
 | 33 | [x] | CMDB import/export/reconcile actions in portal | Portal | M | M | ✓ |
