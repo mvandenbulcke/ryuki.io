@@ -571,6 +571,11 @@ fn requests_route_permission(path: &str) -> Option<&'static str> {
         Some("approve") => Some("approve"),
         // reject is an approver decision (the inverse of approve)
         Some("reject") => Some("approve"),
+        // rework (send back to Intake for fixes) is the non-terminal sibling of
+        // reject — also an approver decision.
+        Some("rework") => Some("approve"),
+        // fail (mark terminally Failed) is an operator act during execution.
+        Some("fail") => Some("execute"),
         // cancel: requester-tier floor so the requester who raised the request
         // reaches the handler, where the finer requester-OWNS-it-or-admin SoD
         // check runs against the row's created_by (the route table cannot

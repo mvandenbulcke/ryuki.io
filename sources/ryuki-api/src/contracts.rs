@@ -143,6 +143,8 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/retire", post(requests_retire))
         .route("/api/requests/{id}/policy-eval", get(requests_policy_eval))
         .route("/api/requests/{id}/reject", post(requests_reject))
+        .route("/api/requests/{id}/rework", post(requests_rework))
+        .route("/api/requests/{id}/fail", post(requests_fail))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route(
             "/api/requests/{id}/approve-live-apply",
@@ -14659,6 +14661,186 @@ async fn requests_reject(
     .await;
 
     Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/rework — send a request back to Intake for the
+/// requester to fix and re-submit (the non-terminal alternative to reject).
+/// Approve-tier; requires a reason. Valid from Validated/Planned/Approved/Locked.
+async fn requests_rework(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ReasonBody>,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        record_transition_denied(&session, &request_id, "request.rework").await;
+        return Err(status_403());
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Rework reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Rework reason is too long (max 2000 characters)",
+        ));
+    }
+
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
+            .map_err(map_engine_error)?;
+        let stages_json = serde_json::to_value(&reworked.stages).unwrap_or_else(|_| json!([]));
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Intake);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.rework",
+            &current.status,
+            db_status,
+            "intake",
+            json!({ "reason": reason }),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: None,
+                validation_json: None,
+                approval_route_json: None,
+                approval_role: None,
+                approval_decision: None,
+                approval_reason: None,
+            },
+        )
+        .await?;
+        return Ok(Json(serde_json::to_value(&reworked).unwrap_or_default()));
+    }
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+    let reworked = request_lifecycle::rework_request(&store[idx], &session.user_id, reason)
+        .map_err(map_engine_error)?;
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    store[idx] = reworked.clone();
+    audit::record_audit_local(
+        &session,
+        &AuditRecord {
+            action: "request.rework",
+            request_id: Some(&request_id),
+            from_status: Some(&from_status),
+            to_status: "intake",
+            from_stage: Some(&from_stage),
+            to_stage: "intake",
+            detail: json!({ "reason": reason }),
+            outcome: "applied",
+        },
+    )
+    .await;
+    Ok(Json(serde_json::to_value(&reworked).unwrap_or_default()))
+}
+
+/// POST /api/requests/{id}/fail — mark a request terminally Failed (e.g. an
+/// execution or verification failure). Execute-tier; requires a reason. Valid
+/// from any non-concluded state.
+async fn requests_fail(
+    Path(request_id): Path<String>,
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ReasonBody>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        record_transition_denied(&session, &request_id, "request.fail").await;
+        return Err(status_403());
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Failure reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Failure reason is too long (max 2000 characters)",
+        ));
+    }
+
+    if let Some(pool) = get_db() {
+        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let current: DbRequestRow = sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(uid)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&request_id))?;
+
+        let request = db_row_to_request(&current, &request_id);
+        let failed = request_lifecycle::fail_request(&request, reason).map_err(map_engine_error)?;
+        let stages_json = serde_json::to_value(&failed.stages).unwrap_or_else(|_| json!([]));
+        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Failed);
+        // The request failed AT its current stage — record that, not a hardcoded
+        // "execute" (a request can fail at validate/plan/approve too).
+        let failed_stage = current_stage_name(&request);
+        apply_transition_audited(
+            pool,
+            &session,
+            uid,
+            &current,
+            "request.fail",
+            &current.status,
+            db_status,
+            &failed_stage,
+            json!({ "reason": reason }),
+            TransitionArtifacts {
+                stages_json,
+                plan_json: None,
+                validation_json: None,
+                approval_route_json: None,
+                approval_role: None,
+                approval_decision: None,
+                approval_reason: None,
+            },
+        )
+        .await?;
+        return Ok(Json(serde_json::to_value(&failed).unwrap_or_default()));
+    }
+
+    let mut store = request_store().lock().await;
+    let idx = store
+        .iter()
+        .position(|r| r.id == request_id)
+        .ok_or_else(|| status_404(&request_id))?;
+    let failed = request_lifecycle::fail_request(&store[idx], reason).map_err(map_engine_error)?;
+    let from_status = request_status_to_db(&store[idx].status).to_string();
+    let from_stage = current_stage_name(&store[idx]);
+    store[idx] = failed.clone();
+    audit::record_audit_local(
+        &session,
+        &AuditRecord {
+            action: "request.fail",
+            request_id: Some(&request_id),
+            from_status: Some(&from_status),
+            to_status: "failed",
+            from_stage: Some(&from_stage),
+            // Failed at its current stage (not a hardcoded "execute").
+            to_stage: &from_stage,
+            detail: json!({ "reason": reason }),
+            outcome: "applied",
+        },
+    )
+    .await;
+    Ok(Json(serde_json::to_value(&failed).unwrap_or_default()))
 }
 
 /// POST /api/requests/{id}/cancel — withdraw a request before execution begins.

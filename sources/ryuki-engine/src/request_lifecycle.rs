@@ -865,6 +865,51 @@ pub fn fail_request(request: &Request, reason: &str) -> Result<Request, String> 
     Ok(failed)
 }
 
+/// Send a request back to `Intake` for the requester to fix and re-submit — the
+/// NON-terminal alternative to a `reject`. Valid only from the review/pre-exec
+/// stages (Validated/Planned/Approved/Locked): a request still in Intake has
+/// nothing to rework yet, and one already Executing/Verifying or concluded must
+/// be `fail`ed or run its course, not bounced. Unlike reject there is no
+/// separation-of-duties gate — rework concludes nothing (it returns to Intake),
+/// so a reviewer bouncing their own request for more work is benign. Records the
+/// reason in metadata. Pure: ryuki-api persists.
+///
+/// Prior derived artifacts (validation/plan/approval) are PRESERVED as history,
+/// not cleared: the lifecycle is status-gated, so reaching Approved again
+/// requires re-running validate → plan → approve from Intake (each overwrites
+/// its artifact), and no action trusts a stale artifact over the current status.
+/// A future slice may additionally null those columns on rework for tidiness.
+pub fn rework_request(request: &Request, actor: &str, reason: &str) -> Result<Request, String> {
+    if reason.trim().is_empty() {
+        return Err("Rework reason cannot be empty".into());
+    }
+    if !matches!(
+        request.status,
+        RequestStatus::Validated
+            | RequestStatus::Planned
+            | RequestStatus::Approved
+            | RequestStatus::Locked
+    ) {
+        return Err(format!(
+            "Cannot rework a request in status {:?}. Rework is only valid from \
+             Validated, Planned, Approved, or Locked.",
+            request.status
+        ));
+    }
+
+    let mut reworked = request.clone();
+    reworked.status = RequestStatus::Intake;
+    reworked.updated_at = Utc::now().to_rfc3339();
+    reworked
+        .metadata
+        .insert("rework_reason".into(), reason.to_string());
+    reworked
+        .metadata
+        .insert("reworked_by".into(), actor.to_string());
+
+    Ok(reworked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,6 +1289,46 @@ mod tests {
         let mut req = make_test_request();
         req.status = RequestStatus::Completed;
         assert!(fail_request(&req, "reason").is_err());
+    }
+
+    #[test]
+    fn test_rework_sends_back_to_intake_from_review_stages() {
+        for from in [
+            RequestStatus::Validated,
+            RequestStatus::Planned,
+            RequestStatus::Approved,
+            RequestStatus::Locked,
+        ] {
+            let mut req = make_test_request();
+            req.status = from.clone();
+            let reworked = rework_request(&req, "carol", "missing change ticket").unwrap();
+            assert_eq!(reworked.status, RequestStatus::Intake, "from {from:?}");
+            assert_eq!(
+                reworked.metadata.get("rework_reason").unwrap(),
+                "missing change ticket"
+            );
+            assert_eq!(reworked.metadata.get("reworked_by").unwrap(), "carol");
+        }
+    }
+
+    #[test]
+    fn test_rework_rejects_invalid_states_and_empty_reason() {
+        // Intake (nothing to rework yet), Executing (too late), and terminal
+        // states cannot be reworked.
+        for bad in [
+            RequestStatus::Intake,
+            RequestStatus::Executing,
+            RequestStatus::Completed,
+            RequestStatus::Rejected,
+        ] {
+            let mut req = make_test_request();
+            req.status = bad.clone();
+            assert!(rework_request(&req, "x", "reason").is_err(), "from {bad:?}");
+        }
+        // Empty reason is rejected even from a valid state.
+        let mut req = make_test_request();
+        req.status = RequestStatus::Planned;
+        assert!(rework_request(&req, "x", "  ").is_err(), "empty reason");
     }
 
     #[test]
