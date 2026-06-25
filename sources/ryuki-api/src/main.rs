@@ -1645,6 +1645,10 @@ async fn main() {
         .route("/api/validation/run", get(validation_run))
         .route("/api/platform/status", get(platform_status))
         .route("/api/platform/uptime", get(uptime))
+        .route(
+            "/api/platform/health/dependencies",
+            get(platform_self_health),
+        )
         .merge(agents::admin_routes())
         .merge(contracts::routes())
         .merge(boundary::routes())
@@ -2038,6 +2042,118 @@ async fn platform_status(Extension(request_id): Extension<RequestId>) -> Json<se
     Json(status)
 }
 
+/// GET /api/platform/health/dependencies — dependency-backed self-health (#6).
+///
+/// Unlike the binary `/ready`, this reports EACH backing dependency
+/// (database connectivity, migrations, scheduler liveness) and an aggregate
+/// verdict. Alerting-safe: a probe that errors is `down` (never silently
+/// healthy), and the aggregate maps to 200 (healthy/degraded — still serving)
+/// or 503 (unhealthy). Authenticated (it lives in the human-gated router).
+async fn platform_self_health() -> (StatusCode, Json<serde_json::Value>) {
+    use ryuki_engine::self_health::{aggregate, DependencyProbe};
+
+    let mut probes: Vec<DependencyProbe> = Vec::new();
+    let pool = crate::database::get_db();
+
+    // 1. Database connectivity.
+    match pool {
+        None => probes.push(DependencyProbe::down(
+            "database",
+            "no database pool configured",
+        )),
+        Some(p) => match sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(p).await {
+            Ok(1) => probes.push(DependencyProbe::healthy("database")),
+            Ok(_) => probes.push(DependencyProbe::down("database", "unexpected probe result")),
+            Err(e) => {
+                tracing::warn!(error = %e, "self-health: database probe failed");
+                probes.push(DependencyProbe::down(
+                    "database",
+                    "connectivity probe failed",
+                ));
+            }
+        },
+    }
+
+    // 2. Migrations applied.
+    probes.push(match crate::database::migration_status() {
+        MigrationStatus::Applied => DependencyProbe::healthy("migrations"),
+        MigrationStatus::NotApplied => DependencyProbe::down("migrations", "not applied"),
+        MigrationStatus::Failed => DependencyProbe::down("migrations", "failed"),
+    });
+
+    // 3. Scheduler liveness — an enabled schedule whose next_run_at is >2x its
+    //    interval overdue means the leader tick is not advancing it.
+    match pool {
+        None => probes.push(DependencyProbe::down("scheduler", "no database pool")),
+        Some(p) => match probe_scheduler_liveness(p).await {
+            Ok(probe) => probes.push(probe),
+            Err(e) => {
+                tracing::warn!(error = %e, "self-health: scheduler probe failed");
+                // Alerting-safe: a failed probe is NOT healthy.
+                probes.push(DependencyProbe::down("scheduler", "liveness probe failed"));
+            }
+        },
+    }
+
+    let overall = aggregate(&probes);
+    let http = if overall.is_serving() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = serde_json::json!({
+        "status": overall.as_str(),
+        "dependencies": probes,
+        "checked_at": chrono::Utc::now().to_rfc3339(),
+    });
+    (http, Json(body))
+}
+
+/// Probe whether the scheduler tick is advancing its schedules. A LIVE leader
+/// tick advances EVERY due schedule's next_run_at within its own interval, so
+/// ANY enabled schedule slipping past 2x its interval means the tick failed to
+/// run it — that is `down` (it must page), NOT degraded: a partial outage that
+/// left a long-interval schedule not-yet-overdue would otherwise mask a dead
+/// tick behind a 200. `healthy` when none are overdue; `degraded` only when
+/// there are no enabled schedules at all (informational — nothing to run).
+async fn probe_scheduler_liveness(
+    pool: &sqlx::PgPool,
+) -> Result<ryuki_engine::self_health::DependencyProbe, sqlx::Error> {
+    // An enabled schedule is "overdue" when its next_run_at slipped more than 2x
+    // its own interval into the past — a live tick advances next_run_at each run.
+    let (enabled, overdue): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE enabled), \
+           count(*) FILTER (WHERE enabled AND next_run_at \
+                            < now() - (interval_secs * 2) * interval '1 second') \
+         FROM schedules",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(classify_scheduler_liveness(enabled, overdue))
+}
+
+/// Pure verdict for the scheduler-liveness probe from the enabled/overdue counts.
+fn classify_scheduler_liveness(
+    enabled: i64,
+    overdue: i64,
+) -> ryuki_engine::self_health::DependencyProbe {
+    use ryuki_engine::self_health::DependencyProbe;
+    if enabled == 0 {
+        DependencyProbe::degraded("scheduler", "no enabled schedules")
+    } else if overdue <= 0 {
+        DependencyProbe::healthy("scheduler")
+    } else {
+        // ANY schedule >2x its interval overdue ⇒ the tick failed to run it ⇒
+        // down. A healthy tick keeps every schedule within its interval, so even
+        // one straggler signals a stuck/dead leader, not a per-schedule lag.
+        DependencyProbe::down(
+            "scheduler",
+            format!("{overdue} of {enabled} enabled schedule(s) overdue past 2x interval; scheduler tick may be dead"),
+        )
+    }
+}
+
 async fn uptime() -> Json<serde_json::Value> {
     let elapsed = START_TIME.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     Json(serde_json::json!({
@@ -2084,6 +2200,73 @@ mod tests {
         let mut g = lock_or_recover(&m); // would panic with .lock().unwrap()
         *g += 1;
         assert_eq!(*g, 1);
+    }
+
+    #[test]
+    fn scheduler_liveness_verdict_covers_all_cases() {
+        use ryuki_engine::self_health::DependencyHealth;
+        // No enabled schedules -> degraded (informational, nothing to run).
+        assert_eq!(
+            classify_scheduler_liveness(0, 0).health,
+            DependencyHealth::Degraded
+        );
+        // All caught up -> healthy.
+        assert_eq!(
+            classify_scheduler_liveness(3, 0).health,
+            DependencyHealth::Healthy
+        );
+        // Even ONE schedule overdue past 2x interval -> down: a live tick would
+        // have advanced it, so a straggler means the tick is stuck/dead. This
+        // must page (not hide behind a 200) even when other schedules are fine.
+        assert_eq!(
+            classify_scheduler_liveness(3, 1).health,
+            DependencyHealth::Down
+        );
+        // All overdue -> down.
+        assert_eq!(
+            classify_scheduler_liveness(3, 3).health,
+            DependencyHealth::Down
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_liveness_sql_is_valid() {
+        // Validates the FILTER + interval SQL against a real Postgres — nothing
+        // else exercises this query string. DB-gated; skips without a DB.
+        use crate::database::DB_TEST_SERIAL;
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect");
+        crate::database::run_migrations(&pool)
+            .await
+            .expect("migrations must apply");
+        let probe = probe_scheduler_liveness(&pool)
+            .await
+            .expect("scheduler liveness SQL must be valid");
+        assert_eq!(probe.name, "scheduler");
+    }
+
+    #[tokio::test]
+    async fn self_health_without_db_is_unhealthy_503() {
+        // With no DB pool every probe is down -> aggregate unhealthy -> 503.
+        let (status, body) = platform_self_health().await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["status"], serde_json::json!("unhealthy"));
+        let deps = body.0["dependencies"]
+            .as_array()
+            .expect("dependencies array");
+        assert!(
+            deps.iter()
+                .any(|d| d["name"] == "database" && d["health"] == "down"),
+            "database probe must be down with no pool"
+        );
     }
 
     #[test]

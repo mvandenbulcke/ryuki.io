@@ -81,6 +81,7 @@ const DECLARED_MODULES: &[&str] = &[
     "runners",
     "scheduler",
     "secrets_rotation",
+    "self_health",
     "server_decommission",
     "servicenow_api",
     "servicenow_future_api",

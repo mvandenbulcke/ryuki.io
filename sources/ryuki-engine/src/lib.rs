@@ -71,6 +71,7 @@ pub mod runbook_execution;
 pub mod runners;
 pub mod scheduler;
 pub mod secrets_rotation;
+pub mod self_health;
 pub mod server_decommission;
 pub mod servicenow_api;
 pub mod servicenow_future_api;
