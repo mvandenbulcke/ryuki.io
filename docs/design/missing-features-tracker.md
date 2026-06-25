@@ -46,7 +46,7 @@ implementing **all 66**. This file tracks execution.
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
 | 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
 | 16 | [ ] | Enforced site degradation mode (write gating) | Resil | L | H | — |
-| 17 | [ ] | Bulk / batch operations | API | M | H | — |
+| 17 | [~] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
 | 19 | [ ] | Connection health monitoring (scheduled + history) | Integ | M | H | — |
 | 20 | [ ] | Step-up / MFA re-auth for high-risk actions | Security | M | H | — |
