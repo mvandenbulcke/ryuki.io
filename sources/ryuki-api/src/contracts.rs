@@ -21096,6 +21096,7 @@ async fn repo_capacity_list(Query(params): Query<RepoCapacitySiteQuery>) -> ApiR
 }
 
 async fn repo_capacity_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<RepoCapacityUpdateBody>,
 ) -> ApiResult {
@@ -21118,6 +21119,12 @@ async fn repo_capacity_update(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only update a repository in its own site. The
+    // authoritative re-check is the `AND site = $N` predicate in update_usage
+    // below, so a concurrent re-home cannot slip an out-of-scope write through;
+    // this is the fast pre-check on the loaded row.
+    guard_body_site_scope(&session, &repo.site)?;
+    let repo_site = repo.site.clone();
 
     // Build an updated model with the new usage so the engine can recompute
     // days_until_full and status from the authoritative (total, used, growth).
@@ -21135,6 +21142,7 @@ async fn repo_capacity_update(
         used_tb,
         new_days,
         new_status_str,
+        &repo_site,
     )
     .await
     .map_err(db_error)?
@@ -21336,6 +21344,7 @@ async fn hardware_add(Json(body): Json<HardwareAddRequest>) -> ApiResult {
 }
 
 async fn hardware_update_firmware(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<HardwareUpdateFirmwareRequest>,
 ) -> ApiResult {
@@ -21346,16 +21355,22 @@ async fn hardware_update_firmware(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only flash firmware on an asset in its own site.
+    // The authoritative re-check is the `AND site = $3` predicate inside
+    // apply_firmware_update, so a concurrent re-home cannot slip an out-of-scope
+    // write through; this is the fast pre-check on the loaded asset.
+    guard_body_site_scope(&session, &asset.site)?;
 
     // Engine validates (version non-empty) and computes the updated model; the
     // repo call below does the actual durable write.
     let (_updated, _record) =
         hardware_lifecycle::update_firmware(&asset, &body.version).map_err(|e| status_400(&e))?;
 
-    let persisted = crate::repos::hardware_assets::apply_firmware_update(pool, &id, &body.version)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_404(&id))?;
+    let persisted =
+        crate::repos::hardware_assets::apply_firmware_update(pool, &id, &body.version, &asset.site)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&id))?;
 
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
@@ -43202,6 +43217,7 @@ mod hardware_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         let Ok(Json(updated)) = hardware_update_firmware(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "3.00".into(),
@@ -43271,6 +43287,7 @@ mod hardware_db_tests {
 
         // firmware_baseline is "pending" after add_asset; update to match it.
         let Ok(_) = hardware_update_firmware(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "pending".into(),
@@ -43374,6 +43391,7 @@ mod hardware_db_tests {
         // Induce a firmware gap: update installed firmware so it differs from the
         // baseline ('pending'), then it must appear in firmware-gaps.
         if hardware_update_firmware(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(HardwareUpdateFirmwareRequest {
                 version: "9.9.9".into(),
@@ -43464,6 +43482,7 @@ mod hardware_db_tests {
 
         let missing_id = uuid::Uuid::new_v4().to_string();
         let result = hardware_update_firmware(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(missing_id),
             Json(HardwareUpdateFirmwareRequest {
                 version: "1.0".into(),

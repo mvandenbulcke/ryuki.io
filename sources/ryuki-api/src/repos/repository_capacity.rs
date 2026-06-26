@@ -240,24 +240,30 @@ pub async fn update_usage(
     used_tb: f64,
     days_until_full: f64,
     status_str: &str,
+    scope_site: &str,
 ) -> Result<Option<Repository>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
         return Ok(None);
     };
 
+    // The `AND site = $5` predicate (#2) makes the write site-aware atomically: a
+    // row re-homed out of the caller's scope between the handler's scope guard and
+    // here matches 0 rows, so the handler reports 404 instead of writing
+    // off-scope. The predicate and SET are one statement — no tx/lock needed.
     let row: Option<RepositoryRow> = sqlx::query_as(&format!(
         "UPDATE backup_repositories \
          SET used_capacity_tb = $2::numeric, \
              days_until_full  = $3::numeric, \
              status           = $4, \
              last_forecast    = NOW() \
-         WHERE id = $1 \
+         WHERE id = $1 AND site = $5 \
          RETURNING {COLUMNS}"
     ))
     .bind(uid)
     .bind(used_tb)
     .bind(days_until_full)
     .bind(status_str)
+    .bind(scope_site)
     .fetch_optional(pool)
     .await?;
 
@@ -549,7 +555,7 @@ mod repository_capacity_db_tests {
         let new_status = repo_status(&updated_repo);
         let new_status_s = capacity_status_str(&new_status);
 
-        let persisted = update_usage(pool, &repo_id, new_used, new_days, new_status_s)
+        let persisted = update_usage(pool, &repo_id, new_used, new_days, new_status_s, &repo.site)
             .await
             .expect("update_usage failed")
             .expect("row not found");

@@ -243,6 +243,7 @@ pub async fn apply_firmware_update(
     pool: &PgPool,
     asset_id: &str,
     version: &str,
+    scope_site: &str,
 ) -> Result<Option<HardwareAsset>, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(asset_id) else {
         return Ok(None);
@@ -250,17 +251,27 @@ pub async fn apply_firmware_update(
 
     let mut tx = pool.begin().await?;
 
-    let affected = sqlx::query("UPDATE hardware_assets SET firmware_installed = $2 WHERE id = $1")
-        .bind(uid)
-        .bind(version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    // `AND site = $3` (#2): the firmware UPDATE is site-aware atomically, so an
+    // asset re-homed out of the caller's scope between the handler's guard and
+    // here matches 0 rows -> Ok(None) -> the handler's 404, and the
+    // firmware_history INSERT below only runs for an in-scope write.
+    // RETURNING the updated row makes the response come from the SAME scoped,
+    // in-tx write — never a post-commit re-read that a concurrent re-home could
+    // turn into an out-of-scope asset in the reply.
+    let updated: Option<HardwareAssetRow> = sqlx::query_as(&format!(
+        "UPDATE hardware_assets SET firmware_installed = $2 \
+         WHERE id = $1 AND site = $3 RETURNING {COLUMNS}"
+    ))
+    .bind(uid)
+    .bind(version)
+    .bind(scope_site)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    if affected == 0 {
+    let Some(updated) = updated else {
         tx.rollback().await?;
         return Ok(None);
-    }
+    };
 
     sqlx::query("INSERT INTO firmware_history (asset_id, version) VALUES ($1, $2)")
         .bind(uid)
@@ -270,5 +281,5 @@ pub async fn apply_firmware_update(
 
     tx.commit().await?;
 
-    get(pool, asset_id).await
+    updated.into_model().map(Some)
 }
