@@ -7122,6 +7122,8 @@ async fn maintenance_calendar_schedule(
     Extension(session): Extension<AuthSession>,
     Json(body): Json<MaintenanceCalendarScheduleRequest>,
 ) -> ApiResult {
+    // #2: a scoped principal may only schedule maintenance for its own site.
+    guard_body_site_scope(&session, &body.site)?;
     if let Some(pool) = get_db() {
         // 1. Pure validation — no store read, no push.
         let window = maintenance_calendar::validate_window_inputs(
@@ -8400,6 +8402,8 @@ async fn legal_hold_place(
     Extension(session): Extension<AuthSession>,
     Json(req): Json<LegalHoldPlaceRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only place a legal hold in its own site.
+    guard_body_site_scope(&session, &req.site)?;
     // initiated_by = authenticated caller (from request extensions), never a client
     // body field — the hold audit must name the real principal.
     let hold_type = match req.hold_type.to_lowercase().as_str() {
@@ -8890,7 +8894,12 @@ async fn zabbix_drift_summary(Query(query): Query<ZabbixDriftQuery>) -> ApiResul
     }
 }
 
-async fn zabbix_drift_detect(Json(body): Json<ZabbixDriftSiteRequest>) -> ApiResult {
+async fn zabbix_drift_detect(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ZabbixDriftSiteRequest>,
+) -> ApiResult {
+    // #2: a scoped principal may only run drift detection for its own site.
+    guard_body_site_scope(&session, &body.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let reports = zabbix_drift::detect_drift(&body.site).map_err(|e| status_400(&e))?;
     let persisted = crate::repos::zabbix_drift::upsert_detected(pool, &reports)
@@ -18712,6 +18721,25 @@ fn guard_body_site_scope(
     }
 }
 
+/// Body-scope guard for a DUAL-axis WRITE (#2): a scoped principal may only
+/// create/act on a resource whose site AND environment are both within its
+/// scope (e.g. a Kubernetes namespace, which is keyed on both). Reports the
+/// specific failing axis. Pass the body's CONCRETE required values.
+fn guard_body_scope_dual(
+    session: &AuthSession,
+    site: &str,
+    environment: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use ryuki_engine::auth::scope_permits;
+    if !scope_permits(&session.site_scope, Some(site)) {
+        return Err(status_403_out_of_scope("site"));
+    }
+    if !scope_permits(&session.environment_scope, Some(environment)) {
+        return Err(status_403_out_of_scope("environment"));
+    }
+    Ok(())
+}
+
 /// Whether a principal may access a by-id row given the row's CONCRETE,
 /// already-loaded site/environment (#2). Unlike the query-param helpers, this is
 /// the POST-LOAD guard for request-by-id reads: the scope value lives on the row,
@@ -24946,8 +24974,12 @@ async fn k8s_namespaces_list(
     )))
 }
 async fn k8s_namespace_provision(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<K8sProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a namespace is keyed on BOTH site and environment — a scoped principal
+    // may only provision within both of its scopes.
+    guard_body_scope_dual(&session, &b.site, &b.environment)?;
     if b.name.trim().is_empty() {
         return Err(status_400("name cannot be empty"));
     }
@@ -25234,8 +25266,13 @@ async fn dr_plans_list(
     Ok(Json(serde_json::to_value(plans).unwrap_or_default()))
 }
 async fn dr_plan_create(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<DrPlanCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only create a DR plan OWNED by its own site.
+    // `target_site` (the failover destination) is plan content, not an action on
+    // that site, so DR plans may still target a cross-site destination.
+    guard_body_site_scope(&session, &b.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let plan = dr_testing::build_dr_plan(&b.name, &b.site, &b.target_site, b.systems, b.rpo, b.rto)
         .map_err(|e| status_400(&e))?;
@@ -25564,7 +25601,12 @@ async fn compliance_control_assess(
     }
 }
 
-async fn compliance_report_generate(Json(b): Json<ComplianceReportGenerateRequest>) -> ApiResult {
+async fn compliance_report_generate(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<ComplianceReportGenerateRequest>,
+) -> ApiResult {
+    // #2: a scoped principal may only generate a compliance report for its site.
+    guard_body_site_scope(&session, &b.site)?;
     if b.site.trim().is_empty() {
         return Err(status_400("site cannot be empty"));
     }
@@ -30813,6 +30855,62 @@ mod unit_tests {
         )
         .await
         .expect_err("creating a firewall rule in an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn k8s_provision_enforces_both_axes_and_maintenance_site() {
+        // k8s_namespace_provision is DUAL-axis (site + environment). Out-of-scope
+        // SITE is a 403...
+        let err = k8s_namespace_provision(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Json(K8sProvisionRequest {
+                name: "ns1".into(),
+                cluster: "c1".into(),
+                site: "DEFRA".into(),
+                cpu: 1,
+                memory: 1,
+                storage: 1,
+                environment: "production".into(),
+            }),
+        )
+        .await
+        .expect_err("out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // ...and an in-scope SITE but out-of-scope ENVIRONMENT is also a 403
+        // (the second axis is enforced independently — k8s HAS an env axis, so an
+        // environment-scoped principal is constrained, not blanket-denied).
+        let err = k8s_namespace_provision(
+            AuthExtractor(scoped_session(&["GBLON"], &["production"])),
+            Json(K8sProvisionRequest {
+                name: "ns1".into(),
+                cluster: "c1".into(),
+                site: "GBLON".into(),
+                cpu: 1,
+                memory: 1,
+                storage: 1,
+                environment: "dev".into(),
+            }),
+        )
+        .await
+        .expect_err("in-scope site + out-of-scope environment must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // maintenance_calendar_schedule receives its session via Extension and is
+        // site-only: an out-of-scope site is a 403 before any DB access.
+        let err = maintenance_calendar_schedule(
+            Extension(scoped_session(&["GBLON"], &[])),
+            Json(MaintenanceCalendarScheduleRequest {
+                site: "DEFRA".into(),
+                start_time: "2026-07-01T02:00:00Z".into(),
+                end_time: "2026-07-01T04:00:00Z".into(),
+                reason: "patch".into(),
+                affected_cis: vec![],
+            }),
+        )
+        .await
+        .expect_err("scheduling maintenance for an out-of-scope site must be 403");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
