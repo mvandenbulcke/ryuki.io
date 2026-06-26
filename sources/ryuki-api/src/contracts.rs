@@ -16040,6 +16040,7 @@ fn norm_opt(o: &Option<String>) -> Option<String> {
 
 /// POST /api/observe/oncall/contacts — register an on-call contact. Execute-tier.
 async fn on_call_contact_create(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<OnCallContactCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -16050,6 +16051,9 @@ async fn on_call_contact_create(
         return Err(status_400(msg));
     }
     let id = uuid::Uuid::new_v4().to_string();
+    // Persist + audit ATOMICALLY: a contact never lands without its
+    // durable audit_log row (#7).
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(&format!(
         "INSERT INTO on_call_contacts ({ON_CALL_COLUMNS}) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE)"
@@ -16061,9 +16065,26 @@ async fn on_call_contact_create(
     .bind(tier)
     .bind(norm_opt(&b.email))
     .bind(norm_opt(&b.phone))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "oncall-contact-create",
+            None,
+            "created",
+            json!({
+                "contact_id": &id,
+                "name": b.name.trim(),
+                "site": norm_opt(&b.site),
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(
         json!({ "source": "database", "id": id, "created": true }),
     ))
@@ -16120,6 +16141,7 @@ async fn on_call_contact_get(
 /// PUT /api/observe/oncall/contacts/{id} — update a contact's mutable fields.
 /// 404 when unknown; 503 when no DB.
 async fn on_call_contact_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<OnCallContactUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -16200,6 +16222,18 @@ async fn on_call_contact_update(
     .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "oncall-contact-update",
+            None,
+            "updated",
+            json!({ "contact_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(Json(
         json!({ "source": "database", "contact": updated.to_json() }),
@@ -16208,17 +16242,33 @@ async fn on_call_contact_update(
 
 /// DELETE /api/observe/oncall/contacts/{id} — remove a contact. 404 when unknown.
 async fn on_call_contact_delete(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let result = sqlx::query("DELETE FROM on_call_contacts WHERE id = $1")
-        .bind(&id)
-        .execute(pool)
-        .await
-        .map_err(db_error)?;
-    if result.rows_affected() == 0 {
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let deleted: Option<(String,)> =
+        sqlx::query_as("DELETE FROM on_call_contacts WHERE id = $1 RETURNING id")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    if deleted.is_none() {
         return Err(status_404(&id));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "oncall-contact-delete",
+            Some("active"),
+            "deleted",
+            json!({ "contact_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(
         json!({ "source": "database", "deleted": true, "id": id }),
     ))
@@ -19879,7 +19929,10 @@ impl AlertRouteRow {
 const ALERT_ROUTE_COLUMNS: &str = "id, trigger_name, severity, host_group, \
      support_group, priority, enabled, created_at, updated_at";
 
-async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiResult {
+async fn alert_routes_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<AlertRouteCreateRequest>,
+) -> ApiResult {
     // Validate + construct via the engine (severity/priority vocab enforced).
     let route = alert_routing_engine::build_alert_route(
         &body.trigger_name,
@@ -19892,8 +19945,11 @@ async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiRe
 
     // Durable path: persist to the `alert_routes` table and return the stored
     // row so the response matches the DB exactly (survives restart).
+    // Persist + audit ATOMICALLY: a route never lands without its
+    // durable audit_log row (#7).
     if let Some(pool) = get_db() {
         let uid = uuid::Uuid::parse_str(&route.id).map_err(|e| status_400(&e.to_string()))?;
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: AlertRouteRow = sqlx::query_as(&format!(
             "INSERT INTO alert_routes \
                 (id, trigger_name, severity, host_group, support_group, priority, enabled) \
@@ -19906,9 +19962,25 @@ async fn alert_routes_create(Json(body): Json<AlertRouteCreateRequest>) -> ApiRe
         .bind(&route.support_group)
         .bind(&route.priority)
         .bind(route.enabled)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "alert-route-create",
+                None,
+                "created",
+                json!({
+                    "route_id": row.id.to_string(),
+                    "trigger_name": &row.trigger_name,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(row.to_json()));
     }
     // No-DB fallback: build_alert_route already pushed onto the engine static.
@@ -19954,6 +20026,7 @@ async fn alert_routes_get(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn alert_routes_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<AlertRouteUpdateRequest>,
 ) -> ApiResult {
@@ -19998,6 +20071,9 @@ async fn alert_routes_update(
         let Ok(uid) = uuid::Uuid::parse_str(&id) else {
             return Err(status_404(&id));
         };
+        // Persist + audit ATOMICALLY: wrap in tx so the audit row is written
+        // only when the UPDATE actually finds and modifies a row (#7).
+        let mut tx = pool.begin().await.map_err(db_error)?;
         // Coalesce — keep the existing value for any field not supplied.
         let row: Option<AlertRouteRow> = sqlx::query_as(&format!(
             "UPDATE alert_routes \
@@ -20018,13 +20094,26 @@ async fn alert_routes_update(
         .bind(body.support_group.as_deref())
         .bind(body.priority.as_deref())
         .bind(body.enabled)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
-        return match row {
-            Some(updated) => Ok(Json(updated.to_json())),
-            None => Err(status_404(&id)),
-        };
+        if let Some(updated) = row {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "alert-route-update",
+                    None,
+                    "updated",
+                    json!({ "route_id": updated.id.to_string() }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            return Ok(Json(updated.to_json()));
+        }
+        return Err(status_404(&id));
     }
     // No-DB fallback: engine handles vocab validation + ROUTE_STORE mutation.
     let route = match alert_routing_engine::update_route(
@@ -20042,19 +20131,37 @@ async fn alert_routes_update(
     Ok(Json(serde_json::to_value(route).unwrap()))
 }
 
-async fn alert_routes_delete(Path(id): Path<String>) -> ApiResult {
+async fn alert_routes_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         let Ok(uid) = uuid::Uuid::parse_str(&id) else {
             return Err(status_404(&id));
         };
-        let result = sqlx::query("DELETE FROM alert_routes WHERE id = $1")
-            .bind(uid)
-            .execute(pool)
-            .await
-            .map_err(db_error)?;
-        if result.rows_affected() == 0 {
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let deleted: Option<(uuid::Uuid,)> =
+            sqlx::query_as("DELETE FROM alert_routes WHERE id = $1 RETURNING id")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        if deleted.is_none() {
             return Err(status_404(&id));
         }
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "alert-route-delete",
+                Some("active"),
+                "deleted",
+                json!({ "route_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         // Keep engine in sync.
         let _ = alert_routing_engine::delete_route(&id);
         return Ok(Json(serde_json::json!({"deleted": true, "id": id})));
@@ -32948,14 +33055,19 @@ mod db_lifecycle_tests {
             return;
         };
 
-        let Json(created) = on_call_contact_create(Json(OnCallContactCreateRequest {
-            name: "Alice".to_string(),
-            role: "SRE".to_string(),
-            site: Some("DEFRA".to_string()),
-            escalation_tier: Some(1),
-            email: Some("alice@example.com".to_string()),
-            phone: None,
-        }))
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
+
+        let Json(created) = on_call_contact_create(
+            sess(),
+            Json(OnCallContactCreateRequest {
+                name: "Alice".to_string(),
+                role: "SRE".to_string(),
+                site: Some("DEFRA".to_string()),
+                escalation_tier: Some(1),
+                email: Some("alice@example.com".to_string()),
+                phone: None,
+            }),
+        )
         .await
         .expect("create");
         let id = created["id"].as_str().unwrap().to_string();
@@ -32966,6 +33078,7 @@ mod db_lifecycle_tests {
 
         // Partial update: bump tier + add a phone; the email is kept.
         let Json(updated) = on_call_contact_update(
+            sess(),
             Path(id.clone()),
             Json(OnCallContactUpdateRequest {
                 name: None,
@@ -32986,6 +33099,7 @@ mod db_lifecycle_tests {
         // Clearing BOTH methods violates the has-method rule → 400.
         assert!(
             on_call_contact_update(
+                sess(),
                 Path(id.clone()),
                 Json(OnCallContactUpdateRequest {
                     name: None,
@@ -33002,7 +33116,7 @@ mod db_lifecycle_tests {
             "clearing both methods is rejected"
         );
 
-        let Json(del) = on_call_contact_delete(Path(id.clone()))
+        let Json(del) = on_call_contact_delete(sess(), Path(id.clone()))
             .await
             .expect("delete");
         assert_eq!(del["deleted"], true);
@@ -40635,6 +40749,7 @@ mod alert_routes_db_tests {
             return;
         };
 
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
         let trigger = format!("test-trigger-{}", uuid::Uuid::new_v4());
         let body = AlertRouteCreateRequest {
             trigger_name: trigger.clone(),
@@ -40643,10 +40758,24 @@ mod alert_routes_db_tests {
             support_group: "Wintel Operations".into(),
             priority: "P2".into(),
         };
-        let Ok(Json(created)) = alert_routes_create(Json(body)).await else {
+        let Ok(Json(created)) = alert_routes_create(sess(), Json(body)).await else {
             panic!("create failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
+
+        // #7 audit: the create wrote a durable audit_log row.
+        let create_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'alert-route-create' AND detail->>'route_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query create audit");
+        assert!(
+            create_audited,
+            "alert route create must write an audit_log row"
+        );
 
         // Update: change severity to warning and disable.
         let update = AlertRouteUpdateRequest {
@@ -40657,7 +40786,8 @@ mod alert_routes_db_tests {
             priority: None,
             enabled: Some(false),
         };
-        let Ok(Json(updated)) = alert_routes_update(Path(id.clone()), Json(update)).await else {
+        let Ok(Json(updated)) = alert_routes_update(sess(), Path(id.clone()), Json(update)).await
+        else {
             panic!("update failed");
         };
         assert_eq!(updated["severity"], "warning");
@@ -40688,6 +40818,7 @@ mod alert_routes_db_tests {
             return;
         };
 
+        let sess = || AuthExtractor(AuthSession::static_dry_run());
         let trigger = format!("test-del-trigger-{}", uuid::Uuid::new_v4());
         let body = AlertRouteCreateRequest {
             trigger_name: trigger.clone(),
@@ -40696,13 +40827,13 @@ mod alert_routes_db_tests {
             support_group: "Unix Operations".into(),
             priority: "P3".into(),
         };
-        let Ok(Json(created)) = alert_routes_create(Json(body)).await else {
+        let Ok(Json(created)) = alert_routes_create(sess(), Json(body)).await else {
             panic!("create failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // Delete.
-        let Ok(Json(del)) = alert_routes_delete(Path(id.clone())).await else {
+        let Ok(Json(del)) = alert_routes_delete(sess(), Path(id.clone())).await else {
             panic!("delete failed");
         };
         assert_eq!(del["deleted"], true);
@@ -40723,7 +40854,12 @@ mod alert_routes_db_tests {
             return;
         };
 
-        let Err((status, _)) = alert_routes_delete(Path("not-a-uuid".into())).await else {
+        let Err((status, _)) = alert_routes_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("not-a-uuid".into()),
+        )
+        .await
+        else {
             panic!("expected Err for bad id");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -40761,7 +40897,12 @@ mod alert_routes_db_tests {
             priority: None,
             enabled: None,
         };
-        let result = alert_routes_update(Path(uid.to_string()), Json(update)).await;
+        let result = alert_routes_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(uid.to_string()),
+            Json(update),
+        )
+        .await;
 
         sqlx::query("DELETE FROM alert_routes WHERE id = $1")
             .bind(uid)
@@ -40809,7 +40950,12 @@ mod alert_routes_db_tests {
             priority: None,
             enabled: None,
         };
-        let result = alert_routes_update(Path(uid.to_string()), Json(update)).await;
+        let result = alert_routes_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(uid.to_string()),
+            Json(update),
+        )
+        .await;
 
         sqlx::query("DELETE FROM alert_routes WHERE id = $1")
             .bind(uid)
