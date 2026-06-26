@@ -415,6 +415,20 @@ pub async fn audit_trail_for_request(pool: Option<&PgPool>, request_id: &str) ->
     })
 }
 
+/// The EMPTY trail shape `audit_trail_for_request` returns for a request with no
+/// entries (or an unknown id). Used by the scope guard (#2) so an out-of-scope
+/// request's trail is byte-indistinguishable from an unknown one — the by-id
+/// audit endpoint must not become a cross-scope existence oracle.
+pub fn empty_request_trail(pool: Option<&PgPool>, request_id: &str) -> Value {
+    let durable = pool.is_some();
+    json!({
+        "durable": durable,
+        "source": if durable { "database" } else { "dry-run" },
+        "request_id": request_id,
+        "entries": [],
+    })
+}
+
 /// Read the global, newest-first audit feed across all requests. DB-backed
 /// when available (durable: true); otherwise serves the process-local store
 /// (durable: false). `limit` is clamped by the caller. Returns the same entry

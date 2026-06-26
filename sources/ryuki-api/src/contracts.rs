@@ -3757,7 +3757,10 @@ async fn catalog_policy_guardrails_rules() -> Json<Value> {
 /// against the guardrail catalog. Informational (a read): it reports which
 /// guardrail rules' required inputs are satisfied; it does NOT gate the
 /// lifecycle. Degrades to 404 when the request is unknown.
-async fn requests_policy_eval(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_policy_eval(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
     let request = if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let row: DbRequestRow = sqlx::query_as(&format!(
@@ -3778,6 +3781,8 @@ async fn requests_policy_eval(Path(request_id): Path<String>) -> ApiResult {
             .cloned()
             .ok_or_else(|| status_404(&request_id))?
     };
+    // #2: a scoped principal may only evaluate policy for an in-scope request.
+    scope_guard_or_404(&session, &request.site, &request.environment, &request_id)?;
 
     // Resolve the catalog workflow id the SAME way every execution path does
     // (RequestType slug like "server-deployment" -> "linux-/windows-server-
@@ -12981,7 +12986,10 @@ async fn requests_approve_live_apply(
 /// evidence digest, and timestamps. The full (sanitized) evidence lives on the
 /// request's stages via GET /api/requests/{id}; this surfaces the job itself.
 /// 404 when no job has been dispatched (e.g. request not yet executed).
-async fn requests_execution_job(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_execution_job(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
     let Some(pool) = get_db() else {
         return Err(status_404(&request_id));
     };
@@ -12996,16 +13004,20 @@ async fn requests_execution_job(Path(request_id): Path<String>) -> ApiResult {
         evidence_digest: Option<String>,
         created_at: chrono::DateTime<chrono::Utc>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
+        // #2: the parent request's scope, used only for the by-id scope guard.
+        site: String,
+        environment: String,
     }
     // JOIN requests so a synthetic/orphan agent_jobs.request_id (the column is
     // not FK-constrained and migrations seed fixtures) cannot surface job
     // metadata for a request that does not exist — match requests_get's 404.
+    // The JOIN also yields the request's site/environment for the scope guard.
     // Latest job wins (a re-dispatch supersedes), deterministic on (created_at,
     // id). agent_id is intentionally NOT exposed: it is self-declared fleet
     // identity, surfaced only via the admin-gated agents view.
     let row: Option<ExecJobRow> = sqlx::query_as(
         "SELECT j.id, j.mode, j.status, j.result_status, j.evidence_digest, \
-         j.created_at, j.completed_at \
+         j.created_at, j.completed_at, r.site, r.environment \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 \
          ORDER BY j.created_at DESC, j.id DESC LIMIT 1",
@@ -13018,6 +13030,8 @@ async fn requests_execution_job(Path(request_id): Path<String>) -> ApiResult {
     let Some(j) = row else {
         return Err(status_404(&request_id));
     };
+    // #2: an out-of-scope request's job metadata is a 404 (no existence oracle).
+    scope_guard_or_404(&session, &j.site, &j.environment, &request_id)?;
     Ok(Json(json!({
         "request_id": request_id,
         "agent_job_id": j.id.to_string(),
@@ -13031,7 +13045,10 @@ async fn requests_execution_job(Path(request_id): Path<String>) -> ApiResult {
     })))
 }
 
-async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
+async fn requests_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
         let row: DbRequestRow = sqlx::query_as(&format!(
@@ -13042,6 +13059,9 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: a scoped principal may only read a request within its scope — an
+        // out-of-scope request is a 404 (indistinguishable from a missing one).
+        scope_guard_or_404(&session, &row.site, &row.environment, &request_id)?;
         // The durable lifecycle state (047): payload is authoritative for all
         // 14 types; stages/approval_route/plan/validation_results are the REAL
         // persisted history that survives a restart (no fabrication).
@@ -13082,6 +13102,8 @@ async fn requests_get(Path(request_id): Path<String>) -> ApiResult {
     let record = store.iter().find(|r| r.id == request_id);
     match record {
         Some(r) => {
+            // #2: same scope guard on the in-memory (no-DB) path.
+            scope_guard_or_404(&session, &r.site, &r.environment, &request_id)?;
             // Sanitize in-memory request stages/plan before sending to portal,
             // applying the same redaction discipline as the DB path.
             let mut val = serde_json::to_value(r).unwrap_or_default();
@@ -15193,9 +15215,17 @@ async fn requests_audit(
             Json(json!({"error": "Audit-tier access is required to read the request audit trail"})),
         ));
     }
-    Ok(Json(
-        audit::audit_trail_for_request(get_db(), &request_id).await,
-    ))
+    // #2: serve the REAL trail ONLY when the request is proven in-scope. A
+    // not-found request, an out-of-scope request, AND a scope-lookup error all
+    // fail CLOSED to the SAME empty (unknown-shaped) trail — so the audit
+    // endpoint is never a cross-scope existence oracle, and a transient lookup
+    // error can never fall through to serving unverified audit data.
+    match request_site_env(&request_id).await {
+        Ok(Some((site, environment))) if row_scope_permits(&session, &site, &environment) => Ok(
+            Json(audit::audit_trail_for_request(get_db(), &request_id).await),
+        ),
+        _ => Ok(Json(audit::empty_request_trail(get_db(), &request_id))),
+    }
 }
 
 // ─── Per-user scope preferences (#59 backend) ───
@@ -15353,15 +15383,18 @@ async fn requests_approval_quorum(
     };
 
     // 404 an unknown request so "no approvals yet" is distinguishable from "no
-    // such request".
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM requests WHERE id = $1")
-        .bind(uid)
-        .fetch_optional(pool)
-        .await
-        .map_err(db_error)?;
-    if exists.is_none() {
+    // such request". The same SELECT yields site/environment for the scope guard.
+    let exists: Option<(String, String)> =
+        sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+    let Some((site, environment)) = exists else {
         return Err(status_404(&request_id));
-    }
+    };
+    // #2: an out-of-scope request's quorum is a 404 (same as unknown — no oracle).
+    scope_guard_or_404(&session, &site, &environment, &request_id)?;
 
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT role, decision, actor FROM request_approval_decisions \
@@ -15425,6 +15458,9 @@ async fn request_evidence_pack(
             .cloned()
             .ok_or_else(|| status_404(&request_id))?
     };
+    // #2: a scoped principal may only export an in-scope request's evidence pack
+    // — an out-of-scope request is a 404 (indistinguishable from a missing one).
+    scope_guard_or_404(&session, &request.site, &request.environment, &request_id)?;
 
     // Redacted evidence pack from the pure engine pipeline (sensitive keys are
     // redacted by collect_evidence before it returns).
@@ -18634,6 +18670,59 @@ fn enforce_site_scope(
         ScopeFilter::Allow(None) => Ok(default_site.to_string()),
         ScopeFilter::Deny => Err(status_403_out_of_scope("site")),
     }
+}
+
+/// Whether a principal may access a by-id row given the row's CONCRETE,
+/// already-loaded site/environment (#2). Unlike the query-param helpers, this is
+/// the POST-LOAD guard for request-by-id reads: the scope value lives on the row,
+/// not the request. Pass the loaded values directly — they are non-nullable on
+/// `requests`, so the `scope_permits(None)=unconstrained` fail-open never applies.
+fn row_scope_permits(session: &AuthSession, site: &str, environment: &str) -> bool {
+    use ryuki_engine::auth::scope_permits;
+    scope_permits(&session.site_scope, Some(site))
+        && scope_permits(&session.environment_scope, Some(environment))
+}
+
+/// Post-load by-id scope guard that maps an out-of-scope row to the SAME 404 a
+/// missing row produces (#2) — so a by-id endpoint is never a cross-scope
+/// existence/enumeration oracle for a scoped principal.
+fn scope_guard_or_404(
+    session: &AuthSession,
+    site: &str,
+    environment: &str,
+    request_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if row_scope_permits(session, site, environment) {
+        Ok(())
+    } else {
+        Err(status_404(request_id))
+    }
+}
+
+/// Load just `(site, environment)` for a request by id — for by-id scope guards
+/// on endpoints that do not otherwise load the full row (e.g. the audit trail).
+/// DB authoritative, else the in-memory store. `Ok(None)` ⇒ the request does not
+/// exist. A DB error is PROPAGATED (not collapsed to `None`) so the caller can
+/// fail CLOSED rather than serve data without a scope decision.
+async fn request_site_env(request_id: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+    if let Some(pool) = get_db() {
+        // A malformed id is "not found", not an error (mirrors the by-id 404s).
+        let Ok(uid) = Uuid::parse_str(request_id) else {
+            return Ok(None);
+        };
+        return sqlx::query_as::<_, (String, String)>(
+            "SELECT site, environment FROM requests WHERE id = $1",
+        )
+        .bind(uid)
+        .fetch_optional(pool)
+        .await;
+    }
+    Ok(request_store()
+        .lock()
+        .await
+        .iter()
+        .find(|r| r.id == request_id)
+        .map(|r| (r.site.clone(), r.environment.clone())))
 }
 
 async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
@@ -30411,6 +30500,121 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
+    // ── swarm #2: request-by-id scope guard (no existence oracle) ──
+
+    #[tokio::test]
+    async fn requests_get_denies_out_of_scope_request() {
+        // test_request defaults site=DEFRA, environment=production.
+        let id = format!("scope-byid-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+
+        // A GBLON-scoped principal cannot see a DEFRA request — 404, identical to
+        // a missing request (no cross-scope existence oracle).
+        let err = requests_get(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Path(id.clone()),
+        )
+        .await
+        .expect_err("an out-of-scope request must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // The owning (DEFRA) site scope sees it.
+        let Json(body) = requests_get(
+            AuthExtractor(scoped_session(&["DEFRA"], &[])),
+            Path(id.clone()),
+        )
+        .await
+        .expect("an in-scope request is visible");
+        assert_eq!(body["site"], "DEFRA");
+
+        // An environment-scoped principal outside the request's environment is
+        // also 404 — the guard enforces BOTH axes.
+        let err = requests_get(
+            AuthExtractor(scoped_session(&[], &["dev"])),
+            Path(id.clone()),
+        )
+        .await
+        .expect_err("an out-of-scope environment must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // An unrestricted principal still sees everything (no regression).
+        assert!(requests_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone())
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn requests_policy_eval_and_evidence_pack_deny_out_of_scope() {
+        let id = format!("scope-byid-{}", Uuid::new_v4());
+        request_store().lock().await.push(test_request(&id));
+        let out = scoped_session(&["GBLON"], &[]);
+
+        let err = requests_policy_eval(AuthExtractor(out.clone()), Path(id.clone()))
+            .await
+            .expect_err("policy-eval on an out-of-scope request must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let err = request_evidence_pack(AuthExtractor(out), Path(id.clone()))
+            .await
+            .expect_err("evidence pack for an out-of-scope request must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn requests_audit_out_of_scope_returns_empty_trail_no_oracle() {
+        // Seed a request and drive a validate transition so it has a real, non-
+        // empty audit trail an in-scope reader would see.
+        let id = format!("scope-audit-{}", Uuid::new_v4());
+        let mut request = test_request(&id);
+        request.approval_route.push("Datacenter Approver".into());
+        request_store().lock().await.push(request);
+        let _ = requests_validate(
+            Path(id.clone()),
+            AuthExtractor(static_admin_operator_session()),
+        )
+        .await
+        .expect("validate from intake");
+
+        // In-scope (DEFRA) reader sees the validate entry.
+        let Json(in_scope) = requests_audit(
+            AuthExtractor(scoped_session(&["DEFRA"], &[])),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        assert!(
+            in_scope["entries"]
+                .as_array()
+                .is_some_and(|e| !e.is_empty()),
+            "the owning scope must see the real trail"
+        );
+
+        // Out-of-scope (GBLON) reader gets an EMPTY trail — byte-indistinguishable
+        // from an unknown request, never the real who-acted-when data.
+        let Json(out_scope) = requests_audit(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Path(id.clone()),
+        )
+        .await
+        .expect("audit read");
+        // Byte-identical to an UNKNOWN request's empty trail (no-DB ⇒ dry-run),
+        // so the out-of-scope reader cannot distinguish "not mine" from "no such
+        // request" via any field, not just `entries`.
+        assert_eq!(
+            out_scope,
+            serde_json::json!({
+                "durable": false,
+                "source": "dry-run",
+                "request_id": id,
+                "entries": [],
+            }),
+            "an out-of-scope trail must be byte-identical to an unknown request's"
+        );
+    }
+
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
 
     #[test]
@@ -31953,14 +32157,20 @@ mod db_lifecycle_tests {
 
         // Slice 3: the execution-job endpoint surfaces the dispatched job (the
         // AWX-style "job" view the portal renders).
-        let Json(exec_job) = requests_execution_job(p(&id_str))
-            .await
-            .expect("execution-job endpoint");
+        let Json(exec_job) =
+            requests_execution_job(AuthExtractor(AuthSession::static_dry_run()), p(&id_str))
+                .await
+                .expect("execution-job endpoint");
         assert_eq!(exec_job["agent_job_id"].as_str(), Some(job_id));
         assert_eq!(exec_job["mode"].as_str(), Some("OfflineDryRun"));
         assert_eq!(exec_job["status"].as_str(), Some("Pending"));
         // Unknown request -> 404.
-        let Err((st, _)) = requests_execution_job(Path(Uuid::new_v4().to_string())).await else {
+        let Err((st, _)) = requests_execution_job(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(Uuid::new_v4().to_string()),
+        )
+        .await
+        else {
             panic!("expected 404 for unknown request");
         };
         assert_eq!(st, StatusCode::NOT_FOUND);
