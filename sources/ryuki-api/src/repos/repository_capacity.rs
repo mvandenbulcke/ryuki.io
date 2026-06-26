@@ -235,7 +235,7 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<Repository>, sqlx::Error> {
 /// Returns `Ok(None)` when `id` is malformed or no row matches; returns
 /// `Ok(Some(repo))` on success. `Err` for genuine DB failures (callers → 500).
 pub async fn update_usage(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     used_tb: f64,
     days_until_full: f64,
@@ -264,7 +264,7 @@ pub async fn update_usage(
     .bind(days_until_full)
     .bind(status_str)
     .bind(scope_site)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|r| r.into_model()).transpose()

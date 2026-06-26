@@ -22011,8 +22011,9 @@ async fn repo_capacity_update(
     let new_status = repository_capacity::repo_status(&updated);
     let new_status_str = crate::repos::repository_capacity::capacity_status_str(&new_status);
 
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let persisted = crate::repos::repository_capacity::update_usage(
-        pool,
+        &mut *tx,
         &id,
         used_tb,
         new_days,
@@ -22022,6 +22023,19 @@ async fn repo_capacity_update(
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "repo-capacity-update",
+            None,
+            "updated",
+            json!({ "repo_id": &id, "site": &repo_site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(json!({
         "repository_id": persisted.id,
@@ -22235,7 +22249,12 @@ async fn hardware_lifecycle_report(
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
-async fn hardware_add(Json(body): Json<HardwareAddRequest>) -> ApiResult {
+async fn hardware_add(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<HardwareAddRequest>,
+) -> ApiResult {
+    // #2: a scoped principal may only add hardware into its own site.
+    guard_body_site_scope(&session, &body.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let asset = hardware_lifecycle::add_asset(
@@ -22248,9 +22267,23 @@ async fn hardware_add(Json(body): Json<HardwareAddRequest>) -> ApiResult {
     )
     .map_err(|e| status_400(&e))?;
 
-    let persisted = crate::repos::hardware_assets::insert(pool, &asset)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::hardware_assets::insert(&mut *tx, &asset)
         .await
         .map_err(db_error)?;
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "hardware-add",
+            None,
+            "added",
+            json!({ "asset_id": &persisted.id, "site": &persisted.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
@@ -22272,17 +22305,36 @@ async fn hardware_update_firmware(
     // apply_firmware_update, so a concurrent re-home cannot slip an out-of-scope
     // write through; this is the fast pre-check on the loaded asset.
     guard_body_site_scope(&session, &asset.site)?;
+    let asset_site = asset.site.clone();
 
     // Engine validates (version non-empty) and computes the updated model; the
     // repo call below does the actual durable write.
     let (_updated, _record) =
         hardware_lifecycle::update_firmware(&asset, &body.version).map_err(|e| status_400(&e))?;
 
-    let persisted =
-        crate::repos::hardware_assets::apply_firmware_update(pool, &id, &body.version, &asset.site)
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| status_404(&id))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::hardware_assets::apply_firmware_update(
+        &mut tx,
+        &id,
+        &body.version,
+        &asset_site,
+    )
+    .await
+    .map_err(db_error)?
+    .ok_or_else(|| status_404(&id))?;
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "hardware-firmware-update",
+            None,
+            "updated",
+            json!({ "asset_id": &id, "site": &asset_site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
@@ -26338,9 +26390,23 @@ async fn storage_array_register(
         b.total_capacity_gb,
     )
     .map_err(|e| status_400(&e))?;
-    crate::repos::storage_provisioning::create_array(db, &array)
+    let mut tx = db.begin().await.map_err(db_error)?;
+    crate::repos::storage_provisioning::create_array(&mut *tx, &array)
         .await
         .map_err(db_error)?;
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "storage-array-register",
+            None,
+            "registered",
+            json!({ "array_id": &array.id, "site": &array.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "array": ryuki_engine::storage_provisioning::get_array_response(&array),
@@ -26362,6 +26428,7 @@ struct StorageArrayUpdateRequest {
 /// (partial). Lowering total capacity below the used capacity is a 400 (the DB
 /// `used <= total` invariant). 404 when unknown; 503 when no DB.
 async fn storage_array_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<StorageArrayUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -26384,8 +26451,9 @@ async fn storage_array_update(
     if b.pool_count.is_some_and(|v| v > i32::MAX as u32) {
         return Err(status_400("pool_count is too large"));
     }
+    let mut tx = db.begin().await.map_err(db_error)?;
     let updated = crate::repos::storage_provisioning::update_array(
-        db,
+        &mut *tx,
         &id,
         b.model.as_deref(),
         b.total_capacity_gb,
@@ -26406,6 +26474,23 @@ async fn storage_array_update(
         }
     })?
     .ok_or_else(|| status_404(&id))?;
+    // #2: guard the AUTHORITATIVE site of the just-updated row inside the tx; an
+    // out-of-scope update returns 403 and the tx drops (rollback) — so a scoped
+    // principal can never mutate another site's array via its id.
+    guard_body_site_scope(&session, &updated.site)?;
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "storage-array-update",
+            None,
+            "updated",
+            json!({ "array_id": &id, "site": &updated.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "array": ryuki_engine::storage_provisioning::get_array_response(&updated),
@@ -26427,21 +26512,39 @@ async fn storage_array_delete(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     guard_body_site_scope(&session, &array.site)?;
+    let array_site = array.site.clone();
     use crate::repos::storage_provisioning::ArrayDeleteResult;
-    match crate::repos::storage_provisioning::delete_array(db, &id)
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let result = crate::repos::storage_provisioning::delete_array(&mut tx, &id)
         .await
-        .map_err(db_error)?
-    {
-        ArrayDeleteResult::Deleted => Ok(Json(json!({
-            "source": "database",
-            "deleted": true,
-            "array_id": id,
-        }))),
-        ArrayDeleteResult::NotFound => Err(status_404(&id)),
-        ArrayDeleteResult::Blocked(n) => Err(status_409(&format!(
-            "array '{id}' has {n} volume(s); retire them before decommissioning"
-        ))),
+        .map_err(db_error)?;
+    match result {
+        ArrayDeleteResult::NotFound => return Err(status_404(&id)),
+        ArrayDeleteResult::Blocked(n) => {
+            return Err(status_409(&format!(
+                "array '{id}' has {n} volume(s); retire them before decommissioning"
+            )));
+        }
+        ArrayDeleteResult::Deleted => {}
     }
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "storage-array-delete",
+            Some("active"),
+            "deleted",
+            json!({ "array_id": &id, "site": &array_site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "database",
+        "deleted": true,
+        "array_id": id,
+    })))
 }
 
 async fn storage_check_capacity(
@@ -26612,6 +26715,7 @@ async fn k8s_namespace_get(
     Ok(Json(container_namespace::get_namespace_response(&ns)))
 }
 async fn k8s_namespace_update_quota(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<K8sQuotaRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -26623,73 +26727,128 @@ async fn k8s_namespace_update_quota(
     // The Terminating guard is applied ATOMICALLY in the repo UPDATE (no
     // read-then-write race): NotFound -> 404, Terminating -> 409.
     use crate::repos::container_namespace::TransitionOutcome;
-    match crate::repos::container_namespace::update_quota(db, &id, b.cpu, b.memory, b.storage)
-        .await
-        .map_err(db_error)?
-    {
-        TransitionOutcome::Updated(ns) => Ok(Json(json!({
-            "source": "db",
-            "action": "update-quota",
-            "providerCallsEnabled": false,
-            "namespace": ns,
-        }))),
-        TransitionOutcome::NotFound => Err(status_404(&id)),
-        TransitionOutcome::Terminating => Err(status_409(&format!(
-            "Cannot update quota for terminating namespace '{id}'"
-        ))),
-    }
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let outcome =
+        crate::repos::container_namespace::update_quota(&mut tx, &id, b.cpu, b.memory, b.storage)
+            .await
+            .map_err(db_error)?;
+    let ns = match outcome {
+        TransitionOutcome::Updated(ns) => ns,
+        TransitionOutcome::NotFound => return Err(status_404(&id)),
+        TransitionOutcome::Terminating => {
+            return Err(status_409(&format!(
+                "Cannot update quota for terminating namespace '{id}'"
+            )));
+        }
+    };
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "k8s-namespace-quota-update",
+            None,
+            "updated",
+            json!({ "namespace_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "update-quota",
+        "providerCallsEnabled": false,
+        "namespace": ns,
+    })))
 }
 async fn k8s_namespace_suspend(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::container_namespace::TransitionOutcome;
-    match crate::repos::container_namespace::set_namespace_status(
-        db,
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::container_namespace::set_namespace_status(
+        &mut tx,
         &id,
         &ryuki_engine::container_namespace::NamespaceStatus::Suspended,
     )
     .await
-    .map_err(db_error)?
-    {
-        TransitionOutcome::Updated(ns) => Ok(Json(json!({
-            "source": "db",
-            "action": "suspend-namespace",
-            "providerCallsEnabled": false,
-            "namespace": ns,
-        }))),
-        TransitionOutcome::NotFound => Err(status_404(&id)),
-        TransitionOutcome::Terminating => Err(status_409(&format!(
-            "Cannot suspend terminating namespace '{id}'"
-        ))),
-    }
+    .map_err(db_error)?;
+    let ns = match outcome {
+        TransitionOutcome::Updated(ns) => ns,
+        TransitionOutcome::NotFound => return Err(status_404(&id)),
+        TransitionOutcome::Terminating => {
+            return Err(status_409(&format!(
+                "Cannot suspend terminating namespace '{id}'"
+            )));
+        }
+    };
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "k8s-namespace-suspend",
+            None,
+            "suspended",
+            json!({ "namespace_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "suspend-namespace",
+        "providerCallsEnabled": false,
+        "namespace": ns,
+    })))
 }
 async fn k8s_namespace_resume(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::container_namespace::TransitionOutcome;
-    match crate::repos::container_namespace::set_namespace_status(
-        db,
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::container_namespace::set_namespace_status(
+        &mut tx,
         &id,
         &ryuki_engine::container_namespace::NamespaceStatus::Active,
     )
     .await
-    .map_err(db_error)?
-    {
-        TransitionOutcome::Updated(ns) => Ok(Json(json!({
-            "source": "db",
-            "action": "resume-namespace",
-            "providerCallsEnabled": false,
-            "namespace": ns,
-        }))),
-        TransitionOutcome::NotFound => Err(status_404(&id)),
-        TransitionOutcome::Terminating => Err(status_409(&format!(
-            "Cannot resume terminating namespace '{id}'"
-        ))),
-    }
+    .map_err(db_error)?;
+    let ns = match outcome {
+        TransitionOutcome::Updated(ns) => ns,
+        TransitionOutcome::NotFound => return Err(status_404(&id)),
+        TransitionOutcome::Terminating => {
+            return Err(status_409(&format!(
+                "Cannot resume terminating namespace '{id}'"
+            )));
+        }
+    };
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "k8s-namespace-resume",
+            None,
+            "resumed",
+            json!({ "namespace_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "resume-namespace",
+        "providerCallsEnabled": false,
+        "namespace": ns,
+    })))
 }
 async fn k8s_namespace_terminate(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
@@ -26697,25 +26856,42 @@ async fn k8s_namespace_terminate(
     // UPDATE, so two concurrent terminates can't both succeed: the loser sees
     // Terminating -> 409. NotFound -> 404.
     use crate::repos::container_namespace::TransitionOutcome;
-    match crate::repos::container_namespace::set_namespace_status(
-        db,
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::container_namespace::set_namespace_status(
+        &mut tx,
         &id,
         &ryuki_engine::container_namespace::NamespaceStatus::Terminating,
     )
     .await
-    .map_err(db_error)?
-    {
-        TransitionOutcome::Updated(ns) => Ok(Json(json!({
-            "source": "db",
-            "action": "terminate-namespace",
-            "providerCallsEnabled": false,
-            "namespace": ns,
-        }))),
-        TransitionOutcome::NotFound => Err(status_404(&id)),
-        TransitionOutcome::Terminating => Err(status_409(&format!(
-            "Namespace '{id}' is already terminating"
-        ))),
-    }
+    .map_err(db_error)?;
+    let ns = match outcome {
+        TransitionOutcome::Updated(ns) => ns,
+        TransitionOutcome::NotFound => return Err(status_404(&id)),
+        TransitionOutcome::Terminating => {
+            return Err(status_409(&format!(
+                "Namespace '{id}' is already terminating"
+            )));
+        }
+    };
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "k8s-namespace-terminate",
+            None,
+            "terminated",
+            json!({ "namespace_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "db",
+        "action": "terminate-namespace",
+        "providerCallsEnabled": false,
+        "namespace": ns,
+    })))
 }
 async fn k8s_cluster_utilization(
     AuthExtractor(session): AuthExtractor,
@@ -46013,12 +46189,28 @@ mod hardware_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-TEST-{uid}")[..20].to_string();
 
-        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+        let Ok(Json(created)) = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(add_request("HPE", &serial)),
+        )
+        .await
+        else {
             panic!("hardware_add failed");
         };
 
         let id = created["id"].as_str().expect("id in response").to_string();
         uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        // #7 audit: hardware_add wrote a durable audit row naming the asset.
+        let hw_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'hardware-add' AND detail->>'asset_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query hardware-add audit");
+        assert!(hw_audited, "hardware_add must write a durable audit row");
 
         let record = crate::repos::hardware_assets::get(pool, &id)
             .await
@@ -46065,7 +46257,12 @@ mod hardware_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-FW-{uid}")[..18].to_string();
 
-        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+        let Ok(Json(created)) = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(add_request("HPE", &serial)),
+        )
+        .await
+        else {
             panic!("hardware_add failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -46134,7 +46331,12 @@ mod hardware_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let serial = format!("HPE-CHK-{uid}")[..19].to_string();
 
-        let Ok(Json(created)) = hardware_add(Json(add_request("HPE", &serial))).await else {
+        let Ok(Json(created)) = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(add_request("HPE", &serial)),
+        )
+        .await
+        else {
             panic!("hardware_add failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -46225,14 +46427,17 @@ mod hardware_db_tests {
         // when 039 was applied and may have drifted on a long-lived test DB).
         let uid = uuid::Uuid::new_v4().to_string();
         let warranty = (chrono::Utc::now() + chrono::Duration::days(45)).to_rfc3339();
-        let Ok(Json(created)) = hardware_add(Json(HardwareAddRequest {
-            vendor: "HPE".into(),
-            model: "TestModel".into(),
-            site: "GBLON".into(),
-            cluster: "test-cluster".into(),
-            serial: format!("TEST-{}", &uid[..8]),
-            warranty_expiry: warranty,
-        }))
+        let Ok(Json(created)) = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(HardwareAddRequest {
+                vendor: "HPE".into(),
+                model: "TestModel".into(),
+                site: "GBLON".into(),
+                cluster: "test-cluster".into(),
+                serial: format!("TEST-{}", &uid[..8]),
+                warranty_expiry: warranty,
+            }),
+        )
         .await
         else {
             panic!("hardware_add failed");
@@ -46301,7 +46506,11 @@ mod hardware_db_tests {
             return;
         };
 
-        let result = hardware_add(Json(add_request("Dell", "DELL-001"))).await;
+        let result = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(add_request("Dell", "DELL-001")),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected hardware_add with unknown vendor to fail");
         };
@@ -46322,14 +46531,17 @@ mod hardware_db_tests {
             return;
         };
 
-        let result = hardware_add(Json(HardwareAddRequest {
-            vendor: "HPE".into(),
-            model: "M".into(),
-            site: "GBLON".into(),
-            cluster: "c".into(),
-            serial: "BADW-001".into(),
-            warranty_expiry: "not-a-date".into(),
-        }))
+        let result = hardware_add(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(HardwareAddRequest {
+                vendor: "HPE".into(),
+                model: "M".into(),
+                site: "GBLON".into(),
+                cluster: "c".into(),
+                serial: "BADW-001".into(),
+                warranty_expiry: "not-a-date".into(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected hardware_add with malformed warranty to fail");

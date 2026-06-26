@@ -260,7 +260,10 @@ pub enum ArrayDeleteResult {
 }
 
 /// Register (insert) a freshly-built storage array.
-pub async fn create_array(pool: &PgPool, array: &StorageArray) -> Result<(), sqlx::Error> {
+pub async fn create_array(
+    executor: impl sqlx::PgExecutor<'_>,
+    array: &StorageArray,
+) -> Result<(), sqlx::Error> {
     sqlx::query(&format!(
         "INSERT INTO storage_arrays ({ARRAY_COLUMNS}) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
@@ -274,7 +277,7 @@ pub async fn create_array(pool: &PgPool, array: &StorageArray) -> Result<(), sql
     .bind(i64::try_from(array.used_capacity_gb).unwrap_or(0))
     .bind(i32::try_from(array.pool_count).unwrap_or(i32::MAX))
     .bind(enum_to_db(&array.status))
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -285,7 +288,7 @@ pub async fn create_array(pool: &PgPool, array: &StorageArray) -> Result<(), sql
 /// the handler maps that DB check-violation to a 400. Returns the updated array,
 /// or `Ok(None)` when no such array exists.
 pub async fn update_array(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     model: Option<&str>,
     total_capacity_gb: Option<u64>,
@@ -307,7 +310,7 @@ pub async fn update_array(
     .bind(total_capacity_gb.map(|v| i64::try_from(v).unwrap_or(i64::MAX)))
     .bind(pool_count.map(|v| i32::try_from(v).unwrap_or(i32::MAX)))
     .bind(status.map(enum_to_db))
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.map(|r| r.into_model()).transpose()
 }
@@ -319,12 +322,14 @@ pub async fn update_array(
 /// lock, so the count check cannot be raced — and `ON DELETE RESTRICT` is the
 /// DB-level backstop. The explicit count gives a clean 409 instead of a raw FK
 /// violation.
-pub async fn delete_array(pool: &PgPool, id: &str) -> Result<ArrayDeleteResult, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+pub async fn delete_array(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+) -> Result<ArrayDeleteResult, sqlx::Error> {
     let exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM storage_arrays WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     if exists.is_none() {
         return Ok(ArrayDeleteResult::NotFound);
@@ -332,16 +337,15 @@ pub async fn delete_array(pool: &PgPool, id: &str) -> Result<ArrayDeleteResult, 
     let volume_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM storage_volumes WHERE storage_array = $1")
             .bind(id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
     if volume_count > 0 {
         return Ok(ArrayDeleteResult::Blocked(volume_count));
     }
     sqlx::query("DELETE FROM storage_arrays WHERE id = $1")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-    tx.commit().await?;
     Ok(ArrayDeleteResult::Deleted)
 }
 
@@ -723,7 +727,9 @@ mod storage_provisioning_db_tests {
         )
         .expect("build");
         let id = array.id.clone();
-        create_array(&db, &array).await.expect("create");
+        let mut tx = db.begin().await.expect("begin");
+        create_array(&mut *tx, &array).await.expect("create");
+        tx.commit().await.expect("commit");
 
         // Partial update: model + capacity + status; pool_count omitted stays 0.
         let updated = update_array(
@@ -754,8 +760,12 @@ mod storage_provisioning_db_tests {
         .execute(&db)
         .await
         .unwrap();
-        match delete_array(&db, &id).await.expect("delete-blocked") {
-            ArrayDeleteResult::Blocked(n) => assert_eq!(n, 1),
+        let mut tx = db.begin().await.expect("begin");
+        match delete_array(&mut tx, &id).await.expect("delete-blocked") {
+            ArrayDeleteResult::Blocked(n) => {
+                tx.rollback().await.ok();
+                assert_eq!(n, 1);
+            }
             _ => panic!("delete must be blocked while a volume references the array"),
         }
 
@@ -765,14 +775,18 @@ mod storage_provisioning_db_tests {
             .execute(&db)
             .await
             .unwrap();
+        let mut tx2 = db.begin().await.expect("begin");
         assert!(matches!(
-            delete_array(&db, &id).await.expect("delete"),
+            delete_array(&mut tx2, &id).await.expect("delete"),
             ArrayDeleteResult::Deleted
         ));
+        tx2.commit().await.expect("commit");
+        let mut tx3 = db.begin().await.expect("begin");
         assert!(matches!(
-            delete_array(&db, &id).await.expect("delete-absent"),
+            delete_array(&mut tx3, &id).await.expect("delete-absent"),
             ArrayDeleteResult::NotFound
         ));
+        tx3.rollback().await.ok();
     }
 
     #[tokio::test]

@@ -187,7 +187,10 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<HardwareAsset>, sqlx:
 ///
 /// We `RETURNING` the inserted row so the returned model carries the
 /// DB-authoritative values (the response then matches a subsequent `get`).
-pub async fn insert(pool: &PgPool, r: &HardwareAsset) -> Result<HardwareAsset, sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    r: &HardwareAsset,
+) -> Result<HardwareAsset, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let warranty_expiry: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&r.warranty_expiry)
@@ -219,7 +222,7 @@ pub async fn insert(pool: &PgPool, r: &HardwareAsset) -> Result<HardwareAsset, s
     .bind(support_status_str(&r.support_status))
     .bind(lifecycle_status_str(&r.lifecycle_status))
     .bind(last_health_check)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model()
@@ -240,7 +243,7 @@ pub async fn insert(pool: &PgPool, r: &HardwareAsset) -> Result<HardwareAsset, s
 /// appends a `firmware_history` row so the full audit trail is preserved even if
 /// two concurrent updates race; last-write-wins is acceptable here.
 pub async fn apply_firmware_update(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     asset_id: &str,
     version: &str,
     scope_site: &str,
@@ -248,8 +251,6 @@ pub async fn apply_firmware_update(
     let Ok(uid) = Uuid::parse_str(asset_id) else {
         return Ok(None);
     };
-
-    let mut tx = pool.begin().await?;
 
     // `AND site = $3` (#2): the firmware UPDATE is site-aware atomically, so an
     // asset re-homed out of the caller's scope between the handler's guard and
@@ -265,21 +266,18 @@ pub async fn apply_firmware_update(
     .bind(uid)
     .bind(version)
     .bind(scope_site)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let Some(updated) = updated else {
-        tx.rollback().await?;
         return Ok(None);
     };
 
     sqlx::query("INSERT INTO firmware_history (asset_id, version) VALUES ($1, $2)")
         .bind(uid)
         .bind(version)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-
-    tx.commit().await?;
 
     updated.into_model().map(Some)
 }

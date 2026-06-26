@@ -39,7 +39,7 @@ use ryuki_engine::container_namespace::{
     ContainerRequest, Environment, K8sNamespace, NamespaceStatus, RequestStatus, ResourceQuota,
 };
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 // ─── Enum helpers ─────────────────────────────────────────────────────────────
 
@@ -392,17 +392,17 @@ pub enum TransitionOutcome {
     Terminating,
 }
 
-async fn namespace_exists(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+async fn namespace_exists(conn: &mut PgConnection, id: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM k8s_namespaces WHERE id = $1)")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
 }
 
 /// Update the 6 quota columns for a namespace by id, guarded so a Terminating
 /// namespace (or one concurrently terminated) is rejected atomically.
 pub async fn update_quota(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     cpu: u32,
     memory: u32,
@@ -438,11 +438,11 @@ pub async fn update_quota(
     .bind(storage_gb)
     .bind(max_pods)
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     match row {
         Some(r) => Ok(TransitionOutcome::Updated(Box::new(r.into_model()?))),
-        None if namespace_exists(pool, id).await? => Ok(TransitionOutcome::Terminating),
+        None if namespace_exists(conn, id).await? => Ok(TransitionOutcome::Terminating),
         None => Ok(TransitionOutcome::NotFound),
     }
 }
@@ -451,7 +451,7 @@ pub async fn update_quota(
 /// (you cannot suspend/resume a terminating namespace, and a second concurrent
 /// terminate cannot re-terminate). The guard is atomic with the UPDATE.
 pub async fn set_namespace_status(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     status: &NamespaceStatus,
 ) -> Result<TransitionOutcome, sqlx::Error> {
@@ -463,11 +463,11 @@ pub async fn set_namespace_status(
     ))
     .bind(enum_to_db(status))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     match row {
         Some(r) => Ok(TransitionOutcome::Updated(Box::new(r.into_model()?))),
-        None if namespace_exists(pool, id).await? => Ok(TransitionOutcome::Terminating),
+        None if namespace_exists(conn, id).await? => Ok(TransitionOutcome::Terminating),
         None => Ok(TransitionOutcome::NotFound),
     }
 }
@@ -766,11 +766,15 @@ mod container_namespace_db_tests {
             .expect("provision failed");
 
         // Update quota: cpu=12, memory=32, storage=300
-        let updated = match update_quota(&db, &ns_id, 12, 32, 300)
+        let mut tx = db.begin().await.expect("begin");
+        let updated = match update_quota(&mut tx, &ns_id, 12, 32, 300)
             .await
             .expect("update_quota failed")
         {
-            TransitionOutcome::Updated(ns) => *ns,
+            TransitionOutcome::Updated(ns) => {
+                tx.commit().await.expect("commit");
+                *ns
+            }
             other => panic!("expected Updated, got {other:?}"),
         };
         assert_eq!(updated.resource_quota.cpu_request, 12);
@@ -781,9 +785,11 @@ mod container_namespace_db_tests {
         assert_eq!(updated.resource_quota.max_pods, 96);
 
         // Not found returns NotFound
-        let absent = update_quota(&db, "k8s-nonexistent", 4, 8, 100)
+        let mut tx_absent = db.begin().await.expect("begin");
+        let absent = update_quota(&mut tx_absent, "k8s-nonexistent", 4, 8, 100)
             .await
             .expect("must not error for absent");
+        tx_absent.rollback().await.ok();
         assert!(matches!(absent, TransitionOutcome::NotFound));
 
         // Cleanup
@@ -823,49 +829,61 @@ mod container_namespace_db_tests {
         };
 
         // Creating -> Suspended
+        let mut tx1 = db.begin().await.expect("begin");
         let suspended = updated_ns(
-            set_namespace_status(&db, &ns_id, &NamespaceStatus::Suspended)
+            set_namespace_status(&mut tx1, &ns_id, &NamespaceStatus::Suspended)
                 .await
                 .expect("suspend failed"),
         );
+        tx1.commit().await.expect("commit");
         assert_eq!(suspended.status, NamespaceStatus::Suspended);
 
         // Suspended -> Active (resume)
+        let mut tx2 = db.begin().await.expect("begin");
         let resumed = updated_ns(
-            set_namespace_status(&db, &ns_id, &NamespaceStatus::Active)
+            set_namespace_status(&mut tx2, &ns_id, &NamespaceStatus::Active)
                 .await
                 .expect("resume failed"),
         );
+        tx2.commit().await.expect("commit");
         assert_eq!(resumed.status, NamespaceStatus::Active);
 
         // Active -> Terminating
+        let mut tx3 = db.begin().await.expect("begin");
         let terminated = updated_ns(
-            set_namespace_status(&db, &ns_id, &NamespaceStatus::Terminating)
+            set_namespace_status(&mut tx3, &ns_id, &NamespaceStatus::Terminating)
                 .await
                 .expect("terminate failed"),
         );
+        tx3.commit().await.expect("commit");
         assert_eq!(terminated.status, NamespaceStatus::Terminating);
 
         // Guard: once Terminating, further transitions are rejected (no clobber).
-        let blocked = set_namespace_status(&db, &ns_id, &NamespaceStatus::Suspended)
+        let mut tx4 = db.begin().await.expect("begin");
+        let blocked = set_namespace_status(&mut tx4, &ns_id, &NamespaceStatus::Suspended)
             .await
             .expect("must not error");
+        tx4.rollback().await.ok();
         assert!(
             matches!(blocked, TransitionOutcome::Terminating),
             "suspending a Terminating namespace must be rejected"
         );
-        let quota_blocked = update_quota(&db, &ns_id, 4, 8, 100)
+        let mut tx5 = db.begin().await.expect("begin");
+        let quota_blocked = update_quota(&mut tx5, &ns_id, 4, 8, 100)
             .await
             .expect("must not error");
+        tx5.rollback().await.ok();
         assert!(
             matches!(quota_blocked, TransitionOutcome::Terminating),
             "updating quota on a Terminating namespace must be rejected"
         );
 
         // Not found returns NotFound
-        let absent = set_namespace_status(&db, "k8s-nonexistent", &NamespaceStatus::Active)
+        let mut tx6 = db.begin().await.expect("begin");
+        let absent = set_namespace_status(&mut tx6, "k8s-nonexistent", &NamespaceStatus::Active)
             .await
             .expect("must not error for absent");
+        tx6.rollback().await.ok();
         assert!(matches!(absent, TransitionOutcome::NotFound));
 
         // Cleanup
@@ -904,9 +922,11 @@ mod container_namespace_db_tests {
         assert!(found.is_some());
 
         // Set to Terminating — should now return None
-        set_namespace_status(&db, &ns_id, &NamespaceStatus::Terminating)
+        let mut tx_term = db.begin().await.expect("begin");
+        set_namespace_status(&mut tx_term, &ns_id, &NamespaceStatus::Terminating)
             .await
             .expect("terminate failed");
+        tx_term.commit().await.expect("commit");
         let not_found = find_active_namespace_by_name(&db, &name, "defra-aks-01")
             .await
             .expect("find failed");
