@@ -10890,9 +10890,12 @@ struct AiopsRejectRequest {
 }
 
 async fn aiops_generate(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let suggestions = match get_db() {
         Some(pool) => crate::repos::aiops::list_by_site(pool, site)
             .await
@@ -11046,9 +11049,12 @@ async fn aiops_type(
 }
 
 async fn aiops_savings(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let suggestions = match get_db() {
         Some(pool) => crate::repos::aiops::list_by_site(pool, site)
             .await
@@ -11059,9 +11065,12 @@ async fn aiops_savings(
 }
 
 async fn aiops_stats(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<AiopsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let suggestions = match get_db() {
         Some(pool) => crate::repos::aiops::list_by_site(pool, site)
             .await
@@ -21084,8 +21093,13 @@ struct RepoCapacityTrendQuery {
     months: Option<u32>,
 }
 
-async fn repo_capacity_list(Query(params): Query<RepoCapacitySiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn repo_capacity_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<RepoCapacitySiteQuery>,
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let repos = match get_db() {
         Some(pool) => crate::repos::repository_capacity::list_by_site(pool, site)
             .await
@@ -21187,8 +21201,13 @@ async fn repo_capacity_at_risk() -> ApiResult {
     Ok(Json(repository_capacity::get_at_risk(&repos)))
 }
 
-async fn repo_capacity_report(Query(params): Query<RepoCapacitySiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn repo_capacity_report(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<RepoCapacitySiteQuery>,
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let repos = match get_db() {
         Some(pool) => crate::repos::repository_capacity::list_by_site(pool, site)
             .await
@@ -21271,8 +21290,13 @@ async fn hardware_assets_or_empty(
     }
 }
 
-async fn hardware_inventory(Query(query): Query<HardwareInventoryQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn hardware_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<HardwareInventoryQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let assets = hardware_assets_or_empty(site).await?;
     Ok(Json(serde_json::to_value(assets).unwrap_or_default()))
 }
@@ -43517,7 +43541,11 @@ mod hardware_db_tests {
         };
 
         // inventory: all sites returns ≥ 6 seed rows.
-        let Ok(Json(all)) = hardware_inventory(Query(HardwareInventoryQuery { site: None })).await
+        let Ok(Json(all)) = hardware_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(HardwareInventoryQuery { site: None }),
+        )
+        .await
         else {
             panic!("hardware_inventory failed");
         };
@@ -43529,9 +43557,12 @@ mod hardware_db_tests {
         );
 
         // inventory: GBLON returns ≥ 3 seed rows.
-        let Ok(Json(gblon)) = hardware_inventory(Query(HardwareInventoryQuery {
-            site: Some("GBLON".into()),
-        }))
+        let Ok(Json(gblon)) = hardware_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(HardwareInventoryQuery {
+                site: Some("GBLON".into()),
+            }),
+        )
         .await
         else {
             panic!("hardware_inventory GBLON failed");
