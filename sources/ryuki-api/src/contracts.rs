@@ -16243,13 +16243,19 @@ async fn metrics_record_sample(
         _ => None,
     };
 
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    // #2: enforce scope BEFORE any DB access; bind the EFFECTIVE (site,
+    // environment) into the INSERT — NEVER the raw body. Out-of-scope is a 403,
+    // an omitted value narrows to the principal's own scope, unrestricted writes
+    // verbatim.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&body.site), norm(&body.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = uuid::Uuid::new_v4().to_string();
     let result = sqlx::query(
         "INSERT INTO metric_samples (id, metric_key, site, environment, value, observed_at) \
@@ -16257,8 +16263,8 @@ async fn metrics_record_sample(
     )
     .bind(&id)
     .bind(metric_key)
-    .bind(norm(&body.site))
-    .bind(norm(&body.environment))
+    .bind(&f_site)
+    .bind(&f_env)
     .bind(body.value)
     .bind(observed_at)
     .execute(pool)
@@ -16880,13 +16886,18 @@ async fn metrics_budget_create(
             ));
         }
     };
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    // #2: enforce scope BEFORE any DB access; bind the EFFECTIVE (site,
+    // environment) into the INSERT — NEVER the raw body — so a scoped principal
+    // cannot define a budget for another scope.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&body.site), norm(&body.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = uuid::Uuid::new_v4().to_string();
     let result = sqlx::query(
         "INSERT INTO metric_budgets \
@@ -16895,8 +16906,8 @@ async fn metrics_budget_create(
     )
     .bind(&id)
     .bind(metric_key)
-    .bind(norm(&body.site))
-    .bind(norm(&body.environment))
+    .bind(&f_site)
+    .bind(&f_env)
     .bind(body.threshold)
     .bind(comparison)
     .execute(pool)
@@ -17342,13 +17353,17 @@ async fn slo_create(
             "site/environment must be at most 200 characters",
         ));
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    // #2: enforce scope BEFORE any DB access; bind the EFFECTIVE (site,
+    // environment) into the INSERT — NEVER the raw body — so a scoped principal
+    // cannot define an SLO for another scope.
+    let (f_site, f_env) = enforce_scope_filters(&session, norm(&b.site), norm(&b.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO slo_definitions \
@@ -17361,8 +17376,8 @@ async fn slo_create(
     .bind(window)
     .bind(good_key)
     .bind(total_key)
-    .bind(norm(&b.site))
-    .bind(norm(&b.environment))
+    .bind(&f_site)
+    .bind(&f_env)
     .execute(pool)
     .await
     .map_err(db_error)?;
@@ -30645,6 +30660,60 @@ mod unit_tests {
         )
         .await
         .expect_err("an environment-scoped force-rotate must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_writes_deny_out_of_scope_before_db() {
+        // metrics_record_sample / metrics_budget_create / slo_create write
+        // site+environment from the body. A scoped principal must not write to
+        // another scope — 403 BEFORE any DB access (no-DB mode would otherwise
+        // 503; the 403 firing first proves the scope gate precedes the DB).
+        let out = scoped_session(&["GBLON"], &[]);
+
+        let err = metrics_record_sample(
+            AuthExtractor(out.clone()),
+            Json(MetricSampleRequest {
+                metric_key: "cpu.util".into(),
+                site: Some("DEFRA".into()),
+                environment: None,
+                value: 1.0,
+                observed_at: None,
+            }),
+        )
+        .await
+        .expect_err("recording a sample for an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = metrics_budget_create(
+            AuthExtractor(out.clone()),
+            Json(MetricBudgetCreateRequest {
+                metric_key: "cpu.util".into(),
+                site: Some("DEFRA".into()),
+                environment: None,
+                threshold: 1.0,
+                comparison: None,
+            }),
+        )
+        .await
+        .expect_err("defining a budget for an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Environment axis is enforced too: in-scope site, out-of-scope env.
+        let err = slo_create(
+            AuthExtractor(scoped_session(&["GBLON"], &["production"])),
+            Json(SloCreateRequest {
+                name: "slo-x".into(),
+                target: 0.99,
+                window_days: Some(30),
+                good_metric_key: "good".into(),
+                total_metric_key: "total".into(),
+                site: Some("GBLON".into()),
+                environment: Some("dev".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope environment must be 403");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
