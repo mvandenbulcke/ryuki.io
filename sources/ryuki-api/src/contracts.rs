@@ -7682,8 +7682,13 @@ struct SoftwareComplianceQuery {
     site: String,
 }
 
-async fn software_packages_list(Query(query): Query<SoftwarePackagesQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn software_packages_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SoftwarePackagesQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     if let Some(pool) = get_db() {
         // DB path: read approved_packages table (source of truth).
         // site_scope filter mirrors engine SiteScope::covers:
@@ -9497,8 +9502,13 @@ struct SyntheticRunAllQuery {
     site: Option<String>,
 }
 
-async fn synthetic_run_all(Query(query): Query<SyntheticRunAllQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("DEFRA");
+async fn synthetic_run_all(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SyntheticRunAllQuery>,
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let checks = crate::repos::synthetic_health::list_checks_for_site(pool, site)
         .await
@@ -9536,8 +9546,13 @@ struct SyntheticDashboardQuery {
     site: Option<String>,
 }
 
-async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("DEFRA");
+async fn synthetic_dashboard(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SyntheticDashboardQuery>,
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let Some(pool) = get_db() else {
         let empty = synthetic_health::get_dashboard(&[], &[], site);
         return Ok(Json(serde_json::to_value(empty).unwrap_or_default()));
@@ -9552,8 +9567,13 @@ async fn synthetic_dashboard(Query(query): Query<SyntheticDashboardQuery>) -> Ap
     Ok(Json(serde_json::to_value(dashboard).unwrap_or_default()))
 }
 
-async fn synthetic_outages(Query(query): Query<SyntheticDashboardQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("DEFRA");
+async fn synthetic_outages(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SyntheticDashboardQuery>,
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let Some(pool) = get_db() else {
         return Ok(Json(
             serde_json::to_value(Vec::<synthetic_health::OutageEntry>::new()).unwrap_or_default(),
@@ -19509,8 +19529,13 @@ async fn certificates_revoke(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn certificates_expiring(Query(query): Query<CertificateExpiringQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn certificates_expiring(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<CertificateExpiringQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let days = query.days.unwrap_or(90);
 
     let Some(pool) = get_db() else {
@@ -21535,8 +21560,13 @@ async fn hardware_contract() -> Json<Value> {
 
 // ─── Outage communications handlers ───
 
-async fn outage_notices_list(Query(query): Query<OutageNoticeListQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn outage_notices_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<OutageNoticeListQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let notices = match get_db() {
         Some(pool) => crate::repos::outage_comms::list(pool, site)
             .await
@@ -22547,9 +22577,12 @@ struct FirmwareExceptionRequest {
 }
 
 async fn firmware_devices_list(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<FirmwareDeviceQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("");
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     match get_db() {
         Some(pool) => {
             let devices = crate::repos::firmware_lifecycle::list_devices(pool, site)
@@ -35408,7 +35441,9 @@ mod approved_packages_db_tests {
         };
 
         let query = SoftwarePackagesQuery { site: None };
-        let result = software_packages_list(Query(query)).await;
+        let result =
+            software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
+                .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -35444,7 +35479,9 @@ mod approved_packages_db_tests {
         let query = SoftwarePackagesQuery {
             site: Some("FRPAR".into()),
         };
-        let result = software_packages_list(Query(query)).await;
+        let result =
+            software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
+                .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -35463,7 +35500,9 @@ mod approved_packages_db_tests {
         let query2 = SoftwarePackagesQuery {
             site: Some("DEFRA".into()),
         };
-        let result2 = software_packages_list(Query(query2)).await;
+        let result2 =
+            software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query2))
+                .await;
         let Ok(Json(body2)) = result2 else {
             panic!("expected Ok, got Err for DEFRA: {result2:?}");
         };
@@ -35488,7 +35527,9 @@ mod approved_packages_db_tests {
         // That's acceptable: the important guarantee is the no-DB path is NOT
         // broken, proven by `make test-unit`.
         let query = SoftwarePackagesQuery { site: None };
-        let result = software_packages_list(Query(query)).await;
+        let result =
+            software_packages_list(AuthExtractor(AuthSession::static_dry_run()), Query(query))
+                .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -42823,10 +42864,13 @@ mod certificates_db_tests {
         };
 
         // Use a site filter that matches the seeded GBLON row only.
-        let Ok(Json(result)) = certificates_expiring(Query(CertificateExpiringQuery {
-            site: Some("GBLON".into()),
-            days: Some(90),
-        }))
+        let Ok(Json(result)) = certificates_expiring(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CertificateExpiringQuery {
+                site: Some("GBLON".into()),
+                days: Some(90),
+            }),
+        )
         .await
         else {
             panic!("certificates_expiring failed");
