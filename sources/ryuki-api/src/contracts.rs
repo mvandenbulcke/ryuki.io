@@ -24123,9 +24123,12 @@ async fn ipam_release_ip(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn ipam_summary(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<IpamSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site summary ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     if let Some(pool) = get_db() {
         let row: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT COALESCE(SUM(total_ips), 0), COALESCE(SUM(used_ips), 0), \
@@ -25063,9 +25066,12 @@ async fn storage_check_capacity(
     )))
 }
 async fn storage_report(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site summary ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let (total_gb, used_gb, volume_count, array_count) = match get_db() {
         Some(pool) => crate::repos::storage_provisioning::get_storage_report(pool, site)
             .await
@@ -25315,9 +25321,12 @@ async fn k8s_namespace_terminate(
     }
 }
 async fn k8s_cluster_utilization(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site summary ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let namespaces = match get_db() {
         Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
             .await
@@ -25353,9 +25362,12 @@ async fn k8s_validate_name(
     )))
 }
 async fn k8s_summary(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site summary ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let namespaces = match get_db() {
         Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
             .await
@@ -25951,8 +25963,13 @@ async fn compliance_finding_waive(
     }
 }
 
-async fn compliance_summary(Query(q): Query<ComplianceSiteQuery>) -> ApiResult {
-    let site = q.site.as_deref().unwrap_or("");
+async fn compliance_summary(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<ComplianceSiteQuery>,
+) -> ApiResult {
+    // #2: scoped-site summary ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let summaries = match get_db() {
         Some(pool) => crate::repos::compliance_reporting::get_compliance_summary(pool, site)
             .await
@@ -31231,6 +31248,30 @@ mod unit_tests {
             Query(DatacenterSiteQuery {
                 site: "GBLON".into(),
             }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn summary_reads_deny_out_of_scope_and_env_scoped() {
+        // The single-site SUMMARY reads (ipam/storage/k8s/compliance) resolve the
+        // scoped site before the aggregate query — a scoped principal summarizes
+        // only its own site, never all sites by omitting ?site.
+        let err = ipam_summary(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Query(IpamSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope summary must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = k8s_summary(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Query(K8sSiteQuery { site: None }),
         )
         .await
         .expect_err("an environment-scoped principal must be 403");
