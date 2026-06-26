@@ -21294,32 +21294,50 @@ async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(check).unwrap_or_default()))
 }
 
-async fn hardware_firmware_gaps(Query(query): Query<HardwareFirmwareGapsQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
-    let assets = hardware_assets_or_empty("").await?;
-    let gaps = hardware_lifecycle::get_firmware_gaps(&assets, site);
+async fn hardware_firmware_gaps(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<HardwareFirmwareGapsQuery>,
+) -> ApiResult {
+    // #2: resolve the scoped site, then load ONLY that site's assets. The old
+    // hardcoded "" loaded EVERY site's inventory into memory and post-filtered —
+    // an auth-bypassable cross-site read for a scoped principal.
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let assets = hardware_assets_or_empty(&site).await?;
+    let gaps = hardware_lifecycle::get_firmware_gaps(&assets, &site);
     Ok(Json(serde_json::to_value(gaps).unwrap_or_default()))
 }
 
-async fn hardware_support_risk(Query(query): Query<HardwareSupportRiskQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
-    let assets = hardware_assets_or_empty("").await?;
-    let risk = hardware_lifecycle::get_support_risk(&assets, site);
+async fn hardware_support_risk(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<HardwareSupportRiskQuery>,
+) -> ApiResult {
+    // #2: scoped-site load only (see hardware_firmware_gaps).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let assets = hardware_assets_or_empty(&site).await?;
+    let risk = hardware_lifecycle::get_support_risk(&assets, &site);
     Ok(Json(serde_json::to_value(risk).unwrap_or_default()))
 }
 
-async fn hardware_refresh_plan(Query(query): Query<HardwareRefreshPlanQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
-    let assets = hardware_assets_or_empty("").await?;
-    let plan = hardware_lifecycle::get_refresh_plan(&assets, site);
+async fn hardware_refresh_plan(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<HardwareRefreshPlanQuery>,
+) -> ApiResult {
+    // #2: scoped-site load only (see hardware_firmware_gaps).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let assets = hardware_assets_or_empty(&site).await?;
+    let plan = hardware_lifecycle::get_refresh_plan(&assets, &site);
     Ok(Json(serde_json::to_value(plan).unwrap_or_default()))
 }
 
-async fn hardware_lifecycle_report(Query(query): Query<HardwareLifecycleReportQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn hardware_lifecycle_report(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<HardwareLifecycleReportQuery>,
+) -> ApiResult {
+    // #2: scoped-site load only (see hardware_firmware_gaps).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
     // No DB -> a zero report (get_lifecycle_report over an empty asset set).
-    let assets = hardware_assets_or_empty("").await?;
-    let report = hardware_lifecycle::get_lifecycle_report(&assets, site);
+    let assets = hardware_assets_or_empty(&site).await?;
+    let report = hardware_lifecycle::get_lifecycle_report(&assets, &site);
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
@@ -31085,6 +31103,32 @@ mod unit_tests {
         )
         .await
         .expect_err("starting a DR test for an out-of-scope plan must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn hardware_reports_deny_out_of_scope_and_load_scoped() {
+        // BUG CLASS FIX: the 4 hardware report reads used to load EVERY site's
+        // inventory then post-filter. Now they resolve the scoped site first and
+        // load only it. A GBLON-scoped principal asking for DEFRA is 403 BEFORE
+        // any load — it never pulls another site's assets into memory.
+        let err = hardware_firmware_gaps(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Query(HardwareFirmwareGapsQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("out-of-scope hardware firmware gaps must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // An environment-scoped principal is denied too (hardware is site-only).
+        let err = hardware_support_risk(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Query(HardwareSupportRiskQuery { site: None }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be forbidden");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
@@ -43403,8 +43447,11 @@ mod hardware_db_tests {
             cleanup(pool, &id).await;
             panic!("hardware_update_firmware failed");
         }
-        let Ok(Json(gaps)) =
-            hardware_firmware_gaps(Query(HardwareFirmwareGapsQuery { site: None })).await
+        let Ok(Json(gaps)) = hardware_firmware_gaps(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(HardwareFirmwareGapsQuery { site: None }),
+        )
+        .await
         else {
             cleanup(pool, &id).await;
             panic!("hardware_firmware_gaps failed");
