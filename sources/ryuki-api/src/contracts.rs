@@ -5145,9 +5145,13 @@ struct CustomizationSpecQuery {
 /// proposal matches the catalog. Catalog-derived safe facts only — no live
 /// vCenter/directory calls.
 async fn integrations_vmware_customization_spec_governance(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<CustomizationSpecQuery>,
-) -> Json<Value> {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+) -> ApiResult {
+    // #2: scoped-site read (default DEFRA). The governance evaluation is over a
+    // static catalog (no per-tenant DB read), so scoping here is defense-in-depth.
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     let proposed = customization_spec_governance::ProposedSpec {
         spec_reference: params.spec,
         country_code: params.country,
@@ -5157,7 +5161,7 @@ async fn integrations_vmware_customization_spec_governance(
         network_behavior: params.network,
     };
     let result = customization_spec_governance::evaluate_customization_spec(site, &proposed);
-    Json(json!(result))
+    Ok(Json(json!(result)))
 }
 
 async fn integrations_vmware_object_placement() -> Json<Value> {
@@ -6456,9 +6460,18 @@ async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
 }
 
 async fn emergency_history(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<EmergencySiteQuery>,
 ) -> Result<Json<Value>, ProblemDetails> {
-    let site = params.site.unwrap_or_default();
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, params.site.as_deref(), "").map_err(|_| {
+        problem_details(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "requested site is outside your authorized scope",
+            None::<String>,
+        )
+    })?;
     if let Some(pool) = get_db() {
         let rows: Vec<EmergencyChangeRow> = if site.is_empty() {
             sqlx::query_as(&format!(
@@ -6520,9 +6533,18 @@ async fn emergency_history(
 }
 
 async fn emergency_stats(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<EmergencySiteQuery>,
 ) -> Result<Json<Value>, ProblemDetails> {
-    let site = params.site.unwrap_or_default();
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, params.site.as_deref(), "").map_err(|_| {
+        problem_details(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "requested site is outside your authorized scope",
+            None::<String>,
+        )
+    })?;
     if let Some(pool) = get_db() {
         let rows: Vec<EmergencyChangeRow> = if site.is_empty() {
             sqlx::query_as(&format!(
@@ -28783,8 +28805,9 @@ mod unit_tests {
     /// nothing, so it returns review (with the derived facts), not admit.
     #[tokio::test]
     async fn customization_spec_governance_derives_facts_for_known_site() {
-        let Json(result) =
-            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+        let Json(result) = integrations_vmware_customization_spec_governance(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CustomizationSpecQuery {
                 site: Some("DEFRA".into()),
                 spec: None,
                 country: None,
@@ -28792,8 +28815,10 @@ mod unit_tests {
                 ou: None,
                 domain: None,
                 network: None,
-            }))
-            .await;
+            }),
+        )
+        .await
+        .expect("governance eval");
         assert_eq!(result["decision"], "review");
         assert_eq!(
             result["safe_facts"]["ou_pattern_reference"],
@@ -28804,8 +28829,9 @@ mod unit_tests {
     /// A proposed value that drifts from the catalog downgrades to review.
     #[tokio::test]
     async fn customization_spec_governance_reviews_on_drift() {
-        let Json(result) =
-            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+        let Json(result) = integrations_vmware_customization_spec_governance(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CustomizationSpecQuery {
                 site: Some("DEFRA".into()),
                 spec: None,
                 country: Some("FR".into()),
@@ -28813,16 +28839,19 @@ mod unit_tests {
                 ou: None,
                 domain: None,
                 network: None,
-            }))
-            .await;
+            }),
+        )
+        .await
+        .expect("governance eval");
         assert_eq!(result["decision"], "review");
     }
 
     /// An ungoverned site is blocked (no catalog spec).
     #[tokio::test]
     async fn customization_spec_governance_blocks_unknown_site() {
-        let Json(result) =
-            integrations_vmware_customization_spec_governance(Query(CustomizationSpecQuery {
+        let Json(result) = integrations_vmware_customization_spec_governance(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CustomizationSpecQuery {
                 site: Some("ZZZZZ".into()),
                 spec: None,
                 country: None,
@@ -28830,8 +28859,10 @@ mod unit_tests {
                 ou: None,
                 domain: None,
                 network: None,
-            }))
-            .await;
+            }),
+        )
+        .await
+        .expect("governance eval");
         assert_eq!(result["decision"], "block");
         assert!(result["safe_facts"].is_null());
     }
@@ -36393,9 +36424,12 @@ mod emergency_change_unit_tests {
             eprintln!("SKIP test_history_fallback_no_db: running in DB mode");
             return;
         }
-        let Ok(Json(body)) = emergency_history(Query(EmergencySiteQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let Ok(Json(body)) = emergency_history(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EmergencySiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await
         else {
             panic!("expected Ok");
@@ -36411,7 +36445,12 @@ mod emergency_change_unit_tests {
             eprintln!("SKIP test_stats_fallback_no_db: running in DB mode");
             return;
         }
-        let Ok(Json(body)) = emergency_stats(Query(EmergencySiteQuery { site: None })).await else {
+        let Ok(Json(body)) = emergency_stats(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EmergencySiteQuery { site: None }),
+        )
+        .await
+        else {
             panic!("expected Ok");
         };
         assert_eq!(body["source"], "dry-run");
@@ -37691,9 +37730,12 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000006";
         seed_change(pool, id, "Initiated", "DEFRA").await;
 
-        let Ok(Json(body)) = emergency_history(Query(EmergencySiteQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let Ok(Json(body)) = emergency_history(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EmergencySiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await
         else {
             panic!("expected Ok");
@@ -37748,7 +37790,12 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000008";
         seed_change(pool, id, "Verified", "DEFRA").await;
 
-        let Ok(Json(body)) = emergency_stats(Query(EmergencySiteQuery { site: None })).await else {
+        let Ok(Json(body)) = emergency_stats(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EmergencySiteQuery { site: None }),
+        )
+        .await
+        else {
             panic!("expected Ok");
         };
         assert_eq!(body["source"], "database");
