@@ -17130,7 +17130,10 @@ async fn metrics_budget_create(
         enforce_scope_filters(&session, norm(&body.site), norm(&body.environment))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let result = sqlx::query(
+    // Persist + audit ATOMICALLY: a budget never lands without its
+    // durable audit_log row (#7).
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    sqlx::query(
         "INSERT INTO metric_budgets \
          (id, metric_key, site, environment, threshold, comparison) \
          VALUES ($1, $2, $3, $4, $5, $6)",
@@ -17141,18 +17144,34 @@ async fn metrics_budget_create(
     .bind(&f_env)
     .bind(body.threshold)
     .bind(comparison)
-    .execute(pool)
-    .await;
-    match result {
-        Ok(_) => Ok(Json(json!({"id": id, "created": true}))),
-        Err(e) => {
-            tracing::error!(error = %e, "creating metric budget failed");
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "could not create budget"})),
-            ))
-        }
-    }
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "creating metric budget failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not create budget"})),
+        )
+    })?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "metric-budget-create",
+            None,
+            "created",
+            json!({
+                "budget_id": &id,
+                "metric_key": metric_key,
+                "site": &f_site,
+                "environment": &f_env,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({"id": id, "created": true})))
 }
 
 /// GET /api/metrics/budgets — list all defined budgets. Request-tier read.
@@ -17596,6 +17615,9 @@ async fn slo_create(
     let (f_site, f_env) = enforce_scope_filters(&session, norm(&b.site), norm(&b.environment))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = uuid::Uuid::new_v4().to_string();
+    // Persist + audit ATOMICALLY: an SLO definition never lands without its
+    // durable audit_log row (#7).
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(
         "INSERT INTO slo_definitions \
          (id, name, target, window_days, good_metric_key, total_metric_key, site, environment) \
@@ -17609,9 +17631,27 @@ async fn slo_create(
     .bind(total_key)
     .bind(&f_site)
     .bind(&f_env)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "slo-create",
+            None,
+            "created",
+            json!({
+                "slo_id": &id,
+                "name": name,
+                "site": &f_site,
+                "environment": &f_env,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({ "id": id, "created": true })))
 }
 
@@ -17793,14 +17833,30 @@ async fn metrics_budget_delete(
         ));
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let deleted: Option<(String,)> =
         sqlx::query_as("DELETE FROM metric_budgets WHERE id = $1 RETURNING id")
             .bind(&id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
     match deleted {
-        Some((deleted_id,)) => Ok(Json(json!({"deleted": deleted_id}))),
+        Some((deleted_id,)) => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "metric-budget-delete",
+                    Some("active"),
+                    "deleted",
+                    json!({ "budget_id": &deleted_id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({"deleted": deleted_id})))
+        }
         None => Err(status_404(&id)),
     }
 }
@@ -17815,14 +17871,30 @@ async fn slo_delete(AuthExtractor(session): AuthExtractor, Path(id): Path<String
         ));
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let deleted: Option<(String,)> =
         sqlx::query_as("DELETE FROM slo_definitions WHERE id = $1 RETURNING id")
             .bind(&id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
     match deleted {
-        Some((deleted_id,)) => Ok(Json(json!({"deleted": deleted_id}))),
+        Some((deleted_id,)) => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "slo-delete",
+                    Some("active"),
+                    "deleted",
+                    json!({ "slo_id": &deleted_id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({"deleted": deleted_id})))
+        }
         None => Err(status_404(&id)),
     }
 }
@@ -34531,6 +34603,20 @@ mod db_lifecycle_tests {
             panic!("delete failed");
         };
         assert_eq!(out["deleted"], serde_json::json!(id));
+
+        // #7 audit: the delete wrote a durable, correctly-attributed audit row.
+        let delete_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'metric-budget-delete' AND detail->>'budget_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query delete audit");
+        assert!(
+            delete_audited,
+            "budget delete must write a durable audit_log row"
+        );
 
         // A second delete of the now-absent budget is a 404.
         let err = metrics_budget_delete(
