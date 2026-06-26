@@ -232,6 +232,19 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False
 - **evidence:** Pool configured with acquire_timeout, idle_timeout, max_lifetime, but no statement_timeout or query timeout context. A slow query (e.g., missing index, full table scan, bad plan) will hang until the request-level timeout (configured via timeout_secs in main.rs, 60-300s typical) fires. This can saturate the pool waiting on that one slow query. Database should have statement_timeout set via SET statement_timeout or pool.execute('SET statement_timeout ...') at connection init. Suggest: add pool initialization step to set per-statement timeouts (e.g., 15s default, configurable per pool tier).
 - **verified:** The gap is REAL and CONCRETE: ryuki-api/src/database.rs (lines 104-129) configures the sqlx PgPool with acquire_timeout, idle_timeout, and max_lifetime, but does NOT set any per-statement or query timeout. A slow database query (missing index, full table scan, bad plan) will block a connection indefinitely until the request-level timeout fires (60-300s typical), allowing pool saturation. SQLx 0.8 supports statement_timeout via connection initialization, but this is not implemented. This gap is NOT tracked in the 66-item missing-features-tracker.md. It is implementable via pool.after_connect() 
+- **STATUS (2026-06-27) — COMPLETE:** `try_connect_with_url` now sets, via
+  `PgPoolOptions::after_connect` (once per physical connection, all pools),
+  `statement_timeout = '30s'` (bounds a runaway query below the 60-300s request
+  timeout so it aborts first instead of pinning a connection) AND
+  `lock_timeout = '10s'` (bounds a contended-lock wait — advisory-chain / row
+  locks are held only briefly, so a longer wait is real pile-up and should fail
+  fast + retry). 30s is generous for this control plane's small-table OLTP and
+  its fast DDL migrations (all 109 verified to run single statements well under
+  it), yet safely below the request timeout. DB-gated test asserts both values
+  via SHOW; migrations + the audit-chain advisory-lock path verified unaffected.
+  Reviewed (fresh-context): the lock_timeout was added specifically to address
+  the reviewer's note that statement_timeout alone is a blunt instrument for lock
+  waits.
 
 ### 13. OpenAPI specification not implemented (#64 mismarked as shipped)
 - **area:** sources/ryuki-api/Cargo.toml, sources/ryuki-api/src/main.rs · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

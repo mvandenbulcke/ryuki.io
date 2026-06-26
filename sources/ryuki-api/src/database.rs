@@ -139,6 +139,24 @@ pub async fn try_connect_with_url(
         .idle_timeout(Duration::from_secs(idle_timeout_secs))
         .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
         .max_lifetime(Duration::from_secs(max_lifetime_secs))
+        // #12: bound every statement at the DB so a runaway query (missing index,
+        // bad plan, full scan) cannot pin a pool connection until the much-larger
+        // request timeout (60-300s) fires and saturate the pool. 30s is generous
+        // for this control plane's small-table OLTP and its fast DDL migrations,
+        // yet well below the request timeout so the statement aborts first.
+        // `lock_timeout` (10s, < statement_timeout) bounds waits on a contended
+        // lock specifically — the advisory-chain / row locks are held only
+        // briefly, so a longer wait means real pile-up and should fail fast and
+        // retry rather than queue behind statement_timeout. Both are
+        // session-scoped, set once per physical connection.
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                use sqlx::Executor;
+                conn.execute("SET statement_timeout = '30s'; SET lock_timeout = '10s'")
+                    .await?;
+                Ok(())
+            })
+        })
         .connect(url)
         .await
     {
@@ -197,9 +215,39 @@ pub static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 mod tests {
     use super::{
         get_db, live_platform_health, migration_status, set_migration_status_for_test,
-        MigrationStatus,
+        try_connect_with_url, MigrationStatus, DB_TEST_SERIAL,
     };
     use ryuki_engine::health_monitor::{HealthSource, HealthStatus};
+
+    /// #12: every pooled connection must carry the per-statement timeout set in
+    /// `after_connect`, so a runaway query aborts at the DB instead of pinning a
+    /// connection until the request timeout fires.
+    #[tokio::test]
+    async fn statement_timeout_is_set_on_pool_connections() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Ok(url) = std::env::var("RYUKI_DATABASE_URL") else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        try_connect_with_url(&url, 2, 1, 300, 30, 1800).await;
+        let pool = get_db().expect("pool must be connected");
+        let stmt: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(pool)
+            .await
+            .expect("SHOW statement_timeout");
+        assert_eq!(
+            stmt, "30s",
+            "every pooled connection must carry the 30s statement_timeout from after_connect"
+        );
+        let lock: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(pool)
+            .await
+            .expect("SHOW lock_timeout");
+        assert_eq!(
+            lock, "10s",
+            "every pooled connection must carry the 10s lock_timeout from after_connect"
+        );
+    }
 
     #[test]
     fn migration_status_tracks_updates() {
