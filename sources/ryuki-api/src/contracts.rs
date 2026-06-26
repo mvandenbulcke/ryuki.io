@@ -7569,7 +7569,10 @@ async fn maintenance_calendar_contract() -> Json<Value> {
 
 // ─── Patch wave orchestration handlers ───
 
-async fn patch_plan(Json(body): Json<PatchPlanRequest>) -> ApiResult {
+async fn patch_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<PatchPlanRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let mut wave = patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality)
@@ -7580,9 +7583,23 @@ async fn patch_plan(Json(body): Json<PatchPlanRequest>) -> ApiResult {
     // proper UUID so the repo can bind it correctly.
     wave.id = Uuid::new_v4().to_string();
 
-    crate::repos::patch_waves::insert(pool, &wave)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::patch_waves::insert(&mut *tx, &wave)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "patch-plan",
+            None,
+            "planned",
+            json!({ "wave_id": &wave.id, "site": wave.site_scope.first() }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&wave).unwrap_or_default()))
 }
@@ -7599,18 +7616,20 @@ async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
 
     let (updated, result) = patch_engine::validate_patch_wave(&wave).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::patch_waves::transition(pool, before, &updated, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::patch_waves::transition(&mut tx, before, &updated, None)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
 async fn patch_approve(
-    Extension(session): Extension<AuthSession>,
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchActionRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -7627,17 +7646,34 @@ async fn patch_approve(
     let approved =
         patch_engine::approve_patch_wave(&wave, &session.user_id).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::patch_waves::transition(pool, before, &approved, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::patch_waves::transition(&mut tx, before, &approved, None)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "patch-approve",
+            Some(before),
+            "approved",
+            json!({ "wave_id": &body.wave_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
-async fn patch_execute(Json(body): Json<PatchActionRequest>) -> ApiResult {
+async fn patch_execute(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<PatchActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
@@ -7650,12 +7686,26 @@ async fn patch_execute(Json(body): Json<PatchActionRequest>) -> ApiResult {
     let (completed, evidence) =
         patch_engine::execute_patch_wave(&wave).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::patch_waves::transition(pool, before, &completed, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::patch_waves::transition(&mut tx, before, &completed, None)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "patch-execute",
+            Some(before),
+            "executed",
+            json!({ "wave_id": &body.wave_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -27320,6 +27370,7 @@ async fn compliance_findings_list(
 }
 
 async fn compliance_finding_resolve(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<ComplianceResolveRequest>,
 ) -> ApiResult {
@@ -27328,21 +27379,37 @@ async fn compliance_finding_resolve(
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::compliance_reporting::MutationOutcome;
-    match crate::repos::compliance_reporting::resolve_finding(pool, &id, &b.resolution)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::compliance_reporting::resolve_finding(&mut *tx, &id, &b.resolution)
         .await
-        .map_err(db_error)?
-    {
-        MutationOutcome::Updated(f) => Ok(Json(json!({ "source": "db", "finding": f }))),
-        MutationOutcome::NotFound => Err((
+        .map_err(db_error)?;
+    let MutationOutcome::Updated(ref f) = outcome else {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("Finding '{}' not found", id)})),
-        )),
-    }
+        ));
+    };
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "compliance-finding-resolve",
+            // The UPDATE has no status guard and we don't read the prior state,
+            // so we don't claim a from_status (avoids mis-recording a re-resolve).
+            None,
+            "resolved",
+            json!({ "finding_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({ "source": "db", "finding": f })))
 }
 
 async fn compliance_finding_waive(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
-    Extension(session): Extension<AuthSession>,
     Json(b): Json<ComplianceWaiveRequest>,
 ) -> ApiResult {
     // approved_by = authenticated caller (from request extensions), never a client
@@ -27355,32 +27422,47 @@ async fn compliance_finding_waive(
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     use crate::repos::compliance_reporting::MutationOutcome;
-    match crate::repos::compliance_reporting::create_waiver(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::compliance_reporting::create_waiver(
+        &mut *tx,
         &id,
         &b.reason,
         &session.user_id,
         &b.expiry,
     )
     .await
-    .map_err(db_error)?
-    {
-        MutationOutcome::Updated(f) => Ok(Json(json!({
-            "source": "db",
-            "waiver": {
-                "finding_id": &id,
-                "reason": &b.reason,
-                "approved_by": &session.user_id,
-                "expiry": &b.expiry,
-                "created_at": chrono::Utc::now().to_rfc3339()
-            },
-            "finding": f
-        }))),
-        MutationOutcome::NotFound => Err((
+    .map_err(db_error)?;
+    let MutationOutcome::Updated(ref f) = outcome else {
+        return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("Finding '{}' not found", id)})),
-        )),
-    }
+        ));
+    };
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "compliance-finding-waive",
+            // No status guard + no prior-state read → don't claim a from_status.
+            None,
+            "waived",
+            json!({ "finding_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(json!({
+        "source": "db",
+        "waiver": {
+            "finding_id": &id,
+            "reason": &b.reason,
+            "approved_by": &session.user_id,
+            "expiry": &b.expiry,
+            "created_at": chrono::Utc::now().to_rfc3339()
+        },
+        "finding": f
+    })))
 }
 
 async fn compliance_summary(
@@ -43596,7 +43678,12 @@ mod patch_waves_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = patch_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("patch_plan failed");
         };
 
@@ -43632,7 +43719,12 @@ mod patch_waves_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
 
         // 1. plan
-        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = patch_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("patch_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -43662,7 +43754,7 @@ mod patch_waves_db_tests {
         let mut approver = AuthSession::static_dry_run();
         approver.user_id = "patch-approver".into();
         let Ok(Json(approved)) = patch_approve(
-            Extension(approver),
+            AuthExtractor(approver),
             Json(PatchActionRequest {
                 wave_id: id.clone(),
             }),
@@ -43678,6 +43770,23 @@ mod patch_waves_db_tests {
             "the persisted approver must be the session principal, not a hardcoded string"
         );
 
+        // #7 audit: the approve wrote a durable audit row attributing the
+        // approver (atomic with the CAS transition).
+        let (audit_actor, _): (String, String) = sqlx::query_as(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'patch-approve' AND detail->>'wave_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .expect("query approve audit")
+        .expect("a patch-approve audit row must exist");
+        assert_eq!(
+            audit_actor, "patch-approver",
+            "audit actor must be the approver session principal"
+        );
+
         let wave = crate::repos::patch_waves::get(pool, &id)
             .await
             .expect("get failed")
@@ -43689,9 +43798,12 @@ mod patch_waves_db_tests {
         );
 
         // 4. execute
-        let Ok(Json(evidence)) = patch_execute(Json(PatchActionRequest {
-            wave_id: id.clone(),
-        }))
+        let Ok(Json(evidence)) = patch_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -43743,7 +43855,12 @@ mod patch_waves_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = patch_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = patch_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("patch_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -43767,9 +43884,11 @@ mod patch_waves_db_tests {
         }
 
         // A transition that still expects the stale Draft status must NOT apply.
-        let applied = crate::repos::patch_waves::transition(pool, "Draft", &draft, None)
+        let mut tx = pool.begin().await.expect("begin failed");
+        let applied = crate::repos::patch_waves::transition(&mut tx, "Draft", &draft, None)
             .await
             .expect("transition query failed");
+        // CAS miss → do not commit; tx drops (rollback).
 
         cleanup(pool, &id).await;
         assert!(

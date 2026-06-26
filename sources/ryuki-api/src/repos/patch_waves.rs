@@ -1,15 +1,18 @@
 //! Repository functions for `patch_waves`.
 //!
-//! All functions are pure over `&PgPool`; callers (handlers in `contracts.rs`)
-//! are responsible for mapping `sqlx::Error` → 500 and `None` → 404.
+//! Mutation functions (`insert`, `transition`) accept either a `PgPool`
+//! reference (standalone call) or a `&mut PgConnection` (caller-owned tx) so
+//! that handlers can compose the repo mutation and an audit row atomically.
+//! Read functions (`get`, `list`) remain `&PgPool`-only. Callers are
+//! responsible for mapping `sqlx::Error` → 500 and `None` → 404.
 //!
 //! # Audit parameter
 //! `transition` accepts an `_audit_action: Option<&str>` parameter for
-//! signature parity with the decommission template, but patch waves do not
-//! have a dedicated audit table — the parameter is intentionally unused.
+//! signature parity with the decommission template. Audit rows are written by
+//! the handler via `audit::record_audit_tx` on the same connection.
 
 use ryuki_engine::models::{PatchSchedule, PatchWave, PatchWaveStatus, RebootPolicy};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -144,7 +147,10 @@ pub fn reboot_policy_str(p: &RebootPolicy) -> &'static str {
 /// The legacy `site` and `os_family` columns (nullable as of migration 058) are
 /// derived from the model: `site` from `site_scope.first()` and `os_family` from
 /// `metadata["os_family"]`, or NULL when the model carries no such value.
-pub async fn insert(pool: &PgPool, w: &PatchWave) -> Result<(), sqlx::Error> {
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
+pub async fn insert(executor: impl sqlx::PgExecutor<'_>, w: &PatchWave) -> Result<(), sqlx::Error> {
     let id = Uuid::parse_str(&w.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let servers = serde_json::to_string(&w.servers).unwrap_or_else(|_| "[]".into());
@@ -187,7 +193,7 @@ pub async fn insert(pool: &PgPool, w: &PatchWave) -> Result<(), sqlx::Error> {
     .bind(&validation_errors)
     .bind(status_str(&w.status))
     .bind(&meta)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -227,10 +233,15 @@ pub async fn list(pool: &PgPool) -> Result<Vec<PatchWave>, sqlx::Error> {
 /// when the row is absent or its status had already changed (caller → 409).
 /// `Ok(true)` on success.
 ///
+/// The caller opens the tx, passes `conn = &mut *tx`, and commits on success.
+/// An `Ok(false)` (CAS miss) returns without mutating — the caller drops the tx
+/// (rollback). Only `Ok(true)` callers should commit.
+///
 /// `_audit_action` is accepted for signature parity with the decommission
-/// template but is intentionally unused — patch waves have no audit table yet.
+/// template but is intentionally unused — patch wave audit rows are written by
+/// the handler via `audit::record_audit_tx` on the same connection.
 pub async fn transition(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     expected_status: &str,
     w: &PatchWave,
     _audit_action: Option<&str>,
@@ -248,8 +259,6 @@ pub async fn transition(
     let validation_errors =
         serde_json::to_string(&w.validation_errors).unwrap_or_else(|_| "[]".into());
     let meta = serde_json::to_string(&w.metadata).unwrap_or_else(|_| "{}".into());
-
-    let mut tx = pool.begin().await?;
 
     let res = sqlx::query(
         "UPDATE patch_waves SET \
@@ -278,14 +287,8 @@ pub async fn transition(
     .bind(status_str(&w.status))
     .bind(&meta)
     .bind(expected_status)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
-    if res.rows_affected() == 0 {
-        tx.rollback().await?;
-        return Ok(false);
-    }
-
-    tx.commit().await?;
-    Ok(true)
+    Ok(res.rows_affected() > 0)
 }

@@ -622,8 +622,11 @@ pub async fn list_findings(
 }
 
 /// Atomically resolve a finding — UPDATE...RETURNING.
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
 pub async fn resolve_finding(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     resolution: &str,
 ) -> Result<MutationOutcome, sqlx::Error> {
@@ -637,7 +640,7 @@ pub async fn resolve_finding(
     )
     .bind(format!(" Resolution: {resolution}"))
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     match row {
@@ -647,8 +650,11 @@ pub async fn resolve_finding(
 }
 
 /// Atomically create a waiver on a finding — UPDATE...RETURNING.
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
 pub async fn create_waiver(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     finding_id: &str,
     reason: &str,
     approved_by: &str,
@@ -665,7 +671,7 @@ pub async fn create_waiver(
     )
     .bind(&remediation)
     .bind(finding_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     match row {
