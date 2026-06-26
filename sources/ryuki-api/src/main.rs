@@ -138,6 +138,8 @@ fn unverified_session(provider_mode: &str) -> AuthSession {
         roles: Vec::new(),
         token_valid: false,
         provider_mode: provider_mode.into(),
+        // Unscoped (unrestricted) — scoping applies only to scoped api-tokens.
+        ..Default::default()
     }
 }
 
@@ -148,6 +150,8 @@ fn session_from_db_row(row: DbAuthSessionRow) -> AuthSession {
         roles: row.roles,
         token_valid: true,
         provider_mode: "persisted-session".into(),
+        // A persisted (cookie) session is not scope-restricted.
+        ..Default::default()
     }
 }
 
@@ -244,6 +248,21 @@ struct ApiTokenRow {
     roles: Vec<String>,
     token_valid: bool,
     token_hash: String,
+    site_scope: Option<String>,
+    environment_scope: Option<String>,
+}
+
+/// Parse a persisted scope column (a comma-separated TEXT, or NULL) into the
+/// authorized-scope list: trimmed, non-empty values. NULL/empty ⇒ `[]` =
+/// UNRESTRICTED (see `ryuki_engine::auth::scope_permits`).
+fn parse_token_scope(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Resolves an `ryk_` API-token bearer to an `AuthSession`.
@@ -261,7 +280,8 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
 
     let hash_hex = sha256_hex(plaintext);
     let row = sqlx::query_as::<_, ApiTokenRow>(
-        "SELECT id, name, owner_principal, roles, token_valid, token_hash \
+        "SELECT id, name, owner_principal, roles, token_valid, token_hash, \
+                site_scope, environment_scope \
          FROM api_tokens \
          WHERE token_hash = $1 AND revoked_at IS NULL \
          AND (expires_at IS NULL OR expires_at > NOW())",
@@ -297,6 +317,10 @@ async fn resolve_api_token(plaintext: &str, pool: &sqlx::PgPool) -> AuthSession 
             roles: row.roles,
             token_valid: row.token_valid,
             provider_mode: "api-token".into(),
+            // #2: carry the token's persisted scopes onto the session so handlers
+            // can enforce them. NULL/empty ⇒ unrestricted.
+            site_scope: parse_token_scope(row.site_scope),
+            environment_scope: parse_token_scope(row.environment_scope),
         }
     } else {
         unverified_session("api-token-mismatch")
@@ -3602,6 +3626,7 @@ mod tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()],
             token_valid: true,
             provider_mode: "persisted-session".into(),
+            ..Default::default()
         }
     }
 
@@ -3762,6 +3787,7 @@ mod tests {
                 roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
                 token_valid: true,
                 provider_mode: "persisted-session".into(),
+                ..Default::default()
             };
             if required == "admin" || is_audit_read_path(path) {
                 assert!(
@@ -3803,6 +3829,7 @@ mod tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
             provider_mode: "persisted-session".into(),
+            ..Default::default()
         };
         for path in [
             "/api/activity/audit",

@@ -10317,6 +10317,7 @@ async fn logout_caller_session(headers: &HeaderMap) {
                     roles: r.roles,
                     token_valid: true,
                     provider_mode: "persisted-session".into(),
+                    ..Default::default()
                 },
                 None => crate::unverified_session("local-logout"),
             };
@@ -10654,29 +10655,35 @@ struct AnalyticsTrendQuery {
     metric: Option<String>,
 }
 
-async fn analytics_capacity(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_capacity(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
-    cost_capacity::get_site_capacity(site, &vms)
+    cost_capacity::get_site_capacity(&site, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_capacity_cluster(Query(params): Query<AnalyticsClusterQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_capacity_cluster(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsClusterQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let cluster = params.cluster.as_deref().unwrap_or("defra-general-cluster");
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
-    cost_capacity::get_cluster_capacity(site, cluster, &vms)
+    cost_capacity::get_cluster_capacity(&site, cluster, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -10689,13 +10696,14 @@ async fn analytics_capacity_cluster(Query(params): Query<AnalyticsClusterQuery>)
 /// inventory when a DB is wired, otherwise the static seed (matching the
 /// integrations/vmware static-seed posture). No live vCenter calls.
 async fn integrations_vmware_cluster_capacity_admission(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<ClusterAdmissionQuery>,
 ) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let cluster = params.cluster.as_deref().unwrap_or("defra-general-cluster");
     let (vms, inventory_source) = match crate::database::get_db() {
         Some(pool) => (
-            crate::repos::cost_capacity::list_vms_for_site(pool, site)
+            crate::repos::cost_capacity::list_vms_for_site(pool, &site)
                 .await
                 .map_err(db_error)?,
             "db",
@@ -10703,7 +10711,7 @@ async fn integrations_vmware_cluster_capacity_admission(
         None => (cost_capacity::seed_vms(), "static-seed"),
     };
     let result = cluster_capacity_admission::evaluate_cluster_admission(
-        site,
+        &site,
         cluster,
         params.cpu_cores.unwrap_or(0),
         params.memory_gb.unwrap_or(0),
@@ -10714,72 +10722,87 @@ async fn integrations_vmware_cluster_capacity_admission(
     Ok(Json(json!(result)))
 }
 
-async fn analytics_capacity_forecast(Query(params): Query<AnalyticsForecastQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_capacity_forecast(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsForecastQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let months = params.months.unwrap_or(6);
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
-    cost_capacity::forecast_capacity(site, months, &vms)
+    cost_capacity::forecast_capacity(&site, months, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_cost_summary(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_cost_summary(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
     let pricing = cost_capacity::default_pricing();
-    cost_capacity::get_cost_summary(site, &vms, &pricing)
+    cost_capacity::get_cost_summary(&site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_waste(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_waste(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
     let pricing = cost_capacity::default_pricing();
-    cost_capacity::get_waste_report(site, &vms, &pricing)
+    cost_capacity::get_waste_report(&site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_rightsizing(Query(params): Query<AnalyticsSiteQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_rightsizing(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsSiteQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
     let pricing = cost_capacity::default_pricing();
-    cost_capacity::get_rightsizing_recommendations(site, &vms, &pricing)
+    cost_capacity::get_rightsizing_recommendations(&site, &vms, &pricing)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn analytics_trend(Query(params): Query<AnalyticsTrendQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("DEFRA");
+async fn analytics_trend(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AnalyticsTrendQuery>,
+) -> ApiResult {
+    let site = enforce_site_scope(&session, params.site.as_deref(), "DEFRA")?;
     let metric = params.metric.as_deref().unwrap_or("cpu");
     let vms = match crate::database::get_db() {
-        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, site)
+        Some(pool) => crate::repos::cost_capacity::list_vms_for_site(pool, &site)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
-    cost_capacity::get_trend_report(site, metric, &vms)
+    cost_capacity::get_trend_report(&site, metric, &vms)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -12633,7 +12656,10 @@ fn request_sort_direction(direction: Option<&str>) -> &'static str {
     }
 }
 
-async fn requests_list(Query(params): Query<RequestListParams>) -> Json<Value> {
+async fn requests_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<RequestListParams>,
+) -> ApiResult {
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
     let sort_col = request_sort_column(params.sort.as_deref());
@@ -12646,8 +12672,11 @@ async fn requests_list(Query(params): Query<RequestListParams>) -> Json<Value> {
             .map(str::to_string)
     };
     let f_status = norm(&params.status);
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes. A scoped principal sees
+    // only its own scopes; omitting the filter narrows to its scope rather than
+    // listing every site's requests.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
     let f_type = norm(&params.request_type);
     let f_creator = norm(&params.created_by);
     let f_q = norm(&params.q);
@@ -12700,7 +12729,7 @@ async fn requests_list(Query(params): Query<RequestListParams>) -> Json<Value> {
                 })
             })
             .collect();
-        return Json(json!(summaries));
+        return Ok(Json(json!(summaries)));
     }
 
     // No-DB (dry-run) path: apply the same filters in-memory. The in-memory
@@ -12745,7 +12774,7 @@ async fn requests_list(Query(params): Query<RequestListParams>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!(summaries))
+    Ok(Json(json!(summaries)))
 }
 
 /// Sanitize persisted stage evidence before sending to the portal.
@@ -16245,15 +16274,18 @@ async fn metrics_series(
             Json(json!({"error": "site/environment must be at most 200 characters"})),
         ));
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes BEFORE touching the DB.
+    // A scoped principal may only read within its scopes; omitting the filter
+    // narrows the read to its own scope rather than widening it to all scopes.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -16372,15 +16404,18 @@ async fn metrics_insights(
             Json(json!({"error": "site/environment must be at most 200 characters"})),
         ));
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes BEFORE touching the DB.
+    // A scoped principal may only read within its scopes; omitting the filter
+    // narrows the read to its own scope rather than widening it to all scopes.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -16482,15 +16517,18 @@ async fn metrics_generate_suggestions(
             Json(json!({ "error": format!("{name} must be a finite number") })),
         ));
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes BEFORE touching the DB.
+    // A scoped principal may only read within its scopes; omitting the filter
+    // narrows the read to its own scope rather than widening it to all scopes.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -16671,15 +16709,18 @@ async fn metrics_what_if(
             ));
         }
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes BEFORE touching the DB.
+    // A scoped principal may only read within its scopes; omitting the filter
+    // narrows the read to its own scope rather than widening it to all scopes.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let rows = match fetch_metric_series_rows(pool, metric_key, &f_site, &f_env).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -16865,6 +16906,15 @@ async fn metrics_budget_list(AuthExtractor(session): AuthExtractor) -> ApiResult
     };
     let budgets: Vec<Value> = rows
         .iter()
+        // #2: a scoped principal sees only in-scope (or platform-wide None) budget
+        // definitions — consistent with metrics_budget_status.
+        .filter(|b| {
+            ryuki_engine::auth::scope_permits(&session.site_scope, b.site.as_deref())
+                && ryuki_engine::auth::scope_permits(
+                    &session.environment_scope,
+                    b.environment.as_deref(),
+                )
+        })
         .map(|b| {
             json!({
                 "id": b.id,
@@ -16914,6 +16964,17 @@ async fn metrics_budget_status(AuthExtractor(session): AuthExtractor) -> ApiResu
     let mut breached_count = 0u64;
     let mut errored_count = 0u64;
     for b in &budgets {
+        // #2: a scoped principal sees only budgets for sites/environments within
+        // its scope (a None/platform-wide budget is not another site's data, so
+        // it remains visible — scope_permits passes a None target).
+        if !ryuki_engine::auth::scope_permits(&session.site_scope, b.site.as_deref())
+            || !ryuki_engine::auth::scope_permits(
+                &session.environment_scope,
+                b.environment.as_deref(),
+            )
+        {
+            continue;
+        }
         let comparison =
             ryuki_engine::metric_budget::BudgetComparison::from_str_or_above(&b.comparison);
         // A per-budget series-query failure must NOT read as "not breached" — a
@@ -17074,15 +17135,16 @@ async fn metrics_commitment(
             ));
         }
     }
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     let norm = |o: &Option<String>| {
         o.as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let f_site = norm(&params.site);
-    let f_env = norm(&params.environment);
+    // #2: enforce the session's site/environment scopes before any DB access.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     // Usage = the explicit override (no DB needed), else the series mean. Only
     // query the series on the fallback path, so an explicit-usage model never
     // fails on an empty series or a DB outage.
@@ -17299,6 +17361,15 @@ async fn slo_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
     };
     let slos: Vec<Value> = rows
         .iter()
+        // #2: a scoped principal sees only in-scope (or platform-wide None) SLO
+        // definitions — consistent with slo_status.
+        .filter(|s| {
+            ryuki_engine::auth::scope_permits(&session.site_scope, s.site.as_deref())
+                && ryuki_engine::auth::scope_permits(
+                    &session.environment_scope,
+                    s.environment.as_deref(),
+                )
+        })
         .map(|s| {
             json!({
                 "id": s.id, "name": s.name, "target": s.target,
@@ -17344,6 +17415,16 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let mut breached_count = 0u64;
     let mut errored_count = 0u64;
     for s in &slos {
+        // #2: a scoped principal sees only SLOs for sites/environments within its
+        // scope (a None/platform-wide SLO stays visible — see metrics_budget_status).
+        if !ryuki_engine::auth::scope_permits(&session.site_scope, s.site.as_deref())
+            || !ryuki_engine::auth::scope_permits(
+                &session.environment_scope,
+                s.environment.as_deref(),
+            )
+        {
+            continue;
+        }
         let since = now - chrono::Duration::days(i64::from(s.window_days));
         let good = sum_metric_in_window(
             pool,
@@ -17504,12 +17585,32 @@ async fn metering_usage(
     // Always bound the lower edge: default to the last 90 days so the aggregate
     // is never an unbounded full-table scan.
     let since = since.or_else(|| Some(chrono::Utc::now() - chrono::Duration::days(90)));
-    let f_site = q
+    let requested_site = q
         .site
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // #2: this aggregate has no environment dimension (it sums all environments
+    // per site), so an environment-scoped principal cannot be served a
+    // correctly-scoped result — deny rather than leak cross-environment counts.
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return Err(status_403_out_of_scope("environment"));
+    }
+    // Enforce site scope: a scoped principal is narrowed to its own site; an
+    // out-of-scope value (or an omitted filter from a multi-scope principal) is
+    // a 403 — never a silent all-sites read.
+    let f_site = match ryuki_engine::auth::resolve_scope_filter(
+        &session.site_scope,
+        requested_site.as_deref(),
+    ) {
+        ryuki_engine::auth::ScopeFilter::Allow(v) => v,
+        ryuki_engine::auth::ScopeFilter::Deny => return Err(status_403_out_of_scope("site")),
+    };
 
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // One pass: count requests grouped by (site, status); a NULL bound disables
@@ -17703,12 +17804,31 @@ async fn chargeback_report(
     let since = parse_ts(&q.since).map_err(|_| status_400("since must be an RFC3339 timestamp"))?;
     let until = parse_ts(&q.until).map_err(|_| status_400("until must be an RFC3339 timestamp"))?;
     let since = since.or_else(|| Some(chrono::Utc::now() - chrono::Duration::days(90)));
-    let f_site = q
+    let requested_site = q
         .site
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // #2: this aggregate sums all environments per site, so an environment-scoped
+    // principal cannot be served a correctly-scoped result — deny rather than leak.
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return Err(status_403_out_of_scope("environment"));
+    }
+    // Enforce site scope: a scoped principal is narrowed to its own site; an
+    // out-of-scope value (or an omitted filter from a multi-scope principal) is a
+    // 403 — never a silent all-sites financial read.
+    let f_site = match ryuki_engine::auth::resolve_scope_filter(
+        &session.site_scope,
+        requested_site.as_deref(),
+    ) {
+        ryuki_engine::auth::ScopeFilter::Allow(v) => v,
+        ryuki_engine::auth::ScopeFilter::Deny => return Err(status_403_out_of_scope("site")),
+    };
 
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let counts: Vec<(String, String, i64)> = match sqlx::query_as(
@@ -18443,6 +18563,77 @@ pub(crate) fn status_503_no_db() -> (StatusCode, Json<Value>) {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({"error": "persistence required: this operation requires a database"})),
     )
+}
+
+/// 403 for a request that names (or, while scoped, omits) a scope the principal
+/// is not authorized for (#2). `dimension` is "site" or "environment".
+fn status_403_out_of_scope(dimension: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": format!("requested {dimension} is outside your authorized scope"),
+        })),
+    )
+}
+
+/// The effective `(site, environment)` filters a scoped read must query with
+/// after [`enforce_scope_filters`] has applied the principal's scopes.
+type ScopeFilters = (Option<String>, Option<String>);
+
+/// Enforce the session's site/environment scopes (#2) against the requested
+/// filters, returning the EFFECTIVE filters the handler must query with.
+///
+/// Security contract: an UNRESTRICTED principal (empty scope) reads any scope
+/// (the filters pass through verbatim). A SCOPED principal may only read within
+/// its authorized scopes — and crucially, omitting the filter NARROWS the read
+/// to its own scope rather than widening it to all scopes. A request for an
+/// out-of-scope value, or an omitted filter from a principal holding several
+/// scopes, is a 403. Inputs should already be trimmed/normalized (blank ⇒ None).
+fn enforce_scope_filters(
+    session: &AuthSession,
+    site: Option<String>,
+    environment: Option<String>,
+) -> Result<ScopeFilters, (StatusCode, Json<Value>)> {
+    use ryuki_engine::auth::{resolve_scope_filter, ScopeFilter};
+    let site = match resolve_scope_filter(&session.site_scope, site.as_deref()) {
+        ScopeFilter::Allow(v) => v,
+        ScopeFilter::Deny => return Err(status_403_out_of_scope("site")),
+    };
+    let environment = match resolve_scope_filter(&session.environment_scope, environment.as_deref())
+    {
+        ScopeFilter::Allow(v) => v,
+        ScopeFilter::Deny => return Err(status_403_out_of_scope("environment")),
+    };
+    Ok((site, environment))
+}
+
+/// Resolve the effective `site` for a SITE-ONLY read (analytics/capacity) under
+/// the session's site scope (#2). `default_site` is applied ONLY for an
+/// UNRESTRICTED principal that named no site — a scoped principal is narrowed to
+/// its own scope (or 403'd), never silently defaulted to a site that may be out
+/// of scope. These reads have no environment axis (they span all environments of
+/// a site), so an environment-scoped principal is denied rather than leaked
+/// cross-environment data.
+fn enforce_site_scope(
+    session: &AuthSession,
+    requested: Option<&str>,
+    default_site: &str,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    use ryuki_engine::auth::{resolve_scope_filter, ScopeFilter};
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return Err(status_403_out_of_scope("environment"));
+    }
+    match resolve_scope_filter(&session.site_scope, requested) {
+        // Scoped (or explicit) value resolved to a concrete in-scope site.
+        ScopeFilter::Allow(Some(s)) => Ok(s),
+        // Unrestricted principal that named no site → keep the legacy default.
+        ScopeFilter::Allow(None) => Ok(default_site.to_string()),
+        ScopeFilter::Deny => Err(status_403_out_of_scope("site")),
+    }
 }
 
 async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
@@ -26989,15 +27180,17 @@ mod router_tests {
 
     async fn get_json(uri: &str) -> (StatusCode, Value) {
         let app = routes();
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(uri)
-                    .body(Body::empty())
-                    .expect("request builds"),
-            )
-            .await
-            .expect("router responds");
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builds");
+        // The real app wraps `routes()` with the auth middleware that resolves and
+        // inserts the session; this bare-router harness has no such layer, so inject
+        // an (unscoped) static-dry-run session to mirror it for auth-gated handlers.
+        request
+            .extensions_mut()
+            .insert(AuthSession::static_dry_run());
+        let response = app.oneshot(request).await.expect("router responds");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -27997,16 +28190,18 @@ mod unit_tests {
     /// admitted, and the response discloses the seed as the inventory source.
     #[tokio::test]
     async fn cluster_capacity_admission_admits_modest_request() {
-        let Json(result) =
-            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+        let Json(result) = integrations_vmware_cluster_capacity_admission(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(ClusterAdmissionQuery {
                 site: Some("DEFRA".into()),
                 cluster: Some("defra-general-cluster".into()),
                 cpu_cores: Some(4),
                 memory_gb: Some(16),
                 storage_gb: Some(0),
-            }))
-            .await
-            .expect("admission evaluation should succeed");
+            }),
+        )
+        .await
+        .expect("admission evaluation should succeed");
         assert_eq!(result["decision"], "admit");
         assert_eq!(result["inventory_source"], "static-seed");
         assert!(
@@ -28021,16 +28216,18 @@ mod unit_tests {
     /// only reviewed in dry-run, so the decision downgrades admit -> review.
     #[tokio::test]
     async fn cluster_capacity_admission_reviews_when_storage_requested() {
-        let Json(result) =
-            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+        let Json(result) = integrations_vmware_cluster_capacity_admission(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(ClusterAdmissionQuery {
                 site: Some("DEFRA".into()),
                 cluster: Some("defra-general-cluster".into()),
                 cpu_cores: Some(4),
                 memory_gb: Some(16),
                 storage_gb: Some(500),
-            }))
-            .await
-            .expect("admission evaluation should succeed");
+            }),
+        )
+        .await
+        .expect("admission evaluation should succeed");
         assert_eq!(result["decision"], "review");
     }
 
@@ -28038,32 +28235,36 @@ mod unit_tests {
     /// so compute headroom is exceeded.
     #[tokio::test]
     async fn cluster_capacity_admission_blocks_oversized_request() {
-        let Json(result) =
-            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+        let Json(result) = integrations_vmware_cluster_capacity_admission(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(ClusterAdmissionQuery {
                 site: Some("DEFRA".into()),
                 cluster: Some("defra-general-cluster".into()),
                 cpu_cores: Some(500),
                 memory_gb: Some(8),
                 storage_gb: Some(0),
-            }))
-            .await
-            .expect("admission evaluation should succeed");
+            }),
+        )
+        .await
+        .expect("admission evaluation should succeed");
         assert_eq!(result["decision"], "block");
     }
 
     /// A cluster with no seeded inventory cannot be decided against -> defer.
     #[tokio::test]
     async fn cluster_capacity_admission_defers_unknown_cluster() {
-        let Json(result) =
-            integrations_vmware_cluster_capacity_admission(Query(ClusterAdmissionQuery {
+        let Json(result) = integrations_vmware_cluster_capacity_admission(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(ClusterAdmissionQuery {
                 site: Some("DEFRA".into()),
                 cluster: Some("ghost-cluster".into()),
                 cpu_cores: Some(4),
                 memory_gb: Some(8),
                 storage_gb: Some(50),
-            }))
-            .await
-            .expect("admission evaluation should succeed");
+            }),
+        )
+        .await
+        .expect("admission evaluation should succeed");
         assert_eq!(result["decision"], "defer");
     }
 
@@ -28581,6 +28782,7 @@ mod unit_tests {
             roles: vec!["PlatformAdmin".into()],
             token_valid: true,
             provider_mode: "local".into(),
+            ..Default::default()
         };
         let fixture: Value = serde_json::from_str(AUTH_SESSION_FIXTURE).unwrap();
         assert_eq!(serde_json::to_value(&session).unwrap(), fixture);
@@ -28793,6 +28995,7 @@ mod unit_tests {
             roles: Vec::new(),
             token_valid: false,
             provider_mode: "local-unauthenticated".into(),
+            ..Default::default()
         };
         let Err((status, Json(body))) = local_me_response(&AuthMode::Local, unverified) else {
             panic!("unverified session should be rejected in local mode");
@@ -28815,6 +29018,7 @@ mod unit_tests {
             roles: vec!["PlatformAdmin".into()],
             token_valid: true,
             provider_mode: "persisted-session".into(),
+            ..Default::default()
         };
         let Ok(Json(body)) = local_me_response(&AuthMode::Local, session) else {
             panic!("verified session should be returned");
@@ -28915,12 +29119,16 @@ mod unit_tests {
         let request = test_request("requests-list-seam-test");
         request_store().lock().await.push(request);
 
-        let Json(body) = requests_list(Query(RequestListParams {
-            limit: Some(100),
-            offset: Some(0),
-            ..Default::default()
-        }))
-        .await;
+        let Json(body) = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                limit: Some(100),
+                offset: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an unrestricted session lists requests");
 
         let item = body
             .as_array()
@@ -28991,31 +29199,43 @@ mod unit_tests {
         };
 
         // Filter by site → only the DEFRA row.
-        let Json(by_site) = requests_list(Query(RequestListParams {
-            site: Some("DEFRA".into()),
-            ..Default::default()
-        }))
-        .await;
+        let Json(by_site) = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                site: Some("DEFRA".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an unrestricted session lists requests");
         let site_ids = ids(&by_site);
         assert!(site_ids.contains(&"rl-filter-a".to_string()));
         assert!(!site_ids.contains(&"rl-filter-b".to_string()));
 
         // Case-insensitive substring on the (requester) name.
-        let Json(by_q) = requests_list(Query(RequestListParams {
-            q: Some("BOB".into()),
-            ..Default::default()
-        }))
-        .await;
+        let Json(by_q) = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                q: Some("BOB".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an unrestricted session lists requests");
         let q_ids = ids(&by_q);
         assert!(q_ids.contains(&"rl-filter-b".to_string()));
         assert!(!q_ids.contains(&"rl-filter-a".to_string()));
 
         // A blank filter is ignored (both rows listed).
-        let Json(blank) = requests_list(Query(RequestListParams {
-            site: Some("   ".into()),
-            ..Default::default()
-        }))
-        .await;
+        let Json(blank) = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                site: Some("   ".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("an unrestricted session lists requests");
         let blank_ids = ids(&blank);
         assert!(blank_ids.contains(&"rl-filter-a".to_string()));
         assert!(blank_ids.contains(&"rl-filter-b".to_string()));
@@ -29076,6 +29296,7 @@ mod unit_tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_BACKUP_OPERATOR.to_string()],
             token_valid: true,
             provider_mode: "api-token".to_string(),
+            ..Default::default()
         };
         assert_eq!(session.provider_mode, "api-token");
         assert!(check_permission(&session, "execute"));
@@ -29094,6 +29315,7 @@ mod unit_tests {
             // minted under MockDryRun/StaticDryRun -> token_valid persisted FALSE
             token_valid: false,
             provider_mode: "api-token".to_string(),
+            ..Default::default()
         };
         // It still holds the coarse admin permission via its roles...
         assert!(require_admin_permission(&session).is_ok());
@@ -29120,6 +29342,7 @@ mod unit_tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
             provider_mode: "api-token".to_string(),
+            ..Default::default()
         };
         assert!(require_admin_permission(&session).is_ok());
         assert!(!is_interactive_external_admin(&session));
@@ -29144,6 +29367,7 @@ mod unit_tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: true,
             provider_mode: "entra-id".to_string(),
+            ..Default::default()
         };
         assert!(is_interactive_external_admin(&entra));
         for mode in ["persisted-session", "api-token"] {
@@ -29510,6 +29734,7 @@ mod unit_tests {
             roles: vec![],
             token_valid: false,
             provider_mode: "local-unauthenticated".to_string(),
+            ..Default::default()
         };
         let Err((status, Json(body))) =
             requests_audit(AuthExtractor(no_roles), Path("any".to_string())).await
@@ -29542,6 +29767,7 @@ mod unit_tests {
             roles: vec![],
             token_valid: false,
             provider_mode: "local-unauthenticated".to_string(),
+            ..Default::default()
         };
         let Err((status, Json(body))) = activity_audit_feed(
             AuthExtractor(no_roles),
@@ -29644,6 +29870,7 @@ mod unit_tests {
             roles: vec![],
             token_valid: false,
             provider_mode: "local-unauthenticated".to_string(),
+            ..Default::default()
         };
         let Err((status, _)) =
             request_evidence_pack(AuthExtractor(no_roles), Path("whatever".to_string())).await
@@ -29830,6 +30057,7 @@ mod unit_tests {
             roles: vec![],
             token_valid: true,
             provider_mode: "test".into(),
+            ..Default::default()
         };
         let err = requests_approval_quorum(
             AuthExtractor(no_perm),
@@ -29953,6 +30181,236 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    // ── swarm #2: site/environment-scoped RBAC enforcement ──
+
+    /// Build a PlatformAdmin (so coarse read permission always passes) carrying
+    /// the given site/environment scopes, to exercise the scope gate in isolation.
+    fn scoped_session(site: &[&str], environment: &[&str]) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.site_scope = site.iter().map(|x| x.to_string()).collect();
+        s.environment_scope = environment.iter().map(|x| x.to_string()).collect();
+        s
+    }
+
+    #[tokio::test]
+    async fn metrics_series_denies_out_of_scope_site() {
+        // A GBLON-scoped principal asking for DEFRA is a 403 BEFORE any DB access.
+        let session = scoped_session(&["GBLON"], &[]);
+        let err = metrics_series(
+            AuthExtractor(session),
+            Query(MetricSeriesParams {
+                metric_key: Some("cpu.util".into()),
+                site: Some("DEFRA".into()),
+                environment: None,
+                horizon: None,
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?site must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_series_denies_out_of_scope_environment() {
+        // Site is in scope, but the environment is not → 403 (the env dimension
+        // is enforced independently of the site dimension).
+        let session = scoped_session(&["GBLON"], &["production"]);
+        let err = metrics_series(
+            AuthExtractor(session),
+            Query(MetricSeriesParams {
+                metric_key: Some("cpu.util".into()),
+                site: Some("GBLON".into()),
+                environment: Some("dev".into()),
+                horizon: None,
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?environment must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_series_denies_omitted_site_for_multi_scope_principal() {
+        // CRITICAL leak guard: a multi-scope principal that OMITS ?site must NOT
+        // fall through to an all-sites read — it is forbidden until it names one.
+        let session = scoped_session(&["GBLON", "DEFRA"], &[]);
+        let err = metrics_series(
+            AuthExtractor(session),
+            Query(MetricSeriesParams {
+                metric_key: Some("cpu.util".into()),
+                site: None,
+                environment: None,
+                horizon: None,
+            }),
+        )
+        .await
+        .expect_err("an omitted ?site for a multi-scope principal must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn metrics_series_single_scope_omitted_site_passes_gate_then_503() {
+        // A single-scope principal that omits ?site is NARROWED to its own scope
+        // (not denied): it clears the scope gate and reaches the DB layer, which
+        // is a 503 in no-DB test mode — proving the gate ALLOWED (no 403).
+        let session = scoped_session(&["GBLON"], &[]);
+        let err = metrics_series(
+            AuthExtractor(session),
+            Query(MetricSeriesParams {
+                metric_key: Some("cpu.util".into()),
+                site: None,
+                environment: None,
+                horizon: None,
+            }),
+        )
+        .await
+        .expect_err("no-DB mode is a 503 once the scope gate is cleared");
+        assert_eq!(
+            err.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a single-scope omitted ?site must narrow (not 403) and reach the DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn metering_usage_denies_environment_scoped_principal() {
+        // Usage metering has no environment dimension (it sums all environments
+        // per site), so an environment-scoped principal is denied rather than
+        // served a cross-environment leak.
+        let session = scoped_session(&[], &["production"]);
+        let err = metering_usage(
+            AuthExtractor(session),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: None,
+            }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be forbidden on usage metering");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn requests_list_denies_out_of_scope_site() {
+        // The listing endpoint enforces the same scope gate: a GBLON-scoped
+        // principal asking for DEFRA is forbidden, never shown other sites' rows.
+        let session = scoped_session(&["GBLON"], &[]);
+        let err = requests_list(
+            AuthExtractor(session),
+            Query(RequestListParams {
+                site: Some("DEFRA".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?site must be forbidden on the listing endpoint");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn analytics_capacity_denies_out_of_scope_site() {
+        // The analytics/capacity family honors an explicit ?site verbatim; a
+        // GBLON-scoped principal asking for DEFRA must be a 403 BEFORE any DB read.
+        let session = scoped_session(&["GBLON"], &[]);
+        let err = analytics_capacity(
+            AuthExtractor(session),
+            Query(AnalyticsSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?site must be forbidden on analytics");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn analytics_capacity_omitted_site_narrows_to_scope_not_default() {
+        // CRITICAL: the legacy default site is "DEFRA". A GBLON-scoped principal
+        // that OMITS ?site must NOT be silently served the DEFRA default — it is
+        // narrowed to its own scope. The response's `site` field proves the read
+        // was scoped to GBLON, never DEFRA.
+        let session = scoped_session(&["GBLON"], &[]);
+        let Json(body) = analytics_capacity(
+            AuthExtractor(session),
+            Query(AnalyticsSiteQuery { site: None }),
+        )
+        .await
+        .expect("a single-scope principal clears the gate (narrowed to its scope)");
+        assert_eq!(
+            body["site"], "GBLON",
+            "an omitted ?site must narrow to the principal's own scope, never the DEFRA default"
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_capacity_denies_environment_scoped_principal() {
+        // Capacity spans all environments of a site, so an environment-scoped
+        // principal cannot be served a correctly-scoped result — 403.
+        let session = scoped_session(&[], &["production"]);
+        let err = analytics_capacity(
+            AuthExtractor(session),
+            Query(AnalyticsSiteQuery {
+                site: Some("GBLON".into()),
+            }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be forbidden on analytics");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn chargeback_report_denies_out_of_scope_site() {
+        // Chargeback is the same site-aggregate shape as metering_usage: a scoped
+        // principal must not read another site's financial totals.
+        let session = scoped_session(&["GBLON"], &[]);
+        let err = chargeback_report(
+            AuthExtractor(session),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?site must be forbidden on chargeback");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn chargeback_report_denies_omitted_site_for_multi_scope_principal() {
+        // A multi-scope principal that omits ?site must not get an all-sites
+        // financial read — it is forbidden until it names one in-scope site.
+        let session = scoped_session(&["GBLON", "DEFRA"], &[]);
+        let err = chargeback_report(
+            AuthExtractor(session),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: None,
+            }),
+        )
+        .await
+        .expect_err("an omitted ?site for a multi-scope principal must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn chargeback_report_denies_environment_scoped_principal() {
+        let session = scoped_session(&[], &["production"]);
+        let err = chargeback_report(
+            AuthExtractor(session),
+            Query(MeteringQuery {
+                since: None,
+                until: None,
+                site: None,
+            }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be forbidden on chargeback");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
 
     #[test]
@@ -30014,6 +30472,7 @@ mod unit_tests {
             roles: vec![],
             token_valid: true,
             provider_mode: "test".into(),
+            ..Default::default()
         };
         // Non-execute principal is forbidden on both.
         assert_eq!(

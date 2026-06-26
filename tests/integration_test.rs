@@ -55,6 +55,7 @@ fn engine_auth_session_serialization_matches_seam_fixture() {
         roles: vec!["PlatformAdmin".to_string()],
         token_valid: true,
         provider_mode: "local".to_string(),
+        ..Default::default()
     };
     let expected: serde_json::Value = serde_json::from_str(AUTH_SESSION_FIXTURE).unwrap();
     assert_eq!(serde_json::to_value(&session).unwrap(), expected);

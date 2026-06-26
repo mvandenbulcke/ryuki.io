@@ -413,6 +413,8 @@ impl EntraTokenValidator {
                 roles: claims.roles,
                 token_valid: true,
                 provider_mode: "entra-id".to_string(),
+                // Entra/OIDC sessions are not scope-restricted (#2).
+                ..Default::default()
             },
             failure_reason: None,
         }

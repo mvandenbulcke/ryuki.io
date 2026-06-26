@@ -2147,6 +2147,7 @@ mod tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
             provider_mode: "test".into(),
+            ..Default::default()
         };
         let err = admin_agents_liveness(
             Extension(non_admin),
@@ -6454,6 +6455,7 @@ mod tests {
             roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
             token_valid: true,
             provider_mode: "test".to_string(),
+            ..Default::default()
         };
 
         // check_permission must return false for a non-admin.

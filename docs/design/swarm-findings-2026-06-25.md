@@ -74,6 +74,24 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 2. **API token scopes exist in DB but are not enforced** (/Users/mvandenbulcke/Repos/ryuki.io/migrations/045_api_tokens.sql lines 6-7):
    - Migration comment states: "site_scope/environment_scope are persisted and shown but NOT yet enforced (scoped enforc
 
+- **STATUS (2026-06-26) — first rollout shipped:** `AuthSession` now carries
+  `site_scope`/`environment_scope`, populated in `resolve_api_token`. Pure engine
+  primitives `scope_permits` + `resolve_scope_filter` (trim/dedup/narrow/deny),
+  plus API helpers `enforce_scope_filters` (site+env) and `enforce_site_scope`
+  (site-only, deny env-scoped). ENFORCED read surface: metrics_series/insights/
+  generate_suggestions/what_if/commitment, metrics_budget_status + _list,
+  slo_status + _list, metering_usage, chargeback_report, requests_list, and the
+  analytics/capacity family (capacity, capacity_cluster, capacity_forecast,
+  cost_summary, waste, rightsizing, trend, vmware_cluster_capacity_admission).
+  Dual-reviewed (GPT-5 Codex + fresh-context agent): both SHIP the code; no leak
+  in any enforced handler. DEFERRED (tracked follow-ups, same pattern): the
+  request-by-id family (requests_get/audit/approval_quorum/evidence_pack/policy_eval/
+  jobs — needs per-request site/env load + scope check), the domain-read surface
+  (maintenance_calendar, log_forwarders, datacenter_readiness, firewall_rules,
+  dr_testing, secrets_rotation summary, etc.), and write-path scope checks
+  (metrics_budget_create/slo_create/metrics_record_sample body site/env). A
+  centralized scope layer is the likely vehicle for the remaining breadth.
+
 ### 4. False-healthy platform health checks (all hardcoded to Healthy)
 - **area:** ryuki-engine/src/health_monitor.rs (lines 102-181) · **kind:** latent-bug · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** All check_*_health() functions return hardcoded HealthStatus::Healthy with source=Simulated, never dependency-backed. check_api_health(), check_portal_health(), check_validator_health(), check_kubernetes_health(), check_vault_health(), check_database_health() all hardcoded to 'Healthy'. This means /api/platform/health/all (handler: platform_health_all_checks at contracts.rs:21622) returns false-OK even when real dependencies are down. Monitoring systems treating this as a truth signal (instead of advisory-only) will miss real outages. The 'Simulated' source should trigger alerting, but many operators check status==Healthy first.

@@ -54,13 +54,27 @@ pub struct RbacRole {
     pub permissions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthSession {
     pub user_id: String,
     pub display_name: String,
     pub roles: Vec<String>,
     pub token_valid: bool,
     pub provider_mode: String,
+    /// Authorized SITE scopes for this principal (#2). EMPTY = unrestricted
+    /// (the common unscoped admin/operator case). Only a SCOPED api-token
+    /// populates these (from api_tokens.site_scope); every other principal —
+    /// cookie/local/entra session, static dry-run — is unscoped. Transient
+    /// (per-request), not persisted on the sessions table.
+    ///
+    /// `skip_serializing_if` empty keeps the canonical `/me` seam shape unchanged
+    /// for the common UNSCOPED case (the keys appear only when a scope is set),
+    /// while `default` lets older payloads without the keys deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub site_scope: Vec<String>,
+    /// Authorized ENVIRONMENT scopes (#2). EMPTY = unrestricted, like `site_scope`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_scope: Vec<String>,
 }
 
 impl AuthSession {
@@ -71,6 +85,7 @@ impl AuthSession {
             roles: vec![APP_ROLE_PLATFORM_ADMIN.to_string()],
             token_valid: false,
             provider_mode: "static-dry-run".to_string(),
+            ..Self::default()
         }
     }
 
@@ -81,6 +96,7 @@ impl AuthSession {
             roles: vec![],
             token_valid: false,
             provider_mode: "entra-id-unverified".to_string(),
+            ..Self::default()
         }
     }
 }
@@ -261,6 +277,72 @@ pub fn scope_permits(scopes: &[String], requested: Option<&str>) -> bool {
             let req = req.trim();
             scopes.iter().any(|s| s.trim() == req)
         }
+    }
+}
+
+/// The effective filter to query with after enforcing a principal's scopes (#2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeFilter {
+    /// Proceed using this effective filter value. `None` (no filter / all
+    /// scopes) is only ever returned for an UNRESTRICTED principal — a scoped
+    /// principal is always narrowed to a concrete in-scope value.
+    Allow(Option<String>),
+    /// The principal requested a scope it does not hold, or omitted the scope
+    /// while holding several distinct ones — deny the read (403).
+    Deny,
+}
+
+/// Resolve the EFFECTIVE scope filter for a principal whose authorized scopes
+/// are `scopes`, given the `requested` filter value (`?site` / `?environment`).
+///
+/// This is the enforcement counterpart to [`scope_permits`]. Where
+/// `scope_permits` only answers yes/no for an explicit value, this also closes
+/// the omitted-filter leak: a scoped principal that omits the filter must NOT
+/// fall through to an unfiltered (all-scopes) read. Instead it is narrowed to
+/// its own scope when that is unambiguous.
+///
+/// Rules (deny-by-default once a scope is set):
+/// - UNRESTRICTED (`scopes` has no non-blank entry) ⇒ `Allow(requested)` — the
+///   requested value passes through verbatim (trimmed; blank ⇒ `None`).
+/// - explicit `requested` in scope ⇒ `Allow(Some(requested))`.
+/// - explicit `requested` out of scope ⇒ `Deny`.
+/// - omitted `requested` with exactly ONE distinct authorized scope ⇒
+///   `Allow(Some(that scope))` — narrow the read to the principal's own scope.
+/// - omitted `requested` with MULTIPLE distinct authorized scopes ⇒ `Deny` — the
+///   single-value filter cannot express a set, so the principal must name one
+///   in-scope value explicitly. Scopes are trimmed and DEDUPLICATED first, so a
+///   token whose only scope is repeated (e.g. `["GBLON", " GBLON "]`) still
+///   narrows rather than denying.
+///
+/// Pure; the API resolves the principal's scopes and requested value and passes
+/// them in.
+pub fn resolve_scope_filter(scopes: &[String], requested: Option<&str>) -> ScopeFilter {
+    // Trim + drop blanks so a `?site=` with whitespace behaves like omission.
+    let requested = requested.map(str::trim).filter(|s| !s.is_empty());
+    // Distinct, trimmed, non-blank authorized scopes. An all-blank scope set has
+    // no usable scope and collapses to the unrestricted case (this cannot arise
+    // from a real token — `parse_token_scope` strips blanks to an empty Vec).
+    let mut distinct: Vec<&str> = scopes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let Some(&first) = distinct.first() else {
+        // No usable scope ⇒ unrestricted: pass the requested value through.
+        return ScopeFilter::Allow(requested.map(str::to_string));
+    };
+    match requested {
+        Some(req) => {
+            if distinct.contains(&req) {
+                ScopeFilter::Allow(Some(req.to_string()))
+            } else {
+                ScopeFilter::Deny
+            }
+        }
+        None if distinct.len() > 1 => ScopeFilter::Deny,
+        None => ScopeFilter::Allow(Some(first.to_string())),
     }
 }
 
@@ -581,6 +663,82 @@ mod tests {
         assert!(
             !scope_permits(&s(&["GBLON"]), Some("gblon")),
             "site identifiers are canonical/case-sensitive"
+        );
+    }
+
+    #[test]
+    fn resolve_scope_filter_matrix() {
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        use ScopeFilter::{Allow, Deny};
+
+        // UNRESTRICTED: the requested value passes through verbatim (blank/None
+        // stays None — an admin/operator legitimately reads all scopes).
+        assert_eq!(resolve_scope_filter(&[], None), Allow(None));
+        assert_eq!(
+            resolve_scope_filter(&[], Some("GBLON")),
+            Allow(Some("GBLON".into()))
+        );
+        assert_eq!(resolve_scope_filter(&[], Some("  ")), Allow(None));
+
+        // SINGLE-scope principal: an explicit in-scope value is allowed; an
+        // omitted filter is NARROWED to that one scope (never widened to all).
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON"]), Some("GBLON")),
+            Allow(Some("GBLON".into()))
+        );
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON"]), None),
+            Allow(Some("GBLON".into())),
+            "an omitted filter must narrow to the principal's own scope, not all scopes"
+        );
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON"]), Some("  ")),
+            Allow(Some("GBLON".into())),
+            "a blank filter is treated as omission and narrows to scope"
+        );
+
+        // Out-of-scope explicit value is denied (THE cross-tenant gap).
+        assert_eq!(resolve_scope_filter(&s(&["GBLON"]), Some("DEFRA")), Deny);
+
+        // MULTI-scope principal: an in-scope value is allowed, but an OMITTED
+        // filter is denied — the single-value query cannot express the set, so
+        // the principal must name one in-scope value (no silent all-scopes read).
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON", "DEFRA"]), Some("DEFRA")),
+            Allow(Some("DEFRA".into()))
+        );
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON", "DEFRA"]), Some("FRPAR")),
+            Deny
+        );
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON", "DEFRA"]), None),
+            Deny,
+            "a multi-scope principal must not get an unfiltered (all-scopes) read"
+        );
+
+        // Whitespace is trimmed on both sides; the match is case-SENSITIVE.
+        assert_eq!(
+            resolve_scope_filter(&s(&[" GBLON "]), Some("GBLON")),
+            Allow(Some("GBLON".into()))
+        );
+        assert_eq!(resolve_scope_filter(&s(&["GBLON"]), Some("gblon")), Deny);
+
+        // Duplicate scopes collapse to ONE distinct scope: an omitted filter
+        // narrows (does NOT deny as if multi-scope).
+        assert_eq!(
+            resolve_scope_filter(&s(&["GBLON", " GBLON "]), None),
+            Allow(Some("GBLON".into())),
+            "a repeated single scope must narrow, not be treated as multi-scope"
+        );
+
+        // An all-blank scope set has no USABLE scope, so it collapses to the
+        // unrestricted case (this cannot arise from a real token — parse_token_scope
+        // strips blanks, yielding an empty Vec — but the engine stays well-defined).
+        assert_eq!(resolve_scope_filter(&s(&["  ", ""]), None), Allow(None));
+        assert_eq!(
+            resolve_scope_filter(&s(&["  ", ""]), Some("GBLON")),
+            Allow(Some("GBLON".into()))
         );
     }
 }
