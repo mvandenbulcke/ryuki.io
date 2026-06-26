@@ -18687,6 +18687,31 @@ fn enforce_site_scope(
     }
 }
 
+/// Body-scope guard for a site-only WRITE (#2): a scoped principal may only
+/// create/act on a resource in its own site. An out-of-scope site is a 403, and
+/// an environment-scoped principal is denied (these resources — DNS records,
+/// IPAM subnets, firewall rules, storage volumes/arrays — have NO environment
+/// axis, so an environment scope cannot be honored). Pass the body's CONCRETE,
+/// required site value (non-`Option`), so the `scope_permits(None)=unconstrained`
+/// fail-open never applies.
+fn guard_body_site_scope(
+    session: &AuthSession,
+    site: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return Err(status_403_out_of_scope("environment"));
+    }
+    if ryuki_engine::auth::scope_permits(&session.site_scope, Some(site)) {
+        Ok(())
+    } else {
+        Err(status_403_out_of_scope("site"))
+    }
+}
+
 /// Whether a principal may access a by-id row given the row's CONCRETE,
 /// already-loaded site/environment (#2). Unlike the query-param helpers, this is
 /// the POST-LOAD guard for request-by-id reads: the scope value lives on the row,
@@ -23396,8 +23421,11 @@ async fn dns_records_list(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn dns_record_create(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<DnsCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only create a DNS record in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     if let Some(pool) = get_db() {
         // Validate + construct via the pure engine builder (no static mutation),
         // then persist. The engine stays storage-free; the DB is the source of
@@ -23637,8 +23665,11 @@ struct IpamSubnetCreateRequest {
 /// derived from the CIDR by the pure engine builder, then persisted).
 /// Execute-tier (the /api/network family). 503 when no database is configured.
 async fn ipam_subnet_create(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<IpamSubnetCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only create a subnet in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let subnet = dns_ipam::build_ipam_subnet(&b.cidr, &b.gateway, b.vlan_id, &b.site)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
@@ -24114,6 +24145,8 @@ async fn firewall_rule_create(
     Extension(session): Extension<AuthSession>,
     Json(b): Json<FwCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only create a firewall rule in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     if let Some(pool) = get_db() {
         // Next priority is computed from the DURABLE rules for the site (the
         // engine's static-store version would miss persisted rules).
@@ -24310,8 +24343,11 @@ async fn firewall_rule_validate(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn firewall_rule_set_create(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<FwRuleSetCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only create a rule set in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let id = format!(
         "fws-{}-{}",
@@ -24503,8 +24539,11 @@ async fn storage_volumes_list(
     )))
 }
 async fn storage_volume_provision(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<StorageProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only provision a volume in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     if b.name.trim().is_empty() {
         return Err(status_400("name cannot be empty"));
     }
@@ -24707,8 +24746,11 @@ struct StorageArrayRegisterRequest {
 /// validated and constructed by the pure engine builder, then persisted.
 /// Execute-tier. 503 when no database is configured.
 async fn storage_array_register(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<StorageArrayRegisterRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only register an array in its own site.
+    guard_body_site_scope(&session, &b.site)?;
     let db = get_db().ok_or_else(status_503_no_db)?;
     let array = ryuki_engine::storage_provisioning::build_storage_array(
         &b.name,
@@ -30717,6 +30759,63 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn infra_creates_deny_out_of_scope_and_env_scoped() {
+        // Body-scope WRITES: a scoped principal must not create a resource in
+        // another site — 403 BEFORE any DB access (the guard precedes get_db).
+        // dns_record_create goes through AuthExtractor.
+        let err = dns_record_create(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Json(DnsCreateRequest {
+                name: "www".into(),
+                record_type: "A".into(),
+                value: "10.0.0.1".into(),
+                zone: "example.test".into(),
+                ttl: 3600,
+                site: "DEFRA".into(),
+            }),
+        )
+        .await
+        .expect_err("creating a DNS record in an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // These resources have no environment axis, so an environment-scoped
+        // principal is denied even for an in-scope site.
+        let err = dns_record_create(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Json(DnsCreateRequest {
+                name: "www".into(),
+                record_type: "A".into(),
+                value: "10.0.0.1".into(),
+                zone: "example.test".into(),
+                ttl: 3600,
+                site: "GBLON".into(),
+            }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // firewall_rule_create receives its session via Extension (not
+        // AuthExtractor) — the same guard must apply.
+        let err = firewall_rule_create(
+            Extension(scoped_session(&["GBLON"], &[])),
+            Json(FwCreateRequest {
+                name: "r1".into(),
+                source_ip: "10.0.0.0/8".into(),
+                dest_ip: "10.1.0.0/16".into(),
+                protocol: "tcp".into(),
+                action: "allow".into(),
+                direction: "inbound".into(),
+                site: "DEFRA".into(),
+                description: "x".into(),
+            }),
+        )
+        .await
+        .expect_err("creating a firewall rule in an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
 
     #[test]
@@ -31489,12 +31588,15 @@ mod db_lifecycle_tests {
         };
 
         // CREATE — a /24 yields 254 usable hosts.
-        let Json(created) = ipam_subnet_create(Json(IpamSubnetCreateRequest {
-            cidr: "10.99.0.0/24".to_string(),
-            gateway: "10.99.0.1".to_string(),
-            vlan_id: 999,
-            site: "TESTSITE".to_string(),
-        }))
+        let Json(created) = ipam_subnet_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(IpamSubnetCreateRequest {
+                cidr: "10.99.0.0/24".to_string(),
+                gateway: "10.99.0.1".to_string(),
+                vlan_id: 999,
+                site: "TESTSITE".to_string(),
+            }),
+        )
         .await
         .expect("create subnet");
         let id = created["subnet"]["id"].as_str().unwrap().to_string();
@@ -33180,14 +33282,17 @@ mod dns_records_db_tests {
         };
 
         // Create a record, then update its value + TTL in place.
-        let Json(created) = dns_record_create(Json(DnsCreateRequest {
-            name: "www".into(),
-            record_type: "A".into(),
-            value: "10.0.0.1".into(),
-            zone: "example.test".into(),
-            ttl: 3600,
-            site: "DEFRA".into(),
-        }))
+        let Json(created) = dns_record_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(DnsCreateRequest {
+                name: "www".into(),
+                record_type: "A".into(),
+                value: "10.0.0.1".into(),
+                zone: "example.test".into(),
+                ttl: 3600,
+                site: "DEFRA".into(),
+            }),
+        )
         .await
         .expect("create");
         let id = created["record"]["id"].as_str().expect("id").to_string();
