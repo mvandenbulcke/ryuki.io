@@ -5,7 +5,7 @@
 //! xmin CAS in `transition` guards all mutations.
 
 use ryuki_engine::firewall_rules::{FirewallRuleSet, RuleSetStatus};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 pub const COLUMNS: &str =
     "id, status, site, rule_set_json::text AS rule_set_json, xmin::text AS row_version";
@@ -55,7 +55,10 @@ fn decode_status(s: &str) -> Result<RuleSetStatus, String> {
         .map_err(|e| format!("unknown firewall_rule_sets status '{s}': {e}"))
 }
 
-pub async fn insert(pool: &PgPool, rs: &FirewallRuleSet) -> Result<(), sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    rs: &FirewallRuleSet,
+) -> Result<(), sqlx::Error> {
     let rule_set_json = serde_json::to_value(rs).map_err(|e| {
         sqlx::Error::Decode(format!("firewall_rule_sets: serialize failed: {e}").into())
     })?;
@@ -68,7 +71,7 @@ pub async fn insert(pool: &PgPool, rs: &FirewallRuleSet) -> Result<(), sqlx::Err
     .bind(&rs.site)
     .bind(status_str(&rs.status))
     .bind(rule_set_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -114,8 +117,9 @@ pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<FirewallRuleS
 
 /// Atomically update a rule set IFF the row has NOT been written since it was
 /// read (xmin CAS). Returns `Ok(false)` on CAS mismatch — handler maps this to 409.
+/// The caller owns the transaction; pass `&mut *tx` where `tx: Transaction<'_, Postgres>`.
 pub async fn transition(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     id: &str,
     expected_version: &str,
     updated: &FirewallRuleSet,
@@ -123,7 +127,6 @@ pub async fn transition(
     let rule_set_json = serde_json::to_value(updated).map_err(|e| {
         sqlx::Error::Decode(format!("firewall_rule_sets: serialize failed: {e}").into())
     })?;
-    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE firewall_rule_sets SET \
          status = $2, \
@@ -135,14 +138,9 @@ pub async fn transition(
     .bind(status_str(&updated.status))
     .bind(rule_set_json)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(conn)
     .await?;
-    if res.rows_affected() == 0 {
-        tx.rollback().await?;
-        return Ok(false);
-    }
-    tx.commit().await?;
-    Ok(true)
+    Ok(res.rows_affected() > 0)
 }
 
 // To run ONLY these DB tests:
@@ -234,7 +232,8 @@ mod firewall_rule_sets_db_tests {
 
         let (fetched, version) = get(&pool, &id).await.expect("get").expect("row");
         let updated = apply_rule_set_pure(&fetched).expect("apply");
-        let cas_ok = transition(&pool, &id, &version, &updated)
+        let mut conn = pool.acquire().await.expect("acquire");
+        let cas_ok = transition(&mut conn, &id, &version, &updated)
             .await
             .expect("transition");
         assert!(cas_ok, "CAS should succeed");
@@ -264,7 +263,8 @@ mod firewall_rule_sets_db_tests {
 
         let (fetched, version) = get(&pool, &id).await.expect("get").expect("row");
         let updated = revoke_rule_set_pure(&fetched).expect("revoke");
-        let cas_ok = transition(&pool, &id, &version, &updated)
+        let mut conn = pool.acquire().await.expect("acquire");
+        let cas_ok = transition(&mut conn, &id, &version, &updated)
             .await
             .expect("transition");
         assert!(cas_ok);
@@ -294,7 +294,8 @@ mod firewall_rule_sets_db_tests {
         insert(&pool, &rs).await.expect("insert");
         let (fetched, version) = get(&pool, &id).await.expect("get").expect("row");
         let revoked = revoke_rule_set_pure(&fetched).expect("revoke");
-        transition(&pool, &id, &version, &revoked)
+        let mut conn = pool.acquire().await.expect("acquire");
+        transition(&mut conn, &id, &version, &revoked)
             .await
             .expect("transition to revoked");
 
@@ -340,13 +341,15 @@ mod firewall_rule_sets_db_tests {
         let updated = apply_rule_set_pure(&fetched).expect("apply");
 
         // Use a wrong version
-        let cas_ok = transition(&pool, &id, "0", &updated)
+        let mut conn1 = pool.acquire().await.expect("acquire conn1");
+        let cas_ok = transition(&mut conn1, &id, "0", &updated)
             .await
             .expect("transition");
         assert!(!cas_ok, "wrong version must return false (CAS miss)");
 
         // Original version should still work
-        let cas_ok2 = transition(&pool, &id, &version, &updated)
+        let mut conn2 = pool.acquire().await.expect("acquire conn2");
+        let cas_ok2 = transition(&mut conn2, &id, &version, &updated)
             .await
             .expect("transition2");
         assert!(cas_ok2);

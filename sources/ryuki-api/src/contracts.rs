@@ -8833,6 +8833,7 @@ async fn legal_hold_validate(
 }
 
 async fn legal_hold_extend(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(req): Json<LegalHoldExtendRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -8854,6 +8855,7 @@ async fn legal_hold_extend(
         }]))
         .unwrap_or_else(|_| "[]".into());
 
+        let mut tx = pool.begin().await.map_err(db_error)?;
         // Append new audit entry to existing trail via jsonb concatenation.
         let row: Option<LegalHoldRow> = sqlx::query_as(&format!(
             "UPDATE legal_holds \
@@ -8866,16 +8868,32 @@ async fn legal_hold_extend(
         .bind(&id)
         .bind(&req.new_expiry)
         .bind(audit_entry)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
-        return match row {
-            Some(updated) => Ok(Json(updated.to_json())),
-            None => Err((
-                StatusCode::CONFLICT,
-                Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
-            )),
+        let updated = match row {
+            Some(r) => r,
+            None => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
+                ));
+            }
         };
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "legal-hold-extend",
+                None,
+                "extended",
+                json!({ "hold_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        return Ok(Json(updated.to_json()));
     }
     // No-DB fallback: engine validates status=Active and parses new_expiry.
     match legal_hold::extend_hold(&id, &req.new_expiry) {
@@ -8885,8 +8903,8 @@ async fn legal_hold_extend(
 }
 
 async fn legal_hold_release(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
-    Extension(session): Extension<AuthSession>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // released_by = authenticated caller (from request extensions), never a client
     // body field — the release audit must name the real principal.
@@ -8902,6 +8920,7 @@ async fn legal_hold_release(
         }]))
         .unwrap_or_else(|_| "[]".into());
 
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: Option<LegalHoldRow> = sqlx::query_as(&format!(
             "UPDATE legal_holds \
              SET status = 'Released', released_by = $2, released_date = $3::timestamptz, \
@@ -8913,16 +8932,32 @@ async fn legal_hold_release(
         .bind(&session.user_id)
         .bind(&now)
         .bind(audit_entry)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
-        return match row {
-            Some(updated) => Ok(Json(updated.to_json())),
-            None => Err((
-                StatusCode::CONFLICT,
-                Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
-            )),
+        let updated = match row {
+            Some(r) => r,
+            None => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
+                ));
+            }
         };
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "legal-hold-release",
+                None,
+                "released",
+                json!({ "hold_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        return Ok(Json(updated.to_json()));
     }
     // No-DB fallback: engine validates status=Active and records audit entry.
     match legal_hold::release_hold(&id, &session.user_id) {
@@ -25965,6 +26000,7 @@ async fn firewall_rule_set_create(
     );
     let rs = firewall_rules::build_rule_set(&id, &b.name, b.rule_ids, &b.site, &b.target)
         .map_err(|e| status_400(&e))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
     // Validate all referenced rule IDs exist for this site in the DB (mirrors the
     // in-memory check in the engine's stateful create_rule_set).
     for rule_id in &rs.rules {
@@ -25973,7 +26009,7 @@ async fn firewall_rule_set_create(
         )
         .bind(rule_id)
         .bind(&rs.site)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
         if !exists {
@@ -25983,9 +26019,22 @@ async fn firewall_rule_set_create(
             )));
         }
     }
-    crate::repos::firewall_rule_sets::insert(pool, &rs)
+    crate::repos::firewall_rule_sets::insert(&mut *tx, &rs)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "firewall-rule-set-create",
+            None,
+            "created",
+            json!({ "rule_set_id": rs.id, "site": rs.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
@@ -26053,7 +26102,8 @@ async fn firewall_rule_set_apply(
     // on the loaded row; the xmin CAS below fails the write if the row changed.
     guard_body_site_scope(&session, &rs.site)?;
     let updated = firewall_rules::apply_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
-    let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let cas_ok = crate::repos::firewall_rule_sets::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !cas_ok {
@@ -26061,6 +26111,19 @@ async fn firewall_rule_set_apply(
             "rule set was modified concurrently; reload and retry",
         ));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "firewall-rule-set-apply",
+            None,
+            "applied",
+            json!({ "rule_set_id": &id, "site": rs.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "rule_set": serde_json::to_value(&updated).unwrap_or_default(),
@@ -26079,7 +26142,8 @@ async fn firewall_rule_set_revoke(
     // #2: a scoped principal may only revoke a rule set in its own site.
     guard_body_site_scope(&session, &rs.site)?;
     let updated = firewall_rules::revoke_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
-    let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let cas_ok = crate::repos::firewall_rule_sets::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !cas_ok {
@@ -26087,6 +26151,19 @@ async fn firewall_rule_set_revoke(
             "rule set was modified concurrently; reload and retry",
         ));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "firewall-rule-set-revoke",
+            None,
+            "revoked",
+            json!({ "rule_set_id": &id, "site": rs.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "rule_set": serde_json::to_value(&updated).unwrap_or_default(),
@@ -42640,6 +42717,7 @@ mod legal_hold_db_tests {
         // Extend to a known far-future date.
         let new_expiry = "2099-12-31T00:00:00Z";
         let Ok(Json(extended)) = legal_hold_extend(
+            AuthExtractor(approver_session("test-user")),
             Path(id.clone()),
             Json(LegalHoldExtendRequest {
                 new_expiry: new_expiry.into(),
@@ -42657,6 +42735,23 @@ mod legal_hold_db_tests {
                 .starts_with("2099"),
             "expiry_date must reflect 2099, got: {}",
             extended["expiry_date"]
+        );
+
+        // #7 audit: extend wrote a durable audit_log row (in ADDITION to the
+        // JSONB audit_trail column on the legal_holds row), attributing the actor.
+        let (audit_actor, _): (String, String) = sqlx::query_as(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'legal-hold-extend' AND detail->>'hold_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .expect("query extend audit")
+        .expect("a legal-hold-extend audit_log row must exist");
+        assert_eq!(
+            audit_actor, "test-user",
+            "audit actor must be the session principal"
         );
 
         // Active query must include the hold with the new expiry.
@@ -42698,8 +42793,8 @@ mod legal_hold_db_tests {
         let id = placed["id"].as_str().expect("id").to_string();
 
         let Ok(Json(released)) = legal_hold_release(
+            AuthExtractor(approver_session("test-releaser")),
             Path(id.clone()),
-            Extension(approver_session("test-releaser")),
         )
         .await
         else {
@@ -42788,16 +42883,22 @@ mod legal_hold_db_tests {
         let id = placed["id"].as_str().expect("id").to_string();
 
         // First release: OK.
-        let Ok(_) =
-            legal_hold_release(Path(id.clone()), Extension(approver_session("releaser-1"))).await
+        let Ok(_) = legal_hold_release(
+            AuthExtractor(approver_session("releaser-1")),
+            Path(id.clone()),
+        )
+        .await
         else {
             cleanup_hold(pool, &id).await;
             panic!("first release failed");
         };
 
         // Second release: must conflict.
-        let Err((status, _)) =
-            legal_hold_release(Path(id.clone()), Extension(approver_session("releaser-2"))).await
+        let Err((status, _)) = legal_hold_release(
+            AuthExtractor(approver_session("releaser-2")),
+            Path(id.clone()),
+        )
+        .await
         else {
             cleanup_hold(pool, &id).await;
             panic!("expected Err on double-release");
@@ -42836,6 +42937,7 @@ mod legal_hold_db_tests {
 
         // Extend via handler.
         let Ok(Json(extended)) = legal_hold_extend(
+            AuthExtractor(approver_session("direct-test-user")),
             Path(id.clone()),
             Json(LegalHoldExtendRequest {
                 new_expiry: "2098-01-01T00:00:00Z".into(),
@@ -42856,8 +42958,8 @@ mod legal_hold_db_tests {
 
         // Release via handler.
         let Ok(Json(released)) = legal_hold_release(
+            AuthExtractor(approver_session("direct-test-releaser")),
             Path(id.clone()),
-            Extension(approver_session("direct-test-releaser")),
         )
         .await
         else {
