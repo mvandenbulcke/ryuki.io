@@ -7366,7 +7366,10 @@ async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuer
     }
 }
 
-async fn maintenance_calendar_cancel(Path(id): Path<String>) -> ApiResult {
+async fn maintenance_calendar_cancel(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // Try-parse the path param as a UUID; fall through to the engine on parse failure.
         if let Ok(uid) = Uuid::parse_str(&id) {
@@ -7393,14 +7396,28 @@ async fn maintenance_calendar_cancel(Path(id): Path<String>) -> ApiResult {
                 _ => {}
             }
 
+            let mut tx = pool.begin().await.map_err(db_error)?;
             let updated: MaintWindowRow = sqlx::query_as(&format!(
                 "UPDATE maintenance_windows SET status = 'Cancelled' WHERE id = $1 \
                  RETURNING {MW_COLUMNS}"
             ))
             .bind(uid)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(db_error)?;
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "maintenance-window-cancel",
+                    Some("scheduled"),
+                    "cancelled",
+                    json!({ "window_id": &id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
 
             return Ok(Json(updated.to_value_with_source("database")));
         }
@@ -9320,6 +9337,7 @@ async fn noise_suggest(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
 }
 
 async fn noise_suppress(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<NoiseSuppressRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -9329,9 +9347,10 @@ async fn noise_suppress(
         let suppress_until = now
             .checked_add_signed(chrono::Duration::minutes(body.duration_minutes as i64))
             .unwrap_or(now);
-        // Atomic compare-and-set: guard + mutation in a single statement.
-        // Returns the updated row only when the trigger was NOT already Suppressed,
-        // matching the engine's mutex-held find+guard+mutate sequence.
+        // Atomic compare-and-set inside a tx so the audit row is written
+        // atomically with the suppression (#7). The CAS UPDATE still guards
+        // against double-apply; the tx is rolled back (no audit) on 404/409.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
             "UPDATE noisy_triggers \
              SET status = 'Suppressed', suppress_until = $1, suppress_reason = $2, \
@@ -9343,15 +9362,30 @@ async fn noise_suppress(
         .bind(&body.reason)
         .bind(now)
         .bind(trigger_uuid)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
         if let Some(r) = row {
-            // Row returned → successful suppression.
+            // Row returned → successful suppression; audit + commit atomically.
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "noise-suppress",
+                    None,
+                    "suppressed",
+                    json!({ "trigger_id": &id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
             return Ok(Json(noise_row_to_json(&r)));
         }
-        // 0 rows returned — either the trigger doesn't exist, or it's already Suppressed.
-        // One follow-up SELECT to distinguish the two cases.
+        // 0 rows returned — either the trigger doesn't exist, or it's already
+        // Suppressed. Roll back (no audit row written) and disambiguate via a
+        // read on the pool.
+        drop(tx);
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM noisy_triggers WHERE id = $1")
                 .bind(trigger_uuid)
@@ -9380,39 +9414,50 @@ async fn noise_suppress(
 }
 
 async fn noise_resolve(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<NoiseResolveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let trigger_uuid = parse_noise_id(&id)?;
         // Engine has NO prior-status guard for resolve — unconditional UPDATE
-        // mutating exactly: status, resolution, updated_at
+        // mutating exactly: status, resolution, updated_at. Wrapped in a tx
+        // so the audit row is written atomically; a 404 rolls back with no audit.
         let now = chrono::Utc::now();
-        let result = sqlx::query(
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let resolved: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
             "UPDATE noisy_triggers \
              SET status = 'Resolved', resolution = $1, updated_at = $2 \
-             WHERE id = $3",
-        )
+             WHERE id = $3 \
+             RETURNING {NOISE_COLUMNS}"
+        ))
         .bind(&body.resolution)
         .bind(now)
         .bind(trigger_uuid)
-        .execute(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
-        if result.rows_affected() == 0 {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Trigger not found: {}", id)})),
-            ));
+        if let Some(row) = resolved {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "noise-resolve",
+                    None,
+                    "resolved",
+                    json!({ "trigger_id": &id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            return Ok(Json(noise_row_to_json(&row)));
         }
-        let row: NoisyTriggerRow = sqlx::query_as(&format!(
-            "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1"
-        ))
-        .bind(trigger_uuid)
-        .fetch_one(pool)
-        .await
-        .map_err(db_error)?;
-        return Ok(Json(noise_row_to_json(&row)));
+        // 0 rows → trigger not found; roll back (no audit row written).
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Trigger not found: {}", id)})),
+        ));
     }
     match noise_remediation::resolve_noise(&id, &body.resolution) {
         Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
@@ -26884,6 +26929,7 @@ async fn secrets_list(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn secrets_register(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<SecretsRegisterRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -26896,6 +26942,10 @@ async fn secrets_register(
             &b.site,
         )
         .map_err(|e| status_400(&e))?;
+        // Persist + audit ATOMICALLY: a secret never lands without its
+        // durable audit_log row (#7). Detail carries references only —
+        // NEVER vault_path or any credential value.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(&format!(
             "INSERT INTO managed_secrets ({MANAGED_SECRET_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
@@ -26910,9 +26960,26 @@ async fn secrets_register(
         .bind(serde_enum_str(&secret.status))
         .bind(&secret.owner)
         .bind(&secret.site)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "secret-register",
+                None,
+                "registered",
+                json!({
+                    "secret_id": &secret.id,
+                    "name": secret.name.trim(),
+                    "site": &secret.site,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "dry_run": true,
@@ -26982,6 +27049,7 @@ struct SecretsUpdateRequest {
 /// accepts or returns a credential value. Changing the interval reschedules
 /// next_rotation_due from the existing last_rotated. 404 on a missing secret.
 async fn secrets_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<SecretsUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -27028,6 +27096,9 @@ async fn secrets_update(
     }
     let next_due = secrets_rotation::next_rotation_due_from(&existing.last_rotated, interval);
 
+    // Wrap mutation + audit in a tx so they land together (#7).
+    // Detail carries references only — NEVER vault_path or credential values.
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(
         "UPDATE managed_secrets SET name = $1, owner = $2, site = $3, \
          rotation_interval_days = $4, next_rotation_due = $5 WHERE id = $6",
@@ -27038,9 +27109,25 @@ async fn secrets_update(
     .bind(interval as i64)
     .bind(&next_due)
     .bind(&id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "secret-update",
+            None,
+            "updated",
+            json!({
+                "secret_id": &id,
+                "site": &site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     let updated: ManagedSecretRow = sqlx::query_as(&format!(
         "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
@@ -27061,26 +27148,45 @@ async fn secrets_update(
 /// re-retiring an already-retired secret is a no-op success. 404 if missing; 503
 /// with no DB.
 async fn secrets_deregister(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // DB form is the serde (kebab-case) string, like every other status write.
     let retired = serde_enum_str(&secrets_rotation::SecretStatus::Retired);
+    // Wrap mutation + audit in a tx (#7). 404 rolls back with no audit row.
+    // Detail carries references only — NEVER vault_path or credential values.
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
         "UPDATE managed_secrets SET status = $1 WHERE id = $2 \
          RETURNING {MANAGED_SECRET_COLUMNS}"
     ))
     .bind(&retired)
     .bind(&id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?;
     match row {
-        Some(secret) => Ok(Json(json!({
-            "source": "database",
-            "retired": true,
-            "secret": secret.to_value(),
-        }))),
+        Some(secret) => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "secret-deregister",
+                    Some("active"),
+                    "retired",
+                    json!({ "secret_id": &id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({
+                "source": "database",
+                "retired": true,
+                "secret": secret.to_value(),
+            })))
+        }
         None => Err(secrets_not_found(format!("Secret '{id}' not found"))),
     }
 }
@@ -35355,7 +35461,11 @@ mod maint_calendar_db_tests {
             return;
         };
         let random_id = Uuid::new_v4().to_string();
-        let result = maintenance_calendar_cancel(Path(random_id.clone())).await;
+        let result = maintenance_calendar_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(random_id.clone()),
+        )
+        .await;
         let Err((status, Json(body))) = result else {
             panic!("expected Err for non-existent id");
         };
@@ -35381,7 +35491,11 @@ mod maint_calendar_db_tests {
         )
         .await;
 
-        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        let result = maintenance_calendar_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.to_string()),
+        )
+        .await;
         cleanup_window(pool, id).await;
 
         let Err((status, Json(body))) = result else {
@@ -35412,7 +35526,11 @@ mod maint_calendar_db_tests {
         )
         .await;
 
-        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        let result = maintenance_calendar_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.to_string()),
+        )
+        .await;
         cleanup_window(pool, id).await;
 
         let Err((status, Json(body))) = result else {
@@ -35447,7 +35565,11 @@ mod maint_calendar_db_tests {
         )
         .await;
 
-        let result = maintenance_calendar_cancel(Path(id.to_string())).await;
+        let result = maintenance_calendar_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.to_string()),
+        )
+        .await;
         cleanup_window(pool, id).await;
 
         let Ok(Json(body)) = result else {
@@ -37413,7 +37535,12 @@ mod secrets_rotation_db_tests {
         assert!(has(&due_before, id), "overdue secret is due before retire");
 
         // Soft retire.
-        let Ok(Json(out)) = secrets_deregister(Path(id.into())).await else {
+        let Ok(Json(out)) = secrets_deregister(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await
+        else {
             cleanup_secret(pool, id).await;
             panic!("deregister failed");
         };
@@ -37492,7 +37619,12 @@ mod secrets_rotation_db_tests {
         );
 
         // Re-deregister is idempotent.
-        let Ok(Json(again)) = secrets_deregister(Path(id.into())).await else {
+        let Ok(Json(again)) = secrets_deregister(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await
+        else {
             panic!("idempotent re-deregister failed");
         };
         assert_eq!(again["retired"], serde_json::json!(true));
@@ -37501,6 +37633,7 @@ mod secrets_rotation_db_tests {
         // PUT metadata-update on a retired secret is allowed (record corrections)
         // and must NOT un-retire it.
         let _ = secrets_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.into()),
             Json(SecretsUpdateRequest {
                 name: Some("corrected-name".into()),
@@ -37518,9 +37651,12 @@ mod secrets_rotation_db_tests {
         );
 
         // Deregistering a missing secret is a 404.
-        let err = secrets_deregister(Path("sr-not-a-real-secret-xyz".into()))
-            .await
-            .expect_err("deregistering a missing secret must 404");
+        let err = secrets_deregister(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("sr-not-a-real-secret-xyz".into()),
+        )
+        .await
+        .expect_err("deregistering a missing secret must 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         cleanup_secret(pool, id).await;
@@ -37538,6 +37674,7 @@ mod secrets_rotation_db_tests {
         seed_secret(pool, id, "DEFRA", "2099-01-01T00:00:00+00:00").await;
 
         let _ = secrets_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.into()),
             Json(SecretsUpdateRequest {
                 name: Some("renamed-secret".into()),
@@ -37570,6 +37707,7 @@ mod secrets_rotation_db_tests {
         // Blank owner → 400; missing secret → 404.
         assert!(matches!(
             secrets_update(
+                AuthExtractor(AuthSession::static_dry_run()),
                 Path(id.into()),
                 Json(SecretsUpdateRequest {
                     name: None,
@@ -37583,6 +37721,7 @@ mod secrets_rotation_db_tests {
         ));
         assert!(matches!(
             secrets_update(
+                AuthExtractor(AuthSession::static_dry_run()),
                 Path("sr-does-not-exist".into()),
                 Json(SecretsUpdateRequest {
                     name: Some("x".into()),
@@ -37903,14 +38042,17 @@ mod secrets_rotation_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let result = secrets_register(Json(SecretsRegisterRequest {
-            name: "dbtest-registered-secret".to_string(),
-            secret_type: "token".to_string(),
-            vault_path: "kv/dbtest/registered".to_string(),
-            interval_days: 30,
-            owner: "test.owner".to_string(),
-            site: "DBTEST-REG".to_string(),
-        }))
+        let result = secrets_register(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SecretsRegisterRequest {
+                name: "dbtest-registered-secret".to_string(),
+                secret_type: "token".to_string(),
+                vault_path: "kv/dbtest/registered".to_string(),
+                interval_days: 30,
+                owner: "test.owner".to_string(),
+                site: "DBTEST-REG".to_string(),
+            }),
+        )
         .await;
 
         let Ok(Json(body)) = &result else {
@@ -37918,6 +38060,28 @@ mod secrets_rotation_db_tests {
         };
         assert_eq!(body["source"], "database");
         let new_id = body["secret"]["id"].as_str().expect("new secret id");
+
+        // #7 audit: register wrote a durable audit row naming the secret but
+        // NEVER leaking the vault path / secret material.
+        let (audit_actor, audit_detail) = sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'secret-register' AND detail->>'secret_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(new_id)
+        .fetch_optional(pool)
+        .await
+        .expect("query register audit")
+        .expect("a secret-register audit row must exist");
+        assert_eq!(audit_actor, "static-user", "audit actor must be the caller");
+        assert!(
+            audit_detail.contains("dbtest-registered-secret"),
+            "detail must name the secret"
+        );
+        assert!(
+            !audit_detail.contains("kv/dbtest/registered"),
+            "detail must NEVER leak the vault_path"
+        );
 
         // It must be readable straight back from the DB.
         let readback = secrets_get(Path(new_id.to_string())).await;
@@ -39228,6 +39392,7 @@ mod noise_remediation_db_tests {
         .expect("reset trigger to Active");
 
         let result = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-1000-1000-1000-000000000001".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 60,
@@ -39282,6 +39447,7 @@ mod noise_remediation_db_tests {
         .expect("force trigger to Suppressed");
 
         let result = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-1000-1000-1000-000000000002".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 30,
@@ -39320,6 +39486,7 @@ mod noise_remediation_db_tests {
         .expect("reset trigger to Active");
 
         let result = noise_resolve(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-1000-1000-1000-000000000003".into()),
             Json(NoiseResolveRequest {
                 resolution: "Resolved via DB test — log rotation expanded".into(),
@@ -39364,6 +39531,7 @@ mod noise_remediation_db_tests {
         };
 
         let result = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("not-a-uuid".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 60,
@@ -39387,6 +39555,7 @@ mod noise_remediation_db_tests {
         };
 
         let result = noise_resolve(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("bad-uuid".into()),
             Json(NoiseResolveRequest {
                 resolution: "test".into(),
@@ -39411,6 +39580,7 @@ mod noise_remediation_db_tests {
         };
 
         let result = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-ffff-ffff-ffff-000000000099".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 60,
@@ -39447,6 +39617,7 @@ mod noise_remediation_db_tests {
 
         // First suppress → must succeed (200).
         let first = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-1000-1000-1000-000000000005".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 30,
@@ -39458,6 +39629,7 @@ mod noise_remediation_db_tests {
 
         // Second suppress → must fail (400 already suppressed), not silently overwrite.
         let second = noise_suppress(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-1000-1000-1000-000000000005".into()),
             Json(NoiseSuppressRequest {
                 duration_minutes: 120,
@@ -39598,6 +39770,7 @@ mod noise_remediation_db_tests {
         };
 
         let result = noise_resolve(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("e0000100-ffff-ffff-ffff-000000000099".into()),
             Json(NoiseResolveRequest {
                 resolution: "ghost".into(),
