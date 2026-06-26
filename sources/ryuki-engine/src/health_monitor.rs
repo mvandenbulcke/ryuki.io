@@ -69,7 +69,19 @@ pub fn run_all_checks() -> PlatformHealth {
 
     let components: Vec<String> = checks.iter().map(|c| c.component.clone()).collect();
 
-    let overall_status = if checks.iter().all(|c| c.status == HealthStatus::Healthy) {
+    PlatformHealth {
+        overall_status: aggregate_status(&checks),
+        components,
+        source: aggregate_source(&checks),
+        checks,
+        timestamp: Utc::now().to_rfc3339(),
+    }
+}
+
+/// Aggregate per-check statuses into one verdict: healthy only when ALL are
+/// healthy; any unhealthy wins; otherwise any degraded; else unknown.
+fn aggregate_status(checks: &[HealthCheck]) -> HealthStatus {
+    if checks.iter().all(|c| c.status == HealthStatus::Healthy) {
         HealthStatus::Healthy
     } else if checks.iter().any(|c| c.status == HealthStatus::Unhealthy) {
         HealthStatus::Unhealthy
@@ -77,9 +89,14 @@ pub fn run_all_checks() -> PlatformHealth {
         HealthStatus::Degraded
     } else {
         HealthStatus::Unknown
-    };
+    }
+}
 
-    let overall_source = if checks
+/// Aggregate per-check provenance: the board counts as `DependencyBacked` as
+/// soon as ANY check is a real probe, so a consumer can tell a board that
+/// contains live evidence apart from a fully simulated one.
+fn aggregate_source(checks: &[HealthCheck]) -> HealthSource {
+    if checks
         .iter()
         .any(|c| c.source == HealthSource::DependencyBacked)
     {
@@ -88,15 +105,52 @@ pub fn run_all_checks() -> PlatformHealth {
         HealthSource::Simulated
     } else {
         HealthSource::Unavailable
-    };
-
-    PlatformHealth {
-        overall_status,
-        components,
-        checks,
-        timestamp: Utc::now().to_rfc3339(),
-        source: overall_source,
     }
+}
+
+/// Build a database health check from a REAL connectivity probe result.
+///
+/// Unlike [`check_database_health`] — a dry-run placeholder that always reports
+/// healthy — this reflects an actual dependency probe: `probe_ok` is true only
+/// when the caller confirmed the database answered a liveness query. The source
+/// is [`HealthSource::DependencyBacked`] so consumers can tell it apart from the
+/// simulated checks, and a failed probe reports [`HealthStatus::Unhealthy`] —
+/// never silently healthy.
+pub fn database_health_from_probe(probe_ok: bool) -> HealthCheck {
+    HealthCheck {
+        name: "db-connection".into(),
+        component: "platform-db".into(),
+        status: if probe_ok {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Unhealthy
+        },
+        source: HealthSource::DependencyBacked,
+        last_check: Utc::now().to_rfc3339(),
+        message: if probe_ok {
+            "Database connectivity probe succeeded".into()
+        } else {
+            "Database connectivity probe FAILED - database is unreachable".into()
+        },
+    }
+}
+
+/// Replace the check whose component matches `replacement.component` with
+/// `replacement`, then recompute the aggregate status and source. Used by the
+/// API layer to fold a REAL dependency probe (e.g. live database connectivity)
+/// into the otherwise-simulated board, so both the aggregate verdict and the
+/// per-component gauge reflect reality for dependencies we can actually probe.
+/// No-op for the component lookup if no check matches (aggregates still recomputed).
+pub fn override_check(health: &mut PlatformHealth, replacement: HealthCheck) {
+    if let Some(slot) = health
+        .checks
+        .iter_mut()
+        .find(|c| c.component == replacement.component)
+    {
+        *slot = replacement;
+    }
+    health.overall_status = aggregate_status(&health.checks);
+    health.source = aggregate_source(&health.checks);
 }
 
 pub fn check_api_health() -> HealthCheck {
@@ -185,7 +239,17 @@ pub fn metrics_text() -> String {
 }
 
 pub fn metrics_text_with_api_requests(total_api_requests: u64) -> String {
-    let health = run_all_checks();
+    metrics_text_from_health(&run_all_checks(), total_api_requests)
+}
+
+/// Render Prometheus exposition text for a SPECIFIC platform-health board.
+///
+/// Callers that hold a real dependency probe (e.g. live database connectivity)
+/// pass a board built via [`override_check`] so the `ryuki_platform_health`
+/// gauge reflects reality instead of the simulated placeholder. Each series
+/// carries a `source` label (`simulated` vs `dependency-backed`) so an alert can
+/// scope to dependency-backed signals and never be lulled by a simulated `1`.
+pub fn metrics_text_from_health(health: &PlatformHealth, total_api_requests: u64) -> String {
     let mut out = String::new();
 
     out.push_str(
@@ -198,8 +262,8 @@ pub fn metrics_text_with_api_requests(total_api_requests: u64) -> String {
             _ => 0,
         };
         out.push_str(&format!(
-            "ryuki_platform_health{{component=\"{}\"}} {}\n",
-            check.component, value
+            "ryuki_platform_health{{component=\"{}\",source=\"{}\"}} {}\n",
+            check.component, check.source, value
         ));
     }
 
@@ -389,6 +453,75 @@ mod tests {
         assert!(metrics.contains("ryuki_platform_info"));
         assert!(metrics.contains("version=\"0.1.0\""));
         assert!(metrics.contains("component=\"platform-api\""));
+    }
+
+    #[test]
+    fn database_health_from_probe_reflects_real_state() {
+        // A successful probe is dependency-backed and healthy.
+        let ok = database_health_from_probe(true);
+        assert_eq!(ok.status, HealthStatus::Healthy);
+        assert_eq!(ok.source, HealthSource::DependencyBacked);
+        assert_eq!(ok.component, "platform-db");
+        assert!(!ok.message.contains("DRY-RUN"));
+
+        // A failed probe is UNHEALTHY — never silently healthy. This is the
+        // anti-false-healthy invariant the whole change exists to guarantee.
+        let down = database_health_from_probe(false);
+        assert_eq!(down.status, HealthStatus::Unhealthy);
+        assert_eq!(down.source, HealthSource::DependencyBacked);
+    }
+
+    #[test]
+    fn override_check_folds_real_probe_into_board() {
+        let mut health = run_all_checks();
+        // Baseline: simulated board is all-healthy + simulated.
+        assert_eq!(health.overall_status, HealthStatus::Healthy);
+        assert_eq!(health.source, HealthSource::Simulated);
+
+        // Fold in a FAILED real database probe.
+        override_check(&mut health, database_health_from_probe(false));
+
+        // The db component is now the real (unhealthy, dependency-backed) check.
+        let db = health
+            .checks
+            .iter()
+            .find(|c| c.component == "platform-db")
+            .expect("platform-db check present");
+        assert_eq!(db.status, HealthStatus::Unhealthy);
+        assert_eq!(db.source, HealthSource::DependencyBacked);
+
+        // Aggregates recomputed: any unhealthy => overall unhealthy; any real
+        // probe => board is dependency-backed.
+        assert_eq!(health.overall_status, HealthStatus::Unhealthy);
+        assert_eq!(health.source, HealthSource::DependencyBacked);
+        // The check count is unchanged — override replaces, never appends.
+        assert_eq!(health.checks.len(), 6);
+    }
+
+    #[test]
+    fn metrics_gauge_reflects_real_db_outage_with_source_label() {
+        let mut health = run_all_checks();
+        override_check(&mut health, database_health_from_probe(false));
+        let metrics = metrics_text_from_health(&health, 7);
+
+        // The dangerous false-healthy signal is gone: the db gauge reads 0 when
+        // the real probe failed, and is tagged dependency-backed.
+        assert!(metrics.contains(
+            "ryuki_platform_health{component=\"platform-db\",source=\"dependency-backed\"} 0"
+        ));
+        // Simulated components still carry their honest source label.
+        assert!(
+            metrics.contains(
+                "ryuki_platform_health{component=\"platform-api\",source=\"simulated\"} 1"
+            )
+        );
+        // A healthy probe flips the same series to 1.
+        let mut healthy = run_all_checks();
+        override_check(&mut healthy, database_health_from_probe(true));
+        let metrics_ok = metrics_text_from_health(&healthy, 7);
+        assert!(metrics_ok.contains(
+            "ryuki_platform_health{component=\"platform-db\",source=\"dependency-backed\"} 1"
+        ));
     }
 
     #[test]

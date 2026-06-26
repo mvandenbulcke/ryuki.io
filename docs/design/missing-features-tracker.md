@@ -106,12 +106,14 @@ After the clean/additive items above were shipped, a 61-agent multi-lens swarm
 review surfaced **41 confirmed new gaps** (real + not-already-covered) — see
 [swarm-findings-2026-06-25.md](swarm-findings-2026-06-25.md). These are the
 refreshed work queue; the cleanest (High/Small/CI-validatable) are being worked
-first. Top: missing CHECK constraints on `requests` enum columns
-(request_type/status/criticality/stage), false-healthy `health_monitor`
-hardcoded-Healthy checks, dead `site_status`/`component_status` persistence.
+first. Top: dead `site_status`/`component_status` persistence, audit-trail gaps
+on security ops (#5/#7), `requests_list` pagination envelope (#9).
 
-**Shipped:** #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`), #8 agent
-approve — revoke deferred (`6d6fb5b`), #63 observability deploy (`0ce0ed3`).
+**Shipped:** #2 site/env-scoped RBAC (33-commit sweep), #3 SoD (`aa0e188`),
+#4 false-healthy health gauge — `ryuki_platform_health` db component is now a
+real `SELECT 1` probe with a `source` label (simulated vs dependency-backed),
+#5 audit hash chain (`6bcb231`), #8 agent approve — revoke deferred (`6d6fb5b`),
+#63 observability deploy (`0ce0ed3`).
 
 **#14 slice 1** (`fa1df10`): server-side filters (status/site/environment/
 request_type/created_by/q) + allowlisted sort/direction on GET /api/requests,

@@ -44,6 +44,38 @@ pub struct PoolMetrics {
     pub active: usize,
 }
 
+/// Build a platform-health board whose database component reflects a REAL
+/// connectivity probe when a pool is configured.
+///
+/// `health_monitor::run_all_checks()` is a simulated, always-healthy board: its
+/// gauge would report `platform-db = 1` even during a total database outage,
+/// silently defeating any alert wired to it. When a pool exists this probes it
+/// (`SELECT 1`) and folds the real verdict in, so the gauge and aggregate tell
+/// the truth. With no pool it returns the simulated board unchanged, so a
+/// deliberate dry-run deployment is not misreported as a database outage.
+/// Alerting-safe: a probe that errors reports the database `Unhealthy`.
+pub async fn live_platform_health() -> ryuki_engine::health_monitor::PlatformHealth {
+    use ryuki_engine::health_monitor;
+    let mut health = health_monitor::run_all_checks();
+    if let Some(pool) = get_db() {
+        // Bound the probe so a /metrics scrape can never hang on a saturated or
+        // wedged pool up to the 30s acquire timeout: a database that cannot
+        // answer SELECT 1 within a few seconds is itself unhealthy. Alerting-safe
+        // — a timeout, a query error, or any non-1 answer all map to Unhealthy,
+        // never silently healthy.
+        let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool);
+        let probe_ok = matches!(
+            tokio::time::timeout(Duration::from_secs(3), probe).await,
+            Ok(Ok(1))
+        );
+        health_monitor::override_check(
+            &mut health,
+            health_monitor::database_health_from_probe(probe_ok),
+        );
+    }
+    health
+}
+
 pub fn pool_metrics() -> PoolMetrics {
     match get_db() {
         Some(pool) => {
@@ -163,7 +195,11 @@ pub static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 
 #[cfg(test)]
 mod tests {
-    use super::{migration_status, set_migration_status_for_test, MigrationStatus};
+    use super::{
+        get_db, live_platform_health, migration_status, set_migration_status_for_test,
+        MigrationStatus,
+    };
+    use ryuki_engine::health_monitor::{HealthSource, HealthStatus};
 
     #[test]
     fn migration_status_tracks_updates() {
@@ -175,5 +211,25 @@ mod tests {
 
         set_migration_status_for_test(MigrationStatus::Failed);
         assert_eq!(migration_status(), MigrationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn live_platform_health_leaves_db_simulated_without_a_pool() {
+        // No pool configured => a deliberate dry-run deployment. The board must
+        // NOT be flipped to a database outage: the db component stays the
+        // simulated placeholder, so we never page on an intentionally-absent DB.
+        // (Skips if some other test in this binary already initialized the pool.)
+        if get_db().is_some() {
+            eprintln!("SKIP: a database pool is configured in this test binary");
+            return;
+        }
+        let health = live_platform_health().await;
+        let db = health
+            .checks
+            .iter()
+            .find(|c| c.component == "platform-db")
+            .expect("platform-db check present");
+        assert_eq!(db.source, HealthSource::Simulated);
+        assert_eq!(db.status, HealthStatus::Healthy);
     }
 }

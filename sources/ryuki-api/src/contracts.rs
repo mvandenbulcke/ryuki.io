@@ -11208,12 +11208,12 @@ async fn aiops_contract() -> Json<Value> {
 }
 
 async fn platform_health() -> Json<Value> {
-    let health = ryuki_engine::health_monitor::run_all_checks();
+    let health = crate::database::live_platform_health().await;
     Json(serde_json::to_value(health).unwrap_or_default())
 }
 
 async fn platform_health_components() -> Json<Value> {
-    let health = ryuki_engine::health_monitor::run_all_checks();
+    let health = crate::database::live_platform_health().await;
     let component_map: Vec<serde_json::Value> = health
         .checks
         .iter()
@@ -22250,9 +22250,13 @@ async fn platform_health_check_adapter(
 }
 
 async fn platform_health_metrics_text() -> axum::response::Response {
+    // Dependency-backed: the db component of the `ryuki_platform_health` gauge
+    // reflects a real connectivity probe rather than the simulated placeholder.
+    let health = crate::database::live_platform_health().await;
+    let body = health_monitor::metrics_text_from_health(&health, 0);
     axum::response::Response::builder()
         .header("Content-Type", "text/plain; charset=utf-8")
-        .body(axum::body::Body::from(health_monitor::metrics_text()))
+        .body(axum::body::Body::from(body))
         .unwrap()
 }
 

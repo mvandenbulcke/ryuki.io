@@ -122,6 +122,23 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-engine/src/health_monitor.rs (lines 102-181) · **kind:** latent-bug · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** All check_*_health() functions return hardcoded HealthStatus::Healthy with source=Simulated, never dependency-backed. check_api_health(), check_portal_health(), check_validator_health(), check_kubernetes_health(), check_vault_health(), check_database_health() all hardcoded to 'Healthy'. This means /api/platform/health/all (handler: platform_health_all_checks at contracts.rs:21622) returns false-OK even when real dependencies are down. Monitoring systems treating this as a truth signal (instead of advisory-only) will miss real outages. The 'Simulated' source should trigger alerting, but many operators check status==Healthy first.
 - **verified:** The health check system in ryuki-engine/src/health_monitor.rs unconditionally returns HealthStatus::Healthy + HealthSource::Simulated for all seven component checks (API, portal, validator, Kubernetes, vault, database, adapters). Every function from check_api_health() through check_database_health() hardcodes these values with "DRY-RUN" message markers. The DependencyBacked enum variant exists (line 27) but is never produced by any check function. Tests explicitly assert the always-healthy stub behavior (test_all_checks_healthy_in_dry_run, lines 270-283). The missing-features-tracker.md marks 
+- **STATUS (2026-06-26) — COMPLETE:** The dangerous false-healthy signal was the
+  Prometheus `ryuki_platform_health{component="platform-db"}` gauge, hardcoded to
+  `1` even during a total DB outage — an alert wired to it could never fire.
+  Fixed: new pure engine helpers `database_health_from_probe(probe_ok)` (the
+  first real `DependencyBacked` check; `Unhealthy` when the probe fails),
+  `override_check()` (folds a real probe into the board + recomputes aggregates),
+  and `metrics_text_from_health()` (emits a per-series `source` label so a
+  scraper can scope alerts to `source="dependency-backed"`). API-side
+  `database::live_platform_health()` runs a real `SELECT 1` when a pool exists
+  and folds the verdict into `/metrics`, `/api/platform/health`,
+  `/health/components`, and `/api/platform/health/metrics`. No-pool (dry-run)
+  deployments stay simulated so they are not misreported as an outage; the
+  authoritative readiness endpoint `/api/platform/health/dependencies` already
+  reports no-pool as `down`. `/health/all` keeps its advisory marker. The five
+  components we cannot probe (api/portal/validator/k8s/vault) remain honestly
+  `source="simulated"`. Dual-reviewed (GPT-5 Codex + fresh-context agent), engine
+  + api tests green.
 
 ### 5. Security operations lack audit trail logging
 - **area:** ryuki-api/src/contracts.rs (lines 11752-11787, 11845-11878, 25691-25746) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True

@@ -2004,7 +2004,11 @@ async fn validation_run(
 
 async fn metrics() -> Response {
     let count = REQUEST_COUNTER.load(Ordering::Relaxed);
-    let mut body = ryuki_engine::health_monitor::metrics_text_with_api_requests(count);
+    // Dependency-backed health board: the `ryuki_platform_health` gauge reflects
+    // a REAL database probe (when a pool is configured) so it can read 0 during
+    // an outage instead of the simulated placeholder's permanent 1.
+    let health = crate::database::live_platform_health().await;
+    let mut body = ryuki_engine::health_monitor::metrics_text_from_health(&health, count);
 
     let tracker = duration_tracker();
     let durations = lock_or_recover(&tracker.durations);
