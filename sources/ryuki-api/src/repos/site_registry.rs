@@ -39,11 +39,15 @@ pub struct SiteEntryRow {
 ///
 /// Returns `Ok(true)` when the row was found and updated, `Ok(false)` when the
 /// unlocode is unknown (the handler maps this to 404).
-pub async fn set_active(pool: &PgPool, unlocode: &str, active: bool) -> Result<bool, sqlx::Error> {
+pub async fn set_active(
+    executor: impl sqlx::PgExecutor<'_>,
+    unlocode: &str,
+    active: bool,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE site_registry SET active = $1 WHERE unlocode = $2")
         .bind(active)
         .bind(unlocode)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }

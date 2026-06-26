@@ -131,7 +131,10 @@ pub fn status_str(s: &SnapshotStatus) -> &'static str {
 /// `created_at`/`updated_at` are not bound here — the DB column defaults (NOW())
 /// own them. We `RETURNING` the inserted row so the returned model carries the
 /// DB-authoritative timestamps (the response then matches a subsequent `get`).
-pub async fn insert(pool: &PgPool, r: &SnapshotRecord) -> Result<SnapshotRecord, sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    r: &SnapshotRecord,
+) -> Result<SnapshotRecord, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
@@ -155,7 +158,7 @@ pub async fn insert(pool: &PgPool, r: &SnapshotRecord) -> Result<SnapshotRecord,
     .bind(&r.backup_impact)
     .bind(&r.remediation_plan)
     .bind(&meta)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model()
@@ -202,7 +205,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<SnapshotRecord>, sqlx::Error> {
 /// `_audit_action` is accepted for signature parity with the patch_waves
 /// template but is intentionally unused — snapshots have no audit table yet.
 pub async fn transition(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     expected_status: &str,
     r: &SnapshotRecord,
     _audit_action: Option<&str>,
@@ -231,7 +234,7 @@ pub async fn transition(
     .bind(&r.remediation_plan)
     .bind(&meta)
     .bind(expected_status)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|row| row.into_model()).transpose()

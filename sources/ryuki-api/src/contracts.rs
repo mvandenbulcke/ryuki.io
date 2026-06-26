@@ -10278,7 +10278,10 @@ fn parse_source_types(raw: &[String]) -> Result<Vec<log_forwarder::LogSourceType
 /// Insert one `LogSource` row per requested source type and return the list of
 /// persisted records. The handler fans out: one row per `(hostname, source_type)`
 /// pair so each source has an independent status lifecycle.
-async fn logs_onboard(Json(body): Json<LogsOnboardRequest>) -> ApiResult {
+async fn logs_onboard(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<LogsOnboardRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let source_types = parse_source_types(&body.source_types).map_err(|e| status_400(&e))?;
@@ -10312,9 +10315,26 @@ async fn logs_onboard(Json(body): Json<LogsOnboardRequest>) -> ApiResult {
             retention_days: 90,
         })
         .collect();
-    let persisted = crate::repos::log_forwarders::onboard_sources(pool, &result.hostname, &sources)
-        .await
-        .map_err(db_error)?;
+
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted =
+        crate::repos::log_forwarders::onboard_sources(&mut tx, &result.hostname, &sources)
+            .await
+            .map_err(db_error)?;
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "logs-onboard",
+            None,
+            "onboarded",
+            json!({ "hostname": &result.hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(
         serde_json::to_value(serde_json::json!({
@@ -10438,20 +10458,39 @@ async fn logs_retention(Query(params): Query<LogsSiteQuery>) -> ApiResult {
 /// one atomic, advisory-locked step (`repos::log_forwarders::disable_all_for_hostname`)
 /// so it cannot race a concurrent onboard or be left partially applied. The
 /// response lists the sources that were actually transitioned.
-async fn logs_disable(Path(hostname): Path<String>) -> ApiResult {
+async fn logs_disable(
+    AuthExtractor(session): AuthExtractor,
+    Path(hostname): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     if hostname.is_empty() {
         return Err(status_400("hostname cannot be empty"));
     }
 
-    let disabled = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let disabled = crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
         .await
         .map_err(db_error)?;
 
     let disabled_sources: Vec<log_forwarder::LogSourceType> =
         disabled.into_iter().map(|s| s.source_type).collect();
     let count = disabled_sources.len();
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "logs-disable",
+            None,
+            "disabled",
+            json!({ "hostname": &hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
     let result = log_forwarder::DisableResult {
         success: true,
         hostname: hostname.clone(),
@@ -18752,6 +18791,7 @@ async fn chargeback_rate_set(
     let id = uuid::Uuid::new_v4().to_string();
     // Setting a rate ENABLES it — re-enable on conflict so a previously disabled
     // row is not silently excluded from reporting after an update.
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(
         "INSERT INTO cost_rates (id, request_type, unit_cost, currency) \
          VALUES ($1, $2, $3, $4) \
@@ -18763,9 +18803,24 @@ async fn chargeback_rate_set(
     .bind(request_type)
     .bind(b.unit_cost)
     .bind(&currency)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "chargeback-rate-set",
+            None,
+            "set",
+            json!({ "request_type": request_type, "unit_cost": b.unit_cost, "currency": &currency }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
     Ok(Json(json!({
         "request_type": request_type,
         "unit_cost": b.unit_cost,
@@ -19135,7 +19190,10 @@ async fn vm_day2_change_contract() -> Json<Value> {
 
 // ─── Snapshot Governance handlers ───
 
-async fn snapshot_plan(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
+async fn snapshot_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<SnapshotPlanRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let mut record = snapshot_engine::plan_snapshot(
@@ -19153,9 +19211,24 @@ async fn snapshot_plan(Json(body): Json<SnapshotPlanRequest>) -> ApiResult {
     // proper UUID so the repo can bind it correctly.
     record.id = Uuid::new_v4().to_string();
 
-    let persisted = crate::repos::snapshots::insert(pool, &record)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::snapshots::insert(&mut *tx, &record)
         .await
         .map_err(db_error)?;
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "snapshot-plan",
+            None,
+            "planned",
+            json!({ "snapshot_id": &persisted.id, "platform_ci_key": &persisted.platform_ci_key }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -19174,7 +19247,10 @@ async fn snapshot_validate(Json(body): Json<SnapshotActionRequest>) -> ApiResult
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn snapshot_review(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
+async fn snapshot_review(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<SnapshotActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let record = crate::repos::snapshots::get(pool, &body.snapshot_id)
@@ -19186,10 +19262,25 @@ async fn snapshot_review(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
 
     let reviewed = snapshot_engine::review_snapshot_policy(&record).map_err(|e| status_409(&e))?;
 
-    let persisted = crate::repos::snapshots::transition(pool, before, &reviewed, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::snapshots::transition(&mut *tx, before, &reviewed, None)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "snapshot-review",
+            Some(before),
+            "reviewed",
+            json!({ "snapshot_id": &body.snapshot_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -19227,7 +19318,10 @@ async fn snapshot_flag_stale() -> ApiResult {
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn snapshot_remediate(Json(body): Json<SnapshotActionRequest>) -> ApiResult {
+async fn snapshot_remediate(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<SnapshotActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let record = crate::repos::snapshots::get(pool, &body.snapshot_id)
@@ -19240,10 +19334,25 @@ async fn snapshot_remediate(Json(body): Json<SnapshotActionRequest>) -> ApiResul
     let remediated =
         snapshot_engine::plan_snapshot_remediation(&record).map_err(|e| status_409(&e))?;
 
-    let persisted = crate::repos::snapshots::transition(pool, before, &remediated, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::snapshots::transition(&mut *tx, before, &remediated, None)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "snapshot-remediate",
+            Some(before),
+            "remediated",
+            json!({ "snapshot_id": &body.snapshot_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -23692,6 +23801,7 @@ fn site_toggle_lock() -> &'static Mutex<()> {
 async fn site_registry_set_active(
     unlocode: &str,
     active: bool,
+    session: &AuthSession,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let engine_toggle = |code: &str| {
         if active {
@@ -23701,10 +23811,18 @@ async fn site_registry_set_active(
         }
     };
 
+    let to_status = if active { "activated" } else { "deactivated" };
+    let action = if active {
+        "site-registry-activate"
+    } else {
+        "site-registry-deactivate"
+    };
+
     if let Some(pool) = get_db() {
         // One critical section for DB write + static update (see SITE_TOGGLE_LOCK).
         let _guard = site_toggle_lock().lock().await;
-        let found = crate::repos::site_registry::set_active(pool, unlocode, active)
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let found = crate::repos::site_registry::set_active(&mut *tx, unlocode, active)
             .await
             .map_err(db_error)?;
         if !found {
@@ -23713,6 +23831,14 @@ async fn site_registry_set_active(
                 Json(json!({"error": format!("Site '{}' not found in reference list", unlocode)})),
             ));
         }
+        audit::record_audit_tx(
+            &mut tx,
+            session,
+            &audit::security_audit(action, None, to_status, json!({ "unlocode": unlocode })),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         let mut result = engine_toggle(unlocode)
             .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
         result["source"] = json!("database");
@@ -23727,15 +23853,17 @@ async fn site_registry_set_active(
 }
 
 async fn site_registry_activate(
+    AuthExtractor(session): AuthExtractor,
     Path(unlocode): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry_set_active(&unlocode, true).await
+    site_registry_set_active(&unlocode, true, &session).await
 }
 
 async fn site_registry_deactivate(
+    AuthExtractor(session): AuthExtractor,
     Path(unlocode): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    site_registry_set_active(&unlocode, false).await
+    site_registry_set_active(&unlocode, false, &session).await
 }
 
 async fn site_registry_search(
@@ -44904,7 +45032,12 @@ mod snapshots_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
 
@@ -44942,14 +45075,33 @@ mod snapshots_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Ok(Json(reviewed)) = snapshot_review(Json(SnapshotActionRequest {
-            snapshot_id: id.clone(),
-        }))
+        // #7 audit: snapshot_plan wrote a durable audit row naming the snapshot.
+        let plan_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'snapshot-plan' AND detail->>'snapshot_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query snapshot-plan audit");
+        assert!(plan_audited, "snapshot_plan must write a durable audit row");
+
+        let Ok(Json(reviewed)) = snapshot_review(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SnapshotActionRequest {
+                snapshot_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -44992,7 +45144,12 @@ mod snapshots_db_tests {
             support_group: "test-sg".into(),
             change_context: "remediate test".into(),
         };
-        let Ok(Json(created)) = snapshot_plan(Json(past_body)).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(past_body),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -45002,9 +45159,12 @@ mod snapshots_db_tests {
             panic!("snapshot_flag_stale failed");
         }
 
-        let Ok(Json(remediated)) = snapshot_remediate(Json(SnapshotActionRequest {
-            snapshot_id: id.clone(),
-        }))
+        let Ok(Json(remediated)) = snapshot_remediate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SnapshotActionRequest {
+                snapshot_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -45038,14 +45198,22 @@ mod snapshots_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
 
         // Future expiry -> stays Draft (flag-stale would not touch it).
-        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Err((status, _)) = snapshot_remediate(Json(SnapshotActionRequest {
-            snapshot_id: id.clone(),
-        }))
+        let Err((status, _)) = snapshot_remediate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SnapshotActionRequest {
+                snapshot_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -45075,7 +45243,12 @@ mod snapshots_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = snapshot_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -45091,9 +45264,12 @@ mod snapshots_db_tests {
         );
 
         // Advance it to ReviewRequested through the normal path.
-        if snapshot_review(Json(SnapshotActionRequest {
-            snapshot_id: id.clone(),
-        }))
+        if snapshot_review(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SnapshotActionRequest {
+                snapshot_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
@@ -45136,7 +45312,12 @@ mod snapshots_db_tests {
             change_context: "stale test".into(),
         };
 
-        let Ok(Json(created)) = snapshot_plan(Json(past_body)).await else {
+        let Ok(Json(created)) = snapshot_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(past_body),
+        )
+        .await
+        else {
             panic!("snapshot_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -47676,9 +47857,11 @@ mod log_forwarder_db_tests {
             ),
         ];
 
-        let persisted = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+        let mut tx = pool.begin().await.expect("begin tx");
+        let persisted = crate::repos::log_forwarders::onboard_sources(&mut tx, &hostname, &sources)
             .await
             .expect("onboard_sources failed");
+        tx.commit().await.expect("commit tx");
         assert_eq!(
             persisted.len(),
             2,
@@ -47686,9 +47869,11 @@ mod log_forwarder_db_tests {
         );
 
         // Second identical call: idempotent no-op (already-present types skipped).
-        let again = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+        let mut tx = pool.begin().await.expect("begin tx");
+        let again = crate::repos::log_forwarders::onboard_sources(&mut tx, &hostname, &sources)
             .await
             .expect("second onboard_sources failed");
+        tx.commit().await.expect("commit tx");
         assert!(again.is_empty(), "re-onboarding must insert nothing");
 
         let rows = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
@@ -47726,12 +47911,16 @@ mod log_forwarder_db_tests {
         )];
 
         // Onboard, then disable → the Syslog row is NotConfigured.
-        crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
+        let mut tx = pool.begin().await.expect("begin tx");
+        crate::repos::log_forwarders::onboard_sources(&mut tx, &hostname, &sources)
             .await
             .expect("onboard failed");
-        crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+        tx.commit().await.expect("commit tx");
+        let mut tx = pool.begin().await.expect("begin tx");
+        crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
             .await
             .expect("disable failed");
+        tx.commit().await.expect("commit tx");
         let after_disable = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
             .await
             .expect("list failed");
@@ -47743,9 +47932,12 @@ mod log_forwarder_db_tests {
         );
 
         // Re-onboard the same source — it must be re-enabled, not skipped.
-        let reonboarded = crate::repos::log_forwarders::onboard_sources(pool, &hostname, &sources)
-            .await
-            .expect("re-onboard failed");
+        let mut tx = pool.begin().await.expect("begin tx");
+        let reonboarded =
+            crate::repos::log_forwarders::onboard_sources(&mut tx, &hostname, &sources)
+                .await
+                .expect("re-onboard failed");
+        tx.commit().await.expect("commit tx");
         assert_eq!(
             reonboarded.len(),
             1,
@@ -47799,13 +47991,17 @@ mod log_forwarder_db_tests {
         );
         s2.status = ryuki_engine::log_forwarder::ForwardingStatus::Active;
         s1.status = ryuki_engine::log_forwarder::ForwardingStatus::Configured;
-        crate::repos::log_forwarders::onboard_sources(pool, &hostname, &[s1, s2])
+        let mut tx = pool.begin().await.expect("begin tx");
+        crate::repos::log_forwarders::onboard_sources(&mut tx, &hostname, &[s1, s2])
             .await
             .expect("onboard_sources failed");
+        tx.commit().await.expect("commit tx");
 
-        let disabled = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+        let mut tx = pool.begin().await.expect("begin tx");
+        let disabled = crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
             .await
             .expect("disable failed");
+        tx.commit().await.expect("commit tx");
         assert_eq!(disabled.len(), 2, "both active sources must be disabled");
         assert!(
             disabled
@@ -47824,9 +48020,11 @@ mod log_forwarder_db_tests {
         );
 
         // Idempotent: a second disable changes nothing.
-        let again = crate::repos::log_forwarders::disable_all_for_hostname(pool, &hostname)
+        let mut tx = pool.begin().await.expect("begin tx");
+        let again = crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
             .await
             .expect("second disable failed");
+        tx.commit().await.expect("commit tx");
         assert!(again.is_empty(), "re-disable must change nothing");
 
         for r in &rows {

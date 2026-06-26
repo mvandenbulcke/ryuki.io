@@ -200,6 +200,7 @@ pub async fn insert(pool: &PgPool, r: &LogSource) -> Result<LogSource, sqlx::Err
 /// Insert a new log forwarder within an existing transaction and return the
 /// persisted row. Accepts a mutable reference to a `sqlx::Transaction` so the
 /// caller can batch multiple inserts in a single atomic operation.
+#[allow(dead_code)]
 pub async fn insert_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     r: &LogSource,
@@ -272,16 +273,14 @@ pub async fn transition(
 /// `(hostname, source_type)` UNIQUE constraint (migration 066) is the hard
 /// backstop behind this serialization.
 pub async fn onboard_sources(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     hostname: &str,
     sources: &[LogSource],
 ) -> Result<Vec<LogSource>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
     // Serialize all onboard/disable activity for this hostname.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("log_forwarders:{hostname}"))
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     // Lock the hostname's existing rows and index them by source type.
@@ -289,7 +288,7 @@ pub async fn onboard_sources(
         "SELECT {COLUMNS} FROM log_forwarders WHERE hostname = $1 FOR UPDATE"
     ))
     .bind(hostname)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
     let existing_by_type: std::collections::HashMap<String, (String, String)> = existing
         .into_iter()
@@ -314,7 +313,28 @@ pub async fn onboard_sources(
             None => {
                 let mut to_insert = source.clone();
                 to_insert.hostname = hostname.to_string();
-                persisted.push(insert_tx(&mut tx, &to_insert).await?);
+                let row: LogForwarderRow = sqlx::query_as(&format!(
+                    "INSERT INTO log_forwarders \
+                     (id, hostname, source_type, site, status, log_volume_per_day_mb, retention_days) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     RETURNING {COLUMNS}"
+                ))
+                .bind(&to_insert.id)
+                .bind(&to_insert.hostname)
+                .bind(source_type_str(&to_insert.source_type))
+                .bind(&to_insert.site)
+                .bind(status_str(&to_insert.status))
+                .bind(
+                    i32::try_from(to_insert.log_volume_per_day_mb)
+                        .map_err(|e| sqlx::Error::Decode(format!("log_volume_per_day_mb: {e}").into()))?,
+                )
+                .bind(
+                    i32::try_from(to_insert.retention_days)
+                        .map_err(|e| sqlx::Error::Decode(format!("retention_days: {e}").into()))?,
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                persisted.push(row.into_model()?);
             }
             // Already Configured/Active — onboarding is an idempotent no-op.
             Some((_, status)) if status == configured || status == active => {}
@@ -328,14 +348,13 @@ pub async fn onboard_sources(
                 .bind(id)
                 .bind(configured)
                 .bind(&source.site)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut *conn)
                 .await?;
                 persisted.push(row.into_model()?);
             }
         }
     }
 
-    tx.commit().await?;
     Ok(persisted)
 }
 
@@ -349,15 +368,13 @@ pub async fn onboard_sources(
 /// rows that were actually transitioned — their `source_type`s are the sources
 /// that were disabled by this call.
 pub async fn disable_all_for_hostname(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     hostname: &str,
 ) -> Result<Vec<LogSource>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
     // Serialize against concurrent onboard/disable for this hostname.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("log_forwarders:{hostname}"))
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
     let not_configured = status_str(&ForwardingStatus::NotConfigured);
@@ -368,9 +385,8 @@ pub async fn disable_all_for_hostname(
     ))
     .bind(hostname)
     .bind(not_configured)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut *conn)
     .await?;
 
-    tx.commit().await?;
     disabled.into_iter().map(|r| r.into_model()).collect()
 }
