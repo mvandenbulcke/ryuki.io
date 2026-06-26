@@ -144,6 +144,19 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (lines 11752-11787, 11845-11878, 25691-25746) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** API token revocation (admin_tokens_revoke, line 11752), session revocation (admin_sessions_revoke, line 11845), and secret rotation (secrets_rotate, line 25691) all write ONLY to tracing logs, never to audit_log table. Compare with request lifecycle operations (line 12082) which call audit::record_audit_tx(). These are privileged admin/security operations; audit_log is the durable evidence table for compliance. Missing: (1) audit_log INSERTs for token/session/secret mutations, (2) matching notification drafts for these high-risk events.
 - **verified:** This is a genuine, verifiable gap. Three security-sensitive admin operations (token revocation, session revocation, secret rotation) write ONLY to ephemeral tracing logs, never to the durable, append-only audit_log table. The audit_log infrastructure exists and is proven to work for request lifecycle transitions, but is not applied to these privileged operations. The design document (/docs/design/missing-features.md) explicitly mandates that "token create/revoke and session revoke write audit log entries" as part of the Authentication & Authorization completion feature. This is not tracked in 
+- **STATUS (2026-06-26) — audit trail COMPLETE (notifications deferred):** All
+  five privileged security mutations now write a DURABLE, hash-chained
+  `audit_log` row ATOMICALLY with the mutation (wrapped in a tx; a 404/conflict
+  rolls back and records nothing): `admin_tokens_create` (design-doc mandated),
+  `admin_tokens_revoke`, `admin_sessions_revoke` (DELETE…RETURNING names the
+  subject), `secrets_rotate`, `secrets_rotate_all` (one summary row). New
+  `audit::security_audit()` constructor builds a non-lifecycle AuditRecord
+  (request_id=None, to_stage="security"); `detail` carries references ONLY —
+  never token plaintext/hash or secret values. DB-gated tests prove each path
+  writes a correctly-attributed, non-leaking row (token create+revoke, session
+  revoke, secret rotate), all green against the live DB. The finding's secondary
+  ask — notification drafts for these events — is DEFERRED (audit is the
+  compliance-critical durable evidence; notifications are a follow-up).
 
 ### 6. Configuration mutations unaudited and unnotified
 - **area:** ryuki-api/src/contracts.rs (lines 11432-11479) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True

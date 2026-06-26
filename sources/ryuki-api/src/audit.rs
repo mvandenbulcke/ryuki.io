@@ -227,6 +227,31 @@ pub struct AuditRecord<'a> {
     pub outcome: &'a str,
 }
 
+/// Build an [`AuditRecord`] for a privileged SECURITY operation (API token
+/// create/revoke, session revoke, secret rotation) rather than a request
+/// lifecycle transition. Those operations have no request_id or lifecycle
+/// stage, so `request_id`/`from_stage` are `None` and `to_stage` is the fixed
+/// `"security"` marker; the real semantics live in `action`, the status pair,
+/// and `detail`. `detail` MUST carry only references (ids, names, scopes) —
+/// NEVER secret material (token plaintext/hash, secret values).
+pub fn security_audit<'a>(
+    action: &'a str,
+    from_status: Option<&'a str>,
+    to_status: &'a str,
+    detail: Value,
+) -> AuditRecord<'a> {
+    AuditRecord {
+        action,
+        request_id: None,
+        from_status,
+        to_status,
+        from_stage: None,
+        to_stage: "security",
+        detail,
+        outcome: "success",
+    }
+}
+
 fn entry_from(session: &AuthSession, record: &AuditRecord<'_>) -> AuditEntry {
     AuditEntry {
         occurred_at: chrono::Utc::now().to_rfc3339(),

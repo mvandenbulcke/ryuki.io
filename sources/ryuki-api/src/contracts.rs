@@ -11778,6 +11778,9 @@ async fn admin_tokens_create(
     let plaintext = generate_api_token();
     let token_hash = crate::sha256_hex(&plaintext);
 
+    // Mint + durable audit commit ATOMICALLY: a token can never exist without
+    // its audit row, nor an audit row without the token.
+    let mut tx = map_api_token_result(pool.begin().await, "create-begin")?;
     let row: TokenListRow = map_api_token_result(
         sqlx::query_as::<_, TokenListRow>(
             "INSERT INTO api_tokens \
@@ -11794,10 +11797,36 @@ async fn admin_tokens_create(
         .bind(&body.environment_scope)
         .bind(token_valid)
         .bind(expires_at)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await,
         "create",
     )?;
+
+    // Durable audit_log entry — metadata ONLY, never the plaintext or hash.
+    map_api_token_result(
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "api-token-create",
+                None,
+                "created",
+                json!({
+                    "token_id": row.id,
+                    "name": row.name,
+                    "owner_principal": row.owner_principal,
+                    "roles": row.roles,
+                    "site_scope": row.site_scope,
+                    "environment_scope": row.environment_scope,
+                    "token_valid": row.token_valid,
+                    "expires_at": row.expires_at,
+                }),
+            ),
+        )
+        .await,
+        "create-audit",
+    )?;
+    map_api_token_result(tx.commit().await, "create-commit")?;
 
     // Audit line: actor + action + token metadata. NEVER the plaintext or hash.
     tracing::info!(
@@ -11897,17 +11926,19 @@ async fn admin_tokens_revoke(
         return Err(api_token_db_required());
     };
 
+    let mut tx = map_api_token_result(pool.begin().await, "revoke-begin")?;
     let result = map_api_token_result(
         sqlx::query(
             "UPDATE api_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL",
         )
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await,
         "revoke",
     )?;
 
     if result.rows_affected() == 0 {
+        // Tx rolls back on drop — nothing was revoked, so record no audit row.
         return Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::new(
@@ -11916,6 +11947,23 @@ async fn admin_tokens_revoke(
             )),
         ));
     }
+
+    // Durable audit_log entry, atomic with the revoke.
+    map_api_token_result(
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "api-token-revoke",
+                Some("active"),
+                "revoked",
+                json!({ "token_id": id }),
+            ),
+        )
+        .await,
+        "revoke-audit",
+    )?;
+    map_api_token_result(tx.commit().await, "revoke-commit")?;
 
     tracing::info!(
         actor = %session.user_id,
@@ -11990,20 +12038,47 @@ async fn admin_sessions_revoke(
         return Err(api_token_db_required());
     };
 
-    let result = map_api_token_result(
-        sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(id)
-            .execute(pool)
-            .await,
+    let mut tx = map_api_token_result(pool.begin().await, "revoke-session-begin")?;
+    // RETURNING the subject so the audit row names WHOSE session was revoked,
+    // not just the opaque session id.
+    let revoked: Option<(String, String)> = map_api_token_result(
+        sqlx::query_as::<_, (String, String)>(
+            "DELETE FROM sessions WHERE id = $1 RETURNING user_id, display_name",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await,
         "revoke-session",
     )?;
 
-    if result.rows_affected() == 0 {
+    let Some((subject_user, subject_display)) = revoked else {
+        // Tx rolls back on drop — no session deleted, no audit row.
         return Err((
             StatusCode::NOT_FOUND,
             Json(ApiError::new("NOT_FOUND", "No session with that id")),
         ));
-    }
+    };
+
+    // Durable audit_log entry, atomic with the delete.
+    map_api_token_result(
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "session-revoke",
+                Some("active"),
+                "revoked",
+                json!({
+                    "session_id": id,
+                    "subject_user": subject_user,
+                    "subject_display": subject_display,
+                }),
+            ),
+        )
+        .await,
+        "revoke-session-audit",
+    )?;
+    map_api_token_result(tx.commit().await, "revoke-session-commit")?;
 
     tracing::info!(
         actor = %session.user_id,
@@ -26668,6 +26743,26 @@ async fn secrets_rotate(
             ));
         }
         insert_rotation_run(&mut tx, &run).await?;
+        // Durable audit_log entry, atomic with the rotation. Secret VALUES are
+        // never touched — only the id/site and the rotation-run reference.
+        let prior_status = serde_enum_str(&secret.status);
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "secret-rotate",
+                Some(&prior_status),
+                "rotated",
+                json!({
+                    "secret_id": id,
+                    "site": secret.site,
+                    "rotation_run_id": run.id,
+                    "new_version": run.new_version,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
@@ -26781,6 +26876,7 @@ async fn secrets_rotate_all(
 
         let mut tx = pool.begin().await.map_err(db_error)?;
         let mut rotations = Vec::new();
+        let mut rotated_ids: Vec<String> = Vec::new();
         for row in &due {
             let secret = row.to_engine();
             // Version index is keyed on runs ACTUALLY inserted so far (not the
@@ -26808,8 +26904,28 @@ async fn secrets_rotate_all(
             if res.rows_affected() == 1 {
                 insert_rotation_run(&mut tx, &run).await?;
                 rotations.push(serde_json::to_value(&run).unwrap_or_default());
+                rotated_ids.push(secret.id.clone());
             }
         }
+        // ONE durable audit_log entry summarizing this privileged force-rotate of
+        // the whole site, atomic with the rotations. Recorded even when 0 were
+        // due — the invocation of a destructive admin action is itself evidence.
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "secret-rotate-all",
+                None,
+                "rotated",
+                json!({
+                    "site": site,
+                    "rotated_count": rotated_ids.len(),
+                    "secret_ids": rotated_ids,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
@@ -32947,6 +33063,121 @@ mod db_lifecycle_tests {
         s
     }
 
+    /// #5 audit-trail gap: minting and revoking an API token must each write a
+    /// DURABLE audit_log row attributing the admin caller, with token metadata
+    /// only — NEVER the plaintext or hash.
+    #[tokio::test]
+    async fn test_token_create_and_revoke_write_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let admin = admin_session("dbtest-admin-tok-4d2");
+        let created = admin_tokens_create(
+            AuthExtractor(admin.clone()),
+            Json(CreateTokenRequest {
+                name: "dbtest-audit-token".into(),
+                owner_principal: "svc.dbtest".into(),
+                roles: vec![],
+                site_scope: None,
+                environment_scope: None,
+                expires_at: None,
+            }),
+        )
+        .await;
+        let (_status, _hdr, Json(body)) = created.expect("token create must succeed");
+        let token_id = body["id"].as_str().expect("token id").to_string();
+        let token_uuid = Uuid::parse_str(&token_id).expect("uuid");
+
+        let (c_action, c_actor, c_detail) = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, actor_principal, detail::text FROM audit_log \
+             WHERE action = 'api-token-create' AND detail->>'token_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&token_id)
+        .fetch_optional(pool)
+        .await
+        .expect("query create audit")
+        .expect("a durable create audit row must exist");
+        assert_eq!(c_action, "api-token-create");
+        assert_eq!(c_actor, "dbtest-admin-tok-4d2", "actor must be the admin");
+        assert!(c_detail.contains("dbtest-audit-token"), "names the token");
+        assert!(
+            !c_detail.contains("ryk_"),
+            "detail must NEVER leak the plaintext token"
+        );
+
+        let revoked = admin_tokens_revoke(AuthExtractor(admin.clone()), Path(token_uuid)).await;
+        assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
+        let revoke_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'api-token-revoke' AND detail->>'token_id' = $1)",
+        )
+        .bind(&token_id)
+        .fetch_one(pool)
+        .await
+        .expect("query revoke audit");
+
+        // api_tokens is cleaned up; audit_log is append-only (chain intact).
+        sqlx::query("DELETE FROM api_tokens WHERE id = $1")
+            .bind(token_uuid)
+            .execute(pool)
+            .await
+            .ok();
+
+        assert!(
+            revoke_audited,
+            "revoke must write its own durable audit_log row"
+        );
+    }
+
+    /// #5 audit-trail gap: admin session revocation must write a DURABLE
+    /// audit_log row naming the SUBJECT whose session was closed.
+    #[tokio::test]
+    async fn test_session_revoke_writes_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let sid = Uuid::new_v4();
+        let subject = "dbtest-victim-sess-8a1";
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, display_name, roles, provider, expires_at) \
+             VALUES ($1, $2, $3, $4, 'local', now() + interval '1 hour')",
+        )
+        .bind(sid)
+        .bind(subject)
+        .bind(format!("{subject} (test)"))
+        .bind(vec!["viewer".to_string()])
+        .execute(pool)
+        .await
+        .expect("seed session");
+
+        let admin = admin_session("dbtest-admin-sess-2c7");
+        let revoked = admin_sessions_revoke(AuthExtractor(admin), Path(sid)).await;
+        assert!(revoked.is_ok(), "revoke must succeed: {revoked:?}");
+
+        let (action, actor, detail) = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, actor_principal, detail::text FROM audit_log \
+             WHERE action = 'session-revoke' AND detail->>'session_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(sid.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("query session-revoke audit")
+        .expect("a durable session-revoke audit row must exist");
+
+        assert_eq!(action, "session-revoke");
+        assert_eq!(actor, "dbtest-admin-sess-2c7", "actor must be the admin");
+        assert!(
+            detail.contains(subject),
+            "audit detail must name the subject whose session was revoked"
+        );
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -36861,6 +37092,55 @@ mod secrets_rotation_db_tests {
         assert_eq!(
             persisted_actor, session_user,
             "rotated_by MUST be the session user_id, never a client value"
+        );
+    }
+
+    /// #5 audit-trail gap: a secret rotation must write a DURABLE audit_log row
+    /// (not just a tracing line), attributing the authenticated caller, naming
+    /// the secret by reference, and NEVER leaking secret material.
+    #[tokio::test]
+    async fn test_rotate_writes_audit_log_entry() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-audit-9c1";
+        let session_user = "dbtest-principal-audit-3b8e";
+        seed_secret(pool, id, "DBTEST-AUD", "2026-12-31T00:00:00+00:00").await;
+
+        let result = secrets_rotate(
+            Path(id.to_string()),
+            Extension(caller_session(session_user)),
+        )
+        .await;
+        assert!(result.is_ok(), "rotate must succeed: {result:?}");
+
+        // The durable audit_log row, read back from the DB (not the response).
+        let row = sqlx::query_as::<_, (String, String, String, String)>(
+            "SELECT action, actor_principal, to_status, detail::text \
+             FROM audit_log WHERE action = 'secret-rotate' \
+               AND detail->>'secret_id' = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("query audit_log");
+
+        cleanup_secret(pool, id).await;
+
+        let (action, actor, to_status, detail) =
+            row.expect("a durable audit_log row must exist for the rotation");
+        assert_eq!(action, "secret-rotate");
+        assert_eq!(
+            actor, session_user,
+            "audit actor MUST be the authenticated caller"
+        );
+        assert_eq!(to_status, "rotated");
+        assert!(detail.contains(id), "detail must name the secret id");
+        assert!(
+            !detail.contains("kv/test/"),
+            "detail must NEVER leak the vault path / secret material"
         );
     }
 
