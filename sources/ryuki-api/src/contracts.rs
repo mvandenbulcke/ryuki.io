@@ -25293,6 +25293,7 @@ async fn dr_plan_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
     Ok(Json(serde_json::to_value(&plan).unwrap_or_default()))
 }
 async fn dr_plan_update_rpo_rto(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<DrRpoRtoRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -25301,6 +25302,10 @@ async fn dr_plan_update_rpo_rto(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only update a plan in its own site. The site is
+    // checked on the loaded row; the version CAS below fails the write if the row
+    // (including site) changed concurrently, so there is no TOCTOU window.
+    guard_body_site_scope(&session, &plan.site)?;
     let updated =
         dr_testing::update_rpo_rto_pure(&plan, b.rpo, b.rto).map_err(|e| status_409(&e))?;
     let ok = crate::repos::dr_plans::transition(pool, &id, &version, &updated)
@@ -25317,9 +25322,9 @@ async fn dr_plan_update_rpo_rto(
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 async fn dr_test_start(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<DrTestStartRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pool = get_db().ok_or_else(status_503_no_db)?;
     // Plan resolved from static store (DB-consistent via slice-1 write-through)
     let plan = dr_testing::get_plan_from_store(&b.plan_id).ok_or_else(|| {
         (
@@ -25327,6 +25332,10 @@ async fn dr_test_start(
             Json(json!({"error": format!("DR plan '{}' not found", b.plan_id)})),
         )
     })?;
+    // #2: a scoped principal may only start a DR test for a plan in its own site
+    // — checked before touching the DB.
+    guard_body_site_scope(&session, &plan.site)?;
+    let pool = get_db().ok_or_else(status_503_no_db)?;
     let run = dr_testing::build_test_run(&plan, &b.scenario_type, &b.tester)
         .map_err(|e| status_400(&e))?;
     crate::repos::dr_test_runs::insert(pool, &run)
@@ -25335,6 +25344,7 @@ async fn dr_test_start(
     Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
 }
 async fn dr_test_complete(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<DrTestCompleteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -25342,13 +25352,19 @@ async fn dr_test_complete(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&b.test_id))?;
-    let completed_run = dr_testing::complete_test_run_pure(&run, &b.result, b.systems_failed)
-        .map_err(|e| status_409(&e))?;
-    let completed_at = completed_run.completed_at.clone().unwrap_or_default();
+    // #2: load the plan and enforce scope BEFORE any run-state validation, so an
+    // out-of-scope test_id cannot leak run state (e.g. a 409 "already completed")
+    // ahead of the 403 scope decision. A scoped principal may only complete a DR
+    // test for a plan in its own site; the per-row version CAS in the write tx
+    // below fails if either row changed concurrently, so there is no TOCTOU gap.
     let (plan, plan_version) = crate::repos::dr_plans::get(pool, &run.plan_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&run.plan_id))?;
+    guard_body_site_scope(&session, &plan.site)?;
+    let completed_run = dr_testing::complete_test_run_pure(&run, &b.result, b.systems_failed)
+        .map_err(|e| status_409(&e))?;
+    let completed_at = completed_run.completed_at.clone().unwrap_or_default();
     let updated_plan = dr_testing::mark_plan_tested_pure(&plan, &completed_at);
     let run_json = serde_json::to_value(&completed_run)
         .map_err(|e| db_error(sqlx::Error::Decode(format!("serialize run: {e}").into())))?;
@@ -30911,6 +30927,36 @@ mod unit_tests {
         )
         .await
         .expect_err("scheduling maintenance for an out-of-scope site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dr_test_start_denies_out_of_scope_plan() {
+        // Seed a DEFRA-owned plan into the in-memory DR store (write-through src).
+        let plan = ryuki_engine::dr_testing::build_dr_plan(
+            "scope-dr-plan",
+            "DEFRA",
+            "GBLON",
+            vec!["sys-01".into()],
+            15,
+            60,
+        )
+        .expect("build plan");
+        let plan_id = plan.id.clone();
+        ryuki_engine::dr_testing::upsert_plan(&plan);
+
+        // A GBLON-scoped principal cannot start a DR test for the DEFRA plan —
+        // 403 before any DB access (the by-id mutation guard precedes get_db).
+        let err = dr_test_start(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Json(DrTestStartRequest {
+                plan_id,
+                scenario_type: "failover".into(),
+                tester: "t".into(),
+            }),
+        )
+        .await
+        .expect_err("starting a DR test for an out-of-scope plan must be 403");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
