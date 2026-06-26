@@ -23,9 +23,9 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::gmsa_lifecycle::{GMSAAccount, GMSAStatus};
-use sqlx::PgPool;
 #[cfg(test)]
 use sqlx::Row;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── SELECT fragment ─────────────────────────────────────────────────────────
@@ -169,12 +169,17 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<GMSAAccount>, sqlx::E
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-/// Insert a new account and its initial authorized-host rows in a single
-/// transaction, then return the persisted account (with DB-authoritative
-/// timestamps). A duplicate `name` violates the UNIQUE constraint and
-/// propagates as a `sqlx::Error` with `is_unique_violation() == true` —
-/// callers map this to 409.
-pub async fn insert(pool: &PgPool, r: &GMSAAccount) -> Result<GMSAAccount, sqlx::Error> {
+/// Insert a new account and its initial authorized-host rows inside a
+/// caller-owned transaction, then return the persisted account.
+///
+/// The caller opens the tx, passes `conn = &mut *tx`, and commits on success.
+/// A duplicate `name` violates the UNIQUE constraint and propagates as a
+/// `sqlx::Error` with `is_unique_violation() == true` — callers map this to 409.
+///
+/// The re-read to return DB-authoritative timestamps must happen AFTER the
+/// caller has committed; callers do a post-commit `get_by_name(pool, name)`
+/// with the pool (not the tx) as the final response.
+pub async fn insert(conn: &mut PgConnection, r: &GMSAAccount) -> Result<(), sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let created_at: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&r.created_at)
@@ -195,8 +200,6 @@ pub async fn insert(pool: &PgPool, r: &GMSAAccount) -> Result<GMSAAccount, sqlx:
         )
     })?;
 
-    let mut tx = pool.begin().await?;
-
     sqlx::query(
         "INSERT INTO gmsa_accounts \
          (id, name, sam_account_name, dns_host_name, service_principal_names, \
@@ -213,7 +216,7 @@ pub async fn insert(pool: &PgPool, r: &GMSAAccount) -> Result<GMSAAccount, sqlx:
     .bind(interval_days)
     .bind(created_at)
     .bind(last_rotation_at)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     // Dedup the input hosts so a repeated host in the request can't trip the
@@ -230,16 +233,11 @@ pub async fn insert(pool: &PgPool, r: &GMSAAccount) -> Result<GMSAAccount, sqlx:
         )
         .bind(id)
         .bind(host)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
 
-    tx.commit().await?;
-
-    // Re-read through the aggregating query to return DB-authoritative timestamps.
-    get_by_name(pool, &r.name).await?.ok_or_else(|| {
-        sqlx::Error::Decode("gmsa_accounts: row vanished immediately after insert".into())
-    })
+    Ok(())
 }
 
 /// Outcome of a host-assignment mutation. The repo enforces the lifecycle
@@ -266,11 +264,15 @@ pub enum HostOpOutcome {
 /// gone or was concurrently changed (e.g. revoked) — which the caller maps to
 /// 404/409. Only the rotation-relevant columns are written, so a concurrent
 /// metadata change (SPNs/site/etc.) is never clobbered by a stale full-row write.
+///
+/// Accepts any `sqlx::PgExecutor<'_>` (pool reference OR `&mut *tx`) so a
+/// handler can compose the mutation and an audit row in a single atomic tx.
+/// The caller re-reads via `get_by_name(pool, name)` after commit for the response.
 pub async fn rotate(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     name: &str,
     expected_status: &str,
-) -> Result<Option<GMSAAccount>, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let affected = sqlx::query(
         "UPDATE gmsa_accounts \
          SET last_rotation_at = NOW(), status = 'Active', updated_at = NOW() \
@@ -278,15 +280,11 @@ pub async fn rotate(
     )
     .bind(name)
     .bind(expected_status)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
 
-    if affected == 0 {
-        return Ok(None);
-    }
-
-    get_by_name(pool, name).await
+    Ok(affected > 0)
 }
 
 /// Assign a host to an account, concurrency-safely. Locks the account row
@@ -294,20 +292,23 @@ pub async fn rotate(
 /// insert; re-checks the revoked guard under the lock; then upserts the child
 /// row (idempotent via ON CONFLICT). The engine `assign_to_host` is the pure
 /// spec of this logic; this is its concurrency-safe persistence.
-pub async fn add_host(pool: &PgPool, name: &str, host: &str) -> Result<HostOpOutcome, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
+///
+/// The caller owns the transaction: pass `conn = &mut *tx`, and commit only
+/// on `Applied`. Early-return outcomes roll back via tx drop at the call site.
+pub async fn add_host(
+    conn: &mut PgConnection,
+    name: &str,
+    host: &str,
+) -> Result<HostOpOutcome, sqlx::Error> {
     let acct: Option<(Uuid, String)> =
         sqlx::query_as("SELECT id, status FROM gmsa_accounts WHERE name = $1 FOR UPDATE")
             .bind(name)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     let Some((acct_id, status)) = acct else {
-        tx.rollback().await?;
         return Ok(HostOpOutcome::AccountNotFound);
     };
     if status == "Revoked" {
-        tx.rollback().await?;
         return Ok(HostOpOutcome::AccountRevoked);
     }
 
@@ -317,10 +318,9 @@ pub async fn add_host(pool: &PgPool, name: &str, host: &str) -> Result<HostOpOut
     )
     .bind(acct_id)
     .bind(host)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
-    tx.commit().await?;
     Ok(HostOpOutcome::Applied)
 }
 
@@ -329,20 +329,20 @@ pub async fn add_host(pool: &PgPool, name: &str, host: &str) -> Result<HostOpOut
 /// last-host invariants are checked under the lock, immediately before the
 /// delete, so concurrent callers can never both pass a stale last-host guard
 /// and drain the account to zero authorized hosts.
+///
+/// The caller owns the transaction: pass `conn = &mut *tx`, and commit only
+/// on `Applied`. Early-return outcomes roll back via tx drop at the call site.
 pub async fn remove_host(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     name: &str,
     host: &str,
 ) -> Result<HostOpOutcome, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
     let acct: Option<Uuid> =
         sqlx::query_scalar("SELECT id FROM gmsa_accounts WHERE name = $1 FOR UPDATE")
             .bind(name)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     let Some(acct_id) = acct else {
-        tx.rollback().await?;
         return Ok(HostOpOutcome::AccountNotFound);
     };
 
@@ -351,30 +351,27 @@ pub async fn remove_host(
     )
     .bind(acct_id)
     .bind(host)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
     if present == 0 {
-        tx.rollback().await?;
         return Ok(HostOpOutcome::HostNotPresent);
     }
 
     let total: i64 =
         sqlx::query_scalar("SELECT count(*) FROM gmsa_host_assignments WHERE gmsa_account_id = $1")
             .bind(acct_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
     if total <= 1 {
-        tx.rollback().await?;
         return Ok(HostOpOutcome::LastHost);
     }
 
     sqlx::query("DELETE FROM gmsa_host_assignments WHERE gmsa_account_id = $1 AND host = $2")
         .bind(acct_id)
         .bind(host)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
-    tx.commit().await?;
     Ok(HostOpOutcome::Applied)
 }
 

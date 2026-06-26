@@ -4180,7 +4180,7 @@ async fn ad_enable(Path(name): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn ad_delete(Path(name): Path<String>) -> ApiResult {
+async fn ad_delete(AuthExtractor(session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
         .await
@@ -4189,10 +4189,25 @@ async fn ad_delete(Path(name): Path<String>) -> ApiResult {
     let updated =
         ad_computer_lifecycle::delete_computer_model(&computer).map_err(|e| status_409(&e))?;
     let before = crate::repos::ad_computers::status_str(&computer.status);
-    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let (persisted, _) =
+        crate::repos::ad_computers::transition(&mut *tx, before, updated_at, &updated)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ad-computer-delete",
+            Some(before),
+            "deleted",
+            json!({ "computer_name": &computer.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
@@ -4246,13 +4261,17 @@ async fn ad_computer_contract() -> Json<Value> {
 
 // ─── gMSA lifecycle handlers ───
 
-async fn gmsa_create(Json(body): Json<GmsaCreateRequest>) -> ApiResult {
+async fn gmsa_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<GmsaCreateRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let account = gmsa_lifecycle::create_gmsa(&body.name, body.hosts, body.spns, &body.site)
         .map_err(|e| status_400(&e))?;
 
-    let persisted = crate::repos::gmsa_accounts::insert(pool, &account)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::gmsa_accounts::insert(&mut tx, &account)
         .await
         .map_err(|e| {
             // Only the account-name UNIQUE constraint is a "duplicate name". The
@@ -4266,6 +4285,30 @@ async fn gmsa_create(Json(body): Json<GmsaCreateRequest>) -> ApiResult {
             }
             db_error(e)
         })?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "gmsa-create",
+            None,
+            "created",
+            json!({ "gmsa_name": &account.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
+    // Re-read post-commit to return DB-authoritative timestamps.
+    let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &account.name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"INTERNAL_ERROR","message":"gMSA not found after insert commit"})),
+            )
+        })?;
 
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
@@ -4278,65 +4321,111 @@ async fn gmsa_validate(Json(body): Json<GmsaValidateRequest>) -> ApiResult {
     }
 }
 
-async fn gmsa_assign(Path((name, host)): Path<(String, String)>) -> ApiResult {
+async fn gmsa_assign(
+    AuthExtractor(session): AuthExtractor,
+    Path((name, host)): Path<(String, String)>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     // add_host enforces the revoked guard under a row lock (concurrency-safe);
     // the engine assign_to_host is the pure spec of the same rule.
     use crate::repos::gmsa_accounts::HostOpOutcome;
-    match crate::repos::gmsa_accounts::add_host(pool, &name, &host)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::gmsa_accounts::add_host(&mut tx, &name, &host)
+        .await
+        .map_err(db_error)?;
+    match outcome {
+        HostOpOutcome::AccountNotFound => return Err(status_404(&name)),
+        HostOpOutcome::AccountRevoked => {
+            return Err(status_409(&format!(
+                "Cannot assign hosts to revoked gMSA {name}"
+            )))
+        }
+        HostOpOutcome::Applied => {}
+        other => {
+            return Err(db_error(sqlx::Error::Protocol(format!(
+                "add_host returned unexpected outcome {other:?}"
+            ))))
+        }
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "gmsa-assign-host",
+            None,
+            "assigned",
+            json!({ "gmsa_name": &name, "host": &host }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
+    // Re-read post-commit for response.
+    let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
         .await
         .map_err(db_error)?
-    {
-        HostOpOutcome::AccountNotFound => Err(status_404(&name)),
-        HostOpOutcome::AccountRevoked => Err(status_409(&format!(
-            "Cannot assign hosts to revoked gMSA {name}"
-        ))),
-        HostOpOutcome::Applied => {
-            let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
-                .await
-                .map_err(db_error)?
-                .ok_or_else(|| status_404(&name))?;
-            Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
-        }
-        other => Err(db_error(sqlx::Error::Protocol(format!(
-            "add_host returned unexpected outcome {other:?}"
-        )))),
-    }
+        .ok_or_else(|| status_404(&name))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn gmsa_remove(Path((name, host)): Path<(String, String)>) -> ApiResult {
+async fn gmsa_remove(
+    AuthExtractor(session): AuthExtractor,
+    Path((name, host)): Path<(String, String)>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     // remove_host enforces the host-present and last-host invariants under a row
     // lock, so two concurrent removes cannot both drain the account to zero
     // hosts; the engine remove_from_host is the pure spec of the same rules.
     use crate::repos::gmsa_accounts::HostOpOutcome;
-    match crate::repos::gmsa_accounts::remove_host(pool, &name, &host)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::gmsa_accounts::remove_host(&mut tx, &name, &host)
+        .await
+        .map_err(db_error)?;
+    match outcome {
+        HostOpOutcome::AccountNotFound => return Err(status_404(&name)),
+        HostOpOutcome::HostNotPresent => {
+            return Err(status_409(&format!(
+                "Host {host} is not in the authorized list for {name}"
+            )))
+        }
+        HostOpOutcome::LastHost => {
+            return Err(status_409(&format!(
+                "Cannot remove last host from {name}. At least one authorized host required."
+            )))
+        }
+        HostOpOutcome::Applied => {}
+        other => {
+            return Err(db_error(sqlx::Error::Protocol(format!(
+                "remove_host returned unexpected outcome {other:?}"
+            ))))
+        }
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "gmsa-remove-host",
+            None,
+            "removed",
+            json!({ "gmsa_name": &name, "host": &host }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
+    // Re-read post-commit for response.
+    let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
         .await
         .map_err(db_error)?
-    {
-        HostOpOutcome::AccountNotFound => Err(status_404(&name)),
-        HostOpOutcome::HostNotPresent => Err(status_409(&format!(
-            "Host {host} is not in the authorized list for {name}"
-        ))),
-        HostOpOutcome::LastHost => Err(status_409(&format!(
-            "Cannot remove last host from {name}. At least one authorized host required."
-        ))),
-        HostOpOutcome::Applied => {
-            let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
-                .await
-                .map_err(db_error)?
-                .ok_or_else(|| status_404(&name))?;
-            Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
-        }
-        other => Err(db_error(sqlx::Error::Protocol(format!(
-            "remove_host returned unexpected outcome {other:?}"
-        )))),
-    }
+        .ok_or_else(|| status_404(&name))?;
+    Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn gmsa_rotate(Path(name): Path<String>) -> ApiResult {
+async fn gmsa_rotate(AuthExtractor(session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let account = crate::repos::gmsa_accounts::get_by_name(pool, &name)
@@ -4354,10 +4443,37 @@ async fn gmsa_rotate(Path(name): Path<String>) -> ApiResult {
     // CAS on the loaded status so a concurrent revoke (or other status change)
     // is not silently overwritten; rotate only touches last_rotation_at + status.
     let before = crate::repos::gmsa_accounts::status_str(&account.status);
-    let persisted = crate::repos::gmsa_accounts::rotate(pool, &name, before)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let matched = crate::repos::gmsa_accounts::rotate(&mut *tx, &name, before)
+        .await
+        .map_err(db_error)?;
+    if !matched {
+        return Err(status_409("state changed concurrently; reload and retry"));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "gmsa-rotate",
+            Some(before),
+            "rotated",
+            json!({ "gmsa_name": &name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+
+    // Re-read post-commit for response.
+    let persisted = crate::repos::gmsa_accounts::get_by_name(pool, &name)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error":"INTERNAL_ERROR","message":"gMSA not found after rotate commit"})),
+            )
+        })?;
 
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
@@ -4603,19 +4719,36 @@ async fn shares_permission_report(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
-async fn shares_revoke(Path((id, group)): Path<(String, String)>) -> ApiResult {
+async fn shares_revoke(
+    AuthExtractor(session): AuthExtractor,
+    Path((id, group)): Path<(String, String)>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    match crate::repos::file_share_ntfs::revoke_permission(pool, &id, &group)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let deleted = crate::repos::file_share_ntfs::revoke_permission(&mut *tx, &id, &group)
         .await
-        .map_err(db_error)?
-    {
-        Some(()) => Ok(Json(serde_json::json!({
-            "message": format!("Revoked {group} from share {id}"),
-            "share_id": id,
-            "ad_group": group,
-        }))),
-        None => Err(status_404(&format!("permission {group} on share {id}"))),
+        .map_err(db_error)?;
+    if deleted.is_none() {
+        return Err(status_404(&format!("permission {group} on share {id}")));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "share-permission-revoke",
+            None,
+            "revoked",
+            json!({ "share_id": &id, "ad_group": &group }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(serde_json::json!({
+        "message": format!("Revoked {group} from share {id}"),
+        "share_id": id,
+        "ad_group": group,
+    })))
 }
 
 async fn shares_contract() -> Json<Value> {
@@ -24212,7 +24345,10 @@ async fn access_review_summary() -> ApiResult {
     }
 }
 
-async fn access_campaign_create(Json(body): Json<AccessCampaignCreateRequest>) -> ApiResult {
+async fn access_campaign_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<AccessCampaignCreateRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let review_type =
         access_recertification::parse_review_type(&body.review_type).map_err(|e| status_400(&e))?;
@@ -24226,9 +24362,23 @@ async fn access_campaign_create(Json(body): Json<AccessCampaignCreateRequest>) -
         0, // overwritten by insert_campaign DB count
         0,
     );
-    let inserted = crate::repos::access_recertification::insert_campaign(pool, &campaign)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let inserted = crate::repos::access_recertification::insert_campaign(&mut tx, &campaign)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "access-campaign-create",
+            None,
+            "created",
+            json!({ "campaign_id": &inserted.id, "campaign_name": &inserted.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(access_recertification::campaign_response(&inserted)))
 }
 
@@ -39036,12 +39186,15 @@ mod access_recertification_db_tests {
             .await
             .ok();
 
-        let result = access_campaign_create(Json(AccessCampaignCreateRequest {
-            name: name.to_string(),
-            review_type: "ADGroup".to_string(),
-            reviewer_group: "identity-governance".to_string(),
-            days: 30,
-        }))
+        let result = access_campaign_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(AccessCampaignCreateRequest {
+                name: name.to_string(),
+                review_type: "ADGroup".to_string(),
+                reviewer_group: "identity-governance".to_string(),
+                days: 30,
+            }),
+        )
         .await;
 
         let persisted: Option<(String, String)> = sqlx::query_as(
@@ -45139,12 +45292,15 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("testcrt-{uid}")[..20]);
 
-        let Ok(Json(created)) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(Json(created)) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
@@ -45152,6 +45308,25 @@ mod gmsa_db_tests {
 
         let id = created["id"].as_str().expect("id in response").to_string();
         uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        // #7 audit: gmsa_create wrote a durable audit row naming the account but
+        // NEVER any credential / managed-password material.
+        let (audit_actor, audit_detail) = sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'gmsa-create' AND detail->>'gmsa_name' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&name)
+        .fetch_optional(pool)
+        .await
+        .expect("query gmsa-create audit")
+        .expect("a gmsa-create audit row must exist");
+        assert_eq!(audit_actor, "static-user", "audit actor must be the caller");
+        assert!(audit_detail.contains(&name), "detail must name the gMSA");
+        assert!(
+            !audit_detail.to_lowercase().contains("password"),
+            "detail must NEVER contain credential material"
+        );
 
         let record = crate::repos::gmsa_accounts::get_by_name(pool, &name)
             .await
@@ -45199,19 +45374,26 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstasgn-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
         };
 
         // Assign a second host.
-        let Ok(Json(assigned)) = gmsa_assign(Path((name.clone(), "host2.corp.local".into()))).await
+        let Ok(Json(assigned)) = gmsa_assign(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path((name.clone(), "host2.corp.local".into())),
+        )
+        .await
         else {
             cleanup(pool, &name).await;
             panic!("gmsa_assign failed");
@@ -45254,18 +45436,25 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrmv-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into(), "host2.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
         };
 
-        let Ok(Json(removed)) = gmsa_remove(Path((name.clone(), "host2.corp.local".into()))).await
+        let Ok(Json(removed)) = gmsa_remove(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path((name.clone(), "host2.corp.local".into())),
+        )
+        .await
         else {
             cleanup(pool, &name).await;
             panic!("gmsa_remove failed");
@@ -45307,18 +45496,25 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstlast-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
         };
 
-        let Err((status, _)) = gmsa_remove(Path((name.clone(), "host1.corp.local".into()))).await
+        let Err((status, _)) = gmsa_remove(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path((name.clone(), "host1.corp.local".into())),
+        )
+        .await
         else {
             cleanup(pool, &name).await;
             panic!("expected remove of last host to fail");
@@ -45345,12 +45541,15 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrot-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
@@ -45366,7 +45565,12 @@ mod gmsa_db_tests {
         // Small delay to ensure last_rotation_at advances.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let Ok(Json(rotated)) = gmsa_rotate(Path(name.clone())).await else {
+        let Ok(Json(rotated)) = gmsa_rotate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(name.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &name).await;
             panic!("gmsa_rotate failed");
         };
@@ -45407,23 +45611,29 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstdup-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("first gmsa_create failed");
         };
 
-        let Err((status, _)) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host2.corp.local".into()],
-            spns: vec!["HTTP/host2.corp.local".into()],
-            site: "DEFRA".into(),
-        }))
+        let Err((status, _)) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host2.corp.local".into()],
+                spns: vec!["HTTP/host2.corp.local".into()],
+                site: "DEFRA".into(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &name).await;
@@ -45451,12 +45661,15 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstarvk-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
@@ -45469,7 +45682,11 @@ mod gmsa_db_tests {
             .await
             .expect("status update failed");
 
-        let Err((status, _)) = gmsa_assign(Path((name.clone(), "host2.corp.local".into()))).await
+        let Err((status, _)) = gmsa_assign(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path((name.clone(), "host2.corp.local".into())),
+        )
+        .await
         else {
             cleanup(pool, &name).await;
             panic!("expected assign on revoked account to fail");
@@ -45496,12 +45713,15 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrotvk-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["host1.corp.local".into()],
-            spns: vec!["HTTP/host1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["host1.corp.local".into()],
+                spns: vec!["HTTP/host1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
@@ -45514,7 +45734,12 @@ mod gmsa_db_tests {
             .await
             .expect("status update failed");
 
-        let Err((status, _)) = gmsa_rotate(Path(name.clone())).await else {
+        let Err((status, _)) = gmsa_rotate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(name.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &name).await;
             panic!("expected rotate on revoked account to fail");
         };
@@ -45547,21 +45772,31 @@ mod gmsa_db_tests {
         let uid = uuid::Uuid::new_v4().to_string();
         let name = test_name(&format!("tstrepo-{uid}")[..20]);
 
-        let Ok(_) = gmsa_create(Json(GmsaCreateRequest {
-            name: name.clone(),
-            hosts: vec!["h1.corp.local".into(), "h2.corp.local".into()],
-            spns: vec!["HTTP/h1.corp.local".into()],
-            site: "GBLON".into(),
-        }))
+        let Ok(_) = gmsa_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(GmsaCreateRequest {
+                name: name.clone(),
+                hosts: vec!["h1.corp.local".into(), "h2.corp.local".into()],
+                spns: vec!["HTTP/h1.corp.local".into()],
+                site: "GBLON".into(),
+            }),
+        )
         .await
         else {
             panic!("gmsa_create failed");
         };
 
-        // First remove (2 -> 1) applies.
-        let first = crate::repos::gmsa_accounts::remove_host(pool, &name, "h1.corp.local")
-            .await
-            .expect("remove_host failed");
+        // First remove (2 -> 1) applies — commit so the change persists.
+        let first = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let o = crate::repos::gmsa_accounts::remove_host(&mut tx, &name, "h1.corp.local")
+                .await
+                .expect("remove_host failed");
+            if o == HostOpOutcome::Applied {
+                tx.commit().await.expect("commit tx");
+            }
+            o
+        };
         assert_eq!(
             first,
             HostOpOutcome::Applied,
@@ -45569,9 +45804,14 @@ mod gmsa_db_tests {
         );
 
         // Second remove must be rejected by the repo's locked last-host guard.
-        let second = crate::repos::gmsa_accounts::remove_host(pool, &name, "h2.corp.local")
-            .await
-            .expect("remove_host failed");
+        let second = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let o = crate::repos::gmsa_accounts::remove_host(&mut tx, &name, "h2.corp.local")
+                .await
+                .expect("remove_host failed");
+            // LastHost → tx drops (rollback) naturally.
+            o
+        };
         assert_eq!(
             second,
             HostOpOutcome::LastHost,
@@ -45579,9 +45819,13 @@ mod gmsa_db_tests {
         );
 
         // Removing a host that is not present is reported distinctly.
-        let absent = crate::repos::gmsa_accounts::remove_host(pool, &name, "nope.corp.local")
-            .await
-            .expect("remove_host failed");
+        let absent = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let o = crate::repos::gmsa_accounts::remove_host(&mut tx, &name, "nope.corp.local")
+                .await
+                .expect("remove_host failed");
+            o
+        };
         assert_eq!(absent, HostOpOutcome::HostNotPresent);
 
         cleanup(pool, &name).await;

@@ -233,8 +233,11 @@ pub async fn insert(pool: &PgPool, r: &ADComputer) -> Result<ADComputer, sqlx::E
 ///
 /// Returns `Ok(None)` when the row is absent or was concurrently modified;
 /// returns `Ok(Some((persisted, new_updated_at)))` on success.
+///
+/// Accepts any `sqlx::PgExecutor<'_>` (pool reference OR `&mut *tx`) so a
+/// handler can compose the mutation and an audit row in a single atomic tx.
 pub async fn transition(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     expected_status: &str,
     expected_updated_at: DateTime<Utc>,
     r: &ADComputer,
@@ -266,7 +269,7 @@ pub async fn transition(
     .bind(&metadata_json)
     .bind(expected_status)
     .bind(expected_updated_at)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|r| r.into_model()).transpose()

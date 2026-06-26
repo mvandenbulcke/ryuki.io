@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use ryuki_engine::access_recertification::{
     AccessReview, CampaignStatus, RecertificationCampaign, ReviewStatus, ReviewType,
 };
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── Column lists ─────────────────────────────────────────────────────────────
@@ -454,9 +454,13 @@ pub async fn exempt(
 // ─── Campaign repository functions ────────────────────────────────────────────
 
 /// Insert a new campaign. reviews_count and completed_count are computed from
-/// the access_reviews table by the caller or passed in directly.
+/// the access_reviews table at insert time so they reflect real data.
+///
+/// The caller owns the transaction: pass `conn = &mut *tx` and commit on success.
+/// All three queries (two COUNTs + INSERT) execute on the same connection so they
+/// are covered by the same atomic tx; the audit row is written before commit.
 pub async fn insert_campaign(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     campaign: &RecertificationCampaign,
 ) -> Result<RecertificationCampaign, sqlx::Error> {
     let start_date: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&campaign.start_date)
@@ -471,7 +475,7 @@ pub async fn insert_campaign(
     let (reviews_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM access_reviews WHERE review_type = $1")
             .bind(&review_type_str)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     let (completed_count,): (i64,) = sqlx::query_as(
@@ -479,7 +483,7 @@ pub async fn insert_campaign(
          WHERE review_type = $1 AND status IN ('Approved','Revoked','Exempted')",
     )
     .bind(&review_type_str)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     // Checked narrowing to the INT columns — never silently truncate a COUNT.
@@ -503,7 +507,7 @@ pub async fn insert_campaign(
     .bind(reviews_count)
     .bind(completed_count)
     .bind(campaign.status.to_string())
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     row.into_model()
@@ -964,9 +968,11 @@ mod access_recertification_db_tests {
         );
         let campaign_id = campaign.id.clone();
 
-        let inserted = insert_campaign(&pool, &campaign)
+        let mut tx = pool.begin().await.expect("begin tx");
+        let inserted = insert_campaign(&mut tx, &campaign)
             .await
             .expect("insert_campaign");
+        tx.commit().await.expect("commit tx");
         assert_eq!(inserted.name, "Test Campaign");
         assert_eq!(inserted.status, CampaignStatus::Active);
         // reviews_count computed from DB

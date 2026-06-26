@@ -385,8 +385,11 @@ pub async fn insert_permission(pool: &PgPool, r: &NTFSFolder) -> Result<NTFSFold
 /// Revoke (DELETE) an NTFS permission row identified by `(file_share_id, ad_group)`.
 /// Returns `Ok(Some(()))` if a row was deleted, `Ok(None)` if no matching row
 /// existed (caller → 404). Malformed `file_share_id` → `Ok(None)`.
+///
+/// Accepts any `sqlx::PgExecutor<'_>` (pool reference OR `&mut *tx`) so a
+/// handler can compose the deletion and an audit row in a single atomic tx.
 pub async fn revoke_permission(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     file_share_id: &str,
     ad_group: &str,
 ) -> Result<Option<()>, sqlx::Error> {
@@ -398,7 +401,7 @@ pub async fn revoke_permission(
         sqlx::query("DELETE FROM ntfs_permissions WHERE file_share_id = $1 AND ad_group = $2")
             .bind(uid)
             .bind(ad_group)
-            .execute(pool)
+            .execute(executor)
             .await?;
 
     if result.rows_affected() == 0 {
