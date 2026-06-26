@@ -26209,9 +26209,15 @@ async fn secrets_expiring(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 async fn secrets_rotate_all(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<SecretsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: this is a DESTRUCTIVE site-keyed write (force-rotate every due secret
+    // for a site). A scoped principal may only act on its own site — an
+    // out-of-scope or environment-scoped request is a 403, and an omitted site
+    // narrows to the principal's own scope. An unrestricted caller keeps the
+    // existing "" → require-an-explicit-site behavior (the empty-site 400 below).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
     if let Some(pool) = get_db() {
         if site.trim().is_empty() {
             return Err(status_400("site cannot be empty"));
@@ -26223,7 +26229,7 @@ async fn secrets_rotate_all(
              WHERE site = $1 AND status <> 'retired' \
                AND next_rotation_due::timestamptz <= now() ORDER BY id"
         ))
-        .bind(site)
+        .bind(&site)
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
@@ -26276,7 +26282,7 @@ async fn secrets_rotate_all(
             "rotations": rotations,
         })));
     }
-    secrets_rotation::force_rotate_all(site)
+    secrets_rotation::force_rotate_all(&site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -30613,6 +30619,33 @@ mod unit_tests {
             }),
             "an out-of-scope trail must be byte-identical to an unknown request's"
         );
+    }
+
+    #[tokio::test]
+    async fn secrets_rotate_all_denies_out_of_scope_and_env_scoped() {
+        // A DESTRUCTIVE site-keyed write: a GBLON-scoped principal must not be
+        // able to force-rotate DEFRA's secrets — 403 before any DB access.
+        let err = secrets_rotate_all(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Query(SecretsSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope force-rotate must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // Secrets have no environment axis, so an environment-scoped principal is
+        // denied rather than allowed to rotate across environments.
+        let err = secrets_rotate_all(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Query(SecretsSiteQuery {
+                site: Some("GBLON".into()),
+            }),
+        )
+        .await
+        .expect_err("an environment-scoped force-rotate must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
@@ -35643,9 +35676,12 @@ mod secrets_rotation_db_tests {
             panic!("due query failed");
         };
         assert!(!has(&due_after, id), "retired secret is excluded from due");
-        let Ok(Json(ra)) = secrets_rotate_all(Query(SecretsSiteQuery {
-            site: Some(site.into()),
-        }))
+        let Ok(Json(ra)) = secrets_rotate_all(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(SecretsSiteQuery {
+                site: Some(site.into()),
+            }),
+        )
         .await
         else {
             panic!("rotate-all failed");
@@ -35897,9 +35933,12 @@ mod secrets_rotation_db_tests {
         seed_secret(pool, id, site, "2020-01-01T00:00:00+00:00").await;
         assert_eq!(run_count_for(pool, id).await, 0, "fixture must start clean");
 
-        let result = secrets_rotate_all(Query(SecretsSiteQuery {
-            site: Some(site.to_string()),
-        }))
+        let result = secrets_rotate_all(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(SecretsSiteQuery {
+                site: Some(site.to_string()),
+            }),
+        )
         .await;
 
         let Ok(Json(body)) = &result else {
@@ -35944,9 +35983,12 @@ mod secrets_rotation_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let result = secrets_rotate_all(Query(SecretsSiteQuery {
-            site: Some("   ".to_string()),
-        }))
+        let result = secrets_rotate_all(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(SecretsSiteQuery {
+                site: Some("   ".to_string()),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for empty site, got Ok");
