@@ -110,8 +110,11 @@ pub fn status_str(s: &CertificateStatus) -> &'static str {
 /// defaults to NOW()'). We `RETURNING` the inserted row so the returned model
 /// carries the DB-authoritative `created_at` (the response then matches a
 /// subsequent `get`).
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
 pub async fn insert(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     r: &CertificateRecord,
 ) -> Result<CertificateRecord, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
@@ -143,7 +146,7 @@ pub async fn insert(
     .bind(&r.hostname)
     .bind(&r.site)
     .bind(status_str(&r.status))
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model()
@@ -191,8 +194,11 @@ pub async fn list(pool: &PgPool) -> Result<Vec<CertificateRecord>, sqlx::Error> 
 ///
 /// `_audit_action` is accepted for signature parity with the snapshots template
 /// but is intentionally unused — certificates have no audit table.
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
 pub async fn transition(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     expected_status: &str,
     expected_valid_to: &str,
     r: &CertificateRecord,
@@ -243,7 +249,7 @@ pub async fn transition(
     .bind(status_str(&r.status))
     .bind(expected_status)
     .bind(expected_valid_to)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|row| row.into_model()).transpose()

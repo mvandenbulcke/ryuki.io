@@ -19744,7 +19744,10 @@ async fn app_env_contract() -> Json<Value> {
 
 // ─── Certificate lifecycle handlers ───
 
-async fn certificates_request(Json(body): Json<CertificateRequestRequest>) -> ApiResult {
+async fn certificates_request(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<CertificateRequestRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = certificate_lifecycle::CertificateRequest {
@@ -19760,9 +19763,27 @@ async fn certificates_request(Json(body): Json<CertificateRequestRequest>) -> Ap
 
     // The engine already mints a valid UUID (Uuid::new_v4().to_string()), so no
     // id replacement is needed here (unlike engines that use human-readable ids).
-    let persisted = crate::repos::certificates::insert(pool, &record)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::certificates::insert(&mut *tx, &record)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "certificate-request",
+            None,
+            "requested",
+            json!({
+                "cert_id": persisted.id,
+                "common_name": persisted.common_name,
+                "site": persisted.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -19819,6 +19840,7 @@ async fn certificates_verify(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn certificates_renew(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<CertificateRenewRequest>,
 ) -> ApiResult {
@@ -19841,16 +19863,37 @@ async fn certificates_renew(
     let renewed = certificate_lifecycle::renew_certificate(&cert, body.validity_days)
         .map_err(|e| status_400(&e))?;
 
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let persisted =
-        crate::repos::certificates::transition(pool, before, &cert.valid_to, &renewed, None)
+        crate::repos::certificates::transition(&mut *tx, before, &cert.valid_to, &renewed, None)
             .await
             .map_err(db_error)?
             .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "certificate-renew",
+            Some(before),
+            "renewed",
+            json!({
+                "cert_id": cert.id,
+                "common_name": cert.common_name,
+                "site": cert.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn certificates_revoke(Path(id): Path<String>) -> ApiResult {
+async fn certificates_revoke(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let cert = crate::repos::certificates::get(pool, &id)
@@ -19863,11 +19906,29 @@ async fn certificates_revoke(Path(id): Path<String>) -> ApiResult {
     // Engine guard: returns Err if already revoked → 409.
     let revoked = certificate_lifecycle::revoke_certificate(&cert).map_err(|e| status_409(&e))?;
 
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let persisted =
-        crate::repos::certificates::transition(pool, before, &cert.valid_to, &revoked, None)
+        crate::repos::certificates::transition(&mut *tx, before, &cert.valid_to, &revoked, None)
             .await
             .map_err(db_error)?
             .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "certificate-revoke",
+            Some(before),
+            "revoked",
+            json!({
+                "cert_id": cert.id,
+                "common_name": cert.common_name,
+                "site": cert.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -43903,7 +43964,12 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
 
@@ -43942,13 +44008,19 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
         let original_valid_to = created["valid_to"].as_str().expect("valid_to").to_string();
 
         let Ok(Json(renewed)) = certificates_renew(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 730 }),
         )
@@ -43988,16 +44060,54 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Ok(Json(revoked)) = certificates_revoke(Path(id.clone())).await else {
+        // #7 audit: the certificate request wrote a durable audit row.
+        let request_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'certificate-request' AND detail->>'cert_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query request audit");
+        assert!(
+            request_audited,
+            "certificate request must write a durable audit row"
+        );
+
+        let Ok(Json(revoked)) = certificates_revoke(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("certificates_revoke failed");
         };
         assert_eq!(revoked["status"], "Revoked");
+
+        // #7 audit: the revoke wrote a durable audit row, atomic with the CAS.
+        let revoke_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'certificate-revoke' AND detail->>'cert_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query revoke audit");
+        assert!(
+            revoke_audited,
+            "certificate revoke must write a durable audit row"
+        );
 
         let record = crate::repos::certificates::get(pool, &id)
             .await
@@ -44023,19 +44133,35 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // First revoke — must succeed.
-        if certificates_revoke(Path(id.clone())).await.is_err() {
+        if certificates_revoke(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .is_err()
+        {
             cleanup(pool, &id).await;
             panic!("first revoke failed");
         }
 
         // Second revoke — must be 409.
-        let Err((status, _)) = certificates_revoke(Path(id.clone())).await else {
+        let Err((status, _)) = certificates_revoke(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("expected second revoke to be rejected");
         };
@@ -44060,7 +44186,12 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -44076,7 +44207,13 @@ mod certificates_db_tests {
         );
 
         // Advance it to Revoked through the normal path.
-        if certificates_revoke(Path(id.clone())).await.is_err() {
+        if certificates_revoke(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .is_err()
+        {
             cleanup(pool, &id).await;
             panic!("certificates_revoke failed");
         }
@@ -44115,7 +44252,12 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -44133,6 +44275,7 @@ mod certificates_db_tests {
         // Renew once through the normal path — advances valid_to to V1, status
         // stays Active.
         if certificates_renew(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 730 }),
         )
@@ -44168,17 +44311,29 @@ mod certificates_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = certificates_request(Json(request_body(&suffix))).await else {
+        let Ok(Json(created)) = certificates_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(request_body(&suffix)),
+        )
+        .await
+        else {
             panic!("certificates_request failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        if certificates_revoke(Path(id.clone())).await.is_err() {
+        if certificates_revoke(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .is_err()
+        {
             cleanup(pool, &id).await;
             panic!("revoke failed");
         }
 
         let Err((status, _)) = certificates_renew(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(CertificateRenewRequest { validity_days: 365 }),
         )
