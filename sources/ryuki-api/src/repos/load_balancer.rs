@@ -457,7 +457,7 @@ pub async fn provision_lb(
 /// Add a pool member. Returns Ok(pool_id) on success.
 /// Unique violation (pool_id, hostname PK) → caller maps to 409.
 pub async fn add_pool_member(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     pool_id: &str,
     member: &PoolMember,
 ) -> Result<(), sqlx::Error> {
@@ -471,7 +471,7 @@ pub async fn add_pool_member(
     .bind(i32::from(member.port))
     .bind(i32::from(member.weight))
     .bind(enum_to_db(&member.status))
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -479,14 +479,14 @@ pub async fn add_pool_member(
 /// Remove a pool member by (pool_id, hostname).
 /// Returns Ok(true) when deleted, Ok(false) when absent.
 pub async fn remove_pool_member(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     pool_id: &str,
     hostname: &str,
 ) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("DELETE FROM lb_pool_members WHERE pool_id = $1 AND hostname = $2")
         .bind(pool_id)
         .bind(hostname)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -494,7 +494,7 @@ pub async fn remove_pool_member(
 /// Update a virtual server's status (free set — no from-state guard).
 /// Returns Ok(Some(vs)) on success, Ok(None) when vs absent.
 pub async fn update_vs_status(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     status: &VirtualServerStatus,
 ) -> Result<Option<LbVirtualServer>, sqlx::Error> {
@@ -505,7 +505,7 @@ pub async fn update_vs_status(
     ))
     .bind(id)
     .bind(enum_to_db(status))
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.map(|r| r.into_model()).transpose()
 }
@@ -520,7 +520,7 @@ pub async fn update_vs_status(
 /// exists.
 #[allow(clippy::too_many_arguments)]
 pub async fn update_virtual_server(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     port: Option<u16>,
     protocol: Option<&LbProtocol>,
@@ -544,7 +544,7 @@ pub async fn update_virtual_server(
     .bind(persistence.map(enum_to_db))
     .bind(update_ssl)
     .bind(ssl_value)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     row.map(|r| r.into_model()).transpose()
 }
@@ -555,12 +555,14 @@ pub async fn update_virtual_server(
 /// (its FK insert takes a KEY SHARE lock on the pool row, which conflicts), so
 /// the orphan check cannot race. The pool is deleted only if no other VS still
 /// references it (members cascade). Returns `false` when the VS did not exist.
-pub async fn delete_virtual_server(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+pub async fn delete_virtual_server(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+) -> Result<bool, sqlx::Error> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT pool_id FROM lb_virtual_servers WHERE id = $1 FOR UPDATE")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut *conn)
             .await?;
     let Some((pool_id,)) = row else {
         return Ok(false);
@@ -569,11 +571,11 @@ pub async fn delete_virtual_server(pool: &PgPool, id: &str) -> Result<bool, sqlx
     // serializes against our orphan check below.
     sqlx::query("SELECT id FROM lb_pools WHERE id = $1 FOR UPDATE")
         .bind(&pool_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     sqlx::query("DELETE FROM lb_virtual_servers WHERE id = $1")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     // Drop the backing pool only when nothing references it anymore.
     sqlx::query(
@@ -581,9 +583,8 @@ pub async fn delete_virtual_server(pool: &PgPool, id: &str) -> Result<bool, sqlx
          AND NOT EXISTS (SELECT 1 FROM lb_virtual_servers WHERE pool_id = $1)",
     )
     .bind(&pool_id)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(true)
 }
 
@@ -874,7 +875,12 @@ mod load_balancer_db_tests {
         );
 
         // DELETE removes the VS and orphan-cleans the (now unreferenced) pool.
-        assert!(delete_virtual_server(&db, &vs_id).await.expect("delete"));
+        let mut tx = db.begin().await.expect("begin");
+        let deleted = delete_virtual_server(&mut tx, &vs_id)
+            .await
+            .expect("delete");
+        tx.commit().await.expect("commit");
+        assert!(deleted);
         assert!(
             get_virtual_server(&db, &vs_id)
                 .await
@@ -889,9 +895,12 @@ mod load_balancer_db_tests {
             .unwrap();
         assert!(pool_gone.is_none(), "the orphaned pool was cleaned");
         // Deleting an absent VS returns false, not an error.
-        assert!(!delete_virtual_server(&db, &vs_id)
+        let mut tx = db.begin().await.expect("begin");
+        let deleted_absent = delete_virtual_server(&mut tx, &vs_id)
             .await
-            .expect("delete-absent"));
+            .expect("delete-absent");
+        tx.commit().await.expect("commit");
+        assert!(!deleted_absent);
 
         sqlx::query("DELETE FROM lb_requests WHERE id = $1")
             .bind(&req_id)

@@ -28180,6 +28180,7 @@ struct LbVsUpdateRequest {
 /// PUT /api/network/loadbalancer/vs/{id} — update a VS's structural fields
 /// (validated through the pure engine parsers). 404 when unknown; 503 when no DB.
 async fn lb_vs_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<LbVsUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -28206,8 +28207,9 @@ async fn lb_vs_update(
         Some(s) => (true, Some(s)),
     };
 
+    let mut tx = db.begin().await.map_err(db_error)?;
     let updated = crate::repos::load_balancer::update_virtual_server(
-        db,
+        &mut *tx,
         &id,
         port,
         protocol.as_ref(),
@@ -28218,6 +28220,14 @@ async fn lb_vs_update(
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit("lb-vs-update", None, "updated", json!({ "vs_id": &id })),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &updated.pool_id)
         .await
@@ -28230,14 +28240,31 @@ async fn lb_vs_update(
 
 /// DELETE /api/network/loadbalancer/vs/{id} — decommission a VS (and orphan-clean
 /// its backing pool). 404 when unknown; 503 when no DB.
-async fn lb_vs_delete(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn lb_vs_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
-    let deleted = crate::repos::load_balancer::delete_virtual_server(db, &id)
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let deleted = crate::repos::load_balancer::delete_virtual_server(&mut tx, &id)
         .await
         .map_err(db_error)?;
     if !deleted {
         return Err(status_404(&id));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "lb-vs-delete",
+            Some("active"),
+            "deleted",
+            json!({ "vs_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "db",
         "deleted": true,
@@ -28245,6 +28272,7 @@ async fn lb_vs_delete(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
     })))
 }
 async fn lb_pool_member_add(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<LbMemberRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -28260,7 +28288,7 @@ async fn lb_pool_member_add(
 
     let db = get_db().ok_or_else(status_503_no_db)?;
 
-    // Resolve VS → pool_id
+    // Resolve VS → pool_id (read before mutation tx)
     let vs = crate::repos::load_balancer::get_virtual_server(db, &id)
         .await
         .map_err(db_error)?
@@ -28275,7 +28303,8 @@ async fn lb_pool_member_add(
         status: ryuki_engine::load_balancer::PoolMemberStatus::Up,
     };
 
-    crate::repos::load_balancer::add_pool_member(db, &pool_id, &member)
+    let mut tx = db.begin().await.map_err(db_error)?;
+    crate::repos::load_balancer::add_pool_member(&mut *tx, &pool_id, &member)
         .await
         .map_err(|e| {
             if e.as_database_error()
@@ -28290,8 +28319,21 @@ async fn lb_pool_member_add(
                 db_error(e)
             }
         })?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "lb-pool-member-add",
+            None,
+            "added",
+            json!({ "vs_id": &id, "hostname": &member.hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
-    // Return updated member count
+    // Return updated member count (post-commit read)
     let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &pool_id)
         .await
         .map_err(db_error)?;
@@ -28307,17 +28349,20 @@ async fn lb_pool_member_add(
     })))
 }
 async fn lb_pool_member_remove(
+    AuthExtractor(session): AuthExtractor,
     Path((id, hostname)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
 
+    // Resolve VS → pool_id (read before mutation tx)
     let vs = crate::repos::load_balancer::get_virtual_server(db, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     let pool_id = vs.pool_id.clone();
 
-    let removed = crate::repos::load_balancer::remove_pool_member(db, &pool_id, &hostname)
+    let mut tx = db.begin().await.map_err(db_error)?;
+    let removed = crate::repos::load_balancer::remove_pool_member(&mut *tx, &pool_id, &hostname)
         .await
         .map_err(db_error)?;
 
@@ -28327,7 +28372,21 @@ async fn lb_pool_member_remove(
             hostname, id
         )));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "lb-pool-member-remove",
+            None,
+            "removed",
+            json!({ "vs_id": &id, "hostname": &hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
+    // Return updated member count (post-commit read)
     let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &pool_id)
         .await
         .map_err(db_error)?;
@@ -28342,16 +28401,28 @@ async fn lb_pool_member_remove(
         "member_count": member_count
     })))
 }
-async fn lb_vs_drain(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn lb_vs_drain(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
-        db,
+        &mut *tx,
         &id,
         &ryuki_engine::load_balancer::VirtualServerStatus::Draining,
     )
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit("lb-vs-drain", None, "draining", json!({ "vs_id": &id })),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "db",
         "action": "drain-virtual-server",
@@ -28360,16 +28431,28 @@ async fn lb_vs_drain(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
         "new_connections": "stopped"
     })))
 }
-async fn lb_vs_disable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn lb_vs_disable(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
-        db,
+        &mut *tx,
         &id,
         &ryuki_engine::load_balancer::VirtualServerStatus::Offline,
     )
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit("lb-vs-disable", None, "disabled", json!({ "vs_id": &id })),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "db",
         "action": "disable-virtual-server",
@@ -28378,16 +28461,28 @@ async fn lb_vs_disable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
         "new_connections": "allowed"
     })))
 }
-async fn lb_vs_enable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn lb_vs_enable(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
-        db,
+        &mut *tx,
         &id,
         &ryuki_engine::load_balancer::VirtualServerStatus::Online,
     )
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit("lb-vs-enable", None, "enabled", json!({ "vs_id": &id })),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "db",
         "action": "enable-virtual-server",
@@ -34295,6 +34390,47 @@ mod db_lifecycle_tests {
             detail.contains("auth_mode"),
             "audit records the config keys"
         );
+    }
+
+    /// #7 audit: lb_vs_drain (a load-balancer VS status mutation) writes a
+    /// durable audit row. Drains a migration-seeded VS, then re-enables it to
+    /// restore the fixture status.
+    #[tokio::test]
+    async fn test_lb_vs_drain_writes_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let vs_id = "vs-defra-web"; // seeded by migration 072
+        let res = lb_vs_drain(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(vs_id.to_string()),
+        )
+        .await;
+        let drained_ok = res.is_ok();
+        // Only meaningful when the drain itself succeeded.
+        let audited = if drained_ok {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM audit_log \
+                 WHERE action = 'lb-vs-drain' AND detail->>'vs_id' = $1)",
+            )
+            .bind(vs_id)
+            .fetch_one(pool)
+            .await
+            .expect("query audit")
+        } else {
+            false
+        };
+        // Restore the seeded VS to enabled before asserting, so a failed
+        // assertion never leaves the fixture draining.
+        let _ = lb_vs_enable(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(vs_id.to_string()),
+        )
+        .await;
+        assert!(drained_ok, "lb_vs_drain must succeed: {res:?}");
+        assert!(audited, "lb_vs_drain must write a durable audit row");
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
