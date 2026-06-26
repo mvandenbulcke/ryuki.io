@@ -23521,20 +23521,30 @@ async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn dns_record_delete(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let result = sqlx::query("DELETE FROM dns_records WHERE id = $1")
-            .bind(&id)
-            .execute(pool)
-            .await
-            .map_err(db_error)?;
-        if result.rows_affected() == 0 {
+        // #2: the DELETE itself loads the authoritative site (RETURNING site) and
+        // the scope guard runs inside the SAME transaction, so a concurrent
+        // re-home cannot slip an out-of-scope delete through — the row the DELETE
+        // removed is exactly the one whose site is checked, and a 403 (or 404)
+        // drops the tx and rolls the delete back.
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let deleted: Option<(String,)> =
+            sqlx::query_as("DELETE FROM dns_records WHERE id = $1 RETURNING site")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let Some((site,)) = deleted else {
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("DNS record '{}' not found", id)})),
             ));
-        }
+        };
+        guard_body_site_scope(&session, &site)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "deleted": true,
@@ -23562,15 +23572,20 @@ struct DnsUpdateRequest {
 /// through the same pure engine builder as create, so an invalid type/value/ttl
 /// is a 400. DB-backed: a record must be persisted to be updated.
 async fn dns_record_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<DnsUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: lock the row FOR UPDATE and guard its site inside ONE transaction, so a
+    // concurrent re-home cannot slip an out-of-scope update through the window
+    // between the load and the write. A 403/404/400 drops the tx (rollback).
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let existing: DnsRecordRow = sqlx::query_as(&format!(
-        "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
+        "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1 FOR UPDATE"
     ))
     .bind(&id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?
     .ok_or_else(|| {
@@ -23579,6 +23594,7 @@ async fn dns_record_update(
             Json(json!({"error": format!("DNS record '{}' not found", id)})),
         )
     })?;
+    guard_body_site_scope(&session, &existing.site)?;
 
     let new_type = b.record_type.as_deref().unwrap_or(&existing.record_type);
     let new_value = b.value.as_deref().unwrap_or(&existing.value);
@@ -23604,7 +23620,7 @@ async fn dns_record_update(
     .bind(validated.ttl as i32)
     .bind(dns_status_str(&validated.status))
     .bind(&id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
 
@@ -23612,9 +23628,10 @@ async fn dns_record_update(
         "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
     ))
     .bind(&id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(
         json!({"source": "database", "record": updated.to_json()}),
     ))
@@ -33462,6 +33479,7 @@ mod dns_records_db_tests {
         let id = created["record"]["id"].as_str().expect("id").to_string();
 
         let Json(updated) = dns_record_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(DnsUpdateRequest {
                 value: Some("10.0.0.99".into()),
@@ -33478,6 +33496,7 @@ mod dns_records_db_tests {
 
         // A bad value is a 400 (re-validated through the engine builder).
         let bad = dns_record_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(DnsUpdateRequest {
                 value: Some(String::new()),
@@ -33490,6 +33509,7 @@ mod dns_records_db_tests {
 
         // Updating a missing record is a 404.
         let missing = dns_record_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path("dns-nonexistent".into()),
             Json(DnsUpdateRequest {
                 value: Some("1.1.1.1".into()),
