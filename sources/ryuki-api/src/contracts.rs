@@ -24291,6 +24291,7 @@ async fn firewall_rule_get(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn firewall_rule_delete(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -24300,18 +24301,23 @@ async fn firewall_rule_delete(
         // the engine's in-memory delete_rule, which already retain()s the id out
         // of the static rule-sets.
         let mut tx = pool.begin().await.map_err(db_error)?;
-        let result = sqlx::query("DELETE FROM firewall_rules WHERE id = $1")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_error)?;
-        if result.rows_affected() == 0 {
+        // #2: the DELETE carries `RETURNING site` so the authoritative site is
+        // loaded atomically with the removal; the scope guard runs before the
+        // cascade + commit, and a 403 drops the tx (the delete is rolled back).
+        let deleted: Option<String> =
+            sqlx::query_scalar("DELETE FROM firewall_rules WHERE id = $1 RETURNING site")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let Some(site) = deleted else {
             tx.rollback().await.ok();
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Firewall rule '{}' not found", id)})),
             ));
-        }
+        };
+        guard_body_site_scope(&session, &site)?;
         // Cascade: rebuild rule_set_json.rules without the deleted id, only for
         // rule-sets that actually reference it (the ids live inside the JSONB
         // array at $.rules). jsonb_exists guards the WHERE so unaffected rule-sets
@@ -24345,6 +24351,7 @@ async fn firewall_rule_delete(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn firewall_rule_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<FwUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -24368,19 +24375,38 @@ async fn firewall_rule_update(
                 ))
             }
         };
+        // #2: lock the row and guard its site inside ONE tx BEFORE the update, so
+        // a concurrent re-home cannot slip an out-of-scope update through.
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let locked: Option<(String,)> =
+            sqlx::query_as("SELECT site FROM firewall_rules WHERE id = $1 FOR UPDATE")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let Some((site,)) = locked else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Firewall rule '{}' not found", id)})),
+            ));
+        };
+        guard_body_site_scope(&session, &site)?;
         let sql = format!(
             "UPDATE firewall_rules SET {col} = $2 WHERE id = $1 RETURNING {FIREWALL_COLUMNS}"
         );
         let row: Option<FirewallRuleRow> = sqlx::query_as(&sql)
             .bind(&id)
             .bind(&val)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
         return match row {
-            Some(updated) => Ok(Json(
-                json!({"source": "database", "rule": updated.to_json()}),
-            )),
+            Some(updated) => {
+                tx.commit().await.map_err(db_error)?;
+                Ok(Json(
+                    json!({"source": "database", "rule": updated.to_json()}),
+                ))
+            }
             None => Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Firewall rule '{}' not found", id)})),
@@ -39638,9 +39664,12 @@ mod firewall_rules_db_tests {
             .expect("insert rule-set");
 
         // 3. Delete the rule.
-        let _ = firewall_rule_delete(Path(rule_id.clone()))
-            .await
-            .expect("delete rule");
+        let _ = firewall_rule_delete(
+            AuthExtractor(approver_session("fw-user")),
+            Path(rule_id.clone()),
+        )
+        .await
+        .expect("delete rule");
 
         // 4. The deleted id is gone from the rule-set; the unrelated id remains.
         let (rs, _v) = crate::repos::firewall_rule_sets::get(pool, &rs_id)
@@ -39691,7 +39720,13 @@ mod firewall_rules_db_tests {
         let update = FwUpdateRequest {
             action: "deny".into(),
         };
-        let Ok(Json(updated)) = firewall_rule_update(Path(id.clone()), Json(update)).await else {
+        let Ok(Json(updated)) = firewall_rule_update(
+            AuthExtractor(approver_session("fw-user")),
+            Path(id.clone()),
+            Json(update),
+        )
+        .await
+        else {
             panic!("update failed");
         };
         // DB path returns {"source": "database", "rule": {...}}
@@ -39745,7 +39780,10 @@ mod firewall_rules_db_tests {
             .unwrap_or_else(|| created["id"].as_str().expect("id"))
             .to_string();
 
-        let Ok(_) = firewall_rule_delete(Path(id.clone())).await else {
+        let Ok(_) =
+            firewall_rule_delete(AuthExtractor(approver_session("fw-user")), Path(id.clone()))
+                .await
+        else {
             panic!("delete failed");
         };
 
