@@ -11059,6 +11059,7 @@ async fn aiops_implement(
 }
 
 async fn aiops_type(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<AiopsTypeQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Convert display form (e.g. "right-sizing") to DB form (e.g. "RightSizing")
@@ -11090,6 +11091,8 @@ async fn aiops_type(
             .map_err(db_error)?,
         None => vec![],
     };
+    // #2: a scoped principal sees only its own site's suggestions (env-scoped → none).
+    let suggestions = retain_site_scoped(&session, suggestions, |s| s.site.as_str());
     Ok(Json(aiops::get_suggestions_by_type(
         &params.suggestion_type,
         &suggestions,
@@ -18791,6 +18794,30 @@ fn guard_body_site_scope(
     }
 }
 
+/// Retain only the list-all rows a principal may see (#2): unrestricted keeps
+/// all rows; a site-scoped principal keeps only its own site's rows; an
+/// environment-scoped principal keeps NONE — these list-all resources are
+/// site-only, so an environment scope cannot be honored and we fail closed to an
+/// empty result rather than leak every site. For the no-param "list everything"
+/// reads that have no `?site` to narrow.
+fn retain_site_scoped<T>(
+    session: &AuthSession,
+    rows: Vec<T>,
+    site_of: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    use ryuki_engine::auth::scope_permits;
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+    {
+        return Vec::new();
+    }
+    rows.into_iter()
+        .filter(|r| scope_permits(&session.site_scope, Some(site_of(r))))
+        .collect()
+}
+
 /// Body-scope guard for a DUAL-axis WRITE (#2): a scoped principal may only
 /// create/act on a resource whose site AND environment are both within its
 /// scope (e.g. a Kubernetes namespace, which is keyed on both). Reports the
@@ -21244,13 +21271,15 @@ async fn repo_capacity_forecast(
     }
 }
 
-async fn repo_capacity_at_risk() -> ApiResult {
+async fn repo_capacity_at_risk(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let repos = match get_db() {
         Some(pool) => crate::repos::repository_capacity::list_all(pool)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal sees only its own site's repos (env-scoped → none).
+    let repos = retain_site_scoped(&session, repos, |r| &r.site);
     Ok(Json(repository_capacity::get_at_risk(&repos)))
 }
 
@@ -21354,8 +21383,10 @@ async fn hardware_inventory(
     Ok(Json(serde_json::to_value(assets).unwrap_or_default()))
 }
 
-async fn hardware_warranty_expiring() -> ApiResult {
+async fn hardware_warranty_expiring(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let assets = hardware_assets_or_empty("").await?;
+    // #2: a scoped principal sees only its own site's assets (env-scoped → none).
+    let assets = retain_site_scoped(&session, assets, |a| &a.site);
     let expiring = hardware_lifecycle::get_warranty_expiring(&assets);
     Ok(Json(serde_json::to_value(expiring).unwrap_or_default()))
 }
@@ -26633,7 +26664,9 @@ async fn secrets_rotation_history(
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
-async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn secrets_due_rotations(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let rows: Vec<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets \
@@ -26643,6 +26676,8 @@ async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
+        // #2: a scoped principal sees only its own site's secrets (env-scoped → none).
+        let rows = retain_site_scoped(&session, rows, |r| &r.site);
         let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
         return Ok(Json(json!({
             "source": "database",
@@ -26656,6 +26691,7 @@ async fn secrets_due_rotations() -> Result<Json<Value>, (StatusCode, Json<Value>
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 async fn secrets_expiring(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<SecretsExpiringQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let days = q.days.unwrap_or(30);
@@ -26671,6 +26707,8 @@ async fn secrets_expiring(
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
+        // #2: a scoped principal sees only its own site's secrets (env-scoped → none).
+        let rows = retain_site_scoped(&session, rows, |r| &r.site);
         let secrets: Vec<Value> = rows.iter().map(ManagedSecretRow::to_value).collect();
         return Ok(Json(json!({
             "source": "database",
@@ -27290,13 +27328,17 @@ async fn datacenter_site_report_endpoint(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn datacenter_failing_checks_endpoint() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn datacenter_failing_checks_endpoint(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_all(pool)
             .await
             .map_err(db_error)?,
         None => vec![],
     };
+    // #2: a scoped principal sees only its own site's checks (env-scoped → none).
+    let checks = retain_site_scoped(&session, checks, |c| &c.site);
     datacenter_readiness::get_failing_checks(&checks)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
@@ -27387,13 +27429,17 @@ async fn datacenter_full_readiness_endpoint(
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 
-async fn datacenter_sites_endpoint() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn datacenter_sites_endpoint(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_all(pool)
             .await
             .map_err(db_error)?,
         None => vec![],
     };
+    // #2: a scoped principal sees only its own site (env-scoped → none).
+    let checks = retain_site_scoped(&session, checks, |c| &c.site);
     datacenter_readiness::get_sites(&checks)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
@@ -31456,6 +31502,39 @@ mod unit_tests {
         .await
         .expect_err("an environment-scoped principal must be 403");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn retain_site_scoped_filters_list_all_rows() {
+        #[derive(Clone)]
+        struct Row {
+            site: String,
+        }
+        let rows = || {
+            vec![
+                Row {
+                    site: "GBLON".into(),
+                },
+                Row {
+                    site: "DEFRA".into(),
+                },
+            ]
+        };
+        // Unrestricted → all rows.
+        assert_eq!(
+            retain_site_scoped(&AuthSession::static_dry_run(), rows(), |r| &r.site).len(),
+            2
+        );
+        // Site-scoped → only the principal's own site.
+        let kept = retain_site_scoped(&scoped_session(&["GBLON"], &[]), rows(), |r| &r.site);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].site, "GBLON");
+        // Environment-scoped → NONE (these list-all resources are site-only, so an
+        // environment scope cannot be honored — fail closed to empty, never leak).
+        assert!(
+            retain_site_scoped(&scoped_session(&[], &["production"]), rows(), |r| &r.site)
+                .is_empty()
+        );
     }
 
     // ── swarm #14: auth bodies reject unknown fields (no silent field-drop) ──
@@ -36488,7 +36567,9 @@ mod secrets_rotation_db_tests {
         };
 
         // Due before retiring.
-        let Ok(Json(due_before)) = secrets_due_rotations().await else {
+        let Ok(Json(due_before)) =
+            secrets_due_rotations(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             cleanup_secret(pool, id).await;
             panic!("due query failed");
         };
@@ -36509,7 +36590,9 @@ mod secrets_rotation_db_tests {
         );
 
         // No longer due; rotate-all for the site skips it.
-        let Ok(Json(due_after)) = secrets_due_rotations().await else {
+        let Ok(Json(due_after)) =
+            secrets_due_rotations(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             panic!("due query failed");
         };
         assert!(!has(&due_after, id), "retired secret is excluded from due");
@@ -36554,7 +36637,9 @@ mod secrets_rotation_db_tests {
             Some("retired"),
             "failing a run must NOT un-retire the secret"
         );
-        let Ok(Json(due_post_fail)) = secrets_due_rotations().await else {
+        let Ok(Json(due_post_fail)) =
+            secrets_due_rotations(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             panic!("due query failed");
         };
         assert!(
@@ -43777,7 +43862,9 @@ mod hardware_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // Our asset (warranty now+45d <= now+90d) must appear in warranty-expiring.
-        let Ok(Json(expiring)) = hardware_warranty_expiring().await else {
+        let Ok(Json(expiring)) =
+            hardware_warranty_expiring(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             cleanup(pool, &id).await;
             panic!("hardware_warranty_expiring failed");
         };
