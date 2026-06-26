@@ -19206,7 +19206,10 @@ async fn request_site_env(request_id: &str) -> Result<Option<(String, String)>, 
         .map(|r| (r.site.clone(), r.environment.clone())))
 }
 
-async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResult {
+async fn decommission_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<DecommissionPlanRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let server_type = match body.server_type.as_str() {
@@ -19230,9 +19233,27 @@ async fn decommission_plan(Json(body): Json<DecommissionPlanRequest>) -> ApiResu
     // proper UUID so the repo can bind it correctly.
     req.id = Uuid::new_v4().to_string();
 
-    crate::repos::decommissions::insert(pool, &req)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::decommissions::insert(&mut *tx, &req)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "decommission-plan",
+            None,
+            "created",
+            json!({
+                "decommission_id": req.id,
+                "server_name": req.server_name,
+                "site": req.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&req).unwrap_or_default()))
 }
@@ -19276,17 +19297,38 @@ async fn decommission_approve(
     let approved = server_decommission::approve_decommission(&req, &session.user_id)
         .map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::decommissions::transition(pool, before, &approved, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::decommissions::transition(&mut tx, before, &approved, None)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "decommission-approve",
+            Some(before),
+            "approved",
+            json!({
+                "decommission_id": approved.id,
+                "server_name": approved.server_name,
+                "site": approved.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
 }
 
-async fn decommission_quarantine(Path(id): Path<String>) -> ApiResult {
+async fn decommission_quarantine(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -19298,18 +19340,39 @@ async fn decommission_quarantine(Path(id): Path<String>) -> ApiResult {
 
     let quarantined = server_decommission::quarantine_server(&req).map_err(|e| status_409(&e))?;
 
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let ok =
-        crate::repos::decommissions::transition(pool, before, &quarantined, Some("quarantine"))
+        crate::repos::decommissions::transition(&mut tx, before, &quarantined, Some("quarantine"))
             .await
             .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "decommission-quarantine",
+            Some(before),
+            "quarantined",
+            json!({
+                "decommission_id": quarantined.id,
+                "server_name": quarantined.server_name,
+                "site": quarantined.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&quarantined).unwrap_or_default()))
 }
 
-async fn decommission_execute(Path(id): Path<String>) -> ApiResult {
+async fn decommission_execute(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -19321,12 +19384,30 @@ async fn decommission_execute(Path(id): Path<String>) -> ApiResult {
 
     let executed = server_decommission::execute_decommission(&req).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::decommissions::transition(pool, before, &executed, Some("execute"))
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::decommissions::transition(&mut tx, before, &executed, Some("execute"))
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "decommission-execute",
+            Some(before),
+            "executed",
+            json!({
+                "decommission_id": executed.id,
+                "server_name": executed.server_name,
+                "site": executed.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
@@ -19346,7 +19427,10 @@ async fn decommission_verify(Path(id): Path<String>) -> ApiResult {
         .map_err(|e| status_400(&e))
 }
 
-async fn decommission_rollback(Path(id): Path<String>) -> ApiResult {
+async fn decommission_rollback(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
@@ -19359,12 +19443,31 @@ async fn decommission_rollback(Path(id): Path<String>) -> ApiResult {
     let rolled_back =
         server_decommission::rollback_decommission(&req).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::decommissions::transition(pool, before, &rolled_back, Some("rollback"))
-        .await
-        .map_err(db_error)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok =
+        crate::repos::decommissions::transition(&mut tx, before, &rolled_back, Some("rollback"))
+            .await
+            .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "decommission-rollback",
+            Some(before),
+            "rolled-back",
+            json!({
+                "decommission_id": rolled_back.id,
+                "server_name": rolled_back.server_name,
+                "site": rolled_back.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&rolled_back).unwrap_or_default()))
 }
@@ -42340,7 +42443,9 @@ mod server_decommission_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let body = plan_body(&suffix);
 
-        let Ok(Json(created)) = decommission_plan(Json(body)).await else {
+        let Ok(Json(created)) =
+            decommission_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        else {
             panic!("plan failed");
         };
 
@@ -42380,7 +42485,12 @@ mod server_decommission_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
 
         // 1. plan
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -42405,7 +42515,12 @@ mod server_decommission_db_tests {
         assert_eq!(got["status"].as_str().unwrap_or(""), "Approved");
 
         // 3. quarantine
-        let Ok(Json(quarantined)) = decommission_quarantine(Path(id.clone())).await else {
+        let Ok(Json(quarantined)) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
         };
@@ -42418,11 +42533,31 @@ mod server_decommission_db_tests {
         assert_eq!(got["status"].as_str().unwrap_or(""), "Quarantined");
 
         // 4. execute
-        let Ok(Json(executed)) = decommission_execute(Path(id.clone())).await else {
+        let Ok(Json(executed)) = decommission_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("execute failed");
         };
         assert_eq!(executed["status"].as_str().unwrap_or(""), "Executed");
+
+        // #7 audit: the IRREVERSIBLE execute wrote a durable audit row, atomic
+        // with the CAS transition.
+        let execute_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'decommission-execute' AND detail->>'decommission_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query execute audit");
+        assert!(
+            execute_audited,
+            "decommission execute must write a durable audit row"
+        );
 
         let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
             cleanup(pool, &id).await;
@@ -42483,7 +42618,12 @@ mod server_decommission_db_tests {
         let server_name = format!("srv-{suffix}");
 
         // plan
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -42497,7 +42637,12 @@ mod server_decommission_db_tests {
         };
 
         // quarantine
-        let Ok(_) = decommission_quarantine(Path(id.clone())).await else {
+        let Ok(_) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
         };
@@ -42529,7 +42674,12 @@ mod server_decommission_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
         let server_name = format!("srv-{suffix}");
 
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -42544,7 +42694,12 @@ mod server_decommission_db_tests {
             panic!("approve failed");
         };
 
-        let Ok(_) = decommission_quarantine(Path(id.clone())).await else {
+        let Ok(_) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("quarantine failed");
         };
@@ -42583,13 +42738,23 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // Attempt quarantine without approve — must fail 409
-        let Err((status, _)) = decommission_quarantine(Path(id.clone())).await else {
+        let Err((status, _)) = decommission_quarantine(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("expected 409 but quarantine succeeded on a Planned request");
         };
@@ -42613,7 +42778,12 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -42627,7 +42797,12 @@ mod server_decommission_db_tests {
             panic!("approve failed");
         };
 
-        let Err((status, _)) = decommission_execute(Path(id.clone())).await else {
+        let Err((status, _)) = decommission_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("expected 409 but execute succeeded before quarantine");
         };
@@ -42651,7 +42826,12 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -42678,7 +42858,12 @@ mod server_decommission_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = decommission_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();

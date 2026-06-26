@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::models::{DecommissionRequest, DecommissionStatus, ServerType};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -130,7 +130,13 @@ pub fn status_str(s: &DecommissionStatus) -> &'static str {
 
 /// Insert a new decommission request. The caller supplies the model (with an
 /// already-generated `id` string); we parse it into a `Uuid` for the PK column.
-pub async fn insert(pool: &PgPool, req: &DecommissionRequest) -> Result<(), sqlx::Error> {
+///
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    req: &DecommissionRequest,
+) -> Result<(), sqlx::Error> {
     let id = Uuid::parse_str(&req.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let deps =
@@ -177,7 +183,7 @@ pub async fn insert(pool: &PgPool, req: &DecommissionRequest) -> Result<(), sqlx
     .bind(created_at)
     .bind(updated_at)
     .bind(&meta)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -216,11 +222,17 @@ pub async fn list_quarantine(pool: &PgPool) -> Result<Vec<DecommissionRequest>, 
 }
 
 /// Atomically transition a request to its new state IFF its current DB status
-/// still equals `expected_status` (optimistic lock), and (optionally) append an
-/// audit-log row in the SAME transaction. Returns `Ok(false)` when the row was
-/// absent or its status had already changed (caller → 409). `Ok(true)` on success.
+/// still equals `expected_status` (optimistic lock), and (optionally) append a
+/// `quarantine_log` row. Returns `Ok(false)` when the row was absent or its
+/// status had already changed (caller → 409). `Ok(true)` on success.
+///
+/// Accepts a `&mut PgConnection` so the caller can share a transaction with an
+/// audit write. Pass `&mut *tx` from a `sqlx::Transaction` for atomic
+/// mutation + audit; pass `&mut *pool.begin().await?` for a standalone call.
+/// A CAS miss returns `Ok(false)` without touching the executor further —
+/// the caller should drop the tx (auto-rollback) and return 409.
 pub async fn transition(
-    pool: &PgPool,
+    executor: &mut PgConnection,
     expected_status: &str,
     req: &DecommissionRequest,
     audit_action: Option<&str>,
@@ -244,8 +256,6 @@ pub async fn transition(
     let updated_at = DateTime::parse_from_rfc3339(&req.updated_at)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
-
-    let mut tx = pool.begin().await?;
 
     let res = sqlx::query(
         "UPDATE decommission_requests SET \
@@ -272,11 +282,10 @@ pub async fn transition(
     .bind(updated_at)
     .bind(&meta)
     .bind(expected_status)
-    .execute(&mut *tx)
+    .execute(&mut *executor)
     .await?;
 
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
 
@@ -287,10 +296,9 @@ pub async fn transition(
         )
         .bind(&req.server_name)
         .bind(action)
-        .execute(&mut *tx)
+        .execute(&mut *executor)
         .await?;
     }
 
-    tx.commit().await?;
     Ok(true)
 }
