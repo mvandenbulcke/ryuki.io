@@ -451,11 +451,9 @@ pub async fn reserve_ips(
 ///
 /// Returns `Err(ReleaseError::NotFound)` if no row with `reservation_id` exists.
 pub async fn release_reservation(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     reservation_id: &str,
 ) -> Result<PortReservation, ReleaseError> {
-    let mut tx = pool.begin().await?;
-
     // Lock the reservation row to serialize concurrent release attempts.
     let row: Option<ReservationRow> = sqlx::query_as(&format!(
         "SELECT {RESERVATION_COLUMNS} FROM port_reservations \
@@ -463,12 +461,11 @@ pub async fn release_reservation(
          FOR UPDATE"
     ))
     .bind(reservation_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let resv_row = match row {
         None => {
-            tx.rollback().await?;
             return Err(ReleaseError::NotFound);
         }
         Some(r) => r,
@@ -476,15 +473,14 @@ pub async fn release_reservation(
 
     // Idempotency guard — do NOT restore if already released.
     if resv_row.status == "released" {
-        tx.rollback().await?;
         return Err(ReleaseError::AlreadyReleased);
     }
 
     if resv_row.resource_type == "ports" {
         // Parse every stored port id strictly. A malformed id means the row is
-        // corrupt; fail loudly (rolling the tx back via the `?` early return)
-        // rather than silently dropping the port from the restore and then
-        // marking the reservation released with that port stuck in 'Reserved'.
+        // corrupt; fail loudly rather than silently dropping the port from the
+        // restore and then marking the reservation released with that port stuck
+        // in 'Reserved'.
         let port_uuids: Vec<Uuid> = resv_row
             .port_ids
             .iter()
@@ -495,11 +491,6 @@ pub async fn release_reservation(
             })?;
 
         if !port_uuids.is_empty() {
-            // Restore only ports still in 'Reserved' state AND not claimed by a
-            // DIFFERENT active reservation. The status guard avoids overriding a
-            // port someone moved to InUse; the NOT EXISTS guard avoids freeing a
-            // port that — after out-of-band repair — was re-reserved by another
-            // active reservation (releasing this one must not clobber that one).
             sqlx::query(
                 "UPDATE switch_ports sp \
                  SET status = 'Available', updated_at = NOW() \
@@ -513,7 +504,7 @@ pub async fn release_reservation(
             )
             .bind(&port_uuids)
             .bind(reservation_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         }
     } else if resv_row.resource_type == "ips" {
@@ -526,7 +517,7 @@ pub async fn release_reservation(
             .bind(resv_row.ip_count)
             .bind(&resv_row.site)
             .bind(vlan_id_db)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         }
     }
@@ -536,14 +527,12 @@ pub async fn release_reservation(
          WHERE reservation_id = $1",
     )
     .bind(reservation_id)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
-    tx.commit().await?;
-
-    get_reservation(pool, reservation_id).await?.ok_or_else(|| {
-        sqlx::Error::Decode("port_reservations: row vanished after release".into()).into()
-    })
+    let mut released = resv_row.into_model().map_err(ReleaseError::Db)?;
+    released.status = "released".to_string();
+    Ok(released)
 }
 
 // ─── Error types ─────────────────────────────────────────────────────────────
@@ -883,9 +872,14 @@ mod network_readiness_db_tests {
         assert_eq!(reserved_before, 2);
 
         // Release
-        let released = release_reservation(&pool, &resv.reservation_id)
-            .await
-            .expect("release_reservation");
+        let released = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let r = release_reservation(&mut tx, &resv.reservation_id)
+                .await
+                .expect("release_reservation");
+            tx.commit().await.expect("commit tx");
+            r
+        };
         assert_eq!(released.status, "released");
 
         // Verify ports are back to Available
@@ -932,9 +926,14 @@ mod network_readiness_db_tests {
         .expect("fetch vlan after reserve");
         assert_eq!(after_reserve, 93, "100 - 7 = 93");
 
-        let released = release_reservation(&pool, &resv.reservation_id)
-            .await
-            .expect("release");
+        let released = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let r = release_reservation(&mut tx, &resv.reservation_id)
+                .await
+                .expect("release");
+            tx.commit().await.expect("commit tx");
+            r
+        };
         assert_eq!(released.status, "released");
 
         let (after_release,): (i32,) = sqlx::query_as(
@@ -977,9 +976,13 @@ mod network_readiness_db_tests {
         assert_eq!(after_reserve, 45);
 
         // First release
-        release_reservation(&pool, &resv.reservation_id)
-            .await
-            .expect("first release");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            release_reservation(&mut tx, &resv.reservation_id)
+                .await
+                .expect("first release");
+            tx.commit().await.expect("commit tx");
+        }
 
         let (after_first_release,): (i32,) = sqlx::query_as(
             "SELECT available_ips FROM vlans WHERE site = 'DEFRA' AND vlan_id = 200",
@@ -990,7 +993,11 @@ mod network_readiness_db_tests {
         assert_eq!(after_first_release, 50, "restored to 50");
 
         // Second release — must return AlreadyReleased, NOT restore again
-        let result = release_reservation(&pool, &resv.reservation_id).await;
+        let result = {
+            let mut tx = pool.begin().await.expect("begin tx for second release");
+            release_reservation(&mut tx, &resv.reservation_id).await
+            // tx drops on error (no commit)
+        };
         match result {
             Err(ReleaseError::AlreadyReleased) => {} // expected
             other => panic!("expected AlreadyReleased, got {:?}", other),

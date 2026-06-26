@@ -90,7 +90,7 @@ pub async fn list_active(pool: &PgPool) -> Result<Vec<IncidentContext>, sqlx::Er
 }
 
 pub async fn transition(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     id: &str,
     expected_version: &str,
     updated: &IncidentContext,
@@ -98,7 +98,6 @@ pub async fn transition(
     let incident_json = serde_json::to_value(updated).map_err(|e| {
         sqlx::Error::Decode(format!("incident_contexts: serialize failed: {e}").into())
     })?;
-    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE incident_contexts SET \
          status = $2, \
@@ -110,12 +109,10 @@ pub async fn transition(
     .bind(&updated.status)
     .bind(incident_json)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(conn)
     .await?;
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
-    tx.commit().await?;
     Ok(true)
 }

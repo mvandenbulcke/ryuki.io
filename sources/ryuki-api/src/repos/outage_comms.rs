@@ -209,9 +209,12 @@ pub async fn list_upcoming(pool: &PgPool, site: &str) -> Result<Vec<OutageNotice
 
 // ─── Write functions ──────────────────────────────────────────────────────────
 
-/// Insert a new notice + its affected systems in a single transaction.
-/// Returns the persisted notice (re-read through the aggregating query).
-pub async fn insert(pool: &PgPool, notice: &OutageNotice) -> Result<OutageNotice, sqlx::Error> {
+/// Insert a new notice + its affected systems using the caller-supplied connection.
+/// Returns the UUID string for the new notice; caller commits the transaction.
+pub async fn insert(
+    conn: &mut sqlx::PgConnection,
+    notice: &OutageNotice,
+) -> Result<String, sqlx::Error> {
     let id = Uuid::new_v4();
 
     let start_time: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&notice.start_time)
@@ -220,8 +223,6 @@ pub async fn insert(pool: &PgPool, notice: &OutageNotice) -> Result<OutageNotice
     let end_time: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&notice.end_time)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
-
-    let mut tx = pool.begin().await?;
 
     sqlx::query(
         "INSERT INTO outage_notices \
@@ -236,33 +237,29 @@ pub async fn insert(pool: &PgPool, notice: &OutageNotice) -> Result<OutageNotice
     .bind(notice.impact_level.to_string())
     .bind(&notice.message_template)
     .bind(notice.status.to_string())
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     for system in &notice.affected_systems {
         sqlx::query("INSERT INTO outage_notice_systems (notice_id, system_name) VALUES ($1, $2)")
             .bind(id)
             .bind(system)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
     }
 
-    tx.commit().await?;
-
-    get(pool, &id.to_string()).await?.ok_or_else(|| {
-        sqlx::Error::Decode("outage_notices: row vanished immediately after insert".into())
-    })
+    Ok(id.to_string())
 }
 
 /// CAS: transition notice to Sent (guard already verified by caller).
-/// Returns Ok(None) on status mismatch → caller maps to 409.
+/// Returns true if the update landed, false on status mismatch → caller maps to 409.
 pub async fn send(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     expected_status: &str,
-) -> Result<Option<OutageNotice>, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let affected = sqlx::query(
@@ -272,21 +269,17 @@ pub async fn send(
     )
     .bind(uid)
     .bind(expected_status)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
 
-    if affected == 0 {
-        return Ok(None);
-    }
-
-    get(pool, id).await
+    Ok(affected > 0)
 }
 
 /// CAS: transition notice to Acknowledged and record ack in child table.
 /// Returns Ok(None) on status mismatch → caller maps to 409.
 pub async fn acknowledge(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     id: &str,
     user: &str,
     expected_status: &str,
@@ -294,8 +287,6 @@ pub async fn acknowledge(
     let Ok(uid) = Uuid::parse_str(id) else {
         return Ok(None);
     };
-
-    let mut tx = pool.begin().await?;
 
     let affected = sqlx::query(
         "UPDATE outage_notices \
@@ -305,12 +296,11 @@ pub async fn acknowledge(
     .bind(uid)
     .bind(user)
     .bind(expected_status)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
     if affected == 0 {
-        tx.rollback().await?;
         return Ok(None);
     }
 
@@ -320,10 +310,8 @@ pub async fn acknowledge(
     )
     .bind(uid)
     .bind(user)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-
-    tx.commit().await?;
 
     Ok(Some(NoticeAckEvent {
         notice_id: id.to_string(),
@@ -333,14 +321,14 @@ pub async fn acknowledge(
 }
 
 /// CAS: transition notice to Completed.
-/// Returns Ok(None) on status mismatch → caller maps to 409.
+/// Returns true if the update landed, false on status mismatch → caller maps to 409.
 pub async fn complete(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     expected_status: &str,
-) -> Result<Option<OutageNotice>, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let affected = sqlx::query(
@@ -350,26 +338,22 @@ pub async fn complete(
     )
     .bind(uid)
     .bind(expected_status)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
 
-    if affected == 0 {
-        return Ok(None);
-    }
-
-    get(pool, id).await
+    Ok(affected > 0)
 }
 
 /// CAS: transition notice to Cancelled.
-/// Returns Ok(None) on status mismatch → caller maps to 409.
+/// Returns true if the update landed, false on status mismatch → caller maps to 409.
 pub async fn cancel(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     id: &str,
     expected_status: &str,
-) -> Result<Option<OutageNotice>, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let affected = sqlx::query(
@@ -379,15 +363,11 @@ pub async fn cancel(
     )
     .bind(uid)
     .bind(expected_status)
-    .execute(pool)
+    .execute(executor)
     .await?
     .rows_affected();
 
-    if affected == 0 {
-        return Ok(None);
-    }
-
-    get(pool, id).await
+    Ok(affected > 0)
 }
 
 // ─── DB integration tests ─────────────────────────────────────────────────────
@@ -475,7 +455,15 @@ mod outage_comms_db_tests {
         };
 
         let notice = make_notice("DEHAM", vec!["deham-app-01"]);
-        let inserted = insert(&pool, &notice).await.expect("insert");
+        let inserted = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &notice).await.expect("insert");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert")
+                .expect("notice exists after insert")
+        };
 
         let found = get(&pool, &inserted.id).await.expect("get");
         assert!(found.is_some(), "should find inserted notice");
@@ -497,7 +485,15 @@ mod outage_comms_db_tests {
         };
 
         let notice = make_notice("NLAMS", vec!["nlams-app-01", "nlams-db-01"]);
-        let inserted = insert(&pool, &notice).await.expect("insert");
+        let inserted = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &notice).await.expect("insert");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert")
+                .expect("notice exists after insert")
+        };
 
         assert!(!inserted.id.is_empty());
         assert_eq!(inserted.site, "NLAMS");
@@ -529,19 +525,29 @@ mod outage_comms_db_tests {
         };
 
         let notice = make_notice("DEBER", vec!["deber-app-01"]);
-        let inserted = insert(&pool, &notice).await.expect("insert");
+        let inserted = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &notice).await.expect("insert");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert")
+                .expect("notice exists after insert")
+        };
 
         // Successful send: Draft → Sent
-        let sent = send(&pool, &inserted.id, "Draft")
+        let sent_ok = send(&pool, &inserted.id, "Draft").await.expect("send");
+        assert!(sent_ok, "send should succeed");
+        let sent = get(&pool, &inserted.id)
             .await
-            .expect("send")
-            .expect("send should succeed");
+            .expect("get sent")
+            .expect("notice exists");
         assert_eq!(sent.status, NoticeStatus::Sent);
         assert!(sent.sent_at.is_some());
 
         // CAS rejection: notice is now Sent, not Draft anymore
         let miss = send(&pool, &inserted.id, "Draft").await.expect("send miss");
-        assert!(miss.is_none(), "stale expected_status → Ok(None) / 409");
+        assert!(!miss, "stale expected_status → false / 409");
 
         // Illegal transition guard (engine-level): try sending again via Sent status
         let miss2 = send(&pool, &inserted.id, "Sent")
@@ -551,7 +557,7 @@ mod outage_comms_db_tests {
         // The caller (handler) runs the engine guard before calling the repo.
         // Here we just confirm the CAS works correctly (succeeds on matching status).
         assert!(
-            miss2.is_some(),
+            miss2,
             "CAS matches Sent→Sent at repo level (engine guard is handler's responsibility)"
         );
         // Roll back to prevent state pollution
@@ -571,18 +577,29 @@ mod outage_comms_db_tests {
         };
 
         let notice = make_notice("FRPAR", vec!["frpar-core"]);
-        let inserted = insert(&pool, &notice).await.expect("insert");
+        let inserted = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &notice).await.expect("insert");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert")
+                .expect("notice exists after insert")
+        };
 
         // Must be Sent before acknowledging
-        let _sent = send(&pool, &inserted.id, "Draft")
-            .await
-            .expect("send")
-            .expect("send succeeded");
+        let _sent_ok = send(&pool, &inserted.id, "Draft").await.expect("send");
+        assert!(_sent_ok, "send succeeded");
 
-        let ack = acknowledge(&pool, &inserted.id, "alice.operator", "Sent")
-            .await
-            .expect("acknowledge")
-            .expect("acknowledge succeeded");
+        let ack = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = acknowledge(&mut tx, &inserted.id, "alice.operator", "Sent")
+                .await
+                .expect("acknowledge")
+                .expect("acknowledge succeeded");
+            tx.commit().await.expect("commit tx");
+            result
+        };
 
         assert_eq!(ack.notice_id, inserted.id);
         assert_eq!(ack.user, "alice.operator");
@@ -607,9 +624,13 @@ mod outage_comms_db_tests {
         assert_eq!(updated.acknowledged_by, Some("alice.operator".into()));
 
         // CAS rejection: notice no longer in Sent status
-        let miss = acknowledge(&pool, &inserted.id, "bob", "Sent")
-            .await
-            .expect("ack miss");
+        let miss = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            acknowledge(&mut tx, &inserted.id, "bob", "Sent")
+                .await
+                .expect("ack miss")
+            // tx drops on miss (rollback)
+        };
         assert!(miss.is_none(), "stale Sent status → Ok(None) / 409");
 
         cleanup_notice(&pool, &inserted.id).await;
@@ -625,28 +646,51 @@ mod outage_comms_db_tests {
 
         // Complete path: Draft → Sent → Acknowledged → Completed
         let n1 = make_notice("GBLON", vec!["gblon-srv"]);
-        let i1 = insert(&pool, &n1).await.expect("insert n1");
-        send(&pool, &i1.id, "Draft")
+        let i1 = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &n1).await.expect("insert n1");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert n1")
+                .expect("n1 exists")
+        };
+        send(&pool, &i1.id, "Draft").await.expect("send");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            acknowledge(&mut tx, &i1.id, "user", "Sent")
+                .await
+                .expect("ack")
+                .expect("acked");
+            tx.commit().await.expect("commit tx");
+        }
+        let complete_ok = complete(&pool, &i1.id, "Acknowledged")
             .await
-            .expect("send")
-            .expect("sent");
-        acknowledge(&pool, &i1.id, "user", "Sent")
+            .expect("complete");
+        assert!(complete_ok, "complete must succeed");
+        let completed = get(&pool, &i1.id)
             .await
-            .expect("ack")
-            .expect("acked");
-        let completed = complete(&pool, &i1.id, "Acknowledged")
-            .await
-            .expect("complete")
-            .expect("completed");
+            .expect("get completed")
+            .expect("completed exists");
         assert_eq!(completed.status, NoticeStatus::Completed);
 
         // Cancel path: Draft → Cancelled
         let n2 = make_notice("DEFRA", vec!["defra-srv"]);
-        let i2 = insert(&pool, &n2).await.expect("insert n2");
-        let cancelled = cancel(&pool, &i2.id, "Draft")
+        let i2 = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let notice_id = insert(&mut tx, &n2).await.expect("insert n2");
+            tx.commit().await.expect("commit tx");
+            get(&pool, &notice_id)
+                .await
+                .expect("get after insert n2")
+                .expect("n2 exists")
+        };
+        let cancel_ok = cancel(&pool, &i2.id, "Draft").await.expect("cancel");
+        assert!(cancel_ok, "cancel must succeed");
+        let cancelled = get(&pool, &i2.id)
             .await
-            .expect("cancel")
-            .expect("cancelled");
+            .expect("get cancelled")
+            .expect("cancelled exists");
         assert_eq!(cancelled.status, NoticeStatus::Cancelled);
 
         cleanup_notice(&pool, &i1.id).await;

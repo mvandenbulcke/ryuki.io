@@ -20604,16 +20604,38 @@ async fn network_reserve_ips(Json(body): Json<NetworkReserveIpsRequest>) -> ApiR
     }
 }
 
-async fn network_release(Path(id): Path<String>) -> ApiResult {
+async fn network_release(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    match crate::repos::network_readiness::release_reservation(pool, &id).await {
-        Ok(resv) => Ok(Json(serde_json::to_value(resv).unwrap_or_default())),
-        Err(crate::repos::network_readiness::ReleaseError::NotFound) => Err(status_404(&id)),
-        Err(crate::repos::network_readiness::ReleaseError::AlreadyReleased) => {
-            Err(status_409("reservation is already released"))
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let resv = match crate::repos::network_readiness::release_reservation(&mut tx, &id).await {
+        Ok(r) => r,
+        Err(crate::repos::network_readiness::ReleaseError::NotFound) => {
+            return Err(status_404(&id));
         }
-        Err(crate::repos::network_readiness::ReleaseError::Db(e)) => Err(db_error(e)),
-    }
+        Err(crate::repos::network_readiness::ReleaseError::AlreadyReleased) => {
+            return Err(status_409("reservation is already released"));
+        }
+        Err(crate::repos::network_readiness::ReleaseError::Db(e)) => {
+            return Err(db_error(e));
+        }
+    };
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "network-release",
+            None,
+            "released",
+            json!({"reservation_id": &id, "site": &resv.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    Ok(Json(serde_json::to_value(resv).unwrap_or_default()))
 }
 
 async fn network_capacity(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
@@ -22188,7 +22210,10 @@ async fn outage_notices_list(
     Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
-async fn outage_notices_create(Json(body): Json<OutageNoticeCreateRequest>) -> ApiResult {
+async fn outage_notices_create(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<OutageNoticeCreateRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = outage_comms::build_notice(
         &body.site,
@@ -22198,9 +22223,27 @@ async fn outage_notices_create(Json(body): Json<OutageNoticeCreateRequest>) -> A
         &body.impact_level,
     )
     .map_err(|e| status_400(&e))?;
-    let persisted = crate::repos::outage_comms::insert(pool, &notice)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let notice_id = crate::repos::outage_comms::insert(&mut tx, &notice)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "outage-notice-create",
+            None,
+            "created",
+            json!({"notice_id": &notice_id, "site": &notice.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    let persisted = crate::repos::outage_comms::get(pool, &notice_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(status_503_no_db)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
@@ -22238,17 +22281,43 @@ async fn outage_notices_preview(
     Ok(Json(outage_comms::preview_notice_pure(&notice)))
 }
 
-async fn outage_notices_send(Path(id): Path<String>) -> ApiResult {
+async fn outage_notices_send(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     outage_comms::send_guard(&notice).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::outage_comms::send(pool, &id, &notice.status.to_string())
+    let from_status = notice.status.to_string();
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let sent = crate::repos::outage_comms::send(&mut *tx, &id, &from_status)
+        .await
+        .map_err(db_error)?;
+    if !sent {
+        return Err(status_409(
+            "notice was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "outage-notice-send",
+            Some(&from_status),
+            "sent",
+            json!({"notice_id": &id, "site": &notice.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    let updated = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+        .ok_or_else(status_503_no_db)?;
     Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
@@ -22262,41 +22331,107 @@ async fn outage_notices_acknowledge(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     outage_comms::acknowledge_guard(&notice).map_err(|e| status_409(&e))?;
-    let ack =
-        // Acknowledger = authenticated caller (from request extensions), never a
-        // client body field — the audit trail must name the real principal.
-        crate::repos::outage_comms::acknowledge(pool, &id, &session.user_id, &notice.status.to_string())
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    let from_status = notice.status.to_string();
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // Acknowledger = authenticated caller (from request extensions), never a
+    // client body field — the audit trail must name the real principal.
+    let ack = crate::repos::outage_comms::acknowledge(&mut tx, &id, &session.user_id, &from_status)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "outage-notice-acknowledge",
+            Some(&from_status),
+            "acknowledged",
+            json!({"notice_id": &id, "site": &notice.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(ack).unwrap_or_default()))
 }
 
-async fn outage_notices_complete(Path(id): Path<String>) -> ApiResult {
+async fn outage_notices_complete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     outage_comms::complete_guard(&notice).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::outage_comms::complete(pool, &id, &notice.status.to_string())
+    let from_status = notice.status.to_string();
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::outage_comms::complete(&mut *tx, &id, &from_status)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "notice was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "outage-notice-complete",
+            Some(&from_status),
+            "completed",
+            json!({"notice_id": &id, "site": &notice.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    let updated = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+        .ok_or_else(status_503_no_db)?;
     Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
-async fn outage_notices_cancel(Path(id): Path<String>) -> ApiResult {
+async fn outage_notices_cancel(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let notice = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     outage_comms::cancel_guard(&notice).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::outage_comms::cancel(pool, &id, &notice.status.to_string())
+    let from_status = notice.status.to_string();
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::outage_comms::cancel(&mut *tx, &id, &from_status)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "notice was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "outage-notice-cancel",
+            Some(&from_status),
+            "cancelled",
+            json!({"notice_id": &id, "site": &notice.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    let updated = crate::repos::outage_comms::get(pool, &id)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_409("notice was modified concurrently; reload and retry"))?;
+        .ok_or_else(status_503_no_db)?;
     Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
@@ -23692,6 +23827,7 @@ async fn incident_changes(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn incident_resolve(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<IncidentResolveRequest>,
 ) -> ApiResult {
@@ -23701,16 +23837,31 @@ async fn incident_resolve(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     let updated = resolve_incident_pure(&ctx, &body.resolution).map_err(|e| status_409(&e))?;
-    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::incident_contexts::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "incident-resolve",
+            None,
+            "resolved",
+            json!({"incident_id": &id}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 async fn incident_add_ci(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<IncidentAddCiRequest>,
 ) -> ApiResult {
@@ -23721,16 +23872,31 @@ async fn incident_add_ci(
         .ok_or_else(|| status_404(&id))?;
     let updated =
         add_affected_ci_pure(&ctx, &body.ci_name, &body.ci_type).map_err(|e| status_409(&e))?;
-    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::incident_contexts::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "incident-add-ci",
+            None,
+            "updated",
+            json!({"incident_id": &id}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 async fn incident_escalate(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<IncidentEscalateRequest>,
 ) -> ApiResult {
@@ -23740,12 +23906,26 @@ async fn incident_escalate(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     let updated = escalate_pure(&ctx, &body.reason).map_err(|e| status_409(&e))?;
-    let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::incident_contexts::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "incident-escalate",
+            None,
+            "escalated",
+            json!({"incident_id": &id}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
@@ -48516,6 +48696,51 @@ mod incident_contexts_db_tests {
         .expect("build_incident_context must succeed")
     }
 
+    /// #7 audit: the outage_notices_create HANDLER writes a durable audit row
+    /// naming the notice (atomic with the insert). Lives here for the shared
+    /// DB harness; exercises a different domain handler.
+    #[tokio::test]
+    async fn test_outage_notice_create_writes_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let res = super::outage_notices_create(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Json(super::OutageNoticeCreateRequest {
+                site: "DEFRA".into(),
+                affected_systems: vec!["sys-oaudit-1".into()],
+                start_time: "2026-07-01T00:00:00Z".into(),
+                end_time: "2026-07-01T02:00:00Z".into(),
+                impact_level: "High".into(),
+            }),
+        )
+        .await;
+        let Ok(super::Json(created)) = &res else {
+            panic!("outage_notices_create failed: {res:?}");
+        };
+        let id = created["id"].as_str().expect("notice id").to_string();
+
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'outage-notice-create' AND detail->>'notice_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query audit");
+        sqlx::query("DELETE FROM outage_notices WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+        assert!(
+            audited,
+            "outage_notices_create must write a durable audit row"
+        );
+    }
+
     /// Full lifecycle: assemble -> add-ci -> escalate -> resolve.
     /// Asserts status after each step: add-ci and escalate keep "active", resolve sets "resolved".
     #[tokio::test]
@@ -48559,9 +48784,17 @@ mod incident_contexts_db_tests {
             "affected_ci must grow by 1"
         );
 
-        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &with_ci)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::incident_contexts::transition(&mut tx, &id, &version, &with_ci)
+                    .await
+                    .expect("transition failed");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok, "add_ci transition must succeed");
 
         let (fetched, version) = crate::repos::incident_contexts::get(pool, &id)
@@ -48591,9 +48824,17 @@ mod incident_contexts_db_tests {
             "escalation field must contain the reason"
         );
 
-        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &escalated)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::incident_contexts::transition(&mut tx, &id, &version, &escalated)
+                    .await
+                    .expect("transition failed");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok, "escalate transition must succeed");
 
         let (fetched, version) = crate::repos::incident_contexts::get(pool, &id)
@@ -48618,9 +48859,17 @@ mod incident_contexts_db_tests {
             "resolve must set status to resolved"
         );
 
-        let ok = crate::repos::incident_contexts::transition(pool, &id, &version, &resolved)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::incident_contexts::transition(&mut tx, &id, &version, &resolved)
+                    .await
+                    .expect("transition failed");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok, "resolve transition must succeed");
 
         let (fetched, _version) = crate::repos::incident_contexts::get(pool, &id)
@@ -48681,18 +48930,32 @@ mod incident_contexts_db_tests {
         let escalated =
             ryuki_engine::incident_context::escalate_pure(&original, "escalation reason a")
                 .expect("escalate must succeed");
-        crate::repos::incident_contexts::transition(pool, &id, &stale_version, &escalated)
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::incident_contexts::transition(
+                &mut tx,
+                &id,
+                &stale_version,
+                &escalated,
+            )
             .await
             .expect("first transition must succeed");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+        }
 
         // Second writer presents stale version — must be rejected.
         let stale_update =
             ryuki_engine::incident_context::escalate_pure(&original, "escalation reason b")
                 .expect("second escalate must succeed");
-        let applied =
-            crate::repos::incident_contexts::transition(pool, &id, &stale_version, &stale_update)
+        let applied = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::incident_contexts::transition(&mut tx, &id, &stale_version, &stale_update)
                 .await
-                .expect("transition query must not error");
+                .expect("transition query must not error")
+            // tx drops (no commit on miss)
+        };
 
         cleanup(pool, &id).await;
         assert!(
@@ -48726,9 +48989,16 @@ mod incident_contexts_db_tests {
             .expect("found");
         let resolved1 = ryuki_engine::incident_context::resolve_incident_pure(&loaded, "first fix")
             .expect("resolve 1");
-        let ok = crate::repos::incident_contexts::transition(pool, &id, &v1, &resolved1)
-            .await
-            .expect("transition 1");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::incident_contexts::transition(&mut tx, &id, &v1, &resolved1)
+                .await
+                .expect("transition 1");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok, "first resolve must succeed");
 
         // Re-get to get fresh version, then resolve again
@@ -48741,9 +49011,16 @@ mod incident_contexts_db_tests {
         let resolved2 =
             ryuki_engine::incident_context::resolve_incident_pure(&already_resolved, "second fix")
                 .expect("resolve 2 — no guard on already-resolved");
-        let ok2 = crate::repos::incident_contexts::transition(pool, &id, &v2, &resolved2)
-            .await
-            .expect("transition 2");
+        let ok2 = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::incident_contexts::transition(&mut tx, &id, &v2, &resolved2)
+                .await
+                .expect("transition 2");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(
             ok2,
             "second resolve with fresh version must succeed (no already-resolved guard)"
@@ -48800,9 +49077,17 @@ mod incident_contexts_db_tests {
             a_update.status, "active",
             "add_ci must keep status active (same-status race premise)"
         );
-        let ok_a = crate::repos::incident_contexts::transition(pool, &id, &ver_a, &a_update)
-            .await
-            .expect("a transition");
+        let ok_a = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::incident_contexts::transition(&mut tx, &id, &ver_a, &a_update)
+                    .await
+                    .expect("a transition");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok_a, "first same-status write must succeed");
 
         // Reader B adds a different CI with the now-stale version — must be rejected.
@@ -48816,9 +49101,13 @@ mod incident_contexts_db_tests {
             b_update.status, "active",
             "B's add_ci must also keep status active (same-status race premise)"
         );
-        let ok_b = crate::repos::incident_contexts::transition(pool, &id, &ver_b, &b_update)
-            .await
-            .expect("b transition query must not error");
+        let ok_b = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::incident_contexts::transition(&mut tx, &id, &ver_b, &b_update)
+                .await
+                .expect("b transition query must not error")
+            // tx drops (no commit on miss)
+        };
 
         cleanup(pool, &id).await;
         assert!(
