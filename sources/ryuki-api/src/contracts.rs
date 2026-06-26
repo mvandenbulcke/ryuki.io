@@ -24792,9 +24792,12 @@ async fn firewall_rule_set_revoke(
 }
 
 async fn firewall_conflicts(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<FwConflictsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    firewall_rules::get_conflicts(q.site.as_deref().unwrap_or(""))
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    firewall_rules::get_conflicts(&site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -25162,9 +25165,18 @@ async fn storage_array_update(
 /// DELETE /api/datacenter/storage/arrays/{id} — decommission an array. REFUSES
 /// (409) when volumes still reference it. 404 when unknown; 503 when no DB.
 async fn storage_array_delete(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: a scoped principal may only decommission an array in its own site.
+    // Loaded then guarded before the delete; storage_arrays.site is not re-homed
+    // by any handler, so there is no check-then-act window to exploit.
+    let array = crate::repos::storage_provisioning::get_array(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    guard_body_site_scope(&session, &array.site)?;
     use crate::repos::storage_provisioning::ArrayDeleteResult;
     match crate::repos::storage_provisioning::delete_array(db, &id)
         .await
@@ -25769,16 +25781,22 @@ async fn dr_tests_due() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))
 }
 async fn dr_readiness(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<DrSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::get_dr_readiness(q.site.as_deref().unwrap_or(""))
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    dr_testing::get_dr_readiness(&site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn dr_scenarios(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<DrSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dr_testing::list_scenarios(q.site.as_deref().unwrap_or(""))
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    dr_testing::list_scenarios(&site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
@@ -26745,9 +26763,12 @@ async fn secrets_rotate_all(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn secrets_rotation_summary(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<SecretsSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    secrets_rotation::get_rotation_summary(q.site.as_deref().unwrap_or(""))
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    secrets_rotation::get_rotation_summary(&site)
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
