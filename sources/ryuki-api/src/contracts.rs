@@ -5737,7 +5737,7 @@ async fn shift_summary() -> Json<Value> {
 
 async fn shift_acknowledge(
     Path(id): Path<String>,
-    Extension(session): Extension<AuthSession>,
+    AuthExtractor(session): AuthExtractor,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Acknowledger = authenticated caller (from request extensions), never a
     // client body field — the audit trail must name the real principal.
@@ -5779,6 +5779,7 @@ async fn shift_acknowledge(
         // CAS: include state guard in WHERE so a concurrent resolve or
         // double-acknowledge between the pre-read and this UPDATE cannot
         // both succeed.  rows_affected == 0 means the state changed under us.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE shift_queue SET acknowledged = true, acknowledged_by = $1, \
              acknowledged_at = $2, updated_at = $2 \
@@ -5787,7 +5788,7 @@ async fn shift_acknowledge(
         .bind(&session.user_id)
         .bind(now)
         .bind(uid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
 
@@ -5797,6 +5798,20 @@ async fn shift_acknowledge(
                 Json(json!({"error": "state changed concurrently; reload and retry"})),
             ));
         }
+
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "shift-acknowledge",
+                None,
+                "acknowledged",
+                json!({ "shift_item_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
             "status": "acknowledged",
@@ -5813,7 +5828,7 @@ async fn shift_acknowledge(
 
 async fn shift_assign(
     Path(id): Path<String>,
-    Extension(session): Extension<AuthSession>,
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<ShiftActionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // assigned_to (body.user) is the ASSIGNEE; assigned_by is the actor that
@@ -5846,6 +5861,7 @@ async fn shift_assign(
 
         let now = chrono::Utc::now();
         // CAS: only assign if still unresolved.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE shift_queue SET assigned_to = $1, assigned_by = $2, updated_at = $3 \
              WHERE id = $4 AND resolved = false",
@@ -5854,7 +5870,7 @@ async fn shift_assign(
         .bind(&session.user_id)
         .bind(now)
         .bind(uid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
 
@@ -5864,6 +5880,20 @@ async fn shift_assign(
                 Json(json!({"error": "state changed concurrently; reload and retry"})),
             ));
         }
+
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "shift-assign",
+                None,
+                "assigned",
+                json!({ "shift_item_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
             "status": "assigned",
@@ -5879,6 +5909,7 @@ async fn shift_assign(
 }
 
 async fn shift_escalate(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<ShiftEscalateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -5915,6 +5946,7 @@ async fn shift_escalate(
 
         let now = chrono::Utc::now();
         // CAS: only escalate if still unresolved and not already escalated.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE shift_queue SET escalated = true, escalation_reason = $1, \
              escalated_at = $2, updated_at = $2 \
@@ -5923,7 +5955,7 @@ async fn shift_escalate(
         .bind(&body.reason)
         .bind(now)
         .bind(uid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
 
@@ -5933,6 +5965,20 @@ async fn shift_escalate(
                 Json(json!({"error": "state changed concurrently; reload and retry"})),
             ));
         }
+
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "shift-escalate",
+                None,
+                "escalated",
+                json!({ "shift_item_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
             "status": "escalated",
@@ -5948,6 +5994,7 @@ async fn shift_escalate(
 }
 
 async fn shift_resolve(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<ShiftResolveRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -5978,6 +6025,7 @@ async fn shift_resolve(
 
         let now = chrono::Utc::now();
         // CAS: only resolve if still unresolved.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE shift_queue SET resolved = true, resolution = $1, \
              resolved_at = $2, updated_at = $2 WHERE id = $3 AND resolved = false",
@@ -5985,7 +6033,7 @@ async fn shift_resolve(
         .bind(&body.resolution)
         .bind(now)
         .bind(uid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
 
@@ -5995,6 +6043,20 @@ async fn shift_resolve(
                 Json(json!({"error": "state changed concurrently; reload and retry"})),
             ));
         }
+
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "shift-resolve",
+                None,
+                "resolved",
+                json!({ "shift_item_id": &id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
             "status": "resolved",
@@ -6283,12 +6345,24 @@ async fn emergency_initiate(
     }
 }
 
-async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+async fn emergency_approve(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
         let now = chrono::Utc::now();
         let approved_by = "EMERGENCY — auto-approved per break-glass policy";
         let audit_entry = format!("EMERGENCY flag — auto-approved at {}", now.to_rfc3339());
         // Atomic compare-and-set: only transitions Initiated → Approved.
+        let mut tx = pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_APPROVE_FAILED",
+                "database error",
+                None::<&str>,
+            )
+        })?;
         let result = sqlx::query(
             "UPDATE emergency_changes \
              SET status = 'Approved', approved_by = $1, \
@@ -6300,7 +6374,7 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
         .bind(&audit_entry)
         .bind(now)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "emergency change DB error");
@@ -6312,6 +6386,35 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
             )
         })?;
         if result.rows_affected() == 1 {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "emergency-approve",
+                    None,
+                    "approved",
+                    json!({ "change_id": &id }),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_APPROVE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+            tx.commit().await.map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_APPROVE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
             return Ok(Json(json!({
                 "source": "database",
                 "change_id": id,
@@ -6321,7 +6424,8 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
                 "dry_run": true,
             })));
         }
-        // 0 rows affected: distinguish 404 vs wrong-state 409.
+        // 0 rows affected: drop tx (rolls back), then distinguish 404 vs wrong-state 409.
+        drop(tx);
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
                 .bind(&id)
@@ -6354,11 +6458,15 @@ async fn emergency_approve(Path(id): Path<String>) -> Result<Json<Value>, Proble
     }
 }
 
-async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+async fn emergency_execute(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
         let now = chrono::Utc::now();
         // First: read affected_systems so we can include them in the response
         // (needed for the JSON shape parity with the engine response).
+        // Pre-read stays on pool (no tx yet).
         let row: Option<EmergencyChangeRow> = sqlx::query_as(&format!(
             "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes WHERE id = $1::uuid"
         ))
@@ -6402,6 +6510,15 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
             row.affected_systems.join(", ")
         );
         // Atomic conditional UPDATE: only transitions Approved → Executed.
+        let mut tx = pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_EXECUTE_FAILED",
+                "database error",
+                None::<&str>,
+            )
+        })?;
         let result = sqlx::query(
             "UPDATE emergency_changes \
              SET status = 'Executed', executed_at = $1, \
@@ -6413,7 +6530,7 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
         .bind(&exec_entry)
         .bind(&systems_entry)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "emergency change DB error");
@@ -6425,6 +6542,35 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
             )
         })?;
         if result.rows_affected() == 1 {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "emergency-execute",
+                    Some("Approved"),
+                    "executed",
+                    json!({ "change_id": &id }),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_EXECUTE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+            tx.commit().await.map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_EXECUTE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
             let mut updated_evidence = row.audit_evidence.clone();
             updated_evidence.push(exec_entry);
             updated_evidence.push(systems_entry);
@@ -6438,7 +6584,7 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
                 "dry_run": true,
             })));
         }
-        // Race: another request got here first.
+        // Race: another request got here first (no audit, no commit).
         return Err(problem_details(
             StatusCode::CONFLICT,
             "EMERGENCY_EXECUTE_FAILED",
@@ -6457,7 +6603,10 @@ async fn emergency_execute(Path(id): Path<String>) -> Result<Json<Value>, Proble
     }
 }
 
-async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, ProblemDetails> {
+async fn emergency_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
         let now = chrono::Utc::now();
         let verify_entry = format!(
@@ -6465,6 +6614,15 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
             now.to_rfc3339()
         );
         // Atomic conditional UPDATE: only transitions Executed → Verified.
+        let mut tx = pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_VERIFY_FAILED",
+                "database error",
+                None::<&str>,
+            )
+        })?;
         let result = sqlx::query(
             "UPDATE emergency_changes \
              SET status = 'Verified', \
@@ -6475,7 +6633,7 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
         .bind(&verify_entry)
         .bind(now)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "emergency change DB error");
@@ -6487,7 +6645,36 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
             )
         })?;
         if result.rows_affected() == 1 {
-            // Re-read audit_evidence for the response shape.
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "emergency-verify",
+                    Some("Executed"),
+                    "verified",
+                    json!({ "change_id": &id }),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_VERIFY_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+            tx.commit().await.map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_VERIFY_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+            // Re-read audit_evidence from pool after commit for the response shape.
             let evidence: Vec<String> = sqlx::query_scalar(
                 "SELECT audit_evidence FROM emergency_changes WHERE id = $1::uuid",
             )
@@ -6504,7 +6691,8 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
                 "dry_run": true,
             })));
         }
-        // 0 rows affected: distinguish 404 vs wrong-state.
+        // 0 rows affected: distinguish 404 vs wrong-state (no audit, no commit).
+        drop(tx);
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
                 .bind(&id)
@@ -6538,6 +6726,7 @@ async fn emergency_verify(Path(id): Path<String>) -> Result<Json<Value>, Problem
 }
 
 async fn emergency_close(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<EmergencyCloseRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
@@ -6545,6 +6734,15 @@ async fn emergency_close(
         let now = chrono::Utc::now();
         let postmortem_entry = format!("Post-mortem review completed at {}", now.to_rfc3339());
         // Atomic conditional UPDATE: only transitions Verified → Closed.
+        let mut tx = pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "emergency change DB error");
+            problem_details(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EMERGENCY_CLOSE_FAILED",
+                "database error",
+                None::<&str>,
+            )
+        })?;
         let result = sqlx::query(
             "UPDATE emergency_changes \
              SET status = 'Closed', post_review_notes = $1, \
@@ -6556,7 +6754,7 @@ async fn emergency_close(
         .bind(&postmortem_entry)
         .bind(now)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "emergency change DB error");
@@ -6568,6 +6766,35 @@ async fn emergency_close(
             )
         })?;
         if result.rows_affected() == 1 {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "emergency-close",
+                    Some("Verified"),
+                    "closed",
+                    json!({ "change_id": &id }),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_CLOSE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+            tx.commit().await.map_err(|e| {
+                tracing::error!(error = %e, "emergency change DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "EMERGENCY_CLOSE_FAILED",
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
             return Ok(Json(json!({
                 "source": "database",
                 "change_id": id,
@@ -6577,7 +6804,8 @@ async fn emergency_close(
                 "dry_run": true,
             })));
         }
-        // 0 rows: distinguish 404 vs wrong-state.
+        // 0 rows: drop tx (rolls back), distinguish 404 vs wrong-state (no audit).
+        drop(tx);
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM emergency_changes WHERE id = $1::uuid")
                 .bind(&id)
@@ -37955,7 +38183,6 @@ mod shift_queue_db_tests {
         let mut s = AuthSession::static_dry_run();
         s.user_id = user_id.into();
         s.display_name = format!("{user_id} (test)");
-        s.provider_mode = "local".into();
         s
     }
     use crate::database::DB_TEST_SERIAL;
@@ -38018,7 +38245,7 @@ mod shift_queue_db_tests {
         // Call the handler — must go through the DB path.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Extension(approver_session("db-test-user")),
+            AuthExtractor(approver_session("db-test-user")),
         )
         .await;
 
@@ -38042,7 +38269,7 @@ mod shift_queue_db_tests {
         };
         let result = shift_acknowledge(
             Path("e0000291-0000-0000-0000-000000000099".to_string()),
-            Extension(approver_session("nobody")),
+            AuthExtractor(approver_session("nobody")),
         )
         .await;
         let Err((status, _)) = result else {
@@ -38064,7 +38291,7 @@ mod shift_queue_db_tests {
         // First acknowledge.
         let _ = shift_acknowledge(
             Path(id.to_string()),
-            Extension(approver_session("ops-lead")),
+            AuthExtractor(approver_session("ops-lead")),
         )
         .await
         .expect("first acknowledge must succeed");
@@ -38072,7 +38299,7 @@ mod shift_queue_db_tests {
         // Second acknowledge must fail with 400.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Extension(approver_session("ops-lead")),
+            AuthExtractor(approver_session("ops-lead")),
         )
         .await;
 
@@ -38105,7 +38332,7 @@ mod shift_queue_db_tests {
 
         let result = shift_assign(
             Path(id.to_string()),
-            Extension(approver_session("shift-lead")),
+            AuthExtractor(approver_session("shift-lead")),
             Json(ShiftActionRequest {
                 user: "network-team".to_string(),
             }),
@@ -38159,6 +38386,7 @@ mod shift_queue_db_tests {
         seed_item(pool, id, "active-incident", "P1", Some("storage-lead")).await;
 
         let result = shift_escalate(
+            AuthExtractor(approver_session("test-escalator")),
             Path(id.to_string()),
             Json(ShiftEscalateRequest {
                 reason: "P1 needs manager escalation".to_string(),
@@ -38212,6 +38440,7 @@ mod shift_queue_db_tests {
                 .expect("count before");
 
         let result = shift_resolve(
+            AuthExtractor(approver_session("test-resolver")),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Backup job re-ran successfully".to_string(),
@@ -38267,6 +38496,7 @@ mod shift_queue_db_tests {
         seed_item(pool, id, "expiring-cert", "P2", Some("sec-team")).await;
 
         let _ = shift_resolve(
+            AuthExtractor(approver_session("test-resolver")),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "First resolution".to_string(),
@@ -38276,6 +38506,7 @@ mod shift_queue_db_tests {
         .expect("first resolve must succeed");
 
         let result = shift_resolve(
+            AuthExtractor(approver_session("test-resolver")),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Second resolution".to_string(),
@@ -38440,6 +38671,7 @@ mod shift_queue_db_tests {
 
         // Resolve the item first.
         let _ = shift_resolve(
+            AuthExtractor(approver_session("test-resolver")),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Resolved before acknowledge".to_string(),
@@ -38451,7 +38683,7 @@ mod shift_queue_db_tests {
         // Now try to acknowledge the resolved item — the pre-read check rejects it.
         let result = shift_acknowledge(
             Path(id.to_string()),
-            Extension(approver_session("late-user")),
+            AuthExtractor(approver_session("late-user")),
         )
         .await;
 
@@ -38502,7 +38734,7 @@ mod shift_queue_db_tests {
         // Assign → Escalate → Resolve.
         let _ = shift_assign(
             Path(id.to_string()),
-            Extension(approver_session("shift-lead")),
+            AuthExtractor(approver_session("shift-lead")),
             Json(ShiftActionRequest {
                 user: "ops-a".to_string(),
             }),
@@ -38511,6 +38743,7 @@ mod shift_queue_db_tests {
         .expect("assign must succeed on direct-insert row");
 
         let _ = shift_escalate(
+            AuthExtractor(approver_session("test-escalator")),
             Path(id.to_string()),
             Json(ShiftEscalateRequest {
                 reason: "Needs manager review".to_string(),
@@ -38520,6 +38753,7 @@ mod shift_queue_db_tests {
         .expect("escalate must succeed on direct-insert row");
 
         let resolve_result = shift_resolve(
+            AuthExtractor(approver_session("test-resolver")),
             Path(id.to_string()),
             Json(ShiftResolveRequest {
                 resolution: "Issue resolved via direct-insert test".to_string(),
@@ -38547,7 +38781,6 @@ mod emergency_change_unit_tests {
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
         s.user_id = user_id.into();
-        s.provider_mode = "local".into();
         s
     }
 
@@ -38600,7 +38833,11 @@ mod emergency_change_unit_tests {
             eprintln!("SKIP test_approve_unknown_id_fallback_no_db: running in DB mode");
             return;
         }
-        let result = emergency_approve(Path("nonexistent-id".into())).await;
+        let result = emergency_approve(
+            AuthExtractor(approver_session("test-approver")),
+            Path("nonexistent-id".into()),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -39696,7 +39933,6 @@ mod emergency_change_db_tests {
     fn approver_session(user_id: &str) -> AuthSession {
         let mut s = AuthSession::static_dry_run();
         s.user_id = user_id.into();
-        s.provider_mode = "local".into();
         s
     }
     use crate::database::DB_TEST_SERIAL;
@@ -39798,13 +40034,34 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000001";
         seed_change(pool, id, "Initiated", "DEFRA").await;
 
-        let result = emergency_approve(Path(id.into())).await;
+        let result = emergency_approve(
+            AuthExtractor(approver_session("test-approver")),
+            Path(id.into()),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
         assert_eq!(body["source"], "database");
         assert_eq!(body["status"], "Approved");
         assert!(body["approved_by"].as_str().unwrap().contains("EMERGENCY"));
+
+        // #7 audit: the approve wrote a durable audit row attributing the
+        // session principal (atomic with the CAS transition).
+        let (audit_actor, _): (String, String) = sqlx::query_as(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'emergency-approve' AND detail->>'change_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("query approve audit")
+        .expect("an emergency-approve audit row must exist");
+        assert_eq!(
+            audit_actor, "test-approver",
+            "audit actor must be the approver session principal"
+        );
 
         // Verify in DB.
         let row: EmergencyChangeRow = sqlx::query_as(&format!(
@@ -39837,7 +40094,11 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000002";
         seed_change(pool, id, "Approved", "DEFRA").await;
 
-        let result = emergency_approve(Path(id.into())).await;
+        let result = emergency_approve(
+            AuthExtractor(approver_session("test-approver")),
+            Path(id.into()),
+        )
+        .await;
 
         cleanup_change(pool, id).await;
 
@@ -39856,7 +40117,11 @@ mod emergency_change_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let result = emergency_approve(Path("e0000360-0000-0000-0000-000000000099".into())).await;
+        let result = emergency_approve(
+            AuthExtractor(approver_session("test-approver")),
+            Path("e0000360-0000-0000-0000-000000000099".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404, got Ok");
         };
@@ -39875,7 +40140,11 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000003";
         seed_change(pool, id, "Approved", "GBLON").await;
 
-        let result = emergency_execute(Path(id.into())).await;
+        let result = emergency_execute(
+            AuthExtractor(approver_session("test-executor")),
+            Path(id.into()),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -39909,7 +40178,11 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000004";
         seed_change(pool, id, "Initiated", "DEFRA").await;
 
-        let result = emergency_execute(Path(id.into())).await;
+        let result = emergency_execute(
+            AuthExtractor(approver_session("test-executor")),
+            Path(id.into()),
+        )
+        .await;
 
         cleanup_change(pool, id).await;
 
@@ -39931,7 +40204,11 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000005";
         seed_change(pool, id, "Executed", "DEFRA").await;
 
-        let result = emergency_verify(Path(id.into())).await;
+        let result = emergency_verify(
+            AuthExtractor(approver_session("test-verifier")),
+            Path(id.into()),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -39977,25 +40254,41 @@ mod emergency_change_db_tests {
         let id = init_body["change_id"].as_str().unwrap().to_string();
 
         // Approve.
-        let Ok(Json(approve_body)) = emergency_approve(Path(id.clone())).await else {
+        let Ok(Json(approve_body)) = emergency_approve(
+            AuthExtractor(approver_session("test-approver")),
+            Path(id.clone()),
+        )
+        .await
+        else {
             panic!("approve failed");
         };
         assert_eq!(approve_body["status"], "Approved");
 
         // Execute.
-        let Ok(Json(exec_body)) = emergency_execute(Path(id.clone())).await else {
+        let Ok(Json(exec_body)) = emergency_execute(
+            AuthExtractor(approver_session("test-executor")),
+            Path(id.clone()),
+        )
+        .await
+        else {
             panic!("execute failed");
         };
         assert_eq!(exec_body["status"], "Executed");
 
         // Verify.
-        let Ok(Json(verify_body)) = emergency_verify(Path(id.clone())).await else {
+        let Ok(Json(verify_body)) = emergency_verify(
+            AuthExtractor(approver_session("test-verifier")),
+            Path(id.clone()),
+        )
+        .await
+        else {
             panic!("verify failed");
         };
         assert_eq!(verify_body["status"], "Verified");
 
         // Close.
         let Ok(Json(close_body)) = emergency_close(
+            AuthExtractor(approver_session("test-closer")),
             Path(id.clone()),
             Json(EmergencyCloseRequest {
                 post_review_notes: "DB lifecycle test passed".into(),
