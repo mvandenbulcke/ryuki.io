@@ -24632,6 +24632,9 @@ async fn firewall_rule_create(
         // created_by = authenticated caller (from request extensions), not the
         // engine default — so the persisted row and response name the real creator.
         rule.created_by = session.user_id.clone();
+        // Persist + audit ATOMICALLY: a firewall rule never lands without its
+        // durable audit_log row (#7).
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(&format!(
             "INSERT INTO firewall_rules ({FIREWALL_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
@@ -24651,9 +24654,30 @@ async fn firewall_rule_create(
         .bind(&rule.created_by)
         .bind(&rule.created_at)
         .bind(&rule.description)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "firewall-rule-create",
+                None,
+                "created",
+                json!({
+                    "rule_id": rule.id,
+                    "name": rule.name,
+                    "site": rule.site,
+                    "action": serde_enum_str(&rule.action),
+                    "direction": serde_enum_str(&rule.direction),
+                    "source_ip": rule.source_ip,
+                    "dest_ip": rule.dest_ip,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "rule": serde_json::to_value(&rule).unwrap_or_default(),
@@ -24743,6 +24767,18 @@ async fn firewall_rule_delete(
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "firewall-rule-delete",
+                Some("active"),
+                "deleted",
+                json!({ "rule_id": id, "site": site }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         // Keep the engine static in sync (delete_rule already scrubs the static
         // rule-sets the same way).
@@ -24809,6 +24845,18 @@ async fn firewall_rule_update(
             .map_err(db_error)?;
         return match row {
             Some(updated) => {
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &audit::security_audit(
+                        "firewall-rule-update",
+                        None,
+                        "updated",
+                        json!({ "rule_id": id, "site": site, "field": col, "value": val }),
+                    ),
+                )
+                .await
+                .map_err(db_error)?;
                 tx.commit().await.map_err(db_error)?;
                 Ok(Json(
                     json!({"source": "database", "rule": updated.to_json()}),
@@ -40671,6 +40719,62 @@ mod firewall_rules_db_tests {
             .await
             .ok();
         cleanup_rule(pool, &rule_id).await;
+    }
+
+    /// #7 audit: firewall rule create + delete each write a durable,
+    /// correctly-attributed audit_log row (atomic with the mutation).
+    #[tokio::test]
+    async fn test_firewall_rule_mutations_write_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let actor = format!("fw-audit-{}", &suffix[..8]);
+        let Ok(Json(created)) = firewall_rule_create(
+            Extension(approver_session(&actor)),
+            Json(create_body(&suffix)),
+        )
+        .await
+        else {
+            panic!("create failed");
+        };
+        let rule_id = created["rule"]["id"].as_str().unwrap().to_string();
+
+        let (c_actor, c_detail) = sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'firewall-rule-create' AND detail->>'rule_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&rule_id)
+        .fetch_optional(pool)
+        .await
+        .expect("query create audit")
+        .expect("a firewall-rule-create audit row must exist");
+        assert_eq!(
+            c_actor, actor,
+            "audit actor must be the authenticated caller"
+        );
+        assert!(c_detail.contains("DEFRA"), "detail must name the site");
+
+        let _ = firewall_rule_delete(
+            AuthExtractor(approver_session(&actor)),
+            Path(rule_id.clone()),
+        )
+        .await
+        .expect("delete");
+        let delete_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'firewall-rule-delete' AND detail->>'rule_id' = $1)",
+        )
+        .bind(&rule_id)
+        .fetch_one(pool)
+        .await
+        .expect("query delete audit");
+
+        cleanup_rule(pool, &rule_id).await;
+        assert!(delete_audited, "delete must write a durable audit_log row");
     }
 
     /// Create → update (action=deny) → GET verifies update persisted.
