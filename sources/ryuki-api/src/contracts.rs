@@ -27063,8 +27063,11 @@ struct DatacenterSiteQuery {
 //   - `get_db() == None`       → degrade to empty slice (no DB available).
 
 async fn datacenter_readiness_score_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only read datacenter readiness for its own site.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27077,8 +27080,11 @@ async fn datacenter_readiness_score_endpoint(
 }
 
 async fn datacenter_site_report_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27103,8 +27109,11 @@ async fn datacenter_failing_checks_endpoint() -> Result<Json<Value>, (StatusCode
 }
 
 async fn datacenter_check_power_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27117,8 +27126,11 @@ async fn datacenter_check_power_endpoint(
 }
 
 async fn datacenter_check_cooling_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27131,8 +27143,11 @@ async fn datacenter_check_cooling_endpoint(
 }
 
 async fn datacenter_check_rack_space_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27145,8 +27160,11 @@ async fn datacenter_check_rack_space_endpoint(
 }
 
 async fn datacenter_check_switchports_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -27159,8 +27177,11 @@ async fn datacenter_check_switchports_endpoint(
 }
 
 async fn datacenter_full_readiness_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<DatacenterSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read.
+    guard_body_site_scope(&session, &params.site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::datacenter_readiness::list_by_site(pool, &params.site)
             .await
@@ -31185,6 +31206,31 @@ mod unit_tests {
         let err = storage_volumes_list(
             AuthExtractor(scoped_session(&[], &["production"])),
             Query(StorageSiteQuery { site: None }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn datacenter_readiness_reads_deny_out_of_scope() {
+        // The 7 datacenter-readiness reads take a required ?site and guard it; a
+        // scoped principal may only read its own site. Representative coverage.
+        let err = datacenter_readiness_score_endpoint(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Query(DatacenterSiteQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope readiness read must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        let err = datacenter_check_power_endpoint(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Query(DatacenterSiteQuery {
+                site: "GBLON".into(),
+            }),
         )
         .await
         .expect_err("an environment-scoped principal must be 403");
