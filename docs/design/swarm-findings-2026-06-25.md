@@ -162,6 +162,20 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (lines 11432-11479) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** admin_platform_settings_update (line 11432) and admin_platform_settings_reset (line 11465) persist to platform_config table via upsert_platform_config_entries (line 11387) and save_platform_config_file but emit NO audit record and NO notifications to approvers/admins. These are high-risk admin actions affecting auth_mode, branding, feature flags, etc. No tracing.info() equivalent. Compare to request.plan (line 12082) which emits audit + notifications.
 - **verified:** Verified in code: admin_platform_settings_update (line 11432) and admin_platform_settings_reset (line 11465) in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/contracts.rs persist to platform_config table but make zero calls to audit::record_audit_tx() or tracing::info(). Contrast: requests_plan() at line 13665 calls apply_transition_audited() which persists audit records; admin_tokens_create/revoke/sessions_revoke all have tracing::info() calls (lines 11665, 11782, 11870). The mutations affect sensitive fields like auth_mode, secret_provider, etc. No entry in missing-features-track
+- **STATUS (2026-06-26) — audit COMPLETE (notifications deferred):**
+  `admin_platform_settings_update` and `_reset` now write a DURABLE hash-chained
+  `audit_log` row ATOMICALLY with the upsert: `upsert_platform_config_entries`
+  was refactored to take `&mut Transaction`, and each handler opens a tx →
+  upserts → `audit::record_audit_tx` (reusing the swarm-#5 `security_audit()`
+  pattern; action `platform-settings-update`/`-reset`) → commit, then saves the
+  config file outside the tx. detail records the new `PlatformConfig` values —
+  verified to hold NO secret fields (identifiers/provider-names/retention/timeouts
+  only; the OIDC client secret lives in env/managed_secrets), and these exact
+  key/value pairs already persist to `platform_config.value`, so auditing adds no
+  new exposure. DB-gated test (`test_platform_settings_update_writes_audit_log`,
+  using a temp config store so the real gitignored `platform-config.json` is never
+  touched) green against the live DB. Notifications to approvers/admins DEFERRED
+  (same follow-up bucket as swarm #5).
 
 ### 7. Operational resource deletions and updates lack audit trails
 - **area:** ryuki-api/src/contracts.rs (lines 15908-15923, 19321-19342, 23083-23107, 23381-23416, 23831-23841, 24426+) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True

@@ -11514,7 +11514,7 @@ fn map_platform_settings_read_result<T, E: std::fmt::Display>(
 }
 
 async fn upsert_platform_config_entries(
-    pool: &sqlx::PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     config: &PlatformConfig,
 ) -> Result<(), ProblemDetails> {
     let entries = platform_config_entries(config);
@@ -11526,7 +11526,7 @@ async fn upsert_platform_config_entries(
             )
             .bind(key)
             .bind(value)
-            .execute(pool)
+            .execute(&mut **tx)
             .await,
             "database",
             Some(key),
@@ -11588,7 +11588,37 @@ async fn admin_platform_settings_update(
     }
 
     if let Some(pool) = get_db() {
-        upsert_platform_config_entries(pool, &body).await?;
+        let mut tx = map_platform_settings_persistence_result(
+            pool.begin().await,
+            "database",
+            Some("begin"),
+        )?;
+        upsert_platform_config_entries(&mut tx, &body).await?;
+        // Durable audit of this privileged config mutation, atomic with the
+        // upsert. PlatformConfig holds only non-secret settings/identifiers — the
+        // SAME key/value pairs already persisted to platform_config — so
+        // recording them adds no new exposure (any future secret-bearing config
+        // field MUST be redacted here before auditing).
+        let settings: serde_json::Map<String, Value> = platform_config_entries(&body)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), Value::String(v)))
+            .collect();
+        map_platform_settings_persistence_result(
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "platform-settings-update",
+                    None,
+                    "updated",
+                    json!({ "settings": settings }),
+                ),
+            )
+            .await,
+            "database",
+            Some("audit"),
+        )?;
+        map_platform_settings_persistence_result(tx.commit().await, "database", Some("commit"))?;
     }
     save_platform_config_file(&body).await?;
     let config = if get_db().is_some() {
@@ -11609,7 +11639,29 @@ async fn admin_platform_settings_reset(
 
     let defaults = PlatformConfig::default();
     if let Some(pool) = get_db() {
-        upsert_platform_config_entries(pool, &defaults).await?;
+        let mut tx = map_platform_settings_persistence_result(
+            pool.begin().await,
+            "database",
+            Some("begin"),
+        )?;
+        upsert_platform_config_entries(&mut tx, &defaults).await?;
+        // Durable audit of the reset-to-defaults, atomic with the upsert.
+        map_platform_settings_persistence_result(
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "platform-settings-reset",
+                    None,
+                    "reset",
+                    json!({ "reset_to_defaults": true }),
+                ),
+            )
+            .await,
+            "database",
+            Some("audit"),
+        )?;
+        map_platform_settings_persistence_result(tx.commit().await, "database", Some("commit"))?;
     }
     save_platform_config_file(&defaults).await?;
     Ok(Json(serde_json::to_value(defaults).unwrap_or_default()))
@@ -33175,6 +33227,63 @@ mod db_lifecycle_tests {
         assert!(
             detail.contains(subject),
             "audit detail must name the subject whose session was revoked"
+        );
+    }
+
+    /// #6 config-mutation audit gap: updating platform settings must write a
+    /// DURABLE audit_log row attributing the admin and recording the new
+    /// (non-secret) settings.
+    #[tokio::test]
+    async fn test_platform_settings_update_writes_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Claim the set-once config store with a TEMP path so the handler's
+        // file-save can never touch the real gitignored platform-config.json.
+        // Skip if another test in this binary already owns the store.
+        if !crate::config_store::try_init_for_test("/tmp/ryuki-test-cfg-6e0.json") {
+            eprintln!("SKIP: config store already initialized by another test");
+            return;
+        }
+        // A verified interactive admin (token_valid + non-machine provider)
+        // passes require_verified_external_admin_permission for any auth_mode.
+        let mut admin = admin_session("dbtest-admin-cfg-6e0");
+        admin.token_valid = true;
+        let marker = "DBTEST Audit Platform 6e0";
+        let body = ryuki_core::types::PlatformConfig {
+            platform_name: marker.into(),
+            ..Default::default()
+        };
+
+        let res = admin_platform_settings_update(AuthExtractor(admin.clone()), Json(body)).await;
+        assert!(res.is_ok(), "settings update must succeed: {res:?}");
+
+        let (action, actor, detail) = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, actor_principal, detail::text FROM audit_log \
+             WHERE action = 'platform-settings-update' \
+               AND detail->'settings'->>'platform_name' = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(marker)
+        .fetch_optional(pool)
+        .await
+        .expect("query audit_log")
+        .expect("a durable platform-settings-update audit row must exist");
+
+        // Restore defaults so the marker does not linger in platform_config for
+        // other tests (audit_log is append-only — its rows are intentionally kept).
+        let _ = admin_platform_settings_reset(AuthExtractor(admin)).await;
+
+        assert_eq!(action, "platform-settings-update");
+        assert_eq!(actor, "dbtest-admin-cfg-6e0", "actor must be the admin");
+        assert!(
+            detail.contains(marker),
+            "audit must record the new settings"
+        );
+        assert!(
+            detail.contains("auth_mode"),
+            "audit records the config keys"
         );
     }
 

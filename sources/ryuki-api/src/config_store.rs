@@ -62,6 +62,16 @@ pub fn get_app_config() -> &'static RyukiConfig {
     APP_CONFIG.get().expect("app config not initialized")
 }
 
+/// Idempotently initialize the app config + config store for a test, pointing
+/// the FILE store at `path` (pass a temp path so handler file-saves never touch
+/// a real config). Returns true ONLY if this call claimed the set-once store, so
+/// a caller can skip rather than risk clobbering a store another test owns.
+#[cfg(test)]
+pub fn try_init_for_test(path: &str) -> bool {
+    let _ = APP_CONFIG.set(RyukiConfig::default());
+    STORE.set(Mutex::new(ConfigStore::new(path))).is_ok()
+}
+
 /// The configured auth mode, or the default (`MockDryRun`) when the config store
 /// is not initialized (e.g. unit tests). Never panics — use this on hot paths
 /// (like the separation-of-duties gate) that can run before/without init.
