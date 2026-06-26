@@ -23805,6 +23805,9 @@ async fn dns_record_create(
         let record =
             dns_ipam::build_dns_record(&b.name, &b.record_type, &b.value, &b.zone, b.ttl, &b.site)
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+        // Persist + audit ATOMICALLY: a DNS record never lands without its
+        // durable audit_log row (#7).
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(&format!(
             "INSERT INTO dns_records ({DNS_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
         ))
@@ -23816,9 +23819,28 @@ async fn dns_record_create(
         .bind(record.ttl as i32)
         .bind(&record.site)
         .bind(dns_status_str(&record.status))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "dns-record-create",
+                None,
+                "created",
+                json!({
+                    "record_id": record.id,
+                    "name": record.name,
+                    "type": record.record_type.to_string(),
+                    "zone": record.zone,
+                    "site": record.site,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
             "record": serde_json::to_value(&record).unwrap_or_default(),
@@ -23882,6 +23904,18 @@ async fn dns_record_delete(
             ));
         };
         guard_body_site_scope(&session, &site)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "dns-record-delete",
+                Some("active"),
+                "deleted",
+                json!({ "record_id": id, "site": site }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "source": "database",
@@ -23967,6 +24001,18 @@ async fn dns_record_update(
     ))
     .bind(&id)
     .fetch_one(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dns-record-update",
+            None,
+            "updated",
+            json!({ "record_id": id, "site": existing.site }),
+        ),
+    )
     .await
     .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
@@ -24085,6 +24131,9 @@ async fn ipam_subnet_create(
             Json(json!({"error": "subnet is too large to persist (host count exceeds i32)"})),
         ));
     }
+    // Persist + audit ATOMICALLY: a subnet never lands without its
+    // durable audit_log row (#7).
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(&format!(
         "INSERT INTO ipam_subnets ({IPAM_SUBNET_COLUMNS}) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
@@ -24098,9 +24147,27 @@ async fn ipam_subnet_create(
     .bind(subnet.used_ips as i32)
     .bind(subnet.available_ips as i32)
     .bind(subnet_status_str(&subnet.status))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ipam-subnet-create",
+            None,
+            "created",
+            json!({
+                "subnet_id": subnet.id,
+                "cidr": subnet.cidr,
+                "site": subnet.site,
+                "vlan_id": b.vlan_id,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "subnet": serde_json::to_value(&subnet).unwrap_or_default(),
@@ -24181,6 +24248,18 @@ async fn ipam_subnet_update(
     .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ipam-subnet-update",
+            None,
+            "updated",
+            json!({ "subnet_id": id, "site": existing.site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
@@ -24237,6 +24316,18 @@ async fn ipam_subnet_delete(
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ipam-subnet-delete",
+            Some("active"),
+            "deleted",
+            json!({ "subnet_id": id, "site": site }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
@@ -24340,6 +24431,22 @@ async fn ipam_reserve_ip(
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "ipam-reserve-ip",
+                None,
+                "reserved",
+                json!({
+                    "subnet_id": b.subnet_id,
+                    "ip": reservation.ip_address,
+                    "site": locked_site,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
 
         let updated_subnet = dns_ipam::IpamSubnet {
@@ -24414,6 +24521,22 @@ async fn ipam_release_ip(
         )
         .bind(&reservation.subnet_id)
         .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "ipam-release-ip",
+                None,
+                "released",
+                json!({
+                    "reservation_id": id,
+                    "subnet_id": reservation.subnet_id,
+                    "site": subnet_site,
+                }),
+            ),
+        )
         .await
         .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
@@ -32575,6 +32698,17 @@ mod db_lifecycle_tests {
         assert_eq!(created["subnet"]["total_ips"], 254);
         assert_eq!(created["subnet"]["available_ips"], 254);
 
+        // #7 audit: the create wrote a durable audit_log row.
+        let create_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'ipam-subnet-create' AND detail->>'subnet_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query create audit");
+        assert!(create_audited, "subnet create must write an audit_log row");
+
         // UPDATE gateway + status; the reservation counters are preserved.
         let Json(updated) = ipam_subnet_update(
             AuthExtractor(AuthSession::static_dry_run()),
@@ -32640,6 +32774,17 @@ mod db_lifecycle_tests {
         .await
         .expect("delete subnet");
         assert_eq!(deleted["deleted"], true);
+
+        // #7 audit: the delete wrote a durable audit_log row.
+        let delete_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'ipam-subnet-delete' AND detail->>'subnet_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query delete audit");
+        assert!(delete_audited, "subnet delete must write an audit_log row");
 
         sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
             .bind(&id)
@@ -34425,6 +34570,67 @@ mod dns_records_db_tests {
         let pool = crate::database::get_db()?;
         crate::database::run_migrations(pool).await.ok()?;
         Some(pool)
+    }
+
+    fn audit_actor(user_id: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s
+    }
+
+    /// #7 audit: DNS record create + delete each write a durable,
+    /// correctly-attributed audit_log row (atomic with the mutation).
+    #[tokio::test]
+    async fn test_dns_record_mutations_write_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let actor = "dns-audit-7c2";
+        let Json(created) = dns_record_create(
+            AuthExtractor(audit_actor(actor)),
+            Json(DnsCreateRequest {
+                name: "audit".into(),
+                record_type: "A".into(),
+                value: "10.7.7.7".into(),
+                zone: "audit.test".into(),
+                ttl: 3600,
+                site: "DEFRA".into(),
+            }),
+        )
+        .await
+        .expect("create");
+        let id = created["record"]["id"].as_str().expect("id").to_string();
+
+        let (c_actor, c_detail) = sqlx::query_as::<_, (String, String)>(
+            "SELECT actor_principal, detail::text FROM audit_log \
+             WHERE action = 'dns-record-create' AND detail->>'record_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .expect("query create audit")
+        .expect("a dns-record-create audit row must exist");
+        assert_eq!(
+            c_actor, actor,
+            "audit actor must be the authenticated caller"
+        );
+        assert!(c_detail.contains("DEFRA"), "detail must name the site");
+
+        let _ = dns_record_delete(AuthExtractor(audit_actor(actor)), Path(id.clone()))
+            .await
+            .expect("delete");
+        let delete_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'dns-record-delete' AND detail->>'record_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query delete audit");
+        assert!(delete_audited, "delete must write a durable audit_log row");
     }
 
     #[tokio::test]
