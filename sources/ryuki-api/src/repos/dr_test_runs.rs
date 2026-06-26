@@ -37,7 +37,10 @@ impl DrTestRunRow {
     }
 }
 
-pub async fn insert(pool: &PgPool, run: &DrTestRun) -> Result<(), sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    run: &DrTestRun,
+) -> Result<(), sqlx::Error> {
     let run_json = serde_json::to_value(run)
         .map_err(|e| sqlx::Error::Decode(format!("dr_test_runs: serialize failed: {e}").into()))?;
     sqlx::query(
@@ -48,7 +51,7 @@ pub async fn insert(pool: &PgPool, run: &DrTestRun) -> Result<(), sqlx::Error> {
     .bind(&run.site)
     .bind(run.completed_at.is_some())
     .bind(run_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -80,14 +83,13 @@ pub async fn list_by_plan(pool: &PgPool, plan_id: &str) -> Result<Vec<DrTestRun>
 
 #[allow(dead_code)]
 pub async fn transition(
-    pool: &PgPool,
+    executor: &mut sqlx::PgConnection,
     id: &str,
     expected_version: &str,
     updated: &DrTestRun,
 ) -> Result<bool, sqlx::Error> {
     let run_json = serde_json::to_value(updated)
         .map_err(|e| sqlx::Error::Decode(format!("dr_test_runs: serialize failed: {e}").into()))?;
-    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE dr_test_runs SET \
          completed = $2, \
@@ -99,12 +101,10 @@ pub async fn transition(
     .bind(updated.completed_at.is_some())
     .bind(run_json)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(&mut *executor)
     .await?;
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
-    tx.commit().await?;
     Ok(true)
 }

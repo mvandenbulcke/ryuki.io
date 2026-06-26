@@ -26473,9 +26473,23 @@ async fn dr_plan_create(
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let plan = dr_testing::build_dr_plan(&b.name, &b.site, &b.target_site, b.systems, b.rpo, b.rto)
         .map_err(|e| status_400(&e))?;
-    crate::repos::dr_plans::insert(pool, &plan)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::dr_plans::insert(&mut *tx, &plan)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dr-plan-create",
+            None,
+            "created",
+            json!({"plan_id": &plan.id, "site": &plan.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     // Write-through: keep the in-memory store consistent so test-run creation
     // (start_test resolves the plan from the static store) sees this new plan.
     dr_testing::upsert_plan(&plan);
@@ -26510,7 +26524,8 @@ async fn dr_plan_update_rpo_rto(
     guard_body_site_scope(&session, &plan.site)?;
     let updated =
         dr_testing::update_rpo_rto_pure(&plan, b.rpo, b.rto).map_err(|e| status_409(&e))?;
-    let ok = crate::repos::dr_plans::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::dr_plans::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
@@ -26518,6 +26533,19 @@ async fn dr_plan_update_rpo_rto(
             "plan was modified concurrently; reload and retry",
         ));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dr-plan-update-rpo-rto",
+            None,
+            "updated",
+            json!({"plan_id": &id, "site": &plan.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     // Write-through: mirror the persisted update into the in-memory store (only
     // reached when the DB CAS won, so the static reflects the DB winner).
     dr_testing::upsert_plan(&updated);
@@ -26540,9 +26568,23 @@ async fn dr_test_start(
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let run = dr_testing::build_test_run(&plan, &b.scenario_type, &b.tester)
         .map_err(|e| status_400(&e))?;
-    crate::repos::dr_test_runs::insert(pool, &run)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::dr_test_runs::insert(&mut *tx, &run)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dr-test-start",
+            None,
+            "started",
+            json!({"test_id": &run.id, "plan_id": &run.plan_id, "site": &run.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(&run).unwrap_or_default()))
 }
 async fn dr_test_complete(
@@ -26618,6 +26660,18 @@ async fn dr_test_complete(
             "DR plan was modified concurrently; reload and retry",
         ));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dr-test-complete",
+            None,
+            "completed",
+            json!({"test_id": &completed_run.id, "plan_id": &completed_run.plan_id, "site": &completed_run.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     dr_testing::upsert_plan(&updated_plan);
     Ok(Json(
@@ -48811,6 +48865,49 @@ mod dr_plans_db_tests {
         .expect("build_dr_plan must succeed for valid inputs")
     }
 
+    /// #7 audit: the dr_plan_create HANDLER writes a durable audit row naming
+    /// the plan (atomic with the insert).
+    #[tokio::test]
+    async fn test_dr_plan_create_writes_audit_log() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let name = format!("audit-dr-{suffix}");
+        let res = super::dr_plan_create(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Json(super::DrPlanCreateRequest {
+                name: name.clone(),
+                site: "DEFRA".into(),
+                target_site: "GBLON".into(),
+                systems: vec!["sys-audit-1".into()],
+                rpo: 15,
+                rto: 60,
+            }),
+        )
+        .await;
+        assert!(res.is_ok(), "dr_plan_create must succeed: {res:?}");
+
+        // Find the created plan by its unique name, then assert its audit row.
+        let id: String = sqlx::query_scalar("SELECT id FROM dr_plans WHERE name = $1")
+            .bind(&name)
+            .fetch_one(pool)
+            .await
+            .expect("created plan row");
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'dr-plan-create' AND detail->>'plan_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query audit");
+        cleanup(pool, &id).await;
+        assert!(audited, "dr_plan_create must write a durable audit row");
+    }
+
     /// create + get round-trip: inserted plan is found and fields match.
     #[tokio::test]
     async fn test_create_get_roundtrip() {
@@ -48872,9 +48969,16 @@ mod dr_plans_db_tests {
         let updated = ryuki_engine::dr_testing::update_rpo_rto_pure(&fetched, 30, 90)
             .expect("update_rpo_rto_pure must succeed");
 
-        let ok = crate::repos::dr_plans::transition(pool, &id, &version, &updated)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::dr_plans::transition(&mut tx, &id, &version, &updated)
+                .await
+                .expect("transition failed");
+            if result {
+                tx.commit().await.expect("commit tx");
+            }
+            result
+        };
         assert!(ok, "transition must succeed");
 
         let (re_fetched, _) = crate::repos::dr_plans::get(pool, &id)
@@ -48933,16 +49037,28 @@ mod dr_plans_db_tests {
         // First update succeeds (bumps xmin).
         let first_update = ryuki_engine::dr_testing::update_rpo_rto_pure(&original, 20, 80)
             .expect("pure fn must succeed");
-        crate::repos::dr_plans::transition(pool, &id, &stale_version, &first_update)
-            .await
-            .expect("first transition must succeed");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let ok =
+                crate::repos::dr_plans::transition(&mut tx, &id, &stale_version, &first_update)
+                    .await
+                    .expect("first transition must succeed");
+            assert!(ok);
+            tx.commit().await.expect("commit tx");
+        }
 
         // Second update with stale version must fail.
         let stale_update = ryuki_engine::dr_testing::update_rpo_rto_pure(&original, 25, 100)
             .expect("pure fn must succeed");
-        let applied = crate::repos::dr_plans::transition(pool, &id, &stale_version, &stale_update)
-            .await
-            .expect("transition query must not error");
+        let applied = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::dr_plans::transition(&mut tx, &id, &stale_version, &stale_update)
+                    .await
+                    .expect("transition query must not error");
+            // result is false (CAS miss) — tx drops without commit = rollback
+            result
+        };
 
         cleanup(pool, &id).await;
         assert!(
@@ -49000,15 +49116,26 @@ mod dr_plans_db_tests {
         );
 
         // First writer wins.
-        let first_ok = crate::repos::dr_plans::transition(pool, &id, &version_a, &update_a)
-            .await
-            .expect("first transition must not error");
+        let first_ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::dr_plans::transition(&mut tx, &id, &version_a, &update_a)
+                .await
+                .expect("first transition must not error");
+            if result {
+                tx.commit().await.expect("commit first tx");
+            }
+            result
+        };
         assert!(first_ok, "first writer must succeed");
 
         // Second writer with the now-stale xmin must lose.
-        let second_ok = crate::repos::dr_plans::transition(pool, &id, &version_b, &update_b)
-            .await
-            .expect("second transition must not error");
+        let second_ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::dr_plans::transition(&mut tx, &id, &version_b, &update_b)
+                .await
+                .expect("second transition must not error");
+            result
+        };
 
         // Verify the winner persisted (rpo=45).
         let (final_plan, _) = crate::repos::dr_plans::get(pool, &id)
@@ -49186,10 +49313,21 @@ mod dr_test_runs_db_tests {
         let completed_at = completed_run.completed_at.clone().unwrap();
 
         // Transition run
-        let ok =
-            crate::repos::dr_test_runs::transition(pool, &run_id, &run_version, &completed_run)
-                .await
-                .expect("transition run");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::dr_test_runs::transition(
+                &mut tx,
+                &run_id,
+                &run_version,
+                &completed_run,
+            )
+            .await
+            .expect("transition run");
+            if result {
+                tx.commit().await.expect("commit run tx");
+            }
+            result
+        };
         assert!(ok, "run transition must succeed");
 
         // Transition plan
@@ -49199,10 +49337,17 @@ mod dr_test_runs_db_tests {
             .expect("plan not found");
         let updated_plan =
             ryuki_engine::dr_testing::mark_plan_tested_pure(&plan_fetched, &completed_at);
-        let plan_ok =
-            crate::repos::dr_plans::transition(pool, &plan_id, &plan_version, &updated_plan)
-                .await
-                .expect("transition plan");
+        let plan_ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::dr_plans::transition(&mut tx, &plan_id, &plan_version, &updated_plan)
+                    .await
+                    .expect("transition plan");
+            if result {
+                tx.commit().await.expect("commit plan tx");
+            }
+            result
+        };
         assert!(plan_ok, "plan transition must succeed");
 
         // Assert BOTH the run completed_at and the plan's last_tested in DB
@@ -49267,9 +49412,15 @@ mod dr_test_runs_db_tests {
         let completed =
             ryuki_engine::dr_testing::complete_test_run_pure(&run_fetched, "Passed", vec![])
                 .expect("first complete must succeed");
-        crate::repos::dr_test_runs::transition(pool, &run_id, &run_version, &completed)
-            .await
-            .expect("transition");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let ok =
+                crate::repos::dr_test_runs::transition(&mut tx, &run_id, &run_version, &completed)
+                    .await
+                    .expect("transition");
+            assert!(ok);
+            tx.commit().await.expect("commit tx");
+        }
 
         // Re-fetch and try to complete again -> Err
         let (completed_run, _) = crate::repos::dr_test_runs::get(pool, &run_id)
@@ -49330,17 +49481,28 @@ mod dr_test_runs_db_tests {
         .expect("complete b");
 
         // First writer wins
-        let first_ok =
-            crate::repos::dr_test_runs::transition(pool, &run_id, &version_a, &completed_a)
-                .await
-                .expect("first transition");
+        let first_ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::dr_test_runs::transition(&mut tx, &run_id, &version_a, &completed_a)
+                    .await
+                    .expect("first transition");
+            if result {
+                tx.commit().await.expect("commit first tx");
+            }
+            result
+        };
         assert!(first_ok, "first writer must succeed");
 
         // Second writer with stale xmin must lose
-        let second_ok =
-            crate::repos::dr_test_runs::transition(pool, &run_id, &version_b, &completed_b)
-                .await
-                .expect("second transition must not error");
+        let second_ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::dr_test_runs::transition(&mut tx, &run_id, &version_b, &completed_b)
+                    .await
+                    .expect("second transition must not error");
+            result
+        };
         assert!(
             !second_ok,
             "second writer with stale xmin must return false"

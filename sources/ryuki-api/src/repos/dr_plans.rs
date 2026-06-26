@@ -49,7 +49,7 @@ fn decode_status(s: &str) -> Result<DrPlanStatus, String> {
         .map_err(|e| format!("unknown dr_plans status '{s}': {e}"))
 }
 
-pub async fn insert(pool: &PgPool, plan: &DrPlan) -> Result<(), sqlx::Error> {
+pub async fn insert(executor: impl sqlx::PgExecutor<'_>, plan: &DrPlan) -> Result<(), sqlx::Error> {
     let plan_json = serde_json::to_value(plan)
         .map_err(|e| sqlx::Error::Decode(format!("dr_plans: serialize failed: {e}").into()))?;
     sqlx::query(
@@ -60,7 +60,7 @@ pub async fn insert(pool: &PgPool, plan: &DrPlan) -> Result<(), sqlx::Error> {
     .bind(&plan.site)
     .bind(status_str(&plan.status))
     .bind(plan_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -105,14 +105,13 @@ pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<DrPlan>, sqlx
 ///
 /// xmin guards ALL mutations including same-status ones (e.g. rpo/rto update).
 pub async fn transition(
-    pool: &PgPool,
+    executor: &mut sqlx::PgConnection,
     id: &str,
     expected_version: &str,
     updated: &DrPlan,
 ) -> Result<bool, sqlx::Error> {
     let plan_json = serde_json::to_value(updated)
         .map_err(|e| sqlx::Error::Decode(format!("dr_plans: serialize failed: {e}").into()))?;
-    let mut tx = pool.begin().await?;
     let res = sqlx::query(
         "UPDATE dr_plans SET \
          status = $2, \
@@ -124,12 +123,10 @@ pub async fn transition(
     .bind(status_str(&updated.status))
     .bind(plan_json)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(&mut *executor)
     .await?;
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
-    tx.commit().await?;
     Ok(true)
 }
