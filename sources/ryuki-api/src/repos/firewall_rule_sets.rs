@@ -8,12 +8,13 @@ use ryuki_engine::firewall_rules::{FirewallRuleSet, RuleSetStatus};
 use sqlx::PgPool;
 
 pub const COLUMNS: &str =
-    "id, status, rule_set_json::text AS rule_set_json, xmin::text AS row_version";
+    "id, status, site, rule_set_json::text AS rule_set_json, xmin::text AS row_version";
 
 #[derive(sqlx::FromRow)]
 pub struct FirewallRuleSetRow {
     pub id: String,
     pub status: String,
+    pub site: String,
     pub rule_set_json: Option<String>,
     pub row_version: String,
 }
@@ -31,6 +32,9 @@ impl FirewallRuleSetRow {
         // DB status column is authoritative on read
         entity.status = decode_status(&self.status)
             .map_err(|e| sqlx::Error::Decode(format!("firewall_rule_sets.status: {e}").into()))?;
+        // DB scalar `site` column is authoritative on read too (#2): scope checks
+        // run against it, so it must not silently drift from the persisted JSON.
+        entity.site = self.site;
         entity.id = self.id;
         Ok(entity)
     }

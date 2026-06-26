@@ -196,17 +196,22 @@ pub async fn accept(
     id: &str,
     implementation_plan: &str,
     expected_status: &str,
+    scope_site: &str,
 ) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
+    // The `AND site = $5` predicate (#2) makes the CAS site-aware: if the row was
+    // re-homed out of the caller's scope after the handler's scope guard, this
+    // matches 0 rows and the handler reports a 409 instead of writing off-scope.
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "UPDATE aiops_suggestions \
          SET status = $4, implementation_plan = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = $3 \
+         WHERE id = $1 AND status = $3 AND site = $5 \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(implementation_plan)
     .bind(expected_status)
     .bind(suggestion_status_to_db(&SuggestionStatus::Accepted))
+    .bind(scope_site)
     .fetch_optional(pool)
     .await?;
 
@@ -220,17 +225,20 @@ pub async fn reject(
     id: &str,
     rejection_reason: &str,
     expected_status: &str,
+    scope_site: &str,
 ) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
+    // `AND site = $5` (#2) — site-aware CAS; see `accept`.
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "UPDATE aiops_suggestions \
          SET status = $4, rejection_reason = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = $3 \
+         WHERE id = $1 AND status = $3 AND site = $5 \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(rejection_reason)
     .bind(expected_status)
     .bind(suggestion_status_to_db(&SuggestionStatus::Rejected))
+    .bind(scope_site)
     .fetch_optional(pool)
     .await?;
 
@@ -243,16 +251,19 @@ pub async fn implement(
     pool: &PgPool,
     id: &str,
     expected_status: &str,
+    scope_site: &str,
 ) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
+    // `AND site = $4` (#2) — site-aware CAS; see `accept`.
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "UPDATE aiops_suggestions \
          SET status = $3, updated_at = NOW() \
-         WHERE id = $1 AND status = $2 \
+         WHERE id = $1 AND status = $2 AND site = $4 \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(expected_status)
     .bind(suggestion_status_to_db(&SuggestionStatus::Implemented))
+    .bind(scope_site)
     .fetch_optional(pool)
     .await?;
 
@@ -462,7 +473,7 @@ mod aiops_db_tests {
         let suggestion = get(&pool, id).await.expect("get").expect("row");
         let expected = ryuki_engine::aiops::guard_reject(&suggestion).expect("guard ok");
 
-        let updated = reject(&pool, id, "Insufficient data", expected)
+        let updated = reject(&pool, id, "Insufficient data", expected, &suggestion.site)
             .await
             .expect("reject repo")
             .expect("CAS hit");

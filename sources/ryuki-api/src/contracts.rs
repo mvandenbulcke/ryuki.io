@@ -10927,18 +10927,23 @@ async fn aiops_review(
     })))
 }
 
-async fn aiops_accept(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn aiops_accept(
+    Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let suggestion = crate::repos::aiops::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only accept a suggestion in its own site.
+    guard_body_site_scope(&session, &suggestion.site)?;
     let expected = aiops::guard_accept(&suggestion).map_err(|e| status_409(&e))?;
     let plan = format!(
         "Implementation plan for {}: dry-run assessment, maintenance window scheduling, execution, verification.",
         suggestion.title
     );
-    let updated = crate::repos::aiops::accept(pool, &id, &plan, expected)
+    let updated = crate::repos::aiops::accept(pool, &id, &plan, expected, &suggestion.site)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
@@ -10953,6 +10958,7 @@ async fn aiops_accept(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
 
 async fn aiops_reject(
     Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<AiopsRejectRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -10960,8 +10966,10 @@ async fn aiops_reject(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only reject a suggestion in its own site.
+    guard_body_site_scope(&session, &suggestion.site)?;
     let expected = aiops::guard_reject(&suggestion).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::aiops::reject(pool, &id, &body.reason, expected)
+    let updated = crate::repos::aiops::reject(pool, &id, &body.reason, expected, &suggestion.site)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
@@ -10974,14 +10982,19 @@ async fn aiops_reject(
     })))
 }
 
-async fn aiops_implement(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn aiops_implement(
+    Path(id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let suggestion = crate::repos::aiops::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only implement a suggestion in its own site.
+    guard_body_site_scope(&session, &suggestion.site)?;
     let expected = aiops::guard_implement(&suggestion).map_err(|e| status_409(&e))?;
-    let updated = crate::repos::aiops::implement(pool, &id, expected)
+    let updated = crate::repos::aiops::implement(pool, &id, expected, &suggestion.site)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
@@ -24455,6 +24468,7 @@ async fn firewall_rule_set_get(
 }
 
 async fn firewall_rule_set_apply(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -24462,6 +24476,9 @@ async fn firewall_rule_set_apply(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only apply a rule set in its own site. Guarded
+    // on the loaded row; the xmin CAS below fails the write if the row changed.
+    guard_body_site_scope(&session, &rs.site)?;
     let updated = firewall_rules::apply_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
     let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
         .await
@@ -24478,6 +24495,7 @@ async fn firewall_rule_set_apply(
 }
 
 async fn firewall_rule_set_revoke(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -24485,6 +24503,8 @@ async fn firewall_rule_set_revoke(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only revoke a rule set in its own site.
+    guard_body_site_scope(&session, &rs.site)?;
     let updated = firewall_rules::revoke_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
     let cas_ok = crate::repos::firewall_rule_sets::transition(pool, &id, &version, &updated)
         .await
