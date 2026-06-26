@@ -21551,11 +21551,13 @@ fn parse_oob_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value>)
 }
 
 async fn oob_test_endpoint(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let endpoint_uuid = parse_oob_id(&id)?;
         let now = chrono::Utc::now();
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE oob_endpoints \
              SET last_tested = $1, reachable = true, updated_at = $1 \
@@ -21563,7 +21565,7 @@ async fn oob_test_endpoint(
         )
         .bind(now)
         .bind(endpoint_uuid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
 
@@ -21573,6 +21575,20 @@ async fn oob_test_endpoint(
                 Json(json!({"error": format!("OOB endpoint {} not found", id)})),
             ));
         }
+
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "oob-test-endpoint",
+                None,
+                "tested",
+                json!({ "endpoint_id": id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
 
         let row: OobEndpointRow = sqlx::query_as(&format!(
             "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1"
@@ -22096,7 +22112,10 @@ fn parse_snow_id(id: &str) -> Result<sqlx::types::Uuid, (StatusCode, Json<Value>
 
 // ─── ServiceNow API handlers ───
 
-async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> ApiResult {
+async fn servicenow_incident(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ServicenowIncidentRequest>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // Replicate engine validation (prepare_incident checks these before new_request).
         if body.ci_name.is_empty() {
@@ -22111,6 +22130,7 @@ async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> Api
             "urgency": body.urgency,
             "assignment_group": body.assignment_group,
         });
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(
             "INSERT INTO servicenow_queue \
              (id, request_type, external_ref, status, ci_name, payload_summary, \
@@ -22122,9 +22142,22 @@ async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> Api
         .bind(&body.description)
         .bind(now)
         .bind(meta.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "servicenow-incident",
+                None,
+                "queued",
+                json!({ "queue_id": id.to_string(), "request_type": "incident" }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "id": id.to_string(),
             "request_type": "incident",
@@ -22146,7 +22179,10 @@ async fn servicenow_incident(Json(body): Json<ServicenowIncidentRequest>) -> Api
     }
 }
 
-async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResult {
+async fn servicenow_change(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ServicenowChangeRequest>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // Replicate engine validation (prepare_change checks these before new_request).
         if body.ci_name.is_empty() {
@@ -22166,6 +22202,7 @@ async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResu
             "planned_start": body.planned_start,
             "planned_end": body.planned_end,
         });
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(
             "INSERT INTO servicenow_queue \
              (id, request_type, external_ref, status, ci_name, payload_summary, \
@@ -22177,9 +22214,22 @@ async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResu
         .bind(&body.description)
         .bind(now)
         .bind(meta.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "servicenow-change",
+                None,
+                "queued",
+                json!({ "queue_id": id.to_string(), "request_type": "change" }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "id": id.to_string(),
             "request_type": "change",
@@ -22203,7 +22253,10 @@ async fn servicenow_change(Json(body): Json<ServicenowChangeRequest>) -> ApiResu
     }
 }
 
-async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiResult {
+async fn servicenow_request(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ServicenowRequestRequest>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // Replicate engine validation (prepare_request checks these before new_request).
         if body.ci_name.is_empty() {
@@ -22217,6 +22270,7 @@ async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiRe
         let meta = serde_json::json!({
             "request_type": body.request_type,
         });
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(
             "INSERT INTO servicenow_queue \
              (id, request_type, external_ref, status, ci_name, payload_summary, \
@@ -22228,9 +22282,22 @@ async fn servicenow_request(Json(body): Json<ServicenowRequestRequest>) -> ApiRe
         .bind(&body.description)
         .bind(now)
         .bind(meta.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "servicenow-request",
+                None,
+                "queued",
+                json!({ "queue_id": id.to_string(), "request_type": "request" }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(json!({
             "id": id.to_string(),
             "request_type": "request",
@@ -22339,7 +22406,10 @@ async fn servicenow_approve(Path(id): Path<String>) -> ApiResult {
     }
 }
 
-async fn servicenow_submit(Path(id): Path<String>) -> ApiResult {
+async fn servicenow_submit(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         let uuid = parse_snow_id(&id)?;
         // Engine guards: Submitted → error, Failed → error.
@@ -22347,16 +22417,30 @@ async fn servicenow_submit(Path(id): Path<String>) -> ApiResult {
         // then immediately sets status=Pending. Net effect: any non-Submitted
         // non-Failed status ends up as Pending. Use a conditional UPDATE that
         // rejects Submitted/Failed.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE servicenow_queue \
              SET status = 'Pending' \
              WHERE id = $1 AND status NOT IN ('Submitted', 'Failed')",
         )
         .bind(uuid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() == 1 {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "servicenow-submit",
+                    Some("queued"),
+                    "submitted",
+                    json!({ "queue_id": uuid.to_string() }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
             let now = chrono::Utc::now().to_rfc3339();
             return Ok(Json(json!({
                 "id": uuid.to_string(),
@@ -22366,7 +22450,7 @@ async fn servicenow_submit(Path(id): Path<String>) -> ApiResult {
                 "note": "DRY-RUN: submission queued locally — live ServiceNow submission is disabled pending API approval",
             })));
         }
-        // 0 rows affected: distinguish 404 vs wrong-state (400).
+        // 0 rows affected: distinguish 404 vs wrong-state (400). Use pool (tx drops).
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1")
                 .bind(uuid)
@@ -22434,20 +22518,37 @@ async fn servicenow_pending() -> ApiResult {
     Ok(Json(servicenow_api::get_pending_submissions()))
 }
 
-async fn servicenow_cancel(Path(id): Path<String>) -> ApiResult {
+async fn servicenow_cancel(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         let uuid = parse_snow_id(&id)?;
         // Engine guard: Submitted → error. Unconditional set to Failed otherwise.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
             "UPDATE servicenow_queue \
              SET status = 'Failed' \
              WHERE id = $1 AND status <> 'Submitted'",
         )
         .bind(uuid)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
         if result.rows_affected() == 1 {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "servicenow-cancel",
+                    None,
+                    "cancelled",
+                    json!({ "queue_id": uuid.to_string() }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
             return Ok(Json(json!({
                 "id": uuid.to_string(),
                 "status": "cancelled",
@@ -22455,7 +22556,7 @@ async fn servicenow_cancel(Path(id): Path<String>) -> ApiResult {
                 "source": "database",
             })));
         }
-        // 0 rows: distinguish 404 vs wrong-state (Submitted → 400).
+        // 0 rows: distinguish 404 vs wrong-state (Submitted → 400). Use pool (tx drops).
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM servicenow_queue WHERE id = $1")
                 .bind(uuid)
@@ -29067,6 +29168,7 @@ async fn secrets_rotation_summary(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn secrets_rotation_fail(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<SecretsFailRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -29112,6 +29214,18 @@ async fn secrets_rotation_fail(
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "secrets-rotation-fail",
+                None,
+                "failed",
+                json!({ "rotation_run_id": &b.rotation_id, "secret_id": &failed.secret_id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
         tx.commit().await.map_err(db_error)?;
 
         return Ok(Json(json!({
@@ -39448,10 +39562,13 @@ mod secrets_rotation_db_tests {
 
         // REGRESSION: failing the preserved run must NOT un-retire the secret
         // (a fail must never re-arm a retired secret for rotation).
-        let _ = secrets_rotation_fail(Json(SecretsFailRequest {
-            rotation_id: run_id.into(),
-            error: "post-retire failure".into(),
-        }))
+        let _ = secrets_rotation_fail(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SecretsFailRequest {
+                rotation_id: run_id.into(),
+                error: "post-retire failure".into(),
+            }),
+        )
         .await
         .expect("fail-run on a retired secret");
         assert_eq!(
@@ -39826,10 +39943,13 @@ mod secrets_rotation_db_tests {
             .expect("rotation id")
             .to_string();
 
-        let result = secrets_rotation_fail(Json(SecretsFailRequest {
-            rotation_id: run_id.clone(),
-            error: "mock provider denied".to_string(),
-        }))
+        let result = secrets_rotation_fail(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SecretsFailRequest {
+                rotation_id: run_id.clone(),
+                error: "mock provider denied".to_string(),
+            }),
+        )
         .await;
 
         let run = run_status(pool, &run_id).await;
@@ -39862,10 +39982,13 @@ mod secrets_rotation_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let result = secrets_rotation_fail(Json(SecretsFailRequest {
-            rotation_id: "rr-dbtest-missing".to_string(),
-            error: "whatever".to_string(),
-        }))
+        let result = secrets_rotation_fail(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SecretsFailRequest {
+                rotation_id: "rr-dbtest-missing".to_string(),
+                error: "whatever".to_string(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404, got Ok");
@@ -39880,10 +40003,13 @@ mod secrets_rotation_db_tests {
             eprintln!("SKIP: RYUKI_DATABASE_URL not set");
             return;
         };
-        let result = secrets_rotation_fail(Json(SecretsFailRequest {
-            rotation_id: "rr-anything".to_string(),
-            error: "   ".to_string(),
-        }))
+        let result = secrets_rotation_fail(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SecretsFailRequest {
+                rotation_id: "rr-anything".to_string(),
+                error: "   ".to_string(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for empty error, got Ok");
@@ -40777,7 +40903,11 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_test_endpoint_not_found_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_test_endpoint(Path("nonexistent-id".into())).await;
+        let result = oob_test_endpoint(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("nonexistent-id".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404, got Ok");
         };
@@ -40912,7 +41042,11 @@ mod oob_access_db_tests {
         )
         .await;
 
-        let result = oob_test_endpoint(Path(id.into())).await;
+        let result = oob_test_endpoint(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
 
         let row: Option<OobEndpointRow> = sqlx::query_as(&format!(
             "SELECT {OOB_COLUMNS} FROM oob_endpoints WHERE id = $1::uuid"
@@ -40946,7 +41080,11 @@ mod oob_access_db_tests {
             return;
         };
 
-        let result = oob_test_endpoint(Path("c0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let result = oob_test_endpoint(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("c0000100-0000-0000-0000-eeeeeeeeeeee".into()),
+        )
+        .await;
         let Err((status, Json(body))) = result else {
             panic!("expected Err 404, got Ok");
         };
@@ -40967,7 +41105,11 @@ mod oob_access_db_tests {
         // A non-UUID path id must be treated as missing (404) — parity with the
         // engine fallback — rather than reaching Postgres and raising a 500 on
         // the uuid cast.
-        let result = oob_test_endpoint(Path("not-a-uuid".into())).await;
+        let result = oob_test_endpoint(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("not-a-uuid".into()),
+        )
+        .await;
         let Err((status, Json(body))) = result else {
             panic!("expected Err 404, got Ok");
         };
@@ -42045,7 +42187,8 @@ mod servicenow_db_tests {
             urgency: "2".into(),
             assignment_group: "Wintel-Operations".into(),
         };
-        let result = servicenow_incident(Json(body)).await;
+        let result =
+            servicenow_incident(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok, got: {result:?}");
         };
@@ -42091,7 +42234,8 @@ mod servicenow_db_tests {
             urgency: "1".into(),
             assignment_group: "Ops".into(),
         };
-        let result = servicenow_incident(Json(body)).await;
+        let result =
+            servicenow_incident(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for empty ci_name");
         };
@@ -42123,7 +42267,8 @@ mod servicenow_db_tests {
             urgency: "1".into(),
             assignment_group: "Ops".into(),
         };
-        let result = servicenow_incident(Json(body)).await;
+        let result =
+            servicenow_incident(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for empty description");
         };
@@ -42140,14 +42285,17 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_change(Json(ServicenowChangeRequest {
-            ci_name: "srv-test-01.corp.local".into(),
-            change_type: "Normal".into(),
-            description: "Memory upgrade".into(),
-            planned_start: "".into(),
-            planned_end: "".into(),
-            risk: "Low".into(),
-        }))
+        let result = servicenow_change(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(ServicenowChangeRequest {
+                ci_name: "srv-test-01.corp.local".into(),
+                change_type: "Normal".into(),
+                description: "Memory upgrade".into(),
+                planned_start: "".into(),
+                planned_end: "".into(),
+                risk: "Low".into(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for empty window");
@@ -42165,14 +42313,17 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_change(Json(ServicenowChangeRequest {
-            ci_name: "srv-test-snow-02.corp.local".into(),
-            change_type: "Standard".into(),
-            description: "Memory upgrade test".into(),
-            planned_start: "2026-06-20T02:00:00Z".into(),
-            planned_end: "2026-06-20T04:00:00Z".into(),
-            risk: "Low".into(),
-        }))
+        let result = servicenow_change(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(ServicenowChangeRequest {
+                ci_name: "srv-test-snow-02.corp.local".into(),
+                change_type: "Standard".into(),
+                description: "Memory upgrade test".into(),
+                planned_start: "2026-06-20T02:00:00Z".into(),
+                planned_end: "2026-06-20T04:00:00Z".into(),
+                risk: "Low".into(),
+            }),
+        )
         .await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok: {result:?}");
@@ -42204,11 +42355,14 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_request(Json(ServicenowRequestRequest {
-            ci_name: "srv-test-snow-03.corp.local".into(),
-            request_type: "software-upgrade".into(),
-            description: "Zabbix agent upgrade".into(),
-        }))
+        let result = servicenow_request(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(ServicenowRequestRequest {
+                ci_name: "srv-test-snow-03.corp.local".into(),
+                request_type: "software-upgrade".into(),
+                description: "Zabbix agent upgrade".into(),
+            }),
+        )
         .await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok: {result:?}");
@@ -42438,7 +42592,11 @@ mod servicenow_db_tests {
         )
         .await;
 
-        let result = servicenow_submit(Path(id.into())).await;
+        let result = servicenow_submit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok: {result:?}");
         };
@@ -42449,6 +42607,20 @@ mod servicenow_db_tests {
             v["id"].as_str().unwrap(),
             id,
             "returned id must be canonical UUID"
+        );
+
+        // #7 audit: submit wrote a durable audit row naming the queue item.
+        let submit_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'servicenow-submit' AND detail->>'queue_id' = $1)",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("query submit audit");
+        assert!(
+            submit_audited,
+            "servicenow_submit must write a durable audit row"
         );
 
         let db_status: String =
@@ -42483,7 +42655,11 @@ mod servicenow_db_tests {
         )
         .await;
 
-        let result = servicenow_submit(Path(id.into())).await;
+        let result = servicenow_submit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup(pool, id).await;
         let Err((status, Json(body))) = result else {
             panic!("expected Err for Submitted");
@@ -42514,7 +42690,11 @@ mod servicenow_db_tests {
         )
         .await;
 
-        let result = servicenow_submit(Path(id.into())).await;
+        let result = servicenow_submit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup(pool, id).await;
         let Err((status, _)) = result else {
             panic!("expected Err for Failed");
@@ -42532,7 +42712,11 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_submit(Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let result = servicenow_submit(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404");
         };
@@ -42643,7 +42827,11 @@ mod servicenow_db_tests {
         )
         .await;
 
-        let result = servicenow_cancel(Path(id.into())).await;
+        let result = servicenow_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         let Ok(Json(v)) = result else {
             panic!("expected Ok: {result:?}");
         };
@@ -42688,7 +42876,11 @@ mod servicenow_db_tests {
         )
         .await;
 
-        let result = servicenow_cancel(Path(id.into())).await;
+        let result = servicenow_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup(pool, id).await;
         let Err((status, Json(body))) = result else {
             panic!("expected Err 400 for Submitted cancel");
@@ -42707,7 +42899,11 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_cancel(Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into())).await;
+        let result = servicenow_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("f0000100-0000-0000-0000-eeeeeeeeeeee".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404");
         };
@@ -42724,7 +42920,11 @@ mod servicenow_db_tests {
             return;
         };
 
-        let result = servicenow_cancel(Path("bad-uuid".into())).await;
+        let result = servicenow_cancel(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("bad-uuid".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 404 for malformed id");
         };

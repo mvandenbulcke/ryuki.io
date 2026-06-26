@@ -106,9 +106,8 @@ After the clean/additive items above were shipped, a 61-agent multi-lens swarm
 review surfaced **41 confirmed new gaps** (real + not-already-covered) — see
 [swarm-findings-2026-06-25.md](swarm-findings-2026-06-25.md). These are the
 refreshed work queue; the cleanest (High/Small/CI-validatable) are being worked
-first. Top: operational resource-mutation audit gap (swarm #7, ~92 deletes),
-dead `site_status`/`component_status` persistence, `requests_list` pagination
-envelope (swarm #9).
+first. Top: dead `site_status`/`component_status` persistence (#8),
+`requests_list` pagination envelope (swarm #9), degradation-mode enforcement.
 
 **Swarm findings shipped:** swarm #4 false-healthy health gauge —
 `ryuki_platform_health` db component is now a real timeout-bounded `SELECT 1`
@@ -116,7 +115,13 @@ probe with a `source` label (`69b260a`); swarm #5 security-ops audit trail —
 token create/revoke, session revoke, secret rotate/rotate-all now write durable
 hash-chained `audit_log` rows atomically (`03e532d`); swarm #6 config-mutation
 audit — platform settings update/reset now write durable audit rows atomically
-(notifications deferred for #5/#6).
+(`376f724`); **swarm #7 operational resource-mutation audit trail — COMPLETE in
+20 reviewed slices (`3c6a481`→`<final>`): every resource mutation (DNS, IPAM,
+firewall, LB, secrets, certificates, gMSA/AD, storage/hw/k8s, DR, backup,
+runbook, decommission, emergency, shift, deployments, ServiceNow, etc.) now
+writes a durable hash-chained audit_log row atomically; repo fns refactored to
+share the caller's tx; ~126 handlers; high-volume telemetry excluded by design**.
+Notifications deferred for #5/#6.
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),

@@ -181,6 +181,32 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (lines 15908-15923, 19321-19342, 23083-23107, 23381-23416, 23831-23841, 24426+) · **kind:** data-integrity · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** on_call_contact_delete (line 15908), alert_routes_delete (line 19321), alert_routes_create (line 19158), dns_record_delete (line 23083), dns_record_create (line 23027), ipam_subnet_delete (line 23381), firewall_rule_delete (line 23831), firewall_rule_create (line 23742), storage_array_delete, lb_vs_delete, etc. all execute DELETE/INSERT/UPDATE without any audit_log INSERT or tracing.info() call. ~92 DELETE operations found, none with audit. Even audit.rs comment (line 7) notes 'append-only audit trail' requirement — yet only request-lifecycle mutations are recorded.
 - **verified:** This is a genuine, concrete gap: ~92 DELETE operations and numerous INSERT/UPDATE operations on operational resources (on-call contacts, alert routes, DNS records, firewall rules, IPAM subnets, etc.) in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/contracts.rs execute without ANY audit trail or tracing. The audit.rs module (37KB) is explicitly scoped to request lifecycle transitions only (line 1: "Append-only audit trail recorder for request lifecycle transitions"). While the infrastructure exists (audit_log table, record_audit_tx functions), resource mutations simply do not call 
+- **STATUS (2026-06-27) — COMPLETE (20 slices, ~126 handlers):** A verification
+  scan revealed the surface was ~128 handlers (not the ~92 first estimated). The
+  sweep shipped in 20 reviewed slices (commits `3c6a481`→`<this>`): firewall
+  rules+rule-sets, DNS, IPAM, metrics SLO/budget, on-call, alert-routes, secrets
+  (register/update/deregister/rotate), maintenance, noise, certificates,
+  decommission, backup-restore, runbook, DR, outage, incident, network-release,
+  load-balancer, gMSA/AD/shares, patch, compliance, storage/hardware/k8s,
+  repo-capacity, legal-hold, snapshot, chargeback, site-registry, log-forwarders,
+  emergency-change, shift-queue, linux/sql/software deployments, ServiceNow,
+  OOB, secrets-rotation-fail, access-campaign. EVERY mutation now writes a
+  durable hash-chained `audit_log` row ATOMICALLY with the mutation (same tx;
+  404/409/guard returns roll back without an audit row), via the
+  `audit::security_audit()` + `record_audit_tx` pattern. Repo-backed mutations
+  were refactored to share the caller's tx (`impl PgExecutor` for single-query
+  fns; `&mut PgConnection` for multi-query fns), with commit-every-caller
+  verified by running each domain's DB module. Handlers lacking an actor gained
+  `AuthExtractor`. detail carries references only — never secret/credential/key
+  material (gMSA passwords, vault paths, cert keys, connection strings all
+  excluded; legal-hold preserves its JSONB audit_trail column alongside the new
+  row). EXCLUDED by design: high-volume telemetry inserts (metrics_record_sample,
+  synthetic_run_all) — per-row auditing would flood the audit_log. Bonus: two
+  pre-existing #2-RBAC site-scope gaps (storage_array_update, hardware_add) were
+  fixed mid-sweep. Each slice was adversarially reviewed (fresh-context). Open
+  follow-ups (flagged as tasks, non-blocking): k8s-namespace site-scope guard,
+  firewall priority race, secrets_update TOCTOU, a few Extension→AuthExtractor
+  consistency + 503→500 polish items.
 
 ### 8. site_status and component_status tables seeded but never read/written
 - **area:** migrations/025_degradation_mode.sql + sources/ryuki-engine/src/degradation_mode.rs · **kind:** dead-code-or-drift · **severity:** high · **effort:** M · **ci_validatable:** True
