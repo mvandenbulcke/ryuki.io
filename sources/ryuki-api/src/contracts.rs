@@ -23467,9 +23467,13 @@ fn dns_status_str(status: &dns_ipam::DnsRecordStatus) -> String {
 const DNS_COLUMNS: &str = "id, name, record_type, value, zone, ttl, site, status";
 
 async fn dns_records_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<DnsListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: a scoped principal lists only its own site ("" = all sites for an
+    // unrestricted caller); an out-of-scope/env-scoped request is a 403.
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let record_type = q.record_type.as_deref().unwrap_or("");
     // Durable path: read from the DB (authoritative, survives restart).
     if let Some(pool) = get_db() {
@@ -23671,9 +23675,12 @@ async fn dns_record_update(
 }
 
 async fn ipam_subnets_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<IpamSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     if let Some(pool) = get_db() {
         let rows: Vec<IpamSubnetRow> = sqlx::query_as(&format!(
             "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets \
@@ -24256,9 +24263,12 @@ const FIREWALL_COLUMNS: &str = "id, name, source_ip, source_port, dest_ip, dest_
      action, direction, priority, site, status, created_by, created_at, description";
 
 async fn firewall_rules_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<FwListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let direction = q.direction.as_deref().unwrap_or("");
     if let Some(pool) = get_db() {
         let rows: Vec<FirewallRuleRow> = sqlx::query_as(&format!(
@@ -24699,9 +24709,12 @@ struct StorageCapacityRequest {
 }
 
 async fn storage_volumes_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let volumes = match get_db() {
         Some(pool) => crate::repos::storage_provisioning::list_volumes(pool, site)
             .await
@@ -24878,9 +24891,12 @@ async fn storage_volume_retire(
     })))
 }
 async fn storage_arrays_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<StorageSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let arrays = match get_db() {
         Some(pool) => crate::repos::storage_provisioning::list_arrays(pool, site)
             .await
@@ -25105,9 +25121,12 @@ struct K8sValidateRequest {
 }
 
 async fn k8s_namespaces_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<K8sSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let namespaces = match get_db() {
         Some(pool) => crate::repos::container_namespace::list_namespaces(pool, site)
             .await
@@ -25689,9 +25708,14 @@ async fn compliance_framework_get(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "source": "db", "framework": fw })))
 }
 
-async fn compliance_controls_list(Query(q): Query<ComplianceControlsQuery>) -> ApiResult {
+async fn compliance_controls_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<ComplianceControlsQuery>,
+) -> ApiResult {
     let framework_id = q.framework_id.as_deref().unwrap_or("");
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let controls = match get_db() {
         Some(pool) => crate::repos::compliance_reporting::list_controls(pool, framework_id, site)
             .await
@@ -25833,8 +25857,13 @@ async fn compliance_report_get(Path(id): Path<String>) -> ApiResult {
     Ok(Json(json!({ "source": "db", "report": report })))
 }
 
-async fn compliance_findings_list(Query(q): Query<ComplianceFindingsQuery>) -> ApiResult {
-    let site = q.site.as_deref().unwrap_or("");
+async fn compliance_findings_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<ComplianceFindingsQuery>,
+) -> ApiResult {
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let severity = q.severity.as_deref().unwrap_or("");
     if !severity.is_empty() {
         compliance_reporting::parse_severity(severity).map_err(|e| status_400(&e))?;
@@ -26098,9 +26127,12 @@ async fn insert_rotation_run(
 }
 
 async fn secrets_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<SecretsListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let secret_type = q.secret_type.as_deref().unwrap_or("");
     if let Some(pool) = get_db() {
         // Normalize the optional type filter through the engine parser, then
@@ -31129,6 +31161,33 @@ mod unit_tests {
         )
         .await
         .expect_err("an environment-scoped principal must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn list_reads_deny_out_of_scope_and_env_scoped() {
+        // The per-row-list reads (dns/ipam/firewall/secrets/compliance/storage/
+        // k8s) all resolve the scoped site BEFORE the DB query, so a scoped
+        // principal lists only its own site. storage_volumes_list is
+        // representative (all 9 share enforce_site_scope).
+        let err = storage_volumes_list(
+            AuthExtractor(scoped_session(&["GBLON"], &[])),
+            Query(StorageSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await
+        .expect_err("an out-of-scope ?site must be 403");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+        // An omitted ?site for a scoped principal must NOT list all sites — and an
+        // environment-scoped principal is denied (these lists are site-only).
+        let err = storage_volumes_list(
+            AuthExtractor(scoped_session(&[], &["production"])),
+            Query(StorageSiteQuery { site: None }),
+        )
+        .await
+        .expect_err("an environment-scoped principal must be 403");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 
