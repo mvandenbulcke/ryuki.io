@@ -23778,18 +23778,24 @@ struct IpamSubnetUpdateRequest {
 /// gateway/vlan are revalidated against the immutable CIDR through the same pure
 /// engine path as create. 404 when the subnet is unknown; 503 when no DB.
 async fn ipam_subnet_update(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<IpamSubnetUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: lock the row FOR UPDATE and guard its site inside ONE transaction
+    // before the write, so a concurrent re-home cannot slip an out-of-scope
+    // update through. A 403/404/400 drops the tx (rollback).
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let existing: IpamSubnetRow = sqlx::query_as(&format!(
-        "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+        "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1 FOR UPDATE"
     ))
     .bind(&id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_error)?
     .ok_or_else(|| ipam_not_found(format!("Subnet '{id}' not found")))?;
+    guard_body_site_scope(&session, &existing.site)?;
 
     let new_gateway = b.gateway.as_deref().unwrap_or(&existing.gateway);
     // Clamp the stored vlan to the valid range before the `as u16` so a corrupt
@@ -23819,16 +23825,17 @@ async fn ipam_subnet_update(
         .bind(new_vlan as i32)
         .bind(&new_status)
         .bind(&id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
     let updated: IpamSubnetRow = sqlx::query_as(&format!(
         "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
     ))
     .bind(&id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(json!({
         "source": "database",
         "subnet": serde_json::to_value(updated.to_engine()).unwrap_or_default(),
@@ -23839,6 +23846,7 @@ async fn ipam_subnet_update(
 /// the subnet still has IP reservations (deleting it would silently drop live
 /// allocations via the FK cascade); release them first. 404 when unknown.
 async fn ipam_subnet_delete(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -23846,16 +23854,21 @@ async fn ipam_subnet_delete(
     // Lock the subnet row FIRST. A concurrent reservation insert needs a SHARE
     // lock on this parent row (the FK), so it blocks until we commit — closing
     // the count-then-delete TOCTOU window where a new reservation could be
-    // silently cascade-deleted.
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM ipam_subnets WHERE id = $1 FOR UPDATE")
+    // silently cascade-deleted. The lock also loads the authoritative site for
+    // the #2 scope guard, so a concurrent re-home cannot slip an out-of-scope
+    // delete through.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT id, site FROM ipam_subnets WHERE id = $1 FOR UPDATE")
             .bind(&id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_error)?;
-    if exists.is_none() {
+    let Some((_subnet_id, site)) = row else {
         return Err(ipam_not_found(format!("Subnet '{id}' not found")));
-    }
+    };
+    // #2: a scoped principal may only delete a subnet in its own site (403); the
+    // guard runs under the row lock and before the DELETE/commit.
+    guard_body_site_scope(&session, &site)?;
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM ip_reservations WHERE subnet_id = $1")
             .bind(&id)
@@ -23906,6 +23919,9 @@ async fn ipam_reserve_ip(
             Some(row) => row.to_engine(),
             None => return Err(status_400(&format!("Subnet '{}' not found", b.subnet_id))),
         };
+        // #2: fast pre-check — a scoped principal may only reserve an IP in its
+        // own site (the authoritative re-check happens under the row lock below).
+        guard_body_site_scope(&session, &subnet.site)?;
         let existing_rows: Vec<IpReservationRow> = sqlx::query_as(&format!(
             "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations WHERE subnet_id = $1"
         ))
@@ -23938,6 +23954,21 @@ async fn ipam_reserve_ip(
         };
 
         let mut tx = pool.begin().await.map_err(db_error)?;
+        // #2: authoritative re-check under the parent subnet's row lock, so a
+        // concurrent re-home cannot slip an out-of-scope reservation through the
+        // window between the unlocked load and these writes.
+        let locked_site: Option<String> =
+            sqlx::query_scalar("SELECT site FROM ipam_subnets WHERE id = $1 FOR UPDATE")
+                .bind(&b.subnet_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        // A concurrent delete between the unlocked pre-read and this lock yields a
+        // clean 400 (same as the pre-read's not-found), not a 500.
+        let Some(locked_site) = locked_site else {
+            return Err(status_400(&format!("Subnet '{}' not found", b.subnet_id)));
+        };
+        guard_body_site_scope(&session, &locked_site)?;
         sqlx::query(&format!(
             "INSERT INTO ip_reservations ({IP_RESERVATION_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
@@ -23987,7 +24018,10 @@ async fn ipam_reserve_ip(
     .map(Json)
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
-async fn ipam_release_ip(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn ipam_release_ip(
+    Extension(session): Extension<AuthSession>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         // Free the reservation and credit its subnet back, atomically. A subnet
         // that was Exhausted reverts to Available (mirrors the engine).
@@ -24004,6 +24038,22 @@ async fn ipam_release_ip(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
         };
 
         let mut tx = pool.begin().await.map_err(db_error)?;
+        // #2: the reservation's site lives on its parent subnet. Lock that subnet
+        // row and guard its site BEFORE the release, so a concurrent re-home
+        // cannot slip an out-of-scope release through. 403 drops the tx.
+        let subnet_site: Option<String> =
+            sqlx::query_scalar("SELECT site FROM ipam_subnets WHERE id = $1 FOR UPDATE")
+                .bind(&reservation.subnet_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let Some(subnet_site) = subnet_site else {
+            return Err(ipam_not_found(format!(
+                "Subnet '{}' not found",
+                reservation.subnet_id
+            )));
+        };
+        guard_body_site_scope(&session, &subnet_site)?;
         sqlx::query("DELETE FROM ip_reservations WHERE id = $1")
             .bind(&id)
             .execute(&mut *tx)
@@ -31812,6 +31862,7 @@ mod db_lifecycle_tests {
 
         // UPDATE gateway + status; the reservation counters are preserved.
         let Json(updated) = ipam_subnet_update(
+            AuthExtractor(AuthSession::static_dry_run()),
             Path(id.clone()),
             Json(IpamSubnetUpdateRequest {
                 gateway: Some("10.99.0.254".to_string()),
@@ -31828,6 +31879,7 @@ mod db_lifecycle_tests {
         // An invalid status is a 400, never a silent coercion.
         assert!(
             ipam_subnet_update(
+                AuthExtractor(AuthSession::static_dry_run()),
                 Path(id.clone()),
                 Json(IpamSubnetUpdateRequest {
                     gateway: None,
@@ -31850,7 +31902,12 @@ mod db_lifecycle_tests {
         .execute(pool)
         .await
         .unwrap();
-        match ipam_subnet_delete(Path(id.clone())).await {
+        match ipam_subnet_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        {
             Err((status, _)) => assert_eq!(status, StatusCode::CONFLICT),
             Ok(_) => panic!("delete must be refused while reservations exist"),
         }
@@ -31861,9 +31918,12 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .unwrap();
-        let Json(deleted) = ipam_subnet_delete(Path(id.clone()))
-            .await
-            .expect("delete subnet");
+        let Json(deleted) = ipam_subnet_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("delete subnet");
         assert_eq!(deleted["deleted"], true);
 
         sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
