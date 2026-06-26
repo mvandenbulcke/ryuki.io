@@ -22492,9 +22492,14 @@ async fn runbook_rollback(Path(id): Path<String>) -> ApiResult {
 }
 
 /// List runbook executions for a given site. 503 when no database is configured.
-async fn runbook_executions_list(Query(params): Query<RunbookListQuery>) -> ApiResult {
+async fn runbook_executions_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<RunbookListQuery>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let site = params.site.as_deref().unwrap_or("");
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
 
     let executions = crate::repos::runbook_executions::list(pool, site)
         .await
@@ -23091,8 +23096,13 @@ struct AccessCampaignCreateRequest {
     days: i64,
 }
 
-async fn access_reviews_list(Query(params): Query<AccessReviewQuery>) -> ApiResult {
-    let site = params.site.as_deref().unwrap_or("");
+async fn access_reviews_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AccessReviewQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let review_type_str = params.review_type.as_deref().unwrap_or("");
     let reviews = match get_db() {
         Some(pool) => crate::repos::access_recertification::list(pool, site, review_type_str)
@@ -25514,10 +25524,13 @@ struct DrTestCompleteRequest {
 }
 
 async fn dr_plans_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<DrSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let plans = if site.is_empty() {
         crate::repos::dr_plans::list(pool).await.map_err(db_error)?
     } else {
@@ -26786,9 +26799,12 @@ struct LbValidateVipRequest {
 }
 
 async fn lb_vs_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<LbSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+    // #2: scoped-site list ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let vss = match get_db() {
         Some(pool) => crate::repos::load_balancer::list_virtual_servers(pool, site)
             .await
@@ -27096,8 +27112,13 @@ async fn lb_vs_enable(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode
         "new_connections": "allowed"
     })))
 }
-async fn lb_status(Query(q): Query<LbSiteQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.as_deref().unwrap_or("");
+async fn lb_status(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<LbSiteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, q.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let (vs_count, pool_count, up_members, down_members, offline_vs, draining_vs) = match get_db() {
         Some(pool) => crate::repos::load_balancer::get_lb_status(pool, site)
             .await
@@ -27542,9 +27563,12 @@ async fn sql_deploy_monitoring(
 }
 
 async fn sql_deploy_inventory(
+    AuthExtractor(session): AuthExtractor,
     Query(params): Query<SqlDeployInventoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = params.site.as_deref().unwrap_or("");
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     match get_db() {
         Some(pool) => {
             let deployments = crate::repos::sql_deployment::list_by_site(pool, site)
