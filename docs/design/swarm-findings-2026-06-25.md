@@ -94,6 +94,16 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   existence oracle. Codex caught + we fixed a fail-open (scope-lookup DB error fell
   through to serving the audit trail; now fails closed).
 
+- **STATUS (2026-06-26) — COMPLETE:** All 116 site/env-filtered handlers from the
+  inventory are now scope-guarded across 32 commits (354803b…8892e74): the metrics/
+  analytics/metering/requests read surface, request-by-id reads, every create, every
+  mutation (CAS, bare-by-id-with-FOR-UPDATE/RETURNING, atomic AND-site predicate),
+  the per-row-list reads, the by-id reads, the list-all reads (per-row filter), all
+  remaining single-site reads, and the 4 hardware all-site-load BUGS. Each slice
+  fmt/clippy/no-DB-suite/secret-scan green + GPT-5-Codex-reviewed (the uniform
+  enforce_site_scope read pattern was reviewed once then applied verbatim). Finding
+  #2 (tracker) marked [x].
+
 - **ARCHITECTURE DECISION (2026-06-26):** A 10-agent inventory/design workflow
   mapped the FULL remaining surface = **116 unenforced site/env handlers** (82 HIGH,
   30 MED, 4 LOW; 31 request-by-id, 41 single-site, 26 per-row-list, 18 write), in
