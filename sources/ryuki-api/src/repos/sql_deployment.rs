@@ -224,13 +224,15 @@ pub async fn list_by_site(pool: &PgPool, site: &str) -> Result<Vec<SQLDeployment
 
 // ─── Write functions ──────────────────────────────────────────────────────────
 
-/// Insert a new deployment + a 'plan' operations row in a single transaction.
-/// Returns the persisted deployment (re-read through the column query).
+/// Insert a new deployment + a 'plan' operations row on the given connection.
+/// Returns the generated deployment UUID. The caller owns the surrounding
+/// transaction and is responsible for commit/rollback. After commit, use
+/// `get(pool, &id.to_string())` to read back the persisted row.
 pub async fn insert(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     deployment: &SQLDeployment,
     payload: serde_json::Value,
-) -> Result<SQLDeployment, sqlx::Error> {
+) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::new_v4();
 
     let cpu = to_i32(deployment.cpu, "cpu")?;
@@ -238,8 +240,6 @@ pub async fn insert(
     let data_disk_gb = to_i32(deployment.data_disk_gb, "data_disk_gb")?;
     let log_disk_gb = to_i32(deployment.log_disk_gb, "log_disk_gb")?;
     let tempdb_disk_gb = to_i32(deployment.tempdb_disk_gb, "tempdb_disk_gb")?;
-
-    let mut tx = pool.begin().await?;
 
     sqlx::query(
         "INSERT INTO sql_deployments \
@@ -262,7 +262,7 @@ pub async fn insert(
     .bind(&deployment.site)
     .bind(deployment.cluster_mode.to_string())
     .bind(deployment.status.to_string())
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     sqlx::query(
@@ -272,34 +272,30 @@ pub async fn insert(
     )
     .bind(id)
     .bind(&payload)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
-    tx.commit().await?;
-
-    get(pool, &id.to_string()).await?.ok_or_else(|| {
-        sqlx::Error::Decode("sql_deployments: row vanished immediately after insert".into())
-    })
+    Ok(id)
 }
 
 /// CAS: advance the deployment status from `expected_status` to `new_status`
-/// AND insert an operations audit row — all in one transaction.
+/// AND insert an operations audit row on the given connection.
 ///
-/// Returns `Ok(None)` when the CAS misses (status changed concurrently → 409).
+/// Returns `Ok(false)` when the CAS misses (status changed concurrently → 409).
+/// Returns `Ok(true)` on success. The caller owns the surrounding transaction
+/// and is responsible for commit/rollback.
 pub async fn transition(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     id: &str,
     operation_type: &str,
     expected_status: &str,
     new_status: &str,
     payload: Option<serde_json::Value>,
     result: Option<serde_json::Value>,
-) -> Result<Option<SQLDeployment>, sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let Ok(uid) = Uuid::parse_str(id) else {
-        return Ok(None);
+        return Ok(false);
     };
-
-    let mut tx = pool.begin().await?;
 
     let affected = sqlx::query(
         "UPDATE sql_deployments \
@@ -309,13 +305,12 @@ pub async fn transition(
     .bind(new_status)
     .bind(uid)
     .bind(expected_status)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?
     .rows_affected();
 
     if affected == 0 {
-        tx.rollback().await?;
-        return Ok(None);
+        return Ok(false);
     }
 
     sqlx::query(
@@ -327,12 +322,10 @@ pub async fn transition(
     .bind(operation_type)
     .bind(&payload)
     .bind(&result)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
-    tx.commit().await?;
-
-    get(pool, id).await
+    Ok(true)
 }
 
 // ─── DB integration tests ─────────────────────────────────────────────────────
@@ -431,7 +424,15 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("NLAMS-SQL-TEST-01", "NLAMS", "AG");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
+        let mut tx = pool.begin().await.expect("begin");
+        let id = insert(&mut tx, &deployment, plan_json)
+            .await
+            .expect("insert");
+        tx.commit().await.expect("commit");
+        let inserted = get(&pool, &id.to_string())
+            .await
+            .expect("get")
+            .expect("row");
 
         assert!(!inserted.id.is_empty());
         assert_eq!(inserted.instance_name, "NLAMS-SQL-TEST-01");
@@ -469,13 +470,21 @@ mod sql_deployment_db_tests {
 
         let (dep, plan) = plan_deployment(make_plan_req("ZZTEST-SQL-DUP", "DEDUS", "Standalone"))
             .expect("engine plan");
-        let first = insert(&pool, &dep, plan).await.expect("first insert");
+        let mut tx = pool.begin().await.expect("begin");
+        let first_id = insert(&mut tx, &dep, plan).await.expect("first insert");
+        tx.commit().await.expect("commit");
+        let first = get(&pool, &first_id.to_string())
+            .await
+            .expect("get")
+            .expect("row");
 
         let (dep2, plan2) = plan_deployment(make_plan_req("ZZTEST-SQL-DUP", "DEDUS", "Standalone"))
             .expect("engine plan 2");
-        let err = insert(&pool, &dep2, plan2)
+        let mut tx2 = pool.begin().await.expect("begin2");
+        let err = insert(&mut tx2, &dep2, plan2)
             .await
             .expect_err("duplicate (site, instance_name) must error");
+        drop(tx2); // rollback
         assert!(
             err.as_database_error()
                 .map(|d| d.is_unique_violation())
@@ -498,7 +507,15 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("FRPAR-SQL-TEST-01", "FRPAR", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
+        let mut tx = pool.begin().await.expect("begin");
+        let inserted_id = insert(&mut tx, &deployment, plan_json)
+            .await
+            .expect("insert");
+        tx.commit().await.expect("commit");
+        let inserted = get(&pool, &inserted_id.to_string())
+            .await
+            .expect("get")
+            .expect("row");
 
         // planned → installing (validate guard first)
         let loaded = get(&pool, &inserted.id)
@@ -507,8 +524,9 @@ mod sql_deployment_db_tests {
             .expect("exists");
         guard_install(&loaded).expect("guard_install should pass for Planned");
 
-        let installing = transition(
-            &pool,
+        let mut tx2 = pool.begin().await.expect("begin2");
+        let ok = transition(
+            &mut tx2,
             &inserted.id,
             "install",
             "planned",
@@ -517,9 +535,14 @@ mod sql_deployment_db_tests {
             Some(json!({ "action": "mock-install" })),
         )
         .await
-        .expect("transition")
-        .expect("transition succeeded");
+        .expect("transition");
+        assert!(ok, "transition succeeded");
+        tx2.commit().await.expect("commit2");
 
+        let installing = get(&pool, &inserted.id)
+            .await
+            .expect("get after install")
+            .expect("exists after install");
         assert_eq!(installing.status, DeploymentStatus::Installing);
 
         // Verify operations row
@@ -540,8 +563,9 @@ mod sql_deployment_db_tests {
             .expect("exists");
         guard_configure(&loaded2).expect("guard_configure should pass for Installing");
 
-        let configuring = transition(
-            &pool,
+        let mut tx3 = pool.begin().await.expect("begin3");
+        let ok2 = transition(
+            &mut tx3,
             &inserted.id,
             "configure",
             "installing",
@@ -550,9 +574,14 @@ mod sql_deployment_db_tests {
             Some(json!({ "action": "mock-configure" })),
         )
         .await
-        .expect("transition")
-        .expect("configuring succeeded");
+        .expect("transition configure");
+        assert!(ok2, "configure transition succeeded");
+        tx3.commit().await.expect("commit3");
 
+        let configuring = get(&pool, &inserted.id)
+            .await
+            .expect("get after configure")
+            .expect("exists after configure");
         assert_eq!(configuring.status, DeploymentStatus::Configuring);
 
         cleanup_deployment(&pool, &inserted.id).await;
@@ -570,7 +599,15 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("DEBER-SQL-TEST-01", "DEBER", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
+        let mut tx = pool.begin().await.expect("begin");
+        let inserted_id = insert(&mut tx, &deployment, plan_json)
+            .await
+            .expect("insert");
+        tx.commit().await.expect("commit");
+        let inserted = get(&pool, &inserted_id.to_string())
+            .await
+            .expect("get")
+            .expect("row");
 
         // Engine guard: planned deployment cannot be configured (must be Installing)
         let loaded = get(&pool, &inserted.id)
@@ -585,8 +622,9 @@ mod sql_deployment_db_tests {
         );
 
         // Repo CAS miss: wrong expected_status (installing when actual is planned)
+        let mut tx_miss = pool.begin().await.expect("begin miss");
         let miss = transition(
-            &pool,
+            &mut tx_miss,
             &inserted.id,
             "configure",
             "installing", // wrong — deployment is planned
@@ -596,9 +634,10 @@ mod sql_deployment_db_tests {
         )
         .await
         .expect("no DB error");
+        drop(tx_miss); // rollback — no mutation happened
         assert!(
-            miss.is_none(),
-            "CAS miss when expected_status does not match → Ok(None)"
+            !miss,
+            "CAS miss when expected_status does not match → Ok(false)"
         );
 
         // Malformed UUID → Ok(None), not error
@@ -620,7 +659,15 @@ mod sql_deployment_db_tests {
 
         let req = make_plan_req("GBLON-SQL-ROUNDTRIP", "GBLON", "Standalone");
         let (deployment, plan_json) = plan_deployment(req).expect("engine plan");
-        let inserted = insert(&pool, &deployment, plan_json).await.expect("insert");
+        let mut tx = pool.begin().await.expect("begin");
+        let inserted_id = insert(&mut tx, &deployment, plan_json)
+            .await
+            .expect("insert");
+        tx.commit().await.expect("commit");
+        let inserted = get(&pool, &inserted_id.to_string())
+            .await
+            .expect("get")
+            .expect("row");
 
         // Round-trip: the DB stores 'Standalone'; the cluster_mode_from_db helper
         // must decode it to ClusterMode::Standalone (not fail due to UPPERCASE serde mismatch).

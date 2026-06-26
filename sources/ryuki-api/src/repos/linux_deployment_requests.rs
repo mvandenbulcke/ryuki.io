@@ -88,7 +88,13 @@ fn decode_status(s: &str) -> Result<LinuxDeploymentStatus, String> {
 
 /// Insert a new linux deployment request. The caller supplies the model with
 /// an already-generated UUID string as `id`; we parse it for the PK column.
-pub async fn insert(pool: &PgPool, req: &LinuxDeploymentRequest) -> Result<(), sqlx::Error> {
+///
+/// Accepts any `sqlx::PgExecutor` so the caller can pass either a `&PgPool`
+/// (auto-commit) or a `&mut PgConnection` inside an open transaction.
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    req: &LinuxDeploymentRequest,
+) -> Result<(), sqlx::Error> {
     let id = Uuid::parse_str(&req.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let hardening = req.hardening_profile.to_string();
@@ -119,7 +125,7 @@ pub async fn insert(pool: &PgPool, req: &LinuxDeploymentRequest) -> Result<(), s
     .bind(&hardening)
     .bind(status_str(&req.status))
     .bind(&plan_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -161,9 +167,10 @@ pub async fn list(pool: &PgPool) -> Result<Vec<LinuxDeploymentRequest>, sqlx::Er
 /// (caller → 409). `Ok(true)` on success.
 ///
 /// Both `status` (scalar column for queryability) and `plan` (full entity
-/// snapshot) are updated atomically within a transaction.
+/// snapshot) are updated on `conn`. The caller owns the surrounding transaction
+/// and is responsible for commit/rollback.
 pub async fn transition(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     expected_status: &str,
     req: &LinuxDeploymentRequest,
 ) -> Result<bool, sqlx::Error> {
@@ -172,8 +179,6 @@ pub async fn transition(
     };
 
     let plan_json = serde_json::to_string(req).unwrap_or_else(|_| "{}".into());
-
-    let mut tx = pool.begin().await?;
 
     let res = sqlx::query(
         "UPDATE linux_deployment_requests SET \
@@ -186,14 +191,12 @@ pub async fn transition(
     .bind(status_str(&req.status))
     .bind(&plan_json)
     .bind(expected_status)
-    .execute(&mut *tx)
+    .execute(conn)
     .await?;
 
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
 
-    tx.commit().await?;
     Ok(true)
 }

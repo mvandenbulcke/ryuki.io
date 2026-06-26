@@ -8311,7 +8311,10 @@ async fn software_validate(Json(body): Json<software_deployment::DeploymentReque
     }
 }
 
-async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>) -> ApiResult {
+async fn software_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<software_deployment::DeploymentRequest>,
+) -> ApiResult {
     // Engine validates, generates ID, builds the plan struct (dry-run).
     let record = match software_deployment::plan_deployment(&body) {
         Ok(r) => r,
@@ -8327,6 +8330,7 @@ async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>)
             .scheduled_time
             .parse::<chrono::DateTime<chrono::Utc>>()
             .ok();
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: SoftwareDeploymentRow = sqlx::query_as(&format!(
             "INSERT INTO software_deployments \
                 (id, server_name, package_id, package_name, target_version, \
@@ -8343,9 +8347,23 @@ async fn software_plan(Json(body): Json<software_deployment::DeploymentRequest>)
         .bind(&record.requester)
         .bind("Planned")
         .bind(plan_json)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        let deployment_id = row.id.clone();
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "software-plan",
+                None,
+                "planned",
+                json!({ "deployment_id": deployment_id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         return Ok(Json(row.to_json()));
     }
     Ok(Json(serde_json::to_value(record).unwrap()))
@@ -8455,12 +8473,16 @@ async fn software_execute(Path(id): Path<String>) -> ApiResult {
     }
 }
 
-async fn software_verify(Path(id): Path<String>) -> ApiResult {
+async fn software_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         // DB path: do NOT call verify_deployment() — it requires the row in
         // DEPLOYMENT_STORE which is not populated from DB after restart.
         // CAS-update the row; handle None by checking current state.
         let now = chrono::Utc::now();
+        let mut tx = pool.begin().await.map_err(db_error)?;
         let row: Option<SoftwareDeploymentRow> = sqlx::query_as(&format!(
             "UPDATE software_deployments \
              SET status = 'Verified', verified_at = $2, updated_at = NOW() \
@@ -8469,18 +8491,34 @@ async fn software_verify(Path(id): Path<String>) -> ApiResult {
         ))
         .bind(&id)
         .bind(now)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_error)?;
 
         return match row {
-            Some(updated) => Ok(Json(json!({
-                "passed": true,
-                "status": "Verified",
-                "deployment": updated.to_json(),
-                "source": "database",
-            }))),
+            Some(updated) => {
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &audit::security_audit(
+                        "software-verify",
+                        None,
+                        "verified",
+                        json!({ "deployment_id": &id }),
+                    ),
+                )
+                .await
+                .map_err(db_error)?;
+                tx.commit().await.map_err(db_error)?;
+                Ok(Json(json!({
+                    "passed": true,
+                    "status": "Verified",
+                    "deployment": updated.to_json(),
+                    "source": "database",
+                })))
+            }
             None => {
+                // tx drops here (rollback) — no mutation happened
                 // Idempotent: already Verified → 200.
                 // Wrong state (incl. Completed) or missing → 409/404.
                 let exists: Option<(String,)> =
@@ -20123,7 +20161,10 @@ fn parse_hardening_profile(p: &str) -> ryuki_engine::models::HardeningProfile {
     }
 }
 
-async fn linux_deploy_plan(Json(body): Json<LinuxDeployPlanRequest>) -> ApiResult {
+async fn linux_deploy_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<LinuxDeployPlanRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let distro = parse_linux_distro(&body.distro);
@@ -20147,14 +20188,31 @@ async fn linux_deploy_plan(Json(body): Json<LinuxDeployPlanRequest>) -> ApiResul
     // proper UUID so the repo can bind it correctly.
     req.id = Uuid::new_v4().to_string();
 
-    crate::repos::linux_deployment_requests::insert(pool, &req)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::linux_deployment_requests::insert(&mut *tx, &req)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "linux-deploy-plan",
+            None,
+            "planned",
+            json!({ "request_id": &req.id, "hostname": &req.hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&req).unwrap_or_default()))
 }
 
-async fn linux_deploy_validate(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+async fn linux_deploy_validate(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<LinuxDeployActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
@@ -20181,18 +20239,36 @@ async fn linux_deploy_validate(Json(body): Json<LinuxDeployActionRequest>) -> Ap
         let mut validated_req = req;
         validated_req.status = ryuki_engine::models::LinuxDeploymentStatus::Validated;
 
-        let ok = crate::repos::linux_deployment_requests::transition(pool, before, &validated_req)
-            .await
-            .map_err(db_error)?;
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let ok =
+            crate::repos::linux_deployment_requests::transition(&mut tx, before, &validated_req)
+                .await
+                .map_err(db_error)?;
         if !ok {
             return Err(status_409("state changed concurrently; reload and retry"));
         }
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "linux-deploy-validate",
+                Some(before),
+                "validated",
+                json!({ "request_id": &validated_req.id, "hostname": &validated_req.hostname }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
     }
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
 }
 
-async fn linux_deploy_execute(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+async fn linux_deploy_execute(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<LinuxDeployActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
@@ -20211,17 +20287,34 @@ async fn linux_deploy_execute(Json(body): Json<LinuxDeployActionRequest>) -> Api
 
     let executed = linux_deployment::execute_linux_deployment(&req).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::linux_deployment_requests::transition(pool, before, &executed)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::linux_deployment_requests::transition(&mut tx, before, &executed)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "linux-deploy-execute",
+            Some(before),
+            "executed",
+            json!({ "request_id": &executed.id, "hostname": &executed.hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
 
-async fn linux_deploy_verify(Json(body): Json<LinuxDeployActionRequest>) -> ApiResult {
+async fn linux_deploy_verify(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<LinuxDeployActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::linux_deployment_requests::get(pool, &body.operation_id)
@@ -20243,12 +20336,26 @@ async fn linux_deploy_verify(Json(body): Json<LinuxDeployActionRequest>) -> ApiR
     let mut verified_req = req;
     verified_req.status = ryuki_engine::models::LinuxDeploymentStatus::Verified;
 
-    let ok = crate::repos::linux_deployment_requests::transition(pool, before, &verified_req)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::linux_deployment_requests::transition(&mut tx, before, &verified_req)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "linux-deploy-verify",
+            Some(before),
+            "verified",
+            json!({ "request_id": &verified_req.id, "hostname": &verified_req.hostname }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(
         serde_json::to_value(&verification).unwrap_or_default(),
@@ -29615,6 +29722,7 @@ struct SqlDeployInventoryQuery {
 // ─── SQL Server Deployment handlers ───
 
 async fn sql_deploy_plan(
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<SqlDeployPlanRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -29634,7 +29742,8 @@ async fn sql_deploy_plan(
     });
     let (deployment, plan_json) =
         sql_deployment::plan_deployment(req).map_err(|e| status_400(&e))?;
-    let inserted = crate::repos::sql_deployment::insert(pool, &deployment, plan_json.clone())
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let id = crate::repos::sql_deployment::insert(&mut tx, &deployment, plan_json.clone())
         .await
         .map_err(|e| {
             // A duplicate (site, instance_name) is a client conflict, not a server
@@ -29647,6 +29756,29 @@ async fn sql_deploy_plan(
                 }
             }
             db_error(e)
+        })?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "sql-deploy-plan",
+            None,
+            "planned",
+            json!({ "deployment_id": id.to_string(), "instance_name": &deployment.instance_name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    // Post-commit read: the row is now visible; build the response from the DB.
+    let inserted = crate::repos::sql_deployment::get(pool, &id.to_string())
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "deployment not found after insert"})),
+            )
         })?;
     Ok(Json(json!({
         "deployment_id": inserted.id,
@@ -29676,6 +29808,7 @@ async fn sql_deploy_validate(
 }
 
 async fn sql_deploy_install(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -29684,8 +29817,9 @@ async fn sql_deploy_install(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     sql_deployment::guard_install(&deployment).map_err(|e| status_409(&e))?;
-    let _ = crate::repos::sql_deployment::transition(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::sql_deployment::transition(
+        &mut tx,
         &id,
         "install",
         "planned",
@@ -29694,12 +29828,30 @@ async fn sql_deploy_install(
         None,
     )
     .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "deployment was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "sql-deploy-install",
+            Some("planned"),
+            "installed",
+            json!({ "deployment_id": &id, "instance_name": &deployment.instance_name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(sql_deployment::install_response(&deployment)))
 }
 
 async fn sql_deploy_configure(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -29708,8 +29860,9 @@ async fn sql_deploy_configure(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     sql_deployment::guard_configure(&deployment).map_err(|e| status_409(&e))?;
-    let _ = crate::repos::sql_deployment::transition(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::sql_deployment::transition(
+        &mut tx,
         &id,
         "configure",
         "installing",
@@ -29718,12 +29871,30 @@ async fn sql_deploy_configure(
         None,
     )
     .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "deployment was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "sql-deploy-configure",
+            Some("installing"),
+            "configured",
+            json!({ "deployment_id": &id, "instance_name": &deployment.instance_name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(sql_deployment::configure_response(&deployment)))
 }
 
 async fn sql_deploy_verify(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -29732,8 +29903,9 @@ async fn sql_deploy_verify(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     sql_deployment::guard_verify(&deployment).map_err(|e| status_409(&e))?;
-    let _ = crate::repos::sql_deployment::transition(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::sql_deployment::transition(
+        &mut tx,
         &id,
         "verify",
         "configuring",
@@ -29742,12 +29914,30 @@ async fn sql_deploy_verify(
         None,
     )
     .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "deployment was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "sql-deploy-verify",
+            Some("configuring"),
+            "verified",
+            json!({ "deployment_id": &id, "instance_name": &deployment.instance_name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(sql_deployment::verify_response(&deployment)))
 }
 
 async fn sql_deploy_backup(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -29756,8 +29946,9 @@ async fn sql_deploy_backup(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     sql_deployment::guard_backup(&deployment).map_err(|e| status_409(&e))?;
-    let _ = crate::repos::sql_deployment::transition(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::sql_deployment::transition(
+        &mut tx,
         &id,
         "backup",
         "verified",
@@ -29766,8 +29957,25 @@ async fn sql_deploy_backup(
         None,
     )
     .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "deployment was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "sql-deploy-backup",
+            Some("verified"),
+            "backed-up",
+            json!({ "deployment_id": &id, "instance_name": &deployment.instance_name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(sql_deployment::backup_response(&deployment)))
 }
 
@@ -29780,8 +29988,9 @@ async fn sql_deploy_monitoring(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     sql_deployment::guard_monitoring(&deployment).map_err(|e| status_409(&e))?;
-    let _ = crate::repos::sql_deployment::transition(
-        pool,
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::sql_deployment::transition(
+        &mut tx,
         &id,
         "monitoring",
         "backed-up",
@@ -29790,8 +29999,13 @@ async fn sql_deploy_monitoring(
         None,
     )
     .await
-    .map_err(db_error)?
-    .ok_or_else(|| status_409("deployment was modified concurrently; reload and retry"))?;
+    .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "deployment was modified concurrently; reload and retry",
+        ));
+    }
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(sql_deployment::monitoring_response(&deployment)))
 }
 
@@ -43554,7 +43768,9 @@ mod software_deployment_db_tests {
         let body = plan_body(&server);
 
         // Plan.
-        let Ok(Json(planned)) = software_plan(Json(body)).await else {
+        let Ok(Json(planned)) =
+            software_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        else {
             panic!("plan failed");
         };
         assert_eq!(
@@ -43598,7 +43814,12 @@ mod software_deployment_db_tests {
         assert!(row.executed_at.is_some(), "executed_at must be set");
 
         // Verify.
-        let Ok(Json(verify_result)) = software_verify(Path(id.clone())).await else {
+        let Ok(Json(verify_result)) = software_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_deployment(pool, &id).await;
             panic!("verify failed");
         };
@@ -43641,7 +43862,12 @@ mod software_deployment_db_tests {
         };
 
         let server = format!("srv-cas-{}", uuid::Uuid::new_v4());
-        let Ok(Json(planned)) = software_plan(Json(plan_body(&server))).await else {
+        let Ok(Json(planned)) = software_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&server)),
+        )
+        .await
+        else {
             panic!("plan failed");
         };
         let id = planned["id"].as_str().expect("id").to_string();
@@ -43710,7 +43936,12 @@ mod software_deployment_db_tests {
         };
 
         // Verify.
-        let Ok(Json(verified)) = software_verify(Path(id.clone())).await else {
+        let Ok(Json(verified)) = software_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_deployment(pool, &id).await;
             panic!("verify on direct-insert row must succeed");
         };
@@ -49098,7 +49329,11 @@ mod linux_deployment_no_db_tests {
 
     #[tokio::test]
     async fn test_plan_returns_503_without_db() {
-        let result = linux_deploy_plan(Json(plan_body())).await;
+        let result = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -49108,7 +49343,8 @@ mod linux_deployment_no_db_tests {
         let body = LinuxDeployActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = linux_deploy_validate(Json(body)).await;
+        let result =
+            linux_deploy_validate(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -49118,7 +49354,8 @@ mod linux_deployment_no_db_tests {
         let body = LinuxDeployActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = linux_deploy_execute(Json(body)).await;
+        let result =
+            linux_deploy_execute(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -49128,7 +49365,8 @@ mod linux_deployment_no_db_tests {
         let body = LinuxDeployActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = linux_deploy_verify(Json(body)).await;
+        let result =
+            linux_deploy_verify(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -49185,12 +49423,31 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
 
         let id = created["id"].as_str().expect("id in response").to_string();
         uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
+
+        // #7 audit: linux_deploy_plan wrote a durable audit row naming the request.
+        let plan_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'linux-deploy-plan' AND detail->>'request_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query plan audit");
+        assert!(
+            plan_audited,
+            "linux_deploy_plan must write a durable audit row"
+        );
 
         let req = crate::repos::linux_deployment_requests::get(pool, &id)
             .await
@@ -49219,15 +49476,23 @@ mod linux_deployment_requests_db_tests {
         };
 
         // 1. plan
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // 2. validate
-        let Ok(Json(vr)) = linux_deploy_validate(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(vr)) = linux_deploy_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -49249,9 +49514,12 @@ mod linux_deployment_requests_db_tests {
         );
 
         // 3. execute
-        let Ok(Json(executed)) = linux_deploy_execute(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(executed)) = linux_deploy_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -49273,9 +49541,12 @@ mod linux_deployment_requests_db_tests {
         );
 
         // 4. verify
-        let Ok(Json(verification)) = linux_deploy_verify(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(verification)) = linux_deploy_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -49310,9 +49581,12 @@ mod linux_deployment_requests_db_tests {
 
         let missing_id = uuid::Uuid::new_v4().to_string();
 
-        let result = linux_deploy_validate(Json(LinuxDeployActionRequest {
-            operation_id: missing_id.clone(),
-        }))
+        let result = linux_deploy_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: missing_id.clone(),
+            }),
+        )
         .await;
         assert!(result.is_err());
         assert_eq!(
@@ -49332,7 +49606,12 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -49348,9 +49627,12 @@ mod linux_deployment_requests_db_tests {
         );
 
         // Advance it to Validated through the normal path.
-        if linux_deploy_validate(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        if linux_deploy_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
@@ -49359,10 +49641,15 @@ mod linux_deployment_requests_db_tests {
         }
 
         // A transition that still expects the stale Planned status must NOT apply.
+        let mut tx_cas = pool
+            .begin()
+            .await
+            .expect("begin tx for stale-CAS transition test");
         let applied =
-            crate::repos::linux_deployment_requests::transition(pool, "Planned", &planned)
+            crate::repos::linux_deployment_requests::transition(&mut tx_cas, "Planned", &planned)
                 .await
                 .expect("transition query failed");
+        drop(tx_cas); // rollback — no mutation happened
 
         cleanup(pool, &id).await;
         assert!(
@@ -49381,7 +49668,12 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -49393,13 +49685,18 @@ mod linux_deployment_requests_db_tests {
             .expect("req");
         let before = crate::repos::linux_deployment_requests::status_str(&req.status).to_string();
         req.status = ryuki_engine::models::LinuxDeploymentStatus::Completed;
-        crate::repos::linux_deployment_requests::transition(pool, &before, &req)
+        let mut tx_force = pool.begin().await.expect("begin force-transition tx");
+        crate::repos::linux_deployment_requests::transition(&mut tx_force, &before, &req)
             .await
             .expect("force-transition");
+        tx_force.commit().await.expect("commit force-transition");
 
-        let result = linux_deploy_execute(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = linux_deploy_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
@@ -49424,7 +49721,12 @@ mod linux_deployment_requests_db_tests {
         };
 
         // Plan a valid request.
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -49436,14 +49738,19 @@ mod linux_deployment_requests_db_tests {
             .expect("deployment not found");
         let before = crate::repos::linux_deployment_requests::status_str(&req.status).to_string();
         req.cpu = 0; // validate_linux_deployment rejects cpu==0
-        crate::repos::linux_deployment_requests::transition(pool, &before, &req)
+        let mut tx_patch = pool.begin().await.expect("begin patch tx");
+        crate::repos::linux_deployment_requests::transition(&mut tx_patch, &before, &req)
             .await
             .expect("patch transition");
+        tx_patch.commit().await.expect("commit patch tx");
 
         // Validate should return Ok(passed=false), not Err.
-        let Ok(Json(vr)) = linux_deploy_validate(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(vr)) = linux_deploy_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -49475,14 +49782,22 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let result = linux_deploy_execute(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = linux_deploy_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
@@ -49504,14 +49819,22 @@ mod linux_deployment_requests_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = linux_deploy_plan(Json(plan_body())).await else {
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
             panic!("linux_deploy_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let result = linux_deploy_verify(Json(LinuxDeployActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = linux_deploy_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(LinuxDeployActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
