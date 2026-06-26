@@ -21360,13 +21360,18 @@ async fn hardware_warranty_expiring() -> ApiResult {
     Ok(Json(serde_json::to_value(expiring).unwrap_or_default()))
 }
 
-async fn hardware_firmware_check(Path(id): Path<String>) -> ApiResult {
+async fn hardware_firmware_check(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // Single-item read: 404 when absent or when no DB is configured.
     let pool = get_db().ok_or_else(|| status_404(&id))?;
     let asset = crate::repos::hardware_assets::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only check firmware for an asset in its own site.
+    guard_body_site_scope(&session, &asset.site)?;
     let check = hardware_lifecycle::check_firmware_compliance(&asset);
     Ok(Json(serde_json::to_value(check).unwrap_or_default()))
 }
@@ -21592,7 +21597,10 @@ async fn outage_notices_create(Json(body): Json<OutageNoticeCreateRequest>) -> A
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn outage_notices_get(Path(id): Path<String>) -> ApiResult {
+async fn outage_notices_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // Read surface: 404-as-absent when no DB (not 503).
     let Some(pool) = get_db() else {
         return Err(status_404(&id));
@@ -21601,10 +21609,15 @@ async fn outage_notices_get(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only read an outage notice in its own site.
+    guard_body_site_scope(&session, &notice.site)?;
     Ok(Json(serde_json::to_value(notice).unwrap_or_default()))
 }
 
-async fn outage_notices_preview(Path(id): Path<String>) -> ApiResult {
+async fn outage_notices_preview(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // Read surface: 404-as-absent when no DB.
     let Some(pool) = get_db() else {
         return Err(status_404(&id));
@@ -21613,6 +21626,8 @@ async fn outage_notices_preview(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only preview an outage notice in its own site.
+    guard_body_site_scope(&session, &notice.site)?;
     Ok(Json(outage_comms::preview_notice_pure(&notice)))
 }
 
@@ -23629,7 +23644,10 @@ async fn dns_record_create(
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
-async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn dns_record_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let row: Option<DnsRecordRow> = sqlx::query_as(&format!(
             "SELECT {DNS_COLUMNS} FROM dns_records WHERE id = $1"
@@ -23639,9 +23657,13 @@ async fn dns_record_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCo
         .await
         .map_err(db_error)?;
         return match row {
-            Some(record) => Ok(Json(
-                json!({"source": "database", "record": record.to_json()}),
-            )),
+            Some(record) => {
+                // #2: a scoped principal may only read a record in its own site.
+                guard_body_site_scope(&session, &record.site)?;
+                Ok(Json(
+                    json!({"source": "database", "record": record.to_json()}),
+                ))
+            }
             None => Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("DNS record '{}' not found", id)})),
@@ -23799,7 +23821,10 @@ async fn ipam_subnets_list(
         .map(Json)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
-async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn ipam_subnet_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let subnet_row: Option<IpamSubnetRow> = sqlx::query_as(&format!(
             "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
@@ -23812,6 +23837,8 @@ async fn ipam_subnet_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusC
             Some(row) => row.to_engine(),
             None => return Err(ipam_not_found(format!("Subnet '{id}' not found"))),
         };
+        // #2: a scoped principal may only read a subnet in its own site.
+        guard_body_site_scope(&session, &subnet.site)?;
         let reservation_rows: Vec<IpReservationRow> = sqlx::query_as(&format!(
             "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations \
              WHERE subnet_id = $1 ORDER BY id"
@@ -24462,6 +24489,7 @@ async fn firewall_rule_create(
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn firewall_rule_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -24473,7 +24501,11 @@ async fn firewall_rule_get(
         .await
         .map_err(db_error)?;
         return match row {
-            Some(rule) => Ok(Json(json!({"source": "database", "rule": rule.to_json()}))),
+            Some(rule) => {
+                // #2: a scoped principal may only read a rule in its own site.
+                guard_body_site_scope(&session, &rule.site)?;
+                Ok(Json(json!({"source": "database", "rule": rule.to_json()})))
+            }
             None => Err(status_404(&id)),
         };
     }
@@ -24686,6 +24718,7 @@ async fn firewall_rule_set_list(
 }
 
 async fn firewall_rule_set_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -24693,10 +24726,14 @@ async fn firewall_rule_set_get(
         .await
         .map_err(db_error)?
     {
-        Some((rs, _version)) => Ok(Json(json!({
-            "source": "database",
-            "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
-        }))),
+        Some((rs, _version)) => {
+            // #2: a scoped principal may only read a rule set in its own site.
+            guard_body_site_scope(&session, &rs.site)?;
+            Ok(Json(json!({
+                "source": "database",
+                "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
+            })))
+        }
         None => Err(status_404(&id)),
     }
 }
@@ -25146,6 +25183,7 @@ async fn storage_array_delete(
 }
 
 async fn storage_check_capacity(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<StorageCapacityRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let array = match get_db() {
@@ -25155,6 +25193,8 @@ async fn storage_check_capacity(
             .ok_or_else(|| status_404(&b.array_id))?,
         None => return Err(status_404(&b.array_id)),
     };
+    // #2: a scoped principal may only check capacity for an array in its own site.
+    guard_body_site_scope(&session, &array.site)?;
     Ok(Json(ryuki_engine::storage_provisioning::check_capacity(
         &array,
         b.requested_gb,
@@ -25559,12 +25599,17 @@ async fn dr_plan_create(
     dr_testing::upsert_plan(&plan);
     Ok(Json(serde_json::to_value(&plan).unwrap_or_default()))
 }
-async fn dr_plan_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn dr_plan_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (plan, _version) = crate::repos::dr_plans::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only read a DR plan in its own site.
+    guard_body_site_scope(&session, &plan.site)?;
     Ok(Json(serde_json::to_value(&plan).unwrap_or_default()))
 }
 async fn dr_plan_update_rpo_rto(
@@ -25697,13 +25742,18 @@ async fn dr_test_complete(
         serde_json::to_value(&completed_run).unwrap_or_default(),
     ))
 }
-async fn dr_test_results(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn dr_test_results(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // Verify plan exists first (matches engine behavior returning error if plan missing)
-    crate::repos::dr_plans::get(pool, &id)
+    let (plan, _version) = crate::repos::dr_plans::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only read a plan's test results in its own site.
+    guard_body_site_scope(&session, &plan.site)?;
     let runs = crate::repos::dr_test_runs::list_by_plan(pool, &id)
         .await
         .map_err(db_error)?;
@@ -40123,7 +40173,12 @@ mod firewall_rules_db_tests {
         );
 
         // GET confirms persisted.
-        let Ok(Json(got)) = firewall_rule_get(Path(id.clone())).await else {
+        let Ok(Json(got)) = firewall_rule_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             panic!("get after update failed");
         };
         let got_action = got
@@ -40169,7 +40224,12 @@ mod firewall_rules_db_tests {
             panic!("delete failed");
         };
 
-        let Err((status, _)) = firewall_rule_get(Path(id.clone())).await else {
+        let Err((status, _)) = firewall_rule_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             panic!("expected 404 after delete");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -43609,7 +43669,12 @@ mod hardware_db_tests {
             panic!("hardware_update_firmware failed");
         };
 
-        let Ok(Json(check)) = hardware_firmware_check(Path(id.clone())).await else {
+        let Ok(Json(check)) = hardware_firmware_check(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("hardware_firmware_check failed");
         };
