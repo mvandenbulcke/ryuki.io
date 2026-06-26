@@ -189,7 +189,12 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<ADComputer>, sqlx::Er
 /// model so the response matches the engine-produced timestamps exactly.
 /// `metadata` is serialized to JSON and bound as `::jsonb`. `updated_at` is
 /// left to the DB default (`NOW()`).
-pub async fn insert(pool: &PgPool, r: &ADComputer) -> Result<ADComputer, sqlx::Error> {
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    r: &ADComputer,
+) -> Result<ADComputer, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let last_logon: DateTime<Utc> = chrono::DateTime::parse_from_rfc3339(&r.last_logon)
@@ -217,7 +222,7 @@ pub async fn insert(pool: &PgPool, r: &ADComputer) -> Result<ADComputer, sqlx::E
     .bind(&r.os)
     .bind(created_at)
     .bind(&metadata_json)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model().map(|(m, _)| m)

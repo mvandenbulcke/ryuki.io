@@ -4093,11 +4093,15 @@ async fn identity_ad_computer() -> Json<Value> {
 
 // ─── AD computer lifecycle handlers ───
 
-async fn ad_prestage(Json(body): Json<AdPrestageRequest>) -> ApiResult {
+async fn ad_prestage(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<AdPrestageRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let computer = ad_computer_lifecycle::prestage_computer(&body.name, &body.site, &body.ou_path)
         .map_err(|e| status_400(&e))?;
-    let persisted = crate::repos::ad_computers::insert(pool, &computer)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::ad_computers::insert(&mut *tx, &computer)
         .await
         .map_err(|e| {
             if let Some(d) = e.as_database_error() {
@@ -4107,6 +4111,19 @@ async fn ad_prestage(Json(body): Json<AdPrestageRequest>) -> ApiResult {
             }
             db_error(e)
         })?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ad-prestage",
+            None,
+            "prestaged",
+            json!({ "computer_name": &computer.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
@@ -4118,7 +4135,11 @@ async fn ad_validate(Json(body): Json<AdValidateRequest>) -> ApiResult {
     }
 }
 
-async fn ad_move(Path(name): Path<String>, Json(body): Json<AdMoveRequest>) -> ApiResult {
+async fn ad_move(
+    AuthExtractor(session): AuthExtractor,
+    Path(name): Path<String>,
+    Json(body): Json<AdMoveRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
         .await
@@ -4135,15 +4156,33 @@ async fn ad_move(Path(name): Path<String>, Json(body): Json<AdMoveRequest>) -> A
     let updated = ad_computer_lifecycle::move_computer_model(&computer, &body.target_ou)
         .map_err(|e| status_400(&e))?;
     let before_status = crate::repos::ad_computers::status_str(&computer.status);
+    let mut tx = pool.begin().await.map_err(db_error)?;
     let (persisted, _) =
-        crate::repos::ad_computers::transition(pool, before_status, updated_at, &updated)
+        crate::repos::ad_computers::transition(&mut *tx, before_status, updated_at, &updated)
             .await
             .map_err(db_error)?
             .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ad-move",
+            Some(before_status),
+            "moved",
+            json!({ "computer_name": &computer.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn ad_disable(Path(name): Path<String>, Json(body): Json<AdDisableRequest>) -> ApiResult {
+async fn ad_disable(
+    AuthExtractor(session): AuthExtractor,
+    Path(name): Path<String>,
+    Json(body): Json<AdDisableRequest>,
+) -> ApiResult {
     // Empty reason is bad input (400) — check before touching the DB.
     if body.reason.trim().is_empty() {
         return Err(status_400("disable reason must not be empty"));
@@ -4157,14 +4196,29 @@ async fn ad_disable(Path(name): Path<String>, Json(body): Json<AdDisableRequest>
     let updated = ad_computer_lifecycle::disable_computer_model(&computer, &body.reason)
         .map_err(|e| status_409(&e))?;
     let before = crate::repos::ad_computers::status_str(&computer.status);
-    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let (persisted, _) =
+        crate::repos::ad_computers::transition(&mut *tx, before, updated_at, &updated)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ad-disable",
+            Some(before),
+            "disabled",
+            json!({ "computer_name": &computer.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn ad_enable(Path(name): Path<String>) -> ApiResult {
+async fn ad_enable(AuthExtractor(session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let (computer, updated_at) = crate::repos::ad_computers::get_by_name(pool, &name)
         .await
@@ -4173,10 +4227,25 @@ async fn ad_enable(Path(name): Path<String>) -> ApiResult {
     let updated =
         ad_computer_lifecycle::enable_computer_model(&computer).map_err(|e| status_409(&e))?;
     let before = crate::repos::ad_computers::status_str(&computer.status);
-    let (persisted, _) = crate::repos::ad_computers::transition(pool, before, updated_at, &updated)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let (persisted, _) =
+        crate::repos::ad_computers::transition(&mut *tx, before, updated_at, &updated)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("computer was modified concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "ad-enable",
+            Some(before),
+            "enabled",
+            json!({ "computer_name": &computer.name }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
@@ -7604,7 +7673,10 @@ async fn patch_plan(
     Ok(Json(serde_json::to_value(&wave).unwrap_or_default()))
 }
 
-async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
+async fn patch_validate(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<PatchActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
@@ -7623,6 +7695,18 @@ async fn patch_validate(Json(body): Json<PatchActionRequest>) -> ApiResult {
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "patch-validate",
+            Some(before),
+            "validated",
+            json!({ "wave_id": &body.wave_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
@@ -8654,7 +8738,7 @@ async fn protect_legal_hold() -> Json<Value> {
 // ─── Legal Hold Engine Handlers ───
 
 async fn legal_hold_place(
-    Extension(session): Extension<AuthSession>,
+    AuthExtractor(session): AuthExtractor,
     Json(req): Json<LegalHoldPlaceRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // #2: a scoped principal may only place a legal hold in its own site.
@@ -8691,6 +8775,7 @@ async fn legal_hold_place(
         // Durable path: timestamps via ::timestamptz casts, JSONB via ::jsonb on
         // text binds. hold_type/status serialize capitalized (serde variant
         // names), matching the migration-026 CHECK constraints and seeds.
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query(
             "INSERT INTO legal_holds \
                 (id, server_or_app_name, hold_type, reason, initiated_by, initiated_date, \
@@ -8708,9 +8793,22 @@ async fn legal_hold_place(
         .bind(serde_json::to_string(&hold.affected_backups).unwrap_or_else(|_| "[]".into()))
         .bind(&hold.site)
         .bind(serde_json::to_string(&hold.audit_trail).unwrap_or_else(|_| "[]".into()))
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "legal-hold-place",
+                None,
+                "placed",
+                json!({ "hold_id": &hold.id }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
     }
     Ok(Json(serde_json::to_value(&hold).unwrap_or_default()))
 }
@@ -23543,13 +23641,19 @@ async fn runbook_complete(
 }
 
 /// Fail a persisted runbook execution. 503/404/409 as appropriate.
-async fn runbook_fail(Path(id): Path<String>, Json(body): Json<RunbookFailRequest>) -> ApiResult {
+async fn runbook_fail(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+    Json(body): Json<RunbookFailRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+
+    let before = crate::repos::runbook_executions::status_str(&exec.status);
 
     let updated =
         runbook_execution::fail_execution_pure(&exec, &body.reason).map_err(|e| status_409(&e))?;
@@ -23561,6 +23665,18 @@ async fn runbook_fail(Path(id): Path<String>, Json(body): Json<RunbookFailReques
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "runbook-fail",
+            Some(before),
+            "failed",
+            json!({ "runbook_execution_id": &id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
@@ -24023,7 +24139,10 @@ struct IncidentEscalateRequest {
     reason: String,
 }
 
-async fn incident_assemble(Json(body): Json<IncidentAssembleRequest>) -> ApiResult {
+async fn incident_assemble(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<IncidentAssembleRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let ctx = build_incident_context(
         &body.incident_title,
@@ -24032,9 +24151,23 @@ async fn incident_assemble(Json(body): Json<IncidentAssembleRequest>) -> ApiResu
         &body.site,
     )
     .map_err(|e| status_400(&e))?;
-    crate::repos::incident_contexts::insert(pool, &ctx)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::incident_contexts::insert(&mut *tx, &ctx)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "incident-assemble",
+            None,
+            "assembled",
+            json!({ "incident_id": &ctx.incident_id }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
     Ok(Json(serde_json::to_value(&ctx).unwrap_or_default()))
 }
 
@@ -42705,7 +42838,7 @@ mod legal_hold_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let Ok(Json(placed)) = legal_hold_place(
-            Extension(approver_session("test-user")),
+            AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
         )
         .await
@@ -42713,6 +42846,21 @@ mod legal_hold_db_tests {
             panic!("place failed");
         };
         let id = placed["id"].as_str().expect("id").to_string();
+
+        // #7 audit: place wrote a durable audit_log row (alongside the JSONB
+        // audit_trail column on the legal_holds row).
+        let place_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'legal-hold-place' AND detail->>'hold_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query place audit");
+        assert!(
+            place_audited,
+            "legal_hold_place must write a durable audit_log row"
+        );
 
         // Extend to a known far-future date.
         let new_expiry = "2099-12-31T00:00:00Z";
@@ -42783,7 +42931,7 @@ mod legal_hold_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let Ok(Json(placed)) = legal_hold_place(
-            Extension(approver_session("test-user")),
+            AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
         )
         .await
@@ -42840,7 +42988,7 @@ mod legal_hold_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let Ok(Json(placed)) = legal_hold_place(
-            Extension(approver_session("test-user")),
+            AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
         )
         .await
@@ -42873,7 +43021,7 @@ mod legal_hold_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
         let Ok(Json(placed)) = legal_hold_place(
-            Extension(approver_session("test-user")),
+            AuthExtractor(approver_session("test-user")),
             Json(place_body(&suffix)),
         )
         .await
@@ -44008,9 +44156,12 @@ mod patch_waves_db_tests {
         let id = created["id"].as_str().expect("id").to_string();
 
         // 2. validate
-        let Ok(Json(vr)) = patch_validate(Json(PatchActionRequest {
-            wave_id: id.clone(),
-        }))
+        let Ok(Json(vr)) = patch_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -44151,9 +44302,12 @@ mod patch_waves_db_tests {
         assert_eq!(draft.status, ryuki_engine::models::PatchWaveStatus::Draft);
 
         // Advance it to Validated through the normal path.
-        if patch_validate(Json(PatchActionRequest {
-            wave_id: id.clone(),
-        }))
+        if patch_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {

@@ -32,7 +32,12 @@ impl IncidentContextRow {
     }
 }
 
-pub async fn insert(pool: &PgPool, ctx: &IncidentContext) -> Result<(), sqlx::Error> {
+/// Accepts any `sqlx::PgExecutor` — pass `pool` for a standalone call, or
+/// `&mut *tx` to share a transaction with an audit write.
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    ctx: &IncidentContext,
+) -> Result<(), sqlx::Error> {
     let incident_json = serde_json::to_value(ctx).map_err(|e| {
         sqlx::Error::Decode(format!("incident_contexts: serialize failed: {e}").into())
     })?;
@@ -46,7 +51,7 @@ pub async fn insert(pool: &PgPool, ctx: &IncidentContext) -> Result<(), sqlx::Er
     .bind(&ctx.severity)
     .bind(&ctx.status)
     .bind(incident_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
