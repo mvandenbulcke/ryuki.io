@@ -4196,18 +4196,28 @@ async fn ad_delete(Path(name): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn ad_reconcile(Query(query): Query<AdReconcileQuery>) -> ApiResult {
+async fn ad_reconcile(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<AdReconcileQuery>,
+) -> ApiResult {
     // Pure dry-run analytics — no DB interaction.
-    let site = query.site.as_deref().unwrap_or("DEFRA");
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     match ad_computer_lifecycle::reconcile_computers(site) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
     }
 }
 
-async fn ad_orphaned(Query(query): Query<AdOrphanedQuery>) -> ApiResult {
+async fn ad_orphaned(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<AdOrphanedQuery>,
+) -> ApiResult {
     // Pure dry-run analytics — no DB interaction.
-    let site = query.site.as_deref().unwrap_or("DEFRA");
+    // #2: scoped-site read (default DEFRA for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
+    let site = site_scoped.as_str();
     match ad_computer_lifecycle::get_orphaned(site) {
         Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
@@ -4366,8 +4376,13 @@ async fn gmsa_test(Path((name, host)): Path<(String, String)>) -> ApiResult {
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn gmsa_inventory(Query(query): Query<GmsaInventoryQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn gmsa_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<GmsaInventoryQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let Some(pool) = get_db() else {
         return Ok(Json(serde_json::Value::Array(vec![])));
     };
@@ -4456,8 +4471,13 @@ async fn identity_file_share_ntfs() -> Json<Value> {
 
 // ─── File Share NTFS recertification handlers ───
 
-async fn shares_list(Query(query): Query<SharesQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn shares_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SharesQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let shares = match get_db() {
         Some(pool) => crate::repos::file_share_ntfs::list_shares(pool, site)
             .await
@@ -4481,9 +4501,12 @@ async fn shares_get(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn shares_recertification_due(
+    AuthExtractor(session): AuthExtractor,
     Query(query): Query<SharesRecertificationDueQuery>,
 ) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let now = chrono::Utc::now();
     let due = match get_db() {
         Some(pool) => crate::repos::file_share_ntfs::list_recertification_due(pool, site, now)
@@ -4546,8 +4569,13 @@ async fn shares_open_access(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(open).unwrap_or_default()))
 }
 
-async fn shares_stale_owners(Query(query): Query<SharesStaleOwnersQuery>) -> ApiResult {
-    let site = query.site.as_deref().unwrap_or("");
+async fn shares_stale_owners(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SharesStaleOwnersQuery>,
+) -> ApiResult {
+    // #2: scoped-site read ("" = all sites for an unrestricted caller).
+    let site_scoped = enforce_site_scope(&session, query.site.as_deref(), "")?;
+    let site = site_scoped.as_str();
     let now = chrono::Utc::now();
     let threshold = now - chrono::Duration::days(365);
     let stale = match get_db() {
