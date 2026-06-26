@@ -84,13 +84,29 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   analytics/capacity family (capacity, capacity_cluster, capacity_forecast,
   cost_summary, waste, rightsizing, trend, vmware_cluster_capacity_admission).
   Dual-reviewed (GPT-5 Codex + fresh-context agent): both SHIP the code; no leak
-  in any enforced handler. DEFERRED (tracked follow-ups, same pattern): the
-  request-by-id family (requests_get/audit/approval_quorum/evidence_pack/policy_eval/
-  jobs — needs per-request site/env load + scope check), the domain-read surface
-  (maintenance_calendar, log_forwarders, datacenter_readiness, firewall_rules,
-  dr_testing, secrets_rotation summary, etc.), and write-path scope checks
-  (metrics_budget_create/slo_create/metrics_record_sample body site/env). A
-  centralized scope layer is the likely vehicle for the remaining breadth.
+  in any enforced handler.
+
+- **STATUS (2026-06-26) — slice 2 (request-by-id reads) shipped (commit d4c00b9):**
+  Post-load scope guard (`scope_guard_or_404` / `row_scope_permits` /
+  `request_site_env`) on requests_get, requests_policy_eval, requests_execution_job,
+  request_evidence_pack, requests_approval_quorum, requests_audit. Out-of-scope is
+  byte-indistinguishable from not-found (404, or the empty trail for audit) — no
+  existence oracle. Codex caught + we fixed a fail-open (scope-lookup DB error fell
+  through to serving the audit trail; now fails closed).
+
+- **ARCHITECTURE DECISION (2026-06-26):** A 10-agent inventory/design workflow
+  mapped the FULL remaining surface = **116 unenforced site/env handlers** (82 HIGH,
+  30 MED, 4 LOW; 31 request-by-id, 41 single-site, 26 per-row-list, 18 write), in
+  13 same-pattern buckets. Chose the **hybrid helper-layer** (typed scope extractors
+  for param reads + post-load guard for by-id + body-scope validation for writes +
+  an anti-fail-open lint) over transparent middleware (which is fail-open by
+  construction and structurally blind to the mid-handler-loaded row + inconsistent
+  omit-defaults). REMAINING after slice 2: the destructive writes (secrets_rotate_all,
+  firewall apply/revoke + rule create/update/delete, dns/ipam create/update/delete,
+  storage/k8s provision, metrics/slo writes), the by-id mutations, the single-site /
+  per-row-list reads (maintenance/readiness/firewall/dr/log-forwarders/secrets/
+  hardware/compliance/dns/ipam/storage/k8s/aiops/baseline/zabbix/outage/...), and the
+  4 hardware hard-coded-''-load bugs. Severity-ordered, reviewable commits.
 
 ### 4. False-healthy platform health checks (all hardcoded to Healthy)
 - **area:** ryuki-engine/src/health_monitor.rs (lines 102-181) · **kind:** latent-bug · **severity:** high · **effort:** M · **ci_validatable:** True
