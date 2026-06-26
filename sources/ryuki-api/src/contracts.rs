@@ -18791,10 +18791,28 @@ async fn backup_restore_approve(
 
     let approved = backup_engine::approve_restore(&r, approver).map_err(|e| status_409(&e))?;
 
-    let persisted = crate::repos::restore_requests::transition(pool, before, &approved, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let persisted = crate::repos::restore_requests::transition(&mut *tx, before, &approved, None)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "backup-restore-approve",
+            Some(before),
+            "approved",
+            json!({
+                "restore_id": r.id,
+                "source_ci_key": r.source_ci_key,
+                "target_site": r.target_site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
@@ -18805,7 +18823,10 @@ async fn backup_restore_approve(
 /// the safe direction: a second call finds the request Executed (not Approved),
 /// so the engine's Approved precondition rejects it (409) — a restore cannot be
 /// silently run twice, and list/get reflect that it ran.
-async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+async fn backup_restore_execute(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<RestoreActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let r = crate::repos::restore_requests::get(pool, &body.restore_id)
@@ -18826,10 +18847,28 @@ async fn backup_restore_execute(Json(body): Json<RestoreActionRequest>) -> ApiRe
         evidence.len().to_string(),
     );
 
-    crate::repos::restore_requests::transition(pool, before, &executed, None)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::restore_requests::transition(&mut *tx, before, &executed, None)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_409("state changed concurrently; reload and retry"))?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "backup-restore-execute",
+            Some(before),
+            "executed",
+            json!({
+                "restore_id": r.id,
+                "source_ci_key": r.source_ci_key,
+                "target_site": r.target_site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
@@ -22944,9 +22983,27 @@ async fn runbook_start(
     let exec = runbook_execution::build_execution(&body.runbook_id, &body.site, &session.user_id)
         .map_err(|e| status_400(&e))?;
 
-    crate::repos::runbook_executions::insert(pool, &exec)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    crate::repos::runbook_executions::insert(&mut *tx, &exec)
         .await
         .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "runbook-start",
+            None,
+            "started",
+            json!({
+                "runbook_id": exec.runbook_id,
+                "execution_id": exec.id,
+                "site": exec.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&exec).unwrap_or_default()))
 }
@@ -22976,12 +23033,14 @@ async fn runbook_execute_step(Path(params): Path<(String, u32)>) -> ApiResult {
     let updated =
         runbook_execution::execute_step_pure(&exec, step_order).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
@@ -22999,23 +23058,46 @@ async fn runbook_approve(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    let before = crate::repos::runbook_executions::status_str(&exec.status);
+
     // Approver = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
     let updated = runbook_execution::approve_execution_pure(&exec, &session.user_id)
         .map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "runbook-approve",
+            Some(before),
+            "approved",
+            json!({
+                "runbook_id": updated.runbook_id,
+                "execution_id": id,
+                "site": updated.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 /// Complete a persisted runbook execution. 503/404/409 as appropriate.
-async fn runbook_complete(Path(id): Path<String>) -> ApiResult {
+async fn runbook_complete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
@@ -23023,14 +23105,34 @@ async fn runbook_complete(Path(id): Path<String>) -> ApiResult {
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    let before = crate::repos::runbook_executions::status_str(&exec.status);
+
     let updated = runbook_execution::complete_execution_pure(&exec).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "runbook-complete",
+            Some(before),
+            "completed",
+            json!({
+                "runbook_id": updated.runbook_id,
+                "execution_id": id,
+                "site": updated.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
@@ -23047,18 +23149,23 @@ async fn runbook_fail(Path(id): Path<String>, Json(body): Json<RunbookFailReques
     let updated =
         runbook_execution::fail_execution_pure(&exec, &body.reason).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
 
 /// Rollback a persisted runbook execution. 503/404/409 as appropriate.
-async fn runbook_rollback(Path(id): Path<String>) -> ApiResult {
+async fn runbook_rollback(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let (exec, version) = crate::repos::runbook_executions::get(pool, &id)
@@ -23066,14 +23173,34 @@ async fn runbook_rollback(Path(id): Path<String>) -> ApiResult {
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    let before = crate::repos::runbook_executions::status_str(&exec.status);
+
     let updated = runbook_execution::rollback_execution_pure(&exec).map_err(|e| status_409(&e))?;
 
-    let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &updated)
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::runbook_executions::transition(&mut tx, &id, &version, &updated)
         .await
         .map_err(db_error)?;
     if !ok {
         return Err(status_409("state changed concurrently; reload and retry"));
     }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "runbook-rollback",
+            Some(before),
+            "rolled-back",
+            json!({
+                "runbook_id": updated.runbook_id,
+                "execution_id": id,
+                "site": updated.site,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
@@ -43837,6 +43964,20 @@ mod backup_restore_db_tests {
         };
         assert_eq!(approved_resp["status"], "Approved");
 
+        // #7 audit: the restore approve wrote a durable audit row.
+        let approve_audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'backup-restore-approve' AND detail->>'restore_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query approve audit");
+        assert!(
+            approve_audited,
+            "restore approve must write a durable audit row"
+        );
+
         // Verify DB row.
         let record = crate::repos::restore_requests::get(pool, &id)
             .await
@@ -43950,9 +44091,12 @@ mod backup_restore_db_tests {
             panic!("approve failed");
         }
 
-        let Ok(Json(evidence)) = backup_restore_execute(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-        }))
+        let Ok(Json(evidence)) = backup_restore_execute(
+            AuthExtractor(approver_session("Exec Actor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup_restore(pool, &id).await;
@@ -43978,9 +44122,12 @@ mod backup_restore_db_tests {
         );
 
         // A second execute must be rejected — the request is no longer Approved.
-        let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-        }))
+        let Err((status, _)) = backup_restore_execute(
+            AuthExtractor(approver_session("Exec Actor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup_restore(pool, &id).await;
@@ -44018,9 +44165,12 @@ mod backup_restore_db_tests {
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Err((status, _)) = backup_restore_execute(Json(RestoreActionRequest {
-            restore_id: id.clone(),
-        }))
+        let Err((status, _)) = backup_restore_execute(
+            AuthExtractor(approver_session("Exec Actor")),
+            Json(RestoreActionRequest {
+                restore_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup_restore(pool, &id).await;
@@ -47951,9 +48101,15 @@ mod runbook_executions_db_tests {
         let approved =
             ryuki_engine::runbook_execution::approve_execution_pure(&fetched, "change.manager")
                 .expect("approve must succeed from Draft");
-        let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &approved)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::runbook_executions::transition(&mut tx, &id, &version, &approved)
+                    .await
+                    .expect("transition failed");
+            tx.commit().await.expect("commit tx");
+            result
+        };
         assert!(ok, "approve transition must succeed");
 
         let (fetched, version) = crate::repos::runbook_executions::get(pool, &id)
@@ -47969,9 +48125,15 @@ mod runbook_executions_db_tests {
         // 3. Complete
         let completed = ryuki_engine::runbook_execution::complete_execution_pure(&fetched)
             .expect("complete must succeed from Approved");
-        let ok = crate::repos::runbook_executions::transition(pool, &id, &version, &completed)
-            .await
-            .expect("transition failed");
+        let ok = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result =
+                crate::repos::runbook_executions::transition(&mut tx, &id, &version, &completed)
+                    .await
+                    .expect("transition failed");
+            tx.commit().await.expect("commit tx");
+            result
+        };
         assert!(ok, "complete transition must succeed");
 
         let (fetched, _version) = crate::repos::runbook_executions::get(pool, &id)
@@ -48035,18 +48197,30 @@ mod runbook_executions_db_tests {
         // Advance it to Approved through the normal path (this bumps the row version).
         let approved = ryuki_engine::runbook_execution::approve_execution_pure(&draft, "approver")
             .expect("approve must succeed");
-        crate::repos::runbook_executions::transition(pool, &id, &stale_version, &approved)
-            .await
-            .expect("first transition must succeed");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::runbook_executions::transition(&mut tx, &id, &stale_version, &approved)
+                .await
+                .expect("first transition must succeed");
+            tx.commit().await.expect("commit tx");
+        }
 
         // A transition presenting the STALE row version must NOT apply, even
         // though it changes the status (the xmin token has advanced).
         let stale_update = ryuki_engine::runbook_execution::complete_execution_pure(&draft)
             .expect("complete_pure on draft must return Ok (not terminal)");
-        let applied =
-            crate::repos::runbook_executions::transition(pool, &id, &stale_version, &stale_update)
-                .await
-                .expect("transition query must not error");
+        let applied = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::runbook_executions::transition(
+                &mut tx,
+                &id,
+                &stale_version,
+                &stale_update,
+            )
+            .await
+            .expect("transition query must not error")
+            // tx drops here = rollback (CAS miss, nothing written)
+        };
 
         cleanup(pool, &id).await;
         assert!(
@@ -48080,9 +48254,13 @@ mod runbook_executions_db_tests {
             .expect("not found");
         let mut terminal = exec.clone();
         terminal.status = ryuki_engine::runbook_execution::ExecutionStatus::Completed;
-        crate::repos::runbook_executions::transition(pool, &id, &version, &terminal)
-            .await
-            .expect("force-complete transition must succeed");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::runbook_executions::transition(&mut tx, &id, &version, &terminal)
+                .await
+                .expect("force-complete transition must succeed");
+            tx.commit().await.expect("commit tx");
+        }
 
         let (fetched, _version) = crate::repos::runbook_executions::get(pool, &id)
             .await
@@ -48125,11 +48303,14 @@ mod runbook_executions_db_tests {
             .expect("found");
         let running = ryuki_engine::runbook_execution::execute_step_pure(&loaded, 1)
             .expect("step 1 must succeed");
-        assert!(
-            crate::repos::runbook_executions::transition(pool, &id, &v0, &running)
+        assert!({
+            let mut tx = pool.begin().await.expect("begin tx");
+            let result = crate::repos::runbook_executions::transition(&mut tx, &id, &v0, &running)
                 .await
-                .expect("transition")
-        );
+                .expect("transition");
+            tx.commit().await.expect("commit tx");
+            result
+        });
 
         // Two concurrent readers both observe the SAME running version.
         let (reader_a, ver_running) = crate::repos::runbook_executions::get(pool, &id)
@@ -48161,9 +48342,19 @@ mod runbook_executions_db_tests {
             "A's step write must keep status Running (same-status race premise)"
         );
         assert!(
-            crate::repos::runbook_executions::transition(pool, &id, &ver_running, &a_update)
+            {
+                let mut tx = pool.begin().await.expect("begin tx");
+                let result = crate::repos::runbook_executions::transition(
+                    &mut tx,
+                    &id,
+                    &ver_running,
+                    &a_update,
+                )
                 .await
-                .expect("a transition"),
+                .expect("a transition");
+                tx.commit().await.expect("commit tx");
+                result
+            },
             "first same-status write must succeed"
         );
 
@@ -48176,10 +48367,13 @@ mod runbook_executions_db_tests {
             ryuki_engine::runbook_execution::ExecutionStatus::Running,
             "B's step write must keep status Running (same-status race premise)"
         );
-        let applied =
-            crate::repos::runbook_executions::transition(pool, &id, &ver_running_b, &b_update)
+        let applied = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::runbook_executions::transition(&mut tx, &id, &ver_running_b, &b_update)
                 .await
-                .expect("b transition query must not error");
+                .expect("b transition query must not error")
+            // tx drops here = rollback (CAS miss, nothing written)
+        };
 
         cleanup(pool, &id).await;
         assert!(

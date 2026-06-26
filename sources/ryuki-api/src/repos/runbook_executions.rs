@@ -88,7 +88,10 @@ fn decode_status(s: &str) -> Result<ExecutionStatus, String> {
 
 /// Insert a new runbook execution. The caller supplies the model with an
 /// already-generated text id (e.g. "rbx-defra-abc1234").
-pub async fn insert(pool: &PgPool, exec: &RunbookExecution) -> Result<(), sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    exec: &RunbookExecution,
+) -> Result<(), sqlx::Error> {
     let execution_json = serde_json::to_value(exec).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
@@ -104,7 +107,7 @@ pub async fn insert(pool: &PgPool, exec: &RunbookExecution) -> Result<(), sqlx::
     .bind(&exec.site)
     .bind(&exec.started_by)
     .bind(execution_json)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -161,7 +164,7 @@ pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<RunbookExecution>, sq
 /// Both `status` (scalar column for queryability) and `execution_json` (full
 /// entity snapshot) are updated atomically within a transaction.
 pub async fn transition(
-    pool: &PgPool,
+    executor: &mut sqlx::PgConnection,
     id: &str,
     expected_version: &str,
     updated: &RunbookExecution,
@@ -169,8 +172,6 @@ pub async fn transition(
     let execution_json = serde_json::to_value(updated).map_err(|e| {
         sqlx::Error::Decode(format!("runbook_executions: serialize failed: {e}").into())
     })?;
-
-    let mut tx = pool.begin().await?;
 
     let res = sqlx::query(
         "UPDATE runbook_executions SET \
@@ -183,14 +184,12 @@ pub async fn transition(
     .bind(status_str(&updated.status))
     .bind(execution_json)
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(&mut *executor)
     .await?;
 
     if res.rows_affected() == 0 {
-        tx.rollback().await?;
         return Ok(false);
     }
 
-    tx.commit().await?;
     Ok(true)
 }

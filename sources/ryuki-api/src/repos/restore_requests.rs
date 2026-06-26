@@ -156,7 +156,10 @@ pub fn restore_type_str(t: &RestoreType) -> &'static str {
 /// The `approver` column is written from `r.metadata.get("approver")` so it
 /// stays queryable at the DB level even though the engine model stores it in
 /// metadata.
-pub async fn insert(pool: &PgPool, r: &RestoreRequest) -> Result<RestoreRequest, sqlx::Error> {
+pub async fn insert(
+    executor: impl sqlx::PgExecutor<'_>,
+    r: &RestoreRequest,
+) -> Result<RestoreRequest, sqlx::Error> {
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
     let meta = serde_json::to_string(&r.metadata).unwrap_or_else(|_| "{}".into());
@@ -182,7 +185,7 @@ pub async fn insert(pool: &PgPool, r: &RestoreRequest) -> Result<RestoreRequest,
     .bind(&r.dry_run_plan)
     .bind(approver)
     .bind(&meta)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model()
@@ -275,7 +278,7 @@ pub async fn restore_test_recency(
 /// `_audit_action` is accepted for signature parity with the snapshots template
 /// but is intentionally unused — restore_requests have no audit table yet.
 pub async fn transition(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     expected_status: &str,
     r: &RestoreRequest,
     _audit_action: Option<&str>,
@@ -319,7 +322,7 @@ pub async fn transition(
     .bind(approver)
     .bind(&meta)
     .bind(expected_status)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
 
     row.map(|row| row.into_model()).transpose()
