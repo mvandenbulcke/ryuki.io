@@ -12609,13 +12609,19 @@ async fn aiops_review(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only review a suggestion in its own site. Guard
+    // BEFORE guard_review so an out-of-scope suggestion 404s like a missing one and
+    // never leaks its review state via the 409 branch (site-only resource).
+    site_scope_guard_or_404(&session, &suggestion.site, &id)?;
     let expected = aiops::guard_review(&suggestion).map_err(|e| status_409(&e))?;
     // Reviewer = authenticated caller (from request extensions), never a
     // client-supplied body field — the audit trail must name the real principal.
-    let updated = crate::repos::aiops::review(pool, &id, &session.user_id, expected)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
+    // Pass the loaded site so the CAS is site-aware (closes the load→write TOCTOU).
+    let updated =
+        crate::repos::aiops::review(pool, &id, &session.user_id, expected, &suggestion.site)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_409("Suggestion was modified concurrently; reload and retry"))?;
     Ok(Json(json!({
         "source": "db",
         "id": updated.id,
@@ -12635,7 +12641,7 @@ async fn aiops_accept(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     // #2: a scoped principal may only accept a suggestion in its own site.
-    guard_body_site_scope(&session, &suggestion.site)?;
+    site_scope_guard_or_404(&session, &suggestion.site, &id)?;
     let expected = aiops::guard_accept(&suggestion).map_err(|e| status_409(&e))?;
     let plan = format!(
         "Implementation plan for {}: dry-run assessment, maintenance window scheduling, execution, verification.",
@@ -12665,7 +12671,7 @@ async fn aiops_reject(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     // #2: a scoped principal may only reject a suggestion in its own site.
-    guard_body_site_scope(&session, &suggestion.site)?;
+    site_scope_guard_or_404(&session, &suggestion.site, &id)?;
     let expected = aiops::guard_reject(&suggestion).map_err(|e| status_409(&e))?;
     let updated = crate::repos::aiops::reject(pool, &id, &body.reason, expected, &suggestion.site)
         .await
@@ -12690,7 +12696,7 @@ async fn aiops_implement(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     // #2: a scoped principal may only implement a suggestion in its own site.
-    guard_body_site_scope(&session, &suggestion.site)?;
+    site_scope_guard_or_404(&session, &suggestion.site, &id)?;
     let expected = aiops::guard_implement(&suggestion).map_err(|e| status_409(&e))?;
     let updated = crate::repos::aiops::implement(pool, &id, expected, &suggestion.site)
         .await
@@ -25362,16 +25368,24 @@ async fn repo_capacity_update(
 }
 
 async fn repo_capacity_forecast(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Query(params): Query<RepoCapacityForecastQuery>,
 ) -> ApiResult {
     let days = params.days.unwrap_or(30);
     let repos = match get_db() {
-        Some(pool) => crate::repos::repository_capacity::get(pool, &id)
+        Some(pool) => match crate::repos::repository_capacity::get(pool, &id)
             .await
             .map_err(db_error)?
-            .map(|r| vec![r])
-            .unwrap_or_default(),
+        {
+            // #2: a scoped principal may only read a repo in its own site — an
+            // out-of-scope repo 404s like a missing one (site-only resource).
+            Some(r) => {
+                site_scope_guard_or_404(&session, &r.site, &id)?;
+                vec![r]
+            }
+            None => Vec::new(),
+        },
         None => Vec::new(),
     };
     match repository_capacity::forecast_capacity(&repos, &id, days) {
@@ -25409,6 +25423,7 @@ async fn repo_capacity_report(
 }
 
 async fn repo_capacity_trend(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Query(params): Query<RepoCapacityTrendQuery>,
 ) -> ApiResult {
@@ -25426,6 +25441,9 @@ async fn repo_capacity_trend(
         None => (None, Vec::new()),
     };
     let repo = repo_opt.ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only read a repo in its own site (site-only) — an
+    // out-of-scope repo 404s like a missing one.
+    site_scope_guard_or_404(&session, &repo.site, &id)?;
 
     let data_points: Vec<Value> = history
         .into_iter()
@@ -25450,13 +25468,22 @@ async fn repo_capacity_trend(
     })))
 }
 
-async fn repo_capacity_recommendations(Path(id): Path<String>) -> ApiResult {
+async fn repo_capacity_recommendations(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let repos = match get_db() {
-        Some(pool) => crate::repos::repository_capacity::get(pool, &id)
+        Some(pool) => match crate::repos::repository_capacity::get(pool, &id)
             .await
             .map_err(db_error)?
-            .map(|r| vec![r])
-            .unwrap_or_default(),
+        {
+            // #2: out-of-scope repo 404s like a missing one (site-only resource).
+            Some(r) => {
+                site_scope_guard_or_404(&session, &r.site, &id)?;
+                vec![r]
+            }
+            None => Vec::new(),
+        },
         None => Vec::new(),
     };
     match repository_capacity::get_recommendations(&repos, &id) {
@@ -29579,17 +29606,24 @@ struct FwRuleSetListQuery {
 }
 
 async fn firewall_rule_set_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<FwRuleSetListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let sets = if let Some(site) = q.site.as_deref().filter(|s| !s.is_empty()) {
-        crate::repos::firewall_rule_sets::list_by_site(pool, site)
+        // #2: an explicit ?site must be within the principal's scope (403 if not;
+        // env-scoped denied), then list just that site.
+        let site = enforce_site_scope(&session, Some(site), "")?;
+        crate::repos::firewall_rule_sets::list_by_site(pool, &site)
             .await
             .map_err(db_error)?
     } else {
-        crate::repos::firewall_rule_sets::list(pool)
+        // #2: no ?site → list all, then retain only the principal's own site rows
+        // (unrestricted keeps all; env-scoped keeps none).
+        let all = crate::repos::firewall_rule_sets::list(pool)
             .await
-            .map_err(db_error)?
+            .map_err(db_error)?;
+        retain_site_scoped(&session, all, |r| r.site.as_str())
     };
     let count = sets.len();
     Ok(Json(json!({
@@ -29610,7 +29644,7 @@ async fn firewall_rule_set_get(
     {
         Some((rs, _version)) => {
             // #2: a scoped principal may only read a rule set in its own site.
-            guard_body_site_scope(&session, &rs.site)?;
+            site_scope_guard_or_404(&session, &rs.site, &id)?;
             Ok(Json(json!({
                 "source": "database",
                 "rule_set": serde_json::to_value(&rs).unwrap_or_default(),
@@ -29631,7 +29665,7 @@ async fn firewall_rule_set_apply(
         .ok_or_else(|| status_404(&id))?;
     // #2: a scoped principal may only apply a rule set in its own site. Guarded
     // on the loaded row; the xmin CAS below fails the write if the row changed.
-    guard_body_site_scope(&session, &rs.site)?;
+    site_scope_guard_or_404(&session, &rs.site, &id)?;
     let updated = firewall_rules::apply_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let cas_ok = crate::repos::firewall_rule_sets::transition(&mut tx, &id, &version, &updated)
@@ -29671,7 +29705,7 @@ async fn firewall_rule_set_revoke(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
     // #2: a scoped principal may only revoke a rule set in its own site.
-    guard_body_site_scope(&session, &rs.site)?;
+    site_scope_guard_or_404(&session, &rs.site, &id)?;
     let updated = firewall_rules::revoke_rule_set_pure(&rs).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let cas_ok = crate::repos::firewall_rule_sets::transition(&mut tx, &id, &version, &updated)
@@ -50383,6 +50417,101 @@ mod firewall_rules_db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #2 RBAC: firewall_rule_set_list narrows to the principal's site — an explicit
+    /// ?site outside scope 403s, the unfiltered list drops other sites' rule sets,
+    /// and an unrestricted principal sees all (firewall_rule_sets.site is NOT NULL).
+    #[tokio::test]
+    async fn firewall_rule_set_list_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let mk = |site: &str, tag: &str| firewall_rules::FirewallRuleSet {
+            id: format!("fws-scope-{tag}-{suffix}"),
+            name: format!("scope-{tag}"),
+            rules: vec![],
+            site: site.to_string(),
+            applied_to: "edge".into(),
+            status: firewall_rules::RuleSetStatus::Draft,
+        };
+        let defra = mk("DEFRA", "defra");
+        let gblon = mk("GBLON", "gblon");
+        crate::repos::firewall_rule_sets::insert(pool, &defra)
+            .await
+            .expect("insert defra");
+        crate::repos::firewall_rule_sets::insert(pool, &gblon)
+            .await
+            .expect("insert gblon");
+
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            AuthExtractor(s)
+        };
+        let ids_of = |v: &Value| -> Vec<String> {
+            v["rule_sets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // Unfiltered list for a GBLON principal includes GBLON, excludes DEFRA.
+        let Json(listed) =
+            firewall_rule_set_list(scoped(), Query(FwRuleSetListQuery { site: None }))
+                .await
+                .expect("list");
+        let ids = ids_of(&listed);
+        assert!(
+            ids.contains(&gblon.id) && !ids.contains(&defra.id),
+            "scoped list must include GBLON and exclude DEFRA: {ids:?}"
+        );
+
+        // Explicit ?site=DEFRA for a GBLON principal → 403.
+        let denied = firewall_rule_set_list(
+            scoped(),
+            Query(FwRuleSetListQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope ?site must 403: {denied:?}"
+        );
+
+        // Unrestricted principal sees both.
+        let Json(all) = firewall_rule_set_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(FwRuleSetListQuery { site: None }),
+        )
+        .await
+        .expect("list all");
+        let all_ids = ids_of(&all);
+        assert!(
+            all_ids.contains(&gblon.id) && all_ids.contains(&defra.id),
+            "an unrestricted principal must see both rule sets"
+        );
+
+        // by-id get of the DEFRA rule set 404s for a GBLON principal (no 403 oracle).
+        let got = firewall_rule_set_get(scoped(), Path(defra.id.clone())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope rule-set get must 404 (not a 403 existence oracle): {got:?}"
+        );
+
+        for id in [&defra.id, &gblon.id] {
+            sqlx::query("DELETE FROM firewall_rule_sets WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
     }
 
     /// Deleting a rule cascades into rule-sets: the deleted rule id is removed

@@ -172,17 +172,23 @@ pub async fn review(
     id: &str,
     reviewer: &str,
     expected_status: &str,
+    scope_site: &str,
 ) -> Result<Option<AIOpsSuggestion>, sqlx::Error> {
+    // `AND site = $5` (#2) — site-aware CAS, matching accept/reject/implement: if
+    // the row was re-homed out of the caller's scope after the handler's scope
+    // guard, this matches 0 rows and the handler reports a 409 instead of writing
+    // off-scope (closes the load-then-write TOCTOU).
     let row: Option<AiopsSuggestionRow> = sqlx::query_as(&format!(
         "UPDATE aiops_suggestions \
          SET status = $4, reviewer = $2, updated_at = NOW() \
-         WHERE id = $1 AND status = $3 \
+         WHERE id = $1 AND status = $3 AND site = $5 \
          RETURNING {COLUMNS}"
     ))
     .bind(id)
     .bind(reviewer)
     .bind(expected_status)
     .bind(suggestion_status_to_db(&SuggestionStatus::Reviewed))
+    .bind(scope_site)
     .fetch_optional(pool)
     .await?;
 
@@ -400,7 +406,7 @@ mod aiops_db_tests {
 
         let expected = ryuki_engine::aiops::guard_review(&suggestion).expect("guard ok");
 
-        let updated = review(&pool, id, "alice", expected)
+        let updated = review(&pool, id, "alice", expected, "DEFRA")
             .await
             .expect("review repo")
             .expect("CAS hit");
@@ -446,7 +452,7 @@ mod aiops_db_tests {
         insert_test_suggestion(&pool, id, "CostOptimization", "New", "DEFRA", Some(200.0)).await;
 
         // Attempt CAS with wrong expected status ("Reviewed" but row is "New")
-        let result = review(&pool, id, "bob", "Reviewed")
+        let result = review(&pool, id, "bob", "Reviewed", "DEFRA")
             .await
             .expect("query ok");
         assert!(
