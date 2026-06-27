@@ -29,6 +29,7 @@ pub mod delegation_boundary;
 pub mod dns_ipam;
 pub mod dr_testing;
 pub mod emergency_change;
+pub mod event_alerts;
 pub mod evidence_pipeline;
 pub mod feature_flag;
 pub mod file_share_ntfs;

@@ -163,6 +163,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/events", get(events_list))
+        .route("/api/events/alerts", get(events_alerts))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
         .route("/api/audit/retention", get(audit_retention_report))
@@ -16960,6 +16961,71 @@ async fn events_list(
         })
         .collect();
     Ok(Json(json!({"events": events, "durable": true})))
+}
+
+/// GET /api/events/alerts — the alert-worthy slice of the domain-event stream
+/// (#11 slice 2a). Reuses the scoped feed but keeps only events the pure
+/// `event_alerts` classifier flags — currently a request reaching a NEGATIVE
+/// terminal state: `failed`=critical, `rejected`=warning, `cancelled`=info —
+/// annotating each with its severity. The status filter is pushed into SQL (via
+/// the engine's authoritative status list) so the page is not short-counted when
+/// alerts are rare. Request-tier, site/environment-scoped. Persistent alert
+/// state + recipient routing are later slices. Empty + `durable:false` no DB.
+async fn events_alerts(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<EventsQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read events"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"alerts": [], "durable": false})));
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let aggregate_id = q
+        .aggregate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // The alert status set comes from the engine — same source as the severity
+    // label below — so the SQL filter and the classification can never drift.
+    let statuses: Vec<String> = ryuki_engine::event_alerts::alert_worthy_request_statuses()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let rows = crate::repos::domain_events::list_alerts(
+        pool,
+        aggregate_id,
+        &statuses,
+        &session.site_scope,
+        &session.environment_scope,
+        limit,
+    )
+    .await
+    .map_err(db_error)?;
+    let alerts: Vec<Value> = rows
+        .iter()
+        .filter_map(|r| {
+            let to_status = r.payload.get("to_status").and_then(|v| v.as_str());
+            let severity = ryuki_engine::event_alerts::classify(&r.aggregate_type, to_status)?;
+            Some(json!({
+                "id": r.id,
+                "event_type": r.event_type,
+                "aggregate_type": r.aggregate_type,
+                "aggregate_id": r.aggregate_id,
+                "site": r.site,
+                "environment": r.environment,
+                "actor": r.actor,
+                "severity": severity.as_str(),
+                "payload": r.payload,
+                "occurred_at": r.occurred_at.to_rfc3339(),
+            }))
+        })
+        .collect();
+    Ok(Json(json!({"alerts": alerts, "durable": true})))
 }
 
 /// Query params for the SIEM audit export.
@@ -37182,6 +37248,77 @@ mod db_lifecycle_tests {
         assert!(
             delete_attempt.is_err(),
             "domain_events must be append-only: a DELETE must be rejected"
+        );
+    }
+
+    /// #11 slice 2a: GET /api/events/alerts returns only the alert-worthy events
+    /// (requests reaching a negative terminal state) with the right severity, and
+    /// excludes normal-flow events.
+    #[tokio::test]
+    async fn events_alerts_returns_only_alert_worthy_with_severity() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let agg = format!("evt-alert-{}", Uuid::new_v4());
+        for (event_type, to_status) in [
+            ("request.reject", "rejected"),
+            ("request.execute", "failed"),
+            ("request.verify", "completed"),
+        ] {
+            crate::repos::domain_events::insert(
+                pool,
+                crate::repos::domain_events::NewEvent {
+                    event_type,
+                    aggregate_type: "request",
+                    aggregate_id: &agg,
+                    site: None,
+                    environment: None,
+                    actor: "evt-alert-actor",
+                    payload: json!({ "to_status": to_status }),
+                },
+            )
+            .await
+            .expect("insert event");
+        }
+
+        let resp = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(agg.clone()),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .expect("alerts list must succeed");
+        let alerts = resp.0["alerts"].as_array().expect("alerts array");
+        assert_eq!(
+            alerts.len(),
+            2,
+            "only the rejected + failed events are alerts (completed is not): {alerts:?}"
+        );
+        let by_status: std::collections::HashMap<String, String> = alerts
+            .iter()
+            .map(|a| {
+                (
+                    a["payload"]["to_status"].as_str().unwrap().to_string(),
+                    a["severity"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_status.get("rejected").map(String::as_str),
+            Some("warning")
+        );
+        assert_eq!(
+            by_status.get("failed").map(String::as_str),
+            Some("critical")
+        );
+        assert!(
+            !by_status.contains_key("completed"),
+            "a completed request must not be an alert"
         );
     }
 

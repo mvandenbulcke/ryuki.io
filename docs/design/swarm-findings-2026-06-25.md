@@ -287,6 +287,19 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   REMAINING (later slices, tracker #22): non-request emitters
   (capacity/SLO breach, agent-offline, decommission) and event→alert GENERATION
   + recipient routing.
+- **STATUS (2026-06-27) — SLICE 2a (alert classification + feed):** added a pure
+  `ryuki_engine::event_alerts` classifier (a request reaching a negative terminal
+  state is an alert — `failed`=critical, `rejected`=warning, `cancelled`=info;
+  everything else is normal flow) and `GET /api/events/alerts`, which surfaces the
+  alert-worthy slice with a severity label. The status filter is pushed INTO SQL
+  via the engine's authoritative `alert_worthy_request_statuses()` (a unit test
+  keeps the SQL list and the classifier in lock-step) so an alerts page is never
+  short-counted — alerts are rare relative to all transitions. Request-tier,
+  site/environment-scoped. Engine + DB tests; router-build tests pass. REMAINING
+  (slice 2b/2c): operational emitters producing non-request alert events
+  (SLO/capacity breach, agent-offline — gated by a design call on whether the
+  read-only scheduler may emit), plus persistent alert state/dedup + recipient
+  routing.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

@@ -92,3 +92,38 @@ pub async fn list(
     .fetch_all(pool)
     .await
 }
+
+/// List the alert-worthy slice of the stream (#11 slice 2a): request events whose
+/// payload `to_status` is in `request_statuses` (the engine's authoritative alert
+/// set). The status filter is pushed into SQL — alerts are rare relative to all
+/// transitions, so an in-memory filter of a recent-N page would return near-empty
+/// pages. Same scope semantics as [`list`]. Caller annotates each row's severity
+/// via the same engine classifier, so the SQL filter and the label cannot drift.
+pub async fn list_alerts(
+    pool: &sqlx::PgPool,
+    aggregate_id: Option<&str>,
+    request_statuses: &[String],
+    site_scopes: &[String],
+    env_scopes: &[String],
+    limit: i64,
+) -> Result<Vec<EventRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, event_type, aggregate_type, aggregate_id, site, environment, actor, \
+                payload, occurred_at \
+         FROM domain_events \
+         WHERE aggregate_type = 'request' \
+           AND payload->>'to_status' = ANY($1) \
+           AND ($2::text IS NULL OR aggregate_id = $2) \
+           AND (cardinality($3::text[]) = 0 OR site IS NULL OR site = ANY($3)) \
+           AND (cardinality($4::text[]) = 0 OR environment IS NULL OR environment = ANY($4)) \
+         ORDER BY occurred_at DESC, id DESC \
+         LIMIT $5",
+    )
+    .bind(request_statuses)
+    .bind(aggregate_id)
+    .bind(site_scopes)
+    .bind(env_scopes)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
