@@ -27312,7 +27312,10 @@ async fn access_reviews_list(
     )))
 }
 
-async fn access_review_get(Path(id): Path<String>) -> ApiResult {
+async fn access_review_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // Read surface: with no DB there is no data, so degrade to 404-as-absent
     // (not 503 — only governed mutations require a DB).
     let Some(pool) = get_db() else {
@@ -27322,22 +27325,29 @@ async fn access_review_get(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &review.site, "", &id)?;
     Ok(Json(access_recertification::get_review_response(&review)))
 }
 
-async fn access_reviews_due() -> ApiResult {
+async fn access_reviews_due(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let reviews = match get_db() {
         Some(pool) => crate::repos::access_recertification::list_due(pool)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal only sees its own site's due reviews (env-scoped -> none).
+    let reviews = retain_site_scoped(&session, reviews, |r| r.site.as_str());
     Ok(Json(access_recertification::list_due_reviews_pure(
         &reviews,
     )))
 }
 
-async fn access_reviews_expiring(Query(params): Query<AccessReviewExpiringQuery>) -> ApiResult {
+async fn access_reviews_expiring(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<AccessReviewExpiringQuery>,
+) -> ApiResult {
     let days = params.days.unwrap_or(30);
     if days < 0 {
         return Err(status_400("days must be zero or greater"));
@@ -27348,6 +27358,8 @@ async fn access_reviews_expiring(Query(params): Query<AccessReviewExpiringQuery>
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal only sees its own site's expiring reviews.
+    let reviews = retain_site_scoped(&session, reviews, |r| r.site.as_str());
     Ok(Json(access_recertification::list_expiring_pure(
         &reviews, days,
     )))
@@ -27362,6 +27374,8 @@ async fn access_review_start(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the review-guard / write.
+    scope_guard_or_404(&session, &review.site, "", &id)?;
     access_recertification::start_review_guard(&review, &session.user_id)
         .map_err(|e| status_400(&e))?;
     let (updated, _) =
@@ -27386,6 +27400,8 @@ async fn access_review_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the review-guard / write.
+    scope_guard_or_404(&session, &review.site, "", &id)?;
     access_recertification::approve_review_guard(&review, &session.user_id, justification)
         .map_err(|e| status_400(&e))?;
     let expected_nrd: chrono::DateTime<chrono::Utc> =
@@ -27424,6 +27440,8 @@ async fn access_review_revoke(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the review-guard / write.
+    scope_guard_or_404(&session, &review.site, "", &id)?;
     access_recertification::revoke_review_guard(&review, &session.user_id, reason)
         .map_err(|e| status_400(&e))?;
     let expected_status = review.status.to_string();
@@ -27452,6 +27470,8 @@ async fn access_review_exempt(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the review-guard / write.
+    scope_guard_or_404(&session, &review.site, "", &id)?;
     access_recertification::exempt_review_guard(
         &review,
         &session.user_id,
@@ -27488,9 +27508,30 @@ async fn access_review_exempt(
     Ok(Json(access_recertification::get_review_response(&updated)))
 }
 
-async fn access_review_summary() -> ApiResult {
+async fn access_review_summary(AuthExtractor(session): AuthExtractor) -> ApiResult {
     match get_db() {
         Some(pool) => {
+            // #2: the repo summary aggregates EVERY site. A scoped principal gets a
+            // summary recomputed from ONLY its own site's reviews (env-scoped -> 403
+            // via enforce_site_scope); an unrestricted caller keeps the global one.
+            if is_scoped(&session) {
+                let site = enforce_site_scope(&session, None, "")?;
+                let reviews = crate::repos::access_recertification::list(pool, &site, "")
+                    .await
+                    .map_err(db_error)?;
+                use access_recertification::ReviewStatus;
+                let n = |s: ReviewStatus| reviews.iter().filter(|r| r.status == s).count();
+                return Ok(Json(serde_json::json!({
+                    "source": "scoped",
+                    "site": site,
+                    "total": reviews.len(),
+                    "pending": n(ReviewStatus::Pending),
+                    "in_progress": n(ReviewStatus::InProgress),
+                    "approved": n(ReviewStatus::Approved),
+                    "revoked": n(ReviewStatus::Revoked),
+                    "exempted": n(ReviewStatus::Exempted),
+                })));
+            }
             let val = crate::repos::access_recertification::summary(pool)
                 .await
                 .map_err(db_error)?;
@@ -40295,6 +40336,72 @@ mod db_lifecycle_tests {
                 "out-of-scope runbook_get_execution must 404: {got:?}"
             );
         }
+    }
+
+    /// #2 RBAC: the access-review handlers are site-scoped (access_reviews has site;
+    /// campaigns are global). A GBLON principal gets 404 reading a DEFRA review and
+    /// a summary recomputed from ONLY its own site; unrestricted gets the global
+    /// summary. Review id resolved at runtime.
+    #[tokio::test]
+    async fn access_review_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // by-id read of a DEFRA review -> 404; unrestricted -> not 404.
+        if let Some(id) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM access_reviews WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let got = access_review_get(AuthExtractor(gblon.clone()), Path(id.clone())).await;
+            assert!(
+                matches!(got, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope access_review_get must 404: {got:?}"
+            );
+            let any =
+                access_review_get(AuthExtractor(AuthSession::static_dry_run()), Path(id)).await;
+            assert!(
+                !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+                "unrestricted access_review_get must pass: {any:?}"
+            );
+        }
+
+        // summary is recomputed scoped for a scoped principal (source=scoped, site=GBLON).
+        let scoped = access_review_summary(AuthExtractor(gblon)).await;
+        let scoped_json = match scoped {
+            Ok(Json(v)) => v,
+            other => panic!("scoped access_review_summary must succeed: {other:?}"),
+        };
+        assert_eq!(
+            scoped_json["source"].as_str(),
+            Some("scoped"),
+            "scoped summary must be recomputed per-site: {scoped_json}"
+        );
+        assert_eq!(
+            scoped_json["site"].as_str(),
+            Some("GBLON"),
+            "scoped summary must be for the principal's site: {scoped_json}"
+        );
+
+        // unrestricted summary keeps the global aggregate (not the scoped shape).
+        let global = access_review_summary(AuthExtractor(AuthSession::static_dry_run())).await;
+        let global_json = match global {
+            Ok(Json(v)) => v,
+            other => panic!("unrestricted access_review_summary must succeed: {other:?}"),
+        };
+        assert_ne!(
+            global_json["source"].as_str(),
+            Some("scoped"),
+            "unrestricted summary must use the global aggregate: {global_json}"
+        );
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
