@@ -29,6 +29,7 @@
 - [x] **runbook execution** — `ffa0261` (runbook_executions site-only; 8 (list pre-scoped, catalog global, contract static); start body-guard, get/execute_step/approve/complete/fail/rollback by-id guard before transition, active retain; codex APPROVED first pass)
 - [x] **access review** — `34a5f4c` (access_reviews site-only, campaigns global (no site col); 8 (list pre-scoped); get/start/approve/revoke/exempt by-id, due/expiring retain, summary RECOMPUTED scoped (avoids cross-site count leak); codex APPROVED first pass)
 - [x] **network readiness** — `8becfe1` (switch_ports/vlans/port_reservations site-only; 7 (contract static); reads enforce_site_scope, reserves body-guard, release pre-load guard before status-branch (codex caught 409-vs-404 oracle + wrong-key regression), ports_inventory retain)
+- [x] **outage comms** — `b000cbe` (outage_notices site-only; 10 (list pre-scoped, contract static); create body-guard, get/preview tightened 403→404 oracle, send/ack/complete/cancel by-id guard, active/history/upcoming site-query guard; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -255,9 +256,9 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **network_release** [high] `sources/ryuki-api/src/contracts.rs:22575` — In network_release at sources/ryuki-api/src/contracts.rs, after `resv` is bound (after line 22592) and BEFORE tx.commit() (line 22605), insert `guard_body_site_scope(&session, &res
 
 ## outage  (3)
-- [ ] **outage_notices_create** [high] `sources/ryuki-api/src/contracts.rs:24334` — Add `guard_body_site_scope(&session, &body.site)?;` in outage_notices_create immediately after `let pool = get_db().ok_or_else(status_503_no_db)?;` (contracts.rs:24338), before bui
-- [ ] **outage_notices_send / outage_notices_acknowledge / outage_notices_complete / outage_notices_cancel** [high] `sources/ryuki-api/src/contracts.rs:24405` — Add `guard_body_site_scope(&session, &notice.site)?;` immediately after the notice is loaded and BEFORE the lifecycle guard / tx in each of the four handlers — mirroring outage_not
-- [ ] **outage_notices_active / outage_notices_history / outage_notices_upcoming** [high] `sources/ryuki-api/src/contracts.rs:24559` — Add `session: AuthSession` (AuthExtractor) as a parameter to each of the three handlers, then before the DB call resolve the effective site: `let site = enforce_site_scope(&session
+- [x] **outage_notices_create** [high] `sources/ryuki-api/src/contracts.rs:24334` — Add `guard_body_site_scope(&session, &body.site)?;` in outage_notices_create immediately after `let pool = get_db().ok_or_else(status_503_no_db)?;` (contracts.rs:24338), before bui
+- [x] **outage_notices_send / outage_notices_acknowledge / outage_notices_complete / outage_notices_cancel** [high] `sources/ryuki-api/src/contracts.rs:24405` — Add `guard_body_site_scope(&session, &notice.site)?;` immediately after the notice is loaded and BEFORE the lifecycle guard / tx in each of the four handlers — mirroring outage_not
+- [x] **outage_notices_active / outage_notices_history / outage_notices_upcoming** [high] `sources/ryuki-api/src/contracts.rs:24559` — Add `session: AuthSession` (AuthExtractor) as a parameter to each of the three handlers, then before the DB call resolve the effective site: `let site = enforce_site_scope(&session
 
 ## synthetic  (2)
 - [ ] **synthetic_run_check** [high] `sources/ryuki-api/src/contracts.rs:10329` — Add `AuthExtractor(session): AuthExtractor` to the synthetic_run_check signature (contracts.rs:10329). After loading the check (after line 10334) and BEFORE run_check/insert_result
