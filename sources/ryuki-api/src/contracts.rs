@@ -20957,8 +20957,18 @@ async fn chargeback_report(
 /// Plan a new vm day-2 operation and persist it. Returns the entity (including
 /// the generated `id`) so the caller can drive subsequent lifecycle steps.
 /// 503 when no database is configured.
-async fn vm_day2_plan(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
+async fn vm_day2_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<VmDay2PlanRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only plan a day-2 op within their own site AND
+    // environment (vm_day2_operations is dual-axis).
+    enforce_scope_filters(
+        &session,
+        Some(body.site.clone()),
+        Some(body.environment.clone()),
+    )?;
 
     let change_type = match body.change_type.as_str() {
         "resize-cpu" => ryuki_engine::models::VmChangeType::ResizeCpu,
@@ -20996,13 +21006,19 @@ async fn vm_day2_plan(Json(body): Json<VmDay2PlanRequest>) -> ApiResult {
 /// Validate a persisted vm day-2 operation. Loads the operation by id, runs
 /// the engine validation check, persists `Validated` status on success, and
 /// returns the `ValidationResult`. 503/404/409 as appropriate.
-async fn vm_day2_validate(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+async fn vm_day2_validate(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<VmDay2ActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
 
     // Forward-only lifecycle (Planned -> Validated -> Executed -> Verified): the
     // engine does not enforce ordering, so the API does. Validate only from
@@ -21037,13 +21053,19 @@ async fn vm_day2_validate(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
 /// Execute a persisted vm day-2 operation. Loads the operation by id, runs the
 /// engine execution (which sets status to `Executed`), and persists the
 /// transitioned entity. 503/404/409 as appropriate.
-async fn vm_day2_execute(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+async fn vm_day2_execute(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<VmDay2ActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
 
     // Forward-only lifecycle: execute only from Validated. This enforces
     // validate-before-execute and prevents re-executing an already Executed or
@@ -21069,13 +21091,19 @@ async fn vm_day2_execute(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
 /// Verify a persisted vm day-2 operation. Loads the operation by id, collects
 /// evidence via the engine, persists `Verified` status, and returns the
 /// evidence list. 503/404/409 as appropriate.
-async fn vm_day2_verify(Json(body): Json<VmDay2ActionRequest>) -> ApiResult {
+async fn vm_day2_verify(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<VmDay2ActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let op = crate::repos::vm_day2_operations::get(pool, &body.operation_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // #2: out-of-scope (dual-axis) -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &op.site, &op.environment, &body.operation_id)?;
 
     // Forward-only lifecycle: verify only from Executed.
     if op.status != ryuki_engine::models::VmChangeStatus::Executed {
@@ -39847,6 +39875,97 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #2 RBAC: the vm-day2 handlers are DUAL-AXIS (vm_day2_operations has site AND
+    /// environment). A GBLON principal gets 403 planning in DEFRA; an env-scoped
+    /// principal is denied on a foreign environment; a by-id validate on a DEFRA op
+    /// 404s. Own scope + unrestricted pass the gate. plan uses an invalid change
+    /// type so it 400s AFTER the scope gate (no insert).
+    #[tokio::test]
+    async fn vm_day2_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let plan_req = |site: &str, env: &str| VmDay2PlanRequest {
+            target_ci_key: "vm-rbac2-test".into(),
+            change_type: "bogus-change-type".into(),
+            target_value: 4,
+            site: site.into(),
+            environment: env.into(),
+            owner: "o".into(),
+            maintenance_window: "2099-01-01T00:00:00Z".into(),
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // plan in a foreign site -> 403.
+        let foreign = vm_day2_plan(
+            AuthExtractor(gblon.clone()),
+            Json(plan_req("DEFRA", "production")),
+        )
+        .await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope vm_day2_plan must be forbidden: {foreign:?}"
+        );
+
+        // env-scoped principal denied on a foreign environment.
+        let mut staging = AuthSession::static_dry_run();
+        staging.environment_scope = vec!["staging".into()];
+        let env_denied = vm_day2_plan(
+            AuthExtractor(staging),
+            Json(plan_req("GBLON", "production")),
+        )
+        .await;
+        assert!(
+            matches!(env_denied, Err((StatusCode::FORBIDDEN, _))),
+            "env-scoped vm_day2_plan on a foreign env must be forbidden: {env_denied:?}"
+        );
+
+        // own scope + unrestricted pass the gate (then 400 on the bogus type, no insert).
+        let own = vm_day2_plan(
+            AuthExtractor(gblon.clone()),
+            Json(plan_req("GBLON", "production")),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope vm_day2_plan must pass the scope gate: {own:?}"
+        );
+        let any = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_req("DEFRA", "production")),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted vm_day2_plan must pass the scope gate: {any:?}"
+        );
+
+        // by-id validate on a DEFRA op -> 404 (when present).
+        if let Some(op_id) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM vm_day2_operations WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let validated = vm_day2_validate(
+                AuthExtractor(gblon),
+                Json(VmDay2ActionRequest {
+                    operation_id: op_id,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(validated, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope vm_day2_validate must 404: {validated:?}"
+            );
+        }
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -54614,7 +54733,7 @@ mod vm_day2_no_db_tests {
             owner: "test-owner".into(),
             maintenance_window: "EU-Overnight".into(),
         };
-        let result = vm_day2_plan(Json(body)).await;
+        let result = vm_day2_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -54624,7 +54743,8 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = vm_day2_validate(Json(body)).await;
+        let result =
+            vm_day2_validate(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -54634,7 +54754,8 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = vm_day2_execute(Json(body)).await;
+        let result =
+            vm_day2_execute(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -54644,7 +54765,7 @@ mod vm_day2_no_db_tests {
         let body = VmDay2ActionRequest {
             operation_id: uuid::Uuid::new_v4().to_string(),
         };
-        let result = vm_day2_verify(Json(body)).await;
+        let result = vm_day2_verify(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -54701,7 +54822,12 @@ mod vm_day2_operations_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
 
@@ -54737,15 +54863,23 @@ mod vm_day2_operations_db_tests {
         let suffix = uuid::Uuid::new_v4().to_string();
 
         // 1. plan
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
         // 2. validate
-        let Ok(Json(vr)) = vm_day2_validate(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(vr)) = vm_day2_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -54767,9 +54901,12 @@ mod vm_day2_operations_db_tests {
         );
 
         // 3. execute
-        let Ok(Json(executed)) = vm_day2_execute(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(executed)) = vm_day2_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -54791,9 +54928,12 @@ mod vm_day2_operations_db_tests {
         );
 
         // 4. verify
-        let Ok(Json(evidence)) = vm_day2_verify(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(evidence)) = vm_day2_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -54828,9 +54968,12 @@ mod vm_day2_operations_db_tests {
 
         let missing_id = uuid::Uuid::new_v4().to_string();
 
-        let result = vm_day2_validate(Json(VmDay2ActionRequest {
-            operation_id: missing_id.clone(),
-        }))
+        let result = vm_day2_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: missing_id.clone(),
+            }),
+        )
         .await;
         assert!(result.is_err());
         assert_eq!(
@@ -54852,7 +54995,12 @@ mod vm_day2_operations_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -54868,9 +55016,12 @@ mod vm_day2_operations_db_tests {
         );
 
         // Advance it to Validated through the normal path.
-        if vm_day2_validate(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        if vm_day2_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         .is_err()
         {
@@ -54903,7 +55054,12 @@ mod vm_day2_operations_db_tests {
 
         let suffix = uuid::Uuid::new_v4().to_string();
 
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
@@ -54919,9 +55075,12 @@ mod vm_day2_operations_db_tests {
             .await
             .expect("force-transition");
 
-        let result = vm_day2_execute(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = vm_day2_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
@@ -54949,14 +55108,19 @@ mod vm_day2_operations_db_tests {
         let mut body = plan_body(&suffix);
         body.target_value = 0; // makes resize-cpu validation fail
 
-        let Ok(Json(created)) = vm_day2_plan(Json(body)).await else {
+        let Ok(Json(created)) =
+            vm_day2_plan(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let Ok(Json(vr)) = vm_day2_validate(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let Ok(Json(vr)) = vm_day2_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
@@ -54992,14 +55156,22 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let result = vm_day2_execute(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = vm_day2_execute(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
@@ -55022,14 +55194,22 @@ mod vm_day2_operations_db_tests {
         };
 
         let suffix = uuid::Uuid::new_v4().to_string();
-        let Ok(Json(created)) = vm_day2_plan(Json(plan_body(&suffix))).await else {
+        let Ok(Json(created)) = vm_day2_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
             panic!("vm_day2_plan failed");
         };
         let id = created["id"].as_str().expect("id").to_string();
 
-        let result = vm_day2_verify(Json(VmDay2ActionRequest {
-            operation_id: id.clone(),
-        }))
+        let result = vm_day2_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(VmDay2ActionRequest {
+                operation_id: id.clone(),
+            }),
+        )
         .await;
 
         cleanup(pool, &id).await;
