@@ -20,6 +20,7 @@
 - [x] **site degradation** — `8bafeb6` (site_status keyed by site; 5 of 7 (rules/contract pure); check/enter/exit guard the Path-site before both DB+in-memory; global/degraded retain on DB + fail-closed fallback; codex APPROVED first pass)
 - [x] **maintenance calendar** — `3d3b4b3` (maintenance_windows site-only; 5 (schedule pre-scoped, contract static); conflicts/upcoming/active/month site-query guard (Json→ApiResult); cancel DB scope-arm + engine-fallback fail-closed; codex caught the unguarded cancel fallback, fixed)
 - [x] **zabbix drift** — `3380fe9` (drift_reports site-only; 5 (detect pre-scoped, contract static); summary enforce_site_scope; plan/validate/execute/verify by-id guard before remediation/409; codex APPROVED first pass)
+- [x] **firmware lifecycle** — `a25b7fd` (firmware_records site-only, exceptions child via device-join; 9 handlers (audit grouped as 5); device_get/check/request/revoke load+guard, lists+reports retain, exceptions scoped via device-id set/join; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -184,11 +185,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **zabbix_drift_verify** [high] `sources/ryuki-api/src/contracts.rs:9822` — Change the signature to take the session: `async fn zabbix_drift_verify(session: AuthSession, Path(drift_id): Path<String>)`. After the report is fetched (contracts.rs:9824-9827) a
 
 ## firmware  (5)
-- [ ] **firmware_device_get / firmware_check_compliance** [high] `sources/ryuki-api/src/contracts.rs:25619` — Inject AuthExtractor(session): AuthExtractor into both handlers and guard the loaded row by site before returning/mutating, mirroring sibling firmware_devices_list. (site,env) sour
-- [ ] **firmware_noncompliant / firmware_eol / firmware_compliance_report / firmware_vendor_summary** [high] `sources/ryuki-api/src/contracts.rs:25664` — For all four handlers, thread the session in and apply per-row scoping before returning/aggregating. Concretely:  1. Add `Extension(session): Extension<AuthSession>` to each handle
-- [ ] **firmware_request_exception** [high] `sources/ryuki-api/src/contracts.rs:25700` — In firmware_request_exception (contracts.rs:25700), after acquiring `pool` and BEFORE calling request_exception, load the device and scope-guard it. Concretely: `let device = crate
-- [ ] **firmware_revoke_exception** [medium] `sources/ryuki-api/src/contracts.rs:25749` — Add Extension(session): Extension<AuthSession> to firmware_revoke_exception's signature, then enforce the device's site BEFORE the revoke commits. The (site,env) source is the devi
-- [ ] **firmware_exceptions_list** [medium] `sources/ryuki-api/src/contracts.rs:25731` — Two coordinated changes. (1) Repo: change list_active_exceptions(pool) in sources/ryuki-api/src/repos/firmware_lifecycle.rs:194 to accept a `site: &str` (mirroring list_devices at 
+- [x] **firmware_device_get / firmware_check_compliance** [high] `sources/ryuki-api/src/contracts.rs:25619` — Inject AuthExtractor(session): AuthExtractor into both handlers and guard the loaded row by site before returning/mutating, mirroring sibling firmware_devices_list. (site,env) sour
+- [x] **firmware_noncompliant / firmware_eol / firmware_compliance_report / firmware_vendor_summary** [high] `sources/ryuki-api/src/contracts.rs:25664` — For all four handlers, thread the session in and apply per-row scoping before returning/aggregating. Concretely:  1. Add `Extension(session): Extension<AuthSession>` to each handle
+- [x] **firmware_request_exception** [high] `sources/ryuki-api/src/contracts.rs:25700` — In firmware_request_exception (contracts.rs:25700), after acquiring `pool` and BEFORE calling request_exception, load the device and scope-guard it. Concretely: `let device = crate
+- [x] **firmware_revoke_exception** [medium] `sources/ryuki-api/src/contracts.rs:25749` — Add Extension(session): Extension<AuthSession> to firmware_revoke_exception's signature, then enforce the device's site BEFORE the revoke commits. The (site,env) source is the devi
+- [x] **firmware_exceptions_list** [medium] `sources/ryuki-api/src/contracts.rs:25731` — Two coordinated changes. (1) Repo: change list_active_exceptions(pool) in sources/ryuki-api/src/repos/firmware_lifecycle.rs:194 to accept a `site: &str` (mirroring list_devices at 
 
 ## k8s  (5)
 - [ ] **k8s_namespace_get** [high] `sources/ryuki-api/src/contracts.rs:28690` — 1) Add the session to the handler signature: change `Path(id): Path<String>,` to also take `AuthExtractor(session): AuthExtractor,` first, matching sibling handlers like k8s_namesp
