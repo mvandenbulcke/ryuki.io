@@ -20373,6 +20373,29 @@ async fn metrics_budget_update(
     };
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // #2: metric_budgets is dual-axis (site + environment, both nullable; NULL =
+    // platform-wide). A scoped principal may only modify a budget fully contained
+    // in its scope — a platform-wide or out-of-scope budget is reported as a missing
+    // one (404). Pre-loaded inside the tx so a concurrent change can't slip in.
+    if is_scoped(&session) {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT site, environment FROM metric_budgets WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let permitted = match row {
+            Some((site, env)) => multi_scope_permits(
+                &session,
+                &site.into_iter().collect::<Vec<_>>(),
+                &env.into_iter().collect::<Vec<_>>(),
+            ),
+            None => false,
+        };
+        if !permitted {
+            return Err(status_404(&id));
+        }
+    }
     // COALESCE keeps any omitted field at its current value (PATCH semantics).
     let updated: Option<(String,)> = sqlx::query_as(
         "UPDATE metric_budgets SET \
@@ -20424,6 +20447,27 @@ async fn metrics_budget_delete(
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // #2: dual-axis containment (see metrics_budget_update). A scoped principal may
+    // only delete a budget fully within its scope; platform-wide/out-of-scope -> 404.
+    if is_scoped(&session) {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT site, environment FROM metric_budgets WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_error)?;
+        let permitted = match row {
+            Some((site, env)) => multi_scope_permits(
+                &session,
+                &site.into_iter().collect::<Vec<_>>(),
+                &env.into_iter().collect::<Vec<_>>(),
+            ),
+            None => false,
+        };
+        if !permitted {
+            return Err(status_404(&id));
+        }
+    }
     let deleted: Option<(String,)> =
         sqlx::query_as("DELETE FROM metric_budgets WHERE id = $1 RETURNING id")
             .bind(&id)
@@ -40678,6 +40722,65 @@ mod db_lifecycle_tests {
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted synthetic_run_check must pass: {any:?}"
         );
+    }
+
+    /// #2 RBAC: metric_budgets is dual-axis & nullable (NULL = platform-wide). A
+    /// scoped principal cannot delete a DEFRA-site budget (404, unmutated) nor a
+    /// platform-wide one (404). Uses an execute-tier session; negatives only, so
+    /// the guard fires before any DELETE.
+    #[tokio::test]
+    async fn metrics_budget_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // execute-tier session (metrics_budget_delete requires "execute"), scoped to GBLON.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon
+            .roles
+            .push(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string());
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // out-of-scope (DEFRA-site) budget -> 404, and it must NOT be deleted.
+        if let Some(id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM metric_budgets WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let del = metrics_budget_delete(AuthExtractor(gblon.clone()), Path(id.clone())).await;
+            assert!(
+                matches!(del, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope metrics_budget_delete must 404: {del:?}"
+            );
+            let still: Option<String> =
+                sqlx::query_scalar("SELECT id FROM metric_budgets WHERE id = $1")
+                    .bind(&id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("re-read budget");
+            assert!(
+                still.is_some(),
+                "out-of-scope delete must NOT have removed the budget"
+            );
+        }
+
+        // a platform-wide (site IS NULL) budget -> 404 for a scoped principal.
+        if let Some(id) = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM metric_budgets WHERE site IS NULL LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let del = metrics_budget_delete(AuthExtractor(gblon), Path(id)).await;
+            assert!(
+                matches!(del, Err((StatusCode::NOT_FOUND, _))),
+                "scoped delete of a platform-wide budget must 404: {del:?}"
+            );
+        }
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
