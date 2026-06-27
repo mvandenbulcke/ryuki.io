@@ -10479,8 +10479,12 @@ fn site_from_host(host: &str) -> &'static str {
 }
 
 async fn noise_detect(
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only run noise detection for its own site;
+    // env-scoped principals are rejected (noise is site-keyed via the host).
+    guard_body_site_scope(&session, &body.site)?;
     if let Some(pool) = get_db() {
         // Replicate engine: exact VALID_SITES membership check (uppercase), then
         // fetch all rows and classify via site_from_host in Rust — same logic the
@@ -10515,8 +10519,11 @@ async fn noise_detect(
 }
 
 async fn noise_flapping_detect(
+    AuthExtractor(session): AuthExtractor,
     Json(body): Json<NoiseSiteRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only detect flapping for its own site.
+    guard_body_site_scope(&session, &body.site)?;
     if let Some(pool) = get_db() {
         // Replicate engine: exact VALID_SITES check, then classify hosts via
         // site_from_host in Rust, filter flapping = true.
@@ -10549,10 +10556,33 @@ async fn noise_flapping_detect(
     }
 }
 
-async fn noise_suggest(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn noise_suggest(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         // Parse id as UUID first — malformed id → 404, not a DB cast 500
         let trigger_uuid = parse_noise_id(&id)?;
+        // #2: pre-load ONLY the host and guard via the derived site BEFORE loading
+        // the full row, so an out-of-scope caller never materializes a foreign
+        // trigger (a full-row decode error would otherwise be a 500-vs-404 oracle).
+        if is_scoped(&session) {
+            let host: Option<String> =
+                sqlx::query_scalar("SELECT host FROM noisy_triggers WHERE id = $1")
+                    .bind(trigger_uuid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !host
+                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("Trigger not found: {}", id)})),
+                ));
+            }
+        }
         let row: Option<NoisyTriggerRow> = sqlx::query_as(&format!(
             "SELECT {NOISE_COLUMNS} FROM noisy_triggers WHERE id = $1"
         ))
@@ -10596,6 +10626,13 @@ async fn noise_suggest(Path(id): Path<String>) -> Result<Json<Value>, (StatusCod
             "event_count_last_24h": r.event_count_last_24h,
         })));
     }
+    // #2: the engine fallback has no site dimension; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Trigger not found: {}", id)})),
+        ));
+    }
     match noise_remediation::suggest_remediation(&id) {
         Ok(suggestions) => Ok(Json(suggestions)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -10609,6 +10646,26 @@ async fn noise_suppress(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let trigger_uuid = parse_noise_id(&id)?;
+        // #2: noisy_triggers has no site column — derive the site from the host and
+        // guard BEFORE the CAS write; out-of-scope or missing -> the same "Trigger
+        // not found" 404 (no oracle, no cross-site suppress).
+        if is_scoped(&session) {
+            let host: Option<String> =
+                sqlx::query_scalar("SELECT host FROM noisy_triggers WHERE id = $1")
+                    .bind(trigger_uuid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !host
+                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("Trigger not found: {}", id)})),
+                ));
+            }
+        }
         let now = chrono::Utc::now();
         let suppress_until = now
             .checked_add_signed(chrono::Duration::minutes(body.duration_minutes as i64))
@@ -10669,6 +10726,14 @@ async fn noise_suppress(
             )),
         }
     } else {
+        // #2: the engine fallback has no site dimension; a scoped principal fails
+        // closed with the same not-found rather than suppress a cross-site trigger.
+        if is_scoped(&session) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Trigger not found: {}", id)})),
+            ));
+        }
         match noise_remediation::suppress_trigger(&id, body.duration_minutes, &body.reason) {
             Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
             Err(e) if e.contains("not found") || e.to_lowercase().contains("not found") => {
@@ -10686,6 +10751,25 @@ async fn noise_resolve(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let trigger_uuid = parse_noise_id(&id)?;
+        // #2: derive the site from the host and guard BEFORE the resolve write;
+        // out-of-scope or missing -> the same "Trigger not found" 404.
+        if is_scoped(&session) {
+            let host: Option<String> =
+                sqlx::query_scalar("SELECT host FROM noisy_triggers WHERE id = $1")
+                    .bind(trigger_uuid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !host
+                .map(|h| row_scope_permits(&session, site_from_host(&h), ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("Trigger not found: {}", id)})),
+                ));
+            }
+        }
         // Engine has NO prior-status guard for resolve — unconditional UPDATE
         // mutating exactly: status, resolution, updated_at. Wrapped in a tx
         // so the audit row is written atomically; a 404 rolls back with no audit.
@@ -10725,6 +10809,13 @@ async fn noise_resolve(
             Json(json!({"error": format!("Trigger not found: {}", id)})),
         ));
     }
+    // #2: the engine fallback has no site dimension; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Trigger not found: {}", id)})),
+        ));
+    }
     match noise_remediation::resolve_noise(&id, &body.resolution) {
         Ok(trigger) => Ok(Json(serde_json::to_value(trigger).unwrap_or_default())),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -10732,9 +10823,12 @@ async fn noise_resolve(
 }
 
 async fn noise_report(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<NoiseSiteQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = q.site.unwrap_or_else(|| "DEFRA".to_string());
+    // #2: narrow the site to the principal's scope (env-scoped -> 403; an
+    // unrestricted caller with no ?site keeps the legacy DEFRA default).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "DEFRA")?;
     if let Some(pool) = get_db() {
         const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
         // Validate the raw site exactly as the engine does (no case-folding) so
@@ -10789,7 +10883,9 @@ async fn noise_report(
     }
 }
 
-async fn noise_suppressed_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn noise_suppressed_list(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
             "SELECT {NOISE_COLUMNS} FROM noisy_triggers \
@@ -10798,8 +10894,18 @@ async fn noise_suppressed_list() -> Result<Json<Value>, (StatusCode, Json<Value>
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
-        let arr: Vec<Value> = rows.iter().map(noise_row_to_json).collect();
+        // #2: noisy_triggers has no site column — keep only rows whose host-derived
+        // site is in the principal's scope (env-scoped -> none).
+        let arr: Vec<Value> = rows
+            .iter()
+            .filter(|r| row_scope_permits(&session, site_from_host(&r.host), ""))
+            .map(noise_row_to_json)
+            .collect();
         return Ok(Json(Value::Array(arr)));
+    }
+    // #2: the engine fallback can't be site-filtered; a scoped principal sees none.
+    if is_scoped(&session) {
+        return Ok(Json(Value::Array(vec![])));
     }
     match noise_remediation::get_suppressed_triggers() {
         Ok(triggers) => Ok(Json(serde_json::to_value(triggers).unwrap_or_default())),
@@ -39651,6 +39757,96 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #2 RBAC: the noise-remediation handlers are site-scoped via the host-derived
+    /// site (noisy_triggers has no site column; site_from_host classifies). A GBLON
+    /// principal gets 403 detecting/reporting for DEFRA and 404 suppressing a
+    /// DEFRA-host trigger; its own site and an unrestricted principal pass. The
+    /// trigger id is resolved at runtime.
+    #[tokio::test]
+    async fn noise_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // detect for a foreign site -> 403 (deterministic body guard).
+        let detect = noise_detect(
+            AuthExtractor(gblon.clone()),
+            Json(NoiseSiteRequest {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(detect, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope noise_detect must be forbidden: {detect:?}"
+        );
+
+        // report for a foreign site -> 403.
+        let report = noise_report(
+            AuthExtractor(gblon.clone()),
+            Query(NoiseSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(report, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope noise_report must be forbidden: {report:?}"
+        );
+
+        // own site + unrestricted detect pass.
+        let own = noise_detect(
+            AuthExtractor(gblon.clone()),
+            Json(NoiseSiteRequest {
+                site: "GBLON".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope noise_detect must pass: {own:?}"
+        );
+        let any = noise_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted noise_detect must pass: {any:?}"
+        );
+
+        // suppress a DEFRA-host trigger out-of-scope -> 404 (host-derived guard).
+        if let Some(defra_trig) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM noisy_triggers WHERE LOWER(host) LIKE '%defra%' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let suppress = noise_suppress(
+                AuthExtractor(gblon),
+                Path(defra_trig),
+                Json(NoiseSuppressRequest {
+                    duration_minutes: 60,
+                    reason: "scope-test".into(),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(suppress, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope noise_suppress must 404: {suppress:?}"
+            );
+        }
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -46500,7 +46696,7 @@ mod noise_remediation_db_tests {
         let body = NoiseSiteRequest {
             site: "DEFRA".into(),
         };
-        let result = noise_detect(Json(body)).await;
+        let result = noise_detect(AuthExtractor(AuthSession::static_dry_run()), Json(body)).await;
         let Ok(Json(value)) = result else {
             // Engine fallback may already mutate from other in-process tests;
             // a 400 from unknown site would be wrong here but we just need it to
@@ -46513,7 +46709,7 @@ mod noise_remediation_db_tests {
     #[tokio::test]
     async fn test_noise_suppressed_list_fallback_in_memory() {
         // noise_suppressed_list now returns Result; unwrap the Ok arm.
-        match noise_suppressed_list().await {
+        match noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await {
             Ok(Json(value)) => assert!(value.is_array() || value.is_object()),
             Err(_) => {
                 // Engine error in test environment is acceptable — just verify
@@ -46841,7 +47037,7 @@ mod noise_remediation_db_tests {
         .expect("seed Suppressed row");
 
         // A real DB is present → Result must be Ok, not Err(500).
-        let result = noise_suppressed_list().await;
+        let result = noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok from noise_suppressed_list with live DB, got Err");
         };
@@ -46889,9 +47085,12 @@ mod noise_remediation_db_tests {
         .expect("insert ghost trigger");
 
         // With site_from_host filtering, DEFRA query should include this row.
-        let result = noise_detect(Json(NoiseSiteRequest {
-            site: "DEFRA".into(),
-        }))
+        let result = noise_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "DEFRA".into(),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -46947,9 +47146,12 @@ mod noise_remediation_db_tests {
         };
 
         // Seeded: srv-defra-app01 has event_count_last_24h=47 > 10 → should appear
-        let result = noise_detect(Json(NoiseSiteRequest {
-            site: "DEFRA".into(),
-        }))
+        let result = noise_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "DEFRA".into(),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -46973,9 +47175,12 @@ mod noise_remediation_db_tests {
         };
 
         // Seeded: srv-gblon-net01 is flapping → should appear for GBLON
-        let result = noise_flapping_detect(Json(NoiseSiteRequest {
-            site: "GBLON".into(),
-        }))
+        let result = noise_flapping_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "GBLON".into(),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -46998,9 +47203,12 @@ mod noise_remediation_db_tests {
             return;
         };
 
-        let result = noise_report(Query(NoiseSiteQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let result = noise_report(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(NoiseSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -47028,7 +47236,7 @@ mod noise_remediation_db_tests {
         };
 
         // Ensure at least the seeded Suppressed row is present.
-        let result = noise_suppressed_list().await;
+        let result = noise_suppressed_list(AuthExtractor(AuthSession::static_dry_run())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok from noise_suppressed_list, got Err");
         };
@@ -47052,7 +47260,11 @@ mod noise_remediation_db_tests {
             return;
         };
 
-        let result = noise_suggest(Path("e0000100-1000-1000-1000-000000000002".into())).await;
+        let result = noise_suggest(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("e0000100-1000-1000-1000-000000000002".into()),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -47077,9 +47289,12 @@ mod noise_remediation_db_tests {
             return;
         };
 
-        let result = noise_detect(Json(NoiseSiteRequest {
-            site: "NOWHERE".into(),
-        }))
+        let result = noise_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "NOWHERE".into(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400, got Ok");
@@ -47098,9 +47313,12 @@ mod noise_remediation_db_tests {
         // The engine validates the raw site (exact uppercase membership) and
         // rejects lowercase; the DB path must reject it identically (400), not
         // silently case-fold "defra" -> "DEFRA".
-        let result = noise_detect(Json(NoiseSiteRequest {
-            site: "defra".into(),
-        }))
+        let result = noise_detect(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(NoiseSiteRequest {
+                site: "defra".into(),
+            }),
+        )
         .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400 for lowercase site, got Ok");
