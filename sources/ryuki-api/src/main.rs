@@ -1300,13 +1300,23 @@ async fn rate_limit_middleware(
         let key = format!("{path_group}:{client_key}");
         let limiter = limiters.for_path_group(&path_group);
 
-        if limiter.check_key(&key).is_err() {
+        if let Err(not_until) = limiter.check_key(&key) {
             tracing::warn!(
                 client = %client_key,
                 key_source = key_source.as_str(),
                 path_group,
                 "rate limit exceeded"
             );
+            // #32: a 429 SHOULD carry Retry-After (RFC 9110 §10.2.3) so clients —
+            // notably the polling execution agents — back off instead of hammering
+            // the same bucket. Derive whole seconds from the governor NotUntil
+            // (rounded down, min 1) so the hint tracks the real bucket refill.
+            let retry_after_secs = not_until
+                .wait_time_from(governor::clock::Clock::now(
+                    &governor::clock::DefaultClock::default(),
+                ))
+                .as_secs()
+                .max(1);
             let body =
                 serde_json::to_string(&ApiError::new("RATE_LIMIT_EXCEEDED", "Too many requests"))
                     .unwrap_or_else(|_| {
@@ -1315,6 +1325,7 @@ async fn rate_limit_middleware(
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("content-type", "application/json")
+                .header("retry-after", retry_after_secs.to_string())
                 .body(Body::from(body))
                 .unwrap();
         }

@@ -478,6 +478,14 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/agents.rs (poll_job, ack_result, heartbeat handlers) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** False
 - **evidence:** Agents poll for jobs at fixed intervals (typically 10-30s). If 1000 agents poll simultaneously every 30s, API receives 33 reqs/s. Request timeout is global (e.g., 60s). No per-agent rate limit, no per-request queue depth tracking, no adaptive backoff suggestion in response (e.g., 'retry after 60s'). If API is degraded, all agents will keep hammering the same endpoints. Suggest: add per-agent request rate limit (via Extension<LocalLoginThrottle> pattern) or return 429 with Retry-After when queue depth exceeds threshold.
 - **verified:** This is a genuine, concrete gap: agent polling has IP-based rate limiting (path group `api`), but lacks: (1) per-agent rate limiting via bearer token, (2) Retry-After header in 429 responses (HTTP spec gap), (3) queue depth feedback in poll responses, (4) coarse path group for agents mixed with all API traffic. The missing-features tracker does not log this. The code in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/main.rs lines 1302-1308 (rate_limit_path_group) and 1279-1295 (429 response) confirms: agent paths fall into the default `api` bucket with no agent-scoped override, and 
+- **STATUS (2026-06-27) — PARTIAL (sub-point 2 done):** the rate-limit 429 now
+  carries a `Retry-After` header (RFC 9110 §10.2.3) derived from the governor
+  `NotUntil` wait time (whole seconds, rounded down, min 1), so clients —
+  notably the polling execution agents — get a concrete backoff hint instead of
+  hammering the same bucket. This benefits ALL rate-limited clients, not just
+  agents. REMAINING (larger follow-up): per-agent (bearer-token) rate limiting,
+  a dedicated `agents` path group separate from the shared `api` bucket, and
+  queue-depth feedback in poll responses.
 
 ### 33. Agent job polling query missing composite index for fairness
 - **area:** ryuki-api/src/agents.rs (lines 2450-2451, similar patterns) · **kind:** missing-feature · **severity:** medium · **effort:** L · **ci_validatable:** False
