@@ -7643,10 +7643,17 @@ struct DegradationEnterRequest {
     reason: String,
 }
 
-async fn degradation_check(Path(site): Path<String>) -> Json<Value> {
+async fn degradation_check(
+    AuthExtractor(session): AuthExtractor,
+    Path(site): Path<String>,
+) -> ApiResult {
+    // #2: a scoped principal may only check its own site's degradation status;
+    // env-scoped principals are rejected (degradation is keyed by site). Covers
+    // both the DB and in-memory paths.
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
         match crate::repos::degradation::get_site_status(pool, &site).await {
-            Ok(Some(status)) => return Json(serde_json::to_value(status).unwrap_or_default()),
+            Ok(Some(status)) => return Ok(Json(serde_json::to_value(status).unwrap_or_default())),
             Ok(None) => {}
             // A DB read error falls back to the in-memory engine so the status
             // endpoint stays available — but log it so the outage is not silent.
@@ -7656,15 +7663,17 @@ async fn degradation_check(Path(site): Path<String>) -> Json<Value> {
         }
     }
     let status = degradation_mode::check_site_health(&site);
-    Json(serde_json::to_value(status).unwrap_or_default())
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
-async fn degradation_global() -> Json<Value> {
+async fn degradation_global(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
         match crate::repos::degradation::list_site_statuses(pool).await {
             Ok(sites) if !sites.is_empty() => {
+                // #2: a scoped principal's global view aggregates only its own sites.
+                let sites = retain_site_scoped(&session, sites, |s| s.site.as_str());
                 let global = degradation_mode::global_status_from(sites);
-                return Json(serde_json::to_value(global).unwrap_or_default());
+                return Ok(Json(serde_json::to_value(global).unwrap_or_default()));
             }
             Ok(_) => {}
             Err(e) => {
@@ -7672,14 +7681,21 @@ async fn degradation_global() -> Json<Value> {
             }
         }
     }
+    // #2: the in-memory fallback aggregates ALL sites and cannot be filtered; a
+    // scoped principal fails closed rather than see cross-site degradation state.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     let global = degradation_mode::get_global_status();
-    Json(serde_json::to_value(global).unwrap_or_default())
+    Ok(Json(serde_json::to_value(global).unwrap_or_default()))
 }
 
-async fn degradation_degraded() -> Json<Value> {
+async fn degradation_degraded(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
         match crate::repos::degradation::list_site_statuses(pool).await {
             Ok(sites) if !sites.is_empty() => {
+                // #2: a scoped principal only sees its own site's degradation.
+                let sites = retain_site_scoped(&session, sites, |s| s.site.as_str());
                 let degraded: Vec<_> = sites
                     .into_iter()
                     .filter(|s| {
@@ -7687,7 +7703,7 @@ async fn degradation_degraded() -> Json<Value> {
                             || s.state == degradation_mode::SiteDegradationState::Unreachable
                     })
                     .collect();
-                return Json(serde_json::to_value(degraded).unwrap_or_default());
+                return Ok(Json(serde_json::to_value(degraded).unwrap_or_default()));
             }
             Ok(_) => {}
             Err(e) => {
@@ -7695,8 +7711,12 @@ async fn degradation_degraded() -> Json<Value> {
             }
         }
     }
+    // #2: the in-memory fallback lists ALL degraded sites; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     let degraded = degradation_mode::get_degraded_sites();
-    Json(serde_json::to_value(degraded).unwrap_or_default())
+    Ok(Json(serde_json::to_value(degraded).unwrap_or_default()))
 }
 
 async fn degradation_enter(
@@ -7704,6 +7724,9 @@ async fn degradation_enter(
     Path(site): Path<String>,
     Json(body): Json<DegradationEnterRequest>,
 ) -> ApiResult {
+    // #2: scoped principals may only enter degradation for their own site;
+    // env-scoped principals are rejected (degradation is keyed by site).
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_error)?;
         let status = crate::repos::degradation::enter(&mut tx, &site, &body.reason)
@@ -7733,6 +7756,8 @@ async fn degradation_exit(
     AuthExtractor(session): AuthExtractor,
     Path(site): Path<String>,
 ) -> ApiResult {
+    // #2: scoped principals may only exit degradation for their own site.
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
         let mut tx = pool.begin().await.map_err(db_error)?;
         let status = crate::repos::degradation::exit(&mut tx, &site)
@@ -39073,6 +39098,65 @@ mod db_lifecycle_tests {
         assert!(
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted shares_get must pass: {any:?}"
+        );
+    }
+
+    /// #2 RBAC: the site-degradation handlers are site-scoped (the table is keyed
+    /// by site). A GBLON principal gets 403 checking/entering/exiting DEFRA's
+    /// degradation; its own site and an unrestricted principal pass the gate. The
+    /// guard is deterministic (fires before any DB/engine work), so no seeded
+    /// site_status rows are required.
+    #[tokio::test]
+    async fn degradation_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // check / enter / exit a foreign site -> 403.
+        let check = degradation_check(AuthExtractor(gblon.clone()), Path("DEFRA".into())).await;
+        assert!(
+            matches!(check, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope degradation_check must be forbidden: {check:?}"
+        );
+        let enter = degradation_enter(
+            AuthExtractor(gblon.clone()),
+            Path("DEFRA".into()),
+            Json(DegradationEnterRequest {
+                reason: "scope-test".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(enter, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope degradation_enter must be forbidden: {enter:?}"
+        );
+        let exit = degradation_exit(AuthExtractor(gblon.clone()), Path("DEFRA".into())).await;
+        assert!(
+            matches!(exit, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope degradation_exit must be forbidden: {exit:?}"
+        );
+
+        // own site passes the gate.
+        let own = degradation_check(AuthExtractor(gblon), Path("GBLON".into())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope degradation_check must pass the gate: {own:?}"
+        );
+
+        // unrestricted passes the gate.
+        let any = degradation_check(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("DEFRA".into()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted degradation_check must pass the gate: {any:?}"
         );
     }
 
