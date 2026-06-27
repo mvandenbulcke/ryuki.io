@@ -10190,8 +10190,13 @@ async fn observe_zabbix_drift() -> Json<Value> {
 
 // ─── Zabbix drift remediation endpoints ───
 
-async fn zabbix_drift_summary(Query(query): Query<ZabbixDriftQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
+async fn zabbix_drift_summary(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<ZabbixDriftQuery>,
+) -> ApiResult {
+    // #2: narrow the site to the principal's scope (env-scoped -> 403; an
+    // unrestricted caller with no ?site keeps the legacy DEFRA default).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
     match get_db() {
         Some(pool) => {
             let reports = crate::repos::zabbix_drift::list_by_site(pool, &site)
@@ -10221,12 +10226,17 @@ async fn zabbix_drift_detect(
     Ok(Json(serde_json::to_value(&persisted).map_err(db_error)?))
 }
 
-async fn zabbix_drift_plan(Path(drift_id): Path<String>) -> ApiResult {
+async fn zabbix_drift_plan(
+    AuthExtractor(session): AuthExtractor,
+    Path(drift_id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let report = crate::repos::zabbix_drift::get(pool, &drift_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&drift_id))?;
+    // #2: out-of-scope -> 404 before the remediation/transition (409) leak.
+    scope_guard_or_404(&session, &report.site, "", &drift_id)?;
     let steps = zabbix_drift::plan_remediation(&report).map_err(|e| status_409(&e))?;
     let expected =
         crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Detected);
@@ -10242,12 +10252,17 @@ async fn zabbix_drift_plan(Path(drift_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&planned).map_err(db_error)?))
 }
 
-async fn zabbix_drift_validate(Path(drift_id): Path<String>) -> ApiResult {
+async fn zabbix_drift_validate(
+    AuthExtractor(session): AuthExtractor,
+    Path(drift_id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let report = crate::repos::zabbix_drift::get(pool, &drift_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&drift_id))?;
+    // #2: out-of-scope -> 404 before the remediation/transition (409) leak.
+    scope_guard_or_404(&session, &report.site, "", &drift_id)?;
     let result = zabbix_drift::validate_remediation(&report).map_err(|e| status_409(&e))?;
     let expected =
         crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Planned);
@@ -10263,12 +10278,17 @@ async fn zabbix_drift_validate(Path(drift_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&result).map_err(db_error)?))
 }
 
-async fn zabbix_drift_execute(Path(drift_id): Path<String>) -> ApiResult {
+async fn zabbix_drift_execute(
+    AuthExtractor(session): AuthExtractor,
+    Path(drift_id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let report = crate::repos::zabbix_drift::get(pool, &drift_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&drift_id))?;
+    // #2: out-of-scope -> 404 before the remediation/transition (409) leak.
+    scope_guard_or_404(&session, &report.site, "", &drift_id)?;
     let evidence = zabbix_drift::execute_remediation(&report).map_err(|e| status_409(&e))?;
     let expected =
         crate::repos::zabbix_drift::status_str(&ryuki_engine::zabbix_drift::DriftStatus::Validated);
@@ -10285,12 +10305,17 @@ async fn zabbix_drift_execute(Path(drift_id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&evidence).map_err(db_error)?))
 }
 
-async fn zabbix_drift_verify(Path(drift_id): Path<String>) -> ApiResult {
+async fn zabbix_drift_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(drift_id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let report = crate::repos::zabbix_drift::get(pool, &drift_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&drift_id))?;
+    // #2: out-of-scope -> 404 before the remediation/transition (409) leak.
+    scope_guard_or_404(&session, &report.site, "", &drift_id)?;
     let result = zabbix_drift::verify_remediation(&report).map_err(|e| status_409(&e))?;
     // FIX: persist the Verified status — previously this was never written back.
     let expected = crate::repos::zabbix_drift::status_str(
@@ -39255,6 +39280,76 @@ mod db_lifecycle_tests {
             assert!(
                 matches!(cancel, Err((StatusCode::BAD_REQUEST, _))),
                 "out-of-scope cancel must look like not-found (400): {cancel:?}"
+            );
+        }
+    }
+
+    /// #2 RBAC: the zabbix-drift handlers are site-scoped. A GBLON principal gets
+    /// 403 on the site-query summary for DEFRA (and 404 on a DEFRA drift report's
+    /// by-id remediation, when one exists); its own site and an unrestricted
+    /// principal pass. drift_id is a random UUID resolved at runtime.
+    #[tokio::test]
+    async fn zabbix_drift_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // site-query summary -> 403 for a foreign site.
+        let foreign = zabbix_drift_summary(
+            AuthExtractor(gblon.clone()),
+            Query(ZabbixDriftQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope zabbix_drift_summary must be forbidden: {foreign:?}"
+        );
+
+        // own site passes.
+        let own = zabbix_drift_summary(
+            AuthExtractor(gblon.clone()),
+            Query(ZabbixDriftQuery {
+                site: Some("GBLON".into()),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope zabbix_drift_summary must pass: {own:?}"
+        );
+
+        // unrestricted passes.
+        let any = zabbix_drift_summary(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(ZabbixDriftQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted zabbix_drift_summary must pass: {any:?}"
+        );
+
+        // by-id remediation on a DEFRA drift report -> 404 (when one exists).
+        if let Some(defra_drift) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM drift_reports WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let plan = zabbix_drift_plan(AuthExtractor(gblon), Path(defra_drift)).await;
+            assert!(
+                matches!(plan, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope zabbix_drift_plan must 404: {plan:?}"
             );
         }
     }
