@@ -33,6 +33,7 @@
 - [x] **synthetic health** — `c14b03b` (health_checks site-only; 2 by-id (run_all/dashboard/outages pre-scoped); run_check guard before run, status scopes via parent check; codex APPROVED first pass)
 - [x] **metric budgets** — `90d6902` (metric_budgets DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) before the write; platform-wide NULL denied to scoped on that axis; codex APPROVED after containment clarification)
 - [x] **slo** — `45b7d1b` (slo_definitions DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) w/ SELECT…FOR UPDATE before the write; platform-wide-on-a-scoped-axis denied; codex APPROVED, TOCTOU caveat closed via row lock)
+- [x] **decommission** — `5bfe1d5` (site-only domain; new site_scope_guard_or_404 by-id 404 guard; plan body 403; approve/quarantine/execute/rollback guard before engine 409; verify/get/inventory were SESSIONLESS now scoped; validate left stateless; codex APPROVED)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -276,8 +277,8 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **slo_delete** [high] `sources/ryuki-api/src/contracts.rs:19754` — Before the DELETE, load the row's scope and gate with the canonical pattern. Because slo_definitions.site/environment are NULLABLE (platform-wide rows must stay deletable by any in
 
 ## decommission  (2)
-- [ ] **decommission_plan** [high] `sources/ryuki-api/src/contracts.rs:21147` — Add `guard_body_site_scope(&session, &body.site)?;` as the first statement of decommission_plan in sources/ryuki-api/src/contracts.rs (immediately after the fn opens at line 21150,
-- [ ] **decommission_approve / decommission_quarantine / decommission_execute / decommission_verify / decommission_rollback / decommission_get / decommission_quarantine_inventory** [high] `sources/ryuki-api/src/contracts.rs:21220-21437` — By-id handlers (approve after 21229, quarantine after 21275, execute after 21319, verify after 21359, rollback after 21377, get at 21430): immediately after `let req = repos::decom
+- [x] **decommission_plan** [high] `sources/ryuki-api/src/contracts.rs:21147` — Add `guard_body_site_scope(&session, &body.site)?;` as the first statement of decommission_plan in sources/ryuki-api/src/contracts.rs (immediately after the fn opens at line 21150,
+- [x] **decommission_approve / decommission_quarantine / decommission_execute / decommission_verify / decommission_rollback / decommission_get / decommission_quarantine_inventory** [high] `sources/ryuki-api/src/contracts.rs:21220-21437` — By-id handlers (approve after 21229, quarantine after 21275, execute after 21319, verify after 21359, rollback after 21377, get at 21430): immediately after `let req = repos::decom
 
 ## linux_deploy  (2)
 - [ ] **linux_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:21481` — Insert the canonical site-only WRITE guard at the top of linux_deploy_plan, immediately after `let pool = get_db()...?;` (contracts.rs:21485) and BEFORE plan_linux_deployment/inser
