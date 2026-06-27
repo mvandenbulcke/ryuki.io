@@ -430,6 +430,16 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (admin_platform_settings_update, etc.), migrations/ · **kind:** missing-feature · **severity:** medium · **effort:** M · **ci_validatable:** True
 - **evidence:** platform_config table (upserted at line 11387) stores live config but has no history/versioning. No config_audit or config_history table. When admin_platform_settings_update (line 11432) runs, prior state is lost. idempotency_records table (migration 093) exists for request replay, but platform_config has no equivalent. Missing: (1) config history table with (key, old_value, new_value, actor, timestamp), (2) audit log entries for config changes, (3) drift detection if in-memory config diverges from DB, (4) admin endpoint to view config change history.
 - **verified:** No configuration history table exists (migration 001 creates platform_config with only key/value/updated_at; no config_history or config_audit table). The upsert at lines 11387-11388 in contracts.rs overwrites prior values silently—only latest state persists. admin_platform_settings_update (line 11432) does not call record_audit; platform config changes are not logged to audit_log despite the audit_log table existing. No endpoint (GET /api/admin/platform-settings/history) exposes config change history. No drift detection mechanism exists. Not explicitly tracked in missing-features-tracker.md (
+- **STATUS (2026-06-27) — COMPLETE (change-history):** the premise partly
+  changed after swarm #6 — `admin_platform_settings_update`/`_reset` now DO write
+  durable hash-chained audit_log rows (`platform-settings-update` /
+  `platform-settings-reset`) capturing actor + the new non-secret settings, so
+  the append-only audit_log already IS the config history. This adds the missing
+  read surface: `GET /api/admin/platform-settings/history` →
+  `admin_platform_settings_history` queries those two actions (newest first,
+  bounded pagination), returning actor/when/detail. Admin-tier; empty +
+  `durable:false` with no DB. DB test records a config-change row then asserts it
+  surfaces. REMAINING (separate follow-up): active-vs-DB drift detection.
 
 ### 29. monitoring_review_queue table completely unused by API
 - **area:** migrations/031_monitoring_queue.sql + sources/ryuki-api/src/contracts.rs · **kind:** dead-code-or-drift · **severity:** medium · **effort:** M · **ci_validatable:** True

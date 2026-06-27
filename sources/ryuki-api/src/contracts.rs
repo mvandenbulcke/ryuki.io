@@ -1328,6 +1328,10 @@ pub fn routes() -> Router {
             "/api/admin/platform-settings/reset",
             post(admin_platform_settings_reset),
         )
+        .route(
+            "/api/admin/platform-settings/history",
+            get(admin_platform_settings_history),
+        )
         .route("/api/admin/tokens", post(admin_tokens_create))
         .route("/api/admin/tokens", get(admin_tokens_list))
         .route("/api/admin/tokens/{id}", delete(admin_tokens_revoke))
@@ -12477,6 +12481,64 @@ async fn admin_platform_settings(
     let config =
         map_platform_settings_read_result(crate::config_store::load_config().await, "file")?;
     Ok(Json(serde_json::to_value(config).unwrap_or_default()))
+}
+
+/// GET /api/admin/platform-settings/history — the change history of platform
+/// settings (#28). The update/reset handlers (#6) write durable, hash-chained
+/// audit_log rows (`platform-settings-update` / `platform-settings-reset`); this
+/// surfaces them as a queryable history (who changed it, when, and the recorded
+/// NON-secret detail) without needing a separate config_history table — the
+/// append-only audit_log IS the history. Admin-tier read, newest first, bounded
+/// pagination. Empty + `durable:false` with no DB. (Active-vs-DB drift detection
+/// — flagging when the in-memory config diverges from the persisted row — remains
+/// a separate follow-up; this closes the change-history gap.)
+async fn admin_platform_settings_history(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<PaginationParams>,
+) -> ApiResult {
+    if !check_permission(&session, "admin") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Admin access is required to read platform-settings history"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"history": [], "durable": false})));
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
+    let offset = params.offset.unwrap_or(0) as i64;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+        String,
+    )> = sqlx::query_as(
+        "SELECT action, actor_principal, actor_display, occurred_at, detail::text \
+         FROM audit_log \
+         WHERE action IN ('platform-settings-update', 'platform-settings-reset') \
+         ORDER BY occurred_at DESC, id DESC \
+         LIMIT $1 OFFSET $2",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let history: Vec<Value> = rows
+        .into_iter()
+        .map(|(action, actor, actor_display, occurred_at, detail)| {
+            json!({
+                "action": action,
+                "actor": actor,
+                "actor_display": actor_display,
+                "occurred_at": occurred_at.to_rfc3339(),
+                "detail": serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"history": history, "durable": true})))
 }
 
 async fn admin_platform_settings_update(
@@ -36861,6 +36923,52 @@ mod db_lifecycle_tests {
         assert!(
             patterns[0].get("suggested_article_body").is_none(),
             "the article body must be omitted from the list projection"
+        );
+    }
+
+    /// #28: GET /api/admin/platform-settings/history surfaces config-change
+    /// audit rows. Appends a real `platform-settings-update` audit row (the same
+    /// path #6 uses — avoids the set-once config store), then reads it back.
+    #[tokio::test]
+    async fn admin_platform_settings_history_surfaces_config_changes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let marker = "HIST-TEST-MARKER-7c3";
+        let mut tx = pool.begin().await.expect("begin tx");
+        audit::record_audit_tx(
+            &mut tx,
+            &admin_session("dbtest-cfg-hist-7c3"),
+            &audit::security_audit(
+                "platform-settings-update",
+                None,
+                "updated",
+                json!({ "settings": { "platform_name": marker } }),
+            ),
+        )
+        .await
+        .expect("record config-change audit row");
+        tx.commit().await.expect("commit");
+
+        let resp = admin_platform_settings_history(
+            AuthExtractor(admin_session("dbtest-cfg-hist-reader")),
+            Query(PaginationParams {
+                limit: Some(100),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .expect("history must succeed");
+        assert_eq!(resp.0["durable"], json!(true));
+        let history = resp.0["history"].as_array().expect("history array");
+        assert!(
+            history.iter().any(|h| {
+                h["action"] == json!("platform-settings-update")
+                    && h["detail"]["settings"]["platform_name"] == json!(marker)
+            }),
+            "the recorded config change must appear in the history"
         );
     }
 
