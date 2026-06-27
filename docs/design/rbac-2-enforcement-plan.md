@@ -10,6 +10,7 @@
 - [x] **load balancer** — `3e19354` (site-only; all 10 handlers: provision/vs_get/update/delete/drain/disable/enable/member_add/remove/validate_vip; vs_get loads-then-guards-then-loads-pool; codex caught 2 cross-site defects)
 - [x] **log forwarders** — `18f5486` (site-only; all 8: onboard/coverage/gaps/volume/retention/validate/verify/disable; disable was cross-site → new site-confined repo fn disable_for_hostname_in_sites; codex APPROVED first pass)
 - [x] **immutability** — `0838806` (site-only; all 8 reads: check/retention_lock/air_gap by-id, verify_all/compliance_report site-query, noncompliant/retention_risk list-all, remediation by-id-over-list; codex APPROVED first pass)
+- [x] **ad computers** — `3f8ab20` (site-only; all 6: prestage body-create, move/disable/enable/delete by-name writes (guard before status-409 leak), ad_get by-name read; codex APPROVED first pass; resolves the AD-write chip)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -78,13 +79,13 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **logs_verify** [medium] `sources/ryuki-api/src/contracts.rs:10628` — In logs_verify (sources/ryuki-api/src/contracts.rs:10628) add `session: AuthSession` to the signature, then after `list_by_hostname` returns `hosts` apply the per-row helper `retai
 
 ## ad  (7)
-- [ ] **ad_prestage** [high] `sources/ryuki-api/src/contracts.rs:4118` — Insert `guard_body_site_scope(&session, &body.site)?;` immediately after the get_db() line at contracts.rs:4122, BEFORE prestage_computer/insert (4123-4126). The helper at contract
-- [ ] **ad_move** [high] `sources/ryuki-api/src/contracts.rs:4160` — The row is already loaded with computer.site BEFORE any mutation, so the guard is a one-liner with no extra DB round-trip. Insert immediately after the 404 check (after line 4169, 
-- [ ] **ad_disable** [high] `sources/ryuki-api/src/contracts.rs:4203` — After loading the row at line 4216 (the `let (computer, updated_at) = get_by_name(...).ok_or_else(status_404)?` result) and BEFORE the disable_computer_model/transition write at 42
-- [ ] **ad_delete** [high] `sources/ryuki-api/src/contracts.rs:4274` — After loading the row at line 4279, before delete_computer_model at 4281, add a by-id scope guard mapping out-of-scope to 404: `scope_guard_or_404(&session, &computer.site, "", &na
-- [ ] **ad_move / ad_disable / ad_enable / ad_delete (by-name AD computer writes)** [high] `sources/ryuki-api/src/contracts.rs:4160` — The row's site is already loaded in `computer.site` immediately after get_by_name. Insert a post-load single-axis site guard in each handler right after the `.ok_or_else(|| status_
-- [ ] **ad_enable** [medium] `sources/ryuki-api/src/contracts.rs:4243` — In ad_enable, after loading `computer` (contracts.rs:4245-4248) and BEFORE the lifecycle transition at line 4249, add a site-only scope guard using the loaded row's site as the (si
-- [ ] **ad_get** [medium] `sources/ryuki-api/src/contracts.rs:4341` — In ad_get (contracts.rs:4341): change the signature to bind the session (AuthExtractor(session): AuthExtractor) instead of _session, then gate on the loaded site BEFORE returning. 
+- [x] **ad_prestage** [high] `sources/ryuki-api/src/contracts.rs:4118` — Insert `guard_body_site_scope(&session, &body.site)?;` immediately after the get_db() line at contracts.rs:4122, BEFORE prestage_computer/insert (4123-4126). The helper at contract
+- [x] **ad_move** [high] `sources/ryuki-api/src/contracts.rs:4160` — The row is already loaded with computer.site BEFORE any mutation, so the guard is a one-liner with no extra DB round-trip. Insert immediately after the 404 check (after line 4169, 
+- [x] **ad_disable** [high] `sources/ryuki-api/src/contracts.rs:4203` — After loading the row at line 4216 (the `let (computer, updated_at) = get_by_name(...).ok_or_else(status_404)?` result) and BEFORE the disable_computer_model/transition write at 42
+- [x] **ad_delete** [high] `sources/ryuki-api/src/contracts.rs:4274` — After loading the row at line 4279, before delete_computer_model at 4281, add a by-id scope guard mapping out-of-scope to 404: `scope_guard_or_404(&session, &computer.site, "", &na
+- [x] **ad_move / ad_disable / ad_enable / ad_delete (by-name AD computer writes)** [high] `sources/ryuki-api/src/contracts.rs:4160` — The row's site is already loaded in `computer.site` immediately after get_by_name. Insert a post-load single-axis site guard in each handler right after the `.ok_or_else(|| status_
+- [x] **ad_enable** [medium] `sources/ryuki-api/src/contracts.rs:4243` — In ad_enable, after loading `computer` (contracts.rs:4245-4248) and BEFORE the lifecycle transition at line 4249, add a site-only scope guard using the loaded row's site as the (si
+- [x] **ad_get** [medium] `sources/ryuki-api/src/contracts.rs:4341` — In ad_get (contracts.rs:4341): change the signature to bind the session (AuthExtractor(session): AuthExtractor) instead of _session, then gate on the loaded site BEFORE returning. 
 
 ## gmsa  (7)
 - [ ] **gmsa_assign** [high] `sources/ryuki-api/src/contracts.rs:4436` — Load the account's site before the mutation and guard it with the site-only write helper. Cleanest oracle-safe approach: extend add_host in sources/ryuki-api/src/repos/gmsa_account
