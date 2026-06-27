@@ -43,22 +43,33 @@ pub fn severity_for_request_status(to_status: &str) -> Option<AlertSeverity> {
     }
 }
 
-/// The request terminal statuses that are alert-worthy — the exact inverse keys
-/// of [`severity_for_request_status`]. Exposed so the alert feed can push this
-/// filter INTO its SQL query: alerts are rare relative to all transitions, so
-/// filtering a recent-N page in memory would yield near-empty pages. Keep this
-/// in lock-step with `severity_for_request_status` (a unit test enforces it).
-pub fn alert_worthy_request_statuses() -> &'static [&'static str] {
-    &["failed", "rejected", "cancelled"]
+/// Classify an SLO-scan event (#11 slice 2b) by its `to_status`. A `breached`
+/// SLO is a critical operational signal; `recovered` is good news, not an alert.
+pub fn severity_for_slo_status(to_status: &str) -> Option<AlertSeverity> {
+    match to_status {
+        "breached" => Some(AlertSeverity::Critical),
+        _ => None,
+    }
 }
 
-/// Classify any domain event into an optional alert severity. Currently only
-/// `request` aggregates are emitted (slice 1); future operational emitters
-/// (capacity/SLO breach, agent-offline) extend this match. `to_status` is the
-/// request payload's terminal status when the aggregate is a request.
+/// The UNION of every alert-worthy `to_status` across all aggregate types.
+/// Exposed so the alert feed can push this filter INTO its SQL query — alerts
+/// are rare relative to all events, so filtering a recent-N page in memory would
+/// yield near-empty pages. The DB filter is intentionally coarse (a single
+/// `to_status` set); [`classify`] then applies the precise per-aggregate rule
+/// and drops any spurious (aggregate, status) pair. A unit test keeps this union
+/// in lock-step with the per-aggregate classifiers.
+pub fn alert_worthy_statuses() -> &'static [&'static str] {
+    &["failed", "rejected", "cancelled", "breached"]
+}
+
+/// Classify any domain event into an optional alert severity. `request`
+/// aggregates key on their terminal status (slice 1); `slo` aggregates on the
+/// breach-scan status (slice 2b). Future operational emitters extend this match.
 pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSeverity> {
     match aggregate_type {
         "request" => to_status.and_then(severity_for_request_status),
+        "slo" => to_status.and_then(severity_for_slo_status),
         _ => None,
     }
 }
@@ -100,26 +111,36 @@ mod tests {
     }
 
     #[test]
-    fn alert_status_list_matches_the_classifier() {
-        // Every status in the SQL-filter list must classify as an alert, and no
-        // status outside it may — so the in-SQL filter and the severity label
-        // can never drift.
-        for s in alert_worthy_request_statuses() {
+    fn alert_status_union_matches_the_classifiers() {
+        // Every status in the coarse SQL-filter union must classify as an alert
+        // for SOME aggregate, so the in-SQL filter and the per-aggregate severity
+        // labels can never drift.
+        for s in alert_worthy_statuses() {
             assert!(
-                severity_for_request_status(s).is_some(),
-                "{s} is in the alert list but not classified as an alert"
+                severity_for_request_status(s).is_some() || severity_for_slo_status(s).is_some(),
+                "{s} is in the alert union but no aggregate classifies it as an alert"
             );
         }
     }
 
     #[test]
-    fn classify_only_alerts_request_aggregates() {
+    fn classify_handles_request_and_slo_aggregates() {
         assert_eq!(
             classify("request", Some("failed")),
             Some(AlertSeverity::Critical)
         );
         assert_eq!(classify("request", Some("completed")), None);
         assert_eq!(classify("request", None), None);
+        assert_eq!(
+            classify("slo", Some("breached")),
+            Some(AlertSeverity::Critical)
+        );
+        // 'recovered' is good news, not an alert.
+        assert_eq!(classify("slo", Some("recovered")), None);
+        // Cross-aggregate spurious pairs never alert (a request can't be
+        // 'breached', an slo can't be 'failed').
+        assert_eq!(classify("slo", Some("failed")), None);
+        assert_eq!(classify("request", Some("breached")), None);
         // An unknown aggregate type never alerts (until an emitter + rule exist).
         assert_eq!(classify("widget", Some("failed")), None);
     }

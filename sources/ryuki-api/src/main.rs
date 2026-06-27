@@ -1629,6 +1629,12 @@ async fn main() {
         tracing::info!("idempotency retention sweep started (interval: 3600s)");
         scheduler::spawn_scheduler(pool.clone(), 60);
         tracing::info!("durable scheduler started (tick interval: 60s)");
+        // #11 slice 2b: SLO-breach scan emits slo.breach/slo.recovered domain
+        // events on transition (write-capable, so separate from the read-only
+        // scheduler). 5-minute cadence — SLO windows are days, so sub-minute
+        // checking adds no signal.
+        contracts::spawn_slo_breach_scan(pool.clone(), 300);
+        tracing::info!("slo-breach scan started (interval: 300s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);

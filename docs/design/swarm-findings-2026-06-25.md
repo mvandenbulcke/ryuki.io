@@ -300,6 +300,23 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   (SLO/capacity breach, agent-offline — gated by a design call on whether the
   read-only scheduler may emit), plus persistent alert state/dedup + recipient
   routing.
+- **STATUS (2026-06-27) — SLICE 2b (first operational emitter: SLO breach):** the
+  design tension is resolved — operational emitters run as a dedicated
+  WRITE-capable background task (`spawn_slo_breach_scan`, the lease/idempotency
+  sweep pattern with #31 backoff), NOT the read-only scheduler. `slo_breach_scan_once`
+  evaluates every enabled SLO (reusing `sum_metric_in_window` + `slo::compute_slo`)
+  and emits `slo.breach` / `slo.recovered` domain events ONLY on a state
+  TRANSITION — deduped via a new `slo_definitions.breaching` flag (migration 112)
+  flipped atomically with the emit; transient (sum-error / insufficient / invalid)
+  evaluations leave the flag unchanged so a flapping source never spams.
+  `event_alerts::classify` gained an `slo` arm (breached=critical), and
+  `list_alerts` now filters on the engine's coarse UNION of alert statuses
+  (`alert_worthy_statuses`) with the precise per-aggregate rule re-applied at read
+  time — so SLO breaches surface in `GET /api/events/alerts` as critical alerts.
+  Wired into startup (300s). DB test: breach→emit once, re-scan→0 (dedup),
+  surfaces as critical, recovery→emit + flag cleared. REMAINING (2c): more
+  emitters (capacity-budget breach, agent-offline) + alert ack/state + recipient
+  routing.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

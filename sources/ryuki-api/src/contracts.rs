@@ -16992,7 +16992,7 @@ async fn events_alerts(
         .filter(|s| !s.is_empty());
     // The alert status set comes from the engine — same source as the severity
     // label below — so the SQL filter and the classification can never drift.
-    let statuses: Vec<String> = ryuki_engine::event_alerts::alert_worthy_request_statuses()
+    let statuses: Vec<String> = ryuki_engine::event_alerts::alert_worthy_statuses()
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -19158,6 +19158,148 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
         "errored_count": errored_count,
         "overall_status": overall_status,
     })))
+}
+
+/// One row for the SLO-breach scan (#11 slice 2b).
+#[derive(sqlx::FromRow)]
+struct SloScanRow {
+    id: String,
+    name: String,
+    target: f64,
+    window_days: i32,
+    good_metric_key: String,
+    total_metric_key: String,
+    site: Option<String>,
+    environment: Option<String>,
+    breaching: bool,
+}
+
+/// One SLO-breach scan pass (#11 slice 2b): evaluate every enabled SLO and, on a
+/// DEFINITIVE compliant/breached result, emit a `slo.breach` / `slo.recovered`
+/// domain event ONLY when the SLO TRANSITIONS — deduped via the `breaching` flag,
+/// flipped atomically with the emit. Transient results (metric-sum error,
+/// insufficient/invalid data) leave the flag unchanged so a flapping data source
+/// never spams. Each SLO is independent; one failure does not abort the rest.
+/// Returns the number of transition events emitted.
+pub(crate) async fn slo_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    let slos: Vec<SloScanRow> = sqlx::query_as(
+        "SELECT id, name, target, window_days, good_metric_key, total_metric_key, \
+                site, environment, breaching \
+         FROM slo_definitions WHERE enabled",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = chrono::Utc::now();
+    let mut emitted = 0u64;
+    for s in &slos {
+        let since = now - chrono::Duration::days(i64::from(s.window_days));
+        let good = sum_metric_in_window(
+            pool,
+            &s.good_metric_key,
+            &s.site,
+            &s.environment,
+            since,
+            now,
+        )
+        .await;
+        let total = sum_metric_in_window(
+            pool,
+            &s.total_metric_key,
+            &s.site,
+            &s.environment,
+            since,
+            now,
+        )
+        .await;
+        let (good, total) = match (good, total) {
+            (Ok(g), Ok(t)) => (g, t),
+            // Transient sum error — skip; do not flip the flag.
+            _ => continue,
+        };
+        // Insufficient data (no events) is not a definitive state.
+        if total <= 0.0 {
+            continue;
+        }
+        // Invalid data (good > total, etc.) is not a definitive state.
+        let Some(status) = ryuki_engine::slo::compute_slo(good, total, s.target) else {
+            continue;
+        };
+        let now_breaching = !status.compliant;
+        if now_breaching == s.breaching {
+            continue; // no transition — already in this state.
+        }
+        // Transition: emit the event + flip the flag atomically.
+        let mut tx = pool.begin().await?;
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: if now_breaching {
+                    "slo.breach"
+                } else {
+                    "slo.recovered"
+                },
+                aggregate_type: "slo",
+                aggregate_id: &s.id,
+                site: s.site.as_deref(),
+                environment: s.environment.as_deref(),
+                actor: "system",
+                payload: json!({
+                    "to_status": if now_breaching { "breached" } else { "recovered" },
+                    "slo_name": &s.name,
+                    "attainment": status.attainment,
+                    "target": s.target,
+                    "window_days": s.window_days,
+                }),
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE slo_definitions SET breaching = $1, updated_at = NOW() WHERE id = $2")
+            .bind(now_breaching)
+            .bind(&s.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        emitted += 1;
+    }
+    Ok(emitted)
+}
+
+/// Spawn the background SLO-breach scan (#11 slice 2b). Write-capable and
+/// SEPARATE from the read-only scheduler (which may not emit). Runs on a fixed
+/// interval with #31-style exponential backoff on consecutive failures so a
+/// persistent outage does not hammer the DB. Call once at startup.
+pub fn spawn_slo_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            ticker.tick().await;
+            match slo_breach_scan_once(&pool).await {
+                Ok(emitted) => {
+                    consecutive_failures = 0;
+                    if emitted > 0 {
+                        tracing::info!(emitted, "slo-breach scan emitted transition events");
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        backoff_intervals,
+                        "slo-breach scan failed; backing off"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        interval_secs.saturating_mul(backoff_intervals),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 /// PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold,
@@ -37320,6 +37462,118 @@ mod db_lifecycle_tests {
             !by_status.contains_key("completed"),
             "a completed request must not be an alert"
         );
+    }
+
+    /// #11 slice 2b: the SLO-breach scan emits slo.breach on the breach
+    /// transition, dedups (no re-emit while still breaching), surfaces as a
+    /// critical alert, and emits slo.recovered when the SLO recovers.
+    #[tokio::test]
+    async fn slo_breach_scan_emits_on_transition_and_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let good_key = format!("slo.scan.good.{suffix}");
+        let total_key = format!("slo.scan.total.{suffix}");
+        let created = slo_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SloCreateRequest {
+                name: format!("scan-test-{suffix}"),
+                target: 0.99,
+                window_days: Some(30),
+                good_metric_key: good_key.clone(),
+                total_metric_key: total_key.clone(),
+                site: None,
+                environment: None,
+            }),
+        )
+        .await
+        .expect("create slo");
+        let slo_id = created.0["id"].as_str().unwrap().to_string();
+
+        let sample =
+            "INSERT INTO metric_samples (id, metric_key, site, environment, value, observed_at) \
+                      VALUES ($1, $2, NULL, NULL, $3, NOW())";
+        // Breach: good=1, total=100 → attainment 0.01 < 0.99.
+        sqlx::query(sample)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&good_key)
+            .bind(1.0_f64)
+            .execute(pool)
+            .await
+            .expect("seed good");
+        sqlx::query(sample)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&total_key)
+            .bind(100.0_f64)
+            .execute(pool)
+            .await
+            .expect("seed total");
+
+        assert_eq!(
+            slo_breach_scan_once(pool).await.expect("scan 1"),
+            1,
+            "first breach must emit one transition event"
+        );
+        assert_eq!(
+            slo_breach_scan_once(pool).await.expect("scan 2"),
+            0,
+            "an already-breaching SLO must not re-emit (dedup)"
+        );
+
+        let alerts = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(slo_id.clone()),
+                limit: Some(50),
+            }),
+        )
+        .await
+        .expect("alerts list");
+        let arr = alerts.0["alerts"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|a| a["event_type"] == json!("slo.breach")
+                    && a["severity"] == json!("critical")),
+            "the SLO breach must surface as a critical alert: {arr:?}"
+        );
+
+        // Recover: add good=99 → good=100, total=100 → attainment 1.0 ≥ 0.99.
+        sqlx::query(sample)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&good_key)
+            .bind(99.0_f64)
+            .execute(pool)
+            .await
+            .expect("seed recovery");
+        assert_eq!(
+            slo_breach_scan_once(pool).await.expect("scan 3"),
+            1,
+            "recovery must emit one transition event"
+        );
+        let breaching: bool =
+            sqlx::query_scalar("SELECT breaching FROM slo_definitions WHERE id = $1")
+                .bind(&slo_id)
+                .fetch_one(pool)
+                .await
+                .expect("read breaching flag");
+        assert!(!breaching, "SLO must no longer be breaching after recovery");
+
+        // Cleanup (domain_events is append-only and intentionally retained).
+        sqlx::query("DELETE FROM slo_definitions WHERE id = $1")
+            .bind(&slo_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1 OR metric_key = $2")
+            .bind(&good_key)
+            .bind(&total_key)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the
