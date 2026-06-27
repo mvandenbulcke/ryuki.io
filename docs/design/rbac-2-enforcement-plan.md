@@ -24,6 +24,7 @@
 - [x] **compliance reporting** — `e541fee` (controls/reports site-only, findings via report-join, frameworks global; 5 (list/generate/findings_list/summary pre-scoped); custom-message 404 inline-match; codex APPROVED first pass)
 - [x] **noise remediation** — `0724731` (noisy_triggers NO site col → HOST-DERIVED via site_from_host; 7 handlers (audit said 4); detect/flapping body-guard, suggest/suppress/resolve host pre-load guard, report enforce_site_scope, suppressed_list host-filter; no-DB fail-closed; codex caught suggest full-row-before-guard oracle, fixed)
 - [x] **vm day-2** — `a88494b` (vm_day2_operations DUAL-AXIS site+environment; 4 (contract static); plan enforce_scope_filters, validate/execute/verify scope_guard_or_404 before status-409; codex APPROVED first pass)
+- [x] **oob access** — `ff6f8d4` (oob_endpoints site-only; all 8 (contract static); test_endpoint pre-load guard before UPDATE, validate_cert/check_defaults by-id, inventory/failing enforce_site_scope (both paths), cert_expiring/firmware_outdated retain + no-DB fail-closed, validate_site Path-guard; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -221,10 +222,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **vm_day2_verify** [high] `sources/ryuki-api/src/contracts.rs:20317` — Add `AuthExtractor(session): AuthExtractor` as the first param of vm_day2_verify (contracts.rs:20317). After the op is loaded (after line 20323, before the status check at 20326), 
 
 ## oob  (4)
-- [ ] **oob_inventory / oob_failing** [high] `sources/ryuki-api/src/contracts.rs:22900` — 
-- [ ] **oob_cert_expiring / oob_firmware_outdated** [high] `sources/ryuki-api/src/contracts.rs:22990` — Add `session: AuthSession` (AuthExtractor) to both handler signatures, then filter rows by scope BEFORE building JSON using the existing per-row helper. (site,env) source = the pri
-- [ ] **oob_validate_site** [high] `sources/ryuki-api/src/contracts.rs:23087` — Add `AuthExtractor(session): AuthExtractor,` as the first param of oob_validate_site (mirroring oob_test_endpoint at 22762). Then inside `if let Some(pool) = get_db()` and BEFORE t
-- [ ] **oob_test_endpoint / oob_validate_cert / oob_check_defaults** [high] `sources/ryuki-api/src/contracts.rs:22761` — For oob_validate_cert and oob_check_defaults: add `AuthExtractor(session): AuthExtractor` to the signature, and after the `row.ok_or_else(...)?` unwrap call `scope_guard_or_404(&se
+- [x] **oob_inventory / oob_failing** [high] `sources/ryuki-api/src/contracts.rs:22900` — 
+- [x] **oob_cert_expiring / oob_firmware_outdated** [high] `sources/ryuki-api/src/contracts.rs:22990` — Add `session: AuthSession` (AuthExtractor) to both handler signatures, then filter rows by scope BEFORE building JSON using the existing per-row helper. (site,env) source = the pri
+- [x] **oob_validate_site** [high] `sources/ryuki-api/src/contracts.rs:23087` — Add `AuthExtractor(session): AuthExtractor,` as the first param of oob_validate_site (mirroring oob_test_endpoint at 22762). Then inside `if let Some(pool) = get_db()` and BEFORE t
+- [x] **oob_test_endpoint / oob_validate_cert / oob_check_defaults** [high] `sources/ryuki-api/src/contracts.rs:22761` — For oob_validate_cert and oob_check_defaults: add `AuthExtractor(session): AuthExtractor` to the signature, and after the `row.ok_or_else(...)?` unwrap call `scope_guard_or_404(&se
 
 ## image_factory  (4)
 - [ ] **image_factory_initiate_build / image_factory_schedule_monthly** [high] `sources/ryuki-api/src/contracts.rs:24616` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param to both handlers, then call `guard_body_site_scope(&session, &body.site)?` (defined contracts.rs:21033) bef
