@@ -30571,6 +30571,10 @@ async fn secrets_register(
     AuthExtractor(session): AuthExtractor,
     Json(b): Json<SecretsRegisterRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: scoped principals may only register a secret in their own site;
+    // env-scoped principals are rejected (managed_secrets is site-only). Placed
+    // before both the DB and no-DB paths.
+    guard_body_site_scope(&session, &b.site)?;
     if let Some(pool) = get_db() {
         let secret = secrets_rotation::build_secret(
             &b.name,
@@ -30637,7 +30641,10 @@ async fn secrets_register(
     .map(Json)
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
-async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn secrets_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
             "SELECT {MANAGED_SECRET_COLUMNS} FROM managed_secrets WHERE id = $1"
@@ -30650,6 +30657,11 @@ async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
             Some(r) => r,
             None => return Err(secrets_not_found(format!("Secret '{id}' not found"))),
         };
+        // #2: an out-of-scope secret is reported identically to a missing one (no
+        // existence oracle) and never exposes its vault_path/rotation history.
+        if !row_scope_permits(&session, &secret.site, "") {
+            return Err(secrets_not_found(format!("Secret '{id}' not found")));
+        }
         let run_rows: Vec<RotationRunRow> = sqlx::query_as(&format!(
             "SELECT {ROTATION_RUN_COLUMNS} FROM rotation_runs \
              WHERE secret_id = $1 ORDER BY started_at, id"
@@ -30665,6 +30677,11 @@ async fn secrets_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode,
             "secret": secret.to_value(),
             "rotation_history": history,
         })));
+    }
+    // #2: the no-DB fallback reads a process-local store with no site dimension; a
+    // scoped principal fails closed rather than read a cross-site secret.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
     }
     secrets_rotation::get_secret(&id)
         .map(Json)
@@ -30702,6 +30719,12 @@ async fn secrets_update(
     .map_err(db_error)?
     .ok_or_else(|| secrets_not_found(format!("Secret '{id}' not found")))?;
 
+    // #2: a scoped principal may only update a secret in its own site; out-of-scope
+    // is reported as not-found (no existence oracle).
+    if !row_scope_permits(&session, &existing.site, "") {
+        return Err(secrets_not_found(format!("Secret '{id}' not found")));
+    }
+
     let name = b
         .name
         .as_deref()
@@ -30726,6 +30749,8 @@ async fn secrets_update(
     if name.is_empty() || owner.is_empty() || site.is_empty() {
         return Err(status_400("name, owner, and site cannot be empty"));
     }
+    // #2: ...and may not re-home the secret to a site outside its scope.
+    guard_body_site_scope(&session, &site)?;
     // 1..=36500 days (100y). The upper bound also keeps `interval as i64` below,
     // and the BIGINT column, from ever wrapping on a hostile u64.
     if interval == 0 || interval > 36_500 {
@@ -30807,6 +30832,11 @@ async fn secrets_deregister(
     .map_err(db_error)?;
     match row {
         Some(secret) => {
+            // #2: out-of-scope -> the same not-found; returning Err drops the tx so
+            // the RETURNING status update rolls back (no cross-site mutation).
+            if !row_scope_permits(&session, &secret.site, "") {
+                return Err(secrets_not_found(format!("Secret '{id}' not found")));
+            }
             audit::record_audit_tx(
                 &mut tx,
                 &session,
@@ -30848,6 +30878,11 @@ async fn secrets_rotate(
             Some(r) => r.to_engine(),
             None => return Err(secrets_not_found(format!("Secret '{id}' not found"))),
         };
+        // #2: out-of-scope -> 404 (same as not-found) BEFORE the retired-status
+        // (409) leak, so a foreign secret never reveals its existence or state.
+        if !row_scope_permits(&session, &secret.site, "") {
+            return Err(secrets_not_found(format!("Secret '{id}' not found")));
+        }
         // A retired secret no longer rotates — refuse a direct rotate.
         if secret.status == secrets_rotation::SecretStatus::Retired {
             return Err((
@@ -30921,13 +30956,40 @@ async fn secrets_rotate(
             "rotation": serde_json::to_value(&run).unwrap_or_default(),
         })));
     }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     secrets_rotation::rotate_secret(&id, &session.user_id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
 async fn secrets_rotation_history(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only read the rotation history of a secret in its
+    // own site. This endpoint reads the engine store, which has no site dimension,
+    // so resolve the parent secret's site from the DB (the authoritative store);
+    // an out-of-scope OR missing secret both 404 (no existence oracle). Unrestricted
+    // principals keep the legacy engine path.
+    if is_scoped(&session) {
+        let Some(pool) = get_db() else {
+            return Err(status_503_no_db());
+        };
+        let site: Option<String> =
+            sqlx::query_scalar("SELECT site FROM managed_secrets WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err(secrets_not_found(format!("Secret '{id}' not found")));
+        }
+    }
     secrets_rotation::get_rotation_history(&id)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
@@ -30953,6 +31015,11 @@ async fn secrets_due_rotations(
             "count": secrets.len(),
             "secrets": secrets,
         })));
+    }
+    // #2: no-DB fallback can't filter by site; the engine list would leak
+    // cross-site secrets (incl. vault_path), so a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
     }
     secrets_rotation::list_due_rotations()
         .map(Json)
@@ -30985,6 +31052,11 @@ async fn secrets_expiring(
             "count": secrets.len(),
             "secrets": secrets,
         })));
+    }
+    // #2: no-DB fallback can't filter by site; the engine list would leak
+    // cross-site secrets (incl. vault_path), so a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
     }
     secrets_rotation::list_expiring(days)
         .map(Json)
@@ -31123,6 +31195,26 @@ async fn secrets_rotation_fail(
                 )))
             }
         };
+        // #2: rotation_runs has no site column — scope on the PARENT secret's site
+        // (resolved via secret_id). An out-of-scope (or orphaned) run is reported as
+        // the same rotation-not-found, so there is no cross-site existence oracle.
+        if is_scoped(&session) {
+            let parent_site: Option<String> =
+                sqlx::query_scalar("SELECT site FROM managed_secrets WHERE id = $1")
+                    .bind(&run.secret_id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !parent_site
+                .map(|s| row_scope_permits(&session, &s, ""))
+                .unwrap_or(false)
+            {
+                return Err(secrets_not_found(format!(
+                    "Rotation '{}' not found",
+                    b.rotation_id
+                )));
+            }
+        }
         let failed = secrets_rotation::fail_rotation_record(&run, &b.error);
 
         let mut tx = pool.begin().await.map_err(db_error)?;
@@ -31165,6 +31257,10 @@ async fn secrets_rotation_fail(
             "dry_run": true,
             "rotation": serde_json::to_value(&failed).unwrap_or_default(),
         })));
+    }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
     }
     secrets_rotation::mark_rotation_failed(&b.rotation_id, &b.error)
         .map(Json)
@@ -38693,6 +38789,114 @@ mod db_lifecycle_tests {
         );
     }
 
+    /// #2 RBAC: the managed-secret handlers are site-scoped. A GBLON principal
+    /// gets 404 reading/rotating/updating a DEFRA secret (no existence oracle,
+    /// before any retired-status 409 leak), 403 registering in DEFRA, and 403
+    /// re-homing a GBLON secret to DEFRA (which leaves it in GBLON). In-scope +
+    /// unrestricted reads pass. Uses migration-051 seeds (sr-defra-001 DEFRA,
+    /// sr-gblon-001 GBLON).
+    #[tokio::test]
+    async fn secrets_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra = "sr-defra-001";
+        let gblon_secret = "sr-gblon-001";
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // read / rotate / update a DEFRA secret -> 404.
+        let got = secrets_get(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope secrets_get must 404: {got:?}"
+        );
+        let rotated = secrets_rotate(Path(defra.to_string()), Extension(gblon.clone())).await;
+        assert!(
+            matches!(rotated, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope secrets_rotate must 404: {rotated:?}"
+        );
+        let updated = secrets_update(
+            AuthExtractor(gblon.clone()),
+            Path(defra.to_string()),
+            Json(SecretsUpdateRequest {
+                name: None,
+                owner: None,
+                site: None,
+                interval_days: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(updated, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope secrets_update must 404: {updated:?}"
+        );
+
+        // register in a foreign site -> 403.
+        let registered = secrets_register(
+            AuthExtractor(gblon.clone()),
+            Json(SecretsRegisterRequest {
+                name: "rbac2-x".into(),
+                secret_type: "password".into(),
+                vault_path: "vault/rbac2-x".into(),
+                interval_days: 30,
+                owner: "o".into(),
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(registered, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope secrets_register must be forbidden: {registered:?}"
+        );
+
+        // re-home a GBLON secret to DEFRA -> 403, and the secret stays in GBLON.
+        let rehome = secrets_update(
+            AuthExtractor(gblon.clone()),
+            Path(gblon_secret.to_string()),
+            Json(SecretsUpdateRequest {
+                name: None,
+                owner: None,
+                site: Some("DEFRA".into()),
+                interval_days: None,
+            }),
+        )
+        .await;
+        let gblon_site: String =
+            sqlx::query_scalar("SELECT site FROM managed_secrets WHERE id = $1")
+                .bind(gblon_secret)
+                .fetch_one(pool)
+                .await
+                .expect("read gblon secret site");
+        assert!(
+            matches!(rehome, Err((StatusCode::FORBIDDEN, _))),
+            "re-homing a secret out of scope must be forbidden: {rehome:?}"
+        );
+        assert_eq!(
+            gblon_site, "GBLON",
+            "a forbidden re-home must NOT have moved the secret"
+        );
+
+        // in-scope + unrestricted reads pass.
+        let own = secrets_get(AuthExtractor(gblon), Path(gblon_secret.to_string())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope secrets_get must pass: {own:?}"
+        );
+        let any = secrets_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted secrets_get must pass: {any:?}"
+        );
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -44199,7 +44403,11 @@ mod secrets_rotation_db_tests {
         );
 
         // It must be readable straight back from the DB.
-        let readback = secrets_get(Path(new_id.to_string())).await;
+        let readback = secrets_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(new_id.to_string()),
+        )
+        .await;
         cleanup_secret(pool, new_id).await;
 
         let Ok(Json(got)) = readback else {
