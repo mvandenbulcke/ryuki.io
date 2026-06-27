@@ -11,6 +11,7 @@
 - [x] **log forwarders** — `18f5486` (site-only; all 8: onboard/coverage/gaps/volume/retention/validate/verify/disable; disable was cross-site → new site-confined repo fn disable_for_hostname_in_sites; codex APPROVED first pass)
 - [x] **immutability** — `0838806` (site-only; all 8 reads: check/retention_lock/air_gap by-id, verify_all/compliance_report site-query, noncompliant/retention_risk list-all, remediation by-id-over-list; codex APPROVED first pass)
 - [x] **ad computers** — `3f8ab20` (site-only; all 6: prestage body-create, move/disable/enable/delete by-name writes (guard before status-409 leak), ad_get by-name read; codex APPROVED first pass; resolves the AD-write chip)
+- [x] **patch waves** — `f81d7cc` (MULTI-SITE: new within_multi_scope/multi_scope_guard_or_404 containment helpers; all 8 wave handlers incl. patch_reboot the audit missed; +narrow_site_aggregate for compliance/pending_reboots dashboards; codex design-reviewed then caught 3 aggregate leaks, all fixed)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -97,13 +98,13 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [ ] **gmsa_create** [?] `sources/ryuki-api/src/contracts.rs:4376` — Add the canonical site-only write guard at the top of gmsa_create, immediately after the session is extracted and before any DB work. body.site is the required CONCRETE (non-Option
 
 ## patch  (7)
-- [ ] **patch_plan** [high] `sources/ryuki-api/src/contracts.rs:8062` — Insert the canonical site-only write guard at the top of patch_plan, before plan_patch_wave: add `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = get_d
-- [ ] **patch_validate** [high] `sources/ryuki-api/src/contracts.rs:8097` — In patch_validate, immediately after the wave is loaded (contracts.rs:8106, before computing `before`/transitioning), add a scope guard using ryuki_engine::auth::scope_permits over
-- [ ] **patch_approve** [high] `sources/ryuki-api/src/contracts.rs:8136` — After loading the wave (line 8145, before approve_patch_wave at 8151), enforce both scope dimensions per-element against the principal using ryuki_engine::auth::scope_permits, retu
-- [ ] **patch_execute** [high] `sources/ryuki-api/src/contracts.rs:8178` — Add a scope gate immediately after the wave loads (after contracts.rs:8187, before the engine call at 8192). Since the wave carries Vec-valued scope, deny unless EVERY targeted sit
-- [ ] **patch_verify** [high] `sources/ryuki-api/src/contracts.rs:8218` — Add `AuthExtractor(session): AuthExtractor` to patch_verify's signature (matching patch_validate at contracts.rs:8097), then after loading the wave (line 8224) and BEFORE patch_eng
-- [ ] **patch_wave_get** [high] `sources/ryuki-api/src/contracts.rs:8266` — Add `AuthExtractor(session): AuthExtractor` to patch_wave_get's signature, then after loading the wave (the Ok(Some(wave)) arm at contracts.rs:8269) and BEFORE returning Json, appl
-- [ ] **patch_waves_list** [medium] `sources/ryuki-api/src/contracts.rs:8252` — 
+- [x] **patch_plan** [high] `sources/ryuki-api/src/contracts.rs:8062` — Insert the canonical site-only write guard at the top of patch_plan, before plan_patch_wave: add `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = get_d
+- [x] **patch_validate** [high] `sources/ryuki-api/src/contracts.rs:8097` — In patch_validate, immediately after the wave is loaded (contracts.rs:8106, before computing `before`/transitioning), add a scope guard using ryuki_engine::auth::scope_permits over
+- [x] **patch_approve** [high] `sources/ryuki-api/src/contracts.rs:8136` — After loading the wave (line 8145, before approve_patch_wave at 8151), enforce both scope dimensions per-element against the principal using ryuki_engine::auth::scope_permits, retu
+- [x] **patch_execute** [high] `sources/ryuki-api/src/contracts.rs:8178` — Add a scope gate immediately after the wave loads (after contracts.rs:8187, before the engine call at 8192). Since the wave carries Vec-valued scope, deny unless EVERY targeted sit
+- [x] **patch_verify** [high] `sources/ryuki-api/src/contracts.rs:8218` — Add `AuthExtractor(session): AuthExtractor` to patch_verify's signature (matching patch_validate at contracts.rs:8097), then after loading the wave (line 8224) and BEFORE patch_eng
+- [x] **patch_wave_get** [high] `sources/ryuki-api/src/contracts.rs:8266` — Add `AuthExtractor(session): AuthExtractor` to patch_wave_get's signature, then after loading the wave (the Ok(Some(wave)) arm at contracts.rs:8269) and BEFORE returning Json, appl
+- [x] **patch_waves_list** [medium] `sources/ryuki-api/src/contracts.rs:8252` — 
 
 ## legal_hold  (7)
 - [ ] **legal_hold_extend** [high] `sources/ryuki-api/src/contracts.rs:9392` — Add a by-id scope guard BEFORE the CAS UPDATE in legal_hold_extend. Since legal_holds is site-only (no environment column), pre-load the hold's site and guard on it. Two equivalent
