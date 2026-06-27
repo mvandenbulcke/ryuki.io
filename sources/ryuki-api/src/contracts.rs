@@ -22014,6 +22014,28 @@ fn scope_guard_or_404(
     }
 }
 
+/// Post-load by-id scope guard for a SITE-ONLY resource — one with no environment
+/// axis (e.g. a decommission request keyed on site alone) (#2). Maps any
+/// out-of-scope or unsatisfiable access to the SAME 404 a missing row produces, so
+/// the endpoint is never a cross-scope existence oracle. An environment-scoped
+/// principal cannot be honored by a site-only resource, so it fails closed to a
+/// 404 — the by-id mirror of `retain_site_scoped` returning an empty list.
+fn site_scope_guard_or_404(
+    session: &AuthSession,
+    site: &str,
+    request_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let env_scoped = session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if !env_scoped && ryuki_engine::auth::scope_permits(&session.site_scope, Some(site)) {
+        Ok(())
+    } else {
+        Err(status_404(request_id))
+    }
+}
+
 /// True iff the principal is scoped on EITHER axis (has any non-blank site or
 /// environment scope). Used to skip an extra pre-load round-trip for the common
 /// unrestricted case while still fail-closing for any scoped principal (#2).
@@ -22130,6 +22152,10 @@ async fn decommission_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<DecommissionPlanRequest>,
 ) -> ApiResult {
+    // A scoped principal may only plan a decommission for a site within its scope
+    // (#2). The site is a caller-supplied body field, so a 403 (not a 404) is
+    // correct here — there is no row to act as an existence oracle.
+    guard_body_site_scope(&session, &body.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let server_type = match body.server_type.as_str() {
@@ -22210,6 +22236,10 @@ async fn decommission_approve(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    // Scope guard BEFORE the engine state transition so an out-of-scope request
+    // 404s exactly like a missing one — never a 409 oracle leaking its status (#2).
+    site_scope_guard_or_404(&session, &req.site, &id)?;
+
     let before = crate::repos::decommissions::status_str(&req.status);
 
     // Approver = authenticated caller (from request extensions), never a
@@ -22256,6 +22286,9 @@ async fn decommission_quarantine(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    // Scope guard BEFORE the engine transition: out-of-scope 404s like a miss (#2).
+    site_scope_guard_or_404(&session, &req.site, &id)?;
+
     let before = crate::repos::decommissions::status_str(&req.status);
 
     let quarantined = server_decommission::quarantine_server(&req).map_err(|e| status_409(&e))?;
@@ -22300,6 +22333,9 @@ async fn decommission_execute(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
 
+    // Scope guard BEFORE the engine transition: out-of-scope 404s like a miss (#2).
+    site_scope_guard_or_404(&session, &req.site, &id)?;
+
     let before = crate::repos::decommissions::status_str(&req.status);
 
     let executed = server_decommission::execute_decommission(&req).map_err(|e| status_409(&e))?;
@@ -22332,13 +22368,20 @@ async fn decommission_execute(
     Ok(Json(serde_json::to_value(&executed).unwrap_or_default()))
 }
 
-async fn decommission_verify(Path(id): Path<String>) -> ApiResult {
+async fn decommission_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let req = crate::repos::decommissions::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+
+    // Scope guard: an out-of-scope request 404s like a missing one, so verify
+    // evidence is never a cross-site information leak (#2).
+    site_scope_guard_or_404(&session, &req.site, &id)?;
 
     // verify_decommission is evidence-only by engine design: it does not
     // transition status. The evidence collection is stateless and idempotent.
@@ -22357,6 +22400,9 @@ async fn decommission_rollback(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+
+    // Scope guard BEFORE the engine transition: out-of-scope 404s like a miss (#2).
+    site_scope_guard_or_404(&session, &req.site, &id)?;
 
     let before = crate::repos::decommissions::status_str(&req.status);
 
@@ -22392,11 +22438,15 @@ async fn decommission_rollback(
     Ok(Json(serde_json::to_value(&rolled_back).unwrap_or_default()))
 }
 
-async fn decommission_quarantine_inventory() -> ApiResult {
+async fn decommission_quarantine_inventory(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
         let requests = crate::repos::decommissions::list_quarantine(pool)
             .await
             .map_err(db_error)?;
+        // Narrow the cross-site inventory to the principal's site scope before
+        // building it — an unrestricted principal keeps all rows, a site-scoped
+        // one keeps only its site, an environment-scoped one keeps none (#2).
+        let requests = retain_site_scoped(&session, requests, |r| r.site.as_str());
         let inventory = server_decommission::get_quarantine_inventory(&requests);
         return Ok(Json(serde_json::to_value(inventory).unwrap_or_default()));
     }
@@ -22407,10 +22457,18 @@ async fn decommission_quarantine_inventory() -> ApiResult {
     ))
 }
 
-async fn decommission_get(Path(id): Path<String>) -> ApiResult {
+async fn decommission_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         return match crate::repos::decommissions::get(pool, &id).await {
-            Ok(Some(req)) => Ok(Json(serde_json::to_value(&req).unwrap_or_default())),
+            // An out-of-scope request 404s exactly like a missing one — by-id read
+            // is never a cross-site existence oracle for a scoped principal (#2).
+            Ok(Some(req)) => {
+                site_scope_guard_or_404(&session, &req.site, &id)?;
+                Ok(Json(serde_json::to_value(&req).unwrap_or_default()))
+            }
             Ok(None) => Err(status_404(&id)),
             Err(e) => Err(db_error(e)),
         };
@@ -50950,7 +51008,12 @@ mod server_decommission_db_tests {
         // id must be parseable as a UUID
         uuid::Uuid::parse_str(&id).expect("id is a valid UUID");
 
-        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+        let Ok(Json(got)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("get after plan failed");
         };
@@ -50965,6 +51028,74 @@ mod server_decommission_db_tests {
             "Planned",
             "status after plan must be Planned"
         );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// #2 RBAC: decommission requests are site-only. A principal scoped to a
+    /// different site cannot read, verify, approve, or plan another site's
+    /// decommission — by-id access 404s (no existence oracle), and a body-supplied
+    /// foreign site on plan is a 403. An in-scope principal is unaffected.
+    #[tokio::test]
+    async fn decommission_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a DEFRA decommission as an unrestricted admin.
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let Ok(Json(created)) = decommission_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body(&suffix)),
+        )
+        .await
+        else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // A GBLON-site-scoped principal (DEFRA is out of scope).
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+
+        let got = decommission_get(AuthExtractor(scoped()), Path(id.clone())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope get must 404: {got:?}"
+        );
+        let v = decommission_verify(AuthExtractor(scoped()), Path(id.clone())).await;
+        assert!(
+            matches!(v, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope verify must 404: {v:?}"
+        );
+        // approve must 404 BEFORE any engine state 409 — no status oracle.
+        let a = decommission_approve(Path(id.clone()), Extension(scoped())).await;
+        assert!(
+            matches!(a, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope approve must 404: {a:?}"
+        );
+
+        // Planning a foreign-site (DEFRA) decommission is a 403 (body-supplied site).
+        let p = decommission_plan(
+            AuthExtractor(scoped()),
+            Json(plan_body(&uuid::Uuid::new_v4().to_string())),
+        )
+        .await;
+        assert!(
+            matches!(p, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope plan must 403: {p:?}"
+        );
+
+        // Positive: a DEFRA-scoped principal CAN read it (guard is not over-broad).
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let ok = decommission_get(AuthExtractor(defra), Path(id.clone())).await;
+        assert!(ok.is_ok(), "in-scope DEFRA get must succeed: {ok:?}");
 
         cleanup(pool, &id).await;
     }
@@ -51005,7 +51136,12 @@ mod server_decommission_db_tests {
         assert_eq!(approved["status"].as_str().unwrap_or(""), "Approved");
 
         // verify persisted
-        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+        let Ok(Json(got)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("get after approve failed");
         };
@@ -51023,7 +51159,12 @@ mod server_decommission_db_tests {
         };
         assert_eq!(quarantined["status"].as_str().unwrap_or(""), "Quarantined");
 
-        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+        let Ok(Json(got)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("get after quarantine failed");
         };
@@ -51056,14 +51197,24 @@ mod server_decommission_db_tests {
             "decommission execute must write a durable audit row"
         );
 
-        let Ok(Json(got)) = decommission_get(Path(id.clone())).await else {
+        let Ok(Json(got)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("get after execute failed");
         };
         assert_eq!(got["status"].as_str().unwrap_or(""), "Executed");
 
         // 5. verify
-        let Ok(Json(_evidence)) = decommission_verify(Path(id.clone())).await else {
+        let Ok(Json(_evidence)) = decommission_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup(pool, &id).await;
             panic!("verify failed");
         };
@@ -51081,7 +51232,12 @@ mod server_decommission_db_tests {
         };
 
         let random_id = uuid::Uuid::new_v4().to_string();
-        let Err((status, _)) = decommission_get(Path(random_id)).await else {
+        let Err((status, _)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(random_id),
+        )
+        .await
+        else {
             panic!("expected 404 for non-existent UUID");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -51096,7 +51252,12 @@ mod server_decommission_db_tests {
             return;
         };
 
-        let Err((status, _)) = decommission_get(Path("not-a-uuid".to_string())).await else {
+        let Err((status, _)) = decommission_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("not-a-uuid".to_string()),
+        )
+        .await
+        else {
             panic!("expected 404 for malformed id");
         };
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -51145,7 +51306,9 @@ mod server_decommission_db_tests {
         };
 
         // inventory must include our server
-        let Ok(Json(inventory)) = decommission_quarantine_inventory().await else {
+        let Ok(Json(inventory)) =
+            decommission_quarantine_inventory(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             cleanup(pool, &id).await;
             panic!("inventory call failed");
         };
