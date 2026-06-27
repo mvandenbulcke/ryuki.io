@@ -1,6 +1,15 @@
 # Swarm #2 — site/env RBAC enforcement: verified gap plan (2026-06-27)
 
-Authoritative work-list from the 203-agent verified audit (149 handlers already enforced). **190 confirmed-gap handlers** across 44 domain groups. Batch 1 (request lifecycle) is SHIPPED (commit b6b3e45).
+## SHIPPED (progress)
+- [x] **request lifecycle** — `b6b3e45` (chokepoint in apply_transition_audited + after-load guards on 13 handlers + create body guard; site+env)
+- [x] **certificates** — `29d5309` (site-only; full CRUD; +AuthExtractor on 5)
+- [x] **storage** volumes/arrays — `4f487d7` (site-only; by-id reads + load-then-guard writes)
+- [x] **k8s namespaces** — `e696c29` (site-only; get + update_quota/suspend/resume/terminate pre-load)
+- [x] **gmsa** — `c998ffc` (site-only; create/assign/remove/rotate/test/expiring; inventory pre-existing)
+
+Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
+
+Authoritative work-list from the 203-agent verified audit (149 handlers already enforced). **190 confirmed-gap handlers** across 44 domain groups.
 
 Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment,&id)?` right after load (SITE-ONLY tables pass `""` for environment, which fails-closed for env-scoped principals); list/query -> `enforce_site_scope` / `retain_site_scoped`; write-from-body -> `enforce_scope_filters`. CAVEATS: some handlers take no session (need AuthExtractor added = makes an open read require auth); some read child tables (e.g. rotation_runs) needing the parent's site via join; confirm each table actually has a site column before guarding.
 
