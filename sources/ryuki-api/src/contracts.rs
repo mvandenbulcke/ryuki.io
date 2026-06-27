@@ -26278,6 +26278,9 @@ async fn runbook_start(
     Json(body): Json<RunbookStartRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only start a runbook in their own site;
+    // env-scoped principals are rejected (runbook_executions is site-only).
+    guard_body_site_scope(&session, &body.site)?;
 
     // actor = authenticated caller (from request extensions), never a client
     // body field — the audit trail must name the real principal.
@@ -26310,19 +26313,27 @@ async fn runbook_start(
 }
 
 /// Fetch a persisted runbook execution by id. 503/404 as appropriate.
-async fn runbook_get_execution(Path(id): Path<String>) -> ApiResult {
+async fn runbook_get_execution(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let (exec, _version) = crate::repos::runbook_executions::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     Ok(Json(serde_json::to_value(&exec).unwrap_or_default()))
 }
 
 /// Execute a step on a persisted runbook execution. 503/404/409 as appropriate.
-async fn runbook_execute_step(Path(params): Path<(String, u32)>) -> ApiResult {
+async fn runbook_execute_step(
+    AuthExtractor(session): AuthExtractor,
+    Path(params): Path<(String, u32)>,
+) -> ApiResult {
     let (id, step_order) = params;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
@@ -26330,6 +26341,8 @@ async fn runbook_execute_step(Path(params): Path<(String, u32)>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the step execution / status-409 leak.
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     let updated =
         runbook_execution::execute_step_pure(&exec, step_order).map_err(|e| status_409(&e))?;
@@ -26358,6 +26371,8 @@ async fn runbook_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     let before = crate::repos::runbook_executions::status_str(&exec.status);
 
@@ -26405,6 +26420,8 @@ async fn runbook_complete(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     let before = crate::repos::runbook_executions::status_str(&exec.status);
 
@@ -26450,6 +26467,8 @@ async fn runbook_fail(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     let before = crate::repos::runbook_executions::status_str(&exec.status);
 
@@ -26491,6 +26510,8 @@ async fn runbook_rollback(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &exec.site, "", &id)?;
 
     let before = crate::repos::runbook_executions::status_str(&exec.status);
 
@@ -26543,7 +26564,7 @@ async fn runbook_executions_list(
 
 /// Return all non-terminal runbook executions across all sites.
 /// 503 when no database is configured.
-async fn runbook_active() -> ApiResult {
+async fn runbook_active(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     // List all sites and merge; the engine's is_terminal classifier determines
@@ -26561,6 +26582,8 @@ async fn runbook_active() -> ApiResult {
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_error)?;
 
+    // #2: a scoped principal only sees its own site's active executions (env-scoped -> none).
+    let rows = retain_site_scoped(&session, rows, |e| e.site.as_str());
     let active: Vec<_> = rows
         .into_iter()
         .filter(|e| {
@@ -40211,6 +40234,65 @@ mod db_lifecycle_tests {
             assert!(
                 matches!(promote, Err((StatusCode::NOT_FOUND, _))),
                 "out-of-scope image_factory_promote must 404: {promote:?}"
+            );
+        }
+    }
+
+    /// #2 RBAC: the runbook-execution handlers are site-scoped (runbook_executions
+    /// has site). A GBLON principal gets 403 starting a runbook in DEFRA and 404
+    /// reading a DEFRA execution; its own site and an unrestricted principal pass.
+    /// start uses an invalid runbook id so it 400s after the gate (no insert).
+    #[tokio::test]
+    async fn runbook_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        let start_req = |site: &str| RunbookStartRequest {
+            runbook_id: "rb-nonexistent".into(),
+            site: site.into(),
+        };
+
+        // start in a foreign site -> 403.
+        let foreign = runbook_start(Extension(gblon.clone()), Json(start_req("DEFRA"))).await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope runbook_start must be forbidden: {foreign:?}"
+        );
+
+        // own + unrestricted pass the gate (then 400 on the bogus runbook, no insert).
+        let own = runbook_start(Extension(gblon.clone()), Json(start_req("GBLON"))).await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope runbook_start must pass the gate: {own:?}"
+        );
+        let any = runbook_start(
+            Extension(AuthSession::static_dry_run()),
+            Json(start_req("DEFRA")),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted runbook_start must pass the gate: {any:?}"
+        );
+
+        // by-id get a DEFRA execution -> 404 (when present).
+        if let Some(ex) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM runbook_executions WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let got = runbook_get_execution(AuthExtractor(gblon), Path(ex)).await;
+            assert!(
+                matches!(got, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope runbook_get_execution must 404: {got:?}"
             );
         }
     }
