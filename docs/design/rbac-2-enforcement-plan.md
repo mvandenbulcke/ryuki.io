@@ -31,6 +31,7 @@
 - [x] **network readiness** — `8becfe1` (switch_ports/vlans/port_reservations site-only; 7 (contract static); reads enforce_site_scope, reserves body-guard, release pre-load guard before status-branch (codex caught 409-vs-404 oracle + wrong-key regression), ports_inventory retain)
 - [x] **outage comms** — `b000cbe` (outage_notices site-only; 10 (list pre-scoped, contract static); create body-guard, get/preview tightened 403→404 oracle, send/ack/complete/cancel by-id guard, active/history/upcoming site-query guard; codex APPROVED first pass)
 - [x] **synthetic health** — `c14b03b` (health_checks site-only; 2 by-id (run_all/dashboard/outages pre-scoped); run_check guard before run, status scopes via parent check; codex APPROVED first pass)
+- [x] **metric budgets** — `90d6902` (metric_budgets DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) before the write; platform-wide NULL denied to scoped on that axis; codex APPROVED after containment clarification)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -266,8 +267,8 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **synthetic_status** [medium] `sources/ryuki-api/src/contracts.rs:10371` — Add `AuthExtractor(session): AuthExtractor` to the handler signature. Since check_results carries no site column, load the parent check to obtain its site: `let check = crate::repo
 
 ## metrics_budget  (2)
-- [ ] **metrics_budget_update** [high] `sources/ryuki-api/src/contracts.rs:19569` — In metrics_budget_update (contracts.rs:19569), after opening the transaction (after line 19600) and BEFORE the UPDATE, load the row scope and guard: let existing: Option<(Option<St
-- [ ] **metrics_budget_delete** [?] `sources/ryuki-api/src/contracts.rs:19640` — Load the row's scope first, then guard before the DELETE. Inside the existing tx (after pool.begin()), add: let row: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELE
+- [x] **metrics_budget_update** [high] `sources/ryuki-api/src/contracts.rs:19569` — In metrics_budget_update (contracts.rs:19569), after opening the transaction (after line 19600) and BEFORE the UPDATE, load the row scope and guard: let existing: Option<(Option<St
+- [x] **metrics_budget_delete** [?] `sources/ryuki-api/src/contracts.rs:19640` — Load the row's scope first, then guard before the DELETE. Inside the existing tx (after pool.begin()), add: let row: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELE
 
 ## slo  (2)
 - [ ] **slo_update** [high] `sources/ryuki-api/src/contracts.rs:19683` — After loading the row but BEFORE applying the UPDATE, add a by-id scope guard. Concretely: change the UPDATE to first read the target's (site, environment) — either a `SELECT site,
