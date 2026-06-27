@@ -15626,6 +15626,16 @@ async fn requests_verify(
         // guard drops here
     };
 
+    // #2: by-id scope guard on the in-memory request before the transition (the
+    // DB branch above already guards). Out-of-scope -> 404, never a cross-scope
+    // transition or existence oracle; unrestricted principals pass.
+    scope_guard_or_404(
+        &session,
+        &cloned_request.site,
+        &cloned_request.environment,
+        &request_id,
+    )?;
+
     // Step 2: compute evidence + build verified_request + enrich — no lock held.
     let evidence = request_lifecycle::verify_request(&cloned_request).map_err(map_engine_error)?;
     let mut verified_request = cloned_request.clone();
@@ -15748,6 +15758,15 @@ async fn requests_protect(
             .ok_or_else(|| status_404(&request_id))?;
         store[idx].clone()
     };
+
+    // #2: by-id scope guard on the in-memory request before the transition (the
+    // DB branch above already guards). Out-of-scope -> 404; unrestricted pass.
+    scope_guard_or_404(
+        &session,
+        &cloned_request.site,
+        &cloned_request.environment,
+        &request_id,
+    )?;
 
     let evidence = request_lifecycle::protect_request(&cloned_request).map_err(map_engine_error)?;
     let mut protected_request = cloned_request.clone();
@@ -34133,6 +34152,43 @@ mod unit_tests {
         let _ = requests_plan(Path(id.to_string()), AuthExtractor(operator))
             .await
             .expect("plan");
+    }
+
+    /// #2 RBAC: the NO-DB (in-memory) branches of requests_verify / requests_protect
+    /// are site/environment-scoped — a scoped principal verifying/protecting an
+    /// out-of-scope request gets a 404 (not a cross-scope transition or oracle),
+    /// while an in-scope principal passes the scope gate. (The DB branches are
+    /// covered by lifecycle_transition_is_site_scoped + the chokepoint.)
+    #[tokio::test]
+    async fn verify_protect_no_db_are_site_scoped() {
+        let id = format!("req-scope-{}", Uuid::new_v4());
+        // Seeds a DEFRA/production request into the in-memory store (no-DB path).
+        seed_planned_request(&id, "alice").await;
+
+        // Out-of-scope (GBLON) → 404 from the no-DB scope guard.
+        let mut gblon = static_admin_operator_session();
+        gblon.site_scope = vec!["GBLON".into()];
+        let v = requests_verify(Path(id.clone()), AuthExtractor(gblon.clone())).await;
+        assert!(
+            matches!(v, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope verify must 404: {v:?}"
+        );
+        let p = requests_protect(Path(id.clone()), AuthExtractor(gblon)).await;
+        assert!(
+            matches!(p, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope protect must 404: {p:?}"
+        );
+
+        // In-scope (DEFRA/production) passes the scope gate (the engine then
+        // rejects the wrong-state transition, but it is never the scope 404).
+        let mut defra = static_admin_operator_session();
+        defra.site_scope = vec!["DEFRA".into()];
+        defra.environment_scope = vec!["production".into()];
+        let v2 = requests_verify(Path(id.clone()), AuthExtractor(defra)).await;
+        assert!(
+            !matches!(v2, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope verify must pass the scope gate: {v2:?}"
+        );
     }
 
     #[test]
