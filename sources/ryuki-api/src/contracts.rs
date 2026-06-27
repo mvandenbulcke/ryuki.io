@@ -19317,14 +19317,22 @@ pub(crate) async fn slo_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, sql
             },
         )
         .await?;
-        // #11 slice 2f: on the BREACH transition, push a portal notification to
-        // the monitoring role in the SAME tx (atomic with the event + flag).
-        if now_breaching {
-            let draft = ryuki_engine::notifications::draft_for_alert(
-                "slo.breach",
-                &s.id,
-                ryuki_engine::notifications::Severity::Critical,
-            );
+        // #11 slice 2f/2g: push a portal notification to the monitoring role in
+        // the SAME tx (atomic with the event + flag) — Critical on breach, Success
+        // on recovery, so operators get both the alert and the all-clear.
+        {
+            let (event_type, severity) = if now_breaching {
+                (
+                    "slo.breach",
+                    ryuki_engine::notifications::Severity::Critical,
+                )
+            } else {
+                (
+                    "slo.recovered",
+                    ryuki_engine::notifications::Severity::Success,
+                )
+            };
+            let draft = ryuki_engine::notifications::draft_for_alert(event_type, &s.id, severity);
             crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
         }
         sqlx::query("UPDATE slo_definitions SET breaching = $1, updated_at = NOW() WHERE id = $2")
@@ -19489,13 +19497,21 @@ pub(crate) async fn budget_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, 
             },
         )
         .await?;
-        // #11 slice 2f: notify the monitoring role on the breach transition.
-        if now_breaching {
-            let draft = ryuki_engine::notifications::draft_for_alert(
-                "budget.breach",
-                &b.id,
-                ryuki_engine::notifications::Severity::Warning,
-            );
+        // #11 slice 2f/2g: notify the monitoring role on both directions —
+        // Warning on breach, Success on recovery.
+        {
+            let (event_type, severity) = if now_breaching {
+                (
+                    "budget.breach",
+                    ryuki_engine::notifications::Severity::Warning,
+                )
+            } else {
+                (
+                    "budget.recovered",
+                    ryuki_engine::notifications::Severity::Success,
+                )
+            };
+            let draft = ryuki_engine::notifications::draft_for_alert(event_type, &b.id, severity);
             crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
         }
         sqlx::query("UPDATE metric_budgets SET breaching = $1, updated_at = NOW() WHERE id = $2")
@@ -37820,6 +37836,20 @@ mod db_lifecycle_tests {
                 .await
                 .expect("read breaching flag");
         assert!(!breaching, "SLO must no longer be breaching after recovery");
+
+        // #11 slice 2g: recovery pushed a Success "all-clear" notification too.
+        let recovered_n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_notifications \
+             WHERE event = 'slo.recovered' AND severity = 'Success' AND body LIKE $1",
+        )
+        .bind(format!("%{slo_id}%"))
+        .fetch_one(pool)
+        .await
+        .expect("count recovery notifications");
+        assert_eq!(
+            recovered_n, 1,
+            "recovery must push exactly one Success notification"
+        );
 
         // Cleanup (domain_events is append-only and intentionally retained).
         sqlx::query("DELETE FROM portal_notifications WHERE body LIKE $1")

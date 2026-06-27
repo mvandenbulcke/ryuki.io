@@ -365,6 +365,13 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   domain-event alert-generation feature is now end-to-end — generate → classify →
   feed → ack → in-app notify. The remaining EXTERNAL transport
   (email/webhook/chat) is a separate tracked feature (tracker #9).
+- **STATUS (2026-06-27) — SLICE 2g (recovery notifications):** the push channel is
+  now symmetric — each emitter notifies on BOTH directions: breach
+  (`slo.breach`=Critical, `budget.breach`/`agent.offline`=Warning) AND recovery
+  (`slo.recovered`/`budget.recovered`/`agent.online`=Success), so operators get
+  the all-clear, not just the alarm. `draft_for_alert` wording made neutral
+  ("Operational event") to cover both. SLO scan DB test asserts exactly one
+  Success recovery notification on recovery. All emitter/engine tests green.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

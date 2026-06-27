@@ -130,13 +130,14 @@ pub fn drafts_for_transition(
     }
 }
 
-/// Pure: produce the portal-notification draft for an OPERATIONAL alert (#11
-/// slice 2f) — an SLO/budget breach or an agent going offline. Operational alerts
-/// have no request owner, so they route to the `MonitoringOperator` role (the
-/// team that watches platform health). The body is synthesised from structured
-/// fields only — no user free-text — so nothing sensitive leaks through the push
-/// channel. `severity` is the alert's severity as already classified upstream
-/// (`event_alerts`), mapped to the portal scale by the caller.
+/// Pure: produce the portal-notification draft for an OPERATIONAL event (#11
+/// slice 2f/2g) — an SLO/budget breach or agent-offline (the alert), AND the
+/// matching recovery (`*.recovered` / `agent.online`) so operators get an "all
+/// clear" too. Operational events have no request owner, so they route to the
+/// `MonitoringOperator` role (the team that watches platform health). The body is
+/// synthesised from structured fields only — no user free-text — so nothing
+/// sensitive leaks through the push channel. `severity` is supplied by the caller
+/// (breach = Warning/Critical per `event_alerts`; recovery = Success).
 pub fn draft_for_alert(
     event_type: &str,
     aggregate_id: &str,
@@ -147,8 +148,8 @@ pub fn draft_for_alert(
         recipient_id: "MonitoringOperator".to_string(),
         event: event_type.to_string(),
         severity,
-        title: format!("Operational alert: {event_type}"),
-        body: format!("{event_type} fired for {aggregate_id}; review the alert feed."),
+        title: format!("Operational event: {event_type}"),
+        body: format!("{event_type} for {aggregate_id}; review the alert feed."),
     }
 }
 
