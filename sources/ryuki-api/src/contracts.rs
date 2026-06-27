@@ -13918,6 +13918,7 @@ async fn requests_approve_live_apply(
         spec: serde_json::Value,
         evidence_digest: Option<String>,
         req_status: String,
+        site: String,
     }
     // The latest TERMINAL, genuinely-successful LivePlan is what gets approved:
     // result_status 'planned' (terraform plan) or 'check_ok' (ansible --check),
@@ -13925,7 +13926,7 @@ async fn requests_approve_live_apply(
     // maps from applied/verified results). JOIN requests both to prove
     // existence and to read the request's own status. Newest by COMPLETION.
     let plan: Option<PlanJobRow> = sqlx::query_as(
-        "SELECT j.platform, j.spec, j.evidence_digest, r.status AS req_status \
+        "SELECT j.platform, j.spec, j.evidence_digest, r.status AS req_status, r.site AS site \
          FROM agent_jobs j JOIN requests r ON r.id = j.request_id \
          WHERE j.request_id = $1 AND j.mode = 'LivePlan' \
            AND j.result_status IN ('planned', 'check_ok') \
@@ -13964,6 +13965,10 @@ async fn requests_approve_live_apply(
             })),
         ));
     }
+
+    // #10: do not mint a live-execution grant for a site that is degraded or
+    // unreachable (enforces the degradation rule, not just advertises it).
+    enforce_site_operational(pool, &plan.site).await?;
 
     let digest = plan.evidence_digest.unwrap_or_default();
 
@@ -19881,6 +19886,42 @@ type ScopeFilters = (Option<String>, Option<String>);
 /// Enforce the session's site/environment scopes (#2) against the requested
 /// filters, returning the EFFECTIVE filters the handler must query with.
 ///
+/// #10: enforce the `write-execution-blocked-when-degraded` degradation rule —
+/// refuse a live-execution grant when the target site is degraded or
+/// unreachable. The persisted site_status (swarm #8) is authoritative; a
+/// healthy/recovering site, or one with no status row, is allowed. A DB read
+/// error is allowed (fail-open + logged) so a transient status-store blip cannot
+/// block ALL live execution — matching the degradation read-path posture.
+pub(crate) async fn enforce_site_operational(
+    pool: &sqlx::PgPool,
+    site: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    use ryuki_engine::degradation_mode::SiteDegradationState;
+    match crate::repos::degradation::get_site_status(pool, site).await {
+        Ok(Some(s))
+            if s.state == SiteDegradationState::Degraded
+                || s.state == SiteDegradationState::Unreachable =>
+        {
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!(
+                        "site '{site}' is in degradation mode (state: {}); live write execution is blocked until it recovers",
+                        s.state
+                    ),
+                    "site": site,
+                    "state": s.state.to_string(),
+                })),
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!(error = %e, %site, "degradation gate: site_status read failed; allowing execution (fail-open)");
+            Ok(())
+        }
+    }
+}
+
 /// Security contract: an UNRESTRICTED principal (empty scope) reads any scope
 /// (the filters pass through verbatim). A SCOPED principal may only read within
 /// its authorized scopes — and crucially, omitting the filter NARROWS the read
@@ -35978,6 +36019,36 @@ mod db_lifecycle_tests {
             before + 2,
             "X-Total-Count (from COUNT(*)) must grow by exactly the 2 created rows"
         );
+    }
+
+    /// #10: enforce_site_operational blocks a degraded/unreachable site (the
+    /// live-execution gate) and allows healthy/unknown sites — read from the
+    /// persisted site_status (mig 025 seed). Non-mutating.
+    #[tokio::test]
+    async fn enforce_site_operational_blocks_degraded_sites() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // GBLON seeded 'degraded', NLAMS seeded 'unreachable' → blocked (503).
+        let gblon = super::enforce_site_operational(pool, "GBLON").await;
+        assert!(
+            matches!(gblon, Err((StatusCode::SERVICE_UNAVAILABLE, _))),
+            "degraded site GBLON must be blocked: {gblon:?}"
+        );
+        let nlams = super::enforce_site_operational(pool, "NLAMS").await;
+        assert!(
+            matches!(nlams, Err((StatusCode::SERVICE_UNAVAILABLE, _))),
+            "unreachable site NLAMS must be blocked: {nlams:?}"
+        );
+        // DEFRA seeded 'healthy' → allowed; an unknown site (no row) → allowed.
+        super::enforce_site_operational(pool, "DEFRA")
+            .await
+            .expect("healthy site DEFRA must be allowed");
+        super::enforce_site_operational(pool, "ZZ-NONEXISTENT")
+            .await
+            .expect("a site with no status row must be allowed");
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the

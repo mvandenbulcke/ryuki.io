@@ -45,7 +45,7 @@ implementing **all 66**. This file tracks execution.
 | 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
 | 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
-| 16 | [ ] | Enforced site degradation mode (write gating) | Resil | L | H | — |
+| 16 | [x] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [~] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
 | 19 | [~] | Connection health monitoring (scheduled + history) | Integ | M | H | — |
@@ -121,7 +121,15 @@ firewall, LB, secrets, certificates, gMSA/AD, storage/hw/k8s, DR, backup,
 runbook, decommission, emergency, shift, deployments, ServiceNow, etc.) now
 writes a durable hash-chained audit_log row atomically; repo fns refactored to
 share the caller's tx; ~126 handlers; high-volume telemetry excluded by design**.
-Notifications deferred for #5/#6.
+Notifications deferred for #5/#6. Swarm #8 degradation persistence — `site_status`/
+`component_status` are now DB-backed and survive restart via `repos/degradation.rs`
+(`af46a7d`); swarm #9 requests-list total — exposed via `X-Total-Count` header,
+backward-compatible (`2f86602`); swarm #12 query safety — per-statement (30s) +
+per-lock (10s) timeouts on every pool connection (`6602e57`); **swarm #10
+degradation ENFORCEMENT (tracker #16) — `enforce_site_operational` returns 503
+when the target site is degraded/unreachable, gating BOTH live-apply grant paths
+(`requests_approve_live_apply` + admin `admin_approve_live_apply_job`) before the
+CP-signed grant is minted (`<this>`)**.
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),

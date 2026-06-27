@@ -1791,6 +1791,20 @@ pub async fn admin_approve_live_apply_job(
     // The approver MUST come from the verified session — never from the request body.
     let approver = session.user_id.as_str();
 
+    // #10: enforce the `write-execution-blocked-when-degraded` rule on the admin
+    // grant path too — this is the second grant-minting chokepoint alongside
+    // `requests_approve_live_apply`. Resolve the target site from the request row
+    // and refuse if the site is degraded/unreachable. An unknown request_id (no
+    // row) is left to `create_live_apply_job` to reject with its proper error.
+    let site: Option<String> = sqlx::query_scalar("SELECT site FROM requests WHERE id = $1")
+        .bind(body.request_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+    if let Some(site) = site {
+        crate::contracts::enforce_site_operational(pool, &site).await?;
+    }
+
     approve_live_apply_with(pool, cp_key, approver, &body).await
 }
 

@@ -250,6 +250,22 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src (degradation mode referenced in contracts but no runtime enforcement) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** True
 - **evidence:** Tracker item #16 'Enforced site degradation mode (write gating)' is []. Contracts show degradation_mode references in JSON schemas (contracts.rs) but no actual handler that checks site_status.state and returns 503 or enforces read-only writes. If GBLON is marked 'degraded', the API will still accept mutations. site_status table is seeded but never read. Suggest: implement a middleware or per-handler check that reads site_status.state and if != 'healthy', return 503 Service Unavailable or enforce read-only (401 on POST/PUT/DELETE).
 - **verified:** This is a genuine, concrete gap: a site_status table is created by migration 025, seeded with test data (GBLON marked degraded), and exists in the database. However, the API layer never reads from it. All mutation handlers (requests_create, requests_execute, requests_approve, etc.) skip degradation checks entirely. The pure degradation_mode engine functions only return hard-coded in-memory test data, never querying the persistent table. Read-only endpoints exist (/api/platform/degradation/*) but mutation paths ignore them. The gap is implementable: add a database query in a middleware or per-h
+- **STATUS (2026-06-27) — COMPLETE:** the degradation rule is now ENFORCED at
+  the live-write chokepoint. New `enforce_site_operational(pool, site)` reads the
+  DB-backed `site_status` (swarm #8) and returns `503 Service Unavailable` when
+  the target site is `Degraded` or `Unreachable`; `Healthy`/`Recovering`/no-row
+  pass. Both grant-minting paths are gated BEFORE the CP-signed LiveApply grant
+  is created: `requests_approve_live_apply` (plan query now selects `r.site`,
+  gate after the 404/409/is_concluded checks) AND the admin endpoint
+  `admin_approve_live_apply_job` (resolves site from `request_id`). A DB
+  read error on the status itself is fail-open + logged (a status-store blip
+  cannot block ALL live execution — matches the #8 read posture); the site
+  resolution itself maps to `db_err`. DB-gated test asserts seeded
+  GBLON/NLAMS → 503, DEFRA/unknown → allowed. Scope: this gates LIVE WRITE
+  EXECUTION (the highest-leverage point); request creation and the non-live
+  per-domain `*_execute` paths are intentionally out of scope (advisory-read
+  endpoints remain for visibility). Fresh-context review caught the admin-path
+  bypass before merge.
 
 ### 11. No domain event stream or alert generation from operational events
 - **area:** ryuki-engine/src/ (lib.rs, alert_routing_engine.rs), migrations/ · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** True
