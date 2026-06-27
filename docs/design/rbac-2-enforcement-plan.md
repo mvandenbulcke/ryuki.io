@@ -23,6 +23,7 @@
 - [x] **firmware lifecycle** — `a25b7fd` (firmware_records site-only, exceptions child via device-join; 9 handlers (audit grouped as 5); device_get/check/request/revoke load+guard, lists+reports retain, exceptions scoped via device-id set/join; codex APPROVED first pass)
 - [x] **compliance reporting** — `e541fee` (controls/reports site-only, findings via report-join, frameworks global; 5 (list/generate/findings_list/summary pre-scoped); custom-message 404 inline-match; codex APPROVED first pass)
 - [x] **noise remediation** — `0724731` (noisy_triggers NO site col → HOST-DERIVED via site_from_host; 7 handlers (audit said 4); detect/flapping body-guard, suggest/suppress/resolve host pre-load guard, report enforce_site_scope, suppressed_list host-filter; no-DB fail-closed; codex caught suggest full-row-before-guard oracle, fixed)
+- [x] **vm day-2** — `a88494b` (vm_day2_operations DUAL-AXIS site+environment; 4 (contract static); plan enforce_scope_filters, validate/execute/verify scope_guard_or_404 before status-409; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -214,10 +215,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **noise_resolve** [medium] `sources/ryuki-api/src/contracts.rs:10191` — Helper: ryuki_engine::auth::scope_permits against the DERIVED site (there is no site column to bind, and enforce_scope_filters expects a real (site,env) — not applicable here). Sou
 
 ## vm_day2  (4)
-- [ ] **vm_day2_plan** [high] `sources/ryuki-api/src/contracts.rs:20205` — 
-- [ ] **vm_day2_validate** [high] `sources/ryuki-api/src/contracts.rs:20244` — Add `Extension(session): Extension<AuthSession>` to the vm_day2_validate signature (the auth middleware already injects it for sibling enforced handlers). Then immediately after lo
-- [ ] **vm_day2_execute** [high] `sources/ryuki-api/src/contracts.rs:20285` — 
-- [ ] **vm_day2_verify** [high] `sources/ryuki-api/src/contracts.rs:20317` — Add `AuthExtractor(session): AuthExtractor` as the first param of vm_day2_verify (contracts.rs:20317). After the op is loaded (after line 20323, before the status check at 20326), 
+- [x] **vm_day2_plan** [high] `sources/ryuki-api/src/contracts.rs:20205` — 
+- [x] **vm_day2_validate** [high] `sources/ryuki-api/src/contracts.rs:20244` — Add `Extension(session): Extension<AuthSession>` to the vm_day2_validate signature (the auth middleware already injects it for sibling enforced handlers). Then immediately after lo
+- [x] **vm_day2_execute** [high] `sources/ryuki-api/src/contracts.rs:20285` — 
+- [x] **vm_day2_verify** [high] `sources/ryuki-api/src/contracts.rs:20317` — Add `AuthExtractor(session): AuthExtractor` as the first param of vm_day2_verify (contracts.rs:20317). After the op is loaded (after line 20323, before the status check at 20326), 
 
 ## oob  (4)
 - [ ] **oob_inventory / oob_failing** [high] `sources/ryuki-api/src/contracts.rs:22900` — 
