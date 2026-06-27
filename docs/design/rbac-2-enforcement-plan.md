@@ -19,6 +19,7 @@
 - [x] **file shares** — `3ecfec9` (site-only; 5 of 8 (list/recert-due/stale-owners pre-scoped, contract static); by-id reads + recertify CAS + ACL open-access/report/revoke all load+guard the parent share before child ACL access; codex APPROVED first pass)
 - [x] **site degradation** — `8bafeb6` (site_status keyed by site; 5 of 7 (rules/contract pure); check/enter/exit guard the Path-site before both DB+in-memory; global/degraded retain on DB + fail-closed fallback; codex APPROVED first pass)
 - [x] **maintenance calendar** — `3d3b4b3` (maintenance_windows site-only; 5 (schedule pre-scoped, contract static); conflicts/upcoming/active/month site-query guard (Json→ApiResult); cancel DB scope-arm + engine-fallback fail-closed; codex caught the unguarded cancel fallback, fixed)
+- [x] **zabbix drift** — `3380fe9` (drift_reports site-only; 5 (detect pre-scoped, contract static); summary enforce_site_scope; plan/validate/execute/verify by-id guard before remediation/409; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -176,11 +177,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **maintenance_calendar_cancel** [high] `sources/ryuki-api/src/contracts.rs:7992` — Resource is site-only (no environment axis) and the row is already loaded by the pre-SELECT, so use the post-load site guard. Right before `let mut tx = pool.begin()` (line 8022), 
 
 ## zabbix  (5)
-- [ ] **zabbix_drift_summary** [high] `sources/ryuki-api/src/contracts.rs:9727` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param of zabbix_drift_summary, then replace `let site = query.site.unwrap_or_else(|| "DEFRA".to_string());` with 
-- [ ] **zabbix_drift_plan** [high] `sources/ryuki-api/src/contracts.rs:9758` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then AFTER loading the report and BEFORE the transition, enforce site scope using the row's loaded site. Since
-- [ ] **zabbix_drift_validate** [high] `sources/ryuki-api/src/contracts.rs:9779` — Add AuthSession + the canonical by-id post-load guard. Change the signature to `async fn zabbix_drift_validate(AuthExtractor(session): AuthExtractor, Path(drift_id): Path<String>)`
-- [ ] **zabbix_drift_execute** [high] `sources/ryuki-api/src/contracts.rs:9800` — Add a session arg to the handler: `async fn zabbix_drift_execute(session: AuthSession, Path(drift_id): Path<String>)`. After loading the report (contracts.rs:9805), before execute_
-- [ ] **zabbix_drift_verify** [high] `sources/ryuki-api/src/contracts.rs:9822` — Change the signature to take the session: `async fn zabbix_drift_verify(session: AuthSession, Path(drift_id): Path<String>)`. After the report is fetched (contracts.rs:9824-9827) a
+- [x] **zabbix_drift_summary** [high] `sources/ryuki-api/src/contracts.rs:9727` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param of zabbix_drift_summary, then replace `let site = query.site.unwrap_or_else(|| "DEFRA".to_string());` with 
+- [x] **zabbix_drift_plan** [high] `sources/ryuki-api/src/contracts.rs:9758` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then AFTER loading the report and BEFORE the transition, enforce site scope using the row's loaded site. Since
+- [x] **zabbix_drift_validate** [high] `sources/ryuki-api/src/contracts.rs:9779` — Add AuthSession + the canonical by-id post-load guard. Change the signature to `async fn zabbix_drift_validate(AuthExtractor(session): AuthExtractor, Path(drift_id): Path<String>)`
+- [x] **zabbix_drift_execute** [high] `sources/ryuki-api/src/contracts.rs:9800` — Add a session arg to the handler: `async fn zabbix_drift_execute(session: AuthSession, Path(drift_id): Path<String>)`. After loading the report (contracts.rs:9805), before execute_
+- [x] **zabbix_drift_verify** [high] `sources/ryuki-api/src/contracts.rs:9822` — Change the signature to take the session: `async fn zabbix_drift_verify(session: AuthSession, Path(drift_id): Path<String>)`. After the report is fetched (contracts.rs:9824-9827) a
 
 ## firmware  (5)
 - [ ] **firmware_device_get / firmware_check_compliance** [high] `sources/ryuki-api/src/contracts.rs:25619` — Inject AuthExtractor(session): AuthExtractor into both handlers and guard the loaded row by site before returning/mutating, mirroring sibling firmware_devices_list. (site,env) sour
