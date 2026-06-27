@@ -328,6 +328,16 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/main.rs (lines 1745-1763) · **kind:** latent-bug · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** Timeout middleware logs only 'request timeout' at WARN level with path + timeout_secs. Actual timeout duration (elapsed) is not logged; no request_id, no handler info, no indication which downstream call timed out (DB, external call, slow business logic). If timeouts cluster on a specific endpoint or pattern, operators have no drill-down path. Suggest: log request_id, handler (resolved from router), actual elapsed_ms, and a categorized hint (db_slow, external_slow, etc.) based on middleware context.
 - **verified:** Request timeout middleware at sources/ryuki-api/src/main.rs lines 1745–1767 logs only path and configured timeout_secs in warn-level traces when a timeout occurs. Actual gaps: (1) request_id available via req.extensions() but never extracted despite being set by request_id_middleware (line 1738) before this layer; (2) _elapsed parameter explicitly ignored—no actual elapsed time measured or logged; (3) timeout responses bypass timing_middleware entirely (middleware order, line 1772 never executes for timeouts); (4) no categorization or handler context. Commit c1e228ef added this middleware 2026
+- **STATUS (2026-06-27) — COMPLETE:** the timeout middleware's warn log now
+  carries `request_id` (read from the `RequestId` extension set by the outer
+  `request_id_middleware` — confirmed populated at this layer: the same
+  extension is read by `timing_middleware`, which only works if request_id runs
+  first), `method`, and the actual `elapsed_ms` (measured with `Instant`, since
+  the timeout path bypasses `timing_middleware`), alongside the existing `path`
+  + `timeout_secs`. Operators can now correlate a timed-out request with its
+  other traces. Logging-only; the 504 response is unchanged. (Per-downstream
+  categorization — db_slow vs external_slow — would need middleware-internal
+  timing context and is left as a larger follow-up.)
 
 ### 19. Missing DELETE and UPDATE endpoints for metric budgets
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True

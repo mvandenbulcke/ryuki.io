@@ -1757,10 +1757,28 @@ async fn main() {
         .layer(middleware::from_fn(
             move |req: HttpRequest<Body>, next: middleware::Next| async move {
                 let path = req.uri().path().to_string();
+                let method = req.method().clone();
+                // #18: capture the request_id (set by the outer request_id_middleware)
+                // and the actual elapsed wall-time so a timeout log can be correlated
+                // with the request's other traces and the real duration confirmed —
+                // previously only the path + configured timeout were logged.
+                let request_id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .map(|r| r.0.clone())
+                    .unwrap_or_default();
+                let started = Instant::now();
                 match tokio::time::timeout(Duration::from_secs(timeout_secs), next.run(req)).await {
                     Ok(response) => response,
                     Err(_elapsed) => {
-                        tracing::warn!(path = %path, timeout_secs, "request timeout");
+                        tracing::warn!(
+                            request_id = %request_id,
+                            method = %method,
+                            path = %path,
+                            timeout_secs,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "request timeout"
+                        );
                         let body = serde_json::to_string(&ApiError::new(
                             "REQUEST_TIMEOUT",
                             format!("Request exceeded {}s timeout", timeout_secs),
