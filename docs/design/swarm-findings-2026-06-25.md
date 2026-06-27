@@ -341,6 +341,18 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   (the scan covers all approved agents): offline→emit-once→dedup→warning-alert→
   recovery→flag-cleared. REMAINING for #11: persistent alert ack/state + recipient
   routing (slice 2e) — the emitter coverage the finding called for is done.
+- **STATUS (2026-06-27) — SLICE 2e (alert acknowledgement):** alerts are now
+  ACTIONABLE. New `alert_acks` satellite (migration 115) keyed by the
+  `domain_events` row id (alerts stay derived from the append-only stream — no
+  materialized alerts table; ack is the one mutable bit). `POST /api/events/alerts/
+  {event_id}/ack` (`events_alert_ack`, request-tier, optional control-char-checked
+  note) upserts the ack and attributes it to the verified session; re-acking
+  updates in place; 404 unknown id. `GET /api/events/alerts` now LEFT-merges ack
+  state (one batched `acks_for` lookup) so each alert carries
+  `acknowledged`/`acknowledged_by`/`acknowledged_at`. DB test: unacked→ack→
+  acknowledged-by-operator + unknown-id 404. REMAINING for #11: recipient routing
+  (notify on alert) — overlaps the notifications transport (tracker #9); that's
+  the last piece of tracker #22.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

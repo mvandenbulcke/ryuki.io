@@ -128,3 +128,59 @@ pub async fn list_alerts(
     .fetch_all(pool)
     .await
 }
+
+/// Acknowledge an alert event (#11 slice 2e): upsert the ack satellite keyed by
+/// the `domain_events` row id. Re-acking updates the actor / time / note in place.
+/// Returns `Ok(false)` when no such event exists (caller → 404) — distinguished
+/// from a genuine DB failure — by checking existence first; the FK would also
+/// reject a bad id, but a clean 404 reads better than a constraint error.
+pub async fn ack_alert(
+    pool: &sqlx::PgPool,
+    event_id: i64,
+    actor: &str,
+    note: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM domain_events WHERE id = $1")
+        .bind(event_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO alert_acks (event_id, acknowledged_by, acknowledged_at, note) \
+         VALUES ($1, $2, NOW(), $3) \
+         ON CONFLICT (event_id) DO UPDATE SET \
+           acknowledged_by = EXCLUDED.acknowledged_by, \
+           acknowledged_at = NOW(), \
+           note = EXCLUDED.note",
+    )
+    .bind(event_id)
+    .bind(actor)
+    .bind(note)
+    .execute(pool)
+    .await?;
+    Ok(true)
+}
+
+/// One acknowledgement, as joined onto an alert in the feed.
+#[derive(sqlx::FromRow)]
+pub struct AckRow {
+    pub event_id: i64,
+    pub acknowledged_by: String,
+    pub acknowledged_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fetch the acks for a set of alert event ids (the feed merges them in). Empty
+/// `ids` short-circuits to an empty result without a query.
+pub async fn acks_for(pool: &sqlx::PgPool, ids: &[i64]) -> Result<Vec<AckRow>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT event_id, acknowledged_by, acknowledged_at FROM alert_acks WHERE event_id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+}

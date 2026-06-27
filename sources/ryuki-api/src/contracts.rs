@@ -164,6 +164,7 @@ pub fn routes() -> Router {
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/events", get(events_list))
         .route("/api/events/alerts", get(events_alerts))
+        .route("/api/events/alerts/{event_id}/ack", post(events_alert_ack))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
         .route("/api/audit/retention", get(audit_retention_report))
@@ -17006,12 +17007,28 @@ async fn events_alerts(
     )
     .await
     .map_err(db_error)?;
-    let alerts: Vec<Value> = rows
+    // Keep only rows the precise per-aggregate classifier flags as alerts.
+    let classified: Vec<(&crate::repos::domain_events::EventRow, &'static str)> = rows
         .iter()
         .filter_map(|r| {
             let to_status = r.payload.get("to_status").and_then(|v| v.as_str());
-            let severity = ryuki_engine::event_alerts::classify(&r.aggregate_type, to_status)?;
-            Some(json!({
+            ryuki_engine::event_alerts::classify(&r.aggregate_type, to_status)
+                .map(|sev| (r, sev.as_str()))
+        })
+        .collect();
+    // #11 slice 2e: merge in acknowledgement state for these alerts (one batched
+    // lookup) so the feed shows which alerts have been seen, by whom, and when.
+    let ids: Vec<i64> = classified.iter().map(|(r, _)| r.id).collect();
+    let acks = crate::repos::domain_events::acks_for(pool, &ids)
+        .await
+        .map_err(db_error)?;
+    let ack_by_id: std::collections::HashMap<i64, &crate::repos::domain_events::AckRow> =
+        acks.iter().map(|a| (a.event_id, a)).collect();
+    let alerts: Vec<Value> = classified
+        .iter()
+        .map(|(r, severity)| {
+            let ack = ack_by_id.get(&r.id);
+            json!({
                 "id": r.id,
                 "event_type": r.event_type,
                 "aggregate_type": r.aggregate_type,
@@ -17019,13 +17036,60 @@ async fn events_alerts(
                 "site": r.site,
                 "environment": r.environment,
                 "actor": r.actor,
-                "severity": severity.as_str(),
+                "severity": severity,
                 "payload": r.payload,
                 "occurred_at": r.occurred_at.to_rfc3339(),
-            }))
+                "acknowledged": ack.is_some(),
+                "acknowledged_by": ack.map(|a| a.acknowledged_by.clone()),
+                "acknowledged_at": ack.map(|a| a.acknowledged_at.to_rfc3339()),
+            })
         })
         .collect();
     Ok(Json(json!({"alerts": alerts, "durable": true})))
+}
+
+/// Body for acknowledging an alert (#11 slice 2e). The note is optional context.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AlertAckBody {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /api/events/alerts/{event_id}/ack — acknowledge an alert (#11 slice 2e).
+/// Marks the alert (a domain_events row) as seen by the acting principal; the
+/// feed then shows `acknowledged` + who/when. Re-acking updates in place.
+/// Request-tier (any authenticated operator). 404 when the event id is unknown,
+/// 400 on a control-character note, 503 with no DB.
+async fn events_alert_ack(
+    AuthExtractor(session): AuthExtractor,
+    Path(event_id): Path<i64>,
+    Json(body): Json<AlertAckBody>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to acknowledge alerts"})),
+        ));
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(n) = note {
+        reject_control_chars("note", n)?;
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let acked = crate::repos::domain_events::ack_alert(pool, event_id, &session.user_id, note)
+        .await
+        .map_err(db_error)?;
+    if !acked {
+        return Err(status_404(&event_id.to_string()));
+    }
+    Ok(Json(
+        json!({"acknowledged": true, "event_id": event_id, "acknowledged_by": session.user_id}),
+    ))
 }
 
 /// Query params for the SIEM audit export.
@@ -37947,6 +38011,104 @@ mod db_lifecycle_tests {
 
         sqlx::query("DELETE FROM agents WHERE agent_id = $1")
             .bind(&agent_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #11 slice 2e: acknowledging an alert marks it (and only it) acknowledged
+    /// in the feed, records who, and 404s an unknown event id.
+    #[tokio::test]
+    async fn events_alert_ack_marks_alert_acknowledged() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let agg = format!("ack-test-{}", Uuid::new_v4());
+        let event_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.reject",
+                aggregate_type: "request",
+                aggregate_id: &agg,
+                site: None,
+                environment: None,
+                actor: "creator",
+                payload: json!({ "to_status": "rejected" }),
+            },
+        )
+        .await
+        .expect("insert alert event");
+
+        let q = |aid: String| EventsQuery {
+            event_type: None,
+            aggregate_id: Some(aid),
+            limit: Some(50),
+        };
+
+        // Before ack: present, not acknowledged.
+        let before = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(q(agg.clone())),
+        )
+        .await
+        .expect("alerts before");
+        let a = before.0["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(event_id))
+            .expect("alert present before ack")
+            .clone();
+        assert_eq!(a["acknowledged"], json!(false));
+
+        // Acknowledge as a specific operator.
+        let mut acker = AuthSession::static_dry_run();
+        acker.user_id = "ops-ack-user".into();
+        let resp = events_alert_ack(
+            AuthExtractor(acker),
+            Path(event_id),
+            Json(AlertAckBody {
+                note: Some("looking into it".into()),
+            }),
+        )
+        .await
+        .expect("ack must succeed");
+        assert_eq!(resp.0["acknowledged"], json!(true));
+
+        // After ack: acknowledged=true, attributed to the operator.
+        let after = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(q(agg.clone())),
+        )
+        .await
+        .expect("alerts after");
+        let a2 = after.0["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == json!(event_id))
+            .expect("alert present after ack")
+            .clone();
+        assert_eq!(a2["acknowledged"], json!(true));
+        assert_eq!(a2["acknowledged_by"], json!("ops-ack-user"));
+
+        // An unknown event id is a 404.
+        let missing = events_alert_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(-999_i64),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "an unknown event id must 404: {missing:?}"
+        );
+
+        // alert_acks is mutable; clean it (domain_events is append-only, kept).
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+            .bind(event_id)
             .execute(pool)
             .await
             .ok();
