@@ -13558,10 +13558,33 @@ fn request_sort_direction(direction: Option<&str>) -> &'static str {
     }
 }
 
+/// The shared WHERE clause for the request list — used by BOTH the page SELECT
+/// and the total COUNT so the two can never drift (a mismatched total would
+/// mislead pagination). Binds $1..$6 = status/site/environment/request_type/
+/// created_by/q(ILIKE); NULL = no filter on that column.
+const REQUESTS_LIST_WHERE: &str = "WHERE ($1::text IS NULL OR status = $1) \
+   AND ($2::text IS NULL OR site = $2) \
+   AND ($3::text IS NULL OR environment = $3) \
+   AND ($4::text IS NULL OR request_type = $4) \
+   AND ($5::text IS NULL OR created_by = $5) \
+   AND ($6::text IS NULL OR name ILIKE '%' || $6 || '%' ESCAPE '\\')";
+
+/// `X-Total-Count` header carrying the filtered total (before limit/offset) so a
+/// paginating client knows how many pages exist. #9: the body stays a bare array
+/// (backward-compatible with the portal consumer); the full `{items,total}`
+/// envelope is deferred to a coordinated portal change.
+fn total_count_headers(total: i64) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&total.to_string()) {
+        h.insert("x-total-count", v);
+    }
+    h
+}
+
 async fn requests_list(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<RequestListParams>,
-) -> ApiResult {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
     let sort_col = request_sort_column(params.sort.as_deref());
@@ -13587,13 +13610,7 @@ async fn requests_list(
         // sort_col/dir are allowlisted constants (never client text); every
         // value filter is a bound parameter, NULL = no filter on that column.
         let sql = format!(
-            "SELECT {REQUEST_COLUMNS} FROM requests \
-             WHERE ($1::text IS NULL OR status = $1) \
-               AND ($2::text IS NULL OR site = $2) \
-               AND ($3::text IS NULL OR environment = $3) \
-               AND ($4::text IS NULL OR request_type = $4) \
-               AND ($5::text IS NULL OR created_by = $5) \
-               AND ($6::text IS NULL OR name ILIKE '%' || $6 || '%' ESCAPE '\\') \
+            "SELECT {REQUEST_COLUMNS} FROM requests {REQUESTS_LIST_WHERE} \
              ORDER BY {sort_col} {dir} LIMIT $7 OFFSET $8"
         );
         // Escape LIKE metacharacters so `q` is a literal substring match, not a
@@ -13631,7 +13648,20 @@ async fn requests_list(
                 })
             })
             .collect();
-        return Ok(Json(json!(summaries)));
+        // Filtered total (same WHERE, no limit/offset) for pagination — exposed
+        // via X-Total-Count so the bare-array body stays backward-compatible.
+        let count_sql = format!("SELECT COUNT(*) FROM requests {REQUESTS_LIST_WHERE}");
+        let total: i64 = sqlx::query_scalar(&count_sql)
+            .bind(&f_status)
+            .bind(&f_site)
+            .bind(&f_env)
+            .bind(&f_type)
+            .bind(&f_creator)
+            .bind(&f_q_like)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(summaries.len() as i64);
+        return Ok((total_count_headers(total), Json(json!(summaries))));
     }
 
     // No-DB (dry-run) path: apply the same filters in-memory. The in-memory
@@ -13659,6 +13689,8 @@ async fn requests_list(
     if dir == "DESC" {
         matched.reverse();
     }
+    // Filtered total BEFORE pagination — for the X-Total-Count header.
+    let total = matched.len() as i64;
     let summaries: Vec<Value> = matched
         .iter()
         .skip(offset)
@@ -13676,7 +13708,7 @@ async fn requests_list(
             })
         })
         .collect();
-    Ok(Json(json!(summaries)))
+    Ok((total_count_headers(total), Json(json!(summaries))))
 }
 
 /// Sanitize persisted stage evidence before sending to the portal.
@@ -32352,7 +32384,7 @@ mod unit_tests {
         let request = test_request("requests-list-seam-test");
         request_store().lock().await.push(request);
 
-        let Json(body) = requests_list(
+        let (_, Json(body)) = requests_list(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(RequestListParams {
                 limit: Some(100),
@@ -32409,6 +32441,44 @@ mod unit_tests {
         assert_eq!(request_sort_direction(None), "DESC");
     }
 
+    /// #9: the X-Total-Count header reports the FILTERED total (before
+    /// limit/offset), not the page size — so a paginating client knows the page
+    /// count. The body stays a bare array (backward-compatible).
+    #[tokio::test]
+    async fn requests_list_total_count_header_reflects_filtered_total() {
+        let site = "RLTOTAL-z9"; // unique site so other tests' rows don't match
+        for i in 0..3 {
+            let mut r = test_request(&format!("rl-total-{i}"));
+            r.site = site.into();
+            request_store().lock().await.push(r);
+        }
+        let (headers, Json(body)) = requests_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RequestListParams {
+                limit: Some(2),
+                offset: Some(0),
+                site: Some(site.into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("list");
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            2,
+            "the page body is capped at limit=2"
+        );
+        let total = headers
+            .get("x-total-count")
+            .expect("X-Total-Count header present")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            total, "3",
+            "X-Total-Count must be the filtered total (3), not the page size (2)"
+        );
+    }
+
     #[tokio::test]
     async fn requests_list_filters_in_memory_by_status_site_and_q() {
         let mut a = test_request("rl-filter-a");
@@ -32432,7 +32502,7 @@ mod unit_tests {
         };
 
         // Filter by site → only the DEFRA row.
-        let Json(by_site) = requests_list(
+        let (_, Json(by_site)) = requests_list(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(RequestListParams {
                 site: Some("DEFRA".into()),
@@ -32446,7 +32516,7 @@ mod unit_tests {
         assert!(!site_ids.contains(&"rl-filter-b".to_string()));
 
         // Case-insensitive substring on the (requester) name.
-        let Json(by_q) = requests_list(
+        let (_, Json(by_q)) = requests_list(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(RequestListParams {
                 q: Some("BOB".into()),
@@ -32460,7 +32530,7 @@ mod unit_tests {
         assert!(!q_ids.contains(&"rl-filter-a".to_string()));
 
         // A blank filter is ignored (both rows listed).
-        let Json(blank) = requests_list(
+        let (_, Json(blank)) = requests_list(
             AuthExtractor(AuthSession::static_dry_run()),
             Query(RequestListParams {
                 site: Some("   ".into()),
@@ -35758,6 +35828,69 @@ mod db_lifecycle_tests {
             justification: "p2 durable-state test".into(),
             fields: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// #9 (DB path): requests_list's X-Total-Count header comes from the COUNT(*)
+    /// query — this validates that SQL runs against Postgres and reflects the
+    /// filtered total independent of the page limit. Uses a before/after DELTA on
+    /// a unique requester (created_by = the verified session principal) so it is
+    /// robust to leftover rows + FK constraints (requests has audit/job children,
+    /// so a plain DELETE cleanup is unreliable).
+    #[tokio::test]
+    async fn requests_list_db_total_count_header() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let user = "rl-dbtotal-7q3";
+        let list = |reader: AuthSession| async move {
+            requests_list(
+                AuthExtractor(reader),
+                Query(RequestListParams {
+                    limit: Some(1),
+                    offset: Some(0),
+                    created_by: Some(user.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("list")
+        };
+        let total_of = |headers: &HeaderMap| -> i64 {
+            headers
+                .get("x-total-count")
+                .expect("X-Total-Count header present")
+                .to_str()
+                .unwrap()
+                .parse()
+                .expect("X-Total-Count is a number")
+        };
+
+        let (before_headers, _) = list(admin_session("rl-dbtotal-reader")).await;
+        let before = total_of(&before_headers);
+
+        let session = admin_session(user);
+        for _ in 0..2 {
+            let _created = requests_create(
+                AuthExtractor(session.clone()),
+                Json(create_body("server-deployment")),
+            )
+            .await
+            .expect("create");
+        }
+
+        let (after_headers, Json(after_body)) = list(admin_session("rl-dbtotal-reader")).await;
+        assert_eq!(
+            after_body.as_array().unwrap().len(),
+            1,
+            "the page body is capped at limit=1 regardless of the total"
+        );
+        assert_eq!(
+            total_of(&after_headers),
+            before + 2,
+            "X-Total-Count (from COUNT(*)) must grow by exactly the 2 created rows"
+        );
     }
 
     /// Every one of the 14 request types round-trips create -> read with its

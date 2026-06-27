@@ -217,6 +217,20 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** sources/ryuki-api/src/contracts.rs (requests_list function) · **kind:** missing-feature · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** Missing-features tracker marks feature #14 as [~] partial: slice 1 shipped with filters (status/site/environment/request_type/created_by/q) + sort + direction. But slice 2 envelope {items, total} is unimplemented. Current requests_list returns bare array Json(json!(summaries)) instead of {items: summaries, total: count}. Portal faceting feature #15 depends on this envelope.
 - **verified:** Gap is REAL and UNIMPLEMENTED: requests_list() at lines 12697/12742 returns bare array Json(json!(summaries)) with no total count. Tracker marks #14 slice 2 as unshipped — the envelope {items, total} is documented but not coded. Portal's get_request_list() (line 2202) expects Vec<ApiRequestSummary>, will break when envelope is added. Function computes limit/offset but never queries COUNT(*) for the total. Tests assume array (line 28844 .as_array()). Marker in tracker: [~] partial = core shipped (slice 1, filters/sort), follow-up slice 2 tracked.
+- **STATUS (2026-06-27) — total exposed via header (backward-compatible):** The
+  core gap (no COUNT(*), no way to know the total for pagination) is closed:
+  requests_list now runs `SELECT COUNT(*)` with the SAME filters (the WHERE was
+  extracted to a shared `const REQUESTS_LIST_WHERE` so the page SELECT and the
+  COUNT can never drift) and returns the filtered total in an `X-Total-Count`
+  response header (no-DB path uses matched.len()). The body stays a bare array,
+  so the Leptos portal consumer (portal/portal-ui) keeps working with NO
+  cross-crate break — the verified concern that "Portal expects Vec, will break
+  when envelope is added." DB-gated before/after-delta test + a no-DB
+  exact-count test. The literal `{items,total}` ENVELOPE shape is intentionally
+  DEFERRED to a coordinated portal change (the portal must switch from parsing a
+  bare array to the envelope first); the header delivers the pagination total now
+  without that risk. Reviewed (fresh-context): COUNT bound to $1..$6, body shape
+  unchanged, injection-safe.
 
 ### 10. No enforced degradation mode; write gates are static/advisory-only
 - **area:** ryuki-api/src (degradation mode referenced in contracts but no runtime enforcement) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** True
