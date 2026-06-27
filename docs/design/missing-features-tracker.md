@@ -129,7 +129,7 @@ per-lock (10s) timeouts on every pool connection (`6602e57`); **swarm #10
 degradation ENFORCEMENT (tracker #16) — `enforce_site_operational` returns 503
 when the target site is degraded/unreachable, gating BOTH live-apply grant paths
 (`requests_approve_live_apply` + admin `admin_approve_live_apply_job`) before the
-CP-signed grant is minted (`<this>`)**.
+CP-signed grant is minted (`5ae1430`)**.
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
