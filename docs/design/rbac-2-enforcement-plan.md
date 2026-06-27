@@ -32,6 +32,7 @@
 - [x] **outage comms** — `b000cbe` (outage_notices site-only; 10 (list pre-scoped, contract static); create body-guard, get/preview tightened 403→404 oracle, send/ack/complete/cancel by-id guard, active/history/upcoming site-query guard; codex APPROVED first pass)
 - [x] **synthetic health** — `c14b03b` (health_checks site-only; 2 by-id (run_all/dashboard/outages pre-scoped); run_check guard before run, status scopes via parent check; codex APPROVED first pass)
 - [x] **metric budgets** — `90d6902` (metric_budgets DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) before the write; platform-wide NULL denied to scoped on that axis; codex APPROVED after containment clarification)
+- [x] **slo** — `45b7d1b` (slo_definitions DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) w/ SELECT…FOR UPDATE before the write; platform-wide-on-a-scoped-axis denied; codex APPROVED, TOCTOU caveat closed via row lock)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -271,8 +272,8 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **metrics_budget_delete** [?] `sources/ryuki-api/src/contracts.rs:19640` — Load the row's scope first, then guard before the DELETE. Inside the existing tx (after pool.begin()), add: let row: Option<(Option<String>, Option<String>)> = sqlx::query_as("SELE
 
 ## slo  (2)
-- [ ] **slo_update** [high] `sources/ryuki-api/src/contracts.rs:19683` — After loading the row but BEFORE applying the UPDATE, add a by-id scope guard. Concretely: change the UPDATE to first read the target's (site, environment) — either a `SELECT site,
-- [ ] **slo_delete** [high] `sources/ryuki-api/src/contracts.rs:19754` — Before the DELETE, load the row's scope and gate with the canonical pattern. Because slo_definitions.site/environment are NULLABLE (platform-wide rows must stay deletable by any in
+- [x] **slo_update** [high] `sources/ryuki-api/src/contracts.rs:19683` — After loading the row but BEFORE applying the UPDATE, add a by-id scope guard. Concretely: change the UPDATE to first read the target's (site, environment) — either a `SELECT site,
+- [x] **slo_delete** [high] `sources/ryuki-api/src/contracts.rs:19754` — Before the DELETE, load the row's scope and gate with the canonical pattern. Because slo_definitions.site/environment are NULLABLE (platform-wide rows must stay deletable by any in
 
 ## decommission  (2)
 - [ ] **decommission_plan** [high] `sources/ryuki-api/src/contracts.rs:21147` — Add `guard_body_site_scope(&session, &body.site)?;` as the first statement of decommission_plan in sources/ryuki-api/src/contracts.rs (immediately after the fn opens at line 21150,
