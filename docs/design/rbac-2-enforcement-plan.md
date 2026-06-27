@@ -21,6 +21,7 @@
 - [x] **maintenance calendar** — `3d3b4b3` (maintenance_windows site-only; 5 (schedule pre-scoped, contract static); conflicts/upcoming/active/month site-query guard (Json→ApiResult); cancel DB scope-arm + engine-fallback fail-closed; codex caught the unguarded cancel fallback, fixed)
 - [x] **zabbix drift** — `3380fe9` (drift_reports site-only; 5 (detect pre-scoped, contract static); summary enforce_site_scope; plan/validate/execute/verify by-id guard before remediation/409; codex APPROVED first pass)
 - [x] **firmware lifecycle** — `a25b7fd` (firmware_records site-only, exceptions child via device-join; 9 handlers (audit grouped as 5); device_get/check/request/revoke load+guard, lists+reports retain, exceptions scoped via device-id set/join; codex APPROVED first pass)
+- [x] **compliance reporting** — `e541fee` (controls/reports site-only, findings via report-join, frameworks global; 5 (list/generate/findings_list/summary pre-scoped); custom-message 404 inline-match; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -199,11 +200,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [ ] **k8s_namespace_terminate** [high] `sources/ryuki-api/src/contracts.rs:28835` — The handler already loads the row as `ns` (TransitionOutcome::Updated(ns), L28853), and ns carries ns.site. Because the namespace has ONLY a site dimension (no environment), use a 
 
 ## compliance  (5)
-- [ ] **compliance_control_get** [high] `sources/ryuki-api/src/contracts.rs:29381` — Add `AuthExtractor(session): AuthExtractor` (matching the sibling compliance_controls_list signature) to compliance_control_get at contracts.rs:29381. After loading `ctrl` (L29388-
-- [ ] **compliance_control_assess** [high] `sources/ryuki-api/src/contracts.rs:29400` — By-id write whose row carries the authoritative `site` (compliance_controls.site). Two equivalent options, both sourcing (site) from the control row itself: (A) Post-load guard: be
-- [ ] **compliance_report_get** [high] `sources/ryuki-api/src/contracts.rs:29484` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then guard by the loaded row's site BEFORE returning. The (site) source is the report itself: after `let repor
-- [ ] **compliance_finding_resolve** [high] `sources/ryuki-api/src/contracts.rs:29533` — compliance_findings has no site column, so load the owning report's site via report_id before the write. Add a repo helper in repos/compliance_reporting.rs, e.g. finding_site(execu
-- [ ] **compliance_finding_waive** [high] `sources/ryuki-api/src/contracts.rs:29571` — Before the DB mutation, load the finding's owning report site and scope-guard it. There is no existing helper for this, so add one to repos/compliance_reporting.rs, e.g. `pub async
+- [x] **compliance_control_get** [high] `sources/ryuki-api/src/contracts.rs:29381` — Add `AuthExtractor(session): AuthExtractor` (matching the sibling compliance_controls_list signature) to compliance_control_get at contracts.rs:29381. After loading `ctrl` (L29388-
+- [x] **compliance_control_assess** [high] `sources/ryuki-api/src/contracts.rs:29400` — By-id write whose row carries the authoritative `site` (compliance_controls.site). Two equivalent options, both sourcing (site) from the control row itself: (A) Post-load guard: be
+- [x] **compliance_report_get** [high] `sources/ryuki-api/src/contracts.rs:29484` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then guard by the loaded row's site BEFORE returning. The (site) source is the report itself: after `let repor
+- [x] **compliance_finding_resolve** [high] `sources/ryuki-api/src/contracts.rs:29533` — compliance_findings has no site column, so load the owning report's site via report_id before the write. Add a repo helper in repos/compliance_reporting.rs, e.g. finding_site(execu
+- [x] **compliance_finding_waive** [high] `sources/ryuki-api/src/contracts.rs:29571` — Before the DB mutation, load the finding's owning report site and scope-guard it. There is no existing helper for this, so add one to repos/compliance_reporting.rs, e.g. `pub async
 
 ## noise  (4)
 - [ ] **noise_suppress** [high] `sources/ryuki-api/src/contracts.rs:10114` — Add a row-scope guard BEFORE the CAS UPDATE commits, since site is host-derived (no site/env input param to bind). Inside the `if let Some(pool) = get_db()` branch, after `parse_no
