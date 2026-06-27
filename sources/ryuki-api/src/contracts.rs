@@ -4750,12 +4750,14 @@ async fn shares_list(
     Ok(Json(serde_json::to_value(shares).unwrap_or_default()))
 }
 
-async fn shares_get(Path(id): Path<String>) -> ApiResult {
+async fn shares_get(AuthExtractor(session): AuthExtractor, Path(id): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let share = crate::repos::file_share_ntfs::get_share(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 (no existence oracle) before the ACL is exposed.
+    scope_guard_or_404(&session, &share.site, "", &id)?;
     let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
         .await
         .map_err(db_error)?;
@@ -4781,6 +4783,7 @@ async fn shares_recertification_due(
 }
 
 async fn shares_recertify(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(_body): Json<RecertifyShareRequest>,
 ) -> ApiResult {
@@ -4793,6 +4796,8 @@ async fn shares_recertify(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the recertify CAS write.
+    scope_guard_or_404(&session, &current.site, "", &id)?;
 
     // The pure engine owns the recertification rule (new dates + Compliant).
     let recertified = file_share_ntfs::recertify_share(std::slice::from_ref(&current), &id, now)
@@ -4816,9 +4821,18 @@ async fn shares_recertify(
     }
 }
 
-async fn shares_open_access(Path(id): Path<String>) -> ApiResult {
+async fn shares_open_access(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let open = match get_db() {
         Some(pool) => {
+            // #2: scope on the parent share's site before exposing its open ACLs.
+            let share = crate::repos::file_share_ntfs::get_share(pool, &id)
+                .await
+                .map_err(db_error)?
+                .ok_or_else(|| status_404(&id))?;
+            scope_guard_or_404(&session, &share.site, "", &id)?;
             let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
                 .await
                 .map_err(db_error)?;
@@ -4850,13 +4864,18 @@ async fn shares_stale_owners(
     Ok(Json(serde_json::to_value(stale).unwrap_or_default()))
 }
 
-async fn shares_permission_report(Path(id): Path<String>) -> ApiResult {
+async fn shares_permission_report(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     // Verify the share exists first.
     let share = crate::repos::file_share_ntfs::get_share(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the ACL report is built.
+    scope_guard_or_404(&session, &share.site, "", &id)?;
     let permissions = crate::repos::file_share_ntfs::list_permissions(pool, &id)
         .await
         .map_err(db_error)?;
@@ -4871,6 +4890,13 @@ async fn shares_revoke(
     Path((id, group)): Path<(String, String)>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scope on the parent share before mutating its ACL; an out-of-scope or
+    // missing share -> 404 (no existence oracle, no cross-site permission revoke).
+    let share = crate::repos::file_share_ntfs::get_share(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &share.site, "", &id)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let deleted = crate::repos::file_share_ntfs::revoke_permission(&mut *tx, &id, &group)
         .await
@@ -38984,6 +39010,69 @@ mod db_lifecycle_tests {
         assert!(
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted sql_deploy_install must pass the scope gate: {any:?}"
+        );
+    }
+
+    /// #2 RBAC: the file-share handlers are site-scoped. A GBLON principal gets
+    /// 404 reading a DEFRA share or revoking one of its ACL entries (no existence
+    /// oracle, before the ACL is exposed or mutated); in-scope + unrestricted reads
+    /// pass. file_shares' id is a random UUID, so the seeded DEFRA/GBLON share ids
+    /// are resolved at runtime (migration 023).
+    #[tokio::test]
+    async fn shares_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let (Some(defra_id), Some(gblon_id)) = (
+            sqlx::query_scalar::<_, String>(
+                "SELECT id::text FROM file_shares WHERE site = 'DEFRA' LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .expect("query defra share id"),
+            sqlx::query_scalar::<_, String>(
+                "SELECT id::text FROM file_shares WHERE site = 'GBLON' LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .expect("query gblon share id"),
+        ) else {
+            eprintln!("SKIP: seed shares not present");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // read a DEFRA share -> 404.
+        let got = shares_get(AuthExtractor(gblon.clone()), Path(defra_id.clone())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope shares_get must 404: {got:?}"
+        );
+        // revoke an ACL entry on a DEFRA share -> 404 (before any mutation).
+        let revoked = shares_revoke(
+            AuthExtractor(gblon.clone()),
+            Path((defra_id.clone(), "DOMAIN\\Everyone".to_string())),
+        )
+        .await;
+        assert!(
+            matches!(revoked, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope shares_revoke must 404: {revoked:?}"
+        );
+        // in-scope read passes.
+        let own = shares_get(AuthExtractor(gblon), Path(gblon_id)).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope shares_get must pass: {own:?}"
+        );
+        // unrestricted read passes.
+        let any = shares_get(AuthExtractor(AuthSession::static_dry_run()), Path(defra_id)).await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted shares_get must pass: {any:?}"
         );
     }
 
