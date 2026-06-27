@@ -8091,8 +8091,12 @@ async fn maintenance_calendar_schedule(
 }
 
 async fn maintenance_calendar_conflicts(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<MaintenanceCalendarConflictsQuery>,
-) -> Json<Value> {
+) -> ApiResult {
+    // #2: a scoped principal may only query its own site's maintenance windows;
+    // env-scoped principals are rejected (maintenance_windows is site-only).
+    guard_body_site_scope(&session, &q.site)?;
     if let Some(pool) = get_db() {
         // Mirrors check_conflicts_internal: site filter + status NOT IN
         // ('Cancelled','Completed') + tstzrange '[)' overlap.
@@ -8109,15 +8113,18 @@ async fn maintenance_calendar_conflicts(
         .await
         .unwrap_or_default();
         let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
-        return Json(json!({ "source": "database", "windows": windows }));
+        return Ok(Json(json!({ "source": "database", "windows": windows })));
     }
     let conflicts = maintenance_calendar::check_conflicts(&q.site, &q.start, &q.end);
-    Json(serde_json::to_value(conflicts).unwrap())
+    Ok(Json(serde_json::to_value(conflicts).unwrap()))
 }
 
 async fn maintenance_calendar_upcoming(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<MaintenanceCalendarSiteQuery>,
-) -> Json<Value> {
+) -> ApiResult {
+    // #2: a scoped principal may only see its own site's upcoming windows.
+    guard_body_site_scope(&session, &q.site)?;
     if let Some(pool) = get_db() {
         // Mirrors get_upcoming: excludes Cancelled only (NOT Completed), 30-day window.
         let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
@@ -8130,13 +8137,18 @@ async fn maintenance_calendar_upcoming(
         .await
         .unwrap_or_default();
         let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
-        return Json(json!({ "source": "database", "windows": windows }));
+        return Ok(Json(json!({ "source": "database", "windows": windows })));
     }
     let windows = maintenance_calendar::get_upcoming(&q.site);
-    Json(serde_json::to_value(windows).unwrap())
+    Ok(Json(serde_json::to_value(windows).unwrap()))
 }
 
-async fn maintenance_calendar_active(Query(q): Query<MaintenanceCalendarSiteQuery>) -> Json<Value> {
+async fn maintenance_calendar_active(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<MaintenanceCalendarSiteQuery>,
+) -> ApiResult {
+    // #2: a scoped principal may only see its own site's active windows.
+    guard_body_site_scope(&session, &q.site)?;
     if let Some(pool) = get_db() {
         // Mirrors get_active: NO status filter (engine get_active does not filter status).
         let rows: Vec<MaintWindowRow> = sqlx::query_as(&format!(
@@ -8148,13 +8160,18 @@ async fn maintenance_calendar_active(Query(q): Query<MaintenanceCalendarSiteQuer
         .await
         .unwrap_or_default();
         let windows: Vec<Value> = rows.iter().map(|r| r.to_value()).collect();
-        return Json(json!({ "source": "database", "windows": windows }));
+        return Ok(Json(json!({ "source": "database", "windows": windows })));
     }
     let windows = maintenance_calendar::get_active(&q.site);
-    Json(serde_json::to_value(windows).unwrap())
+    Ok(Json(serde_json::to_value(windows).unwrap()))
 }
 
-async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuery>) -> ApiResult {
+async fn maintenance_calendar_month(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<MaintenanceCalendarMonthQuery>,
+) -> ApiResult {
+    // #2: a scoped principal may only see its own site's calendar month.
+    guard_body_site_scope(&session, &q.site)?;
     if let Some(pool) = get_db() {
         // Validate and parse the "YYYY-MM" month string; mirrors the engine's error message.
         let month_start_rfc = format!("{}-01T00:00:00Z", q.month);
@@ -8230,6 +8247,12 @@ async fn maintenance_calendar_cancel(
                 None => {
                     return Err(status_400(&format!("Maintenance window not found: {}", id)));
                 }
+                // #2: an out-of-scope window is reported identically to a missing
+                // one (same 400) so a scoped principal gets no existence oracle and
+                // cannot cancel another site's window.
+                Some(ref row) if !row_scope_permits(&session, &row.site, "") => {
+                    return Err(status_400(&format!("Maintenance window not found: {}", id)));
+                }
                 Some(ref row) if row.status == "Completed" => {
                     return Err(status_400("Cannot cancel a completed maintenance window"));
                 }
@@ -8266,6 +8289,13 @@ async fn maintenance_calendar_cancel(
         }
     }
 
+    // #2: the engine fallback (no-DB, or a non-UUID `mw-*` id) cancels a
+    // site-owned window by id with no site check, so a scoped principal fails
+    // closed with the same not-found 400 rather than cancel/oracle another site's
+    // in-memory window. Unrestricted principals keep the legacy engine path.
+    if is_scoped(&session) {
+        return Err(status_400(&format!("Maintenance window not found: {}", id)));
+    }
     // No-DB or non-UUID id: engine path unchanged.
     match maintenance_calendar::cancel_window(&id) {
         Ok(window) => Ok(Json(serde_json::to_value(window).unwrap())),
@@ -39158,6 +39188,75 @@ mod db_lifecycle_tests {
             !matches!(any, Err((StatusCode::FORBIDDEN, _))),
             "unrestricted degradation_check must pass the gate: {any:?}"
         );
+    }
+
+    /// #2 RBAC: the maintenance-calendar handlers are site-scoped. A GBLON
+    /// principal gets 403 querying DEFRA's windows and a 400 not-found (no oracle)
+    /// cancelling a DEFRA window; its own site and an unrestricted principal pass.
+    #[tokio::test]
+    async fn maintenance_calendar_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // site-query read -> 403 for a foreign site.
+        let foreign = maintenance_calendar_active(
+            AuthExtractor(gblon.clone()),
+            Query(MaintenanceCalendarSiteQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope maintenance_calendar_active must be forbidden: {foreign:?}"
+        );
+
+        // own site passes the gate.
+        let own = maintenance_calendar_active(
+            AuthExtractor(gblon.clone()),
+            Query(MaintenanceCalendarSiteQuery {
+                site: "GBLON".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope maintenance_calendar_active must pass the gate: {own:?}"
+        );
+
+        // unrestricted passes the gate.
+        let any = maintenance_calendar_active(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(MaintenanceCalendarSiteQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted maintenance_calendar_active must pass the gate: {any:?}"
+        );
+
+        // cancel a DEFRA window out-of-scope -> 400 not-found (scope arm; no oracle).
+        if let Some(defra_win) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM maintenance_windows WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("query defra window id")
+        {
+            let cancel = maintenance_calendar_cancel(AuthExtractor(gblon), Path(defra_win)).await;
+            assert!(
+                matches!(cancel, Err((StatusCode::BAD_REQUEST, _))),
+                "out-of-scope cancel must look like not-found (400): {cancel:?}"
+            );
+        }
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
