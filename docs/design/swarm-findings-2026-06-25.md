@@ -470,7 +470,17 @@ FINDINGS:
 ### 39. Missing GET-by-id endpoint for AD computers
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** low · **effort:** S · **ci_validatable:** True
 - **evidence:** Lines 361-366 define operations on AD computers: POST /api/identity/ad/{operation} handlers (prestage, validate, move, disable, enable, delete). Lines 369-370 define read endpoints ad_reconcile() and ad_orphaned() for scanning. No GET /api/identity/ad/{name} to retrieve a single computer's record. Operator cannot query an individual computer by name—query-only via reconcile/orphaned bulk scan.
-- **verified:** Verified gap: No GET /api/identity/ad/{name} endpoint exists despite database layer (ad_computers::get_by_name) and active use by POST handlers. Reconcile/orphaned endpoints return aggregation results, not individual computer records. Not in missing-features tracker or API docs. Database function exists at /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/repos/ad_computers.rs; implementation would be straightforward thin wrapper around get_by_name(). Operational need evident: write handlers all call get_by_name internally before modifying.
+- **verified:** Verified gap: No GET /api/identity/ad/{name} endpoint exists despite database layer (ad_computers::get_by_name) and active use by POST handlers. Reconcile/orphaned endpoints return aggregation results, not individual computer records. Not in missing-features tracker or API docs. Database function exists at /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/repos/ad_computers.rs; implementation would be straightforward thin wrapper around get_by_name().
+- **STATUS (2026-06-27) — COMPLETE:** new `GET /api/identity/ad/computer/{name}`
+  → `ad_get` thin wrapper over `repos::ad_computers::get_by_name` (200 with the
+  computer, 404 unknown, 503 no DB; authn-gated to match the AD surface). Path
+  uses a distinct `/computer/` segment to avoid any conflict with the
+  `/api/identity/ad/<verb>/{name}` POST routes (verified: all 20 router-build
+  tests pass). DB test `ad_get_by_name_returns_computer_or_404` prestages then
+  reads back, plus the 404 path. NOTE: a cross-cutting AD site-scope gate is a
+  separate follow-up — the AD write-by-name handlers (move/disable/enable/delete)
+  do not gate by site either, so this read deliberately matches that posture
+  rather than becoming stricter than the writes.
 
 ### 40. Insufficient input validation on free-form text fields (name, description, reason, justification)
 - **area:** ryuki-api/src/contracts.rs (multiple handlers) · **kind:** security-gap · **severity:** low · **effort:** M · **ci_validatable:** True

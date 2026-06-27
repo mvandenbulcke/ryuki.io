@@ -368,6 +368,7 @@ pub fn routes() -> Router {
         .route("/api/identity/ad/delete/{name}", post(ad_delete))
         .route("/api/identity/ad/reconcile", get(ad_reconcile))
         .route("/api/identity/ad/orphaned", get(ad_orphaned))
+        .route("/api/identity/ad/computer/{name}", get(ad_get))
         .route(
             "/api/identity/ad-computer-contract",
             get(ad_computer_contract),
@@ -4305,6 +4306,27 @@ async fn ad_orphaned(
     match ad_computer_lifecycle::get_orphaned(site) {
         Ok(computers) => Ok(Json(serde_json::to_value(computers).unwrap_or_default())),
         Err(e) => Err(status_400(&e)),
+    }
+}
+
+/// GET /api/identity/ad/computer/{name} — fetch a single AD computer by its
+/// unique name (#39). The write-by-name handlers (move/disable/enable/delete)
+/// all read the same row first; this exposes that lookup as a first-class
+/// read so an operator can inspect one computer without a bulk reconcile scan.
+/// 404 when unknown, 503 when no DB. Authn-gated (AuthExtractor) to match the
+/// rest of the AD surface; site-scope gating is intentionally not added here
+/// because the AD write-by-name handlers do not gate either (consistent
+/// posture — a cross-cutting AD scope gate is a separate follow-up).
+async fn ad_get(AuthExtractor(_session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    match crate::repos::ad_computers::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+    {
+        Some((computer, _updated_at)) => {
+            Ok(Json(serde_json::to_value(computer).unwrap_or_default()))
+        }
+        None => Err(status_404(&name)),
     }
 }
 
@@ -36115,6 +36137,53 @@ mod db_lifecycle_tests {
             after,
             before + 1,
             "a preferences update must append exactly one audit row"
+        );
+    }
+
+    /// #39: GET /api/identity/ad/computer/{name} returns a single AD computer by
+    /// name (200) and 404s an unknown name. Prestages the row first, tolerating
+    /// a 409 if a prior run already created it (the row is present either way).
+    #[tokio::test]
+    async fn ad_get_by_name_returns_computer_or_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let name = "DEFRA-SRV-91";
+        let prestage = ad_prestage(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(AdPrestageRequest {
+                name: name.into(),
+                site: "DEFRA".into(),
+                ou_path: "OU=Servers,DC=defra,DC=ryuki,DC=io".into(),
+            }),
+        )
+        .await;
+        if let Err((code, _)) = &prestage {
+            assert_eq!(
+                *code,
+                StatusCode::CONFLICT,
+                "prestage must succeed or 409 (already exists): {prestage:?}"
+            );
+        }
+
+        let got = ad_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(name.to_string()),
+        )
+        .await
+        .expect("a prestaged computer must be found by name");
+        assert_eq!(got.0["name"], json!(name));
+
+        let missing = ad_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("ZZZZZ-NONE-00".to_string()),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "an unknown name must 404: {missing:?}"
         );
     }
 
