@@ -19302,6 +19302,167 @@ pub fn spawn_slo_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
     });
 }
 
+/// One row for the budget-breach scan (#11 slice 2c).
+#[derive(sqlx::FromRow)]
+struct BudgetScanRow {
+    id: String,
+    metric_key: String,
+    site: Option<String>,
+    environment: Option<String>,
+    threshold: f64,
+    comparison: String,
+    breaching: bool,
+}
+
+/// Definitive breach state for one budget, or `None` when there is no data yet
+/// (empty series / no summary) — the same "skip transient" posture as the SLO
+/// scan. Reuses the exact evaluation `metrics_budget_status` performs: load the
+/// series, summarize, project the forecast extreme for the comparison direction,
+/// and evaluate (breach = breached_now OR breached_projected).
+async fn budget_breach_state(
+    pool: &sqlx::PgPool,
+    b: &BudgetScanRow,
+) -> Result<Option<bool>, sqlx::Error> {
+    let rows = fetch_metric_series_rows(pool, &b.metric_key, &b.site, &b.environment).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let points: Vec<ryuki_engine::metric_forecast::MetricPoint> = rows
+        .iter()
+        .map(|r| ryuki_engine::metric_forecast::MetricPoint {
+            t: r.observed_at.timestamp() as f64,
+            value: r.value,
+        })
+        .collect();
+    let Some(summary) = ryuki_engine::metric_forecast::summarize(&points) else {
+        return Ok(None);
+    };
+    let comparison =
+        ryuki_engine::metric_budget::BudgetComparison::from_str_or_above(&b.comparison);
+    let step = metric_series_step(&points);
+    let projection = ryuki_engine::metric_forecast::project_forward(&points, step, 6);
+    let projected_extreme: Option<f64> = if projection.is_empty() {
+        None
+    } else {
+        let extreme = match comparison {
+            ryuki_engine::metric_budget::BudgetComparison::Below => projection
+                .iter()
+                .map(|p| p.value)
+                .filter(|v| v.is_finite())
+                .fold(f64::INFINITY, f64::min),
+            ryuki_engine::metric_budget::BudgetComparison::Above => projection
+                .iter()
+                .map(|p| p.value)
+                .filter(|v| v.is_finite())
+                .fold(f64::NEG_INFINITY, f64::max),
+        };
+        extreme.is_finite().then_some(extreme)
+    };
+    let eval = ryuki_engine::metric_budget::evaluate_budget(
+        b.threshold,
+        comparison,
+        Some(&summary),
+        projected_extreme,
+    );
+    Ok(Some(eval.breached_now || eval.breached_projected))
+}
+
+/// One budget-breach scan pass (#11 slice 2c): evaluate every enabled budget and,
+/// on a DEFINITIVE breach state, emit a `budget.breach` / `budget.recovered`
+/// domain event ONLY when the budget TRANSITIONS — deduped via the `breaching`
+/// flag, flipped atomically with the emit. No-data and transient series-read
+/// errors leave the flag unchanged so a gapping/flapping metric never spams.
+/// Each budget is independent; one failure does not abort the rest. Returns the
+/// number of transition events emitted.
+pub(crate) async fn budget_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, sqlx::Error> {
+    let budgets: Vec<BudgetScanRow> = sqlx::query_as(
+        "SELECT id, metric_key, site, environment, threshold, comparison, breaching \
+         FROM metric_budgets WHERE enabled",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut emitted = 0u64;
+    for b in &budgets {
+        let now_breaching = match budget_breach_state(pool, b).await {
+            Ok(Some(v)) => v,
+            // No definitive state (no data) or a transient per-budget read error:
+            // skip without flipping the flag.
+            Ok(None) | Err(_) => continue,
+        };
+        if now_breaching == b.breaching {
+            continue; // no transition
+        }
+        let mut tx = pool.begin().await?;
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: if now_breaching {
+                    "budget.breach"
+                } else {
+                    "budget.recovered"
+                },
+                aggregate_type: "budget",
+                aggregate_id: &b.id,
+                site: b.site.as_deref(),
+                environment: b.environment.as_deref(),
+                actor: "system",
+                payload: json!({
+                    "to_status": if now_breaching { "breached" } else { "recovered" },
+                    "metric_key": &b.metric_key,
+                    "threshold": b.threshold,
+                    "comparison": &b.comparison,
+                }),
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE metric_budgets SET breaching = $1, updated_at = NOW() WHERE id = $2")
+            .bind(now_breaching)
+            .bind(&b.id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        emitted += 1;
+    }
+    Ok(emitted)
+}
+
+/// Spawn the background budget-breach scan (#11 slice 2c). Write-capable, so
+/// separate from the read-only scheduler; #31-style backoff on consecutive
+/// failures. Call once at startup.
+pub fn spawn_budget_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            ticker.tick().await;
+            match budget_breach_scan_once(&pool).await {
+                Ok(emitted) => {
+                    consecutive_failures = 0;
+                    if emitted > 0 {
+                        tracing::info!(emitted, "budget-breach scan emitted transition events");
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        backoff_intervals,
+                        "budget-breach scan failed; backing off"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        interval_secs.saturating_mul(backoff_intervals),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 /// PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold,
 /// comparison, enabled); omitted fields are left unchanged (PATCH semantics,
 /// swarm #19). Execute-tier (same as create/delete). 404 if absent; 503 no DB.
@@ -37571,6 +37732,114 @@ mod db_lifecycle_tests {
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1 OR metric_key = $2")
             .bind(&good_key)
             .bind(&total_key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #11 slice 2c: the budget-breach scan emits budget.breach on the breach
+    /// transition, dedups, surfaces as a WARNING alert, and emits budget.recovered
+    /// when the metric drops back under the threshold.
+    #[tokio::test]
+    async fn budget_breach_scan_emits_on_transition_and_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("cost.scan.{suffix}");
+        let created = metrics_budget_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(MetricBudgetCreateRequest {
+                metric_key: key.clone(),
+                site: None,
+                environment: None,
+                threshold: 10.0,
+                comparison: Some("above".into()),
+            }),
+        )
+        .await
+        .expect("create budget");
+        let budget_id = created.0["id"].as_str().unwrap().to_string();
+
+        let sample =
+            "INSERT INTO metric_samples (id, metric_key, site, environment, value, observed_at) \
+                      VALUES ($1, $2, NULL, NULL, $3, $4)";
+        let now = chrono::Utc::now();
+        // Breach: latest value 100 > threshold 10.
+        sqlx::query(sample)
+            .bind(Uuid::new_v4().to_string())
+            .bind(&key)
+            .bind(100.0_f64)
+            .bind(now - chrono::Duration::minutes(5))
+            .execute(pool)
+            .await
+            .expect("seed breach sample");
+
+        assert_eq!(
+            budget_breach_scan_once(pool).await.expect("scan 1"),
+            1,
+            "first breach must emit one transition event"
+        );
+        assert_eq!(
+            budget_breach_scan_once(pool).await.expect("scan 2"),
+            0,
+            "an already-breaching budget must not re-emit (dedup)"
+        );
+
+        let alerts = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(budget_id.clone()),
+                limit: Some(50),
+            }),
+        )
+        .await
+        .expect("alerts list");
+        let arr = alerts.0["alerts"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|a| a["event_type"] == json!("budget.breach")
+                    && a["severity"] == json!("warning")),
+            "the budget breach must surface as a warning alert: {arr:?}"
+        );
+
+        // Recover: later low samples → latest 1 ≤ 10 and a downward trend.
+        for off in [3i64, 2, 1] {
+            sqlx::query(sample)
+                .bind(Uuid::new_v4().to_string())
+                .bind(&key)
+                .bind(1.0_f64)
+                .bind(now - chrono::Duration::minutes(off))
+                .execute(pool)
+                .await
+                .expect("seed recovery sample");
+        }
+        assert_eq!(
+            budget_breach_scan_once(pool).await.expect("scan 3"),
+            1,
+            "recovery must emit one transition event"
+        );
+        let breaching: bool =
+            sqlx::query_scalar("SELECT breaching FROM metric_budgets WHERE id = $1")
+                .bind(&budget_id)
+                .fetch_one(pool)
+                .await
+                .expect("read breaching flag");
+        assert!(
+            !breaching,
+            "budget must no longer be breaching after recovery"
+        );
+
+        sqlx::query("DELETE FROM metric_budgets WHERE id = $1")
+            .bind(&budget_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(&key)
             .execute(pool)
             .await
             .ok();

@@ -52,6 +52,17 @@ pub fn severity_for_slo_status(to_status: &str) -> Option<AlertSeverity> {
     }
 }
 
+/// Classify a budget-scan event (#11 slice 2c) by its `to_status`. A `breached`
+/// cost/capacity budget is a WARNING (a spend/headroom threshold was crossed) —
+/// a tier below an SLO breach, which is a reliability-contract violation.
+/// `recovered` is not an alert.
+pub fn severity_for_budget_status(to_status: &str) -> Option<AlertSeverity> {
+    match to_status {
+        "breached" => Some(AlertSeverity::Warning),
+        _ => None,
+    }
+}
+
 /// The UNION of every alert-worthy `to_status` across all aggregate types.
 /// Exposed so the alert feed can push this filter INTO its SQL query — alerts
 /// are rare relative to all events, so filtering a recent-N page in memory would
@@ -70,6 +81,7 @@ pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSe
     match aggregate_type {
         "request" => to_status.and_then(severity_for_request_status),
         "slo" => to_status.and_then(severity_for_slo_status),
+        "budget" => to_status.and_then(severity_for_budget_status),
         _ => None,
     }
 }
@@ -117,7 +129,9 @@ mod tests {
         // labels can never drift.
         for s in alert_worthy_statuses() {
             assert!(
-                severity_for_request_status(s).is_some() || severity_for_slo_status(s).is_some(),
+                severity_for_request_status(s).is_some()
+                    || severity_for_slo_status(s).is_some()
+                    || severity_for_budget_status(s).is_some(),
                 "{s} is in the alert union but no aggregate classifies it as an alert"
             );
         }
@@ -137,6 +151,12 @@ mod tests {
         );
         // 'recovered' is good news, not an alert.
         assert_eq!(classify("slo", Some("recovered")), None);
+        // A breached budget is a warning (cost/capacity), below an SLO breach.
+        assert_eq!(
+            classify("budget", Some("breached")),
+            Some(AlertSeverity::Warning)
+        );
+        assert_eq!(classify("budget", Some("recovered")), None);
         // Cross-aggregate spurious pairs never alert (a request can't be
         // 'breached', an slo can't be 'failed').
         assert_eq!(classify("slo", Some("failed")), None);

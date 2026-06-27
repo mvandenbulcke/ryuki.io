@@ -1635,6 +1635,11 @@ async fn main() {
         // checking adds no signal.
         contracts::spawn_slo_breach_scan(pool.clone(), 300);
         tracing::info!("slo-breach scan started (interval: 300s)");
+        // #11 slice 2c: budget-breach scan emits budget.breach/budget.recovered
+        // domain events on transition (write-capable, same posture as the SLO
+        // scan). 5-minute cadence.
+        contracts::spawn_budget_breach_scan(pool.clone(), 300);
+        tracing::info!("budget-breach scan started (interval: 300s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);

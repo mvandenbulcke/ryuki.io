@@ -317,6 +317,17 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   surfaces as critical, recovery→emit + flag cleared. REMAINING (2c): more
   emitters (capacity-budget breach, agent-offline) + alert ack/state + recipient
   routing.
+- **STATUS (2026-06-27) — SLICE 2c (second operational emitter: budget breach):**
+  `spawn_budget_breach_scan` / `budget_breach_scan_once` mirror the SLO scan
+  exactly, reusing the `metrics_budget_status` evaluation (series → summarize →
+  forecast extreme → `evaluate_budget`). Emits `budget.breach` / `budget.recovered`
+  on transition only, deduped via a new `metric_budgets.breaching` flag (migration
+  113); no-data / transient read errors leave the flag unchanged. `event_alerts`
+  gained a `budget` arm (breached=WARNING — a tier below an SLO breach), so budget
+  breaches surface in `GET /api/events/alerts` as warning alerts. Wired into
+  startup (300s). DB test: breach→emit→dedup→warning-alert→recovery→flag-cleared;
+  slice 2a/2b + engine tests stay green. REMAINING (2d): agent-offline emitter +
+  persistent alert ack/state + recipient routing.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False
