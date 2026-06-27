@@ -23661,6 +23661,26 @@ async fn oob_test_endpoint(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let endpoint_uuid = parse_oob_id(&id)?;
+        // #2: pre-load the endpoint's site and guard BEFORE the UPDATE; an
+        // out-of-scope or missing endpoint -> the same not-found (no oracle, no
+        // cross-site mutation).
+        if is_scoped(&session) {
+            let site: Option<String> =
+                sqlx::query_scalar("SELECT site FROM oob_endpoints WHERE id = $1")
+                    .bind(endpoint_uuid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !site
+                .map(|s| row_scope_permits(&session, &s, ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+                ));
+            }
+        }
         let now = chrono::Utc::now();
         let mut tx = pool.begin().await.map_err(db_error)?;
         let result = sqlx::query(
@@ -23713,6 +23733,13 @@ async fn oob_test_endpoint(
             "dry_run": true,
         })));
     }
+    // #2: the engine fallback has no site dimension; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+        ));
+    }
     match oob_access::test_endpoint(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -23720,6 +23747,7 @@ async fn oob_test_endpoint(
 }
 
 async fn oob_validate_cert(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -23738,6 +23766,13 @@ async fn oob_validate_cert(
                 Json(json!({"error": format!("OOB endpoint {} not found", id)})),
             )
         })?;
+        // #2: out-of-scope -> the same not-found (no existence oracle).
+        if !row_scope_permits(&session, &row.site, "") {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+            ));
+        }
 
         let now = chrono::Utc::now();
         let days_remaining = (row.cert_expiry - now).num_days();
@@ -23753,6 +23788,13 @@ async fn oob_validate_cert(
             "dry_run": true,
         })));
     }
+    // #2: the engine fallback has no site dimension; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+        ));
+    }
     match oob_access::validate_certificate(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -23760,6 +23802,7 @@ async fn oob_validate_cert(
 }
 
 async fn oob_check_defaults(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -23778,6 +23821,13 @@ async fn oob_check_defaults(
                 Json(json!({"error": format!("OOB endpoint {} not found", id)})),
             )
         })?;
+        // #2: out-of-scope -> the same not-found (no existence oracle).
+        if !row_scope_permits(&session, &row.site, "") {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+            ));
+        }
 
         return Ok(Json(json!({
             "source": "database",
@@ -23788,6 +23838,13 @@ async fn oob_check_defaults(
             "dry_run": true,
         })));
     }
+    // #2: the engine fallback has no site dimension; a scoped principal fails closed.
+    if is_scoped(&session) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("OOB endpoint {} not found", id)})),
+        ));
+    }
     match oob_access::check_default_credentials(&id) {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
@@ -23795,9 +23852,12 @@ async fn oob_check_defaults(
 }
 
 async fn oob_inventory(
+    AuthExtractor(session): AuthExtractor,
     Query(query): Query<OobInventoryQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_default();
+    // #2: narrow the site to the principal's scope (env-scoped -> 403; an
+    // unrestricted caller with no ?site -> "" = all sites).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
     if let Some(pool) = get_db() {
         let rows: Vec<OobEndpointRow> = if site.is_empty() {
             sqlx::query_as(&format!(
@@ -23833,9 +23893,11 @@ async fn oob_inventory(
 }
 
 async fn oob_failing(
+    AuthExtractor(session): AuthExtractor,
     Query(query): Query<OobFailingQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let site = query.site.unwrap_or_default();
+    // #2: narrow the site to the principal's scope (env-scoped -> 403; "" = all).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "")?;
     if let Some(pool) = get_db() {
         let rows: Vec<OobEndpointRow> = if site.is_empty() {
             sqlx::query_as(&format!(
@@ -23884,7 +23946,9 @@ async fn oob_failing(
     }
 }
 
-async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn oob_cert_expiring(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         let now = chrono::Utc::now();
         let threshold = now + chrono::Duration::days(30);
@@ -23900,6 +23964,8 @@ async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         .await
         .map_err(db_error)?;
 
+        // #2: a scoped principal only sees its own site's endpoints (env-scoped -> none).
+        let rows = retain_site_scoped(&session, rows, |r| r.site.as_str());
         let endpoints: Vec<Value> = rows
             .iter()
             .map(|r| {
@@ -23924,13 +23990,25 @@ async fn oob_cert_expiring() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
             "dry_run": true,
         })));
     }
+    // #2: the engine fallback can't be site-filtered; a scoped principal sees none.
+    if is_scoped(&session) {
+        return Ok(Json(json!({
+            "source": "engine",
+            "threshold_days": 30,
+            "expiring_count": 0,
+            "endpoints": [],
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_cert_expiring() {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
 }
 
-async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn oob_firmware_outdated(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
         // Mirrors the engine baseline map exactly.
         let baseline: std::collections::HashMap<&str, &str> = std::collections::HashMap::from([
@@ -23947,6 +24025,8 @@ async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>
         .await
         .map_err(db_error)?;
 
+        // #2: a scoped principal only sees its own site's endpoints (env-scoped -> none).
+        let rows = retain_site_scoped(&session, rows, |r| r.site.as_str());
         let outdated: Vec<Value> = rows
             .iter()
             .filter(|r| {
@@ -23975,6 +24055,15 @@ async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>
             "dry_run": true,
         })));
     }
+    // #2: the engine fallback can't be site-filtered; a scoped principal sees none.
+    if is_scoped(&session) {
+        return Ok(Json(json!({
+            "source": "engine",
+            "outdated_count": 0,
+            "endpoints": [],
+            "dry_run": true,
+        })));
+    }
     match oob_access::get_firmware_outdated() {
         Ok(result) => Ok(Json(result)),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -23982,8 +24071,12 @@ async fn oob_firmware_outdated() -> Result<Json<Value>, (StatusCode, Json<Value>
 }
 
 async fn oob_validate_site(
+    AuthExtractor(session): AuthExtractor,
     Path(site): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // #2: a scoped principal may only validate its own site's OOB posture
+    // (env-scoped principals are rejected; oob_endpoints is site-only).
+    guard_body_site_scope(&session, &site)?;
     if let Some(pool) = get_db() {
         let now = chrono::Utc::now();
 
@@ -39966,6 +40059,72 @@ mod db_lifecycle_tests {
         }
     }
 
+    /// #2 RBAC: the OOB-access handlers are site-scoped (oob_endpoints has site). A
+    /// GBLON principal gets 403 validating/inventorying DEFRA and 404 on a DEFRA
+    /// endpoint's by-id check; its own site and an unrestricted principal pass.
+    #[tokio::test]
+    async fn oob_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // validate_site (Path = site) for a foreign site -> 403.
+        let vs = oob_validate_site(AuthExtractor(gblon.clone()), Path("DEFRA".into())).await;
+        assert!(
+            matches!(vs, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope oob_validate_site must be forbidden: {vs:?}"
+        );
+
+        // inventory for a foreign site -> 403.
+        let inv = oob_inventory(
+            AuthExtractor(gblon.clone()),
+            Query(OobInventoryQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(inv, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope oob_inventory must be forbidden: {inv:?}"
+        );
+
+        // own site + unrestricted pass the gate.
+        let own = oob_validate_site(AuthExtractor(gblon.clone()), Path("GBLON".into())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope oob_validate_site must pass: {own:?}"
+        );
+        let any = oob_validate_site(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("DEFRA".into()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted oob_validate_site must pass: {any:?}"
+        );
+
+        // by-id validate_cert on a DEFRA endpoint -> 404 (when present).
+        if let Some(ep) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM oob_endpoints WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let vc = oob_validate_cert(AuthExtractor(gblon), Path(ep)).await;
+            assert!(
+                matches!(vc, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope oob_validate_cert must 404: {vc:?}"
+            );
+        }
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -46283,7 +46442,11 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_inventory_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_inventory(Query(OobInventoryQuery { site: None })).await;
+        let result = oob_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(OobInventoryQuery { site: None }),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46298,7 +46461,11 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_failing_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_failing(Query(OobFailingQuery { site: None })).await;
+        let result = oob_failing(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(OobFailingQuery { site: None }),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46329,7 +46496,7 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_cert_expiring_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_cert_expiring().await;
+        let result = oob_cert_expiring(AuthExtractor(AuthSession::static_dry_run())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46343,7 +46510,7 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_firmware_outdated_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_firmware_outdated().await;
+        let result = oob_firmware_outdated(AuthExtractor(AuthSession::static_dry_run())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46357,7 +46524,11 @@ mod oob_access_unit_tests {
             eprintln!("SKIP test_validate_site_unknown_fallback_no_db: running in DB mode");
             return;
         }
-        let result = oob_validate_site(Path("UNKNOWN".into())).await;
+        let result = oob_validate_site(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("UNKNOWN".into()),
+        )
+        .await;
         assert!(result.is_err(), "unknown site must return Err");
     }
 }
@@ -46537,7 +46708,11 @@ mod oob_access_db_tests {
         };
 
         // The migration already seeds 6 rows for DEFRA and GBLON.
-        let result = oob_inventory(Query(OobInventoryQuery { site: None })).await;
+        let result = oob_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(OobInventoryQuery { site: None }),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46567,9 +46742,12 @@ mod oob_access_db_tests {
             return;
         };
 
-        let result = oob_inventory(Query(OobInventoryQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let result = oob_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(OobInventoryQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
@@ -46594,7 +46772,11 @@ mod oob_access_db_tests {
         };
 
         // Migration seeds at least two unreachable endpoints.
-        let result = oob_failing(Query(OobFailingQuery { site: None })).await;
+        let result = oob_failing(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(OobFailingQuery { site: None }),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46619,7 +46801,7 @@ mod oob_access_db_tests {
 
         // Seeded data has endpoints with expired certs (idrac02, idracgblon03) and
         // near-expiry certs (ipmi03 +20d, xccgblon02 +10d).
-        let result = oob_cert_expiring().await;
+        let result = oob_cert_expiring(AuthExtractor(AuthSession::static_dry_run())).await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46661,7 +46843,11 @@ mod oob_access_db_tests {
         )
         .await;
 
-        let result = oob_validate_cert(Path(id.into())).await;
+        let result = oob_validate_cert(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup_endpoint(pool, id).await;
 
         let Ok(Json(body)) = result else {
@@ -46699,7 +46885,11 @@ mod oob_access_db_tests {
         )
         .await;
 
-        let result = oob_check_defaults(Path(id.into())).await;
+        let result = oob_check_defaults(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup_endpoint(pool, id).await;
 
         let Ok(Json(body)) = result else {
@@ -46733,7 +46923,11 @@ mod oob_access_db_tests {
         )
         .await;
 
-        let result = oob_check_defaults(Path(id.into())).await;
+        let result = oob_check_defaults(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
         cleanup_endpoint(pool, id).await;
 
         let Ok(Json(body)) = result else {
@@ -46757,7 +46951,11 @@ mod oob_access_db_tests {
         // Use the seeded DEFRA site (3 endpoints from migration 027).
         // pool is initialised above for migrations; not used directly in this test.
         let _ = pool;
-        let result = oob_validate_site(Path("DEFRA".into())).await;
+        let result = oob_validate_site(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("DEFRA".into()),
+        )
+        .await;
         let Ok(Json(body)) = result else {
             panic!("expected Ok, got Err: {result:?}");
         };
@@ -46782,7 +46980,11 @@ mod oob_access_db_tests {
             return;
         };
 
-        let result = oob_validate_site(Path("NOSUCHSITE".into())).await;
+        let result = oob_validate_site(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("NOSUCHSITE".into()),
+        )
+        .await;
         let Err((status, _)) = result else {
             panic!("expected Err 400, got Ok");
         };
