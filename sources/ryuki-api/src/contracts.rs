@@ -30709,6 +30709,7 @@ async fn lb_vs_list(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn lb_provision(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<LbProvisionRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let (pool_entity, vs, request) = load_balancer::build_provision(
@@ -30721,6 +30722,10 @@ async fn lb_provision(
         &b.algorithm,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+
+    // #2: body-create site scope — scoped principals may only provision in their
+    // own site; env-scoped principals are rejected (lb resources are site-only).
+    guard_body_site_scope(&session, &vs.site)?;
 
     let db = get_db().ok_or_else(status_503_no_db)?;
 
@@ -30762,15 +30767,28 @@ async fn lb_provision(
         "request": request
     })))
 }
-async fn lb_vs_get(Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn lb_vs_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(db) = get_db() else {
         return Err(status_404(&id));
     };
-    let (vs, pool) = crate::repos::load_balancer::get_virtual_server_with_pool(db, &id)
+    // #2: load only the VS first and guard on its site BEFORE any further work,
+    // so an out-of-scope caller always gets a clean 404 — never a 500 from a
+    // pool/member decode error that would betray the VS's existence.
+    let vs = crate::repos::load_balancer::get_virtual_server(db, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    Ok(Json(load_balancer::get_virtual_server(&vs, &pool)))
+    scope_guard_or_404(&session, &vs.site, "", &id)?;
+    let pool = crate::repos::load_balancer::load_pool_with_members_pub(db, &vs.pool_id)
+        .await
+        .map_err(db_error)?;
+    match pool {
+        Some(p) => Ok(Json(load_balancer::get_virtual_server(&vs, &p))),
+        None => Ok(Json(json!({ "source": "db", "virtual_server": vs }))),
+    }
 }
 
 /// Mutable structural fields of a virtual server. Identity (vip/site/name/pool)
@@ -30794,6 +30812,12 @@ async fn lb_vs_update(
     Json(b): Json<LbVsUpdateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: by-id site scope — pre-load and guard before mutating.
+    let existing = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     // Validate ONLY the provided fields and pass them through as Options — the
     // repo UPDATE is partial (COALESCE), so there is no read-modify-write that a
     // concurrent partial update could clobber.
@@ -30854,6 +30878,12 @@ async fn lb_vs_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: by-id site scope — pre-load and guard before mutating.
+    let existing = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let mut tx = db.begin().await.map_err(db_error)?;
     let deleted = crate::repos::load_balancer::delete_virtual_server(&mut tx, &id)
         .await
@@ -30902,6 +30932,8 @@ async fn lb_pool_member_add(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: by-id site scope — guard the resolved VS before mutating its pool.
+    scope_guard_or_404(&session, &vs.site, "", &id)?;
     let pool_id = vs.pool_id.clone();
 
     let member = ryuki_engine::load_balancer::PoolMember {
@@ -30968,6 +31000,8 @@ async fn lb_pool_member_remove(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: by-id site scope — guard the resolved VS before mutating its pool.
+    scope_guard_or_404(&session, &vs.site, "", &id)?;
     let pool_id = vs.pool_id.clone();
 
     let mut tx = db.begin().await.map_err(db_error)?;
@@ -31015,6 +31049,12 @@ async fn lb_vs_drain(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: by-id site scope — pre-load and guard before mutating status.
+    let existing = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
         &mut *tx,
@@ -31045,6 +31085,12 @@ async fn lb_vs_disable(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: by-id site scope — pre-load and guard before mutating status.
+    let existing = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
         &mut *tx,
@@ -31075,6 +31121,12 @@ async fn lb_vs_enable(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: by-id site scope — pre-load and guard before mutating status.
+    let existing = crate::repos::load_balancer::get_virtual_server(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let mut tx = db.begin().await.map_err(db_error)?;
     let vs = crate::repos::load_balancer::update_vs_status(
         &mut *tx,
@@ -31124,6 +31176,7 @@ async fn lb_status(
     )))
 }
 async fn lb_validate_vip(
+    AuthExtractor(session): AuthExtractor,
     Json(b): Json<LbValidateVipRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Pure validation first
@@ -31139,6 +31192,11 @@ async fn lb_validate_vip(
             Json(json!({"error": "site cannot be empty"})),
         ));
     }
+
+    // #2: scoped principals may only probe VIP availability within their own
+    // site; env-scoped principals are rejected (lb resources are site-only).
+    // Without this, the conflict lookup leaks another site's VIP/VS data.
+    guard_body_site_scope(&session, &b.site)?;
 
     let conflict = match get_db() {
         Some(pool) => crate::repos::load_balancer::find_vip_conflict(pool, &b.vip, &b.site)
@@ -37494,6 +37552,64 @@ mod db_lifecycle_tests {
         .await;
         assert!(drained_ok, "lb_vs_drain must succeed: {res:?}");
         assert!(audited, "lb_vs_drain must write a durable audit row");
+    }
+
+    /// #2 RBAC: the load-balancer VS by-id handlers are site-scoped. A principal
+    /// scoped to a different site gets 404 — never a cross-site read or mutation,
+    /// never an existence oracle — while an unrestricted principal passes the
+    /// gate. Uses the migration-seeded `vs-defra-web` (site DEFRA). The negative
+    /// mutation case hits the pre-load guard BEFORE `db.begin()`, so the fixture
+    /// is left untouched (no restore needed).
+    #[tokio::test]
+    async fn lb_vs_by_id_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let vs_id = "vs-defra-web"; // seeded by migration 072, site = DEFRA
+
+        // Out-of-scope (GBLON) principal: both the read and the mutation 404.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        let got = lb_vs_get(AuthExtractor(gblon.clone()), Path(vs_id.to_string())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope lb_vs_get must 404: {got:?}"
+        );
+        let disabled = lb_vs_disable(AuthExtractor(gblon), Path(vs_id.to_string())).await;
+        assert!(
+            matches!(disabled, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope lb_vs_disable must 404 before any mutation: {disabled:?}"
+        );
+
+        // Unrestricted principal: passes the scope gate (not a 404).
+        let ok = lb_vs_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(vs_id.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(ok, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted lb_vs_get must pass the scope gate: {ok:?}"
+        );
+
+        // The validate-vip probe (body read) is site-scoped too: a GBLON
+        // principal cannot probe DEFRA's VIP space — 403, not a cross-site read.
+        let mut gblon2 = AuthSession::static_dry_run();
+        gblon2.site_scope = vec!["GBLON".into()];
+        let probe = lb_validate_vip(
+            AuthExtractor(gblon2),
+            Json(LbValidateVipRequest {
+                vip: "10.0.0.9".into(),
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(probe, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope lb_validate_vip must be forbidden: {probe:?}"
+        );
     }
 
     /// Read the raw persisted row through the global pool (so it observes what

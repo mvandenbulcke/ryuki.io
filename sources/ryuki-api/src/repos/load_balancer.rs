@@ -256,6 +256,12 @@ pub async fn get_virtual_server(
 
 /// Get a virtual server and its pool (with members) by VS id.
 /// Returns Ok(None) when the VS is absent.
+///
+/// Test-only: the handler path (`lb_vs_get`) now loads the VS first, applies the
+/// site-scope guard, and only then loads the pool — so an out-of-scope caller
+/// can never trigger a pool/member decode error that would betray the VS's
+/// existence (#2). This joint loader is retained for repo-layer assembly tests.
+#[cfg(test)]
 pub async fn get_virtual_server_with_pool(
     pool: &PgPool,
     id: &str,
