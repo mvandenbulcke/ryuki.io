@@ -162,6 +162,7 @@ pub fn routes() -> Router {
         )
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
+        .route("/api/events", get(events_list))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
         .route("/api/audit/retention", get(audit_retention_report))
@@ -13403,6 +13404,30 @@ async fn apply_transition_audited(
         .map_err(db_error)?;
     }
 
+    // #11: emit an operational domain event mirroring this committed transition,
+    // in the SAME tx as the audit row so the event stream faithfully reflects
+    // every applied lifecycle change (no event without the transition, and none
+    // lost after it). event_type = the audit action (e.g. "request.approve");
+    // payload carries only non-secret status/stage references.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: action,
+            aggregate_type: "request",
+            aggregate_id: &request_id,
+            site: Some(&row.site),
+            environment: Some(&row.environment),
+            actor: &session.user_id,
+            payload: json!({
+                "from_status": &current.status,
+                "to_status": &row.status,
+                "to_stage": &row.stage,
+            }),
+        },
+    )
+    .await
+    .map_err(db_error)?;
+
     tx.commit().await.map_err(db_error)?;
     // Best-effort notification emit, DETACHED from the request path. The lifecycle
     // transition is already durably committed; spawning the emit means a slow or
@@ -16860,6 +16885,81 @@ async fn activity_audit_feed(
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
     let offset = params.offset.unwrap_or(0) as i64;
     Ok(Json(audit::audit_feed(get_db(), limit, offset).await))
+}
+
+/// Query params for the operational event feed (#11).
+#[derive(Debug, Deserialize, Default)]
+struct EventsQuery {
+    /// Filter to one dotted event type, e.g. `request.approve`.
+    event_type: Option<String>,
+    /// Filter to one aggregate's history (e.g. a request id).
+    aggregate_id: Option<String>,
+    /// Page size (default 50, capped 500).
+    limit: Option<i64>,
+}
+
+/// GET /api/events — the operational domain-event feed (#11). Newest first, with
+/// optional `event_type` / `aggregate_id` filters. Distinct from the audit feed:
+/// this is the operational stream other subsystems consume (alert generation,
+/// dashboards). Request-tier read, site/environment-scoped (#2): a scoped
+/// principal sees only its own scope's events plus platform-wide (NULL-scope)
+/// events; an environment-scoped principal still sees site-only-NULL events for
+/// its environment. Empty + `durable:false` when no DB is configured.
+async fn events_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<EventsQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read events"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"events": [], "durable": false})));
+    };
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let event_type = q
+        .event_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let aggregate_id = q
+        .aggregate_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // #2: scope is pushed INTO the query (not filtered here after the LIMIT) so a
+    // scoped principal's page is never short-counted by out-of-scope rows. A
+    // scoped principal sees only in-scope events plus platform-wide (NULL-scope)
+    // ones; an unrestricted principal sees all.
+    let rows = crate::repos::domain_events::list(
+        pool,
+        event_type,
+        aggregate_id,
+        &session.site_scope,
+        &session.environment_scope,
+        limit,
+    )
+    .await
+    .map_err(db_error)?;
+    let events: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "event_type": r.event_type,
+                "aggregate_type": r.aggregate_type,
+                "aggregate_id": r.aggregate_id,
+                "site": r.site,
+                "environment": r.environment,
+                "actor": r.actor,
+                "payload": r.payload,
+                "occurred_at": r.occurred_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"events": events, "durable": true})))
 }
 
 /// Query params for the SIEM audit export.
@@ -36970,6 +37070,112 @@ mod db_lifecycle_tests {
             }),
             "the recorded config change must appear in the history"
         );
+    }
+
+    /// #11: the domain-event repo + GET /api/events feed — insert events, filter
+    /// by aggregate_id / event_type, and apply site scope (platform-wide NULL-site
+    /// events stay visible to a scoped principal; another site's events do not).
+    #[tokio::test]
+    async fn domain_events_insert_list_filter_and_scope() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let agg = format!("evt-test-{}", Uuid::new_v4());
+        crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.approve",
+                aggregate_type: "request",
+                aggregate_id: &agg,
+                site: Some("GBLON"),
+                environment: Some("prod"),
+                actor: "evt-test-actor",
+                payload: json!({ "to_status": "approved" }),
+            },
+        )
+        .await
+        .expect("insert GBLON event");
+        crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.verify",
+                aggregate_type: "request",
+                aggregate_id: &agg,
+                site: None,
+                environment: None,
+                actor: "evt-test-actor",
+                payload: json!({}),
+            },
+        )
+        .await
+        .expect("insert platform-wide event");
+
+        // Unrestricted admin: both events for the aggregate.
+        let resp = events_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(agg.clone()),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .expect("list must succeed");
+        assert_eq!(resp.0["durable"], json!(true));
+        assert_eq!(
+            resp.0["events"].as_array().expect("events").len(),
+            2,
+            "both events for the aggregate must return"
+        );
+
+        // event_type filter narrows to one.
+        let approve_only = events_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: Some("request.approve".into()),
+                aggregate_id: Some(agg.clone()),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .expect("filtered list");
+        assert_eq!(
+            approve_only.0["events"].as_array().unwrap().len(),
+            1,
+            "event_type filter must narrow to one"
+        );
+
+        // A DEFRA-scoped principal sees the platform-wide (NULL-site) event but
+        // NOT the GBLON event.
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let scoped = events_list(
+            AuthExtractor(defra),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(agg.clone()),
+                limit: Some(100),
+            }),
+        )
+        .await
+        .expect("scoped list");
+        let scoped_events = scoped.0["events"].as_array().unwrap();
+        assert!(
+            scoped_events.iter().all(|e| e["site"] != json!("GBLON")),
+            "a DEFRA-scoped principal must not see GBLON events: {scoped_events:?}"
+        );
+        assert!(
+            scoped_events.iter().any(|e| e["site"].is_null()),
+            "platform-wide (NULL-site) events must stay visible to a scoped principal"
+        );
+
+        sqlx::query("DELETE FROM domain_events WHERE aggregate_id = $1")
+            .bind(&agg)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the

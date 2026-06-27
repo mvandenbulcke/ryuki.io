@@ -271,6 +271,22 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-engine/src/ (lib.rs, alert_routing_engine.rs), migrations/ · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** True
 - **evidence:** Feature #22 (missing-features-tracker.md, line 54) 'Domain-event alert generation' is marked [ ] (not started). No domain_event, domain_event_stream, or alert_generated table exists (grep of migrations/ confirms). Alert routing exists (alert_routing_engine.rs) but is for INBOUND alert routing only, not OUTBOUND event→alert generation. Notifications module (notifications.rs) only handles request.{plan,approve,reject,verify,cancel} — no domain events. Missing: (1) domain event table/stream, (2) trigger to emit events from major mutations (approve, revoke, decommission, capacity-breach, SLO-breach, etc.), (3) alert generation from events, (4) recipient lookup.
 - **verified:** REAL GAP CONFIRMED. The missing-features tracker marks Feature #22 'Domain-event alert generation' as [ ] (not started). Verification shows: (1) No domain_event/domain_event_stream table exists (grep across all 108 migrations confirms); (2) alert_routing_engine.rs handles INBOUND alert routing only, not OUTBOUND event→alert generation; (3) notifications.rs emits only request-lifecycle transitions (plan/approve/reject/verify/cancel), not operational domain events (capacity_breach, SLO_breach, agent_offline, decommission, approval_denial, etc.); (4) route_decisions table is seeded in mig 008 but
+- **STATUS (2026-06-27) — SLICE 1 COMPLETE (event stream; alert-gen follow-up):**
+  the foundational gap (no event table, nothing emitted) is closed. New append-only
+  `domain_events` table (migration 110), `repos/domain_events.rs` (`insert` over any
+  PgExecutor + scope-aware `list`), an emit inside `apply_transition_audited` —
+  IN THE SAME TX as the audit row — so EVERY request lifecycle transition
+  (plan/approve/reject/verify/execute/cancel) durably appends an event
+  (event_type = the audit action; payload = from/to status + stage), and a read
+  feed `GET /api/events` (request-tier, filter by event_type/aggregate_id,
+  site/environment scope PUSHED INTO SQL so a scoped page is never short-counted).
+  Atomic-with-transition by design (no event without its transition, none lost
+  after). Verified: full plan→approve→execute→verify DB lifecycle tests stay
+  green (emit doesn't break the hot path); dedicated repo/endpoint/scope DB test;
+  fresh-context review (caught + fixed the scope-after-LIMIT pagination bug).
+  REMAINING (later slices, tracker #22): non-request emitters
+  (capacity/SLO breach, agent-offline, decommission) and event→alert GENERATION
+  + recipient routing.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False
