@@ -25372,6 +25372,8 @@ async fn outage_notices_create(
     Json(body): Json<OutageNoticeCreateRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only create an outage notice for their own site.
+    guard_body_site_scope(&session, &body.site)?;
     let notice = outage_comms::build_notice(
         &body.site,
         body.affected_systems,
@@ -25416,8 +25418,9 @@ async fn outage_notices_get(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    // #2: a scoped principal may only read an outage notice in its own site.
-    guard_body_site_scope(&session, &notice.site)?;
+    // #2: out-of-scope -> 404 (a 403 would betray the notice's existence to a
+    // scoped principal; status_404 matches the missing-row response).
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     Ok(Json(serde_json::to_value(notice).unwrap_or_default()))
 }
 
@@ -25433,8 +25436,8 @@ async fn outage_notices_preview(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
-    // #2: a scoped principal may only preview an outage notice in its own site.
-    guard_body_site_scope(&session, &notice.site)?;
+    // #2: out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     Ok(Json(outage_comms::preview_notice_pure(&notice)))
 }
 
@@ -25447,6 +25450,8 @@ async fn outage_notices_send(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     outage_comms::send_guard(&notice).map_err(|e| status_409(&e))?;
     let from_status = notice.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -25487,6 +25492,8 @@ async fn outage_notices_acknowledge(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     outage_comms::acknowledge_guard(&notice).map_err(|e| status_409(&e))?;
     let from_status = notice.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -25521,6 +25528,8 @@ async fn outage_notices_complete(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     outage_comms::complete_guard(&notice).map_err(|e| status_409(&e))?;
     let from_status = notice.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -25561,6 +25570,8 @@ async fn outage_notices_cancel(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the status-409 leak.
+    scope_guard_or_404(&session, &notice.site, "", &id)?;
     outage_comms::cancel_guard(&notice).map_err(|e| status_409(&e))?;
     let from_status = notice.status.to_string();
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -25592,7 +25603,12 @@ async fn outage_notices_cancel(
     Ok(Json(serde_json::to_value(updated).unwrap_or_default()))
 }
 
-async fn outage_notices_active(Query(query): Query<OutageNoticeActiveQuery>) -> ApiResult {
+async fn outage_notices_active(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<OutageNoticeActiveQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only list active notices for their own site.
+    guard_body_site_scope(&session, &query.site)?;
     let notices = match get_db() {
         Some(pool) => crate::repos::outage_comms::list_active(pool, &query.site)
             .await
@@ -25602,7 +25618,12 @@ async fn outage_notices_active(Query(query): Query<OutageNoticeActiveQuery>) -> 
     Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
-async fn outage_notices_history(Query(query): Query<OutageNoticeHistoryQuery>) -> ApiResult {
+async fn outage_notices_history(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<OutageNoticeHistoryQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only see their own site's notice history.
+    guard_body_site_scope(&session, &query.site)?;
     let notices = match get_db() {
         Some(pool) => crate::repos::outage_comms::list_history(pool, &query.site)
             .await
@@ -25612,7 +25633,12 @@ async fn outage_notices_history(Query(query): Query<OutageNoticeHistoryQuery>) -
     Ok(Json(serde_json::to_value(notices).unwrap_or_default()))
 }
 
-async fn outage_notices_upcoming(Query(query): Query<OutageNoticeUpcomingQuery>) -> ApiResult {
+async fn outage_notices_upcoming(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<OutageNoticeUpcomingQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only see their own site's upcoming notices.
+    guard_body_site_scope(&session, &query.site)?;
     let notices = match get_db() {
         Some(pool) => crate::repos::outage_comms::list_upcoming(pool, &query.site)
             .await
@@ -40516,6 +40542,80 @@ mod db_lifecycle_tests {
             !matches!(any, Err((StatusCode::FORBIDDEN, _))),
             "unrestricted network_capacity must pass: {any:?}"
         );
+    }
+
+    /// #2 RBAC: the outage-comms handlers are site-scoped (outage_notices has site).
+    /// A GBLON principal gets 403 listing/creating for DEFRA and 404 reading a DEFRA
+    /// notice (the by-id reads were tightened from 403 to 404 — no existence oracle);
+    /// its own site and an unrestricted principal pass.
+    #[tokio::test]
+    async fn outage_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // active list for a foreign site -> 403.
+        let foreign = outage_notices_active(
+            AuthExtractor(gblon.clone()),
+            Query(OutageNoticeActiveQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope outage_notices_active must be forbidden: {foreign:?}"
+        );
+
+        // create in a foreign site -> 403.
+        let create = outage_notices_create(
+            AuthExtractor(gblon.clone()),
+            Json(OutageNoticeCreateRequest {
+                site: "DEFRA".into(),
+                affected_systems: vec!["srv".into()],
+                start_time: "2099-01-01T00:00:00Z".into(),
+                end_time: "2099-01-01T02:00:00Z".into(),
+                impact_level: "low".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(create, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope outage_notices_create must be forbidden: {create:?}"
+        );
+
+        // own + unrestricted active pass the gate.
+        let own = outage_notices_active(
+            AuthExtractor(gblon.clone()),
+            Query(OutageNoticeActiveQuery {
+                site: "GBLON".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope outage_notices_active must pass: {own:?}"
+        );
+
+        // by-id read of a DEFRA notice -> 404 (when present).
+        if let Some(id) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM outage_notices WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let got = outage_notices_get(AuthExtractor(gblon), Path(id)).await;
+            assert!(
+                matches!(got, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope outage_notices_get must 404 (not 403): {got:?}"
+            );
+        }
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
