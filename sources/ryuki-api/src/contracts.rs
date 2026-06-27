@@ -28323,6 +28323,7 @@ async fn storage_volume_provision(
     }
 }
 async fn storage_volume_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(db) = get_db() else {
@@ -28332,11 +28333,14 @@ async fn storage_volume_get(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: storage is site-only — guard on the loaded volume's site.
+    scope_guard_or_404(&session, &volume.site, "", &id)?;
     Ok(Json(
         ryuki_engine::storage_provisioning::get_volume_response(&volume),
     ))
 }
 async fn storage_volume_extend(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<StorageExtendRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -28347,6 +28351,12 @@ async fn storage_volume_extend(
         return Err(status_400("additional_gb is too large"));
     }
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the volume's site BEFORE mutating (site-only).
+    let existing = crate::repos::storage_provisioning::get_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     use crate::repos::storage_provisioning::ExtendOutcome;
     match crate::repos::storage_provisioning::extend_volume(db, &id, b.additional_gb).await {
         Ok(ExtendOutcome::Done(v)) => Ok(Json(json!({
@@ -28363,6 +28373,7 @@ async fn storage_volume_extend(
     }
 }
 async fn storage_volume_map(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<StorageMapRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -28370,6 +28381,12 @@ async fn storage_volume_map(
         return Err(status_400("hostname cannot be empty"));
     }
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the volume's site BEFORE mutating (site-only).
+    let existing = crate::repos::storage_provisioning::get_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let volume = crate::repos::storage_provisioning::map_volume(db, &id, &b.hostname)
         .await
         .map_err(db_error)?
@@ -28382,10 +28399,17 @@ async fn storage_volume_map(
     })))
 }
 async fn storage_volume_unmap(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(b): Json<StorageMapRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the volume's site BEFORE mutating (site-only).
+    let existing = crate::repos::storage_provisioning::get_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let volume = crate::repos::storage_provisioning::unmap_volume(db, &id, &b.hostname)
         .await
         .map_err(db_error)?
@@ -28398,9 +28422,16 @@ async fn storage_volume_unmap(
     })))
 }
 async fn storage_volume_retire(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the volume's site BEFORE mutating (site-only).
+    let existing = crate::repos::storage_provisioning::get_volume(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     let volume = crate::repos::storage_provisioning::retire_volume(db, &id)
         .await
         .map_err(db_error)?
@@ -28430,6 +28461,7 @@ async fn storage_arrays_list(
     )))
 }
 async fn storage_array_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(db) = get_db() else {
@@ -28439,6 +28471,8 @@ async fn storage_array_get(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: storage is site-only — guard on the loaded array's site.
+    scope_guard_or_404(&session, &array.site, "", &id)?;
     Ok(Json(
         ryuki_engine::storage_provisioning::get_array_response(&array),
     ))
@@ -35764,6 +35798,40 @@ mod db_lifecycle_tests {
         ins.site_scope = vec![site.clone()];
         let ok = certificates_get(AuthExtractor(ins), Path(id.clone())).await;
         assert!(ok.is_ok(), "in-scope cert get must succeed: {ok:?}");
+    }
+
+    /// #2 RBAC (storage, site-only): a by-id volume read is 404 out-of-scope and
+    /// succeeds in-scope.
+    #[tokio::test]
+    async fn storage_volume_by_id_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Some((id, site)): Option<(String, String)> =
+            sqlx::query_as("SELECT id::text, site FROM storage_volumes LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .expect("query storage_volumes")
+        else {
+            eprintln!("SKIP: no seeded storage_volumes");
+            return;
+        };
+        let other = if site == "GBLON" { "DEFRA" } else { "GBLON" };
+
+        let mut out = AuthSession::static_dry_run();
+        out.site_scope = vec![other.to_string()];
+        let denied = storage_volume_get(AuthExtractor(out), Path(id.clone())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope volume get must 404: {denied:?}"
+        );
+
+        let mut ins = AuthSession::static_dry_run();
+        ins.site_scope = vec![site.clone()];
+        let ok = storage_volume_get(AuthExtractor(ins), Path(id.clone())).await;
+        assert!(ok.is_ok(), "in-scope volume get must succeed: {ok:?}");
     }
 
     /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
