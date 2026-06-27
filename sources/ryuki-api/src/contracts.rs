@@ -4120,6 +4120,9 @@ async fn ad_prestage(
     Json(body): Json<AdPrestageRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only prestage in their own site; env-scoped
+    // principals are rejected (ad_computers is site-only).
+    guard_body_site_scope(&session, &body.site)?;
     let computer = ad_computer_lifecycle::prestage_computer(&body.name, &body.site, &body.ou_path)
         .map_err(|e| status_400(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
@@ -4167,6 +4170,8 @@ async fn ad_move(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: by-name site scope — out-of-scope -> 404 (no existence/status oracle).
+    scope_guard_or_404(&session, &computer.site, "", &name)?;
     // A non-Active computer is a state conflict (409), not bad input. Checking it
     // here keeps a malformed target_ou as a 400 from the engine below.
     if computer.status != ad_computer_lifecycle::ComputerStatus::Active {
@@ -4214,6 +4219,8 @@ async fn ad_disable(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: by-name site scope — out-of-scope -> 404 (no existence/status oracle).
+    scope_guard_or_404(&session, &computer.site, "", &name)?;
     // Guard failures (already Deleted / already Disabled) are state conflicts.
     let updated = ad_computer_lifecycle::disable_computer_model(&computer, &body.reason)
         .map_err(|e| status_409(&e))?;
@@ -4246,6 +4253,8 @@ async fn ad_enable(AuthExtractor(session): AuthExtractor, Path(name): Path<Strin
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: by-name site scope — out-of-scope -> 404 (no existence/status oracle).
+    scope_guard_or_404(&session, &computer.site, "", &name)?;
     let updated =
         ad_computer_lifecycle::enable_computer_model(&computer).map_err(|e| status_409(&e))?;
     let before = crate::repos::ad_computers::status_str(&computer.status);
@@ -4277,6 +4286,8 @@ async fn ad_delete(AuthExtractor(session): AuthExtractor, Path(name): Path<Strin
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: by-name site scope — out-of-scope -> 404 (no existence/status oracle).
+    scope_guard_or_404(&session, &computer.site, "", &name)?;
     let updated =
         ad_computer_lifecycle::delete_computer_model(&computer).map_err(|e| status_409(&e))?;
     let before = crate::repos::ad_computers::status_str(&computer.status);
@@ -4334,17 +4345,18 @@ async fn ad_orphaned(
 /// unique name (#39). The write-by-name handlers (move/disable/enable/delete)
 /// all read the same row first; this exposes that lookup as a first-class
 /// read so an operator can inspect one computer without a bulk reconcile scan.
-/// 404 when unknown, 503 when no DB. Authn-gated (AuthExtractor) to match the
-/// rest of the AD surface; site-scope gating is intentionally not added here
-/// because the AD write-by-name handlers do not gate either (consistent
-/// posture — a cross-cutting AD scope gate is a separate follow-up).
-async fn ad_get(AuthExtractor(_session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
+/// 404 when unknown, 503 when no DB. Authn-gated and site-scoped (#2): a
+/// principal scoped to another site gets a 404 (no existence oracle), consistent
+/// with the AD write-by-name handlers (move/disable/enable/delete).
+async fn ad_get(AuthExtractor(session): AuthExtractor, Path(name): Path<String>) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     match crate::repos::ad_computers::get_by_name(pool, &name)
         .await
         .map_err(db_error)?
     {
         Some((computer, _updated_at)) => {
+            // #2: by-name site scope — out-of-scope -> 404 (no existence oracle).
+            scope_guard_or_404(&session, &computer.site, "", &name)?;
             Ok(Json(serde_json::to_value(computer).unwrap_or_default()))
         }
         None => Err(status_404(&name)),
@@ -37873,6 +37885,79 @@ mod db_lifecycle_tests {
         assert!(
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted immutability_check must pass the gate: {any:?}"
+        );
+    }
+
+    /// #2 RBAC: the AD computer by-name handlers are site-scoped. A GBLON
+    /// principal gets 404 reading or disabling a DEFRA computer (no existence or
+    /// status oracle) and the DEFRA row is left unchanged; its own GBLON computer
+    /// and an unrestricted principal pass the gate. Uses migration-018 seeds
+    /// (DEFRA-SRV-01 = DEFRA, GBLON-SRV-01 = GBLON).
+    #[tokio::test]
+    async fn ad_computer_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra = "DEFRA-SRV-01";
+        let gblon_host = "GBLON-SRV-01";
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // Out-of-scope read -> 404.
+        let read = ad_get(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(read, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope ad_get must 404: {read:?}"
+        );
+
+        // Out-of-scope disable -> 404 AND the DEFRA computer's status is unchanged
+        // (capture-before/after, robust to the persistent DB's current state).
+        let before: String = sqlx::query_scalar("SELECT status FROM ad_computers WHERE name = $1")
+            .bind(defra)
+            .fetch_one(pool)
+            .await
+            .expect("read defra computer status");
+        let dis = ad_disable(
+            AuthExtractor(gblon.clone()),
+            Path(defra.to_string()),
+            Json(AdDisableRequest {
+                reason: "scope-test".into(),
+            }),
+        )
+        .await;
+        let after: String = sqlx::query_scalar("SELECT status FROM ad_computers WHERE name = $1")
+            .bind(defra)
+            .fetch_one(pool)
+            .await
+            .expect("re-read defra computer status");
+        assert!(
+            matches!(dis, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope ad_disable must 404: {dis:?}"
+        );
+        assert_eq!(
+            before, after,
+            "out-of-scope disable must NOT have mutated the DEFRA computer"
+        );
+
+        // In-scope read -> not a 404.
+        let own = ad_get(AuthExtractor(gblon), Path(gblon_host.to_string())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope ad_get must pass the gate: {own:?}"
+        );
+
+        // Unrestricted read -> not a 404.
+        let any = ad_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted ad_get must pass the gate: {any:?}"
         );
     }
 
