@@ -8103,6 +8103,16 @@ async fn patch_plan(
     let mut wave = patch_engine::plan_patch_wave(&body.site, &body.os_family, &body.criticality)
         .map_err(|e| status_400(&e))?;
 
+    // #2: a scoped principal may only create a wave whose entire targeting is
+    // within its scope. Guard the CONSTRUCTED wave (not just body.site) so the
+    // site and environment axes the engine derived are both covered.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        "patch-wave",
+    )?;
+
     // The engine generates a non-UUID id (e.g. "pw-abc12345") suitable for
     // in-memory use but not for the UUID primary key column. Replace it with a
     // proper UUID so the repo can bind it correctly.
@@ -8139,6 +8149,14 @@ async fn patch_validate(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+
+    // #2: out-of-scope wave -> 404 before any state/transition leak.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        &body.wave_id,
+    )?;
 
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
@@ -8178,6 +8196,14 @@ async fn patch_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+
+    // #2: out-of-scope wave -> 404 before any state/transition leak.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        &body.wave_id,
+    )?;
 
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
@@ -8221,6 +8247,14 @@ async fn patch_execute(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
 
+    // #2: out-of-scope wave -> 404 before any state/transition leak.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        &body.wave_id,
+    )?;
+
     let before = crate::repos::patch_waves::status_str(&wave.status);
 
     let (completed, evidence) =
@@ -8250,13 +8284,24 @@ async fn patch_execute(
     Ok(Json(serde_json::to_value(&evidence).unwrap_or_default()))
 }
 
-async fn patch_verify(Json(body): Json<PatchActionRequest>) -> ApiResult {
+async fn patch_verify(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<PatchActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+
+    // #2: out-of-scope wave -> 404 before any evidence is computed.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        &body.wave_id,
+    )?;
 
     // verify is evidence-only; it does NOT transition the wave.
     let result = patch_engine::verify_patch_wave(&wave).map_err(|e| status_409(&e))?;
@@ -8269,13 +8314,24 @@ async fn patch_verify(Json(body): Json<PatchActionRequest>) -> ApiResult {
 /// verify -> drain -> per-server reboots -> post-checks, all simulated) and
 /// does NOT transition the wave. 503 without a database, 404 when the wave is
 /// absent, 409 when the engine rejects the wave (e.g. zero servers).
-async fn patch_reboot(Json(body): Json<PatchActionRequest>) -> ApiResult {
+async fn patch_reboot(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<PatchActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let wave = crate::repos::patch_waves::get(pool, &body.wave_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.wave_id))?;
+
+    // #2: out-of-scope wave -> 404 before any reboot plan is computed.
+    multi_scope_guard_or_404(
+        &session,
+        &wave.site_scope,
+        &wave.environment_scope,
+        &body.wave_id,
+    )?;
 
     let stages = patch_engine::orchestrate_reboot(&wave).map_err(|e| status_409(&e))?;
 
@@ -8284,11 +8340,17 @@ async fn patch_reboot(Json(body): Json<PatchActionRequest>) -> ApiResult {
 
 /// List all persisted patch waves (read surface). Returns an empty list when no
 /// database is configured (demo mode), matching the other read-only GETs.
-async fn patch_waves_list() -> ApiResult {
+async fn patch_waves_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
         let waves = crate::repos::patch_waves::list(pool)
             .await
             .map_err(db_error)?;
+        // #2: a scoped principal only sees waves whose entire targeting is within
+        // its scope (env-scoped principals see none of the cross-env waves).
+        let waves: Vec<_> = waves
+            .into_iter()
+            .filter(|w| multi_scope_permits(&session, &w.site_scope, &w.environment_scope))
+            .collect();
         return Ok(Json(serde_json::to_value(&waves).unwrap_or_default()));
     }
     Ok(Json(
@@ -8298,10 +8360,17 @@ async fn patch_waves_list() -> ApiResult {
 
 /// Fetch a single persisted patch wave by id (read surface). 404 when absent or
 /// when no database is configured.
-async fn patch_wave_get(Path(id): Path<String>) -> ApiResult {
+async fn patch_wave_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     if let Some(pool) = get_db() {
         return match crate::repos::patch_waves::get(pool, &id).await {
-            Ok(Some(wave)) => Ok(Json(serde_json::to_value(&wave).unwrap_or_default())),
+            Ok(Some(wave)) => {
+                // #2: out-of-scope wave -> 404 (no existence oracle).
+                multi_scope_guard_or_404(&session, &wave.site_scope, &wave.environment_scope, &id)?;
+                Ok(Json(serde_json::to_value(&wave).unwrap_or_default()))
+            }
             Ok(None) => Err(status_404(&id)),
             Err(e) => Err(db_error(e)),
         };
@@ -8309,18 +8378,31 @@ async fn patch_wave_get(Path(id): Path<String>) -> ApiResult {
     Err(status_404(&id))
 }
 
-async fn patch_compliance() -> ApiResult {
-    match patch_engine::get_patch_compliance() {
-        Ok(compliance) => Ok(Json(compliance)),
-        Err(e) => Err(status_400(&e)),
-    }
+async fn patch_compliance(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let mut compliance = patch_engine::get_patch_compliance().map_err(|e| status_400(&e))?;
+    // #2: the dry-run report spans every site. A scoped principal sees only its
+    // own sites' rows, and the cross-site `overall_compliance_percentage` is
+    // dropped so it cannot leak out-of-scope posture; unrestricted sees all.
+    narrow_site_aggregate(
+        &session,
+        &mut compliance,
+        "sites",
+        &["overall_compliance_percentage"],
+    );
+    Ok(Json(compliance))
 }
 
-async fn patch_pending_reboots() -> ApiResult {
-    match patch_engine::get_pending_reboots() {
-        Ok(reboots) => Ok(Json(reboots)),
-        Err(e) => Err(status_400(&e)),
-    }
+async fn patch_pending_reboots(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    let mut reboots = patch_engine::get_pending_reboots().map_err(|e| status_400(&e))?;
+    // #2: a scoped principal only sees pending reboots for its own sites; the
+    // cross-site `total_pending` is dropped so it cannot leak an out-of-scope count.
+    narrow_site_aggregate(
+        &session,
+        &mut reboots,
+        "pending_reboots",
+        &["total_pending"],
+    );
+    Ok(Json(reboots))
 }
 
 async fn patch_contract() -> Json<Value> {
@@ -21343,6 +21425,81 @@ fn scope_guard_or_404(
         Ok(())
     } else {
         Err(status_404(request_id))
+    }
+}
+
+/// Per-axis containment for a resource that TARGETS a set of values (e.g. a patch
+/// wave's `site_scope` / `environment_scope`) rather than living at one site (#2).
+/// An unrestricted principal (blank scope vec) always passes; a scoped principal
+/// requires the resource's list to be NON-EMPTY and every entry permitted — an
+/// empty resource list means "all" and so fails closed for a scoped caller.
+fn within_multi_scope(principal: &[String], resource: &[String]) -> bool {
+    use ryuki_engine::auth::scope_permits;
+    if principal.iter().all(|s| s.trim().is_empty()) {
+        return true; // unrestricted on this axis
+    }
+    !resource.is_empty() && resource.iter().all(|r| scope_permits(principal, Some(r)))
+}
+
+/// True iff the principal may act on a resource targeting `sites` x `environments`
+/// — both axes must be contained within the principal's scope.
+fn multi_scope_permits(session: &AuthSession, sites: &[String], environments: &[String]) -> bool {
+    within_multi_scope(&session.site_scope, sites)
+        && within_multi_scope(&session.environment_scope, environments)
+}
+
+/// Narrow a per-site aggregate JSON object to a principal's scope (#2). The rows
+/// under `rows_key` are SITE-keyed (each has a "site" string) with no environment
+/// dimension, so: unrestricted -> unchanged; site-scoped -> keep only in-scope
+/// rows; environment-scoped -> none (an env scope cannot be honored on site-only
+/// data, fail closed). Cross-site aggregate fields named in `drop_keys` are
+/// removed for ANY scoped principal so they cannot leak out-of-scope totals.
+fn narrow_site_aggregate(
+    session: &AuthSession,
+    value: &mut Value,
+    rows_key: &str,
+    drop_keys: &[&str],
+) {
+    use ryuki_engine::auth::scope_permits;
+    let site_scoped = session.site_scope.iter().any(|s| !s.trim().is_empty());
+    let env_scoped = session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    if !site_scoped && !env_scoped {
+        return; // unrestricted — see everything
+    }
+    if let Some(map) = value.as_object_mut() {
+        if let Some(rows) = map.get_mut(rows_key).and_then(|v| v.as_array_mut()) {
+            if env_scoped {
+                rows.clear(); // site-keyed data cannot honor an environment scope
+            } else {
+                rows.retain(|row| {
+                    row.get("site")
+                        .and_then(|s| s.as_str())
+                        .map(|s| scope_permits(&session.site_scope, Some(s)))
+                        .unwrap_or(false)
+                });
+            }
+        }
+        for k in drop_keys {
+            map.remove(*k);
+        }
+    }
+}
+
+/// Post-load guard for a multi-site/env resource: out-of-scope -> 404 (no
+/// existence oracle), the multi-target analogue of `scope_guard_or_404`.
+fn multi_scope_guard_or_404(
+    session: &AuthSession,
+    sites: &[String],
+    environments: &[String],
+    id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if multi_scope_permits(session, sites, environments) {
+        Ok(())
+    } else {
+        Err(status_404(id))
     }
 }
 
@@ -37961,6 +38118,168 @@ mod db_lifecycle_tests {
         );
     }
 
+    /// #2 RBAC: patch waves are a MULTI-SITE resource (site_scope/environment_scope
+    /// are target lists), so access uses subset containment: a scoped principal may
+    /// act only on waves whose entire targeting is within its scope. Self-seeds a
+    /// DEFRA-only and a GBLON-only wave (the migration seed leaves site_scope empty
+    /// = "all", a different case). Verifies: GBLON gets 404 on the DEFRA wave (read
+    /// + validate, the latter leaving it unmutated), passes its own GBLON wave; an
+    /// env-scoped-elsewhere principal is denied on the env axis; unrestricted
+    /// passes; and the list is filtered to in-scope waves.
+    #[tokio::test]
+    async fn patch_waves_are_scope_contained() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let d = "aaaaaaaa-0000-0000-0000-0000000000d1"; // DEFRA-only wave
+        let g = "bbbbbbbb-0000-0000-0000-0000000000b1"; // GBLON-only wave
+        for (id, site) in [(d, "DEFRA"), (g, "GBLON")] {
+            let _ = sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await;
+            sqlx::query(
+                "INSERT INTO patch_waves (id, site, os_family, status, name, site_scope, environment_scope, schedule) \
+                 VALUES ($1::uuid, $2, 'windows', 'Draft', 'rbac2-test', jsonb_build_array($2), '[\"production\"]'::jsonb, \
+                         '{\"start\":\"2099-01-01T00:00:00Z\",\"end\":\"2099-01-01T04:00:00Z\",\"maintenance_window\":\"Sat 00:00-04:00\",\"patch_group\":null}'::jsonb)",
+            )
+            .bind(id)
+            .bind(site)
+            .execute(pool)
+            .await
+            .expect("seed test patch wave");
+        }
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // Out-of-scope read -> 404; in-scope read -> not 404.
+        let read_d = patch_wave_get(AuthExtractor(gblon.clone()), Path(d.to_string())).await;
+        let read_g = patch_wave_get(AuthExtractor(gblon.clone()), Path(g.to_string())).await;
+        // Out-of-scope validate -> 404, and the DEFRA wave must stay 'draft'.
+        let validated = patch_validate(
+            AuthExtractor(gblon.clone()),
+            Json(PatchActionRequest {
+                wave_id: d.to_string(),
+            }),
+        )
+        .await;
+        let d_status: String =
+            sqlx::query_scalar("SELECT status FROM patch_waves WHERE id = $1::uuid")
+                .bind(d)
+                .fetch_one(pool)
+                .await
+                .expect("read defra wave status");
+        // List is filtered to in-scope waves.
+        let listed = patch_waves_list(AuthExtractor(gblon)).await;
+
+        // Env-axis: a principal scoped to a different ENVIRONMENT is denied.
+        let mut staging = AuthSession::static_dry_run();
+        staging.environment_scope = vec!["staging".into()];
+        let env_denied = patch_wave_get(AuthExtractor(staging), Path(g.to_string())).await;
+
+        // Unrestricted -> passes.
+        let read_any = patch_wave_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(d.to_string()),
+        )
+        .await;
+
+        // Aggregate dashboards are narrowed too: a GBLON principal sees only GBLON
+        // rows with no cross-site total; an env-scoped principal sees none.
+        let compl_gblon = {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            patch_compliance(AuthExtractor(s)).await
+        };
+        let compl_env = {
+            let mut s = AuthSession::static_dry_run();
+            s.environment_scope = vec!["production".into()];
+            patch_compliance(AuthExtractor(s)).await
+        };
+
+        // Clean up before asserting.
+        for id in [d, g] {
+            let _ = sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+
+        assert!(
+            matches!(read_d, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope patch_wave_get must 404: {read_d:?}"
+        );
+        assert!(
+            !matches!(read_g, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope patch_wave_get must pass: {read_g:?}"
+        );
+        assert!(
+            matches!(validated, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope patch_validate must 404: {validated:?}"
+        );
+        assert_eq!(
+            d_status, "Draft",
+            "out-of-scope validate must NOT have transitioned the DEFRA wave"
+        );
+        assert!(
+            matches!(env_denied, Err((StatusCode::NOT_FOUND, _))),
+            "env-scoped principal must 404 on a production wave: {env_denied:?}"
+        );
+        assert!(
+            !matches!(read_any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted patch_wave_get must pass: {read_any:?}"
+        );
+        let listed_json = match listed {
+            Ok(Json(v)) => v.to_string(),
+            other => panic!("patch_waves_list must succeed: {other:?}"),
+        };
+        assert!(
+            listed_json.contains(g),
+            "scoped list must include the in-scope GBLON wave"
+        );
+        assert!(
+            !listed_json.contains(d),
+            "scoped list must exclude the out-of-scope DEFRA wave"
+        );
+
+        // Aggregate narrowing (the codex-found leak class): GBLON sees only GBLON
+        // rows and no cross-site total; env-scoped sees no rows.
+        let compl_gblon = match compl_gblon {
+            Ok(Json(v)) => v,
+            other => panic!("patch_compliance must succeed: {other:?}"),
+        };
+        let sites = compl_gblon
+            .get("sites")
+            .and_then(|v| v.as_array())
+            .expect("compliance must have a sites array");
+        assert!(
+            !sites.is_empty()
+                && sites
+                    .iter()
+                    .all(|r| r.get("site").and_then(|s| s.as_str()) == Some("GBLON")),
+            "scoped compliance must contain only GBLON rows: {compl_gblon}"
+        );
+        assert!(
+            compl_gblon.get("overall_compliance_percentage").is_none(),
+            "scoped compliance must drop the cross-site aggregate field"
+        );
+        let compl_env = match compl_env {
+            Ok(Json(v)) => v,
+            other => panic!("patch_compliance (env) must succeed: {other:?}"),
+        };
+        assert!(
+            compl_env
+                .get("sites")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "env-scoped compliance must be empty (site-keyed data cannot honor env): {compl_env}"
+        );
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -48504,9 +48823,12 @@ mod patch_waves_db_tests {
         );
 
         // 5. verify (evidence-only, no transition)
-        let Ok(Json(verify_result)) = patch_verify(Json(PatchActionRequest {
-            wave_id: id.clone(),
-        }))
+        let Ok(Json(verify_result)) = patch_verify(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(PatchActionRequest {
+                wave_id: id.clone(),
+            }),
+        )
         .await
         else {
             cleanup(pool, &id).await;
