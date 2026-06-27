@@ -130,6 +130,28 @@ pub fn drafts_for_transition(
     }
 }
 
+/// Pure: produce the portal-notification draft for an OPERATIONAL alert (#11
+/// slice 2f) — an SLO/budget breach or an agent going offline. Operational alerts
+/// have no request owner, so they route to the `MonitoringOperator` role (the
+/// team that watches platform health). The body is synthesised from structured
+/// fields only — no user free-text — so nothing sensitive leaks through the push
+/// channel. `severity` is the alert's severity as already classified upstream
+/// (`event_alerts`), mapped to the portal scale by the caller.
+pub fn draft_for_alert(
+    event_type: &str,
+    aggregate_id: &str,
+    severity: Severity,
+) -> NotificationDraft {
+    NotificationDraft {
+        recipient_kind: RecipientKind::Role,
+        recipient_id: "MonitoringOperator".to_string(),
+        event: event_type.to_string(),
+        severity,
+        title: format!("Operational alert: {event_type}"),
+        body: format!("{event_type} fired for {aggregate_id}; review the alert feed."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +314,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn alert_draft_routes_to_monitoring_operator_with_given_severity() {
+        let d = draft_for_alert("slo.breach", "slo-123", Severity::Critical);
+        assert_eq!(d.recipient_kind, RecipientKind::Role);
+        assert_eq!(d.recipient_id, "MonitoringOperator");
+        assert_eq!(d.event, "slo.breach");
+        assert_eq!(d.severity, Severity::Critical);
+        assert!(d.title.contains("slo.breach"));
+        assert!(d.body.contains("slo-123"));
     }
 }

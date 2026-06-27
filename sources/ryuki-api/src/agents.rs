@@ -1509,6 +1509,15 @@ pub async fn agent_offline_scan_once(
             },
         )
         .await?;
+        // #11 slice 2f: notify the monitoring role when an agent goes offline.
+        if now_offline {
+            let draft = ryuki_engine::notifications::draft_for_alert(
+                "agent.offline",
+                &a.agent_id,
+                ryuki_engine::notifications::Severity::Warning,
+            );
+            crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
+        }
         sqlx::query(
             "UPDATE agents SET offline_alerted = $1, updated_at = NOW() WHERE agent_id = $2",
         )

@@ -51,7 +51,7 @@ implementing **all 66**. This file tracks execution.
 | 19 | [~] | Connection health monitoring (scheduled + history) | Integ | M | H | — |
 | 20 | [ ] | Step-up / MFA re-auth for high-risk actions | Security | M | H | — |
 | 21 | [ ] | Live secret rotation (Vault) + break-glass | Security | L | H | ✓ |
-| 22 | [~] | Domain-event alert generation | Observ | M | H | — |
+| 22 | [x] | Domain-event alert generation | Observ | M | H | — |
 | 23 | [ ] | CP-side poison-job cap / dead-letter | Resil | M | H | — |
 | 24 | [x] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
 | 25 | [x] | SLO / error-budget tracking | Observ | M | H | — |

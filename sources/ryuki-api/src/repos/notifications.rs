@@ -1,4 +1,6 @@
-use ryuki_engine::notifications::{drafts_for_transition, Notification, RecipientKind, Severity};
+use ryuki_engine::notifications::{
+    drafts_for_transition, Notification, NotificationDraft, RecipientKind, Severity,
+};
 use sqlx::types::Uuid;
 use sqlx::PgPool;
 
@@ -129,6 +131,34 @@ pub async fn emit_for_transition(
         .await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+/// Persist one notification draft within the caller's transaction (#11 slice 2f).
+/// Lets an emitter write an operational-alert notification ATOMICALLY with the
+/// domain event + dedup flag it just wrote (no notification without the alert,
+/// and none lost after). `request_id` is `None` for operational alerts.
+pub async fn insert_draft_tx(
+    conn: &mut sqlx::PgConnection,
+    draft: &NotificationDraft,
+    request_id: Option<Uuid>,
+) -> Result<(), sqlx::Error> {
+    let id = format!("pn-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO portal_notifications \
+         (id, recipient_kind, recipient_id, event, request_id, severity, title, body) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(&id)
+    .bind(recipient_kind_to_db(&draft.recipient_kind))
+    .bind(&draft.recipient_id)
+    .bind(&draft.event)
+    .bind(request_id)
+    .bind(severity_to_db(&draft.severity))
+    .bind(&draft.title)
+    .bind(&draft.body)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 

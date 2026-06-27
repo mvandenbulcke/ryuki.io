@@ -353,6 +353,18 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   acknowledged-by-operator + unknown-id 404. REMAINING for #11: recipient routing
   (notify on alert) — overlaps the notifications transport (tracker #9); that's
   the last piece of tracker #22.
+- **STATUS (2026-06-27) — SLICE 2f (in-app recipient routing) — tracker #22
+  functionally COMPLETE:** every operational breach (SLO/budget/agent) now PUSHES
+  a portal notification to the `MonitoringOperator` role, written ATOMICALLY in the
+  same tx as the domain event + dedup flag, so an operator sees it in the portal
+  bell without polling the feed. Pure `notifications::draft_for_alert` (engine)
+  synthesizes the draft from structured fields only (no free-text leak);
+  `repos::notifications::insert_draft_tx` persists it inside the emitter's tx. SLO
+  breach = Critical, budget/agent = Warning. Engine + DB tests (the SLO scan test
+  asserts exactly one MonitoringOperator notification per breach). The
+  domain-event alert-generation feature is now end-to-end — generate → classify →
+  feed → ack → in-app notify. The remaining EXTERNAL transport
+  (email/webhook/chat) is a separate tracked feature (tracker #9).
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

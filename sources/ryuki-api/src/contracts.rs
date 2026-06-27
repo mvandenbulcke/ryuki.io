@@ -19317,6 +19317,16 @@ pub(crate) async fn slo_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, sql
             },
         )
         .await?;
+        // #11 slice 2f: on the BREACH transition, push a portal notification to
+        // the monitoring role in the SAME tx (atomic with the event + flag).
+        if now_breaching {
+            let draft = ryuki_engine::notifications::draft_for_alert(
+                "slo.breach",
+                &s.id,
+                ryuki_engine::notifications::Severity::Critical,
+            );
+            crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
+        }
         sqlx::query("UPDATE slo_definitions SET breaching = $1, updated_at = NOW() WHERE id = $2")
             .bind(now_breaching)
             .bind(&s.id)
@@ -19479,6 +19489,15 @@ pub(crate) async fn budget_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, 
             },
         )
         .await?;
+        // #11 slice 2f: notify the monitoring role on the breach transition.
+        if now_breaching {
+            let draft = ryuki_engine::notifications::draft_for_alert(
+                "budget.breach",
+                &b.id,
+                ryuki_engine::notifications::Severity::Warning,
+            );
+            crate::repos::notifications::insert_draft_tx(&mut tx, &draft, None).await?;
+        }
         sqlx::query("UPDATE metric_budgets SET breaching = $1, updated_at = NOW() WHERE id = $2")
             .bind(now_breaching)
             .bind(&b.id)
@@ -37766,6 +37785,21 @@ mod db_lifecycle_tests {
             "the SLO breach must surface as a critical alert: {arr:?}"
         );
 
+        // #11 slice 2f: the breach also pushed exactly one MonitoringOperator
+        // portal notification (the body carries this SLO's id).
+        let notif_n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM portal_notifications \
+             WHERE event = 'slo.breach' AND recipient_id = 'MonitoringOperator' AND body LIKE $1",
+        )
+        .bind(format!("%{slo_id}%"))
+        .fetch_one(pool)
+        .await
+        .expect("count alert notifications");
+        assert_eq!(
+            notif_n, 1,
+            "an SLO breach must push exactly one MonitoringOperator notification"
+        );
+
         // Recover: add good=99 → good=100, total=100 → attainment 1.0 ≥ 0.99.
         sqlx::query(sample)
             .bind(Uuid::new_v4().to_string())
@@ -37788,6 +37822,11 @@ mod db_lifecycle_tests {
         assert!(!breaching, "SLO must no longer be breaching after recovery");
 
         // Cleanup (domain_events is append-only and intentionally retained).
+        sqlx::query("DELETE FROM portal_notifications WHERE body LIKE $1")
+            .bind(format!("%{slo_id}%"))
+            .execute(pool)
+            .await
+            .ok();
         sqlx::query("DELETE FROM slo_definitions WHERE id = $1")
             .bind(&slo_id)
             .execute(pool)
