@@ -402,6 +402,15 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (metrics_record_sample, line 16134) · **kind:** security-gap · **severity:** medium · **effort:** M · **ci_validatable:** True
 - **evidence:** metrics_record_sample accepts site and environment parameters from the request body without validating that the authenticated user is authorized to record metrics for those scopes. The middleware enforces execute-tier permission, but there is NO scoped access control (e.g., if a user has execute permission for site 'A' only, the handler does not prevent them from recording metrics for site 'B'). The handler should validate body.site and body.environment against the session's site_scope/environment_scope (see feature #2 'administrable, site/env-scoped RBAC' in missing-features-tracker.md).
 - **verified:** This is a genuine, concrete security gap verified against the actual code. The metrics_record_sample handler at /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/contracts.rs:16134-16205 accepts site and environment from the request body without validating them against the authenticated session's scopes. The api_tokens table (migration 045_api_tokens.sql) includes site_scope and environment_scope columns, but the resolve_api_token function (main.rs:259-304) explicitly does NOT load these scopes into the AuthSession struct (line 257 comment: "scopes are persisted but not yet carried on 
+- **STATUS (2026-06-27) — ALREADY CLOSED by swarm #2:** `metrics_record_sample`
+  now calls `enforce_scope_filters(&session, norm(site), norm(env))?` BEFORE any
+  DB access and binds the EFFECTIVE (scope-enforced) site/env into the INSERT —
+  never the raw body. Out-of-scope is a 403; an omitted value narrows to the
+  principal's own scope. The finding was verified against state predating the #2
+  RBAC sweep. (The separate limitation that API-TOKEN scopes are not yet loaded
+  into AuthSession — so token callers are still unrestricted — remains a tracked
+  RBAC follow-up, but the body-vs-scope enforcement this finding describes is in
+  place for human sessions.)
 
 ### 25. Unused/dead-code table: site_status & component_status
 - **area:** database schema / persistence · **kind:** dead-code-or-drift · **severity:** medium · **effort:** M · **ci_validatable:** True
