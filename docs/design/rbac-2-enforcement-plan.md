@@ -22,6 +22,7 @@
 - [x] **zabbix drift** — `3380fe9` (drift_reports site-only; 5 (detect pre-scoped, contract static); summary enforce_site_scope; plan/validate/execute/verify by-id guard before remediation/409; codex APPROVED first pass)
 - [x] **firmware lifecycle** — `a25b7fd` (firmware_records site-only, exceptions child via device-join; 9 handlers (audit grouped as 5); device_get/check/request/revoke load+guard, lists+reports retain, exceptions scoped via device-id set/join; codex APPROVED first pass)
 - [x] **compliance reporting** — `e541fee` (controls/reports site-only, findings via report-join, frameworks global; 5 (list/generate/findings_list/summary pre-scoped); custom-message 404 inline-match; codex APPROVED first pass)
+- [x] **noise remediation** — `0724731` (noisy_triggers NO site col → HOST-DERIVED via site_from_host; 7 handlers (audit said 4); detect/flapping body-guard, suggest/suppress/resolve host pre-load guard, report enforce_site_scope, suppressed_list host-filter; no-DB fail-closed; codex caught suggest full-row-before-guard oracle, fixed)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -207,10 +208,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **compliance_finding_waive** [high] `sources/ryuki-api/src/contracts.rs:29571` — Before the DB mutation, load the finding's owning report site and scope-guard it. There is no existing helper for this, so add one to repos/compliance_reporting.rs, e.g. `pub async
 
 ## noise  (4)
-- [ ] **noise_suppress** [high] `sources/ryuki-api/src/contracts.rs:10114` — Add a row-scope guard BEFORE the CAS UPDATE commits, since site is host-derived (no site/env input param to bind). Inside the `if let Some(pool) = get_db()` branch, after `parse_no
-- [ ] **noise_report** [high] `sources/ryuki-api/src/contracts.rs:10243` — Add the session and enforce before the DB read, mirroring synthetic_run_all (10347-10352). 1) Change signature to `async fn noise_report(AuthExtractor(session): AuthExtractor, Quer
-- [ ] **noise_suppressed_list** [high] `sources/ryuki-api/src/contracts.rs:10301` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then filter the returned rows per-row by the host-derived site before serializing — mirroring noise_report's c
-- [ ] **noise_resolve** [medium] `sources/ryuki-api/src/contracts.rs:10191` — Helper: ryuki_engine::auth::scope_permits against the DERIVED site (there is no site column to bind, and enforce_scope_filters expects a real (site,env) — not applicable here). Sou
+- [x] **noise_suppress** [high] `sources/ryuki-api/src/contracts.rs:10114` — Add a row-scope guard BEFORE the CAS UPDATE commits, since site is host-derived (no site/env input param to bind). Inside the `if let Some(pool) = get_db()` branch, after `parse_no
+- [x] **noise_report** [high] `sources/ryuki-api/src/contracts.rs:10243` — Add the session and enforce before the DB read, mirroring synthetic_run_all (10347-10352). 1) Change signature to `async fn noise_report(AuthExtractor(session): AuthExtractor, Quer
+- [x] **noise_suppressed_list** [high] `sources/ryuki-api/src/contracts.rs:10301` — Add `AuthExtractor(session): AuthExtractor` to the handler signature, then filter the returned rows per-row by the host-derived site before serializing — mirroring noise_report's c
+- [x] **noise_resolve** [medium] `sources/ryuki-api/src/contracts.rs:10191` — Helper: ryuki_engine::auth::scope_permits against the DERIVED site (there is no site column to bind, and enforce_scope_filters expects a real (site,env) — not applicable here). Sou
 
 ## vm_day2  (4)
 - [ ] **vm_day2_plan** [high] `sources/ryuki-api/src/contracts.rs:20205` — 
