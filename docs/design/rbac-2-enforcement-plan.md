@@ -27,6 +27,7 @@
 - [x] **oob access** — `ff6f8d4` (oob_endpoints site-only; all 8 (contract static); test_endpoint pre-load guard before UPDATE, validate_cert/check_defaults by-id, inventory/failing enforce_site_scope (both paths), cert_expiring/firmware_outdated retain + no-DB fail-closed, validate_site Path-guard; codex APPROVED first pass)
 - [x] **image factory** — `f905ecc` (golden_images.site_scope; all 8 (contract static); initiate/schedule body-guard, run_tests/promote/reject by-id guard before transition, active/history Path-guard, superseded retain; codex APPROVED first pass)
 - [x] **runbook execution** — `ffa0261` (runbook_executions site-only; 8 (list pre-scoped, catalog global, contract static); start body-guard, get/execute_step/approve/complete/fail/rollback by-id guard before transition, active retain; codex APPROVED first pass)
+- [x] **access review** — `34a5f4c` (access_reviews site-only, campaigns global (no site col); 8 (list pre-scoped); get/start/approve/revoke/exempt by-id, due/expiring retain, summary RECOMPUTED scoped (avoids cross-site count leak); codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -242,10 +243,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **runbook_active** [high] `sources/ryuki-api/src/contracts.rs:25520` — 
 
 ## access_review  (4)
-- [ ] **access_review_get** [high] `sources/ryuki-api/src/contracts.rs:26197` — In access_review_get (contracts.rs:26197), add the session extractor to the signature: `async fn access_review_get(Path(id): Path<String>, AuthExtractor(session): AuthExtractor)` (
-- [ ] **access_review_start / access_review_approve / access_review_revoke / access_review_exempt** [high] `sources/ryuki-api/src/contracts.rs:26238` — 
-- [ ] **access_review_summary** [medium] `sources/ryuki-api/src/contracts.rs:26373` — 
-- [ ] **access_reviews_due / access_reviews_expiring** [?] `sources/ryuki-api/src/contracts.rs:26210` — Mirror the enforcement the sibling access_reviews_list already uses, but since list_due/list_expiring don't take a site param, enforce per-row after the DB read. Concretely: (a) ad
+- [x] **access_review_get** [high] `sources/ryuki-api/src/contracts.rs:26197` — In access_review_get (contracts.rs:26197), add the session extractor to the signature: `async fn access_review_get(Path(id): Path<String>, AuthExtractor(session): AuthExtractor)` (
+- [x] **access_review_start / access_review_approve / access_review_revoke / access_review_exempt** [high] `sources/ryuki-api/src/contracts.rs:26238` — 
+- [x] **access_review_summary** [medium] `sources/ryuki-api/src/contracts.rs:26373` — 
+- [x] **access_reviews_due / access_reviews_expiring** [?] `sources/ryuki-api/src/contracts.rs:26210` — Mirror the enforcement the sibling access_reviews_list already uses, but since list_due/list_expiring don't take a site param, enforce per-row after the DB read. Concretely: (a) ad
 
 ## network  (3)
 - [ ] **network_readiness_check / network_capacity / network_ports_inventory / network_vlans_inventory** [high] `sources/ryuki-api/src/contracts.rs:22489` — Add `AuthExtractor(session): AuthExtractor` to each of the four handler signatures, then replace the fixed-default unwrap with the effective in-scope site. For network_readiness_ch
