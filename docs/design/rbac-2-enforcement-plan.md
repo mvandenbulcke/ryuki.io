@@ -6,6 +6,8 @@
 - [x] **storage** volumes/arrays — `4f487d7` (site-only; by-id reads + load-then-guard writes)
 - [x] **k8s namespaces** — `e696c29` (site-only; get + update_quota/suspend/resume/terminate pre-load)
 - [x] **gmsa** — `c998ffc` (site-only; create/assign/remove/rotate/test/expiring; inventory pre-existing)
+- [x] **request verify/protect no-DB** — `8346840` (in-memory dry-run branches; DB branches already guarded by b6b3e45)
+- [x] **load balancer** — `3e19354` (site-only; all 10 handlers: provision/vs_get/update/delete/drain/disable/enable/member_add/remove/validate_vip; vs_get loads-then-guards-then-loads-pool; codex caught 2 cross-site defects)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -43,15 +45,15 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [ ] **certificates_verify** [?] `sources/ryuki-api/src/contracts.rs:21941` — Add AuthExtractor(session): AuthExtractor to the certificates_verify signature, then after loading the record call scope_guard_or_404(&session, &record.site, "", &id)? BEFORE retur
 
 ## lb  (9)
-- [ ] **lb_provision** [high] `sources/ryuki-api/src/contracts.rs:30508` — Add `AuthExtractor(session): AuthExtractor` to the lb_provision signature, then before build_provision call `let (eff_site, _) = enforce_scope_filters(&session, norm(&b.site), None
-- [ ] **lb_vs_get** [high] `sources/ryuki-api/src/contracts.rs:30562` — Add `AuthExtractor(session): AuthExtractor` as the first parameter of lb_vs_get (contracts.rs:30562), matching the sibling lb_vs_update. After loading the row at L30566-30569, befo
-- [ ] **lb_vs_update** [high] `sources/ryuki-api/src/contracts.rs:30588` — The UPDATE mutates by id with no site predicate and the row carries `site`, so guard against the row's actual site. Cleanest minimal fix using the canonical helper: pre-load the VS
-- [ ] **lb_vs_delete** [high] `sources/ryuki-api/src/contracts.rs:30649` — Load the VS's site before the destructive write and gate on it. In lb_vs_delete (contracts.rs:30649), after obtaining `db` and before `delete_virtual_server`, fetch the row to lear
-- [ ] **lb_pool_member_add** [high] `sources/ryuki-api/src/contracts.rs:30680` — After loading `vs` at L30702, before opening the mutation tx / calling add_pool_member, add: scope_guard_or_404(&session, &vs.site, "", &id)?; — the (site) source is `vs.site` from
-- [ ] **lb_pool_member_remove** [high] `sources/ryuki-api/src/contracts.rs:30757` — Insert a by-id scope guard immediately after pool_id is resolved (after contracts.rs:30768) and BEFORE the tx begins at L30770:      scope_guard_or_404(&session, &vs.site, "", &id)
-- [ ] **lb_vs_drain** [high] `sources/ryuki-api/src/contracts.rs:30810` — update_vs_status returns the updated VS (carrying `site`) inside the still-open transaction. Insert a post-load by-id guard between the row load (L30823) and the audit/commit: `sco
-- [ ] **lb_vs_disable** [high] `sources/ryuki-api/src/contracts.rs:30840` — The updated row (with site) is only available after the UPDATE, so guard post-load and roll back if out of scope. After the .ok_or_else(|| status_404(&id))? at L30853 (before audit
-- [ ] **lb_vs_enable** [high] `sources/ryuki-api/src/contracts.rs:30870` — After the update_vs_status load at contracts.rs:30876-30883 and BEFORE tx.commit() at L30891, insert: scope_guard_or_404(&session, &vs.site, "", &id)?; (defined at contracts.rs:211
+- [x] **lb_provision** [high] `sources/ryuki-api/src/contracts.rs:30508` — Add `AuthExtractor(session): AuthExtractor` to the lb_provision signature, then before build_provision call `let (eff_site, _) = enforce_scope_filters(&session, norm(&b.site), None
+- [x] **lb_vs_get** [high] `sources/ryuki-api/src/contracts.rs:30562` — Add `AuthExtractor(session): AuthExtractor` as the first parameter of lb_vs_get (contracts.rs:30562), matching the sibling lb_vs_update. After loading the row at L30566-30569, befo
+- [x] **lb_vs_update** [high] `sources/ryuki-api/src/contracts.rs:30588` — The UPDATE mutates by id with no site predicate and the row carries `site`, so guard against the row's actual site. Cleanest minimal fix using the canonical helper: pre-load the VS
+- [x] **lb_vs_delete** [high] `sources/ryuki-api/src/contracts.rs:30649` — Load the VS's site before the destructive write and gate on it. In lb_vs_delete (contracts.rs:30649), after obtaining `db` and before `delete_virtual_server`, fetch the row to lear
+- [x] **lb_pool_member_add** [high] `sources/ryuki-api/src/contracts.rs:30680` — After loading `vs` at L30702, before opening the mutation tx / calling add_pool_member, add: scope_guard_or_404(&session, &vs.site, "", &id)?; — the (site) source is `vs.site` from
+- [x] **lb_pool_member_remove** [high] `sources/ryuki-api/src/contracts.rs:30757` — Insert a by-id scope guard immediately after pool_id is resolved (after contracts.rs:30768) and BEFORE the tx begins at L30770:      scope_guard_or_404(&session, &vs.site, "", &id)
+- [x] **lb_vs_drain** [high] `sources/ryuki-api/src/contracts.rs:30810` — update_vs_status returns the updated VS (carrying `site`) inside the still-open transaction. Insert a post-load by-id guard between the row load (L30823) and the audit/commit: `sco
+- [x] **lb_vs_disable** [high] `sources/ryuki-api/src/contracts.rs:30840` — The updated row (with site) is only available after the UPDATE, so guard post-load and roll back if out of scope. After the .ok_or_else(|| status_404(&id))? at L30853 (before audit
+- [x] **lb_vs_enable** [high] `sources/ryuki-api/src/contracts.rs:30870` — After the update_vs_status load at contracts.rs:30876-30883 and BEFORE tx.commit() at L30891, insert: scope_guard_or_404(&session, &vs.site, "", &id)?; (defined at contracts.rs:211
 
 ## immutability  (8)
 - [ ] **immutability_check** [high] `sources/ryuki-api/src/contracts.rs:9014` — Add `session: AuthSession` as a handler parameter and call scope_guard_or_404 after the row loads, using the row's site (environment is empty for this resource). Concretely at cont
