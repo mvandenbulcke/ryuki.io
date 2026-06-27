@@ -14,6 +14,7 @@
 - [x] **patch waves** — `f81d7cc` (MULTI-SITE: new within_multi_scope/multi_scope_guard_or_404 containment helpers; all 8 wave handlers incl. patch_reboot the audit missed; +narrow_site_aggregate for compliance/pending_reboots dashboards; codex design-reviewed then caught 3 aggregate leaks, all fixed)
 - [x] **legal holds** — `eeaddac` (site-only; all 7; per-handler oracle-safe not-found codes (400/404/409); +is_scoped helper; no-DB fallbacks fail closed 503 for scoped; codex caught a body-oracle + a 6-handler no-DB bypass class, all fixed)
 - [x] **emergency changes** — `b9655e4` (site-only break-glass; all 6; ProblemDetails guards emergency_scope_guard/_preload_guard; per-action 404; guard before status-409; no-DB fail-closed 503; emergency_history pre-scoped; codex APPROVED first pass)
+- [x] **managed secrets** — `3325fb8` (site-only; 7 handlers incl. rotation_history the audit missed; re-home guard on update; rotation_fail scopes via parent secret_id; no-DB fail-closed 503; codex caught a cross-site vault_path leak in due/expiring no-DB fallbacks, fixed)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -134,12 +135,12 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [ ] **storage_array_get** [high] `sources/ryuki-api/src/contracts.rs:28335` — Add `AuthExtractor(session): AuthExtractor` to the storage_array_get signature (matching storage_array_register at contracts.rs:28363). After loading the row (`let array = ... .ok_
 
 ## secrets  (6)
-- [ ] **secrets_register** [high] `sources/ryuki-api/src/contracts.rs:29849` — Insert `guard_body_site_scope(&session, &b.site)?;` as the first statement of secrets_register, before the `if let Some(pool) = get_db()` at L29853. The (site) source is the reques
-- [ ] **secrets_get** [high] `sources/ryuki-api/src/contracts.rs:29919` — In sources/ryuki-api/src/contracts.rs, change secrets_get's signature from `async fn secrets_get(Path(id): Path<String>)` to `async fn secrets_get(AuthExtractor(session): AuthExtra
-- [ ] **secrets_update** [high] `sources/ryuki-api/src/contracts.rs:29969` — In secrets_update, after loading `existing` (L29982) and computing the effective `site` (L30001), add two guards before the tx at L30019 using guard_body_site_scope (defined L21033
-- [ ] **secrets_deregister** [high] `sources/ryuki-api/src/contracts.rs:30068` — By-id write -> guard the RETURNING row's site BEFORE commit, mapping out-of-scope to the same 404 a missing row produces (so it is not a cross-scope oracle), mirroring scope_guard_
-- [ ] **secrets_rotate** [high] `sources/ryuki-api/src/contracts.rs:30112` — After loading `secret` (immediately after the None->404 match, around contracts.rs:30129) and before the retired-status check, add: `scope_guard_or_404(&session, &secret.site, "", 
-- [ ] **secrets_rotation_fail** [high] `sources/ryuki-api/src/contracts.rs:30381` — In secrets_rotation_fail (contracts.rs:30381), after loading `run`/`failed` and BEFORE opening the tx (before L30407), load the parent secret's site from managed_secrets and guard 
+- [x] **secrets_register** [high] `sources/ryuki-api/src/contracts.rs:29849` — Insert `guard_body_site_scope(&session, &b.site)?;` as the first statement of secrets_register, before the `if let Some(pool) = get_db()` at L29853. The (site) source is the reques
+- [x] **secrets_get** [high] `sources/ryuki-api/src/contracts.rs:29919` — In sources/ryuki-api/src/contracts.rs, change secrets_get's signature from `async fn secrets_get(Path(id): Path<String>)` to `async fn secrets_get(AuthExtractor(session): AuthExtra
+- [x] **secrets_update** [high] `sources/ryuki-api/src/contracts.rs:29969` — In secrets_update, after loading `existing` (L29982) and computing the effective `site` (L30001), add two guards before the tx at L30019 using guard_body_site_scope (defined L21033
+- [x] **secrets_deregister** [high] `sources/ryuki-api/src/contracts.rs:30068` — By-id write -> guard the RETURNING row's site BEFORE commit, mapping out-of-scope to the same 404 a missing row produces (so it is not a cross-scope oracle), mirroring scope_guard_
+- [x] **secrets_rotate** [high] `sources/ryuki-api/src/contracts.rs:30112` — After loading `secret` (immediately after the None->404 match, around contracts.rs:30129) and before the retired-status check, add: `scope_guard_or_404(&session, &secret.site, "", 
+- [x] **secrets_rotation_fail** [high] `sources/ryuki-api/src/contracts.rs:30381` — In secrets_rotation_fail (contracts.rs:30381), after loading `run`/`failed` and BEFORE opening the tx (before L30407), load the parent secret's site from managed_secrets and guard 
 
 ## sql_deploy  (6)
 - [ ] **sql_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:31177` — Add the canonical site-only body guard as the FIRST statement of sql_deploy_plan, before get_db()/plan_deployment/insert: `guard_body_site_scope(&session, &body.site)?;` at contrac
