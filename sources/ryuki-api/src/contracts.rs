@@ -25603,8 +25603,14 @@ struct ImageFactoryScheduleBody {
     distro: String,
 }
 
-async fn image_factory_initiate_build(Json(body): Json<ImageFactoryBuildBody>) -> ApiResult {
+async fn image_factory_initiate_build(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ImageFactoryBuildBody>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only initiate a build for their own site;
+    // env-scoped principals are rejected (golden_images is site-only).
+    guard_body_site_scope(&session, &body.site)?;
 
     let img = image_factory::initiate_build(
         &body.image_name,
@@ -25631,13 +25637,18 @@ async fn image_factory_initiate_build(Json(body): Json<ImageFactoryBuildBody>) -
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn image_factory_run_tests(Path(id): Path<String>) -> ApiResult {
+async fn image_factory_run_tests(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let img = crate::repos::golden_images::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the transition/status-409 leak.
+    scope_guard_or_404(&session, &img.site_scope, "", &id)?;
 
     let before = crate::repos::golden_images::status_str(&img.status);
     let testing = image_factory::run_tests(&img).map_err(|e| status_409(&e))?;
@@ -25650,13 +25661,18 @@ async fn image_factory_run_tests(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn image_factory_promote(Path(id): Path<String>) -> ApiResult {
+async fn image_factory_promote(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let img = crate::repos::golden_images::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the promote/status-409 leak.
+    scope_guard_or_404(&session, &img.site_scope, "", &id)?;
 
     let promoted = image_factory::promote_image(&img).map_err(|e| status_409(&e))?;
 
@@ -25672,6 +25688,7 @@ async fn image_factory_promote(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn image_factory_reject(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Json(body): Json<ImageFactoryRejectBody>,
 ) -> ApiResult {
@@ -25681,6 +25698,8 @@ async fn image_factory_reject(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the reject/status-409 leak.
+    scope_guard_or_404(&session, &img.site_scope, "", &id)?;
 
     let before = crate::repos::golden_images::status_str(&img.status);
     let failed = image_factory::reject_image(&img, &body.reason).map_err(|e| status_409(&e))?;
@@ -25693,7 +25712,12 @@ async fn image_factory_reject(
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn image_factory_active(Path(site): Path<String>) -> ApiResult {
+async fn image_factory_active(
+    AuthExtractor(session): AuthExtractor,
+    Path(site): Path<String>,
+) -> ApiResult {
+    // #2: scoped principals may only list active images for their own site.
+    guard_body_site_scope(&session, &site)?;
     // Graceful degradation: no DB → empty list (not a 503)
     if let Some(pool) = get_db() {
         let images = crate::repos::golden_images::list_promoted(pool, &site)
@@ -25722,7 +25746,12 @@ async fn image_factory_active(Path(site): Path<String>) -> ApiResult {
     })))
 }
 
-async fn image_factory_history(Path(site): Path<String>) -> ApiResult {
+async fn image_factory_history(
+    AuthExtractor(session): AuthExtractor,
+    Path(site): Path<String>,
+) -> ApiResult {
+    // #2: scoped principals may only see their own site's build history.
+    guard_body_site_scope(&session, &site)?;
     // Graceful degradation: no DB → empty list
     if let Some(pool) = get_db() {
         let images = crate::repos::golden_images::list(pool, &site)
@@ -25741,12 +25770,14 @@ async fn image_factory_history(Path(site): Path<String>) -> ApiResult {
     })))
 }
 
-async fn image_factory_superseded() -> ApiResult {
+async fn image_factory_superseded(AuthExtractor(session): AuthExtractor) -> ApiResult {
     // Graceful degradation: no DB → empty list
     if let Some(pool) = get_db() {
         let images = crate::repos::golden_images::list_superseded(pool)
             .await
             .map_err(db_error)?;
+        // #2: a scoped principal only sees its own site's superseded images.
+        let images = retain_site_scoped(&session, images, |i| i.site_scope.as_str());
         return Ok(Json(json!({
             "superseded_count": images.len(),
             "images": serde_json::to_value(&images).unwrap_or_default(),
@@ -25758,8 +25789,13 @@ async fn image_factory_superseded() -> ApiResult {
     })))
 }
 
-async fn image_factory_schedule_monthly(Json(body): Json<ImageFactoryScheduleBody>) -> ApiResult {
+async fn image_factory_schedule_monthly(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<ImageFactoryScheduleBody>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only schedule a build for their own site.
+    guard_body_site_scope(&session, &body.site)?;
 
     let img = image_factory::schedule_monthly_build(&body.site, &body.os_family, &body.distro)
         .map_err(|e| status_400(&e))?;
@@ -40121,6 +40157,60 @@ mod db_lifecycle_tests {
             assert!(
                 matches!(vc, Err((StatusCode::NOT_FOUND, _))),
                 "out-of-scope oob_validate_cert must 404: {vc:?}"
+            );
+        }
+    }
+
+    /// #2 RBAC: the image-factory handlers are site-scoped (golden_images.site_scope).
+    /// A GBLON principal gets 403 listing/building for DEFRA and 404 promoting a
+    /// DEFRA image; its own site and an unrestricted principal pass.
+    #[tokio::test]
+    async fn image_factory_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // active (Path = site) for a foreign site -> 403.
+        let foreign =
+            image_factory_active(AuthExtractor(gblon.clone()), Path("DEFRA".into())).await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope image_factory_active must be forbidden: {foreign:?}"
+        );
+
+        // own site + unrestricted pass.
+        let own = image_factory_active(AuthExtractor(gblon.clone()), Path("GBLON".into())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope image_factory_active must pass: {own:?}"
+        );
+        let any = image_factory_active(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("DEFRA".into()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted image_factory_active must pass: {any:?}"
+        );
+
+        // by-id promote on a DEFRA image -> 404 (when present).
+        if let Some(img) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM golden_images WHERE site_scope = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        {
+            let promote = image_factory_promote(AuthExtractor(gblon), Path(img)).await;
+            assert!(
+                matches!(promote, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope image_factory_promote must 404: {promote:?}"
             );
         }
     }
