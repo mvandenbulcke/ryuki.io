@@ -58,14 +58,14 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **lb_vs_enable** [high] `sources/ryuki-api/src/contracts.rs:30870` — After the update_vs_status load at contracts.rs:30876-30883 and BEFORE tx.commit() at L30891, insert: scope_guard_or_404(&session, &vs.site, "", &id)?; (defined at contracts.rs:211
 
 ## immutability  (8)
-- [ ] **immutability_check** [high] `sources/ryuki-api/src/contracts.rs:9014` — Add `session: AuthSession` as a handler parameter and call scope_guard_or_404 after the row loads, using the row's site (environment is empty for this resource). Concretely at cont
-- [ ] **immutability_verify_all** [high] `sources/ryuki-api/src/contracts.rs:9053` — Add `Extension(session): Extension<AuthSession>` to the handler signature, then before the DB read replace the manual empty-site check with `let site = enforce_site_scope(&session,
-- [ ] **immutability_compliance_report** [high] `sources/ryuki-api/src/contracts.rs:9072` — Add the AuthSession to the handler and clamp the queried site to the principal's scope before the DB read. Change the signature to `async fn immutability_compliance_report(AuthExtr
-- [ ] **immutability_noncompliant** [high] `sources/ryuki-api/src/contracts.rs:9091` — Mirror the established twin datacenter_failing_checks_endpoint exactly. (a) Add the session extractor to the signature: `async fn immutability_noncompliant(AuthExtractor(session): 
-- [ ] **immutability_retention_risk** [high] `sources/ryuki-api/src/contracts.rs:9102` — Two-step (the handler currently has no auth extractor, so add it first). 1) Change the signature to accept the session: `async fn immutability_retention_risk(AuthExtractor(session)
-- [ ] **immutability_remediation** [high] `sources/ryuki-api/src/contracts.rs:9113` — 
-- [ ] **immutability_retention_lock** [medium] `sources/ryuki-api/src/contracts.rs:9027` — Add the by-id scope guard, identical to the canonical pattern. 1) Add an AuthSession extractor to the handler signature: `async fn immutability_retention_lock(AuthExtractor(session
-- [ ] **immutability_air_gap** [medium] `sources/ryuki-api/src/contracts.rs:9040` — Add `session: AuthSession` to the handler signature, then after loading the check call `scope_guard_or_404(&session, &check.site, "", &id)?` before returning (the row exposes `chec
+- [x] **immutability_check** [high] `sources/ryuki-api/src/contracts.rs:9014` — Add `session: AuthSession` as a handler parameter and call scope_guard_or_404 after the row loads, using the row's site (environment is empty for this resource). Concretely at cont
+- [x] **immutability_verify_all** [high] `sources/ryuki-api/src/contracts.rs:9053` — Add `Extension(session): Extension<AuthSession>` to the handler signature, then before the DB read replace the manual empty-site check with `let site = enforce_site_scope(&session,
+- [x] **immutability_compliance_report** [high] `sources/ryuki-api/src/contracts.rs:9072` — Add the AuthSession to the handler and clamp the queried site to the principal's scope before the DB read. Change the signature to `async fn immutability_compliance_report(AuthExtr
+- [x] **immutability_noncompliant** [high] `sources/ryuki-api/src/contracts.rs:9091` — Mirror the established twin datacenter_failing_checks_endpoint exactly. (a) Add the session extractor to the signature: `async fn immutability_noncompliant(AuthExtractor(session): 
+- [x] **immutability_retention_risk** [high] `sources/ryuki-api/src/contracts.rs:9102` — Two-step (the handler currently has no auth extractor, so add it first). 1) Change the signature to accept the session: `async fn immutability_retention_risk(AuthExtractor(session)
+- [x] **immutability_remediation** [high] `sources/ryuki-api/src/contracts.rs:9113` — 
+- [x] **immutability_retention_lock** [medium] `sources/ryuki-api/src/contracts.rs:9027` — Add the by-id scope guard, identical to the canonical pattern. 1) Add an AuthSession extractor to the handler signature: `async fn immutability_retention_lock(AuthExtractor(session
+- [x] **immutability_air_gap** [medium] `sources/ryuki-api/src/contracts.rs:9040` — Add `session: AuthSession` to the handler signature, then after loading the check call `scope_guard_or_404(&session, &check.site, "", &id)?` before returning (the row exposes `chec
 
 ## logs  (8)
 - [x] **logs_onboard** [high] `sources/ryuki-api/src/contracts.rs:10535` — Add the canonical site-only write guard at the top of logs_onboard, before the engine/DB work. Insert `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = 
