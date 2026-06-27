@@ -455,6 +455,12 @@ FINDINGS:
 - **area:** ryuki-api/src/main.rs (readiness_check, lines 1905-1915) · **kind:** latent-bug · **severity:** low · **effort:** S · **ci_validatable:** True
 - **evidence:** Query: SELECT 1 → fetch_one(pool) → Ok(1) is considered ready. If a misconfigured DB driver or corrupted connection returns a different type (e.g., null, 0, out-of-range), Ok(_) case treats it as DatabaseUnusable (line 1910) — correct handling but the error path is silent (logs at WARN only). Better: validate result == 1 explicitly and return a distinct error for 'unexpected result type' to help ops distinguish DB corruption from simple unavailability.
 - **verified:** The claimed gap IS real. The readiness_check function at lines 1905-1915 in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/main.rs has asymmetric logging: the Ok(_) arm (line 1910) that catches unexpected return values produces no diagnostic log, while the Err(e) arm (lines 1911-1913) does log with tracing::warn. This is inconsistent with the parallel self-health probe (line 2089-2091) which explicitly logs "unexpected probe result" when Ok(_) is matched. While SELECT 1 should never return anything other than 1 in practice, this observability gap makes edge-case debugging harder. Th
+- **STATUS (2026-06-27) — COMPLETE:** the readiness probe's `Ok(unexpected)` arm
+  now logs a `tracing::warn!` ("readiness probe returned an unexpected result")
+  carrying the actual value, symmetric with the `Err` arm and matching the
+  self-health probe's diagnostic. Behavior unchanged (still `DatabaseUnusable`);
+  this only closes the observability gap so ops can distinguish a corrupted
+  connection from plain unavailability.
 
 ### 38. Missing GET-by-id endpoint for browser sessions
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** low · **effort:** S · **ci_validatable:** True

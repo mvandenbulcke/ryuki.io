@@ -1919,7 +1919,17 @@ async fn readiness_check() -> ReadinessStatus {
         .await
     {
         Ok(1) => ReadinessStatus::Ready,
-        Ok(_) => ReadinessStatus::DatabaseUnusable,
+        Ok(unexpected) => {
+            // #37: log symmetrically with the Err arm so operators can tell a
+            // corrupted/misconfigured connection (SELECT 1 answered something
+            // other than 1) apart from a simple unavailability. Mirrors the
+            // self-health probe's "unexpected probe result" diagnostic.
+            tracing::warn!(
+                result = unexpected,
+                "database readiness probe returned an unexpected result (expected 1)"
+            );
+            ReadinessStatus::DatabaseUnusable
+        }
         Err(e) => {
             tracing::warn!(error = %e, "database readiness probe failed");
             ReadinessStatus::DatabaseUnusable
