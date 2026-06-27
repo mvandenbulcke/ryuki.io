@@ -32054,6 +32054,9 @@ async fn sql_deploy_plan(
     Json(body): Json<SqlDeployPlanRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only plan a deployment in their own site;
+    // env-scoped principals are rejected (sql_deployments is site-only).
+    guard_body_site_scope(&session, &body.site)?;
     let req = json!({
         "instance_name": body.instance_name,
         "sql_version": body.sql_version,
@@ -32144,6 +32147,8 @@ async fn sql_deploy_install(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the guard_install state-409 leak.
+    scope_guard_or_404(&session, &deployment.site, "", &id)?;
     sql_deployment::guard_install(&deployment).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::sql_deployment::transition(
@@ -32187,6 +32192,8 @@ async fn sql_deploy_configure(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the guard_configure state-409 leak.
+    scope_guard_or_404(&session, &deployment.site, "", &id)?;
     sql_deployment::guard_configure(&deployment).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::sql_deployment::transition(
@@ -32230,6 +32237,8 @@ async fn sql_deploy_verify(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the guard_verify state-409 leak.
+    scope_guard_or_404(&session, &deployment.site, "", &id)?;
     sql_deployment::guard_verify(&deployment).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::sql_deployment::transition(
@@ -32273,6 +32282,8 @@ async fn sql_deploy_backup(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the guard_backup state-409 leak.
+    scope_guard_or_404(&session, &deployment.site, "", &id)?;
     sql_deployment::guard_backup(&deployment).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::sql_deployment::transition(
@@ -32308,6 +32319,7 @@ async fn sql_deploy_backup(
 }
 
 async fn sql_deploy_monitoring(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -32315,6 +32327,8 @@ async fn sql_deploy_monitoring(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: out-of-scope -> 404 before the guard_monitoring state-409 leak.
+    scope_guard_or_404(&session, &deployment.site, "", &id)?;
     sql_deployment::guard_monitoring(&deployment).map_err(|e| status_409(&e))?;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let ok = crate::repos::sql_deployment::transition(
@@ -38894,6 +38908,82 @@ mod db_lifecycle_tests {
         assert!(
             !matches!(any, Err((StatusCode::NOT_FOUND, _))),
             "unrestricted secrets_get must pass: {any:?}"
+        );
+    }
+
+    /// #2 RBAC: the SQL-deployment handlers are site-scoped. A GBLON principal
+    /// gets 404 on the by-id transitions of a DEFRA deployment (before the
+    /// guard_X state-409 leak) and 403 planning in DEFRA; in-scope and
+    /// unrestricted callers pass the scope gate (then hit the state machine — a
+    /// 409 on the 'draft' seeds, never a mutation). Uses migration-043 seeds
+    /// (…0001 DEFRA, …0002 GBLON, both 'draft').
+    #[tokio::test]
+    async fn sql_deployments_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra = "e0000400-4000-4000-4000-000000000001";
+        let gblon = "e0000400-4000-4000-4000-000000000002";
+
+        let mut scoped = AuthSession::static_dry_run();
+        scoped.site_scope = vec!["GBLON".into()];
+
+        // by-id transitions on a DEFRA deployment -> 404 (before any state-409 leak).
+        let install =
+            sql_deploy_install(AuthExtractor(scoped.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(install, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope sql_deploy_install must 404: {install:?}"
+        );
+        let monitoring =
+            sql_deploy_monitoring(AuthExtractor(scoped.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(monitoring, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope sql_deploy_monitoring must 404: {monitoring:?}"
+        );
+
+        // plan in a foreign site -> 403.
+        let plan = sql_deploy_plan(
+            AuthExtractor(scoped.clone()),
+            Json(SqlDeployPlanRequest {
+                instance_name: "RBAC2-X".into(),
+                sql_version: None,
+                edition: None,
+                cpu: None,
+                memory_gb: None,
+                data_disk_gb: None,
+                log_disk_gb: None,
+                tempdb_disk_gb: None,
+                collation: None,
+                service_account: "svc@example.local".into(),
+                site: "DEFRA".into(),
+                cluster_mode: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(plan, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope sql_deploy_plan must be forbidden: {plan:?}"
+        );
+
+        // in-scope deployment -> passes the scope gate (then state-409, not 404).
+        let own = sql_deploy_install(AuthExtractor(scoped), Path(gblon.to_string())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope sql_deploy_install must pass the scope gate: {own:?}"
+        );
+
+        // unrestricted -> passes the scope gate (then state-409, not 404).
+        let any = sql_deploy_install(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted sql_deploy_install must pass the scope gate: {any:?}"
         );
     }
 
