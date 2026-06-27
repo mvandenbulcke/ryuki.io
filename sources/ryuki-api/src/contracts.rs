@@ -21928,6 +21928,9 @@ async fn certificates_request(
     Json(body): Json<CertificateRequestRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: a scoped principal may only request a certificate for its own site
+    // (certificates are site-only — env-scoped principals are denied).
+    guard_body_site_scope(&session, &body.site)?;
 
     let req = certificate_lifecycle::CertificateRequest {
         common_name: body.common_name,
@@ -21985,7 +21988,10 @@ async fn certificates_validate(Json(body): Json<CertificateValidateRequest>) -> 
     }
 }
 
-async fn certificates_approve(Path(id): Path<String>) -> ApiResult {
+async fn certificates_approve(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // No state transition: CertificateStatus has no Approved variant.
     // This is an acknowledgement read — load and return the current record.
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -21993,10 +21999,16 @@ async fn certificates_approve(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: certificates are site-only; guard on the loaded row's site (env-scoped
+    // principals fail closed via the empty environment).
+    scope_guard_or_404(&session, &record.site, "", &id)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
-async fn certificates_install(Path(id): Path<String>) -> ApiResult {
+async fn certificates_install(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // No state transition: CertificateStatus has no Installed variant.
     // This is an acknowledgement read — load and return the current record.
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -22004,10 +22016,14 @@ async fn certificates_install(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &record.site, "", &id)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
-async fn certificates_verify(Path(id): Path<String>) -> ApiResult {
+async fn certificates_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     // No state transition: CertificateStatus has no Verified variant.
     // This is an acknowledgement read — load and return the current record.
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -22015,6 +22031,7 @@ async fn certificates_verify(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &record.site, "", &id)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -22029,6 +22046,8 @@ async fn certificates_renew(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: certificates are site-only — guard on the loaded row's site.
+    scope_guard_or_404(&session, &cert.site, "", &id)?;
 
     // A revoked certificate is a state conflict (409), not malformed input (400).
     if cert.status == certificate_lifecycle::CertificateStatus::Revoked {
@@ -22079,6 +22098,8 @@ async fn certificates_revoke(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: certificates are site-only — guard on the loaded row's site.
+    scope_guard_or_404(&session, &cert.site, "", &id)?;
 
     let before = crate::repos::certificates::status_str(&cert.status);
 
@@ -22133,17 +22154,23 @@ async fn certificates_expiring(
     Ok(Json(serde_json::to_value(results).unwrap_or_default()))
 }
 
-async fn certificates_inventory() -> ApiResult {
+async fn certificates_inventory(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let Some(pool) = get_db() else {
         return Ok(Json(serde_json::Value::Array(vec![])));
     };
     let records = crate::repos::certificates::list(pool)
         .await
         .map_err(db_error)?;
+    // #2: site-only — a scoped principal sees only its site's certs; an
+    // environment-scoped principal sees none (retain_site_scoped fails closed).
+    let records = retain_site_scoped(&session, records, |r| r.site.as_str());
     Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
 }
 
-async fn certificates_get(Path(id): Path<String>) -> ApiResult {
+async fn certificates_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let Some(pool) = get_db() else {
         return Err(status_404(&id));
     };
@@ -22151,6 +22178,7 @@ async fn certificates_get(Path(id): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &record.site, "", &id)?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -35706,6 +35734,36 @@ mod db_lifecycle_tests {
         );
 
         cleanup_request(pool, id).await;
+    }
+
+    /// #2 RBAC (certificates, site-only): a by-id cert read is 404 for an
+    /// out-of-scope principal and succeeds for one scoped to the cert's own site.
+    #[tokio::test]
+    async fn certificates_by_id_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let (id, site): (String, String) =
+            sqlx::query_as("SELECT id::text, site FROM certificates LIMIT 1")
+                .fetch_one(pool)
+                .await
+                .expect("a seeded certificate");
+        let other = if site == "GBLON" { "DEFRA" } else { "GBLON" };
+
+        let mut out = AuthSession::static_dry_run();
+        out.site_scope = vec![other.to_string()];
+        let denied = certificates_get(AuthExtractor(out), Path(id.clone())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope cert get must 404: {denied:?}"
+        );
+
+        let mut ins = AuthSession::static_dry_run();
+        ins.site_scope = vec![site.clone()];
+        let ok = certificates_get(AuthExtractor(ins), Path(id.clone())).await;
+        assert!(ok.is_ok(), "in-scope cert get must succeed: {ok:?}");
     }
 
     /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
