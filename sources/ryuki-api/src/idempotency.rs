@@ -424,10 +424,30 @@ pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
         ticker.tick().await; // skip the immediate first tick (just started)
+                             // #31: exponential backoff on consecutive failures so a persistent outage
+                             // is retried with increasing spacing instead of hammering + log-spamming
+                             // at the base interval. The extra sleep is the real delay; the ticker's
+                             // Burst catch-up tick after it returns immediately (no double-wait).
+        let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            if let Err(e) = sweep_expired_records(&pool).await {
-                tracing::error!(error = %e, "idempotency sweep failed");
+            match sweep_expired_records(&pool).await {
+                Ok(_) => consecutive_failures = 0,
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    // 1, 3, 7, 15, 15… extra intervals (capped at 2^4-1).
+                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        backoff_intervals,
+                        "idempotency sweep failed; backing off"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        interval_secs.saturating_mul(backoff_intervals),
+                    ))
+                    .await;
+                }
             }
         }
     });

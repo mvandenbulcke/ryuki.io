@@ -445,6 +445,15 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/agents.rs (spawn_lease_expiry_sweep, lines 1420-1431), ryuki-api/src/idempotency.rs (spawn_idempotency_sweep) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** False
 - **evidence:** Both sweeps run on fixed intervals (30s, 3600s). If expire_leases() or the idempotency sweep fails (DB unavailable, lock contention), they log error and continue on the SAME interval. No exponential backoff or failure rate tracking. If DB connection pool is exhausted, both sweeps will fail every tick, spam logs with no adaptive behavior, and orphan leases/idempotency records. Suggest: add failure counter + exponential backoff (up to max retry interval) or circuit breaker state.
 - **verified:** Confirmed real gap: both spawn_lease_expiry_sweep (agents.rs:1420-1431, 30s interval) and spawn_idempotency_sweep (idempotency.rs:423-434, 3600s interval) log errors and continue on fixed intervals with zero backoff. If expire_leases() or sweep_expired_records() fail (DB unavailable, connection pool exhausted, lock contention), they retry at the same interval forever, silently orphaning leases and idempotency records. Codebase has a circuit_breaker module but it is not used for sweeps. Not in the 66-item missing-features tracker, not in design docs, not implemented. Implementable: add failure 
+- **STATUS (2026-06-27) — COMPLETE:** both sweeps now track `consecutive_failures`
+  and, on each failure, sleep an exponentially-growing extra delay
+  (`(2^min(n,4))-1` × the base interval → 1, 3, 7, 15, 15… intervals), resetting
+  to 0 on the first success. A persistent outage is now retried with increasing
+  spacing instead of hammering + log-spamming at the base interval, and the log
+  carries `consecutive_failures` + `backoff_intervals` for visibility. The extra
+  `tokio::time::sleep` is the controlling delay; the interval ticker's Burst
+  catch-up tick after it returns immediately, so there is no double-wait. The
+  sweep logic (expire_leases / sweep_expired_records) is unchanged.
 
 ### 32. Agent heartbeat poll has no rate limit or queue depth feedback
 - **area:** ryuki-api/src/agents.rs (poll_job, ack_result, heartbeat handlers) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** False
