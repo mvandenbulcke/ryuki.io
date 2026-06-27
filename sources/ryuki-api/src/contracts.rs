@@ -7405,31 +7405,118 @@ struct DegradationEnterRequest {
 }
 
 async fn degradation_check(Path(site): Path<String>) -> Json<Value> {
+    if let Some(pool) = get_db() {
+        match crate::repos::degradation::get_site_status(pool, &site).await {
+            Ok(Some(status)) => return Json(serde_json::to_value(status).unwrap_or_default()),
+            Ok(None) => {}
+            // A DB read error falls back to the in-memory engine so the status
+            // endpoint stays available — but log it so the outage is not silent.
+            Err(e) => {
+                tracing::warn!(error = %e, %site, "degradation_check DB read failed; serving in-memory fallback")
+            }
+        }
+    }
     let status = degradation_mode::check_site_health(&site);
-    Json(serde_json::to_value(status).unwrap())
+    Json(serde_json::to_value(status).unwrap_or_default())
 }
 
 async fn degradation_global() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        match crate::repos::degradation::list_site_statuses(pool).await {
+            Ok(sites) if !sites.is_empty() => {
+                let global = degradation_mode::global_status_from(sites);
+                return Json(serde_json::to_value(global).unwrap_or_default());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "degradation_global DB read failed; serving in-memory fallback")
+            }
+        }
+    }
     let global = degradation_mode::get_global_status();
-    Json(serde_json::to_value(global).unwrap())
+    Json(serde_json::to_value(global).unwrap_or_default())
 }
 
 async fn degradation_degraded() -> Json<Value> {
+    if let Some(pool) = get_db() {
+        match crate::repos::degradation::list_site_statuses(pool).await {
+            Ok(sites) if !sites.is_empty() => {
+                let degraded: Vec<_> = sites
+                    .into_iter()
+                    .filter(|s| {
+                        s.state == degradation_mode::SiteDegradationState::Degraded
+                            || s.state == degradation_mode::SiteDegradationState::Unreachable
+                    })
+                    .collect();
+                return Json(serde_json::to_value(degraded).unwrap_or_default());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "degradation_degraded DB read failed; serving in-memory fallback")
+            }
+        }
+    }
     let degraded = degradation_mode::get_degraded_sites();
-    Json(serde_json::to_value(degraded).unwrap())
+    Json(serde_json::to_value(degraded).unwrap_or_default())
 }
 
 async fn degradation_enter(
+    AuthExtractor(session): AuthExtractor,
     Path(site): Path<String>,
     Json(body): Json<DegradationEnterRequest>,
-) -> Json<Value> {
+) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let status = crate::repos::degradation::enter(&mut tx, &site, &body.reason)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&site))?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "site-enter-degradation",
+                None,
+                "degraded",
+                serde_json::json!({ "site": &site, "reason": &body.reason }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        return Ok(Json(serde_json::to_value(status).unwrap_or_default()));
+    }
     let status = degradation_mode::enter_degradation_mode(&site, &body.reason);
-    Json(serde_json::to_value(status).unwrap())
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
-async fn degradation_exit(Path(site): Path<String>) -> Json<Value> {
+async fn degradation_exit(
+    AuthExtractor(session): AuthExtractor,
+    Path(site): Path<String>,
+) -> ApiResult {
+    if let Some(pool) = get_db() {
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let status = crate::repos::degradation::exit(&mut tx, &site)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| status_404(&site))?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "site-exit-degradation",
+                Some("degraded"),
+                "recovering",
+                serde_json::json!({ "site": &site }),
+            ),
+        )
+        .await
+        .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        return Ok(Json(serde_json::to_value(status).unwrap_or_default()));
+    }
     let status = degradation_mode::exit_degradation_mode(&site);
-    Json(serde_json::to_value(status).unwrap())
+    Ok(Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
 async fn degradation_rules() -> Json<Value> {
@@ -35890,6 +35977,90 @@ mod db_lifecycle_tests {
             total_of(&after_headers),
             before + 2,
             "X-Total-Count (from COUNT(*)) must grow by exactly the 2 created rows"
+        );
+    }
+
+    /// #8: degradation status reads from the DB (migration 025 seed), not the
+    /// in-memory engine — so it survives restart. The component_status rows fold
+    /// into AdapterComponentStatus correctly. Non-mutating.
+    #[tokio::test]
+    async fn degradation_list_reflects_seeded_db_state() {
+        use ryuki_engine::degradation_mode::{ComponentStatus, SiteDegradationState};
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let sites = crate::repos::degradation::list_site_statuses(pool)
+            .await
+            .expect("list site statuses");
+        let find = |s: &str| sites.iter().find(|x| x.site == s).cloned();
+        let defra = find("DEFRA").expect("DEFRA seeded");
+        assert_eq!(defra.state, SiteDegradationState::Healthy);
+        let gblon = find("GBLON").expect("GBLON seeded");
+        assert_eq!(gblon.state, SiteDegradationState::Degraded);
+        // GBLON's hyperv + veeam adapters are seeded degraded → mapped into the struct.
+        assert_eq!(gblon.adapter_status.hyperv, ComponentStatus::Degraded);
+        assert_eq!(gblon.adapter_status.veeam, ComponentStatus::Degraded);
+        assert_eq!(gblon.adapter_status.vmware, ComponentStatus::Up);
+    }
+
+    /// #8: the degradation_enter HANDLER persists state to the DB AND writes a
+    /// durable audit row. Mutates DEFRA, then restores it to its seeded state.
+    #[tokio::test]
+    async fn degradation_enter_persists_and_audits() {
+        use ryuki_engine::degradation_mode::SiteDegradationState;
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let _ = degradation_enter(
+            AuthExtractor(admin_session("degr-actor-7x2")),
+            Path("DEFRA".into()),
+            Json(DegradationEnterRequest {
+                reason: "db-test induced degradation".into(),
+            }),
+        )
+        .await
+        .expect("enter must succeed");
+
+        // Persisted: a fresh read shows DEFRA degraded.
+        let after = crate::repos::degradation::get_site_status(pool, "DEFRA")
+            .await
+            .expect("get")
+            .expect("DEFRA present");
+        let persisted_degraded = after.state == SiteDegradationState::Degraded;
+        // Audited.
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'site-enter-degradation' AND detail->>'site' = 'DEFRA' \
+               AND actor_principal = 'degr-actor-7x2')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("query audit");
+
+        // Restore DEFRA to its migration-025 seeded healthy state.
+        sqlx::query(
+            "UPDATE site_status SET state='healthy', api_status='up', db_status='up', \
+             degradation_reason=NULL, updated_at=NOW() WHERE site='DEFRA'",
+        )
+        .execute(pool)
+        .await
+        .ok();
+        sqlx::query("UPDATE component_status SET status='up' WHERE site='DEFRA'")
+            .execute(pool)
+            .await
+            .ok();
+
+        assert!(
+            persisted_degraded,
+            "enter must persist DEFRA as degraded in the DB"
+        );
+        assert!(
+            audited,
+            "enter must write a durable site-enter-degradation audit row"
         );
     }
 

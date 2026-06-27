@@ -212,6 +212,20 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** migrations/025_degradation_mode.sql + sources/ryuki-engine/src/degradation_mode.rs · **kind:** dead-code-or-drift · **severity:** high · **effort:** M · **ci_validatable:** True
 - **evidence:** Migration 025 creates site_status and component_status tables with INSERT statements seeding DEFRA/GBLON/NLAMS sites. But degradation_mode.rs functions (get_site_statuses, enter_degradation_mode, exit_degradation_mode) all use seed_sites() to generate in-memory data — never query/update the database. API handlers in contracts.rs call these pure engine functions, never SELECT/UPDATE site_status. This causes state loss on restart.
 - **verified:** The site_status and component_status tables are created and seeded in migration 025, but the degradation_mode.rs engine functions exclusively use in-memory seed_sites() to generate state rather than querying/updating the database. API handlers call these pure functions directly, never persisting changes. This causes guaranteed state loss on server restart. The missing-features tracker does not call out this gap — item #16 focuses on write-blocking behavior, not persistence. No repository layer touches these tables (grep returned 0 results). This is a concrete, CI-validatable drift: a test asse
+- **STATUS (2026-06-27) — COMPLETE:** degradation status is now DB-backed
+  (state survives restart). New `repos/degradation.rs` reads site_status +
+  folds component_status rows into the engine's 13-field AdapterComponentStatus,
+  and `enter`/`exit` UPDATE both tables. Engine gained pure
+  `global_status_from(sites)` (get_global_status refactored to use it) +
+  ComponentStatus/SiteDegradationState `from_str` (exact inverse of Display).
+  Handlers: degradation_check/global/degraded read from the DB and fall back to
+  the in-memory engine only when no pool is configured (a DB read ERROR now logs
+  a tracing::warn instead of silently masking the outage); degradation_enter/
+  exit gained AuthExtractor + write a durable audit_log row ATOMICALLY with the
+  two UPDATEs (404 + rollback when the site is absent). rules/contract stay pure.
+  DB-gated tests: seeded-state read + component mapping, and enter persists +
+  audits (then restores DEFRA). Reviewed (fresh-context): component mapping,
+  enum inverse, atomicity, and 404-rollback all confirmed clean.
 
 ### 9. requests_list pagination envelope missing — feature #14 slice 2 incomplete
 - **area:** sources/ryuki-api/src/contracts.rs (requests_list function) · **kind:** missing-feature · **severity:** high · **effort:** M · **ci_validatable:** True

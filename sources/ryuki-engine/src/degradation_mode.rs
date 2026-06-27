@@ -18,6 +18,17 @@ impl std::fmt::Display for ComponentStatus {
     }
 }
 
+impl ComponentStatus {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "degraded" => ComponentStatus::Degraded,
+            "down" => ComponentStatus::Down,
+            _ => ComponentStatus::Up,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SiteDegradationState {
     Healthy,
@@ -33,6 +44,18 @@ impl std::fmt::Display for SiteDegradationState {
             SiteDegradationState::Degraded => write!(f, "degraded"),
             SiteDegradationState::Unreachable => write!(f, "unreachable"),
             SiteDegradationState::Recovering => write!(f, "recovering"),
+        }
+    }
+}
+
+impl SiteDegradationState {
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "degraded" => SiteDegradationState::Degraded,
+            "unreachable" => SiteDegradationState::Unreachable,
+            "recovering" => SiteDegradationState::Recovering,
+            _ => SiteDegradationState::Healthy,
         }
     }
 }
@@ -196,8 +219,7 @@ pub fn check_site_health(site: &str) -> SiteStatus {
     }
 }
 
-pub fn get_global_status() -> GlobalStatus {
-    let sites = seed_sites();
+pub fn global_status_from(sites: Vec<SiteStatus>) -> GlobalStatus {
     let total = sites.len();
     let healthy_count = sites
         .iter()
@@ -211,7 +233,6 @@ pub fn get_global_status() -> GlobalStatus {
         .iter()
         .filter(|s| s.state == SiteDegradationState::Unreachable)
         .count();
-
     let overall = if unreachable_count > 0 {
         SiteDegradationState::Unreachable
     } else if degraded_count > 0 {
@@ -219,7 +240,6 @@ pub fn get_global_status() -> GlobalStatus {
     } else {
         SiteDegradationState::Healthy
     };
-
     GlobalStatus {
         sites,
         overall_health: overall,
@@ -229,6 +249,10 @@ pub fn get_global_status() -> GlobalStatus {
         unreachable_sites: unreachable_count,
         timestamp: Utc::now().to_rfc3339(),
     }
+}
+
+pub fn get_global_status() -> GlobalStatus {
+    global_status_from(seed_sites())
 }
 
 pub fn get_degraded_sites() -> Vec<SiteStatus> {
@@ -467,5 +491,51 @@ mod tests {
         assert_eq!(SiteDegradationState::Degraded.to_string(), "degraded");
         assert_eq!(SiteDegradationState::Unreachable.to_string(), "unreachable");
         assert_eq!(SiteDegradationState::Recovering.to_string(), "recovering");
+    }
+
+    #[test]
+    fn test_component_status_from_str() {
+        assert_eq!(ComponentStatus::from_str("up"), ComponentStatus::Up);
+        assert_eq!(
+            ComponentStatus::from_str("degraded"),
+            ComponentStatus::Degraded
+        );
+        assert_eq!(ComponentStatus::from_str("down"), ComponentStatus::Down);
+        assert_eq!(ComponentStatus::from_str("unknown"), ComponentStatus::Up);
+    }
+
+    #[test]
+    fn test_site_degradation_state_from_str() {
+        assert_eq!(
+            SiteDegradationState::from_str("healthy"),
+            SiteDegradationState::Healthy
+        );
+        assert_eq!(
+            SiteDegradationState::from_str("degraded"),
+            SiteDegradationState::Degraded
+        );
+        assert_eq!(
+            SiteDegradationState::from_str("unreachable"),
+            SiteDegradationState::Unreachable
+        );
+        assert_eq!(
+            SiteDegradationState::from_str("recovering"),
+            SiteDegradationState::Recovering
+        );
+        assert_eq!(
+            SiteDegradationState::from_str("other"),
+            SiteDegradationState::Healthy
+        );
+    }
+
+    #[test]
+    fn test_global_status_from_matches_get_global_status() {
+        let from_fn = global_status_from(seed_sites());
+        let direct = get_global_status();
+        assert_eq!(from_fn.total_sites, direct.total_sites);
+        assert_eq!(from_fn.healthy_sites, direct.healthy_sites);
+        assert_eq!(from_fn.degraded_sites, direct.degraded_sites);
+        assert_eq!(from_fn.unreachable_sites, direct.unreachable_sites);
+        assert_eq!(from_fn.overall_health, direct.overall_health);
     }
 }
