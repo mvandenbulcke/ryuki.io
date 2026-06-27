@@ -22522,6 +22522,10 @@ async fn linux_deploy_plan(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<LinuxDeployPlanRequest>,
 ) -> ApiResult {
+    // A scoped principal may only plan a deployment for a site within its scope
+    // (#2). Site is a caller-supplied body field, so a 403 (not 404) is correct —
+    // no row exists yet to act as an existence oracle.
+    guard_body_site_scope(&session, &body.site)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let distro = parse_linux_distro(&body.distro);
@@ -22576,6 +22580,10 @@ async fn linux_deploy_validate(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Scope guard BEFORE the lifecycle 409 so an out-of-scope operation 404s like a
+    // missing one — never a status oracle for a scoped principal (#2). Site-only.
+    site_scope_guard_or_404(&session, &req.site, &body.operation_id)?;
 
     // Forward-only lifecycle (Planned -> Validated -> Executed -> Verified): the
     // engine does not enforce ordering, so the API does. Validate only from
@@ -22633,6 +22641,9 @@ async fn linux_deploy_execute(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
 
+    // Scope guard BEFORE the lifecycle 409: out-of-scope 404s like a miss (#2).
+    site_scope_guard_or_404(&session, &req.site, &body.operation_id)?;
+
     // Forward-only lifecycle: execute only from Validated. This enforces
     // validate-before-execute and prevents re-executing an already Executed or
     // Verified operation.
@@ -22678,6 +22689,9 @@ async fn linux_deploy_verify(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.operation_id))?;
+
+    // Scope guard BEFORE the lifecycle 409: out-of-scope 404s like a miss (#2).
+    site_scope_guard_or_404(&session, &req.site, &body.operation_id)?;
 
     // Forward-only lifecycle: verify only from Executed.
     if req.status != ryuki_engine::models::LinuxDeploymentStatus::Executed {
@@ -56573,6 +56587,81 @@ mod linux_deployment_requests_db_tests {
             ryuki_engine::models::LinuxDeploymentStatus::Planned,
             "status after plan must be Planned"
         );
+
+        cleanup(pool, &id).await;
+    }
+
+    /// #2 RBAC: linux deployments are site-only. A principal scoped to another
+    /// site cannot plan, validate, execute, or verify a deployment — by-id actions
+    /// 404 (no existence/status oracle), and a body-supplied foreign site on plan
+    /// is a 403. An in-scope principal is unaffected.
+    #[tokio::test]
+    async fn linux_deploy_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a DEFRA deployment as an unrestricted admin.
+        let Ok(Json(created)) = linux_deploy_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(plan_body()),
+        )
+        .await
+        else {
+            panic!("linux_deploy_plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // A GBLON-site-scoped principal (DEFRA out of scope).
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+        let act = |op: String| LinuxDeployActionRequest { operation_id: op };
+
+        // By-id actions 404 BEFORE any lifecycle 409 — no status oracle.
+        let v = linux_deploy_validate(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        assert!(
+            matches!(v, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope validate must 404: {v:?}"
+        );
+        let e = linux_deploy_execute(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        assert!(
+            matches!(e, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope execute must 404: {e:?}"
+        );
+        let vf = linux_deploy_verify(AuthExtractor(scoped()), Json(act(id.clone()))).await;
+        assert!(
+            matches!(vf, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope verify must 404: {vf:?}"
+        );
+
+        // Planning a foreign-site (DEFRA) deployment is a 403 (body-supplied site).
+        let p = linux_deploy_plan(AuthExtractor(scoped()), Json(plan_body())).await;
+        assert!(
+            matches!(p, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope plan must 403: {p:?}"
+        );
+
+        // The denied operation was not mutated — still Planned.
+        let req = crate::repos::linux_deployment_requests::get(pool, &id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(
+            req.status,
+            ryuki_engine::models::LinuxDeploymentStatus::Planned,
+            "denied operation must remain Planned"
+        );
+
+        // Positive: a DEFRA-scoped principal CAN validate it (guard not over-broad).
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let ok = linux_deploy_validate(AuthExtractor(defra), Json(act(id.clone()))).await;
+        assert!(ok.is_ok(), "in-scope DEFRA validate must succeed: {ok:?}");
 
         cleanup(pool, &id).await;
     }
