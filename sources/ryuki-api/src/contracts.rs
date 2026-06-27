@@ -14909,6 +14909,25 @@ async fn requests_approve_live_apply(
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
 
+    // #2: scope guard FIRST — load the request's (site, environment) and 404 for a
+    // scoped admin acting outside its scope (or a missing request) BEFORE any 409
+    // branch below (no-double-apply / plan-state) can leak the request's existence.
+    // requests is dual-axis (site, environment both NOT NULL), so the canonical
+    // by-id guard applies. Admin permission alone does not imply unrestricted scope.
+    match sqlx::query_as::<_, (String, String)>(
+        "SELECT site, environment FROM requests WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?
+    {
+        Some((site, environment)) => {
+            scope_guard_or_404(&session, &site, &environment, &request_id)?
+        }
+        None => return Err(status_404(&request_id)),
+    }
+
     // No-double-apply: at most ONE LiveApply may ever be approved per request.
     // This pre-check returns a friendly 409 if ANY LiveApply already exists for
     // it — active (Pending/Leased/Running), already-applied (Succeeded), or
@@ -43103,6 +43122,52 @@ mod db_lifecycle_tests {
         .await
         .expect("job mode");
         assert_eq!(job_mode, "LivePlan", "a LivePlan agent_job was dispatched");
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// #2 RBAC: requests_approve_live_apply is admin-tier, but admin does NOT imply
+    /// unrestricted scope — a site-scoped admin must not mint a live-apply grant for
+    /// another site's request. An out-of-scope request 404s BEFORE any 409 branch
+    /// (no existence oracle); the in-scope admin reaches the 409 (no completed plan).
+    #[tokio::test]
+    async fn approve_live_apply_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Unrestricted admin creates a DEFRA/production request (create_body site).
+        let admin = admin_session("la-scope-admin");
+        let p = |s: &str| Path(s.to_string());
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+
+        // A GBLON-scoped admin must 404 (not 409) — scope guard precedes the
+        // no-completed-plan 409, so it is not an existence oracle.
+        let mut gblon_admin = admin.clone();
+        gblon_admin.site_scope = vec!["GBLON".into()];
+        let scoped = requests_approve_live_apply(p(&id_str), AuthExtractor(gblon_admin)).await;
+        assert!(
+            matches!(scoped, Err((StatusCode::NOT_FOUND, _))),
+            "an out-of-scope admin must 404, not 409: {scoped:?}"
+        );
+
+        // The in-scope (unrestricted) admin reaches the 409 (no completed plan yet),
+        // proving the request itself is reachable for the right scope.
+        let reachable = requests_approve_live_apply(p(&id_str), AuthExtractor(admin.clone())).await;
+        assert!(
+            matches!(reachable, Err((StatusCode::CONFLICT, _))),
+            "in-scope admin must reach the no-plan 409: {reachable:?}"
+        );
 
         cleanup_request(pool, id).await;
     }
