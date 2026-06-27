@@ -194,11 +194,14 @@ pub fn routes() -> Router {
             post(metrics_budget_create).get(metrics_budget_list),
         )
         .route("/api/metrics/budgets/status", get(metrics_budget_status))
-        .route("/api/metrics/budgets/{id}", delete(metrics_budget_delete))
+        .route(
+            "/api/metrics/budgets/{id}",
+            put(metrics_budget_update).delete(metrics_budget_delete),
+        )
         .route("/api/metrics/commitment", get(metrics_commitment))
         .route("/api/metrics/slo", post(slo_create).get(slo_list))
         .route("/api/metrics/slo/status", get(slo_status))
-        .route("/api/metrics/slo/{id}", delete(slo_delete))
+        .route("/api/metrics/slo/{id}", put(slo_update).delete(slo_delete))
         .route("/api/metering/usage", get(metering_usage))
         .route(
             "/api/metering/chargeback/rates",
@@ -17996,6 +17999,20 @@ struct MetricBudgetCreateRequest {
     comparison: Option<String>,
 }
 
+/// PATCH-style update of a budget's mutable fields (swarm #19). Every field is
+/// optional; an omitted field is left unchanged. The identity/scope columns
+/// (metric_key, site, environment) are NOT updatable here — recreate to re-scope.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricBudgetUpdateRequest {
+    #[serde(default)]
+    threshold: Option<f64>,
+    #[serde(default)]
+    comparison: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 /// A budget row as stored.
 #[derive(sqlx::FromRow)]
 struct MetricBudgetRow {
@@ -18463,6 +18480,23 @@ struct SloCreateRequest {
     environment: Option<String>,
 }
 
+/// PATCH-style update of an SLO's mutable fields (swarm #20). Every field is
+/// optional; an omitted field is left unchanged. The metric keys and scope
+/// (good/total_metric_key, site, environment) are NOT updatable here — recreate
+/// to re-target or re-scope.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SloUpdateRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    target: Option<f64>,
+    #[serde(default)]
+    window_days: Option<i32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 /// Sum a metric's values over the CLOSED window `[since, until]` within a
 /// coherent scope (omitted site/env = the platform-wide IS NULL rows). The upper
 /// bound matters: without it a future-dated sample would leak into the window
@@ -18749,6 +18783,79 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
     })))
 }
 
+/// PUT /api/metrics/budgets/{id} — update a budget's mutable fields (threshold,
+/// comparison, enabled); omitted fields are left unchanged (PATCH semantics,
+/// swarm #19). Execute-tier (same as create/delete). 404 if absent; 503 no DB.
+/// The identity/scope fields are immutable here — recreate to re-scope.
+async fn metrics_budget_update(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+    Json(body): Json<MetricBudgetUpdateRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to update budgets"})),
+        ));
+    }
+    if let Some(t) = body.threshold {
+        if !t.is_finite() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "threshold must be a finite number"})),
+            ));
+        }
+    }
+    let comparison = match body.comparison.as_deref() {
+        None => None,
+        Some("above") => Some("above"),
+        Some("below") => Some("below"),
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "comparison must be 'above' or 'below'"})),
+            ));
+        }
+    };
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // COALESCE keeps any omitted field at its current value (PATCH semantics).
+    let updated: Option<(String,)> = sqlx::query_as(
+        "UPDATE metric_budgets SET \
+           threshold = COALESCE($2, threshold), \
+           comparison = COALESCE($3, comparison), \
+           enabled = COALESCE($4, enabled), \
+           updated_at = NOW() \
+         WHERE id = $1 RETURNING id",
+    )
+    .bind(&id)
+    .bind(body.threshold)
+    .bind(comparison)
+    .bind(body.enabled)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    match updated {
+        Some((updated_id,)) => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "metric-budget-update",
+                    Some("active"),
+                    "updated",
+                    json!({ "budget_id": &updated_id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({"updated": updated_id})))
+        }
+        None => Err(status_404(&id)),
+    }
+}
+
 /// DELETE /api/metrics/budgets/{id} — remove a budget definition (swarm #19,
 /// CRUD completion). Execute-tier (same as create). 404 if absent; 503 no DB.
 async fn metrics_budget_delete(
@@ -18785,6 +18892,79 @@ async fn metrics_budget_delete(
             .map_err(db_error)?;
             tx.commit().await.map_err(db_error)?;
             Ok(Json(json!({"deleted": deleted_id})))
+        }
+        None => Err(status_404(&id)),
+    }
+}
+
+/// PUT /api/metrics/slo/{id} — update an SLO's mutable fields (name, target,
+/// window_days, enabled); omitted fields are left unchanged (PATCH semantics,
+/// swarm #20). Execute-tier. 404 if absent; 503 no DB. The metric keys and
+/// scope are immutable here — recreate to re-target or re-scope.
+async fn slo_update(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+    Json(b): Json<SloUpdateRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Execute-tier access is required to update SLO definitions"})),
+        ));
+    }
+    let name = match b.name.as_deref().map(str::trim) {
+        None => None,
+        Some(n) if (1..=200).contains(&n.len()) => Some(n.to_string()),
+        Some(_) => return Err(status_400("name must be 1..=200 characters")),
+    };
+    if let Some(t) = b.target {
+        if !(t.is_finite() && t > 0.0 && t < 1.0) {
+            return Err(status_400(
+                "target must be a fraction in the open interval (0, 1)",
+            ));
+        }
+    }
+    if let Some(w) = b.window_days {
+        if !(1..=365).contains(&w) {
+            return Err(status_400("window_days must be between 1 and 365"));
+        }
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    // COALESCE keeps any omitted field at its current value (PATCH semantics).
+    let updated: Option<(String,)> = sqlx::query_as(
+        "UPDATE slo_definitions SET \
+           name = COALESCE($2, name), \
+           target = COALESCE($3, target), \
+           window_days = COALESCE($4, window_days), \
+           enabled = COALESCE($5, enabled), \
+           updated_at = NOW() \
+         WHERE id = $1 RETURNING id",
+    )
+    .bind(&id)
+    .bind(name)
+    .bind(b.target)
+    .bind(b.window_days)
+    .bind(b.enabled)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    match updated {
+        Some((updated_id,)) => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "slo-update",
+                    Some("active"),
+                    "updated",
+                    json!({ "slo_id": &updated_id }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({"updated": updated_id})))
         }
         None => Err(status_404(&id)),
     }
@@ -36281,6 +36461,150 @@ mod db_lifecycle_tests {
             matches!(missing, Err((StatusCode::NOT_FOUND, _))),
             "an unknown name must 404: {missing:?}"
         );
+    }
+
+    /// #19: PUT /api/metrics/budgets/{id} updates a budget's mutable fields
+    /// (threshold/comparison/enabled), leaves identity fields untouched, and
+    /// 404s an unknown id.
+    #[tokio::test]
+    async fn metrics_budget_update_changes_fields_or_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let created = metrics_budget_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(MetricBudgetCreateRequest {
+                metric_key: "cost.test.budget_update".into(),
+                site: None,
+                environment: None,
+                threshold: 100.0,
+                comparison: Some("above".into()),
+            }),
+        )
+        .await
+        .expect("create budget");
+        let id = created.0["id"].as_str().expect("budget id").to_string();
+
+        let updated = metrics_budget_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+            Json(MetricBudgetUpdateRequest {
+                threshold: Some(250.0),
+                comparison: Some("below".into()),
+                enabled: Some(false),
+            }),
+        )
+        .await
+        .expect("update budget");
+        assert_eq!(updated.0["updated"], json!(id));
+
+        let (threshold, comparison, enabled): (f64, String, bool) = sqlx::query_as(
+            "SELECT threshold, comparison, enabled FROM metric_budgets WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("read back budget");
+        assert_eq!(threshold, 250.0);
+        assert_eq!(comparison, "below");
+        assert!(!enabled, "budget must be disabled after update");
+
+        let missing = metrics_budget_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("nonexistent-budget-id".into()),
+            Json(MetricBudgetUpdateRequest {
+                threshold: Some(1.0),
+                comparison: None,
+                enabled: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown id must 404: {missing:?}"
+        );
+
+        sqlx::query("DELETE FROM metric_budgets WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #20: PUT /api/metrics/slo/{id} updates an SLO's mutable fields
+    /// (name/target/window_days/enabled) and 404s an unknown id.
+    #[tokio::test]
+    async fn slo_update_changes_fields_or_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let created = slo_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(SloCreateRequest {
+                name: "test-slo-update".into(),
+                target: 0.99,
+                window_days: Some(30),
+                good_metric_key: "slo.test.good".into(),
+                total_metric_key: "slo.test.total".into(),
+                site: None,
+                environment: None,
+            }),
+        )
+        .await
+        .expect("create slo");
+        let id = created.0["id"].as_str().expect("slo id").to_string();
+
+        let updated = slo_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+            Json(SloUpdateRequest {
+                name: Some("test-slo-renamed".into()),
+                target: Some(0.995),
+                window_days: Some(7),
+                enabled: Some(false),
+            }),
+        )
+        .await
+        .expect("update slo");
+        assert_eq!(updated.0["updated"], json!(id));
+
+        let (name, target, window_days, enabled): (String, f64, i32, bool) = sqlx::query_as(
+            "SELECT name, target, window_days, enabled FROM slo_definitions WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("read back slo");
+        assert_eq!(name, "test-slo-renamed");
+        assert_eq!(target, 0.995);
+        assert_eq!(window_days, 7);
+        assert!(!enabled, "slo must be disabled after update");
+
+        let missing = slo_update(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("nonexistent-slo-id".into()),
+            Json(SloUpdateRequest {
+                name: None,
+                target: Some(0.9),
+                window_days: None,
+                enabled: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown id must 404: {missing:?}"
+        );
+
+        sqlx::query("DELETE FROM slo_definitions WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the

@@ -343,11 +343,25 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** Lines 193-196 define routes POST /api/metrics/budgets (create) and GET /api/metrics/budgets{,/status}. No PUT, PATCH, or DELETE endpoints exist. Handlers: metrics_budget_create (line 16764) creates, metrics_budget_list (16834) reads all, metrics_budget_status (16877) evaluates. No async fn for update or delete. Migration creates metric_budgets table but API cannot remove or modify budgets after creation—incomplete CRUD.
 - **verified:** This is a genuine, concrete gap verified against actual code. The metric_budgets table (migrations/097_metric_budgets.sql) is fully-featured with id, enabled toggle, and updated_at fields supporting CRUD operations. However, the API (sources/ryuki-api/src/contracts.rs lines 192-196) exposes only POST and GET endpoints for /api/metrics/budgets with zero support for PUT, PATCH, or DELETE. No handler functions for update/delete exist anywhere in contracts.rs. The table design intentionally supports soft-delete (enabled flag) and modification (updated_at), but clients have no API path to exercise 
+- **STATUS (2026-06-27) — COMPLETE:** CRUD finished. `DELETE /api/metrics/budgets/{id}`
+  (`metrics_budget_delete`) was added earlier; this adds `PUT /api/metrics/budgets/{id}`
+  → `metrics_budget_update` (execute-tier, PATCH semantics via `COALESCE` so omitted
+  fields stay): updates threshold/comparison/enabled, leaving the identity/scope
+  columns (metric_key/site/environment) immutable. Audited atomically
+  (`metric-budget-update`), 404 unknown, 503 no DB; route merged as
+  `put(...).delete(...)`. DB test `metrics_budget_update_changes_fields_or_404`.
 
 ### 20. Missing DELETE and UPDATE endpoints for SLO definitions
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** Line 198 defines route POST /api/metrics/slo (create) and GET /api/metrics/slo{,/status}. No PUT, PATCH, or DELETE endpoints. Handlers: slo_create (line 17208) creates, slo_list (17268) reads all, slo_status (17312) evaluates. No async fn for update or delete. SLO definitions in slo_definitions table cannot be modified or removed after creation—incomplete CRUD.
 - **verified:** Verified by code inspection: (1) migrations/103_slo_definitions.sql defines table with id, updated_at, enabled supporting updates; (2) routes (line 198-199) only expose POST/GET /api/metrics/slo and GET /api/metrics/slo/status — no /{id} variant; (3) no slo_update or slo_delete handler functions exist in contracts.rs; (4) SloCreateRequest struct exists but no SloUpdateRequest; (5) similar CRUD patterns confirmed elsewhere (on-call-contacts, DNS, firewall, IPAM, alert-routes); (6) feature #25 tracker lists SLO shipped [x] but includes no follow-up note about update/delete endpoints missing; (7)
+- **STATUS (2026-06-27) — COMPLETE:** CRUD finished. `DELETE /api/metrics/slo/{id}`
+  (`slo_delete`) was added earlier; this adds `PUT /api/metrics/slo/{id}` →
+  `slo_update` (execute-tier, PATCH semantics via `COALESCE`): updates
+  name/target/window_days/enabled with the same validation as create
+  (target in (0,1), window 1..=365, name 1..=200), leaving the metric keys +
+  scope immutable. Audited atomically (`slo-update`), 404 unknown, 503 no DB;
+  route merged as `put(...).delete(...)`. DB test `slo_update_changes_fields_or_404`.
 
 ### 21. API token operations not emitted to notifications
 - **area:** ryuki-api/src/contracts.rs (lines 11568-11676, 11752-11789) · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True
