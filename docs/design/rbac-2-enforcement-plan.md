@@ -8,6 +8,7 @@
 - [x] **gmsa** — `c998ffc` (site-only; create/assign/remove/rotate/test/expiring; inventory pre-existing)
 - [x] **request verify/protect no-DB** — `8346840` (in-memory dry-run branches; DB branches already guarded by b6b3e45)
 - [x] **load balancer** — `3e19354` (site-only; all 10 handlers: provision/vs_get/update/delete/drain/disable/enable/member_add/remove/validate_vip; vs_get loads-then-guards-then-loads-pool; codex caught 2 cross-site defects)
+- [x] **log forwarders** — `18f5486` (site-only; all 8: onboard/coverage/gaps/volume/retention/validate/verify/disable; disable was cross-site → new site-confined repo fn disable_for_hostname_in_sites; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -66,14 +67,14 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [ ] **immutability_air_gap** [medium] `sources/ryuki-api/src/contracts.rs:9040` — Add `session: AuthSession` to the handler signature, then after loading the check call `scope_guard_or_404(&session, &check.site, "", &id)?` before returning (the row exposes `chec
 
 ## logs  (8)
-- [ ] **logs_onboard** [high] `sources/ryuki-api/src/contracts.rs:10535` — Add the canonical site-only write guard at the top of logs_onboard, before the engine/DB work. Insert `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = 
-- [ ] **logs_coverage** [high] `sources/ryuki-api/src/contracts.rs:10645` — Add `session: AuthSession` to the logs_coverage signature, then before the DB read resolve the effective site via enforce_site_scope: `let site = enforce_site_scope(&session, Some(
-- [ ] **logs_gaps** [high] `sources/ryuki-api/src/contracts.rs:10662` — Add scope enforcement mirroring the canonical sibling hardware_firmware_gaps (contracts.rs:24098). Change the signature to take the session and make site optional, then resolve the
-- [ ] **logs_volume** [high] `sources/ryuki-api/src/contracts.rs:10679` — Add the session and enforce site scope before the DB read. Change the signature to `async fn logs_volume(AuthExtractor(session): AuthExtractor, Query(params): Query<LogsSiteQuery>)
-- [ ] **logs_retention** [high] `sources/ryuki-api/src/contracts.rs:10696` — Add `AuthExtractor(session): AuthExtractor` to the logs_retention signature, then before the DB read compute the effective site: `let site = enforce_site_scope(&session, Some(&para
-- [ ] **logs_disable** [high] `sources/ryuki-api/src/contracts.rs:10715` — Make the disable site-aware (a post-hoc retain won't help — the UPDATE already wrote across sites). Preferred: add a scoped repo variant disable_all_for_hostname_scoped(conn, hostn
-- [ ] **logs_validate** [medium] `sources/ryuki-api/src/contracts.rs:10611` — Add `AuthExtractor(session): AuthExtractor` to the logs_validate signature (sources/ryuki-api/src/contracts.rs:10611). After loading `hosts` via list_by_hostname (line 10613-10615)
-- [ ] **logs_verify** [medium] `sources/ryuki-api/src/contracts.rs:10628` — In logs_verify (sources/ryuki-api/src/contracts.rs:10628) add `session: AuthSession` to the signature, then after `list_by_hostname` returns `hosts` apply the per-row helper `retai
+- [x] **logs_onboard** [high] `sources/ryuki-api/src/contracts.rs:10535` — Add the canonical site-only write guard at the top of logs_onboard, before the engine/DB work. Insert `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = 
+- [x] **logs_coverage** [high] `sources/ryuki-api/src/contracts.rs:10645` — Add `session: AuthSession` to the logs_coverage signature, then before the DB read resolve the effective site via enforce_site_scope: `let site = enforce_site_scope(&session, Some(
+- [x] **logs_gaps** [high] `sources/ryuki-api/src/contracts.rs:10662` — Add scope enforcement mirroring the canonical sibling hardware_firmware_gaps (contracts.rs:24098). Change the signature to take the session and make site optional, then resolve the
+- [x] **logs_volume** [high] `sources/ryuki-api/src/contracts.rs:10679` — Add the session and enforce site scope before the DB read. Change the signature to `async fn logs_volume(AuthExtractor(session): AuthExtractor, Query(params): Query<LogsSiteQuery>)
+- [x] **logs_retention** [high] `sources/ryuki-api/src/contracts.rs:10696` — Add `AuthExtractor(session): AuthExtractor` to the logs_retention signature, then before the DB read compute the effective site: `let site = enforce_site_scope(&session, Some(&para
+- [x] **logs_disable** [high] `sources/ryuki-api/src/contracts.rs:10715` — Make the disable site-aware (a post-hoc retain won't help — the UPDATE already wrote across sites). Preferred: add a scoped repo variant disable_all_for_hostname_scoped(conn, hostn
+- [x] **logs_validate** [medium] `sources/ryuki-api/src/contracts.rs:10611` — Add `AuthExtractor(session): AuthExtractor` to the logs_validate signature (sources/ryuki-api/src/contracts.rs:10611). After loading `hosts` via list_by_hostname (line 10613-10615)
+- [x] **logs_verify** [medium] `sources/ryuki-api/src/contracts.rs:10628` — In logs_verify (sources/ryuki-api/src/contracts.rs:10628) add `session: AuthSession` to the signature, then after `list_by_hostname` returns `hosts` apply the per-row helper `retai
 
 ## ad  (7)
 - [ ] **ad_prestage** [high] `sources/ryuki-api/src/contracts.rs:4118` — Insert `guard_body_site_scope(&session, &body.site)?;` immediately after the get_db() line at contracts.rs:4122, BEFORE prestage_computer/insert (4123-4126). The helper at contract
