@@ -304,6 +304,15 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (user_preferences_put, line 15228) · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** user_preferences_put stores user's site and environment scope preferences but does NOT audit the mutation. If a user's preferences are changed (either by the user themselves or by admin), there is no audit trail. The handler should call audit::record_audit_local or similar after the INSERT...ON CONFLICT.
 - **verified:** Verified real gap: The PUT /api/me/preferences endpoint (user_preferences_put, /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/contracts.rs:15232-15266) modifies user scope preferences (preferred_site, preferred_environment) without recording an audit trail. The handler receives an authenticated AuthSession with user_id, display_name, and roles, but after executing the INSERT...ON CONFLICT...UPDATE query (lines 15245-15259), it returns the response without calling audit::record_audit_local. This is a genuine security-authz gap: scope preferences determine which infrastructure sites/e
+- **STATUS (2026-06-27) — COMPLETE:** `user_preferences_put` now wraps the
+  upsert in a transaction and writes a durable hash-chained `audit_log` row
+  (`audit::security_audit("user.preferences.update", …)` +
+  `record_audit_tx`, committed atomically) — the same pattern as the swarm #7
+  resource-mutation sweep. The detail carries only the new scope identifiers
+  (subject_user_id, preferred_site, preferred_environment) — never credentials.
+  DB-gated test `user_preferences_put_writes_audit_row` asserts exactly one
+  row is appended for the acting principal (before/after delta; audit_log is
+  append-only).
 
 ### 16. Missing CHECK constraint on requests.criticality
 - **area:** requests table / data validation · **kind:** data-integrity · **severity:** medium · **effort:** S · **ci_validatable:** True

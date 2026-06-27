@@ -16328,6 +16328,11 @@ async fn user_preferences_put(
             Json(json!({"error": "database not configured; cannot persist preferences"})),
         ));
     };
+    // #15: scope preferences (preferred_site/environment) gate which infrastructure
+    // a principal sees — a security-relevant mutation. Persist + audit atomically so
+    // a change leaves a durable trail. The detail carries only the new scope values
+    // (non-secret identifiers), never credentials.
+    let mut tx = pool.begin().await.map_err(db_error)?;
     sqlx::query(
         "INSERT INTO user_preferences \
          (user_id, preferred_site, preferred_environment, updated_at) \
@@ -16340,9 +16345,26 @@ async fn user_preferences_put(
     .bind(&session.user_id)
     .bind(&site)
     .bind(&env)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(db_error)?;
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "user.preferences.update",
+            None,
+            "updated",
+            json!({
+                "subject_user_id": &session.user_id,
+                "preferred_site": &site,
+                "preferred_environment": &env,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
 
     Ok(Json(json!({
         "preferred_site": site,
@@ -36049,6 +36071,51 @@ mod db_lifecycle_tests {
         super::enforce_site_operational(pool, "ZZ-NONEXISTENT")
             .await
             .expect("a site with no status row must be allowed");
+    }
+
+    /// #15: a scope-preference change (preferred_site/environment) is a
+    /// security-relevant mutation and must leave a durable audit trail. Assert
+    /// `user_preferences_put` writes a `user.preferences.update` audit_log row
+    /// for the acting principal (before/after delta — audit_log is append-only).
+    #[tokio::test]
+    async fn user_preferences_put_writes_audit_row() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let actor = "prefs-audit-test-user";
+        let count = |p: &'static PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'user.preferences.update' AND actor_principal = $1",
+            )
+            .bind(actor)
+            .fetch_one(p)
+            .await
+            .expect("count audit rows")
+        };
+        let before = count(pool).await;
+
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = actor.into();
+        let resp = user_preferences_put(
+            AuthExtractor(session),
+            Json(UserPreferencesRequest {
+                preferred_site: Some("GBLON".into()),
+                preferred_environment: Some("prod".into()),
+            }),
+        )
+        .await
+        .expect("preferences upsert must succeed");
+        assert_eq!(resp.0["durable"], json!(true));
+
+        let after = count(pool).await;
+        assert_eq!(
+            after,
+            before + 1,
+            "a preferences update must append exactly one audit row"
+        );
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the
