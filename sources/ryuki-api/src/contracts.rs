@@ -13328,6 +13328,19 @@ async fn apply_transition_audited(
     detail: Value,
     artifacts: TransitionArtifacts,
 ) -> Result<DbRequestRow, (StatusCode, Json<Value>)> {
+    // #2 site/environment-scoped RBAC: EVERY request lifecycle transition
+    // (validate/plan/approve/execute/verify/protect/publish/retire/reject/rework/
+    // fail/cancel) funnels through here, so enforce scope ONCE on the loaded
+    // request's site/environment before any mutation. A scoped principal acting on
+    // an out-of-scope request gets the same 404 a missing row produces (never a
+    // cross-scope write, and not an existence oracle); an unrestricted principal
+    // (empty scope) passes unchanged.
+    scope_guard_or_404(
+        session,
+        &current.site,
+        &current.environment,
+        &uid.to_string(),
+    )?;
     let mut tx = pool.begin().await.map_err(db_error)?;
 
     // The CAS condition `AND status = $9` is unchanged so the concurrency/409
@@ -13765,6 +13778,15 @@ async fn requests_create(
         .await;
         return Err(status_403());
     }
+    // #2 site/environment-scoped RBAC: a scoped principal may only create a
+    // request within its own site/environment. Asserts the body's (site,
+    // environment) are in scope (403 otherwise); an unrestricted principal passes
+    // through. Runs before the DB/no-DB split so both paths are covered.
+    enforce_scope_filters(
+        &session,
+        Some(body.site.clone()),
+        Some(body.environment.clone()),
+    )?;
     let request_type = parse_request_type(&body.request_type)?;
     let mut request = request_lifecycle::create_request(
         &body.request_type,
@@ -14456,6 +14478,10 @@ async fn requests_validate(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let result = request_lifecycle::validate_request(&request).map_err(map_engine_error)?;
@@ -15008,6 +15034,10 @@ async fn requests_plan(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let mut stages = request_lifecycle::plan_request(&request).map_err(map_engine_error)?;
@@ -15136,6 +15166,9 @@ async fn requests_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load (before SoD/engine logic)
+        // so an out-of-scope request is a clean 404, never a state oracle.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         // Separation of duties: the approver must not be the request's creator.
         check_sod(
@@ -15249,6 +15282,10 @@ async fn requests_lock(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let locked = request_lifecycle::lock_request(&request).map_err(map_engine_error)?;
@@ -15350,6 +15387,10 @@ async fn requests_execute(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
 
@@ -15502,6 +15543,10 @@ async fn requests_verify(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::verify_request(&request).map_err(map_engine_error)?;
@@ -15633,6 +15678,10 @@ async fn requests_protect(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::protect_request(&request).map_err(map_engine_error)?;
@@ -15741,6 +15790,10 @@ async fn requests_publish(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::publish_request(&request).map_err(map_engine_error)?;
@@ -15850,6 +15903,10 @@ async fn requests_retire(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let evidence = request_lifecycle::retire_request(&request).map_err(map_engine_error)?;
@@ -15973,6 +16030,8 @@ async fn requests_reject(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load (before SoD/engine logic).
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         // Separation of duties: the rejecting approver must not be the creator
         // (the creator withdraws via cancel, not a self-rejection).
@@ -16098,6 +16157,10 @@ async fn requests_rework(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
@@ -16187,6 +16250,10 @@ async fn requests_fail(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine/SoD
+        // logic — so an out-of-scope request is a clean 404 (no state oracle),
+        // never a cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
 
         let request = db_row_to_request(&current, &request_id);
         let failed = request_lifecycle::fail_request(&request, reason).map_err(map_engine_error)?;
@@ -16288,6 +16355,8 @@ async fn cancel_one(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(request_id))?;
+        // #2: by-id scope guard immediately after load (before SoD/engine logic).
+        scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         // SoD: admin OR (requester AND owns the row).
         if !cancel_permitted(session, current.created_by.as_deref()) {
@@ -35596,6 +35665,47 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #2 RBAC: EVERY request lifecycle transition funnels through
+    /// apply_transition_audited, which now scope-guards on the loaded request's
+    /// site/environment. A principal scoped to another site gets a 404 (not a
+    /// cross-scope write); an in-scope principal passes the gate. One test covers
+    /// all transition handlers via the chokepoint.
+    #[tokio::test]
+    async fn lifecycle_transition_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // seed_request creates a DEFRA/production request. 'validated' is plannable.
+        let id = seed_request(pool, "validated", "validate").await;
+        let id_s = id.to_string();
+
+        // Out-of-scope (GBLON) → 404 from the after-load scope guard, BEFORE any
+        // engine logic (so it is not a state oracle either).
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.user_id = "op-gblon".into();
+        gblon.site_scope = vec!["GBLON".into()];
+        let denied = requests_plan(Path(id_s.clone()), AuthExtractor(gblon)).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "an out-of-scope transition must 404 at the scope guard: {denied:?}"
+        );
+
+        // In-scope (DEFRA/production) → passes the gate and the transition runs.
+        let mut defra = AuthSession::static_dry_run();
+        defra.user_id = "op-defra".into();
+        defra.site_scope = vec!["DEFRA".into()];
+        defra.environment_scope = vec!["production".into()];
+        let allowed = requests_plan(Path(id_s.clone()), AuthExtractor(defra)).await;
+        assert!(
+            allowed.is_ok(),
+            "an in-scope transition must pass the scope gate: {allowed:?}"
+        );
+
+        cleanup_request(pool, id).await;
     }
 
     /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
