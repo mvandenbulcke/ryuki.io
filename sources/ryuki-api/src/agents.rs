@@ -1451,6 +1451,115 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
     });
 }
 
+/// One row for the agent-offline scan (#11 slice 2d).
+#[derive(sqlx::FromRow)]
+struct AgentOfflineScanRow {
+    agent_id: String,
+    platform: String,
+    last_seen_at: Option<DateTime<Utc>>,
+    offline_alerted: bool,
+}
+
+/// One agent-offline scan pass (#11 slice 2d): emit `agent.offline` when an
+/// APPROVED agent that has checked in before goes stale (last_seen_at older than
+/// `threshold_secs`), and `agent.online` when it returns — only on a state
+/// TRANSITION, deduped via the `offline_alerted` flag flipped atomically with the
+/// emit. An approved-but-never-seen agent (last_seen_at NULL) is "not yet online",
+/// skipped — it never flips the flag. Each agent is independent. Returns the
+/// number of transition events emitted.
+pub async fn agent_offline_scan_once(
+    pool: &PgPool,
+    threshold_secs: i64,
+) -> Result<u64, sqlx::Error> {
+    let agents: Vec<AgentOfflineScanRow> = sqlx::query_as(
+        "SELECT agent_id, platform, last_seen_at, offline_alerted \
+         FROM agents WHERE status = 'approved'",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = Utc::now();
+    let mut emitted = 0u64;
+    for a in &agents {
+        let Some(seen) = a.last_seen_at else {
+            continue; // never checked in — no definitive offline transition
+        };
+        let now_offline = (now - seen).num_seconds() > threshold_secs;
+        if now_offline == a.offline_alerted {
+            continue; // no transition
+        }
+        let mut tx = pool.begin().await?;
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: if now_offline {
+                    "agent.offline"
+                } else {
+                    "agent.online"
+                },
+                aggregate_type: "agent",
+                aggregate_id: &a.agent_id,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({
+                    "to_status": if now_offline { "offline" } else { "online" },
+                    "platform": &a.platform,
+                    "last_seen_at": seen.to_rfc3339(),
+                }),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE agents SET offline_alerted = $1, updated_at = NOW() WHERE agent_id = $2",
+        )
+        .bind(now_offline)
+        .bind(&a.agent_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        emitted += 1;
+    }
+    Ok(emitted)
+}
+
+/// Spawn the background agent-offline scan (#11 slice 2d). Write-capable (so
+/// separate from the read-only scheduler); #31-style backoff. `threshold_secs`
+/// is the liveness deadline (no check-in within it ⇒ offline). Call once at
+/// startup.
+pub fn spawn_agent_offline_scan(pool: PgPool, interval_secs: u64, threshold_secs: i64) {
+    tokio::spawn(async move {
+        let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // skip the immediate first tick
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            ticker.tick().await;
+            match agent_offline_scan_once(&pool, threshold_secs).await {
+                Ok(emitted) => {
+                    consecutive_failures = 0;
+                    if emitted > 0 {
+                        tracing::info!(emitted, "agent-offline scan emitted transition events");
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
+                    tracing::error!(
+                        error = %e,
+                        consecutive_failures,
+                        backoff_intervals,
+                        "agent-offline scan failed; backing off"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        interval_secs.saturating_mul(backoff_intervals),
+                    ))
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // create_live_apply_job — enqueue a LiveApply job with a CP-signed grant
 // ---------------------------------------------------------------------------

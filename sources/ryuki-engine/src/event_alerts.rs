@@ -63,6 +63,17 @@ pub fn severity_for_budget_status(to_status: &str) -> Option<AlertSeverity> {
     }
 }
 
+/// Classify an agent-liveness event (#11 slice 2d) by its `to_status`. An
+/// `offline` agent is a WARNING — execution for its platform is impaired until a
+/// healthy agent checks in — operationally important but not, on its own, a
+/// reliability-contract breach. `online` (recovery) is not an alert.
+pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
+    match to_status {
+        "offline" => Some(AlertSeverity::Warning),
+        _ => None,
+    }
+}
+
 /// The UNION of every alert-worthy `to_status` across all aggregate types.
 /// Exposed so the alert feed can push this filter INTO its SQL query — alerts
 /// are rare relative to all events, so filtering a recent-N page in memory would
@@ -71,7 +82,7 @@ pub fn severity_for_budget_status(to_status: &str) -> Option<AlertSeverity> {
 /// and drops any spurious (aggregate, status) pair. A unit test keeps this union
 /// in lock-step with the per-aggregate classifiers.
 pub fn alert_worthy_statuses() -> &'static [&'static str] {
-    &["failed", "rejected", "cancelled", "breached"]
+    &["failed", "rejected", "cancelled", "breached", "offline"]
 }
 
 /// Classify any domain event into an optional alert severity. `request`
@@ -82,6 +93,7 @@ pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSe
         "request" => to_status.and_then(severity_for_request_status),
         "slo" => to_status.and_then(severity_for_slo_status),
         "budget" => to_status.and_then(severity_for_budget_status),
+        "agent" => to_status.and_then(severity_for_agent_status),
         _ => None,
     }
 }
@@ -131,7 +143,8 @@ mod tests {
             assert!(
                 severity_for_request_status(s).is_some()
                     || severity_for_slo_status(s).is_some()
-                    || severity_for_budget_status(s).is_some(),
+                    || severity_for_budget_status(s).is_some()
+                    || severity_for_agent_status(s).is_some(),
                 "{s} is in the alert union but no aggregate classifies it as an alert"
             );
         }
@@ -157,6 +170,12 @@ mod tests {
             Some(AlertSeverity::Warning)
         );
         assert_eq!(classify("budget", Some("recovered")), None);
+        // An offline agent is a warning; coming back online is not an alert.
+        assert_eq!(
+            classify("agent", Some("offline")),
+            Some(AlertSeverity::Warning)
+        );
+        assert_eq!(classify("agent", Some("online")), None);
         // Cross-aggregate spurious pairs never alert (a request can't be
         // 'breached', an slo can't be 'failed').
         assert_eq!(classify("slo", Some("failed")), None);

@@ -1640,6 +1640,11 @@ async fn main() {
         // scan). 5-minute cadence.
         contracts::spawn_budget_breach_scan(pool.clone(), 300);
         tracing::info!("budget-breach scan started (interval: 300s)");
+        // #11 slice 2d: agent-offline scan emits agent.offline/agent.online on
+        // transition. Scan every 60s; an approved agent unseen for >180s is
+        // offline (agents heartbeat far more often than that).
+        agents::spawn_agent_offline_scan(pool.clone(), 60, 180);
+        tracing::info!("agent-offline scan started (interval: 60s, threshold: 180s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);

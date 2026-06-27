@@ -328,6 +328,19 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
   startup (300s). DB test: breach→emit→dedup→warning-alert→recovery→flag-cleared;
   slice 2a/2b + engine tests stay green. REMAINING (2d): agent-offline emitter +
   persistent alert ack/state + recipient routing.
+- **STATUS (2026-06-27) — SLICE 2d (third emitter: agent-offline) — the finding's
+  named operational trio is now COMPLETE (SLO + capacity-budget + agent-offline):**
+  `agents::spawn_agent_offline_scan` / `agent_offline_scan_once` emit
+  `agent.offline` when an APPROVED agent that has checked in before goes stale
+  (`last_seen_at` older than the liveness threshold) and `agent.online` when it
+  returns — only on transition, deduped via a new `agents.offline_alerted` flag
+  (migration 114); an approved-but-never-seen agent (NULL last_seen) is skipped.
+  `event_alerts` gained an `agent` arm (offline=WARNING) and `offline` joined the
+  alert-status union, so agent-offline surfaces in `GET /api/events/alerts`. Wired
+  into startup (60s scan / 180s threshold). DB test asserts on the specific agent
+  (the scan covers all approved agents): offline→emit-once→dedup→warning-alert→
+  recovery→flag-cleared. REMAINING for #11: persistent alert ack/state + recipient
+  routing (slice 2e) — the emitter coverage the finding called for is done.
 
 ### 12. No per-statement query timeouts on database operations
 - **area:** ryuki-api/src/database.rs (try_connect_with_url, lines 104-129) · **kind:** missing-feature · **severity:** high · **effort:** L · **ci_validatable:** False

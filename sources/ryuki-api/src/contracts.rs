@@ -37845,6 +37845,113 @@ mod db_lifecycle_tests {
             .ok();
     }
 
+    /// #11 slice 2d: the agent-offline scan emits agent.offline when an approved
+    /// agent goes stale, dedups, surfaces as a warning alert, and emits
+    /// agent.online when it checks back in. Asserts on THIS agent's events (the
+    /// scan covers all approved agents, so the global count is not deterministic).
+    #[tokio::test]
+    async fn agent_offline_scan_emits_on_transition_and_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4().simple().to_string();
+        let agent_id = format!("agent-offline-test-{suffix}");
+        sqlx::query(
+            "INSERT INTO agents (agent_id, platform, public_key, token_hash, status, last_seen_at) \
+             VALUES ($1, 'vmware', 'pk', $2, 'approved', NOW() - INTERVAL '10 minutes')",
+        )
+        .bind(&agent_id)
+        .bind(format!("hash-{suffix}"))
+        .execute(pool)
+        .await
+        .expect("seed approved agent");
+
+        let count_sql =
+            "SELECT COUNT(*) FROM domain_events WHERE aggregate_id = $1 AND event_type = $2";
+
+        // Scan 1: my agent (last seen 10 min ago, threshold 180s) → offline.
+        crate::agents::agent_offline_scan_once(pool, 180)
+            .await
+            .expect("scan 1");
+        let offline_n: i64 = sqlx::query_scalar(count_sql)
+            .bind(&agent_id)
+            .bind("agent.offline")
+            .fetch_one(pool)
+            .await
+            .expect("count offline");
+        assert_eq!(offline_n, 1, "offline must be emitted once");
+        let flagged: bool =
+            sqlx::query_scalar("SELECT offline_alerted FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("flag");
+        assert!(flagged, "agent must be flagged offline");
+
+        // Scan 2: dedup — no second offline event for this agent.
+        crate::agents::agent_offline_scan_once(pool, 180)
+            .await
+            .expect("scan 2");
+        let offline_n2: i64 = sqlx::query_scalar(count_sql)
+            .bind(&agent_id)
+            .bind("agent.offline")
+            .fetch_one(pool)
+            .await
+            .expect("count offline 2");
+        assert_eq!(offline_n2, 1, "an already-offline agent must not re-emit");
+
+        // Surfaced as a warning alert.
+        let alerts = events_alerts(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(EventsQuery {
+                event_type: None,
+                aggregate_id: Some(agent_id.clone()),
+                limit: Some(50),
+            }),
+        )
+        .await
+        .expect("alerts");
+        let arr = alerts.0["alerts"].as_array().unwrap();
+        assert!(
+            arr.iter()
+                .any(|a| a["event_type"] == json!("agent.offline")
+                    && a["severity"] == json!("warning")),
+            "the agent offline must surface as a warning alert: {arr:?}"
+        );
+
+        // Recover: agent checks back in.
+        sqlx::query("UPDATE agents SET last_seen_at = NOW() WHERE agent_id = $1")
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .expect("heartbeat");
+        crate::agents::agent_offline_scan_once(pool, 180)
+            .await
+            .expect("scan 3");
+        let online_n: i64 = sqlx::query_scalar(count_sql)
+            .bind(&agent_id)
+            .bind("agent.online")
+            .fetch_one(pool)
+            .await
+            .expect("count online");
+        assert_eq!(online_n, 1, "online must be emitted once on recovery");
+        let flagged2: bool =
+            sqlx::query_scalar("SELECT offline_alerted FROM agents WHERE agent_id = $1")
+                .bind(&agent_id)
+                .fetch_one(pool)
+                .await
+                .expect("flag 2");
+        assert!(!flagged2, "agent must no longer be flagged offline");
+
+        sqlx::query("DELETE FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     /// #8: degradation status reads from the DB (migration 025 seed), not the
     /// in-memory engine — so it survives restart. The component_status rows fold
     /// into AdapterComponentStatus correctly. Non-mutating.
