@@ -34,6 +34,7 @@
 - [x] **metric budgets** — `90d6902` (metric_budgets DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) before the write; platform-wide NULL denied to scoped on that axis; codex APPROVED after containment clarification)
 - [x] **slo** — `45b7d1b` (slo_definitions DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) w/ SELECT…FOR UPDATE before the write; platform-wide-on-a-scoped-axis denied; codex APPROVED, TOCTOU caveat closed via row lock)
 - [x] **decommission** — `5bfe1d5` (site-only domain; new site_scope_guard_or_404 by-id 404 guard; plan body 403; approve/quarantine/execute/rollback guard before engine 409; verify/get/inventory were SESSIONLESS now scoped; validate left stateless; codex APPROVED)
+- [x] **linux_deploy** — `8dd3a9f` (site-only domain; plan body 403 via guard_body_site_scope; validate/execute/verify by-id site_scope_guard_or_404 before the lifecycle 409; env-scoped fail-closed; codex APPROVED. also fix(test) deploymentId→deployment_id 99e9091)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -281,8 +282,8 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **decommission_approve / decommission_quarantine / decommission_execute / decommission_verify / decommission_rollback / decommission_get / decommission_quarantine_inventory** [high] `sources/ryuki-api/src/contracts.rs:21220-21437` — By-id handlers (approve after 21229, quarantine after 21275, execute after 21319, verify after 21359, rollback after 21377, get at 21430): immediately after `let req = repos::decom
 
 ## linux_deploy  (2)
-- [ ] **linux_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:21481` — Insert the canonical site-only WRITE guard at the top of linux_deploy_plan, immediately after `let pool = get_db()...?;` (contracts.rs:21485) and BEFORE plan_linux_deployment/inser
-- [ ] **linux_deploy_validate / linux_deploy_execute / linux_deploy_verify** [high] `sources/ryuki-api/src/contracts.rs:21529` — Insert guard_body_site_scope(&session, &req.site)?; in each handler immediately after the load line that yields req (right after .ok_or_else(|| status_404(&body.operation_id))? at 
+- [x] **linux_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:21481` — Insert the canonical site-only WRITE guard at the top of linux_deploy_plan, immediately after `let pool = get_db()...?;` (contracts.rs:21485) and BEFORE plan_linux_deployment/inser
+- [x] **linux_deploy_validate / linux_deploy_execute / linux_deploy_verify** [high] `sources/ryuki-api/src/contracts.rs:21529` — Insert guard_body_site_scope(&session, &req.site)?; in each handler immediately after the load line that yields req (right after .ok_or_else(|| status_404(&body.operation_id))? at 
 
 ## approvals  (1)
 - [ ] **approvals_pending** [high] `sources/ryuki-api/src/contracts.rs:3980` — Mirror the sibling requests_list pattern. After computing `role` (3987), derive the effective scope filters and push them into the SQL as bound params:    let (f_site, f_env) = enf
