@@ -23383,8 +23383,12 @@ async fn monitoring_alert_routing_contract() -> Json<Value> {
 
 // ─── Network Port & VLAN Readiness handlers ───
 
-async fn network_readiness_check(Query(query): Query<NetworkReadinessQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
+async fn network_readiness_check(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<NetworkReadinessQuery>,
+) -> ApiResult {
+    // #2: narrow the site to the principal's scope (env-scoped -> 403).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
     let port_count = query.ports.unwrap_or(1);
     let vlan = query.vlan;
     let ip_count = query.ips.unwrap_or(1);
@@ -23420,8 +23424,13 @@ async fn network_readiness_check(Query(query): Query<NetworkReadinessQuery>) -> 
     })))
 }
 
-async fn network_reserve_ports(Json(body): Json<NetworkReservePortsRequest>) -> ApiResult {
+async fn network_reserve_ports(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<NetworkReservePortsRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only reserve ports in their own site.
+    guard_body_site_scope(&session, &body.site)?;
     match crate::repos::network_readiness::reserve_ports(
         pool,
         &body.site,
@@ -23443,8 +23452,13 @@ async fn network_reserve_ports(Json(body): Json<NetworkReservePortsRequest>) -> 
     }
 }
 
-async fn network_reserve_ips(Json(body): Json<NetworkReserveIpsRequest>) -> ApiResult {
+async fn network_reserve_ips(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<NetworkReserveIpsRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scoped principals may only reserve IPs in their own site.
+    guard_body_site_scope(&session, &body.site)?;
     match crate::repos::network_readiness::reserve_ips(
         pool,
         &body.site,
@@ -23474,6 +23488,24 @@ async fn network_release(
     Path(id): Path<String>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: pre-load the reservation's site and guard BEFORE release_reservation
+    // branches on status — otherwise its AlreadyReleased 409 (and NotFound 404)
+    // would be an existence/status oracle. An out-of-scope or missing reservation
+    // -> the canonical 404.
+    if is_scoped(&session) {
+        let site: Option<String> =
+            sqlx::query_scalar("SELECT site FROM port_reservations WHERE reservation_id = $1")
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+                .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err(status_404(&id));
+        }
+    }
     let mut tx = pool.begin().await.map_err(db_error)?;
     let resv = match crate::repos::network_readiness::release_reservation(&mut tx, &id).await {
         Ok(r) => r,
@@ -23503,8 +23535,12 @@ async fn network_release(
     Ok(Json(serde_json::to_value(resv).unwrap_or_default()))
 }
 
-async fn network_capacity(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
+async fn network_capacity(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<NetworkSiteQuery>,
+) -> ApiResult {
+    // #2: narrow the site to the principal's scope (env-scoped -> 403).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
     let (ports, vlans) = match get_db() {
         Some(pool) => {
             let p = crate::repos::network_readiness::list_ports(pool, &site)
@@ -23522,7 +23558,10 @@ async fn network_capacity(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
     )))
 }
 
-async fn network_ports_inventory(Query(query): Query<NetworkSwitchQuery>) -> ApiResult {
+async fn network_ports_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<NetworkSwitchQuery>,
+) -> ApiResult {
     let switch = query.switch.unwrap_or_else(|| "defra-sw-01".to_string());
     let ports = match get_db() {
         Some(pool) => crate::repos::network_readiness::list_ports_by_switch(pool, &switch)
@@ -23530,13 +23569,20 @@ async fn network_ports_inventory(Query(query): Query<NetworkSwitchQuery>) -> Api
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: keep only ports whose site is in the principal's scope — a scoped
+    // principal sees nothing for a switch in another site (env-scoped -> none).
+    let ports = retain_site_scoped(&session, ports, |p| p.site.as_str());
     network_readiness::build_port_inventory(&switch, &ports)
         .map(Json)
         .map_err(|e| status_404(&e))
 }
 
-async fn network_vlans_inventory(Query(query): Query<NetworkSiteQuery>) -> ApiResult {
-    let site = query.site.unwrap_or_else(|| "DEFRA".to_string());
+async fn network_vlans_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<NetworkSiteQuery>,
+) -> ApiResult {
+    // #2: narrow the site to the principal's scope (env-scoped -> 403).
+    let site = enforce_site_scope(&session, query.site.as_deref(), "DEFRA")?;
     let vlans = match get_db() {
         Some(pool) => crate::repos::network_readiness::list_vlans(pool, &site)
             .await
@@ -40401,6 +40447,74 @@ mod db_lifecycle_tests {
             global_json["source"].as_str(),
             Some("scoped"),
             "unrestricted summary must use the global aggregate: {global_json}"
+        );
+    }
+
+    /// #2 RBAC: the network-readiness handlers are site-scoped (switch_ports/vlans
+    /// have site). A GBLON principal gets 403 on a DEFRA capacity read and a DEFRA
+    /// port reservation; its own site and an unrestricted principal pass. These
+    /// guards are deterministic (fire before any DB work).
+    #[tokio::test]
+    async fn network_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // capacity for a foreign site -> 403.
+        let foreign = network_capacity(
+            AuthExtractor(gblon.clone()),
+            Query(NetworkSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(foreign, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope network_capacity must be forbidden: {foreign:?}"
+        );
+
+        // reserve ports in a foreign site -> 403.
+        let reserve = network_reserve_ports(
+            AuthExtractor(gblon.clone()),
+            Json(NetworkReservePortsRequest {
+                site: "DEFRA".into(),
+                count: 2,
+                purpose: "scope-test".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(reserve, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope network_reserve_ports must be forbidden: {reserve:?}"
+        );
+
+        // own site + unrestricted pass the gate.
+        let own = network_capacity(
+            AuthExtractor(gblon),
+            Query(NetworkSiteQuery {
+                site: Some("GBLON".into()),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope network_capacity must pass: {own:?}"
+        );
+        let any = network_capacity(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(NetworkSiteQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted network_capacity must pass: {any:?}"
         );
     }
 
