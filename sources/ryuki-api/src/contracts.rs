@@ -20529,6 +20529,31 @@ async fn slo_update(
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // slo_definitions.site/environment are both nullable (NULL = platform-wide on
+    // that axis). A scoped principal may only touch a row whose footprint is
+    // contained in its authority on BOTH axes; out-of-scope, or platform-wide on
+    // an axis the principal is scoped to, collapses to a 404 (no existence
+    // oracle) BEFORE the UPDATE. An unrestricted principal is unaffected.
+    if is_scoped(&session) {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT site, environment FROM slo_definitions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let permitted = match row {
+            Some((site, environment)) => multi_scope_permits(
+                &session,
+                &site.into_iter().collect::<Vec<_>>(),
+                &environment.into_iter().collect::<Vec<_>>(),
+            ),
+            None => false,
+        };
+        if !permitted {
+            return Err(status_404(&id));
+        }
+    }
     // COALESCE keeps any omitted field at its current value (PATCH semantics).
     let updated: Option<(String,)> = sqlx::query_as(
         "UPDATE slo_definitions SET \
@@ -20579,6 +20604,30 @@ async fn slo_delete(AuthExtractor(session): AuthExtractor, Path(id): Path<String
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // Same dual-axis containment guard as slo_update: a scoped principal may only
+    // delete a row whose (site, environment) footprint is contained in its
+    // authority; platform-wide rows stay deletable only by an unrestricted
+    // principal. 404 (no oracle) BEFORE the DELETE for anything out of scope.
+    if is_scoped(&session) {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT site, environment FROM slo_definitions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let permitted = match row {
+            Some((site, environment)) => multi_scope_permits(
+                &session,
+                &site.into_iter().collect::<Vec<_>>(),
+                &environment.into_iter().collect::<Vec<_>>(),
+            ),
+            None => false,
+        };
+        if !permitted {
+            return Err(status_404(&id));
+        }
+    }
     let deleted: Option<(String,)> =
         sqlx::query_as("DELETE FROM slo_definitions WHERE id = $1 RETURNING id")
             .bind(&id)
@@ -41135,6 +41184,132 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #2 RBAC: slo_update / slo_delete enforce dual-axis subset containment.
+    /// slo_definitions.site/environment are nullable (NULL = platform-wide on that
+    /// axis). A scoped principal may only touch a row whose footprint is contained
+    /// in its authority on both axes; an out-of-scope site, or platform-wide on an
+    /// axis the principal is scoped to, collapses to a 404 (no existence oracle)
+    /// BEFORE the mutation. The in-scope case still succeeds (not over-restrictive).
+    #[tokio::test]
+    async fn slo_update_delete_is_dual_axis_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Create three SLOs with distinct footprints (all via an unrestricted admin).
+        let mut ids: Vec<(String, &str)> = Vec::new();
+        for (site, name) in [
+            (Some("DEFRA".to_string()), "scope-defra"),
+            (None, "scope-global"),
+            (Some("GBLON".to_string()), "scope-gblon"),
+        ] {
+            let created = slo_create(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Json(SloCreateRequest {
+                    name: name.to_string(),
+                    target: 0.99,
+                    window_days: Some(30),
+                    good_metric_key: "slo.scope.good".into(),
+                    total_metric_key: "slo.scope.total".into(),
+                    site,
+                    environment: None,
+                }),
+            )
+            .await
+            .expect("create slo");
+            ids.push((created.0["id"].as_str().expect("slo id").to_string(), name));
+        }
+        let defra_id = ids[0].0.clone();
+        let global_id = ids[1].0.clone();
+        let gblon_id = ids[2].0.clone();
+
+        // A GBLON-site-scoped principal (env-unrestricted).
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+        let hijack = || SloUpdateRequest {
+            name: Some("hijacked".into()),
+            target: None,
+            window_days: None,
+            enabled: Some(false),
+        };
+
+        // Out-of-scope site (DEFRA) → update 404.
+        let r = slo_update(
+            AuthExtractor(scoped()),
+            Path(defra_id.clone()),
+            Json(hijack()),
+        )
+        .await;
+        assert!(
+            matches!(r, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope DEFRA update must 404: {r:?}"
+        );
+        // Platform-wide (site NULL) → update 404 for a site-scoped principal.
+        let r = slo_update(
+            AuthExtractor(scoped()),
+            Path(global_id.clone()),
+            Json(hijack()),
+        )
+        .await;
+        assert!(
+            matches!(r, Err((StatusCode::NOT_FOUND, _))),
+            "platform-wide update must 404 for a scoped principal: {r:?}"
+        );
+        // Out-of-scope delete → 404.
+        let r = slo_delete(AuthExtractor(scoped()), Path(defra_id.clone())).await;
+        assert!(
+            matches!(r, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope DEFRA delete must 404: {r:?}"
+        );
+
+        // Neither denied row was mutated or removed.
+        let (defra_name,): (String,) =
+            sqlx::query_as("SELECT name FROM slo_definitions WHERE id = $1")
+                .bind(&defra_id)
+                .fetch_one(pool)
+                .await
+                .expect("DEFRA slo must still exist");
+        assert_eq!(defra_name, "scope-defra", "DEFRA slo must be unmutated");
+        let (global_name,): (String,) =
+            sqlx::query_as("SELECT name FROM slo_definitions WHERE id = $1")
+                .bind(&global_id)
+                .fetch_one(pool)
+                .await
+                .expect("platform-wide slo must still exist");
+        assert_eq!(
+            global_name, "scope-global",
+            "platform-wide slo must be unmutated"
+        );
+
+        // Positive: in-scope GBLON row updates fine for the scoped principal.
+        let ok = slo_update(
+            AuthExtractor(scoped()),
+            Path(gblon_id.clone()),
+            Json(SloUpdateRequest {
+                name: Some("scope-gblon-renamed".into()),
+                target: None,
+                window_days: None,
+                enabled: None,
+            }),
+        )
+        .await
+        .expect("in-scope GBLON update must succeed");
+        assert_eq!(ok.0["updated"], json!(gblon_id));
+
+        for (id, _) in &ids {
+            sqlx::query("DELETE FROM slo_definitions WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
     }
 
     /// #29: GET /api/observe/monitoring-review-queue reads the seeded
