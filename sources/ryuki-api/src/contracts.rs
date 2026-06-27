@@ -4378,6 +4378,8 @@ async fn gmsa_create(
     Json(body): Json<GmsaCreateRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: a scoped principal may only create a gMSA for its own site (site-only).
+    guard_body_site_scope(&session, &body.site)?;
 
     let account = gmsa_lifecycle::create_gmsa(&body.name, body.hosts, body.spns, &body.site)
         .map_err(|e| status_400(&e))?;
@@ -4438,6 +4440,12 @@ async fn gmsa_assign(
     Path((name, host)): Path<(String, String)>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the gMSA's site BEFORE mutating (site-only).
+    let existing = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    scope_guard_or_404(&session, &existing.site, "", &name)?;
 
     // add_host enforces the revoked guard under a row lock (concurrency-safe);
     // the engine assign_to_host is the pure spec of the same rule.
@@ -4487,6 +4495,12 @@ async fn gmsa_remove(
     Path((name, host)): Path<(String, String)>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the gMSA's site BEFORE mutating (site-only).
+    let existing = crate::repos::gmsa_accounts::get_by_name(pool, &name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&name))?;
+    scope_guard_or_404(&session, &existing.site, "", &name)?;
 
     // remove_host enforces the host-present and last-host invariants under a row
     // lock, so two concurrent removes cannot both drain the account to zero
@@ -4544,6 +4558,8 @@ async fn gmsa_rotate(AuthExtractor(session): AuthExtractor, Path(name): Path<Str
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: gMSA is site-only — guard on the loaded account's site.
+    scope_guard_or_404(&session, &account.site, "", &name)?;
 
     // Fast revoked pre-check (the repo CAS below is the authoritative guard).
     if account.status == gmsa_lifecycle::GMSAStatus::Revoked {
@@ -4590,13 +4606,18 @@ async fn gmsa_rotate(AuthExtractor(session): AuthExtractor, Path(name): Path<Str
     Ok(Json(serde_json::to_value(persisted).unwrap_or_default()))
 }
 
-async fn gmsa_test(Path((name, host)): Path<(String, String)>) -> ApiResult {
+async fn gmsa_test(
+    AuthExtractor(session): AuthExtractor,
+    Path((name, host)): Path<(String, String)>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let account = crate::repos::gmsa_accounts::get_by_name(pool, &name)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&name))?;
+    // #2: gMSA is site-only — guard on the loaded account's site.
+    scope_guard_or_404(&session, &account.site, "", &name)?;
 
     // Read-only: engine validates revoked guard and host authorization.
     let result = gmsa_lifecycle::test_retrieval(&account, &host).map_err(|e| status_409(&e))?;
@@ -4620,13 +4641,15 @@ async fn gmsa_inventory(
     Ok(Json(serde_json::to_value(accounts).unwrap_or_default()))
 }
 
-async fn gmsa_expiring() -> ApiResult {
+async fn gmsa_expiring(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let Some(pool) = get_db() else {
         return Ok(Json(serde_json::Value::Array(vec![])));
     };
     let all = crate::repos::gmsa_accounts::list(pool, "")
         .await
         .map_err(db_error)?;
+    // #2: site-only — a scoped principal sees only its site's accounts.
+    let all = retain_site_scoped(&session, all, |a| a.site.as_str());
     let expiring = gmsa_lifecycle::get_expiring(&all);
     Ok(Json(serde_json::to_value(expiring).unwrap_or_default()))
 }
@@ -35896,6 +35919,53 @@ mod db_lifecycle_tests {
         ins.site_scope = vec![site.clone()];
         let ok = k8s_namespace_get(AuthExtractor(ins), Path(id.clone())).await;
         assert!(ok.is_ok(), "in-scope namespace get must succeed: {ok:?}");
+    }
+
+    /// #2 RBAC (gMSA, site-only): a by-name read is 404 out-of-scope and passes
+    /// the scope gate in-scope (read-only gmsa_test, so no seeded data is mutated).
+    #[tokio::test]
+    async fn gmsa_by_name_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Some((name, site)): Option<(String, String)> =
+            sqlx::query_as("SELECT name, site FROM gmsa_accounts LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .expect("query gmsa_accounts")
+        else {
+            eprintln!("SKIP: no seeded gmsa_accounts");
+            return;
+        };
+        let other = if site == "GBLON" { "DEFRA" } else { "GBLON" };
+
+        let mut out = AuthSession::static_dry_run();
+        out.site_scope = vec![other.to_string()];
+        let denied = gmsa_test(
+            AuthExtractor(out),
+            Path((name.clone(), "dummy-host".to_string())),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope gMSA read must 404: {denied:?}"
+        );
+
+        let mut ins = AuthSession::static_dry_run();
+        ins.site_scope = vec![site.clone()];
+        let allowed = gmsa_test(
+            AuthExtractor(ins),
+            Path((name.clone(), "dummy-host".to_string())),
+        )
+        .await;
+        // In-scope passes the scope gate; it may 409 on the dummy host, but must
+        // NOT be the scope 404.
+        assert!(
+            !matches!(allowed, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope gMSA read must pass the scope gate: {allowed:?}"
+        );
     }
 
     /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
