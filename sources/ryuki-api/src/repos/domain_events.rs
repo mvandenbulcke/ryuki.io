@@ -134,6 +134,20 @@ pub async fn list_alerts(
 /// Returns `Ok(false)` when no such event exists (caller → 404) — distinguished
 /// from a genuine DB failure — by checking existence first; the FK would also
 /// reject a bad id, but a clean 404 reads better than a constraint error.
+/// Fetch a single event's (site, environment) scope tags for an authorization
+/// check (#2). Both are nullable (NULL = platform-wide on that axis). Returns
+/// `None` when the event id is unknown so the caller can 404 without a separate
+/// existence query.
+pub async fn event_scope(
+    pool: &sqlx::PgPool,
+    event_id: i64,
+) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+    sqlx::query_as("SELECT site, environment FROM domain_events WHERE id = $1")
+        .bind(event_id)
+        .fetch_optional(pool)
+        .await
+}
+
 pub async fn ack_alert(
     pool: &sqlx::PgPool,
     event_id: i64,

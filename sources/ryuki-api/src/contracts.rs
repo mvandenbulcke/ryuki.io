@@ -3986,10 +3986,18 @@ async fn approvals_pending(AuthExtractor(session): AuthExtractor) -> ApiResult {
 
     let role = approval_role_for(&session);
 
+    // #2: narrow the pending queue to the approver's site/environment scope, the
+    // same way requests_list does. A scoped principal must not see other sites'
+    // pending approvals; an unrestricted principal sees all (filters are NULL); a
+    // principal holding several distinct scopes with no way to disambiguate is 403'd.
+    let (f_site, f_env) = enforce_scope_filters(&session, None, None)?;
+
     if let Some(pool) = get_db() {
         let rows: Vec<DbRequestRow> = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests \
              WHERE status = 'planned' \
+               AND ($2::text IS NULL OR site = $2) \
+               AND ($3::text IS NULL OR environment = $3) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM request_approval_decisions rad \
                    WHERE rad.request_id = requests.id AND rad.role = $1 \
@@ -3997,6 +4005,8 @@ async fn approvals_pending(AuthExtractor(session): AuthExtractor) -> ApiResult {
              ORDER BY created_at ASC"
         ))
         .bind(&role)
+        .bind(&f_site)
+        .bind(&f_env)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -9092,7 +9102,15 @@ async fn software_history(Path(server): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(history).unwrap()))
 }
 
-async fn software_compliance(Query(query): Query<SoftwareComplianceQuery>) -> ApiResult {
+async fn software_compliance(
+    AuthExtractor(session): AuthExtractor,
+    Query(query): Query<SoftwareComplianceQuery>,
+) -> ApiResult {
+    // #2: site-only compliance report — a scoped principal may only read its own
+    // site (site is a required, caller-supplied param, so 403 is not an oracle);
+    // an environment-scoped principal is denied (no environment axis here). Guards
+    // both the DB and the no-DB engine fallback below.
+    guard_body_site_scope(&session, &query.site)?;
     const VALID_SITES: &[&str] = &["DEBER", "DEFRA", "FRPAR", "GBLON", "NLAMS"];
     if !VALID_SITES.contains(&query.site.as_str()) {
         return Err(status_400(&format!("Unknown site: {}", query.site)));
@@ -17099,6 +17117,15 @@ async fn cancel_one(
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(request_id))?;
 
+    // #2: the no-DB dry-run store must enforce the same by-id scope guard as the DB
+    // branch above — an out-of-scope request 404s exactly like a missing one, so the
+    // in-memory fallback is never a cross-scope cancel or existence oracle.
+    if is_scoped(session) && !row_scope_permits(session, &store[idx].site, &store[idx].environment)
+    {
+        drop(store);
+        return Err(status_404(request_id));
+    }
+
     // In-memory records carry the requester in `requester`; honor the same SoD.
     if !cancel_permitted(session, Some(store[idx].requester.as_str())) {
         drop(store);
@@ -17856,6 +17883,25 @@ async fn events_alert_ack(
         reject_control_chars("note", n)?;
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: enforce the SAME visibility model the alert feed uses (domain_events::
+    // list_alerts) — a scoped principal may ack an alert it can see, i.e. one
+    // tagged to an in-scope site/environment OR platform-wide (NULL) on that axis.
+    // Anything outside its scope 404s exactly like a missing event (no oracle).
+    use ryuki_engine::auth::scope_permits;
+    match crate::repos::domain_events::event_scope(pool, event_id)
+        .await
+        .map_err(db_error)?
+    {
+        Some((site, environment)) => {
+            let site_ok = site.is_none() || scope_permits(&session.site_scope, site.as_deref());
+            let env_ok = environment.is_none()
+                || scope_permits(&session.environment_scope, environment.as_deref());
+            if !(site_ok && env_ok) {
+                return Err(status_404(&event_id.to_string()));
+            }
+        }
+        None => return Err(status_404(&event_id.to_string())),
+    }
     let acked = crate::repos::domain_events::ack_alert(pool, event_id, &session.user_id, note)
         .await
         .map_err(db_error)?;
@@ -18142,6 +18188,14 @@ async fn on_call_contact_create(
     Json(b): Json<OnCallContactCreateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: a scoped principal may only register a contact for a site within its
+    // scope; a NULL (platform-wide) contact may be created only by an unrestricted
+    // principal. Body-supplied → 403 (no existence oracle).
+    match norm_opt(&b.site).as_deref() {
+        Some(s) => guard_body_site_scope(&session, s)?,
+        None if is_scoped(&session) => return Err(status_403_out_of_scope("site")),
+        None => {}
+    }
     let tier = b.escalation_tier.unwrap_or(1);
     if let Some(msg) =
         on_call_contact_rejection(&b.name, &b.role, &b.site, tier, &b.email, &b.phone)
@@ -18191,6 +18245,7 @@ async fn on_call_contact_create(
 /// GET /api/observe/oncall/contacts — list contacts, optionally filtered by site
 /// and/or escalation tier, in escalation order.
 async fn on_call_contact_list(
+    AuthExtractor(session): AuthExtractor,
     Query(q): Query<OnCallListQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(pool) = get_db() else {
@@ -18208,7 +18263,15 @@ async fn on_call_contact_list(
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
-    let contacts: Vec<Value> = rows.iter().map(OnCallContactRow::to_json).collect();
+    // #2: apply the same nullable-site containment as the by-id reads — a scoped
+    // principal keeps only contacts tagged to a concrete in-scope site (NULL/
+    // platform-wide and other sites are dropped); an env-scoped principal keeps
+    // none; an unrestricted principal keeps everything.
+    let contacts: Vec<Value> = rows
+        .iter()
+        .filter(|r| nullable_site_scope_guard_or_404(&session, r.site.as_deref(), "").is_ok())
+        .map(OnCallContactRow::to_json)
+        .collect();
     Ok(Json(json!({
         "source": "database",
         "contacts": contacts,
@@ -18218,6 +18281,7 @@ async fn on_call_contact_list(
 
 /// GET /api/observe/oncall/contacts/{id} — fetch one contact.
 async fn on_call_contact_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
@@ -18229,9 +18293,14 @@ async fn on_call_contact_get(
     .await
     .map_err(db_error)?;
     match row {
-        Some(r) => Ok(Json(
-            json!({ "source": "database", "contact": r.to_json() }),
-        )),
+        Some(r) => {
+            // #2: out-of-scope (or platform-wide for a scoped principal) 404s like a
+            // missing one — no cross-site existence oracle.
+            nullable_site_scope_guard_or_404(&session, r.site.as_deref(), &id)?;
+            Ok(Json(
+                json!({ "source": "database", "contact": r.to_json() }),
+            ))
+        }
         None => Err(status_404(&id)),
     }
 }
@@ -18255,6 +18324,11 @@ async fn on_call_contact_update(
     .await
     .map_err(db_error)?
     .ok_or_else(|| status_404(&id))?;
+
+    // #2: a scoped principal may only touch a contact already within its scope
+    // (out-of-scope / platform-wide → 404, no oracle), and may not re-home it out
+    // of scope or to platform-wide (target site guarded below).
+    nullable_site_scope_guard_or_404(&session, existing.site.as_deref(), &id)?;
 
     // Resolve final values: omitted = keep; for site/email/phone an empty string
     // clears it. The combined email/phone is then validated for the has-method
@@ -18283,6 +18357,14 @@ async fn on_call_contact_update(
         Some(ref s) => norm_opt(&Some(s.clone())),
     };
     let final_enabled = b.enabled.unwrap_or(existing.enabled);
+
+    // #2: the resulting site must also be within the principal's scope — a scoped
+    // principal cannot re-home a contact to another site or to platform-wide.
+    match final_site.as_deref() {
+        Some(s) => guard_body_site_scope(&session, s)?,
+        None if is_scoped(&session) => return Err(status_403_out_of_scope("site")),
+        None => {}
+    }
 
     if let Some(msg) = on_call_contact_rejection(
         &final_name,
@@ -18345,6 +18427,19 @@ async fn on_call_contact_delete(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // #2: pre-load the contact's site (locked) and guard BEFORE the DELETE — an
+    // out-of-scope / platform-wide-for-a-scoped-principal contact 404s like a
+    // missing one, never a cross-site delete or existence oracle.
+    let target: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT site FROM on_call_contacts WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    match target {
+        Some((site,)) => nullable_site_scope_guard_or_404(&session, site.as_deref(), &id)?,
+        None => return Err(status_404(&id)),
+    }
     let deleted: Option<(String,)> =
         sqlx::query_as("DELETE FROM on_call_contacts WHERE id = $1 RETURNING id")
             .bind(&id)
@@ -21466,7 +21561,22 @@ async fn snapshot_governance_contract() -> Json<Value> {
 
 // ─── Backup Coverage & Restore handlers ───
 
-async fn backup_coverage_report(Json(body): Json<CoverageReportRequest>) -> ApiResult {
+async fn backup_coverage_report(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<CoverageReportRequest>,
+) -> ApiResult {
+    // #2: a coverage report spans the caller-supplied site/environment vectors. A
+    // scoped principal may only request a report whose footprint is contained in
+    // its authority on BOTH axes (subset containment) — an empty (all-sites or
+    // all-envs) request from a scoped principal is denied. Body-supplied → 403.
+    if is_scoped(&session) {
+        if !within_multi_scope(&session.site_scope, &body.site_scope) {
+            return Err(status_403_out_of_scope("site"));
+        }
+        if !within_multi_scope(&session.environment_scope, &body.environment_scope) {
+            return Err(status_403_out_of_scope("environment"));
+        }
+    }
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let mut report =
@@ -21485,7 +21595,14 @@ async fn backup_coverage_report(Json(body): Json<CoverageReportRequest>) -> ApiR
     Ok(Json(serde_json::to_value(&persisted).unwrap_or_default()))
 }
 
-async fn backup_restore_plan(Json(body): Json<RestorePlanRequest>) -> ApiResult {
+async fn backup_restore_plan(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<RestorePlanRequest>,
+) -> ApiResult {
+    // #2 dual-axis WRITE: a scoped principal may only plan a restore whose target
+    // site AND environment are both within its scope (body-supplied → 403, no
+    // existence oracle).
+    guard_body_scope_dual(&session, &body.target_site, &body.target_environment)?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let restore_type = match body.restore_type.as_str() {
@@ -21519,13 +21636,24 @@ async fn backup_restore_plan(Json(body): Json<RestorePlanRequest>) -> ApiResult 
 }
 
 /// Validate a persisted restore request (read-only — no state transition).
-async fn backup_restore_validate(Json(body): Json<RestoreActionRequest>) -> ApiResult {
+async fn backup_restore_validate(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<RestoreActionRequest>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
     let r = crate::repos::restore_requests::get(pool, &body.restore_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.restore_id))?;
+
+    // #2 dual-axis by-id read: out-of-scope 404s like a missing one (no oracle).
+    scope_guard_or_404(
+        &session,
+        &r.target_site,
+        &r.target_environment,
+        &body.restore_id,
+    )?;
 
     let result = backup_engine::validate_restore_request(&r).map_err(|e| status_400(&e))?;
 
@@ -21542,6 +21670,15 @@ async fn backup_restore_approve(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.restore_id))?;
+
+    // #2 dual-axis by-id guard BEFORE the engine 409 — out-of-scope 404s like a
+    // missing one, never leaking status via approve_restore's state check.
+    scope_guard_or_404(
+        &session,
+        &r.target_site,
+        &r.target_environment,
+        &body.restore_id,
+    )?;
 
     let before = crate::repos::restore_requests::status_str(&r.status);
     // Approver = authenticated caller (from request extensions), never a
@@ -21593,6 +21730,14 @@ async fn backup_restore_execute(
         .map_err(db_error)?
         .ok_or_else(|| status_404(&body.restore_id))?;
 
+    // #2 dual-axis by-id guard BEFORE the engine 409 — out-of-scope 404s like a miss.
+    scope_guard_or_404(
+        &session,
+        &r.target_site,
+        &r.target_environment,
+        &body.restore_id,
+    )?;
+
     let before = crate::repos::restore_requests::status_str(&r.status);
 
     // Engine requires Approved; produces evidence without changing status.
@@ -21634,24 +21779,42 @@ async fn backup_restore_execute(
 
 /// GET /api/protect/backup/restores — list all persisted restore requests.
 /// Returns an empty array when no DB is available rather than an error.
-async fn backup_restores_list() -> ApiResult {
+async fn backup_restores_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let Some(pool) = get_db() else {
         return Ok(Json(serde_json::Value::Array(vec![])));
     };
     let records = crate::repos::restore_requests::list(pool)
         .await
         .map_err(db_error)?;
+    // #2 dual-axis list filter: keep only rows whose (target_site, target_environment)
+    // are both within the principal's scope. An unrestricted principal keeps all
+    // (row_scope_permits is true when a scope axis is empty); a principal scoped on
+    // one axis keeps rows matching that axis and unrestricted on the other.
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|r| row_scope_permits(&session, &r.target_site, &r.target_environment))
+        .collect();
     Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
 }
 
 /// GET /api/protect/backup/restores/{id} — fetch a single restore request by id.
 /// Returns 404 when absent or when no DB is configured.
-async fn backup_restore_get(Path(id): Path<String>) -> ApiResult {
+async fn backup_restore_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(|| status_404(&id))?;
     let record = crate::repos::restore_requests::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2 dual-axis by-id read: out-of-scope 404s like a missing one (no oracle).
+    scope_guard_or_404(
+        &session,
+        &record.target_site,
+        &record.target_environment,
+        &id,
+    )?;
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -21670,13 +21833,20 @@ struct RestoreTestRecencyQuery {
 /// days, bounded). Systems with no restore request at all are out of scope (a
 /// coverage question — see coverage reports); the response carries a `scope` +
 /// `note` saying so. Read-only; empty + `durable:false` when no DB.
-async fn backup_restore_test_recency(Query(q): Query<RestoreTestRecencyQuery>) -> ApiResult {
+async fn backup_restore_test_recency(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<RestoreTestRecencyQuery>,
+) -> ApiResult {
     use ryuki_engine::backup_recency::{classify_restore_recency, RestoreTestRecency};
 
     let overdue_after_days = q.overdue_after_days.unwrap_or(90);
     if !(1..=3650).contains(&overdue_after_days) {
         return Err(status_400("overdue_after_days must be between 1 and 3650"));
     }
+    // #2: narrow the cross-site aggregate to the principal's scope (restore_requests
+    // are dual-axis, NOT NULL). A scoped principal that holds several distinct
+    // scopes with no way to disambiguate is 403'd (enforce_scope_filters contract).
+    let (f_site, f_env) = enforce_scope_filters(&session, None, None)?;
 
     // The report covers systems that HAVE restore-request history; a system that
     // never had a restore request at all is a backup-coverage gap, not a recency
@@ -21700,9 +21870,13 @@ async fn backup_restore_test_recency(Query(q): Query<RestoreTestRecencyQuery>) -
         })));
     };
 
-    let rows = crate::repos::restore_requests::restore_test_recency(pool)
-        .await
-        .map_err(db_error)?;
+    let rows = crate::repos::restore_requests::restore_test_recency(
+        pool,
+        f_site.as_deref(),
+        f_env.as_deref(),
+    )
+    .await
+    .map_err(db_error)?;
 
     let now_unix = chrono::Utc::now().timestamp();
     let overdue_after_secs = overdue_after_days * 86_400;
@@ -21747,24 +21921,39 @@ async fn backup_restore_test_recency(Query(q): Query<RestoreTestRecencyQuery>) -
 
 /// GET /api/protect/backup/coverage-reports — list all persisted coverage reports.
 /// Returns an empty array when no DB is available rather than an error.
-async fn backup_coverage_reports_list() -> ApiResult {
+async fn backup_coverage_reports_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let Some(pool) = get_db() else {
         return Ok(Json(serde_json::Value::Array(vec![])));
     };
     let records = crate::repos::backup_coverage_reports::list(pool)
         .await
         .map_err(db_error)?;
+    // #2: keep only reports whose (site_scope, environment_scope) footprint is
+    // contained in the principal's authority — an unrestricted principal keeps all;
+    // a scoped principal drops all-sites/all-envs and out-of-scope reports.
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|r| multi_scope_permits(&session, &r.site_scope, &r.environment_scope))
+        .collect();
     Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
 }
 
 /// GET /api/protect/backup/coverage-reports/{id} — fetch a single coverage report by id.
 /// Returns 404 when absent or when no DB is configured.
-async fn backup_coverage_report_get(Path(id): Path<String>) -> ApiResult {
+async fn backup_coverage_report_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(|| status_404(&id))?;
     let record = crate::repos::backup_coverage_reports::get(pool, &id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: a report whose footprint is not contained in the principal's scope 404s
+    // exactly like a missing one (no cross-scope existence oracle).
+    if !multi_scope_permits(&session, &record.site_scope, &record.environment_scope) {
+        return Err(status_404(&id));
+    }
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
@@ -22033,6 +22222,24 @@ fn site_scope_guard_or_404(
         Ok(())
     } else {
         Err(status_404(request_id))
+    }
+}
+
+/// Post-load by-id guard for a SITE-ONLY resource whose site is NULLABLE (NULL =
+/// platform-wide) (#2) — e.g. an on-call contact. A row tagged to a concrete site
+/// follows the normal site_scope_guard_or_404 rule; a platform-wide (NULL) row is
+/// accessible only to an UNRESTRICTED principal, because a scoped principal cannot
+/// contain an all-sites footprint, so it 404s. This is the single-axis analogue of
+/// the nullable dual-axis containment used for metric_budgets / slo.
+fn nullable_site_scope_guard_or_404(
+    session: &AuthSession,
+    site: Option<&str>,
+    request_id: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    match site {
+        Some(s) => site_scope_guard_or_404(session, s, request_id),
+        None if is_scoped(session) => Err(status_404(request_id)),
+        None => Ok(()),
     }
 }
 
@@ -38334,7 +38541,12 @@ mod db_lifecycle_tests {
         .expect("create");
         let id = created["id"].as_str().unwrap().to_string();
 
-        let Json(got) = on_call_contact_get(Path(id.clone())).await.expect("get");
+        let Json(got) = on_call_contact_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        .expect("get");
         assert_eq!(got["contact"]["name"], "Alice");
         assert_eq!(got["contact"]["escalation_tier"], 1);
 
@@ -38383,9 +38595,116 @@ mod db_lifecycle_tests {
             .expect("delete");
         assert_eq!(del["deleted"], true);
         assert!(
-            on_call_contact_get(Path(id.clone())).await.is_err(),
+            on_call_contact_get(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path(id.clone())
+            )
+            .await
+            .is_err(),
             "the contact is gone after delete"
         );
+    }
+
+    /// #2 RBAC: on_call_contacts have a NULLABLE site (NULL = platform-wide), no
+    /// environment axis. Strict containment: a scoped principal may only read/write
+    /// contacts tagged to a concrete in-scope site — another site's contact and a
+    /// platform-wide (NULL) contact both 404 (by-id) / 403 (create), and the list
+    /// drops both. An in-scope principal is unaffected.
+    #[tokio::test]
+    async fn on_call_contact_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let admin = || AuthExtractor(AuthSession::static_dry_run());
+        let mk = |site: Option<String>, name: &str| OnCallContactCreateRequest {
+            name: name.to_string(),
+            role: "SRE".to_string(),
+            site,
+            escalation_tier: Some(1),
+            email: Some("x@example.com".to_string()),
+            phone: None,
+        };
+        let defra =
+            on_call_contact_create(admin(), Json(mk(Some("DEFRA".into()), "Defra On-Call")))
+                .await
+                .expect("create DEFRA");
+        let defra_id = defra.0["id"].as_str().unwrap().to_string();
+        let global = on_call_contact_create(admin(), Json(mk(None, "Global On-Call")))
+            .await
+            .expect("create platform-wide");
+        let global_id = global.0["id"].as_str().unwrap().to_string();
+
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            AuthExtractor(s)
+        };
+
+        assert!(
+            matches!(
+                on_call_contact_get(scoped(), Path(defra_id.clone())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "scoped get of a DEFRA contact must 404"
+        );
+        assert!(
+            matches!(
+                on_call_contact_get(scoped(), Path(global_id.clone())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "scoped get of a platform-wide contact must 404"
+        );
+        assert!(
+            matches!(
+                on_call_contact_delete(scoped(), Path(defra_id.clone())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "scoped delete of a DEFRA contact must 404"
+        );
+        assert!(
+            matches!(
+                on_call_contact_create(scoped(), Json(mk(Some("DEFRA".into()), "x"))).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ),
+            "scoped create for DEFRA must 403"
+        );
+        assert!(
+            matches!(
+                on_call_contact_create(scoped(), Json(mk(None, "x"))).await,
+                Err((StatusCode::FORBIDDEN, _))
+            ),
+            "scoped create platform-wide must 403"
+        );
+
+        let listed = on_call_contact_list(scoped(), Query(OnCallListQuery::default()))
+            .await
+            .expect("list");
+        let names: Vec<String> = listed.0["contacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            !names.contains(&"Defra On-Call".to_string())
+                && !names.contains(&"Global On-Call".to_string()),
+            "scoped list must exclude foreign-site and platform-wide contacts: {names:?}"
+        );
+
+        let mut defra_sess = AuthSession::static_dry_run();
+        defra_sess.site_scope = vec!["DEFRA".into()];
+        assert!(
+            on_call_contact_get(AuthExtractor(defra_sess), Path(defra_id.clone()))
+                .await
+                .is_ok(),
+            "in-scope DEFRA get must succeed"
+        );
+
+        for id in [&defra_id, &global_id] {
+            on_call_contact_delete(admin(), Path(id.clone())).await.ok();
+        }
     }
 
     /// #25: an SLO over recorded good/total metrics reports its attainment and
@@ -42143,6 +42462,86 @@ mod db_lifecycle_tests {
             .ok();
     }
 
+    /// #2 RBAC: events_alert_ack matches the alert feed's visibility model
+    /// (domain_events::list_alerts) — a scoped principal may ack an alert tagged to
+    /// an in-scope site OR platform-wide (NULL site), but acking an alert tagged to
+    /// another site 404s like a missing event (no cross-site oracle).
+    #[tokio::test]
+    async fn events_alert_ack_is_scope_filtered() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let defra_tag = format!("ack-defra-{}", Uuid::new_v4());
+        let global_tag = format!("ack-global-{}", Uuid::new_v4());
+        let defra_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.reject",
+                aggregate_type: "request",
+                aggregate_id: &defra_tag,
+                site: Some("DEFRA"),
+                environment: None,
+                actor: "creator",
+                payload: json!({ "to_status": "rejected" }),
+            },
+        )
+        .await
+        .expect("insert DEFRA alert");
+        let global_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.reject",
+                aggregate_type: "request",
+                aggregate_id: &global_tag,
+                site: None,
+                environment: None,
+                actor: "creator",
+                payload: json!({ "to_status": "rejected" }),
+            },
+        )
+        .await
+        .expect("insert platform-wide alert");
+
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+
+        // Cross-site (DEFRA) alert → 404 for a GBLON-scoped principal.
+        let r = events_alert_ack(
+            AuthExtractor(scoped()),
+            Path(defra_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(r, Err((StatusCode::NOT_FOUND, _))),
+            "cross-site ack must 404: {r:?}"
+        );
+        // Platform-wide (NULL) alert → permitted (the feed shows it to scoped users).
+        let r = events_alert_ack(
+            AuthExtractor(scoped()),
+            Path(global_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            r.is_ok(),
+            "platform-wide ack must succeed for a scoped principal: {r:?}"
+        );
+
+        for id in [defra_id, global_id] {
+            sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
     /// #8: degradation status reads from the DB (migration 025 seed), not the
     /// in-memory engine — so it survives restart. The component_status rows fold
     /// into AdapterComponentStatus correctly. Non-mutating.
@@ -42833,6 +43232,74 @@ mod db_lifecycle_tests {
         .expect("fetch decision");
         assert_eq!(decision, "approved");
         assert_eq!(actor, "dc-approver-p2", "actor is the verified principal");
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// #2 RBAC: approvals_pending narrows the queue to the approver's site scope —
+    /// a GBLON-scoped approver does not see a DEFRA request awaiting approval, while
+    /// an unrestricted approver does.
+    #[tokio::test]
+    async fn approvals_pending_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Build a planned DEFRA request (create_body uses site DEFRA) as an
+        // unrestricted approver.
+        let mut admin = admin_session("approvals-scope-admin");
+        admin.roles = vec![
+            ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN.to_string(),
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER.to_string(),
+        ];
+        let Ok(Json(created)) = requests_create(
+            AuthExtractor(admin.clone()),
+            Json(create_body("server-deployment")),
+        )
+        .await
+        else {
+            panic!("create must succeed");
+        };
+        let id_str = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_str).expect("uuid");
+        let p = |s: &str| Path(s.to_string());
+        let _ = requests_validate(p(&id_str), AuthExtractor(admin.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(p(&id_str), AuthExtractor(admin.clone()))
+            .await
+            .expect("plan");
+
+        // Unrestricted approver sees the DEFRA request pending.
+        let Ok(Json(all)) = approvals_pending(AuthExtractor(admin.clone())).await else {
+            panic!("pending (all) must succeed");
+        };
+        let seen_all = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["request_id"] == json!(id_str));
+        assert!(
+            seen_all,
+            "an unrestricted approver must see the DEFRA request pending"
+        );
+
+        // A GBLON-scoped approver must NOT see the DEFRA request.
+        let mut gblon = admin.clone();
+        gblon.site_scope = vec!["GBLON".into()];
+        let Ok(Json(scoped)) = approvals_pending(AuthExtractor(gblon)).await else {
+            panic!("pending (scoped) must succeed");
+        };
+        let seen_scoped = scoped
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["request_id"] == json!(id_str));
+        assert!(
+            !seen_scoped,
+            "a GBLON-scoped approver must NOT see the DEFRA request"
+        );
 
         cleanup_request(pool, id).await;
     }
@@ -52343,16 +52810,22 @@ mod backup_recency_unit_tests {
 
     #[tokio::test]
     async fn recency_rejects_out_of_range_window() {
-        let err = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
-            overdue_after_days: Some(0),
-        }))
+        let err = backup_restore_test_recency(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RestoreTestRecencyQuery {
+                overdue_after_days: Some(0),
+            }),
+        )
         .await
         .expect_err("overdue_after_days=0 must be rejected");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
 
-        let err = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
-            overdue_after_days: Some(10_000),
-        }))
+        let err = backup_restore_test_recency(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RestoreTestRecencyQuery {
+                overdue_after_days: Some(10_000),
+            }),
+        )
         .await
         .expect_err("overdue_after_days=10000 must be rejected");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
@@ -52360,9 +52833,12 @@ mod backup_recency_unit_tests {
 
     #[tokio::test]
     async fn recency_without_db_reports_not_durable() {
-        let Ok(Json(body)) = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
-            overdue_after_days: None,
-        }))
+        let Ok(Json(body)) = backup_restore_test_recency(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RestoreTestRecencyQuery {
+                overdue_after_days: None,
+            }),
+        )
         .await
         else {
             panic!("no-DB recency should be 200, not an error");
@@ -52459,9 +52935,12 @@ mod backup_restore_db_tests {
             keys.push(key);
         }
 
-        let Ok(Json(body)) = backup_restore_test_recency(Query(RestoreTestRecencyQuery {
-            overdue_after_days: Some(90),
-        }))
+        let Ok(Json(body)) = backup_restore_test_recency(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(RestoreTestRecencyQuery {
+                overdue_after_days: Some(90),
+            }),
+        )
         .await
         else {
             panic!("recency handler failed");
@@ -52503,10 +52982,13 @@ mod backup_restore_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = backup_coverage_report(Json(CoverageReportRequest {
-            site_scope: vec!["GBLON".into()],
-            environment_scope: vec!["production".into()],
-        }))
+        let Ok(Json(created)) = backup_coverage_report(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(CoverageReportRequest {
+                site_scope: vec!["GBLON".into()],
+                environment_scope: vec!["production".into()],
+            }),
+        )
         .await
         else {
             panic!("backup_coverage_report handler failed");
@@ -52540,14 +53022,17 @@ mod backup_restore_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-db-test-001".into(),
-            restore_type: "full-vm".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "GBLON".into(),
-            target_environment: "production".into(),
-            owner: "db-test-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-db-test-001".into(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "production".into(),
+                owner: "db-test-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan handler failed");
@@ -52572,6 +53057,212 @@ mod backup_restore_db_tests {
         cleanup_restore(pool, &id).await;
     }
 
+    /// #2 RBAC: restore requests are DUAL-AXIS (target_site, target_environment). A
+    /// principal scoped to a different site cannot read, validate, approve, execute,
+    /// or list another scope's restore — by-id 404s (no oracle), plan 403s on a
+    /// foreign target, and the list hides it. An in-scope principal is unaffected.
+    #[tokio::test]
+    async fn backup_restore_is_dual_axis_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        // Plan a GBLON/production restore as an unrestricted admin.
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-scope-test-001".into(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "production".into(),
+                owner: "scope-test-owner".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("plan failed");
+        };
+        let id = created["id"].as_str().expect("id").to_string();
+
+        // A DEFRA-site-scoped principal (GBLON out of scope).
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["DEFRA".into()];
+            s
+        };
+        let act = || RestoreActionRequest {
+            restore_id: id.clone(),
+        };
+
+        assert!(
+            matches!(
+                backup_restore_get(AuthExtractor(scoped()), Path(id.clone())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "out-of-scope get must 404"
+        );
+        assert!(
+            matches!(
+                backup_restore_validate(AuthExtractor(scoped()), Json(act())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "out-of-scope validate must 404"
+        );
+        assert!(
+            matches!(
+                backup_restore_approve(Extension(scoped()), Json(act())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "out-of-scope approve must 404"
+        );
+        assert!(
+            matches!(
+                backup_restore_execute(AuthExtractor(scoped()), Json(act())).await,
+                Err((StatusCode::NOT_FOUND, _))
+            ),
+            "out-of-scope execute must 404"
+        );
+
+        // Planning a foreign-target restore is a 403 (body-supplied target).
+        let p = backup_restore_plan(
+            AuthExtractor(scoped()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-scope-test-002".into(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "production".into(),
+                owner: "scope-test-owner".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(p, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope plan must 403: {p:?}"
+        );
+
+        // The scoped list excludes the GBLON restore.
+        let listed = backup_restores_list(AuthExtractor(scoped()))
+            .await
+            .expect("list");
+        let ids: Vec<String> = listed
+            .0
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert!(
+            !ids.contains(&id),
+            "scoped list must exclude the GBLON restore: {ids:?}"
+        );
+
+        // Positive: a GBLON/production principal CAN read it.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        gblon.environment_scope = vec!["production".into()];
+        assert!(
+            backup_restore_get(AuthExtractor(gblon), Path(id.clone()))
+                .await
+                .is_ok(),
+            "in-scope GBLON/production get must succeed"
+        );
+
+        cleanup_restore(pool, &id).await;
+    }
+
+    /// #2 RBAC: backup coverage reports (multi-axis vectors) and the restore-test
+    /// recency aggregate are scope-contained. A scoped principal cannot generate a
+    /// report outside its scope, and the recency aggregate excludes out-of-scope
+    /// source_ci_keys.
+    #[tokio::test]
+    async fn backup_coverage_and_recency_are_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let gblon = || {
+            let mut s = AuthSession::static_dry_run();
+            s.site_scope = vec!["GBLON".into()];
+            s.environment_scope = vec!["production".into()];
+            s
+        };
+
+        // A GBLON/production principal cannot generate a DEFRA coverage report.
+        let denied = backup_coverage_report(
+            AuthExtractor(gblon()),
+            Json(CoverageReportRequest {
+                site_scope: vec!["DEFRA".into()],
+                environment_scope: vec!["production".into()],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope coverage report must 403: {denied:?}"
+        );
+        // ...but can generate a GBLON/production one.
+        let Ok(Json(created)) = backup_coverage_report(
+            AuthExtractor(gblon()),
+            Json(CoverageReportRequest {
+                site_scope: vec!["GBLON".into()],
+                environment_scope: vec!["production".into()],
+            }),
+        )
+        .await
+        else {
+            panic!("in-scope coverage report must succeed");
+        };
+        let rid = created["id"].as_str().expect("id").to_string();
+
+        // Seed a DEFRA restore; the GBLON principal's recency must exclude its ci_key.
+        let defra_ci = format!("ci-recency-defra-{}", uuid::Uuid::new_v4());
+        let _ = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: defra_ci.clone(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "DEFRA".into(),
+                target_environment: "production".into(),
+                owner: "o".into(),
+            }),
+        )
+        .await
+        .expect("seed DEFRA restore");
+
+        let Ok(Json(rec)) = backup_restore_test_recency(
+            AuthExtractor(gblon()),
+            Query(RestoreTestRecencyQuery {
+                overdue_after_days: None,
+            }),
+        )
+        .await
+        else {
+            panic!("recency must succeed");
+        };
+        let excluded = rec["systems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["source_ci_key"] != json!(defra_ci));
+        assert!(
+            excluded,
+            "a GBLON-scoped recency report must exclude the DEFRA ci_key"
+        );
+
+        cleanup_report(pool, &rid).await;
+        sqlx::query("DELETE FROM restore_requests WHERE source_ci_key = $1")
+            .bind(&defra_ci)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     /// restore approve transition: plan → approve → DB shows Approved + metadata.approver set.
     #[tokio::test]
     async fn test_restore_approve_transition() {
@@ -52582,14 +53273,17 @@ mod backup_restore_db_tests {
         };
 
         // Plan first.
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-approve-test".into(),
-            restore_type: "file-level".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "DEFRA".into(),
-            target_environment: "production".into(),
-            owner: "approve-test-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-approve-test".into(),
+                restore_type: "file-level".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "DEFRA".into(),
+                target_environment: "production".into(),
+                owner: "approve-test-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan handler failed");
@@ -52653,14 +53347,17 @@ mod backup_restore_db_tests {
         };
 
         // Plan then approve once.
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-double-approve".into(),
-            restore_type: "full-vm".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "GBLON".into(),
-            target_environment: "production".into(),
-            owner: "double-approve-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-double-approve".into(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "production".into(),
+                owner: "double-approve-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan handler failed");
@@ -52710,14 +53407,17 @@ mod backup_restore_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-execute-test".into(),
-            restore_type: "instant-vm-recovery".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "DEFRA".into(),
-            target_environment: "production".into(),
-            owner: "execute-test-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-execute-test".into(),
+                restore_type: "instant-vm-recovery".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "DEFRA".into(),
+                target_environment: "production".into(),
+                owner: "execute-test-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan failed");
@@ -52797,14 +53497,17 @@ mod backup_restore_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-no-approve-execute".into(),
-            restore_type: "full-vm".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "GBLON".into(),
-            target_environment: "production".into(),
-            owner: "no-approve-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-no-approve-execute".into(),
+                restore_type: "full-vm".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "production".into(),
+                owner: "no-approve-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan failed");
@@ -52840,14 +53543,17 @@ mod backup_restore_db_tests {
             return;
         };
 
-        let Ok(Json(created)) = backup_restore_plan(Json(RestorePlanRequest {
-            source_ci_key: "ci-cas-test".into(),
-            restore_type: "application-item".into(),
-            restore_point: "2026-06-10T02:00:00Z".into(),
-            target_site: "GBLON".into(),
-            target_environment: "staging".into(),
-            owner: "cas-test-owner".into(),
-        }))
+        let Ok(Json(created)) = backup_restore_plan(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(RestorePlanRequest {
+                source_ci_key: "ci-cas-test".into(),
+                restore_type: "application-item".into(),
+                restore_point: "2026-06-10T02:00:00Z".into(),
+                target_site: "GBLON".into(),
+                target_environment: "staging".into(),
+                owner: "cas-test-owner".into(),
+            }),
+        )
         .await
         else {
             panic!("backup_restore_plan failed");

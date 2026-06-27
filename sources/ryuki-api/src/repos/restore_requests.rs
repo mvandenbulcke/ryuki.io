@@ -249,7 +249,12 @@ pub struct RestoreTestRecencyRow {
 /// coverage question, not a recency one).
 pub async fn restore_test_recency(
     pool: &PgPool,
+    site: Option<&str>,
+    environment: Option<&str>,
 ) -> Result<Vec<RestoreTestRecencyRow>, sqlx::Error> {
+    // #2: scope the aggregate to the caller's site/environment BEFORE grouping, so
+    // a scoped principal never learns source_ci_key / recency for rows outside its
+    // scope. A NULL bind = no filter on that axis (an unrestricted principal).
     sqlx::query_as(
         "SELECT source_ci_key, \
                 max(updated_at) FILTER (WHERE status IN ('Verified', 'Completed')) \
@@ -258,10 +263,14 @@ pub async fn restore_test_recency(
                     AS successful_test_count, \
                 count(*) AS total_requests \
          FROM restore_requests \
+         WHERE ($1::text IS NULL OR target_site = $1) \
+           AND ($2::text IS NULL OR target_environment = $2) \
          GROUP BY source_ci_key \
          ORDER BY max(updated_at) FILTER (WHERE status IN ('Verified', 'Completed')) \
                   ASC NULLS FIRST, source_ci_key ASC",
     )
+    .bind(site)
+    .bind(environment)
     .fetch_all(pool)
     .await
 }
