@@ -376,6 +376,10 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** database schema / persistence · **kind:** dead-code-or-drift · **severity:** medium · **effort:** M · **ci_validatable:** True
 - **evidence:** Migration 025_degradation_mode.sql creates site_status and component_status with full seed data (3 sites × 13 adapters = 39 rows). Zero references to FROM/UPDATE/INSERT site_status or component_status in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src. Engine degradation_mode.rs (line 179) calls seed_sites() and seed component statuses in memory only, never reads the DB. Tables are seeded once, never touched again. Durable but unused persistence.
 - **verified:** The gap is verified as real: Migration 025_degradation_mode.sql creates site_status and component_status tables with 39 seeded rows and 3 indexes, but no SQL queries anywhere in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src or the engine ever SELECT/UPDATE/INSERT/DELETE from these tables. The degradation_mode.rs module uses only in-memory seed_sites() function, rebuilding data fresh on each call. The API handlers at /api/platform/degradation/* are routed to pure functions that never touch the database. The tables exist as orphaned persistence, durable but completely unmaintained at
+- **STATUS (2026-06-27) — CLOSED by swarm #8 (`af46a7d`):** `repos/degradation.rs`
+  now SELECTs `site_status`/`component_status` (list/get) and UPDATEs them
+  (enter/exit); the degradation read handlers query the DB so state survives
+  restart. The tables are no longer dead persistence. Duplicate of #8.
 
 ### 26. Scheduler tick can exceed interval without backpressure; no per-tick timeout
 - **area:** ryuki-api/src/scheduler.rs (spawn_scheduler, lines 278-295) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** True
@@ -434,6 +438,13 @@ FINDINGS:
 - **area:** ryuki-api/src/contracts.rs (admin_tokens_revoke, line 11752) · **kind:** missing-feature · **severity:** low · **effort:** S · **ci_validatable:** True
 - **evidence:** admin_tokens_revoke(Path(id), AuthExtractor) does not emit an audit log. Revoking an API token is a sensitive administrative action that affects access control, but it is not recorded in the audit trail. The handler should log: actor, action, token_id, token_name, and timestamp.
 - **verified:** REAL GAP: Admin operations (token revocation at /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/contracts.rs:11752-11790, token creation at 11568-11699, session revocation at 11845-11878, platform settings updates at 11432-11462 and 11465-11479) only log via tracing::info() but do NOT call audit::record_audit() or audit::record_audit_local(). The audit_log table (migration 046) explicitly supports non-request audit (request_id is nullable with comment "nullable: non-request audit later"), and the hash-chain infrastructure (migration 094) is in place. The missing-features.md design do
+- **STATUS (2026-06-27) — CLOSED by swarm #5 (`03e532d`):** `admin_tokens_create`,
+  `admin_tokens_revoke`, and the session-revoke handler now write durable
+  hash-chained audit rows (actions `api-token-create`, `api-token-revoke`,
+  `session-revoke`) atomically with the mutation, covered by
+  `test_token_create_and_revoke_write_audit_log`. Duplicate of #5. (Note: #21 —
+  emitting these as portal NOTIFICATIONS — remains open; #5 deferred
+  security-event notifications.)
 
 ### 36. Unused/dead-code table: monitoring_review_queue (API-only contract)
 - **area:** database schema / persistence · **kind:** dead-code-or-drift · **severity:** low · **effort:** S · **ci_validatable:** True
