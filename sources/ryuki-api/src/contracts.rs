@@ -37171,11 +37171,18 @@ mod db_lifecycle_tests {
             "platform-wide (NULL-site) events must stay visible to a scoped principal"
         );
 
-        sqlx::query("DELETE FROM domain_events WHERE aggregate_id = $1")
+        // #11: the stream is append-only (migration 111) — a DELETE must be
+        // rejected by the guard trigger, never silently succeed. (No cleanup:
+        // events use a unique aggregate_id per run, so they don't accumulate
+        // into the assertions.)
+        let delete_attempt = sqlx::query("DELETE FROM domain_events WHERE aggregate_id = $1")
             .bind(&agg)
             .execute(pool)
-            .await
-            .ok();
+            .await;
+        assert!(
+            delete_attempt.is_err(),
+            "domain_events must be append-only: a DELETE must be rejected"
+        );
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the
