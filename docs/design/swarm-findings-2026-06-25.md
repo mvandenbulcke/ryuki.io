@@ -475,7 +475,15 @@ FINDINGS:
 ### 38. Missing GET-by-id endpoint for browser sessions
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** low · **effort:** S · **ci_validatable:** True
 - **evidence:** Line 1320 defines GET /api/admin/sessions (list) and DELETE /api/admin/sessions/{id} (revoke). No GET /api/admin/sessions/{id} endpoint. Handlers: admin_sessions_list (10403 — returns all sessions), admin_sessions_revoke (11856). Operator cannot retrieve a single session record for inspection—violates REST conventions.
-- **verified:** Code verification shows: (1) routes.rs line 1319-1320 define GET /api/admin/sessions (list) and DELETE /api/admin/sessions/{id} (revoke), but no GET {id}; (2) handler admin_sessions_list exists at line 11804 returning 7 fields per session; admin_sessions_revoke exists at 11845; no admin_sessions_get handler; (3) SessionListRow struct (11793) is defined with all needed columns; (4) parallel REST resources (alert-routes, sites) have GET-by-id endpoints showing this is the codebase's standard pattern; (5) untracked in missing-features-tracker.md. This is a genuine, concrete REST completeness gap 
+- **verified:** Code verification shows: (1) routes.rs line 1319-1320 define GET /api/admin/sessions (list) and DELETE /api/admin/sessions/{id} (revoke), but no GET {id}; (2) handler admin_sessions_list exists at line 11804 returning 7 fields per session; admin_sessions_revoke exists at 11845; no admin_sessions_get handler; (3) SessionListRow struct (11793) is defined with all needed columns; (4) parallel REST resources (alert-routes, sites) have GET-by-id endpoints showing this is the codebase's standard pattern; (5) untracked in missing-features-tracker.md. This is a genuine, concrete REST completeness gap
+- **STATUS (2026-06-27) — COMPLETE:** new `GET /api/admin/sessions/{id}` →
+  `admin_sessions_get` (admin-gated via `require_admin_permission`, reuses the
+  existing `SessionListRow` projection). Registered on the existing `/{id}`
+  route alongside the DELETE (`get(admin_sessions_get).delete(admin_sessions_revoke)`
+  — merged to avoid a duplicate-path panic; all 20 router-build tests pass).
+  Returns the row regardless of expiry (so an operator can inspect an expired
+  session too; `expires_at` reports state), 404 unknown, 503 no DB. DB test
+  `test_admin_sessions_get_returns_session_or_404` covers both paths. 
 
 ### 39. Missing GET-by-id endpoint for AD computers
 - **area:** sources/ryuki-api/src/contracts.rs · **kind:** missing-feature · **severity:** low · **effort:** S · **ci_validatable:** True

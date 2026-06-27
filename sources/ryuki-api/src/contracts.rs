@@ -1321,7 +1321,10 @@ pub fn routes() -> Router {
         .route("/api/admin/tokens", get(admin_tokens_list))
         .route("/api/admin/tokens/{id}", delete(admin_tokens_revoke))
         .route("/api/admin/sessions", get(admin_sessions_list))
-        .route("/api/admin/sessions/{id}", delete(admin_sessions_revoke))
+        .route(
+            "/api/admin/sessions/{id}",
+            get(admin_sessions_get).delete(admin_sessions_revoke),
+        )
         .route(
             "/api/analytics/cost-capacity-contract",
             get(analytics_cost_capacity),
@@ -12849,6 +12852,48 @@ async fn admin_sessions_list(
         .collect();
 
     Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// GET /api/admin/sessions/{id} — fetch a single browser session by id for
+/// inspection (#38). Unlike the list (which shows only active sessions), this
+/// returns the row regardless of expiry so an operator can also inspect an
+/// expired session; `expires_at` reports its state. 404 when absent, 503 no DB.
+async fn admin_sessions_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+
+    let row: Option<SessionListRow> = map_api_token_result(
+        sqlx::query_as::<_, SessionListRow>(
+            "SELECT id, user_id, display_name, roles, provider, created_at, expires_at \
+             FROM sessions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await,
+        "get-session",
+    )?;
+
+    match row {
+        Some(row) => Ok(Json(json!({
+            "id": row.id,
+            "user_id": row.user_id,
+            "display_name": row.display_name,
+            "roles": row.roles,
+            "provider": row.provider,
+            "created_at": row.created_at,
+            "expires_at": row.expires_at,
+        }))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new("NOT_FOUND", "No session with that id")),
+        )),
+    }
 }
 
 /// DELETE /api/admin/sessions/{id} — admin revoke of ANY session (closes the
@@ -35877,6 +35922,57 @@ mod db_lifecycle_tests {
             detail.contains(subject),
             "audit detail must name the subject whose session was revoked"
         );
+    }
+
+    /// #38: GET /api/admin/sessions/{id} returns a single session by id (200
+    /// with the projected fields) and 404s an unknown id.
+    #[tokio::test]
+    async fn test_admin_sessions_get_returns_session_or_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let sid = Uuid::new_v4();
+        let subject = "dbtest-getsess-9f2";
+        sqlx::query(
+            "INSERT INTO sessions (id, user_id, display_name, roles, provider, expires_at) \
+             VALUES ($1, $2, $3, $4, 'local', now() + interval '1 hour')",
+        )
+        .bind(sid)
+        .bind(subject)
+        .bind(format!("{subject} (test)"))
+        .bind(vec!["viewer".to_string()])
+        .execute(pool)
+        .await
+        .expect("seed session");
+
+        let got = admin_sessions_get(
+            AuthExtractor(admin_session("dbtest-admin-getsess-1a4")),
+            Path(sid),
+        )
+        .await
+        .expect("an existing session must be returned");
+        assert_eq!(got.0["id"], json!(sid));
+        assert_eq!(got.0["user_id"], json!(subject));
+        assert_eq!(got.0["provider"], json!("local"));
+
+        let missing = admin_sessions_get(
+            AuthExtractor(admin_session("dbtest-admin-getsess-1a4")),
+            Path(Uuid::new_v4()),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown id must 404: {missing:?}"
+        );
+
+        // Sessions are ephemeral; clean up the seeded row.
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(sid)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #6 config-mutation audit gap: updating platform settings must write a
