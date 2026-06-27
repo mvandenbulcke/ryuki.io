@@ -6356,12 +6356,88 @@ struct EmergencySiteQuery {
 
 // ─── Emergency Change (Break-Glass) handlers ───
 
+/// By-id scope guard for the `ProblemDetails`-returning emergency-change handlers
+/// (#2). Out-of-scope maps to the SAME 404 "Emergency change {id} not found" the
+/// handlers use for a missing row, so there is no existence oracle. Used where the
+/// row (and its site) is already in hand.
+fn emergency_scope_guard(
+    session: &AuthSession,
+    site: &str,
+    id: &str,
+    code: &str,
+) -> Result<(), ProblemDetails> {
+    if row_scope_permits(session, site, "") {
+        Ok(())
+    } else {
+        Err(problem_details(
+            StatusCode::NOT_FOUND,
+            code,
+            format!("Emergency change {id} not found"),
+            None::<&str>,
+        ))
+    }
+}
+
+/// Pre-load an emergency change's site and apply the scope guard before a CAS
+/// UPDATE that has no row in hand (#2). Skips the extra read for unrestricted
+/// principals; an out-of-scope OR absent row yields the canonical 404 so the CAS
+/// path is never an existence oracle.
+async fn emergency_scope_preload_guard(
+    pool: &sqlx::PgPool,
+    session: &AuthSession,
+    id: &str,
+    code: &str,
+) -> Result<(), ProblemDetails> {
+    if !is_scoped(session) {
+        return Ok(());
+    }
+    let site: Option<String> =
+        sqlx::query_scalar("SELECT site FROM emergency_changes WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "emergency change scope pre-load DB error");
+                problem_details(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    code,
+                    "database error",
+                    None::<&str>,
+                )
+            })?;
+    match site {
+        Some(s) if row_scope_permits(session, &s, "") => Ok(()),
+        _ => Err(problem_details(
+            StatusCode::NOT_FOUND,
+            code,
+            format!("Emergency change {id} not found"),
+            None::<&str>,
+        )),
+    }
+}
+
 async fn emergency_initiate(
     Extension(session): Extension<AuthSession>,
     Json(body): Json<EmergencyInitiateRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
     // Initiator = authenticated caller (from request extensions), never a
     // client body field — break-glass audit must name the real principal.
+    // #2: scoped principals may only initiate in their own site; env-scoped
+    // principals are rejected (emergency_changes is site-only). Applied before
+    // both the DB and no-DB paths.
+    if session
+        .environment_scope
+        .iter()
+        .any(|s| !s.trim().is_empty())
+        || !ryuki_engine::auth::scope_permits(&session.site_scope, Some(&body.site))
+    {
+        return Err(problem_details(
+            StatusCode::FORBIDDEN,
+            "EMERGENCY_INITIATE_FAILED",
+            "site is outside your authorized scope",
+            None::<&str>,
+        ));
+    }
     if let Some(pool) = get_db() {
         if body.description.is_empty() || body.reason.is_empty() || body.site.is_empty() {
             return Err(problem_details(
@@ -6429,6 +6505,8 @@ async fn emergency_approve(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
+        // #2: out-of-scope (or absent) -> the canonical 404 before the CAS.
+        emergency_scope_preload_guard(pool, &session, &id, "EMERGENCY_APPROVE_FAILED").await?;
         let now = chrono::Utc::now();
         let approved_by = "EMERGENCY — auto-approved per break-glass policy";
         let audit_entry = format!("EMERGENCY flag — auto-approved at {}", now.to_rfc3339());
@@ -6526,6 +6604,16 @@ async fn emergency_approve(
             )),
         };
     }
+    // #2: the no-DB fallback uses a process-local store with no site dimension; a
+    // scoped principal fails closed rather than act on a cross-site change.
+    if is_scoped(&session) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EMERGENCY_APPROVE_FAILED",
+            "scoped access requires the database",
+            None::<&str>,
+        ));
+    }
     match emergency_change::auto_approve(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -6569,6 +6657,8 @@ async fn emergency_execute(
                 None::<&str>,
             ));
         };
+        // #2: out-of-scope -> 404 (same as not-found) before the status-409 leak.
+        emergency_scope_guard(&session, &row.site, &id, "EMERGENCY_EXECUTE_FAILED")?;
         if row.status != "Approved" {
             return Err(problem_details(
                 StatusCode::CONFLICT,
@@ -6671,6 +6761,15 @@ async fn emergency_execute(
             None::<&str>,
         ));
     }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EMERGENCY_EXECUTE_FAILED",
+            "scoped access requires the database",
+            None::<&str>,
+        ));
+    }
     match emergency_change::execute_emergency(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -6687,6 +6786,8 @@ async fn emergency_verify(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
+        // #2: out-of-scope (or absent) -> the canonical 404 before the CAS.
+        emergency_scope_preload_guard(pool, &session, &id, "EMERGENCY_VERIFY_FAILED").await?;
         let now = chrono::Utc::now();
         let verify_entry = format!(
             "[REDACTED] Post-execution verification passed at {}",
@@ -6793,6 +6894,15 @@ async fn emergency_verify(
             )),
         };
     }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EMERGENCY_VERIFY_FAILED",
+            "scoped access requires the database",
+            None::<&str>,
+        ));
+    }
     match emergency_change::verify_emergency(&id) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -6810,6 +6920,8 @@ async fn emergency_close(
     Json(body): Json<EmergencyCloseRequest>,
 ) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
+        // #2: out-of-scope (or absent) -> the canonical 404 before the CAS.
+        emergency_scope_preload_guard(pool, &session, &id, "EMERGENCY_CLOSE_FAILED").await?;
         let now = chrono::Utc::now();
         let postmortem_entry = format!("Post-mortem review completed at {}", now.to_rfc3339());
         // Atomic conditional UPDATE: only transitions Verified → Closed.
@@ -6909,6 +7021,15 @@ async fn emergency_close(
             )),
         };
     }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EMERGENCY_CLOSE_FAILED",
+            "scoped access requires the database",
+            None::<&str>,
+        ));
+    }
     match emergency_change::close_emergency(&id, &body.post_review_notes) {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err(problem_details(
@@ -6920,7 +7041,9 @@ async fn emergency_close(
     }
 }
 
-async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
+async fn emergency_active(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, ProblemDetails> {
     if let Some(pool) = get_db() {
         let rows: Vec<EmergencyChangeRow> = sqlx::query_as(&format!(
             "SELECT {EMERGENCY_CHANGE_COLUMNS} FROM emergency_changes \
@@ -6930,6 +7053,8 @@ async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
         .await
         .unwrap_or_default();
 
+        // #2: a scoped principal only sees its own site's changes (env-scoped -> none).
+        let rows = retain_site_scoped(&session, rows, |r| r.site.as_str());
         let emergencies: Vec<Value> = rows
             .iter()
             .map(|r| {
@@ -6956,6 +7081,15 @@ async fn emergency_active() -> Result<Json<Value>, ProblemDetails> {
             "emergencies": emergencies,
             "dry_run": true,
         })));
+    }
+    // #2: no-DB fallback can't enforce site scope on the static store.
+    if is_scoped(&session) {
+        return Err(problem_details(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "EMERGENCY_ACTIVE_FAILED",
+            "scoped access requires the database",
+            None::<&str>,
+        ));
     }
     match emergency_change::get_active_emergencies() {
         Ok(v) => Ok(Json(v)),
@@ -38476,6 +38610,89 @@ mod db_lifecycle_tests {
         );
     }
 
+    /// #2 RBAC: the emergency-change (break-glass) handlers are site-scoped and
+    /// return ProblemDetails. A GBLON principal gets 404 approving/executing a
+    /// DEFRA change (no existence/status oracle), 403 initiating in DEFRA, and a
+    /// scope-filtered active list; an unrestricted principal passes the scope gate
+    /// (then hits the state machine). Uses migration-036 seeds (…0001 DEFRA,
+    /// …0002 GBLON, …0003 DEFRA/Approved).
+    #[tokio::test]
+    async fn emergency_changes_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra_approved = "d0000100-1000-1000-1000-000000000003"; // DEFRA, Approved
+        let gblon_id = "d0000100-1000-1000-1000-000000000002"; // GBLON
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // approve/execute a DEFRA change -> 404 (out-of-scope, before any mutation
+        // or status-409 leak).
+        let approve = emergency_approve(
+            AuthExtractor(gblon.clone()),
+            Path(defra_approved.to_string()),
+        )
+        .await;
+        assert!(
+            matches!(approve, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope emergency_approve must 404: {approve:?}"
+        );
+        let execute = emergency_execute(
+            AuthExtractor(gblon.clone()),
+            Path(defra_approved.to_string()),
+        )
+        .await;
+        assert!(
+            matches!(execute, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope emergency_execute must 404: {execute:?}"
+        );
+
+        // initiate in a foreign site -> 403 (no INSERT).
+        let initiate = emergency_initiate(
+            Extension(gblon.clone()),
+            Json(EmergencyInitiateRequest {
+                description: "x".into(),
+                systems: vec!["srv".into()],
+                reason: "y".into(),
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(initiate, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope emergency_initiate must be forbidden: {initiate:?}"
+        );
+
+        // active list is scope-filtered: contains the GBLON change, not the DEFRA ones.
+        let active = emergency_active(AuthExtractor(gblon)).await;
+        let active_json = match active {
+            Ok(Json(v)) => v.to_string(),
+            other => panic!("emergency_active must succeed: {other:?}"),
+        };
+        assert!(
+            active_json.contains(gblon_id),
+            "scoped active list must include the in-scope GBLON change"
+        );
+        assert!(
+            !active_json.contains(defra_approved),
+            "scoped active list must exclude out-of-scope DEFRA changes"
+        );
+
+        // Unrestricted approve passes the scope gate (then fails on state, not 404).
+        let any = emergency_approve(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra_approved.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted emergency_approve must pass the scope gate (state 409, not 404): {any:?}"
+        );
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -43216,7 +43433,8 @@ mod emergency_change_unit_tests {
             eprintln!("SKIP test_active_fallback_no_db: running in DB mode");
             return;
         }
-        let Ok(Json(body)) = emergency_active().await else {
+        let Ok(Json(body)) = emergency_active(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             panic!("expected Ok");
         };
         assert_eq!(body["source"], "dry-run");
@@ -44730,7 +44948,8 @@ mod emergency_change_db_tests {
         let id = "e0000360-0000-0000-0000-000000000007";
         seed_change(pool, id, "Approved", "GBLON").await;
 
-        let Ok(Json(body)) = emergency_active().await else {
+        let Ok(Json(body)) = emergency_active(AuthExtractor(AuthSession::static_dry_run())).await
+        else {
             panic!("expected Ok");
         };
         assert_eq!(body["source"], "database");
