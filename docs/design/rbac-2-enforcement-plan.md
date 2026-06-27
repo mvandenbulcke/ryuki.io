@@ -17,6 +17,7 @@
 - [x] **managed secrets** — `3325fb8` (site-only; 7 handlers incl. rotation_history the audit missed; re-home guard on update; rotation_fail scopes via parent secret_id; no-DB fail-closed 503; codex caught a cross-site vault_path leak in due/expiring no-DB fallbacks, fixed)
 - [x] **sql deployments** — `df32e33` (site-only; 6 of 8 handlers (validate is pure, inventory pre-scoped); plan body-guard + install/configure/verify/backup/monitoring by-id guard before state-409; standard status_404 so no oracle; codex APPROVED first pass)
 - [x] **file shares** — `3ecfec9` (site-only; 5 of 8 (list/recert-due/stale-owners pre-scoped, contract static); by-id reads + recertify CAS + ACL open-access/report/revoke all load+guard the parent share before child ACL access; codex APPROVED first pass)
+- [x] **site degradation** — `8bafeb6` (site_status keyed by site; 5 of 7 (rules/contract pure); check/enter/exit guard the Path-site before both DB+in-memory; global/degraded retain on DB + fail-closed fallback; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -160,11 +161,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **shares_revoke** [high] `sources/ryuki-api/src/contracts.rs:4834` — In shares_revoke (contracts.rs:4834), after obtaining `pool` (line 4838) and before the revoke_permission DELETE (line 4840), load the parent share and guard by its site: `let shar
 
 ## degradation  (5)
-- [ ] **degradation_enter** [high] `sources/ryuki-api/src/contracts.rs:7507` — Add a site-scope write guard at the top of degradation_enter (contracts.rs:7507), BEFORE pool.begin()/the repos::degradation::enter DB write. The (site,env) source is Path(site) ch
-- [ ] **degradation_exit** [high] `sources/ryuki-api/src/contracts.rs:7537` — Add `guard_body_site_scope(&session, &site)?;` (helper defined at contracts.rs:21033) as the FIRST statement in degradation_exit, before `if let Some(pool) = get_db()` (i.e. right 
-- [ ] **degradation_check** [medium] `sources/ryuki-api/src/contracts.rs:7451` — Add AuthExtractor to the handler and a by-id scope guard before returning. Change signature to `async fn degradation_check(AuthExtractor(session): AuthExtractor, Path(site): Path<S
-- [ ] **degradation_global** [medium] `sources/ryuki-api/src/contracts.rs:7467` — Add `AuthExtractor(session): AuthExtractor` to degradation_global's signature, then before aggregating filter the loaded Vec<SiteStatus> to the principal's scope: `let scoped = ret
-- [ ] **degradation_degraded** [medium] `sources/ryuki-api/src/contracts.rs:7484` — 1) Add `AuthExtractor(session): AuthExtractor` as the first handler parameter: `async fn degradation_degraded(AuthExtractor(session): AuthExtractor) -> Json<Value>`. 2) Scope the r
+- [x] **degradation_enter** [high] `sources/ryuki-api/src/contracts.rs:7507` — Add a site-scope write guard at the top of degradation_enter (contracts.rs:7507), BEFORE pool.begin()/the repos::degradation::enter DB write. The (site,env) source is Path(site) ch
+- [x] **degradation_exit** [high] `sources/ryuki-api/src/contracts.rs:7537` — Add `guard_body_site_scope(&session, &site)?;` (helper defined at contracts.rs:21033) as the FIRST statement in degradation_exit, before `if let Some(pool) = get_db()` (i.e. right 
+- [x] **degradation_check** [medium] `sources/ryuki-api/src/contracts.rs:7451` — Add AuthExtractor to the handler and a by-id scope guard before returning. Change signature to `async fn degradation_check(AuthExtractor(session): AuthExtractor, Path(site): Path<S
+- [x] **degradation_global** [medium] `sources/ryuki-api/src/contracts.rs:7467` — Add `AuthExtractor(session): AuthExtractor` to degradation_global's signature, then before aggregating filter the loaded Vec<SiteStatus> to the principal's scope: `let scoped = ret
+- [x] **degradation_degraded** [medium] `sources/ryuki-api/src/contracts.rs:7484` — 1) Add `AuthExtractor(session): AuthExtractor` as the first handler parameter: `async fn degradation_degraded(AuthExtractor(session): AuthExtractor) -> Json<Value>`. 2) Scope the r
 
 ## maintenance  (5)
 - [ ] **maintenance_calendar_conflicts** [high] `sources/ryuki-api/src/contracts.rs:7873` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param and change the return type to ApiResult. Before the DB read, replace direct binding of the caller-supplied 
