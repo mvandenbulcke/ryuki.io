@@ -15,6 +15,7 @@
 - [x] **legal holds** — `eeaddac` (site-only; all 7; per-handler oracle-safe not-found codes (400/404/409); +is_scoped helper; no-DB fallbacks fail closed 503 for scoped; codex caught a body-oracle + a 6-handler no-DB bypass class, all fixed)
 - [x] **emergency changes** — `b9655e4` (site-only break-glass; all 6; ProblemDetails guards emergency_scope_guard/_preload_guard; per-action 404; guard before status-409; no-DB fail-closed 503; emergency_history pre-scoped; codex APPROVED first pass)
 - [x] **managed secrets** — `3325fb8` (site-only; 7 handlers incl. rotation_history the audit missed; re-home guard on update; rotation_fail scopes via parent secret_id; no-DB fail-closed 503; codex caught a cross-site vault_path leak in due/expiring no-DB fallbacks, fixed)
+- [x] **sql deployments** — `df32e33` (site-only; 6 of 8 handlers (validate is pure, inventory pre-scoped); plan body-guard + install/configure/verify/backup/monitoring by-id guard before state-409; standard status_404 so no oracle; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -143,12 +144,12 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **secrets_rotation_fail** [high] `sources/ryuki-api/src/contracts.rs:30381` — In secrets_rotation_fail (contracts.rs:30381), after loading `run`/`failed` and BEFORE opening the tx (before L30407), load the parent secret's site from managed_secrets and guard 
 
 ## sql_deploy  (6)
-- [ ] **sql_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:31177` — Add the canonical site-only body guard as the FIRST statement of sql_deploy_plan, before get_db()/plan_deployment/insert: `guard_body_site_scope(&session, &body.site)?;` at contrac
-- [ ] **sql_deploy_install** [high] `sources/ryuki-api/src/contracts.rs:31263` — In sql_deploy_install, insert a scope guard immediately after the deployment is loaded — between `.ok_or_else(|| status_404(&id))?` (contracts.rs:31271) and the guard_install call 
-- [ ] **sql_deploy_configure** [high] `sources/ryuki-api/src/contracts.rs:31306` — After loading the deployment at contracts.rs:31314 and BEFORE the transition at :31317, insert: `scope_guard_or_404(&session, &deployment.site, "", &id)?;`. (site,env) source = the
-- [ ] **sql_deploy_verify** [high] `sources/ryuki-api/src/contracts.rs:31349` — In sql_deploy_verify, immediately after the deployment is loaded (after contracts.rs:31357 `.ok_or_else(|| status_404(&id))?`) and BEFORE guard_verify / the transaction, insert: `s
-- [ ] **sql_deploy_backup** [high] `sources/ryuki-api/src/contracts.rs:31392` — Insert a by-id scope guard immediately after the deployment is loaded and before guard_backup, at contracts.rs:31401:      scope_guard_or_404(&session, &deployment.site, "", &id)?;
-- [ ] **sql_deploy_monitoring** [high] `sources/ryuki-api/src/contracts.rs:31435` — Add `AuthExtractor(session): AuthExtractor,` as the first extractor in the sql_deploy_monitoring signature (mirroring sql_deploy_install at contracts.rs:31264). Then, immediately a
+- [x] **sql_deploy_plan** [high] `sources/ryuki-api/src/contracts.rs:31177` — Add the canonical site-only body guard as the FIRST statement of sql_deploy_plan, before get_db()/plan_deployment/insert: `guard_body_site_scope(&session, &body.site)?;` at contrac
+- [x] **sql_deploy_install** [high] `sources/ryuki-api/src/contracts.rs:31263` — In sql_deploy_install, insert a scope guard immediately after the deployment is loaded — between `.ok_or_else(|| status_404(&id))?` (contracts.rs:31271) and the guard_install call 
+- [x] **sql_deploy_configure** [high] `sources/ryuki-api/src/contracts.rs:31306` — After loading the deployment at contracts.rs:31314 and BEFORE the transition at :31317, insert: `scope_guard_or_404(&session, &deployment.site, "", &id)?;`. (site,env) source = the
+- [x] **sql_deploy_verify** [high] `sources/ryuki-api/src/contracts.rs:31349` — In sql_deploy_verify, immediately after the deployment is loaded (after contracts.rs:31357 `.ok_or_else(|| status_404(&id))?`) and BEFORE guard_verify / the transaction, insert: `s
+- [x] **sql_deploy_backup** [high] `sources/ryuki-api/src/contracts.rs:31392` — Insert a by-id scope guard immediately after the deployment is loaded and before guard_backup, at contracts.rs:31401:      scope_guard_or_404(&session, &deployment.site, "", &id)?;
+- [x] **sql_deploy_monitoring** [high] `sources/ryuki-api/src/contracts.rs:31435` — Add `AuthExtractor(session): AuthExtractor,` as the first extractor in the sql_deploy_monitoring signature (mirroring sql_deploy_install at contracts.rs:31264). Then, immediately a
 
 ## shares  (5)
 - [ ] **shares_get** [high] `sources/ryuki-api/src/contracts.rs:4718` — Add `AuthExtractor(session): AuthExtractor` as the first handler parameter (the route is GET so the extractor composes fine), then guard after loading the share but before loading 
