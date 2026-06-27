@@ -390,3 +390,36 @@ pub async fn disable_all_for_hostname(
 
     disabled.into_iter().map(|r| r.into_model()).collect()
 }
+
+/// Disable log forwarding for a hostname, confined to a set of sites (#2 site
+/// scope). Same advisory-locked, atomic, idempotent semantics as
+/// [`disable_all_for_hostname`], but the UPDATE only touches rows whose `site`
+/// is in `sites` — so a site-scoped principal can never disable another site's
+/// forwarders. The handler derives `sites` from the rows it is actually
+/// permitted to see, so an unrestricted principal still uses the unfiltered
+/// path above.
+pub async fn disable_for_hostname_in_sites(
+    conn: &mut sqlx::PgConnection,
+    hostname: &str,
+    sites: &[String],
+) -> Result<Vec<LogSource>, sqlx::Error> {
+    // Serialize against concurrent onboard/disable for this hostname.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("log_forwarders:{hostname}"))
+        .execute(&mut *conn)
+        .await?;
+
+    let not_configured = status_str(&ForwardingStatus::NotConfigured);
+    let disabled: Vec<LogForwarderRow> = sqlx::query_as(&format!(
+        "UPDATE log_forwarders SET status = $2, updated_at = NOW() \
+         WHERE hostname = $1 AND status <> $2 AND site = ANY($3) \
+         RETURNING {COLUMNS}"
+    ))
+    .bind(hostname)
+    .bind(not_configured)
+    .bind(sites)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    disabled.into_iter().map(|r| r.into_model()).collect()
+}

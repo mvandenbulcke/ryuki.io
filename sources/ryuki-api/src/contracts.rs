@@ -10561,6 +10561,10 @@ async fn logs_onboard(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
 
+    // #2: scoped principals may only onboard forwarders in their own site;
+    // env-scoped principals are rejected (log_forwarders is site-only).
+    guard_body_site_scope(&session, &body.site)?;
+
     let source_types = parse_source_types(&body.source_types).map_err(|e| status_400(&e))?;
 
     // Deduplicate source types (preserve first-occurrence order).
@@ -10631,13 +10635,19 @@ async fn logs_onboard(
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_validate(Path(hostname): Path<String>) -> ApiResult {
+async fn logs_validate(
+    AuthExtractor(session): AuthExtractor,
+    Path(hostname): Path<String>,
+) -> ApiResult {
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal sees only its own site's forwarders for this
+    // hostname (env-scoped -> none); out-of-scope rows never reach the engine.
+    let hosts = retain_site_scoped(&session, hosts, |h| h.site.as_str());
     log_forwarder::validate_config(&hostname, &hosts)
         .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
         .map_err(|e| status_400(&e))
@@ -10648,13 +10658,19 @@ async fn logs_validate(Path(hostname): Path<String>) -> ApiResult {
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_verify(Path(hostname): Path<String>) -> ApiResult {
+async fn logs_verify(
+    AuthExtractor(session): AuthExtractor,
+    Path(hostname): Path<String>,
+) -> ApiResult {
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal sees only its own site's forwarders for this
+    // hostname (env-scoped -> none); out-of-scope rows never reach the engine.
+    let hosts = retain_site_scoped(&session, hosts, |h| h.site.as_str());
     log_forwarder::verify_forwarding(&hostname, &hosts)
         .map(|r| Json(serde_json::to_value(r).unwrap_or_default()))
         .map_err(|e| status_400(&e))
@@ -10665,7 +10681,12 @@ async fn logs_verify(Path(hostname): Path<String>) -> ApiResult {
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_coverage(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+async fn logs_coverage(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<LogsSiteQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only read coverage for their own site.
+    guard_body_site_scope(&session, &params.site)?;
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
             .await
@@ -10682,7 +10703,12 @@ async fn logs_coverage(Query(params): Query<LogsSiteQuery>) -> ApiResult {
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_gaps(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+async fn logs_gaps(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<LogsSiteQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only read the gap report for their own site.
+    guard_body_site_scope(&session, &params.site)?;
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
             .await
@@ -10699,7 +10725,12 @@ async fn logs_gaps(Query(params): Query<LogsSiteQuery>) -> ApiResult {
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_volume(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+async fn logs_volume(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<LogsSiteQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only read the volume report for their own site.
+    guard_body_site_scope(&session, &params.site)?;
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
             .await
@@ -10716,7 +10747,12 @@ async fn logs_volume(Query(params): Query<LogsSiteQuery>) -> ApiResult {
 /// Reads from DB when available. When no pool is connected the read degrades to
 /// an empty result (never seed data, which would mask missing persistence). A DB
 /// error propagates as 500.
-async fn logs_retention(Query(params): Query<LogsSiteQuery>) -> ApiResult {
+async fn logs_retention(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<LogsSiteQuery>,
+) -> ApiResult {
+    // #2: scoped principals may only read retention status for their own site.
+    guard_body_site_scope(&session, &params.site)?;
     let hosts = match get_db() {
         Some(pool) => crate::repos::log_forwarders::list_by_site(pool, &params.site)
             .await
@@ -10745,10 +10781,44 @@ async fn logs_disable(
         return Err(status_400("hostname cannot be empty"));
     }
 
+    // #2: a scoped principal may only disable forwarders within its own site(s).
+    // An unrestricted principal keeps the original unfiltered atomic path; a
+    // scoped principal resolves the in-scope sites for this hostname up front and
+    // gets a 404 (oracle-safe — indistinguishable from a missing hostname) when
+    // none exist, then the UPDATE is confined to those sites so it can never
+    // disable another site's forwarders.
+    let unrestricted = session.site_scope.iter().all(|s| s.trim().is_empty())
+        && session
+            .environment_scope
+            .iter()
+            .all(|s| s.trim().is_empty());
+    let scoped_sites: Option<Vec<String>> = if unrestricted {
+        None
+    } else {
+        let existing = crate::repos::log_forwarders::list_by_hostname(pool, &hostname)
+            .await
+            .map_err(db_error)?;
+        let in_scope = retain_site_scoped(&session, existing, |r| r.site.as_str());
+        if in_scope.is_empty() {
+            return Err(status_404(&hostname));
+        }
+        let mut sites: Vec<String> = in_scope.into_iter().map(|r| r.site).collect();
+        sites.sort();
+        sites.dedup();
+        Some(sites)
+    };
+
     let mut tx = pool.begin().await.map_err(db_error)?;
-    let disabled = crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
-        .await
-        .map_err(db_error)?;
+    let disabled = match &scoped_sites {
+        None => crate::repos::log_forwarders::disable_all_for_hostname(&mut tx, &hostname)
+            .await
+            .map_err(db_error)?,
+        Some(sites) => {
+            crate::repos::log_forwarders::disable_for_hostname_in_sites(&mut tx, &hostname, sites)
+                .await
+                .map_err(db_error)?
+        }
+    };
 
     let disabled_sources: Vec<log_forwarder::LogSourceType> =
         disabled.into_iter().map(|s| s.source_type).collect();
@@ -37609,6 +37679,106 @@ mod db_lifecycle_tests {
         assert!(
             matches!(probe, Err((StatusCode::FORBIDDEN, _))),
             "out-of-scope lb_validate_vip must be forbidden: {probe:?}"
+        );
+    }
+
+    /// #2 RBAC: the log-forwarder handlers are site-scoped. A GBLON principal
+    /// cannot read another site's coverage (403) and — critically — cannot
+    /// disable a DEFRA hostname's forwarders: it 404s and the DEFRA row stays
+    /// `active` (the cross-site UPDATE is confined to the principal's sites). An
+    /// unrestricted principal and an in-scope principal both pass the gate. The
+    /// disable check uses a dedicated, self-managed DEFRA forwarder row.
+    #[tokio::test]
+    async fn logs_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // Out-of-scope site read -> 403.
+        let cov = logs_coverage(
+            AuthExtractor(gblon.clone()),
+            Query(LogsSiteQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(cov, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope logs_coverage must be forbidden: {cov:?}"
+        );
+
+        // Out-of-scope disable -> 404 AND the DEFRA forwarder must NOT be touched.
+        // Seed a DEDICATED DEFRA forwarder in a known-active state (the migration
+        // seed's status is not stable across runs) so a would-be cross-site
+        // disable WOULD flip it if the guard failed. Then assert the out-of-scope
+        // disable 404s and the row is still active. Clean up either way.
+        let host = "srv-rbac2-logtest.example.local";
+        let _ = sqlx::query("DELETE FROM log_forwarders WHERE hostname = $1")
+            .bind(host)
+            .execute(pool)
+            .await;
+        sqlx::query(
+            "INSERT INTO log_forwarders \
+             (id, hostname, source_type, site, status, log_volume_per_day_mb, retention_days) \
+             VALUES ($1, $2, 'Syslog', 'DEFRA', 'Active', 10, 90)",
+        )
+        .bind("ls-rbac2-logtest-0001")
+        .bind(host)
+        .execute(pool)
+        .await
+        .expect("seed dedicated DEFRA test forwarder");
+
+        let dis = logs_disable(AuthExtractor(gblon.clone()), Path(host.to_string())).await;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM log_forwarders WHERE id = $1")
+                .bind("ls-rbac2-logtest-0001")
+                .fetch_optional(pool)
+                .await
+                .expect("read dedicated forwarder status");
+        // Clean up before asserting so a failed assertion never leaks the row.
+        let _ = sqlx::query("DELETE FROM log_forwarders WHERE hostname = $1")
+            .bind(host)
+            .execute(pool)
+            .await;
+        assert!(
+            matches!(dis, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope logs_disable must 404: {dis:?}"
+        );
+        assert_eq!(
+            status.as_deref(),
+            Some("Active"),
+            "out-of-scope disable must NOT have mutated the DEFRA forwarder"
+        );
+
+        // Unrestricted principal passes the gate.
+        let cov_all = logs_coverage(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(LogsSiteQuery {
+                site: "DEFRA".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(cov_all, Err((StatusCode::FORBIDDEN, _))),
+            "unrestricted logs_coverage must pass the gate: {cov_all:?}"
+        );
+
+        // In-scope principal reads its own site.
+        let cov_own = logs_coverage(
+            AuthExtractor(gblon),
+            Query(LogsSiteQuery {
+                site: "GBLON".into(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(cov_own, Err((StatusCode::FORBIDDEN, _))),
+            "in-scope logs_coverage must pass the gate: {cov_own:?}"
         );
     }
 
