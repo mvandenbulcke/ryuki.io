@@ -28,6 +28,7 @@
 - [x] **image factory** — `f905ecc` (golden_images.site_scope; all 8 (contract static); initiate/schedule body-guard, run_tests/promote/reject by-id guard before transition, active/history Path-guard, superseded retain; codex APPROVED first pass)
 - [x] **runbook execution** — `ffa0261` (runbook_executions site-only; 8 (list pre-scoped, catalog global, contract static); start body-guard, get/execute_step/approve/complete/fail/rollback by-id guard before transition, active retain; codex APPROVED first pass)
 - [x] **access review** — `34a5f4c` (access_reviews site-only, campaigns global (no site col); 8 (list pre-scoped); get/start/approve/revoke/exempt by-id, due/expiring retain, summary RECOMPUTED scoped (avoids cross-site count leak); codex APPROVED first pass)
+- [x] **network readiness** — `8becfe1` (switch_ports/vlans/port_reservations site-only; 7 (contract static); reads enforce_site_scope, reserves body-guard, release pre-load guard before status-branch (codex caught 409-vs-404 oracle + wrong-key regression), ports_inventory retain)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -249,9 +250,9 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **access_reviews_due / access_reviews_expiring** [?] `sources/ryuki-api/src/contracts.rs:26210` — Mirror the enforcement the sibling access_reviews_list already uses, but since list_due/list_expiring don't take a site param, enforce per-row after the DB read. Concretely: (a) ad
 
 ## network  (3)
-- [ ] **network_readiness_check / network_capacity / network_ports_inventory / network_vlans_inventory** [high] `sources/ryuki-api/src/contracts.rs:22489` — Add `AuthExtractor(session): AuthExtractor` to each of the four handler signatures, then replace the fixed-default unwrap with the effective in-scope site. For network_readiness_ch
-- [ ] **network_reserve_ports / network_reserve_ips** [high] `sources/ryuki-api/src/contracts.rs:22526` — Apply the canonical site-only WRITE pattern to BOTH handlers. 1) Add `AuthExtractor(session): AuthExtractor` as the first param of network_reserve_ports (contracts.rs:22526) and ne
-- [ ] **network_release** [high] `sources/ryuki-api/src/contracts.rs:22575` — In network_release at sources/ryuki-api/src/contracts.rs, after `resv` is bound (after line 22592) and BEFORE tx.commit() (line 22605), insert `guard_body_site_scope(&session, &res
+- [x] **network_readiness_check / network_capacity / network_ports_inventory / network_vlans_inventory** [high] `sources/ryuki-api/src/contracts.rs:22489` — Add `AuthExtractor(session): AuthExtractor` to each of the four handler signatures, then replace the fixed-default unwrap with the effective in-scope site. For network_readiness_ch
+- [x] **network_reserve_ports / network_reserve_ips** [high] `sources/ryuki-api/src/contracts.rs:22526` — Apply the canonical site-only WRITE pattern to BOTH handlers. 1) Add `AuthExtractor(session): AuthExtractor` as the first param of network_reserve_ports (contracts.rs:22526) and ne
+- [x] **network_release** [high] `sources/ryuki-api/src/contracts.rs:22575` — In network_release at sources/ryuki-api/src/contracts.rs, after `resv` is bound (after line 22592) and BEFORE tx.commit() (line 22605), insert `guard_body_site_scope(&session, &res
 
 ## outage  (3)
 - [ ] **outage_notices_create** [high] `sources/ryuki-api/src/contracts.rs:24334` — Add `guard_body_site_scope(&session, &body.site)?;` in outage_notices_create immediately after `let pool = get_db().ok_or_else(status_503_no_db)?;` (contracts.rs:24338), before bui
