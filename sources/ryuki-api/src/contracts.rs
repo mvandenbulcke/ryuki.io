@@ -5941,6 +5941,7 @@ async fn shift_escalate(
     Path(id): Path<String>,
     Json(body): Json<ShiftEscalateRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    reject_control_chars("escalation reason", &body.reason)?;
     if let Some(pool) = get_db() {
         // shift_queue.id is UUID — parse before binding (see shift_acknowledge).
         let uid = Uuid::parse_str(&id).map_err(|_| status_404(&id))?;
@@ -15736,6 +15737,7 @@ async fn requests_reject(
         record_transition_denied(&session, &request_id, "request.reject").await;
         return Err(status_403());
     }
+    reject_control_chars("rejection reason", &body.reason)?;
     let reason = body.reason.trim();
     if reason.is_empty() {
         return Err(status_400("Rejection reason is required"));
@@ -16353,6 +16355,22 @@ fn normalize_scope_value(v: Option<String>) -> Result<Option<String>, (StatusCod
             Ok(Some(t.to_string()))
         }
     }
+}
+
+/// Reject control characters (CR/LF/NUL/escape/etc.) in a free-text field (#40).
+/// These values are persisted and later echoed back in JSON and logs, so an
+/// embedded CR/LF could forge a log line or inject a response header, and a
+/// terminal escape could corrupt an operator's console. A finite, short reason/
+/// justification has no legitimate need for control characters — reject the RAW
+/// value (before any trim) with a 400, mirroring `normalize_scope_value` and the
+/// on-call-contact field validation.
+fn reject_control_chars(field: &str, value: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if value.chars().any(char::is_control) {
+        return Err(status_400(&format!(
+            "{field} must not contain control characters"
+        )));
+    }
+    Ok(())
 }
 
 /// GET /api/me/preferences — the CURRENT user's scope preferences (#59).
@@ -25484,6 +25502,7 @@ async fn access_review_approve(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let justification = body.justification.as_deref().unwrap_or("");
+    reject_control_chars("justification", justification)?;
     let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
         .await
         .map_err(db_error)?
@@ -25521,6 +25540,7 @@ async fn access_review_revoke(
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let reason = body.reason.as_deref().unwrap_or("");
+    reject_control_chars("reason", reason)?;
     let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
         .await
         .map_err(db_error)?
@@ -25548,6 +25568,7 @@ async fn access_review_exempt(
     Json(body): Json<AccessReviewExemptRequest>,
 ) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    reject_control_chars("justification", &body.justification)?;
     let (review, updated_at) = crate::repos::access_recertification::get(pool, &id)
         .await
         .map_err(db_error)?
@@ -33281,6 +33302,41 @@ mod unit_tests {
             panic!("empty reason must be a 400");
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// #40: a control character (here a newline) in the rejection reason — a
+    /// log-forging / header-injection vector — is a 400 before any persistence.
+    #[tokio::test]
+    async fn requests_reject_rejects_control_chars_in_reason() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Err((status, _)) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(approver),
+            Json(ReasonBody {
+                reason: "log\nforge".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("a control character in the reason must be a 400");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// #40: the shared free-text guard blocks CR/LF/NUL/TAB and passes clean text.
+    #[test]
+    fn reject_control_chars_blocks_control_allows_clean() {
+        assert!(reject_control_chars("reason", "clean reason 123").is_ok());
+        for bad in ["log\nforge", "carriage\rreturn", "nul\0byte", "tab\tin"] {
+            let err = reject_control_chars("reason", bad)
+                .expect_err("a control character must be rejected");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

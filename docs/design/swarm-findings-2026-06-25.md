@@ -538,6 +538,17 @@ FINDINGS:
 - **area:** ryuki-api/src/contracts.rs (multiple handlers) · **kind:** security-gap · **severity:** low · **effort:** M · **ci_validatable:** True
 - **evidence:** Most text fields are validated for length and non-empty, but there is NO explicit control-character filtering or SQL-injection-resistant escaping verification at the API boundary (relying on parameterized queries only). While parameterized queries in sqlx prevent SQL injection, XSS vectors in JSON responses and LDAP injection in identity operations should be explicitly guarded. Example: on_call_contact_create validates name length but does NOT reject control characters or special HTML chars. Recommendation: apply consistent input sanitization (e.g., unicode normalization, control-char stripping) to all user-facing text fields.
 - **verified:** Control character validation is implemented in on_call_contact_rejection (line 15659-15666) but is missing from multiple other text-field handlers: requests_reject, shift_escalate, access_review_approve, access_review_revoke, access_review_exempt. These unvalidated fields (reason, justification) are persisted to the database and returned in JSON responses, creating potential for log forging and header injection attacks. The gap is real, concrete, and implementable by applying the existing validation pattern consistently across all handlers accepting user text input.
+- **STATUS (2026-06-27) — COMPLETE (named handlers):** added a shared
+  `reject_control_chars(field, value)` guard (400 on any `char::is_control`,
+  mirroring `normalize_scope_value` + the on-call-contact check) and wired it
+  into all five named handlers' free-text fields: `requests_reject` (reason),
+  `shift_escalate` (reason), `access_review_approve` (justification),
+  `access_review_revoke` (reason), `access_review_exempt` (justification). Blocks
+  CR/LF (log-forging / header-injection) and other control chars before
+  persistence. Tests: a pure helper test (CR/LF/NUL/TAB rejected, clean text
+  passes) + a `requests_reject` wiring test. NOTE: a full sweep applying this to
+  EVERY free-text field across all handlers (dozens of `reason`/`justification`
+  fields exist) is a larger follow-up; this closes the five verified handlers.
 
 ### 41. failure_patterns table seeded but never read or written
 - **area:** migrations/028_knowledge_suggestions.sql · **kind:** dead-code-or-drift · **severity:** low · **effort:** M · **ci_validatable:** True
