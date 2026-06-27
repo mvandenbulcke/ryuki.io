@@ -325,10 +325,10 @@ pub fn get_degradation_rules() -> Vec<DegradationRule> {
             evidence: "Affected scope".into(),
         },
         DegradationRule {
-            id: "no-automatic-faidefrar".into(),
+            id: "no-automatic-failover".into(),
             decision: "block".into(),
             requirement:
-                "Degradation mode can suggest safe remediation but must not perform automatic faidefrar."
+                "Degradation mode can suggest safe remediation but must not perform automatic failover."
                     .into(),
             evidence: "Safe remediation".into(),
         },
@@ -341,7 +341,7 @@ pub fn get_degradation_contract() -> serde_json::Value {
         "degradationMode": "fail-safe-read-only",
         "providerCallsEnabled": false,
         "liveExecutionAllowed": false,
-        "faidefrarAutomationAllowed": false,
+        "failoverAutomationAllowed": false,
         "rawProviderPayloadsAllowed": false,
         "degradationScopes": ["site","provider","adapter","dependency","workflow","evidence"],
         "degradationStates": ["normal","degraded-read-only","stale-read-only","blocked","recovering"],
@@ -354,7 +354,7 @@ pub fn get_degradation_contract() -> serde_json::Value {
             {"id":"write-execution-blocked-when-degraded","decision":"block","requirement":"Write-capable workflows remain blocked while affected scope is degraded or stale.","evidence":"Blocked execution decision"},
             {"id":"stale-data-must-be-marked","decision":"block","requirement":"Cached or stale data must be marked before read-only views can be shown.","evidence":"Stale-data marker"},
             {"id":"affected-scope-required","decision":"block","requirement":"Degraded site, provider, adapter, dependency, workflow, or evidence scope must be explicit.","evidence":"Affected scope"},
-            {"id":"no-automatic-faidefrar","decision":"block","requirement":"Degradation mode can suggest safe remediation but must not perform automatic faidefrar.","evidence":"Safe remediation"}
+            {"id":"no-automatic-failover","decision":"block","requirement":"Degradation mode can suggest safe remediation but must not perform automatic failover.","evidence":"Safe remediation"}
         ]
     })
 }
@@ -440,7 +440,7 @@ mod tests {
         assert!(ids.contains(&"write-execution-blocked-when-degraded"));
         assert!(ids.contains(&"stale-data-must-be-marked"));
         assert!(ids.contains(&"affected-scope-required"));
-        assert!(ids.contains(&"no-automatic-faidefrar"));
+        assert!(ids.contains(&"no-automatic-failover"));
         for rule in &rules {
             assert_eq!(rule.decision, "block");
         }
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(contract["degradationMode"], "fail-safe-read-only");
         assert_eq!(contract["providerCallsEnabled"], false);
         assert_eq!(contract["liveExecutionAllowed"], false);
-        assert_eq!(contract["faidefrarAutomationAllowed"], false);
+        assert_eq!(contract["failoverAutomationAllowed"], false);
         assert_eq!(contract["rawProviderPayloadsAllowed"], false);
         assert!(contract["degradationScopes"].as_array().unwrap().len() == 6);
         assert!(contract["rules"].as_array().unwrap().len() == 4);

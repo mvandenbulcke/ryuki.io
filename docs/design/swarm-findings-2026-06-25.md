@@ -353,6 +353,19 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** sources/ryuki-engine/src/degradation_mode.rs vs sources/ryuki-api/src/contracts.rs · **kind:** dead-code-or-drift · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** degradation_mode.rs line 320 has faidefrarAutomationAllowed (nonsensical spelling) and line 333 rule id is 'no-automatic-faidefrar'. But contracts.rs line has the correct 'failoverAutomationAllowed'. Portal or client code consuming engine contract will get inconsistent JSON keys, breaking compatibility.
 - **verified:** This is a real, verifiable gap: the `get_degradation_contract()` function in ryuki-engine/src/degradation_mode.rs (lines 304, 320, 333) produces JSON with the typo field name "faidefrarAutomationAllowed" and rule ID "no-automatic-faidefrar", while the API contracts.rs (line 6907) hardcodes the correct names "failoverAutomationAllowed" and "no-automatic-failover". The API endpoint /api/platform/degradation-contract directly calls the engine's function, meaning clients get inconsistent JSON. No integration test validates this consistency, and the bug is not mentioned in the 66-item missing-featu
+- **STATUS (2026-06-27) — COMPLETE:** the typo `faidefrar` (a find/replace
+  corruption of `failover`) is fixed in ryuki-engine/src/degradation_mode.rs —
+  `failoverAutomationAllowed`, rule id `no-automatic-failover`, and the
+  requirement text "automatic failover" — in BOTH the `get_degradation_contract()`
+  JSON literal and the `DegradationRule` builder. `degradation_contract()`
+  (GET /api/platform/degradation-contract) forwards this verbatim, so clients now
+  receive the correct keys. This aligns the engine with the three sources that
+  ALREADY used the correct spelling: `catalog/degradation-mode-contract.yaml`,
+  `scripts/validator-rs/src/degradation_mode.rs`, and the second hardcoded API
+  contract block (contracts.rs ~7395). Root cause the typo survived: the only
+  coverage (engine tests at lines 443/456) asserted the typo'd names — those two
+  assertions now assert the correct names, closing the regression gap. 23 engine
+  degradation tests pass.
 
 ### 24. Missing scoped access control in metrics recording (cross-tenant bypass risk)
 - **area:** ryuki-api/src/contracts.rs (metrics_record_sample, line 16134) · **kind:** security-gap · **severity:** medium · **effort:** M · **ci_validatable:** True
