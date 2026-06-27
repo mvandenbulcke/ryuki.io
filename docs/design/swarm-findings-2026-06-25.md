@@ -624,3 +624,55 @@ FINDINGS:
   Empty + `durable:false` with no DB. DB test asserts seeded rows return,
   occurrence-count ordering, and that the body is omitted; router-build tests pass.
 
+
+---
+
+## Triage close-out — disposition of remaining findings (2026-06-27)
+
+After the swarm-findings work above, every finding has a terminal disposition.
+Shipped this wave: #4, #5, #6, #7, #8, #9, #10, #12, #15, #18, #19, #20, #23,
+#26, #28, #29, #31, #32 (partial), #37, #38, #39, #40, #41, and #11 (slice 1).
+Already-closed-by-prior-work: #14 (`deny_unknown_fields` present), #24 (scope
+enforced via #2), #25 (DB-backed via #8), #35 (audited via #5), #36 (dup of #29).
+
+The remaining open findings are deliberately **deferred with rationale** —
+larger features needing their own slice, or changes whose risk/cost outweighs
+their value:
+
+- **#11 slice 2 (event→alert generation)** — the event STREAM shipped (slice 1).
+  Generating alerts from events + recipient routing + non-request emitters
+  (capacity/SLO breach, agent-offline) is a substantial follow-up slice
+  (tracker #22, now `[~]`).
+- **#13 (OpenAPI spec)** — LOW ROI for this codebase: handlers overwhelmingly
+  return untyped `Json<Value>` built from `json!()`, so utoipa cannot derive
+  meaningful response schemas. A genuine machine-readable contract would require
+  typing hundreds of responses first; a path-only spec adds little. Deferred
+  pending a decision on whether to invest in typed responses.
+- **#16 (requests.criticality CHECK)** — no authoritative writer: nothing binds
+  `requests.criticality`; it is always the column DEFAULT `'standard'` (the
+  CMDB `configuration_items.criticality` — a different table — already has a
+  CHECK). A CHECK here guards a value that never varies, so it adds no real
+  protection. Skipped.
+- **#17 (requests.stage CHECK)** — high migration risk vs marginal value. The
+  `stage` column is written from many sites with mixed forms, with no single
+  authoritative mapping to enumerate from; an incomplete CHECK would fail the
+  migration or block legitimate writes in some deployment. The valid set is
+  already enforced in application code. Deferred (would need a query of every
+  deployment's distinct values to be provably safe).
+- **#21 (token ops → notifications)** — token create/revoke are already AUDITED
+  (#5/#35). Emitting them as portal NOTIFICATIONS needs the notification engine
+  extended beyond request.* events — folded into the notifications follow-up.
+- **#22 (component_status.adapter_name CHECK)** — zero current impact: the
+  degradation code only UPDATEs the 13 seeded adapter rows (never INSERTs a new
+  adapter type), so the narrow CHECK is never hit. Widening it correctly would
+  require guessing the exact stored string for each newer `AdapterType`. Deferred
+  as speculative.
+- **#27 (audit_log RESTART IDENTITY)** — an IAM/role-grant concern, not an
+  in-DB CHECK: preventing `ALTER SEQUENCE ... RESTART IDENTITY` belongs in
+  database role grants / runbook policy, not application code. Documented as an
+  ops control rather than a code change.
+- **#30 (scheduler lease heartbeat)** and **#33 (agent_jobs composite index)** —
+  tracked as background-task chips (own sessions/worktrees).
+- **#34 (client ids in error messages)** — 72+ instances, `low` severity; the
+  reviewer noted these ids are not secrets. A full opaque-error-code sweep is a
+  large mechanical change with marginal value; deferred.
