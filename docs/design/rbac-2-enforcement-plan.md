@@ -9,6 +9,7 @@
 - [x] **request verify/protect no-DB** — `8346840` (in-memory dry-run branches; DB branches already guarded by b6b3e45)
 - [x] **load balancer** — `3e19354` (site-only; all 10 handlers: provision/vs_get/update/delete/drain/disable/enable/member_add/remove/validate_vip; vs_get loads-then-guards-then-loads-pool; codex caught 2 cross-site defects)
 - [x] **log forwarders** — `18f5486` (site-only; all 8: onboard/coverage/gaps/volume/retention/validate/verify/disable; disable was cross-site → new site-confined repo fn disable_for_hostname_in_sites; codex APPROVED first pass)
+- [x] **immutability** — `0838806` (site-only; all 8 reads: check/retention_lock/air_gap by-id, verify_all/compliance_report site-query, noncompliant/retention_risk list-all, remediation by-id-over-list; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
