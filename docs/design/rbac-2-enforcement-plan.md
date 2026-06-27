@@ -18,6 +18,7 @@
 - [x] **sql deployments** — `df32e33` (site-only; 6 of 8 handlers (validate is pure, inventory pre-scoped); plan body-guard + install/configure/verify/backup/monitoring by-id guard before state-409; standard status_404 so no oracle; codex APPROVED first pass)
 - [x] **file shares** — `3ecfec9` (site-only; 5 of 8 (list/recert-due/stale-owners pre-scoped, contract static); by-id reads + recertify CAS + ACL open-access/report/revoke all load+guard the parent share before child ACL access; codex APPROVED first pass)
 - [x] **site degradation** — `8bafeb6` (site_status keyed by site; 5 of 7 (rules/contract pure); check/enter/exit guard the Path-site before both DB+in-memory; global/degraded retain on DB + fail-closed fallback; codex APPROVED first pass)
+- [x] **maintenance calendar** — `3d3b4b3` (maintenance_windows site-only; 5 (schedule pre-scoped, contract static); conflicts/upcoming/active/month site-query guard (Json→ApiResult); cancel DB scope-arm + engine-fallback fail-closed; codex caught the unguarded cancel fallback, fixed)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -168,11 +169,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **degradation_degraded** [medium] `sources/ryuki-api/src/contracts.rs:7484` — 1) Add `AuthExtractor(session): AuthExtractor` as the first handler parameter: `async fn degradation_degraded(AuthExtractor(session): AuthExtractor) -> Json<Value>`. 2) Scope the r
 
 ## maintenance  (5)
-- [ ] **maintenance_calendar_conflicts** [high] `sources/ryuki-api/src/contracts.rs:7873` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param and change the return type to ApiResult. Before the DB read, replace direct binding of the caller-supplied 
-- [ ] **maintenance_calendar_upcoming** [high] `sources/ryuki-api/src/contracts.rs:7898` — Add `Extension(session): Extension<AuthSession>` to the handler signature, then replace the direct `q.site` bind with the canonical query-param helper: `let site = enforce_site_sco
-- [ ] **maintenance_calendar_active** [high] `sources/ryuki-api/src/contracts.rs:7919` — Add `Extension(session): Extension<AuthSession>` to the maintenance_calendar_active signature, then before the DB read at contracts.rs:7920 compute the effective site via the exist
-- [ ] **maintenance_calendar_month** [high] `sources/ryuki-api/src/contracts.rs:7937` — Add a session to the handler signature and narrow the site before the DB read. Change `async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuery>)` to also 
-- [ ] **maintenance_calendar_cancel** [high] `sources/ryuki-api/src/contracts.rs:7992` — Resource is site-only (no environment axis) and the row is already loaded by the pre-SELECT, so use the post-load site guard. Right before `let mut tx = pool.begin()` (line 8022), 
+- [x] **maintenance_calendar_conflicts** [high] `sources/ryuki-api/src/contracts.rs:7873` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param and change the return type to ApiResult. Before the DB read, replace direct binding of the caller-supplied 
+- [x] **maintenance_calendar_upcoming** [high] `sources/ryuki-api/src/contracts.rs:7898` — Add `Extension(session): Extension<AuthSession>` to the handler signature, then replace the direct `q.site` bind with the canonical query-param helper: `let site = enforce_site_sco
+- [x] **maintenance_calendar_active** [high] `sources/ryuki-api/src/contracts.rs:7919` — Add `Extension(session): Extension<AuthSession>` to the maintenance_calendar_active signature, then before the DB read at contracts.rs:7920 compute the effective site via the exist
+- [x] **maintenance_calendar_month** [high] `sources/ryuki-api/src/contracts.rs:7937` — Add a session to the handler signature and narrow the site before the DB read. Change `async fn maintenance_calendar_month(Query(q): Query<MaintenanceCalendarMonthQuery>)` to also 
+- [x] **maintenance_calendar_cancel** [high] `sources/ryuki-api/src/contracts.rs:7992` — Resource is site-only (no environment axis) and the row is already loaded by the pre-SELECT, so use the post-load site guard. Right before `let mut tx = pool.begin()` (line 8022), 
 
 ## zabbix  (5)
 - [ ] **zabbix_drift_summary** [high] `sources/ryuki-api/src/contracts.rs:9727` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param of zabbix_drift_summary, then replace `let site = query.site.unwrap_or_else(|| "DEFRA".to_string());` with 
