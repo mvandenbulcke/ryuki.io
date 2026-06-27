@@ -435,6 +435,15 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** migrations/031_monitoring_queue.sql + sources/ryuki-api/src/contracts.rs · **kind:** dead-code-or-drift · **severity:** medium · **effort:** M · **ci_validatable:** True
 - **evidence:** Migration 031 creates monitoring_review_queue table and seeds multiple rows. But the handler observe_monitoring_review_queue() in contracts.rs returns only static json!({...contract...}) without any database query. The table is dead persistence with no consumer.
 - **verified:** The monitoring_review_queue table (migration 031) is created and seeded with 5 rows, but the observe_monitoring_review_queue() handler at /api/observe/monitoring-review-queue-contract returns only static JSON metadata without any database query. Comprehensive grep across the entire codebase finds zero SELECT/UPDATE/DELETE operations on this table, zero repository functions, and zero other handlers referencing it. The table exists as dead persistence with no consumer. This gap is not tracked in missing-features-tracker.md, and the catalog marks the feature as "draft" with "static-seed" source, 
+- **STATUS (2026-06-27) — COMPLETE (also closes #36):** new live read
+  `GET /api/observe/monitoring-review-queue` → `monitoring_review_queue_list`
+  SELECTs the table (ordered by SLA deadline), turning the dead seed into a real
+  read surface alongside the existing `-contract` endpoint (mirrors how
+  `shift_queue` is exposed). Request-tier read, site-scoped via
+  `retain_site_scoped` (a scoped principal sees only its site; env-scoped sees
+  none — the queue is site-only); empty + `durable:false` with no DB. DB test
+  asserts the seeded rows return and that a GBLON-scoped principal sees only
+  GBLON rows; all 20 router-build tests pass.
 
 ### 30. Scheduler advisory lock election has no heartbeat/lease; hung leader not detected
 - **area:** ryuki-api/src/scheduler.rs (tick_once, lines 190-196) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** False
@@ -494,6 +503,8 @@ FINDINGS:
 - **area:** database schema / persistence · **kind:** dead-code-or-drift · **severity:** low · **effort:** S · **ci_validatable:** True
 - **evidence:** Migration 031_monitoring_queue.sql creates monitoring_review_queue (id, host_or_service_name, review_type, site, assigned_to, status, etc.) with seed data. Grep shows 2 references in contracts.rs: a route GET /api/observe/monitoring-review-queue-contract (line ~750, observe_monitoring_review_queue handler) and a static JSON response (no query to table). Table is seeded but never read/written; endpoint is pure contract/schema endpoint. Dead persistence.
 - **verified:** REAL AND UNTRACKED GAP: The monitoring_review_queue table (created in migration 031_monitoring_queue.sql at /Users/mvandenbulcke/Repos/ryuki.io/migrations/031_monitoring_queue.sql) is seeded with 5 sample rows but NEVER read or written by the API. The only reference to this table in the Rust codebase is the contract endpoint GET /api/observe/monitoring-review-queue-contract (sources/ryuki-api/src/contracts.rs line ~1060), which returns a STATIC hardcoded JSON payload with no database query. Comparison: The shift_queue table (migration 029) is similarly seeded, but HAS working API endpoints (GE
+- **STATUS (2026-06-27) — CLOSED by #29:** duplicate of #29 — the new
+  `GET /api/observe/monitoring-review-queue` now reads the table live (site-scoped).
 
 ### 37. Health check readiness probe insufficient validation of SELECT 1 result
 - **area:** ryuki-api/src/main.rs (readiness_check, lines 1905-1915) · **kind:** latent-bug · **severity:** low · **effort:** S · **ci_validatable:** True

@@ -1192,6 +1192,10 @@ pub fn routes() -> Router {
             get(observe_monitoring_review_queue),
         )
         .route(
+            "/api/observe/monitoring-review-queue",
+            get(monitoring_review_queue_list),
+        )
+        .route(
             "/api/observe/log-forwarder-onboarding-contract",
             get(observe_log_forwarder),
         )
@@ -10366,6 +10370,67 @@ async fn observe_monitoring_review_queue() -> Json<Value> {
     Json(
         json!({"source":"static-seed","providerCallsEnabled":false,"workflows":["ambiguous-onboarding-review","mapping-owner-assignment","sla-aging-review","escalation-draft","queue-handover","evidence-pack-review"],"signals":["ambiguous-host-mapping","missing-owner","missing-support-group","stale-review","sla-breach-risk","escalation-needed","evidence-missing"],"requiredGuards":["queue-item-summary-known","mapping-ambiguity-marked","owner-known","support-group-known","sla-policy-known","escalation-route-assigned","evidence-redacted"],"planSections":["queueSummary","mappingAmbiguity","ownershipReview","slaStatus","escalationDraft","handoverNotes","approvalRoute","evidenceReferences"],"blockedReasons":["provider-calls-disabled","live-task-creation-disabled","live-escalation-disabled","zabbix-mutation-disabled","queue-item-unknown","owner-unknown","support-group-unknown","sla-policy-missing","escalation-route-missing","evidence-not-redacted"]}),
     )
+}
+
+/// A monitoring-review-queue row as stored (#29).
+#[derive(sqlx::FromRow)]
+struct MonitoringReviewRow {
+    id: String,
+    host_or_service_name: String,
+    review_type: String,
+    site: String,
+    assigned_to: Option<String>,
+    sla_deadline: chrono::DateTime<chrono::Utc>,
+    status: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// GET /api/observe/monitoring-review-queue — the LIVE monitoring review queue
+/// (#29). The `monitoring_review_queue` table (migration 031) was seeded but
+/// never read by the API — only the static contract endpoint existed. This turns
+/// it into a real read surface, mirroring how `shift_queue` is exposed.
+/// Request-tier read, site-scoped (#2): a scoped principal sees only its own
+/// site's items; an environment-scoped principal sees none (this queue is
+/// site-only). Ordered by SLA deadline (most urgent first). Empty +
+/// `durable:false` when no DB is configured.
+async fn monitoring_review_queue_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error": "authentication is required to read the monitoring review queue"}),
+            ),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"items": [], "durable": false})));
+    };
+    let rows: Vec<MonitoringReviewRow> = sqlx::query_as(
+        "SELECT id::text AS id, host_or_service_name, review_type, site, assigned_to, \
+                sla_deadline, status, created_at, updated_at \
+         FROM monitoring_review_queue ORDER BY sla_deadline ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let items: Vec<Value> = retain_site_scoped(&session, rows, |r| r.site.as_str())
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "host_or_service_name": r.host_or_service_name,
+                "review_type": r.review_type,
+                "site": r.site,
+                "assigned_to": r.assigned_to,
+                "sla_deadline": r.sla_deadline.to_rfc3339(),
+                "status": r.status,
+                "created_at": r.created_at.to_rfc3339(),
+                "updated_at": r.updated_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items, "durable": true})))
 }
 
 async fn observe_log_forwarder() -> Json<Value> {
@@ -36661,6 +36726,41 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #29: GET /api/observe/monitoring-review-queue reads the seeded
+    /// `monitoring_review_queue` table (previously dead persistence) and applies
+    /// site scope — a GBLON-scoped principal sees only GBLON rows.
+    #[tokio::test]
+    async fn monitoring_review_queue_list_reads_seeded_rows_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Unrestricted admin sees the seeded rows (mig 031 seeds DEFRA + GBLON).
+        let all = monitoring_review_queue_list(AuthExtractor(AuthSession::static_dry_run()))
+            .await
+            .expect("list must succeed");
+        assert_eq!(all.0["durable"], json!(true));
+        let items = all.0["items"].as_array().expect("items array");
+        assert!(
+            items.len() >= 3,
+            "seeded monitoring-review rows must be returned, got {}",
+            items.len()
+        );
+
+        // A GBLON-scoped principal sees only GBLON rows.
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        let scoped = monitoring_review_queue_list(AuthExtractor(gblon))
+            .await
+            .expect("scoped list must succeed");
+        let scoped_items = scoped.0["items"].as_array().expect("scoped items array");
+        assert!(
+            scoped_items.iter().all(|i| i["site"] == json!("GBLON")),
+            "a GBLON-scoped principal must see only GBLON rows: {scoped_items:?}"
+        );
     }
 
     /// #8: degradation status reads from the DB (migration 025 seed), not the
