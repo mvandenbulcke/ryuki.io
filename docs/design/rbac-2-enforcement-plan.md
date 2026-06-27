@@ -26,6 +26,7 @@
 - [x] **vm day-2** — `a88494b` (vm_day2_operations DUAL-AXIS site+environment; 4 (contract static); plan enforce_scope_filters, validate/execute/verify scope_guard_or_404 before status-409; codex APPROVED first pass)
 - [x] **oob access** — `ff6f8d4` (oob_endpoints site-only; all 8 (contract static); test_endpoint pre-load guard before UPDATE, validate_cert/check_defaults by-id, inventory/failing enforce_site_scope (both paths), cert_expiring/firmware_outdated retain + no-DB fail-closed, validate_site Path-guard; codex APPROVED first pass)
 - [x] **image factory** — `f905ecc` (golden_images.site_scope; all 8 (contract static); initiate/schedule body-guard, run_tests/promote/reject by-id guard before transition, active/history Path-guard, superseded retain; codex APPROVED first pass)
+- [x] **runbook execution** — `ffa0261` (runbook_executions site-only; 8 (list pre-scoped, catalog global, contract static); start body-guard, get/execute_step/approve/complete/fail/rollback by-id guard before transition, active retain; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -235,10 +236,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **image_factory_superseded** [high] `sources/ryuki-api/src/contracts.rs:24754` — Add an AuthSession extractor to the handler and narrow the rows in-handler before returning, keyed on the model's site_scope field, using the existing helper retain_site_scoped (co
 
 ## runbook  (4)
-- [ ] **runbook_start** [high] `sources/ryuki-api/src/contracts.rs:25250` — In runbook_start (contracts.rs:25250), insert `guard_body_site_scope(&session, &body.site)?;` BEFORE the build_execution/insert call — right after `let pool = get_db()...?;` at lin
-- [ ] **runbook_get_execution** [high] `sources/ryuki-api/src/contracts.rs:25287` — Add the session to the signature and a post-load site scope guard before returning, mirroring scope_guard_or_404 usage elsewhere and the sibling list handler's site-only scoping. C
-- [ ] **runbook_execute_step / runbook_approve / runbook_complete / runbook_fail / runbook_rollback** [high] `sources/ryuki-api/src/contracts.rs:25299` — 
-- [ ] **runbook_active** [high] `sources/ryuki-api/src/contracts.rs:25520` — 
+- [x] **runbook_start** [high] `sources/ryuki-api/src/contracts.rs:25250` — In runbook_start (contracts.rs:25250), insert `guard_body_site_scope(&session, &body.site)?;` BEFORE the build_execution/insert call — right after `let pool = get_db()...?;` at lin
+- [x] **runbook_get_execution** [high] `sources/ryuki-api/src/contracts.rs:25287` — Add the session to the signature and a post-load site scope guard before returning, mirroring scope_guard_or_404 usage elsewhere and the sibling list handler's site-only scoping. C
+- [x] **runbook_execute_step / runbook_approve / runbook_complete / runbook_fail / runbook_rollback** [high] `sources/ryuki-api/src/contracts.rs:25299` — 
+- [x] **runbook_active** [high] `sources/ryuki-api/src/contracts.rs:25520` — 
 
 ## access_review  (4)
 - [ ] **access_review_get** [high] `sources/ryuki-api/src/contracts.rs:26197` — In access_review_get (contracts.rs:26197), add the session extractor to the signature: `async fn access_review_get(Path(id): Path<String>, AuthExtractor(session): AuthExtractor)` (
