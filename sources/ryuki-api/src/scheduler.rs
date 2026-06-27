@@ -22,7 +22,7 @@
 //! classifier) lives in `ryuki_engine::scheduler` and is unit-tested there.
 
 use sqlx::{Acquire, PgPool, Postgres, Transaction};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 /// Advisory-lock key for the tick leader election. Distinct from every other
 /// advisory key in the codebase (e.g. the audit chain lock) so the two never
@@ -276,18 +276,37 @@ pub async fn list_recent_executions(
 /// is available; the task runs until the runtime shuts down. Each tick is
 /// leader-elected and idempotent, so a duplicate spawn is harmless.
 pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
+    // #26: bound each tick and apply backpressure so a slow or wedged tick cannot
+    // pin the loop into back-to-back catch-up ticks.
+    // - Skip missed ticks: after a tick that overran the interval, resume on the
+    //   next aligned boundary instead of bursting a run of catch-up ticks (the
+    //   default Burst behavior).
+    // - Per-tick timeout: a GENEROUS guard (>= 5 min, or 4x the interval) so a
+    //   genuinely hung tick — one that escapes the DB-level statement/lock
+    //   timeouts (#12) via an application-level stall — is aborted and retried on
+    //   the next tick rather than starving the loop forever. Dropping the tick
+    //   future rolls back its transaction (the advisory xact lock is released),
+    //   so an abort is safe and the next leader simply retries.
+    let tick_timeout = Duration::from_secs(tick_secs.saturating_mul(4).max(300));
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(tick_secs));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick (just started)
         loop {
             ticker.tick().await;
-            match tick_once(&pool).await {
-                Ok(ran) if ran > 0 => {
+            match tokio::time::timeout(tick_timeout, tick_once(&pool)).await {
+                Ok(Ok(ran)) if ran > 0 => {
                     tracing::info!(ran, "scheduler tick ran due jobs");
                 }
-                Ok(_) => {}
-                Err(error) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
                     tracing::error!(error = %error, "scheduler tick failed");
+                }
+                Err(_elapsed) => {
+                    tracing::error!(
+                        tick_timeout_secs = tick_timeout.as_secs(),
+                        "scheduler tick exceeded its timeout and was aborted; retrying next tick"
+                    );
                 }
             }
         }

@@ -409,6 +409,17 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/scheduler.rs (spawn_scheduler, lines 278-295) · **kind:** latent-bug · **severity:** medium · **effort:** M · **ci_validatable:** True
 - **evidence:** spawn_scheduler loop: ticker.tick().await → match tick_once(pool).await. If tick_once() takes 70+ seconds on a 60-second interval, the next tick fires immediately (interval catches up) and ticks can overlap on the same deadline. No tokio::time::timeout() guards tick_once(). A long/hung DB query, a leader election stall, or MAX_BATCH=100 jobs taking too long can cause the loop to fall behind and fire rapid back-to-back ticks on same-deadline rows, re-running jobs. Suggest: wrap tick_once in tokio::time::timeout with interval - 5s buffer to ensure completion before next tick.
 - **verified:** Verified in /Users/mvandenbulcke/Repos/ryuki.io/sources/ryuki-api/src/scheduler.rs lines 278-295: spawn_scheduler loop uses tokio::time::interval(60s) calling tick_once(&pool).await without timeout guard. If tick_once() takes > 60 seconds, the interval catches up and ticks fire back-to-back with no backpressure, causing excessive CPU and DB pool saturation. Other background sweeps (agents.rs, idempotency.rs) have identical patterns. This is not tracked in the missing-features backlog. The duplicate-execution risk claimed is less severe than stated due to clock_timestamp() advancement guarantee
+- **STATUS (2026-06-27) — COMPLETE:** `spawn_scheduler` now (1) sets
+  `MissedTickBehavior::Skip` so a tick that overran the interval resumes on the
+  next aligned boundary instead of bursting catch-up ticks (the real
+  backpressure fix), and (2) wraps `tick_once` in a GENEROUS `tokio::time::timeout`
+  (≥5 min, or 4× the interval) so a genuinely hung tick — one escaping the
+  DB-level statement/lock timeouts (#12) via an app-level stall — is aborted and
+  retried next tick rather than starving the loop. Aborting is safe: dropping the
+  tick future rolls back its transaction (advisory xact lock released). `tick_once`
+  logic is unchanged (existing scheduler db_tests stay green); the bound is wide
+  enough never to abort a legitimate batch. Note the duplicate-execution risk was
+  already mild (the loop is serial and clock_timestamp advancement de-dupes).
 
 ### 27. Audit log append-only trigger does not guard against RESTART IDENTITY
 - **area:** migrations/046_audit_log.sql · **kind:** data-integrity · **severity:** medium · **effort:** M · **ci_validatable:** True
