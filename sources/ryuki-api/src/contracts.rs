@@ -56665,8 +56665,8 @@ mod linux_deployment_requests_db_tests {
             panic!("linux_deploy_verify failed");
         };
         assert!(
-            verification["deploymentId"].as_str().is_some(),
-            "verification must include deploymentId"
+            verification["deployment_id"].as_str().is_some(),
+            "verification must include deployment_id"
         );
 
         let req = crate::repos::linux_deployment_requests::get(pool, &id)
