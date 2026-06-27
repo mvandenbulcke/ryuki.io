@@ -9034,7 +9034,10 @@ async fn protect_immutability_air_gap() -> Json<Value> {
 
 // ─── Immutability Compliance Engine Handlers ───
 
-async fn immutability_check(Path(id): Path<String>) -> ApiResult {
+async fn immutability_check(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let check = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
             .await
@@ -9042,12 +9045,17 @@ async fn immutability_check(Path(id): Path<String>) -> ApiResult {
             .ok_or_else(|| status_404(&id))?,
         None => return Err(status_404(&id)),
     };
+    // #2: by-id site scope — out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &check.site, "", &id)?;
     let result = immutability_compliance::check_immutability(&id, std::slice::from_ref(&check))
         .map_err(|e| status_404(&e))?;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_retention_lock(Path(id): Path<String>) -> ApiResult {
+async fn immutability_retention_lock(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let check = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
             .await
@@ -9055,12 +9063,17 @@ async fn immutability_retention_lock(Path(id): Path<String>) -> ApiResult {
             .ok_or_else(|| status_404(&id))?,
         None => return Err(status_404(&id)),
     };
+    // #2: by-id site scope — out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &check.site, "", &id)?;
     let result = immutability_compliance::check_retention_lock(&id, std::slice::from_ref(&check))
         .map_err(|e| status_404(&e))?;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_air_gap(Path(id): Path<String>) -> ApiResult {
+async fn immutability_air_gap(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let check = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::get(pool, &id)
             .await
@@ -9068,12 +9081,17 @@ async fn immutability_air_gap(Path(id): Path<String>) -> ApiResult {
             .ok_or_else(|| status_404(&id))?,
         None => return Err(status_404(&id)),
     };
+    // #2: by-id site scope — out-of-scope -> 404 (no existence oracle).
+    scope_guard_or_404(&session, &check.site, "", &id)?;
     let result = immutability_compliance::check_air_gap(&id, std::slice::from_ref(&check))
         .map_err(|e| status_404(&e))?;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
 }
 
-async fn immutability_verify_all(Query(q): Query<ImmutabilityVerifyAllQuery>) -> ApiResult {
+async fn immutability_verify_all(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<ImmutabilityVerifyAllQuery>,
+) -> ApiResult {
     let site = q.site.unwrap_or_default();
     if site.is_empty() {
         return Err((
@@ -9081,6 +9099,8 @@ async fn immutability_verify_all(Query(q): Query<ImmutabilityVerifyAllQuery>) ->
             Json(json!({"error": "Query parameter 'site' is required"})),
         ));
     }
+    // #2: scoped principals may only verify their own site.
+    guard_body_site_scope(&session, &site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::list_by_site(pool, &site)
             .await
@@ -9092,7 +9112,10 @@ async fn immutability_verify_all(Query(q): Query<ImmutabilityVerifyAllQuery>) ->
     Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_compliance_report(Query(q): Query<ImmutabilityComplianceQuery>) -> ApiResult {
+async fn immutability_compliance_report(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<ImmutabilityComplianceQuery>,
+) -> ApiResult {
     let site = q.site.unwrap_or_default();
     if site.is_empty() {
         return Err((
@@ -9100,6 +9123,8 @@ async fn immutability_compliance_report(Query(q): Query<ImmutabilityComplianceQu
             Json(json!({"error": "Query parameter 'site' is required"})),
         ));
     }
+    // #2: scoped principals may only read the compliance report for their own site.
+    guard_body_site_scope(&session, &site)?;
     let checks = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::list_by_site(pool, &site)
             .await
@@ -9111,35 +9136,45 @@ async fn immutability_compliance_report(Query(q): Query<ImmutabilityComplianceQu
     Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
-async fn immutability_noncompliant() -> ApiResult {
+async fn immutability_noncompliant(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let checks = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::list_all(pool)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal sees only its own site's checks (env-scoped -> none).
+    let checks = retain_site_scoped(&session, checks, |c| c.site.as_str());
     let repos = immutability_compliance::get_noncompliant(&checks);
     Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_retention_risk() -> ApiResult {
+async fn immutability_retention_risk(AuthExtractor(session): AuthExtractor) -> ApiResult {
     let checks = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::list_all(pool)
             .await
             .map_err(db_error)?,
         None => Vec::new(),
     };
+    // #2: a scoped principal sees only its own site's checks (env-scoped -> none).
+    let checks = retain_site_scoped(&session, checks, |c| c.site.as_str());
     let repos = immutability_compliance::get_retention_risk(&checks);
     Ok(Json(serde_json::to_value(repos).unwrap_or_default()))
 }
 
-async fn immutability_remediation(Path(id): Path<String>) -> ApiResult {
+async fn immutability_remediation(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let checks = match get_db() {
         Some(pool) => crate::repos::immutability_compliance::list_all(pool)
             .await
             .map_err(db_error)?,
         None => return Err(status_404(&id)),
     };
+    // #2: confine to the principal's sites first; an out-of-scope id then falls
+    // out of the list and yields a 404 (no cross-site remediation oracle).
+    let checks = retain_site_scoped(&session, checks, |c| c.site.as_str());
     let plan =
         immutability_compliance::get_remediation_plan(&id, &checks).map_err(|e| status_404(&e))?;
     Ok(Json(serde_json::to_value(plan).unwrap_or_default()))
@@ -37779,6 +37814,65 @@ mod db_lifecycle_tests {
         assert!(
             !matches!(cov_own, Err((StatusCode::FORBIDDEN, _))),
             "in-scope logs_coverage must pass the gate: {cov_own:?}"
+        );
+    }
+
+    /// #2 RBAC: the immutability-compliance handlers are site-scoped. A GBLON
+    /// principal gets 404 on a DEFRA check (by-id, no existence oracle) and 403
+    /// on a DEFRA site report; its own GBLON check and an unrestricted principal
+    /// pass the gate. All handlers are reads, so migration-037 seed rows
+    /// (imm-…0001 = DEFRA, imm-…0002 = GBLON) are used directly.
+    #[tokio::test]
+    async fn immutability_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra = "imm-00000000-0000-0000-0000-000000000001";
+        let gblon_id = "imm-00000000-0000-0000-0000-000000000002";
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // Out-of-scope by-id read -> 404.
+        let foreign =
+            immutability_check(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(foreign, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope immutability_check must 404: {foreign:?}"
+        );
+
+        // In-scope by-id read -> not a 404.
+        let own =
+            immutability_check(AuthExtractor(gblon.clone()), Path(gblon_id.to_string())).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope immutability_check must pass the gate: {own:?}"
+        );
+
+        // Out-of-scope site report -> 403.
+        let report = immutability_verify_all(
+            AuthExtractor(gblon),
+            Query(ImmutabilityVerifyAllQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(report, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope immutability_verify_all must be forbidden: {report:?}"
+        );
+
+        // Unrestricted by-id read -> not a 404.
+        let any = immutability_check(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted immutability_check must pass the gate: {any:?}"
         );
     }
 
