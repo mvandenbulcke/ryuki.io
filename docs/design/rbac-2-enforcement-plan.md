@@ -13,6 +13,7 @@
 - [x] **ad computers** — `3f8ab20` (site-only; all 6: prestage body-create, move/disable/enable/delete by-name writes (guard before status-409 leak), ad_get by-name read; codex APPROVED first pass; resolves the AD-write chip)
 - [x] **patch waves** — `f81d7cc` (MULTI-SITE: new within_multi_scope/multi_scope_guard_or_404 containment helpers; all 8 wave handlers incl. patch_reboot the audit missed; +narrow_site_aggregate for compliance/pending_reboots dashboards; codex design-reviewed then caught 3 aggregate leaks, all fixed)
 - [x] **legal holds** — `eeaddac` (site-only; all 7; per-handler oracle-safe not-found codes (400/404/409); +is_scoped helper; no-DB fallbacks fail closed 503 for scoped; codex caught a body-oracle + a 6-handler no-DB bypass class, all fixed)
+- [x] **emergency changes** — `b9655e4` (site-only break-glass; all 6; ProblemDetails guards emergency_scope_guard/_preload_guard; per-action 404; guard before status-409; no-DB fail-closed 503; emergency_history pre-scoped; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -117,12 +118,12 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **legal_hold_validate** [medium] `sources/ryuki-api/src/contracts.rs:9329` — Add `AuthExtractor(session): AuthExtractor` as the first param of legal_hold_validate (contracts.rs:9329), mirroring legal_hold_extend (9392-9396). Then immediately after `let Some
 
 ## emergency  (6)
-- [ ] **emergency_initiate** [high] `sources/ryuki-api/src/contracts.rs:6324` — 
-- [ ] **emergency_approve** [high] `sources/ryuki-api/src/contracts.rs:6392` — Reuse existing scope_guard_or_404 (contracts.rs:21108) + row_scope_permits (:21099). (site,env) source = the persisted row's own column. emergency_changes has `site` but no `enviro
-- [ ] **emergency_execute** [high] `sources/ryuki-api/src/contracts.rs:6505` — After the row is loaded and confirmed to exist (immediately after the `let Some(row) = row else {...404...}` block ending at contracts.rs:6536, BEFORE the status check and tx begin
-- [ ] **emergency_verify** [high] `sources/ryuki-api/src/contracts.rs:6650` — Add a by-id site-scope guard BEFORE the CAS UPDATE (i.e. right after `let mut tx = pool.begin()...` at ~6661, or before opening the tx). Source of (site, env): load the row's site 
-- [ ] **emergency_close** [high] `sources/ryuki-api/src/contracts.rs:6772` — The handler does not pre-load the row, so add a site read + guard BEFORE the CAS UPDATE (insert right after `let now = ...` at line 6778, before `pool.begin()` at 6781). Source the
-- [ ] **emergency_active** [high] `sources/ryuki-api/src/contracts.rs:6888` — Make emergency_active mirror its siblings. 1) Change the signature to `async fn emergency_active(AuthExtractor(session): AuthExtractor, Query(params): Query<EmergencySiteQuery>) ->
+- [x] **emergency_initiate** [high] `sources/ryuki-api/src/contracts.rs:6324` — 
+- [x] **emergency_approve** [high] `sources/ryuki-api/src/contracts.rs:6392` — Reuse existing scope_guard_or_404 (contracts.rs:21108) + row_scope_permits (:21099). (site,env) source = the persisted row's own column. emergency_changes has `site` but no `enviro
+- [x] **emergency_execute** [high] `sources/ryuki-api/src/contracts.rs:6505` — After the row is loaded and confirmed to exist (immediately after the `let Some(row) = row else {...404...}` block ending at contracts.rs:6536, BEFORE the status check and tx begin
+- [x] **emergency_verify** [high] `sources/ryuki-api/src/contracts.rs:6650` — Add a by-id site-scope guard BEFORE the CAS UPDATE (i.e. right after `let mut tx = pool.begin()...` at ~6661, or before opening the tx). Source of (site, env): load the row's site 
+- [x] **emergency_close** [high] `sources/ryuki-api/src/contracts.rs:6772` — The handler does not pre-load the row, so add a site read + guard BEFORE the CAS UPDATE (insert right after `let now = ...` at line 6778, before `pool.begin()` at 6781). Source the
+- [x] **emergency_active** [high] `sources/ryuki-api/src/contracts.rs:6888` — Make emergency_active mirror its siblings. 1) Change the signature to `async fn emergency_active(AuthExtractor(session): AuthExtractor, Query(params): Query<EmergencySiteQuery>) ->
 
 ## storage  (6)
 - [ ] **storage_volume_get** [high] `sources/ryuki-api/src/contracts.rs:28228` — Add `AuthExtractor(session): AuthExtractor` to the signature of storage_volume_get (contracts.rs:28228), then after loading the row (after L28237) and before returning, call `scope
