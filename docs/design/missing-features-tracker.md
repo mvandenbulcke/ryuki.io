@@ -131,6 +131,24 @@ when the target site is degraded/unreachable, gating BOTH live-apply grant paths
 (`requests_approve_live_apply` + admin `admin_approve_live_apply_job`) before the
 CP-signed grant is minted (`5ae1430`)**.
 
+**Swarm wave 2026-06-27 (continued):** #23 degradation-contract typo fix
+(`faidefrar`→`failover`, `05d4a21`); #37 readiness-probe symmetric logging
+(`92f9619`); #39 GET-by-name AD computer (`32efbf0`); #18 timeout-log enrichment
+(request_id + elapsed, `93192e3`); #38 GET-by-id browser session (`e051687`);
+#19+#20 PUT update for metric budgets + SLOs (CRUD complete, `4811f40`); #26
+scheduler per-tick timeout + skip-missed backpressure (`8738fb2`); #31
+exponential backoff on lease/idempotency sweeps (`42606ea`); #40 control-char
+rejection on free-text reason/justification fields (`00edcdc`); #29+#36 live
+monitoring-review-queue read (`492110a`); #41 live failure-pattern KB read
+(`e3b0081`); #28 platform-settings change-history endpoint (`442308b`); #32
+(partial) Retry-After on rate-limit 429s (`9d92311`); **#11 (slice 1) operational
+domain-event stream — `domain_events` table (mig 110) + emit in
+`apply_transition_audited` + scoped `GET /api/events` (`d9b11f0`); alert
+generation is the follow-up slice (tracker #22 → `[~]`)**. Already-closed by
+prior work: #14 (deny_unknown_fields present), #24 (scope via #2), #25 (DB-backed
+via #8), #35 (audited via #5). Remaining findings deferred-with-rationale — see
+the triage close-out in [swarm-findings-2026-06-25.md](swarm-findings-2026-06-25.md).
+
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
 #8 agent approve — revoke deferred (`6d6fb5b`), #63 observability deploy
