@@ -26380,6 +26380,7 @@ async fn firmware_devices_list(
 }
 
 async fn firmware_device_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
@@ -26388,6 +26389,8 @@ async fn firmware_device_get(
                 .await
                 .map_err(db_error)?
                 .ok_or_else(|| status_404(&id))?;
+            // #2: out-of-scope -> 404 (no existence oracle).
+            scope_guard_or_404(&session, &device.site, "", &id)?;
             Ok(Json(json!({
                 "source": "live",
                 "device": device
@@ -26398,9 +26401,17 @@ async fn firmware_device_get(
 }
 
 async fn firmware_check_compliance(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: pre-load the device's site and guard BEFORE the recalc write; an
+    // out-of-scope or missing device -> 404 (no existence oracle).
+    let existing = crate::repos::firmware_lifecycle::get_device(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     // Recalculate + persist in ONE transaction (SELECT ... FOR UPDATE inside the
     // repo) so a concurrent request_exception (which sets the device to Exception)
     // cannot be clobbered by a stale recompute writing back the old status.
@@ -26424,12 +26435,16 @@ async fn firmware_check_compliance(
     })))
 }
 
-async fn firmware_noncompliant() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn firmware_noncompliant(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
         Some(pool) => {
             let devices = crate::repos::firmware_lifecycle::list_noncompliant(pool)
                 .await
                 .map_err(db_error)?;
+            // #2: a scoped principal only sees its own site's devices (env-scoped -> none).
+            let devices = retain_site_scoped(&session, devices, |d| d.site.as_str());
             Ok(Json(json!({
                 "source": "live",
                 "count": devices.len(),
@@ -26442,12 +26457,16 @@ async fn firmware_noncompliant() -> Result<Json<Value>, (StatusCode, Json<Value>
     }
 }
 
-async fn firmware_eol() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn firmware_eol(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
         Some(pool) => {
             let devices = crate::repos::firmware_lifecycle::list_eol(pool)
                 .await
                 .map_err(db_error)?;
+            // #2: a scoped principal only sees its own site's EOL devices.
+            let devices = retain_site_scoped(&session, devices, |d| d.site.as_str());
             Ok(Json(json!({
                 "source": "live",
                 "count": devices.len(),
@@ -26474,6 +26493,13 @@ async fn firmware_request_exception(
     )
     .map_err(|e| status_400(&e))?;
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scope on the target device's site before creating an exception for it;
+    // an out-of-scope or missing device -> 404 (no existence oracle).
+    let device = crate::repos::firmware_lifecycle::get_device(pool, &body.device_id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&body.device_id))?;
+    scope_guard_or_404(&session, &device.site, "", &body.device_id)?;
     let exception = crate::repos::firmware_lifecycle::request_exception(
         pool,
         &body.device_id,
@@ -26491,12 +26517,28 @@ async fn firmware_request_exception(
     })))
 }
 
-async fn firmware_exceptions_list() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn firmware_exceptions_list(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
         Some(pool) => {
-            let exceptions = crate::repos::firmware_lifecycle::list_active_exceptions(pool)
+            let mut exceptions = crate::repos::firmware_lifecycle::list_active_exceptions(pool)
                 .await
                 .map_err(db_error)?;
+            // #2: firmware_exceptions has no site column — retain only those whose
+            // parent device is in the principal's scope (resolved via a device map;
+            // env-scoped principals keep none).
+            if is_scoped(&session) {
+                let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
+                    .await
+                    .map_err(db_error)?;
+                let in_scope: std::collections::HashSet<String> = devices
+                    .iter()
+                    .filter(|d| row_scope_permits(&session, &d.site, ""))
+                    .map(|d| d.id.clone())
+                    .collect();
+                exceptions.retain(|e| in_scope.contains(&e.device_id));
+            }
             Ok(Json(json!({
                 "source": "live",
                 "count": exceptions.len(),
@@ -26510,9 +26552,28 @@ async fn firmware_exceptions_list() -> Result<Json<Value>, (StatusCode, Json<Val
 }
 
 async fn firmware_revoke_exception(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scope on the exception's parent-device site (join) BEFORE revoking; an
+    // out-of-scope or missing exception -> 404 (no oracle, no cross-site revoke).
+    if is_scoped(&session) {
+        let site: Option<String> = sqlx::query_scalar(
+            "SELECT fr.site FROM firmware_exceptions fe \
+             JOIN firmware_records fr ON fe.device_id = fr.id WHERE fe.id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err(status_404(&id));
+        }
+    }
     let device_id = crate::repos::firmware_lifecycle::revoke_exception(pool, &id)
         .await
         .map_err(db_error)?
@@ -26525,12 +26586,16 @@ async fn firmware_revoke_exception(
     })))
 }
 
-async fn firmware_compliance_report() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn firmware_compliance_report(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
         Some(pool) => {
             let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
                 .await
                 .map_err(db_error)?;
+            // #2: a scoped principal's report counts only its own site's devices.
+            let devices = retain_site_scoped(&session, devices, |d| d.site.as_str());
             let total = devices.len();
             let compliant = devices
                 .iter()
@@ -26571,12 +26636,16 @@ async fn firmware_compliance_report() -> Result<Json<Value>, (StatusCode, Json<V
     }
 }
 
-async fn firmware_vendor_summary() -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+async fn firmware_vendor_summary(
+    AuthExtractor(session): AuthExtractor,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match get_db() {
         Some(pool) => {
             let devices = crate::repos::firmware_lifecycle::list_all_for_report(pool)
                 .await
                 .map_err(db_error)?;
+            // #2: a scoped principal's vendor summary covers only its own site's devices.
+            let devices = retain_site_scoped(&session, devices, |d| d.site.as_str());
             let mut vendors: std::collections::BTreeMap<
                 String,
                 (usize, usize, usize, usize, usize),
@@ -39352,6 +39421,84 @@ mod db_lifecycle_tests {
                 "out-of-scope zabbix_drift_plan must 404: {plan:?}"
             );
         }
+    }
+
+    /// #2 RBAC: the firmware-lifecycle handlers are site-scoped (firmware_records
+    /// has site; firmware_exceptions scope via the parent-device join). A GBLON
+    /// principal gets 404 reading/recalculating a DEFRA device; in-scope +
+    /// unrestricted reads pass; and the compliance report is scope-filtered
+    /// (scoped total < unrestricted total). Device ids resolved at runtime.
+    #[tokio::test]
+    async fn firmware_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let (Some(defra_dev), Some(gblon_dev)) = (
+            sqlx::query_scalar::<_, String>(
+                "SELECT id::text FROM firmware_records WHERE site = 'DEFRA' LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .expect("query defra device"),
+            sqlx::query_scalar::<_, String>(
+                "SELECT id::text FROM firmware_records WHERE site = 'GBLON' LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await
+            .expect("query gblon device"),
+        ) else {
+            eprintln!("SKIP: seed firmware devices not present");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // read / recalculate a DEFRA device -> 404.
+        let got = firmware_device_get(AuthExtractor(gblon.clone()), Path(defra_dev.clone())).await;
+        assert!(
+            matches!(got, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope firmware_device_get must 404: {got:?}"
+        );
+        let check =
+            firmware_check_compliance(AuthExtractor(gblon.clone()), Path(defra_dev.clone())).await;
+        assert!(
+            matches!(check, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope firmware_check_compliance must 404: {check:?}"
+        );
+
+        // in-scope + unrestricted reads pass.
+        let own = firmware_device_get(AuthExtractor(gblon.clone()), Path(gblon_dev)).await;
+        assert!(
+            !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope firmware_device_get must pass: {own:?}"
+        );
+        let any = firmware_device_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra_dev),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted firmware_device_get must pass: {any:?}"
+        );
+
+        // the compliance report is scope-filtered: scoped total < unrestricted total.
+        let scoped_total = match firmware_compliance_report(AuthExtractor(gblon)).await {
+            Ok(Json(v)) => v["total"].as_u64().unwrap_or(0),
+            other => panic!("scoped firmware_compliance_report failed: {other:?}"),
+        };
+        let all_total =
+            match firmware_compliance_report(AuthExtractor(AuthSession::static_dry_run())).await {
+                Ok(Json(v)) => v["total"].as_u64().unwrap_or(0),
+                other => panic!("unrestricted firmware_compliance_report failed: {other:?}"),
+            };
+        assert!(
+            all_total > scoped_total,
+            "scoped report must exclude other sites' devices: scoped={scoped_total} all={all_total}"
+        );
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
