@@ -565,4 +565,12 @@ FINDINGS:
 - **area:** migrations/028_knowledge_suggestions.sql · **kind:** dead-code-or-drift · **severity:** low · **effort:** M · **ci_validatable:** True
 - **evidence:** Migration 028 creates failure_patterns table (error type, message fragments, workflows, suggested articles) and INSERTs 4 seed rows. Zero references to failure_patterns in sources/ryuki-api or sources/ryuki-engine. This is orphaned persistence with no API handler or engine consumer.
 - **verified:** The failure_patterns table (migration 028) is seeded with 4 rows but has zero references in ryuki-api or ryuki-engine source code. The knowledge_suggestion engine is pure/dry-run only and never reads the database. No repository module, handler, or engine function queries or mutates this table. The feature is not tracked in the missing-features-tracker.md. This is a concrete dead-persistence gap matching the calibre of the site_status example.
+- **STATUS (2026-06-27) — COMPLETE:** new live read
+  `GET /api/operations/failure-patterns` → `failure_patterns_list` SELECTs the
+  table (ordered by occurrence_count DESC, last_seen DESC), turning the dead seed
+  into a real read surface alongside the knowledge-suggestion contract/readiness
+  endpoints. Request-tier read; global KB (no site dimension, so no scoping); the
+  potentially-long `suggested_article_body` is omitted from the list projection.
+  Empty + `durable:false` with no DB. DB test asserts seeded rows return,
+  occurrence-count ordering, and that the body is omitted; router-build tests pass.
 

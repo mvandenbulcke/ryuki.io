@@ -937,6 +937,10 @@ pub fn routes() -> Router {
             "/api/operations/knowledge-suggestion-readiness",
             get(operations_knowledge_suggestion_readiness),
         )
+        .route(
+            "/api/operations/failure-patterns",
+            get(failure_patterns_list),
+        )
         .route("/api/images/factory-contract", get(images_factory))
         .route(
             "/api/patching/maintenance-contract",
@@ -7577,6 +7581,68 @@ struct KnowledgeSuggestionQuery {
     affected_workflow: Option<String>,
     owner: Option<String>,
     support_group: Option<String>,
+}
+
+/// A failure-pattern row as stored (#41).
+#[derive(sqlx::FromRow)]
+struct FailurePatternRow {
+    id: String,
+    error_type: String,
+    error_message_fragment: String,
+    occurrence_count: i32,
+    affected_workflow: String,
+    affected_components: Vec<String>,
+    first_seen: chrono::DateTime<chrono::Utc>,
+    last_seen: chrono::DateTime<chrono::Utc>,
+    suggested_article_title: String,
+    status: String,
+}
+
+/// GET /api/operations/failure-patterns — the LIVE failure-pattern knowledge
+/// base (#41). The `failure_patterns` table (migration 028) was seeded but never
+/// read by the API; this exposes it as a real read surface alongside the
+/// knowledge-suggestion contract/readiness endpoints. Request-tier read, ordered
+/// by occurrence_count DESC (most frequent first). This is a global knowledge
+/// base with no site dimension, so no per-site scoping applies. The
+/// suggested_article_body (potentially long) is omitted from the list; the
+/// title + summary fields are returned. Empty + `durable:false` when no DB.
+async fn failure_patterns_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read failure patterns"})),
+        ));
+    }
+    let Some(pool) = get_db() else {
+        return Ok(Json(json!({"patterns": [], "durable": false})));
+    };
+    let rows: Vec<FailurePatternRow> = sqlx::query_as(
+        "SELECT id::text AS id, error_type, error_message_fragment, occurrence_count, \
+                affected_workflow, affected_components, first_seen, last_seen, \
+                suggested_article_title, status \
+         FROM failure_patterns ORDER BY occurrence_count DESC, last_seen DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let patterns: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "error_type": r.error_type,
+                "error_message_fragment": r.error_message_fragment,
+                "occurrence_count": r.occurrence_count,
+                "affected_workflow": r.affected_workflow,
+                "affected_components": r.affected_components,
+                "first_seen": r.first_seen.to_rfc3339(),
+                "last_seen": r.last_seen.to_rfc3339(),
+                "suggested_article_title": r.suggested_article_title,
+                "status": r.status,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"patterns": patterns, "durable": true})))
 }
 
 /// Dry-run operations knowledge-suggestion readiness. Turns the static
@@ -36760,6 +36826,41 @@ mod db_lifecycle_tests {
         assert!(
             scoped_items.iter().all(|i| i["site"] == json!("GBLON")),
             "a GBLON-scoped principal must see only GBLON rows: {scoped_items:?}"
+        );
+    }
+
+    /// #41: GET /api/operations/failure-patterns reads the seeded
+    /// `failure_patterns` table (previously dead persistence), most-frequent
+    /// first, and projects the non-body fields.
+    #[tokio::test]
+    async fn failure_patterns_list_reads_seeded_rows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let resp = failure_patterns_list(AuthExtractor(AuthSession::static_dry_run()))
+            .await
+            .expect("list must succeed");
+        assert_eq!(resp.0["durable"], json!(true));
+        let patterns = resp.0["patterns"].as_array().expect("patterns array");
+        assert!(
+            !patterns.is_empty(),
+            "seeded failure_patterns rows must be returned"
+        );
+        // Ordered by occurrence_count DESC.
+        let counts: Vec<i64> = patterns
+            .iter()
+            .filter_map(|p| p["occurrence_count"].as_i64())
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] >= w[1]),
+            "patterns must be ordered by occurrence_count DESC: {counts:?}"
+        );
+        // The (potentially long) article body is intentionally not in the list.
+        assert!(
+            patterns[0].get("suggested_article_body").is_none(),
+            "the article body must be omitted from the list projection"
         );
     }
 
