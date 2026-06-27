@@ -9479,6 +9479,7 @@ fn serde_enum_str<T: serde::Serialize>(value: &T) -> String {
 }
 
 async fn legal_hold_validate(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -9496,6 +9497,14 @@ async fn legal_hold_validate(
                 Json(json!({"error": format!("Legal hold {} not found", id)})),
             ));
         };
+        // #2: an out-of-scope hold is reported identically to a missing one (the
+        // same 400 above) so a scoped principal gets no existence oracle.
+        if !row_scope_permits(&session, &hold.site, "") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Legal hold {} not found", id)})),
+            ));
+        }
         // Validate the DB row with parity to legal_hold::validate_hold (do NOT
         // call validate_hold(&id) — it looks up the static HOLD_STORE, absent
         // for DB-seeded/restarted holds). expiry_date is a NOT NULL TIMESTAMPTZ
@@ -9535,6 +9544,12 @@ async fn legal_hold_validate(
             },
         })));
     }
+    // #2: the no-DB fallback reads the process-local HOLD_STORE, which has no site
+    // dimension to enforce scope on — a scoped principal cannot be served safely
+    // without the database, so fail closed (503) rather than leak cross-site data.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     match legal_hold::validate_hold(&id) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -9555,6 +9570,26 @@ async fn legal_hold_extend(
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "new_expiry is required"})),
             ));
+        }
+        // #2: confine to the principal's scope. Pre-load the hold's site (only for
+        // a scoped principal); an out-of-scope hold returns the SAME "not found or
+        // not Active" 409 the CAS below produces, so there is no existence oracle.
+        if is_scoped(&session) {
+            let site: Option<String> =
+                sqlx::query_scalar("SELECT site FROM legal_holds WHERE id = $1")
+                    .bind(&id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !site
+                .map(|s| row_scope_permits(&session, &s, ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
+                ));
+            }
         }
         let now = chrono::Utc::now().to_rfc3339();
         let audit_entry = serde_json::to_string(&serde_json::json!([{
@@ -9605,6 +9640,10 @@ async fn legal_hold_extend(
         return Ok(Json(updated.to_json()));
     }
     // No-DB fallback: engine validates status=Active and parses new_expiry.
+    // #2: no-DB fallback can't enforce site scope on the static HOLD_STORE.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     match legal_hold::extend_hold(&id, &req.new_expiry) {
         Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
@@ -9620,6 +9659,25 @@ async fn legal_hold_release(
     if let Some(pool) = get_db() {
         // DB path: CAS-UPDATE directly.  Do NOT call release_hold() which
         // mutates HOLD_STORE — absent for DB-seeded/restarted holds.
+        // #2: confine to the principal's scope; an out-of-scope hold returns the
+        // SAME "not found or not Active" 409 the CAS below produces (no oracle).
+        if is_scoped(&session) {
+            let site: Option<String> =
+                sqlx::query_scalar("SELECT site FROM legal_holds WHERE id = $1")
+                    .bind(&id)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_error)?;
+            if !site
+                .map(|s| row_scope_permits(&session, &s, ""))
+                .unwrap_or(false)
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": format!("Legal hold {} not found or not Active", id)})),
+                ));
+            }
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let audit_entry = serde_json::to_string(&serde_json::json!([{
             "timestamp": now,
@@ -9669,14 +9727,23 @@ async fn legal_hold_release(
         return Ok(Json(updated.to_json()));
     }
     // No-DB fallback: engine validates status=Active and records audit entry.
+    // #2: no-DB fallback can't enforce site scope on the static HOLD_STORE.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     match legal_hold::release_hold(&id, &session.user_id) {
         Ok(hold) => Ok(Json(serde_json::to_value(hold).unwrap())),
         Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e})))),
     }
 }
 
-async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> ApiResult {
-    let site = q.site.unwrap_or_default();
+async fn legal_hold_active(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<LegalHoldActiveQuery>,
+) -> ApiResult {
+    // #2: narrow the site filter to the principal's scope (env-scoped -> 403;
+    // unrestricted with no ?site -> "" = all sites).
+    let site = enforce_site_scope(&session, q.site.as_deref(), "")?;
     if let Some(pool) = get_db() {
         let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
             "SELECT {LEGAL_HOLD_COLUMNS} FROM legal_holds \
@@ -9695,7 +9762,7 @@ async fn legal_hold_active(Query(q): Query<LegalHoldActiveQuery>) -> ApiResult {
     Ok(Json(serde_json::to_value(holds).unwrap()))
 }
 
-async fn legal_hold_expiring() -> ApiResult {
+async fn legal_hold_expiring(AuthExtractor(session): AuthExtractor) -> ApiResult {
     if let Some(pool) = get_db() {
         // Same predicate as the engine: Active holds expiring within 30 days.
         let rows: Vec<LegalHoldRow> = sqlx::query_as(&format!(
@@ -9706,16 +9773,23 @@ async fn legal_hold_expiring() -> ApiResult {
         .fetch_all(pool)
         .await
         .map_err(db_error)?;
+        // #2: a scoped principal only sees its own site's holds (env-scoped -> none).
+        let rows = retain_site_scoped(&session, rows, |r| r.site.as_str());
         return Ok(Json(json!(rows
             .iter()
             .map(LegalHoldRow::to_json)
             .collect::<Vec<_>>())));
+    }
+    // #2: no-DB fallback can't enforce site scope on the static HOLD_STORE.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
     }
     let holds = legal_hold::get_expiring_holds();
     Ok(Json(serde_json::to_value(holds).unwrap()))
 }
 
 async fn legal_hold_evidence(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
@@ -9729,6 +9803,15 @@ async fn legal_hold_evidence(
         .map_err(db_error)?;
         return match row {
             Some(hold) => {
+                // #2: out-of-scope -> 404 with the SAME body as the not-found arm
+                // below. scope_guard_or_404/status_404 would say "Request ..." — a
+                // body-level existence oracle — so use the handler's own message.
+                if !row_scope_permits(&session, &hold.site, "") {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": format!("Legal hold {} not found", id)})),
+                    ));
+                }
                 let audit =
                     serde_json::from_str::<Value>(&hold.audit_trail).unwrap_or_else(|_| json!([]));
                 Ok(Json(audit))
@@ -9739,13 +9822,20 @@ async fn legal_hold_evidence(
             )),
         };
     }
+    // #2: no-DB fallback can't enforce site scope on the static HOLD_STORE.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     match legal_hold::get_hold_evidence(&id) {
         Ok(evidence) => Ok(Json(serde_json::to_value(evidence).unwrap())),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(json!({"error": e})))),
     }
 }
 
-async fn legal_hold_compliance(Path(server): Path<String>) -> ApiResult {
+async fn legal_hold_compliance(
+    AuthExtractor(session): AuthExtractor,
+    Path(server): Path<String>,
+) -> ApiResult {
     if server.is_empty() {
         return Err(status_400("server_name cannot be empty"));
     }
@@ -9764,6 +9854,9 @@ async fn legal_hold_compliance(Path(server): Path<String>) -> ApiResult {
         .await
         .map_err(db_error)?;
 
+        // #2: only the principal's own-site holds count toward compliance
+        // (env-scoped principals see none — legal_holds is site-only).
+        let rows = retain_site_scoped(&session, rows, |r| r.site.as_str());
         let under_hold = !rows.is_empty();
         let holds: Vec<Value> = rows.iter().map(LegalHoldRow::to_json).collect();
         let message = if under_hold {
@@ -9788,6 +9881,12 @@ async fn legal_hold_compliance(Path(server): Path<String>) -> ApiResult {
         })));
     }
     // No-DB fallback: engine uses HOLD_STORE (current-process only).
+    // #2: no-DB fallback can't enforce site scope on the static HOLD_STORE; a
+    // scoped principal fails closed (503) rather than receive a possibly-false
+    // "no holds, safe to proceed" answer computed from cross-site demo data.
+    if is_scoped(&session) {
+        return Err(status_503_no_db());
+    }
     match legal_hold::check_compliance(&server) {
         Ok(result) => Ok(Json(serde_json::to_value(result).unwrap())),
         Err(e) => Err(status_400(&e)),
@@ -21426,6 +21525,17 @@ fn scope_guard_or_404(
     } else {
         Err(status_404(request_id))
     }
+}
+
+/// True iff the principal is scoped on EITHER axis (has any non-blank site or
+/// environment scope). Used to skip an extra pre-load round-trip for the common
+/// unrestricted case while still fail-closing for any scoped principal (#2).
+fn is_scoped(session: &AuthSession) -> bool {
+    session.site_scope.iter().any(|s| !s.trim().is_empty())
+        || session
+            .environment_scope
+            .iter()
+            .any(|s| !s.trim().is_empty())
 }
 
 /// Per-axis containment for a resource that TARGETS a set of values (e.g. a patch
@@ -38280,6 +38390,92 @@ mod db_lifecycle_tests {
         );
     }
 
+    /// #2 RBAC: the legal-hold handlers are site-scoped, each failing closed with
+    /// its OWN not-found response so out-of-scope is never an oracle: validate ->
+    /// 400, evidence -> 404, active (site query) -> 403, release (CAS) -> 409 with
+    /// the hold left unmutated. In-scope + unrestricted pass. Uses migration-026
+    /// seeds (lh-…0001 = DEFRA/Active, lh-…0002 = GBLON/Active).
+    #[tokio::test]
+    async fn legal_holds_are_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra = "lh-00000000-0000-0000-0000-000000000001";
+        let gblon_hold = "lh-00000000-0000-0000-0000-000000000002";
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // validate: out-of-scope == not-found (the handler's own 400).
+        let validated =
+            legal_hold_validate(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(validated, Err((StatusCode::BAD_REQUEST, _))),
+            "out-of-scope legal_hold_validate must look like not-found (400): {validated:?}"
+        );
+
+        // evidence: out-of-scope -> 404; in-scope -> not 404.
+        let ev_foreign =
+            legal_hold_evidence(AuthExtractor(gblon.clone()), Path(defra.to_string())).await;
+        assert!(
+            matches!(ev_foreign, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope legal_hold_evidence must 404: {ev_foreign:?}"
+        );
+        let ev_own =
+            legal_hold_evidence(AuthExtractor(gblon.clone()), Path(gblon_hold.to_string())).await;
+        assert!(
+            !matches!(ev_own, Err((StatusCode::NOT_FOUND, _))),
+            "in-scope legal_hold_evidence must pass: {ev_own:?}"
+        );
+
+        // active: out-of-scope site -> 403.
+        let active = legal_hold_active(
+            AuthExtractor(gblon.clone()),
+            Query(LegalHoldActiveQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(active, Err((StatusCode::FORBIDDEN, _))),
+            "out-of-scope legal_hold_active must be forbidden: {active:?}"
+        );
+
+        // release: out-of-scope -> 409 and the DEFRA hold must NOT be mutated.
+        let before: String = sqlx::query_scalar("SELECT status FROM legal_holds WHERE id = $1")
+            .bind(defra)
+            .fetch_one(pool)
+            .await
+            .expect("read defra hold status");
+        let released = legal_hold_release(AuthExtractor(gblon), Path(defra.to_string())).await;
+        let after: String = sqlx::query_scalar("SELECT status FROM legal_holds WHERE id = $1")
+            .bind(defra)
+            .fetch_one(pool)
+            .await
+            .expect("re-read defra hold status");
+        assert!(
+            matches!(released, Err((StatusCode::CONFLICT, _))),
+            "out-of-scope legal_hold_release must 409: {released:?}"
+        );
+        assert_eq!(
+            before, after,
+            "out-of-scope release must NOT have mutated the DEFRA hold"
+        );
+
+        // unrestricted -> passes.
+        let any = legal_hold_evidence(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(defra.to_string()),
+        )
+        .await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted legal_hold_evidence must pass: {any:?}"
+        );
+    }
+
     /// Read the raw persisted row through the global pool (so it observes what
     /// the handlers wrote), bypassing the in-memory store.
     async fn read_global_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
@@ -47455,9 +47651,12 @@ mod legal_hold_db_tests {
         );
 
         // Active query must include the hold with the new expiry.
-        let Ok(Json(active)) = legal_hold_active(Query(LegalHoldActiveQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let Ok(Json(active)) = legal_hold_active(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(LegalHoldActiveQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await
         else {
             cleanup_hold(pool, &id).await;
@@ -47508,9 +47707,12 @@ mod legal_hold_db_tests {
         assert_eq!(released["released_by"], "test-releaser");
 
         // Active query must NOT include the released hold.
-        let Ok(Json(active)) = legal_hold_active(Query(LegalHoldActiveQuery {
-            site: Some("DEFRA".into()),
-        }))
+        let Ok(Json(active)) = legal_hold_active(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(LegalHoldActiveQuery {
+                site: Some("DEFRA".into()),
+            }),
+        )
         .await
         else {
             cleanup_hold(pool, &id).await;
@@ -47549,7 +47751,12 @@ mod legal_hold_db_tests {
         };
         let id = placed["id"].as_str().expect("id").to_string();
 
-        let Ok(Json(evidence)) = legal_hold_evidence(Path(id.clone())).await else {
+        let Ok(Json(evidence)) = legal_hold_evidence(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_hold(pool, &id).await;
             panic!("evidence failed");
         };
@@ -47695,7 +47902,12 @@ mod legal_hold_db_tests {
         .await
         .expect("direct SQL insert for validate test");
 
-        let Ok(Json(result)) = legal_hold_validate(Path(id.clone())).await else {
+        let Ok(Json(result)) = legal_hold_validate(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.clone()),
+        )
+        .await
+        else {
             cleanup_hold(pool, &id).await;
             panic!("validate on direct-insert Active hold must succeed");
         };
@@ -47733,7 +47945,12 @@ mod legal_hold_db_tests {
         .await
         .expect("direct SQL insert for compliance test");
 
-        let Ok(Json(result)) = legal_hold_compliance(Path(srv.clone())).await else {
+        let Ok(Json(result)) = legal_hold_compliance(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(srv.clone()),
+        )
+        .await
+        else {
             cleanup_hold(pool, &id).await;
             panic!("compliance check must succeed");
         };
