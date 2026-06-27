@@ -28819,6 +28819,7 @@ async fn k8s_namespace_provision(
     }
 }
 async fn k8s_namespace_get(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(db) = get_db() else {
@@ -28828,6 +28829,8 @@ async fn k8s_namespace_get(
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&id))?;
+    // #2: k8s namespaces are site+environment scoped.
+    scope_guard_or_404(&session, &ns.site, "", &id)?;
     Ok(Json(container_namespace::get_namespace_response(&ns)))
 }
 async fn k8s_namespace_update_quota(
@@ -28840,6 +28843,13 @@ async fn k8s_namespace_update_quota(
     container_namespace::validate_capacity_bounds(b.cpu, b.memory, b.storage)
         .map_err(|e| status_400(&e))?;
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the namespace's site+environment BEFORE mutating
+    // (site/env are immutable, so this pre-load is TOCTOU-safe).
+    let existing = crate::repos::container_namespace::get_namespace(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     // The Terminating guard is applied ATOMICALLY in the repo UPDATE (no
     // read-then-write race): NotFound -> 404, Terminating -> 409.
     use crate::repos::container_namespace::TransitionOutcome;
@@ -28882,6 +28892,13 @@ async fn k8s_namespace_suspend(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the namespace's site+environment BEFORE mutating
+    // (site/env are immutable, so this pre-load is TOCTOU-safe).
+    let existing = crate::repos::container_namespace::get_namespace(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     use crate::repos::container_namespace::TransitionOutcome;
     let mut tx = db.begin().await.map_err(db_error)?;
     let outcome = crate::repos::container_namespace::set_namespace_status(
@@ -28925,6 +28942,13 @@ async fn k8s_namespace_resume(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on the namespace's site+environment BEFORE mutating
+    // (site/env are immutable, so this pre-load is TOCTOU-safe).
+    let existing = crate::repos::container_namespace::get_namespace(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     use crate::repos::container_namespace::TransitionOutcome;
     let mut tx = db.begin().await.map_err(db_error)?;
     let outcome = crate::repos::container_namespace::set_namespace_status(
@@ -28968,6 +28992,12 @@ async fn k8s_namespace_terminate(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let db = get_db().ok_or_else(status_503_no_db)?;
+    // #2: load + guard on site+environment BEFORE mutating (TOCTOU-safe).
+    let existing = crate::repos::container_namespace::get_namespace(db, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    scope_guard_or_404(&session, &existing.site, "", &id)?;
     // The "not already Terminating" guard is applied ATOMICALLY in the repo
     // UPDATE, so two concurrent terminates can't both succeed: the loser sees
     // Terminating -> 409. NotFound -> 404.
@@ -35832,6 +35862,40 @@ mod db_lifecycle_tests {
         ins.site_scope = vec![site.clone()];
         let ok = storage_volume_get(AuthExtractor(ins), Path(id.clone())).await;
         assert!(ok.is_ok(), "in-scope volume get must succeed: {ok:?}");
+    }
+
+    /// #2 RBAC (k8s namespaces, site-only): a by-id read is 404 out-of-scope and
+    /// succeeds in-scope.
+    #[tokio::test]
+    async fn k8s_namespace_by_id_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Some((id, site)): Option<(String, String)> =
+            sqlx::query_as("SELECT id::text, site FROM k8s_namespaces LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .expect("query k8s_namespaces")
+        else {
+            eprintln!("SKIP: no seeded k8s_namespaces");
+            return;
+        };
+        let other = if site == "GBLON" { "DEFRA" } else { "GBLON" };
+
+        let mut out = AuthSession::static_dry_run();
+        out.site_scope = vec![other.to_string()];
+        let denied = k8s_namespace_get(AuthExtractor(out), Path(id.clone())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope namespace get must 404: {denied:?}"
+        );
+
+        let mut ins = AuthSession::static_dry_run();
+        ins.site_scope = vec![site.clone()];
+        let ok = k8s_namespace_get(AuthExtractor(ins), Path(id.clone())).await;
+        assert!(ok.is_ok(), "in-scope namespace get must succeed: {ok:?}");
     }
 
     /// B2 (deterministic): calling `apply_transition_audited` TWICE with the
