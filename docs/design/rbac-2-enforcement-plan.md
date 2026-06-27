@@ -25,6 +25,7 @@
 - [x] **noise remediation** — `0724731` (noisy_triggers NO site col → HOST-DERIVED via site_from_host; 7 handlers (audit said 4); detect/flapping body-guard, suggest/suppress/resolve host pre-load guard, report enforce_site_scope, suppressed_list host-filter; no-DB fail-closed; codex caught suggest full-row-before-guard oracle, fixed)
 - [x] **vm day-2** — `a88494b` (vm_day2_operations DUAL-AXIS site+environment; 4 (contract static); plan enforce_scope_filters, validate/execute/verify scope_guard_or_404 before status-409; codex APPROVED first pass)
 - [x] **oob access** — `ff6f8d4` (oob_endpoints site-only; all 8 (contract static); test_endpoint pre-load guard before UPDATE, validate_cert/check_defaults by-id, inventory/failing enforce_site_scope (both paths), cert_expiring/firmware_outdated retain + no-DB fail-closed, validate_site Path-guard; codex APPROVED first pass)
+- [x] **image factory** — `f905ecc` (golden_images.site_scope; all 8 (contract static); initiate/schedule body-guard, run_tests/promote/reject by-id guard before transition, active/history Path-guard, superseded retain; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -228,10 +229,10 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **oob_test_endpoint / oob_validate_cert / oob_check_defaults** [high] `sources/ryuki-api/src/contracts.rs:22761` — For oob_validate_cert and oob_check_defaults: add `AuthExtractor(session): AuthExtractor` to the signature, and after the `row.ok_or_else(...)?` unwrap call `scope_guard_or_404(&se
 
 ## image_factory  (4)
-- [ ] **image_factory_initiate_build / image_factory_schedule_monthly** [high] `sources/ryuki-api/src/contracts.rs:24616` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param to both handlers, then call `guard_body_site_scope(&session, &body.site)?` (defined contracts.rs:21033) bef
-- [ ] **image_factory_run_tests / image_factory_promote / image_factory_reject** [high] `sources/ryuki-api/src/contracts.rs:24644` — These by-id handlers cannot use enforce_site_scope (no ?site param). Add an AuthSession/AuthExtractor extractor to each handler signature (mirroring enforced siblings around :14346
-- [ ] **image_factory_active / image_factory_history** [high] `sources/ryuki-api/src/contracts.rs:24706` — 
-- [ ] **image_factory_superseded** [high] `sources/ryuki-api/src/contracts.rs:24754` — Add an AuthSession extractor to the handler and narrow the rows in-handler before returning, keyed on the model's site_scope field, using the existing helper retain_site_scoped (co
+- [x] **image_factory_initiate_build / image_factory_schedule_monthly** [high] `sources/ryuki-api/src/contracts.rs:24616` — Add `AuthExtractor(session): AuthExtractor` as the first extractor param to both handlers, then call `guard_body_site_scope(&session, &body.site)?` (defined contracts.rs:21033) bef
+- [x] **image_factory_run_tests / image_factory_promote / image_factory_reject** [high] `sources/ryuki-api/src/contracts.rs:24644` — These by-id handlers cannot use enforce_site_scope (no ?site param). Add an AuthSession/AuthExtractor extractor to each handler signature (mirroring enforced siblings around :14346
+- [x] **image_factory_active / image_factory_history** [high] `sources/ryuki-api/src/contracts.rs:24706` — 
+- [x] **image_factory_superseded** [high] `sources/ryuki-api/src/contracts.rs:24754` — Add an AuthSession extractor to the handler and narrow the rows in-handler before returning, keyed on the model's site_scope field, using the existing helper retain_site_scoped (co
 
 ## runbook  (4)
 - [ ] **runbook_start** [high] `sources/ryuki-api/src/contracts.rs:25250` — In runbook_start (contracts.rs:25250), insert `guard_body_site_scope(&session, &body.site)?;` BEFORE the build_execution/insert call — right after `let pool = get_db()...?;` at lin
