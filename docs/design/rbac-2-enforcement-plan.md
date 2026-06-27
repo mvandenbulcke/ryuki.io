@@ -16,6 +16,7 @@
 - [x] **emergency changes** — `b9655e4` (site-only break-glass; all 6; ProblemDetails guards emergency_scope_guard/_preload_guard; per-action 404; guard before status-409; no-DB fail-closed 503; emergency_history pre-scoped; codex APPROVED first pass)
 - [x] **managed secrets** — `3325fb8` (site-only; 7 handlers incl. rotation_history the audit missed; re-home guard on update; rotation_fail scopes via parent secret_id; no-DB fail-closed 503; codex caught a cross-site vault_path leak in due/expiring no-DB fallbacks, fixed)
 - [x] **sql deployments** — `df32e33` (site-only; 6 of 8 handlers (validate is pure, inventory pre-scoped); plan body-guard + install/configure/verify/backup/monitoring by-id guard before state-409; standard status_404 so no oracle; codex APPROVED first pass)
+- [x] **file shares** — `3ecfec9` (site-only; 5 of 8 (list/recert-due/stale-owners pre-scoped, contract static); by-id reads + recertify CAS + ACL open-access/report/revoke all load+guard the parent share before child ACL access; codex APPROVED first pass)
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -152,11 +153,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **sql_deploy_monitoring** [high] `sources/ryuki-api/src/contracts.rs:31435` — Add `AuthExtractor(session): AuthExtractor,` as the first extractor in the sql_deploy_monitoring signature (mirroring sql_deploy_install at contracts.rs:31264). Then, immediately a
 
 ## shares  (5)
-- [ ] **shares_get** [high] `sources/ryuki-api/src/contracts.rs:4718` — Add `AuthExtractor(session): AuthExtractor` as the first handler parameter (the route is GET so the extractor composes fine), then guard after loading the share but before loading 
-- [ ] **shares_recertify** [high] `sources/ryuki-api/src/contracts.rs:4748` — Add `AuthExtractor(session): AuthExtractor` as the first handler argument, then immediately after `current` is loaded (right after line 4760) insert `scope_guard_or_404(&session, &
-- [ ] **shares_open_access** [high] `sources/ryuki-api/src/contracts.rs:4784` — 
-- [ ] **shares_permission_report** [high] `sources/ryuki-api/src/contracts.rs:4818` — 1) Add AuthExtractor to the handler: change the signature to `async fn shares_permission_report(AuthExtractor(session): AuthExtractor, Path(id): Path<String>) -> ApiResult`. 2) Aft
-- [ ] **shares_revoke** [high] `sources/ryuki-api/src/contracts.rs:4834` — In shares_revoke (contracts.rs:4834), after obtaining `pool` (line 4838) and before the revoke_permission DELETE (line 4840), load the parent share and guard by its site: `let shar
+- [x] **shares_get** [high] `sources/ryuki-api/src/contracts.rs:4718` — Add `AuthExtractor(session): AuthExtractor` as the first handler parameter (the route is GET so the extractor composes fine), then guard after loading the share but before loading 
+- [x] **shares_recertify** [high] `sources/ryuki-api/src/contracts.rs:4748` — Add `AuthExtractor(session): AuthExtractor` as the first handler argument, then immediately after `current` is loaded (right after line 4760) insert `scope_guard_or_404(&session, &
+- [x] **shares_open_access** [high] `sources/ryuki-api/src/contracts.rs:4784` — 
+- [x] **shares_permission_report** [high] `sources/ryuki-api/src/contracts.rs:4818` — 1) Add AuthExtractor to the handler: change the signature to `async fn shares_permission_report(AuthExtractor(session): AuthExtractor, Path(id): Path<String>) -> ApiResult`. 2) Aft
+- [x] **shares_revoke** [high] `sources/ryuki-api/src/contracts.rs:4834` — In shares_revoke (contracts.rs:4834), after obtaining `pool` (line 4838) and before the revoke_permission DELETE (line 4840), load the parent share and guard by its site: `let shar
 
 ## degradation  (5)
 - [ ] **degradation_enter** [high] `sources/ryuki-api/src/contracts.rs:7507` — Add a site-scope write guard at the top of degradation_enter (contracts.rs:7507), BEFORE pool.begin()/the repos::degradation::enter DB write. The (site,env) source is Path(site) ch
