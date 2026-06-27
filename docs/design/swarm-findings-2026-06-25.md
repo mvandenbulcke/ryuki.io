@@ -299,6 +299,13 @@ Ranked: High severity, then CI-validatable, then smaller effort first. `CI` = pr
 - **area:** ryuki-api/src/contracts.rs (LocalLoginRequest, CreateTokenRequest, and ~95+ other request structs) · **kind:** security-gap · **severity:** medium · **effort:** S · **ci_validatable:** True
 - **evidence:** LocalLoginRequest (line ~10160) and CreateTokenRequest (line ~11545) lack #[serde(deny_unknown_fields)]. Only 17 of ~115 request/body structs have this attribute. Attackers can send typo'd fields that are silently dropped, potentially causing 'works as intended' failures to mask security logic. Example: sending 'passwrod' instead of 'password' on local login would be silently ignored, a sign of weak input validation. The attribute prevents this silent field-dropping by raising 422 Unprocessable Entity on unknown fields.
 - **verified:** The claim is verified as technically accurate: LocalLoginRequest (line 9993) and CreateTokenRequest (line 11496) in sources/ryuki-api/src/contracts.rs lack #[serde(deny_unknown_fields)]. I confirmed 218 total Deserialize-derived request structs with only 17 having the attribute, matching the claim's ratio. However, the actual security risk is limited: (1) LocalLoginRequest has only required fields, so missing fields cause full rejection, not silent default-use. (2) CreateTokenRequest has optional fields with defaults; a typo like 'roles_typo' causes roles to default to empty vec, producing a z
+- **STATUS (2026-06-27) — ALREADY CLOSED:** both `LocalLoginRequest` and
+  `CreateTokenRequest` now carry `#[serde(deny_unknown_fields)]` (verified in
+  contracts.rs), so a typo'd field is a 422 rather than a silent drop. The
+  finding was stale / already addressed. Verified portal-compatible: the portal
+  sends exactly the struct fields for both (login `{username,password}`;
+  token-create the six matching fields), so the strict contract does not break
+  the client.
 
 ### 15. Audit logging missing on sensitive scope-related mutations
 - **area:** ryuki-api/src/contracts.rs (user_preferences_put, line 15228) · **kind:** missing-feature · **severity:** medium · **effort:** S · **ci_validatable:** True
