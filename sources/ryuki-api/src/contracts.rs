@@ -30274,7 +30274,10 @@ async fn compliance_controls_list(
     })))
 }
 
-async fn compliance_control_get(Path(id): Path<String>) -> ApiResult {
+async fn compliance_control_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let Some(pool) = get_db() else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -30290,6 +30293,14 @@ async fn compliance_control_get(Path(id): Path<String>) -> ApiResult {
                 Json(json!({"error": format!("Compliance control '{}' not found", id)})),
             )
         })?;
+    // #2: an out-of-scope control is reported identically to a missing one (the
+    // handler's own 404 body) so a scoped principal gets no existence oracle.
+    if !row_scope_permits(&session, &ctrl.site, "") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance control '{}' not found", id)})),
+        ));
+    }
     Ok(Json(json!({ "source": "db", "control": ctrl })))
 }
 
@@ -30307,6 +30318,21 @@ async fn compliance_control_assess(
         compliance_reporting::parse_control_status(&b.status).map_err(|e| status_400(&e))?;
 
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scope on the control's site BEFORE the assessment write; an out-of-scope
+    // or missing control is reported as the same not-found (no oracle, no
+    // cross-site assess).
+    match crate::repos::compliance_reporting::get_control(pool, &id)
+        .await
+        .map_err(db_error)?
+    {
+        Some(ref c) if row_scope_permits(&session, &c.site, "") => {}
+        _ => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Compliance control '{}' not found", id)})),
+            ));
+        }
+    }
     use crate::repos::compliance_reporting::AssessOutcome;
     match crate::repos::compliance_reporting::assess_control(
         pool,
@@ -30377,7 +30403,10 @@ async fn compliance_report_generate(
     Ok(Json(json!({ "source": "db", "report": report })))
 }
 
-async fn compliance_report_get(Path(id): Path<String>) -> ApiResult {
+async fn compliance_report_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
     let Some(pool) = get_db() else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -30393,6 +30422,13 @@ async fn compliance_report_get(Path(id): Path<String>) -> ApiResult {
                 Json(json!({"error": format!("Compliance report '{}' not found", id)})),
             )
         })?;
+    // #2: out-of-scope -> the SAME not-found (no existence oracle).
+    if !row_scope_permits(&session, &report.site, "") {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Compliance report '{}' not found", id)})),
+        ));
+    }
     Ok(Json(json!({ "source": "db", "report": report })))
 }
 
@@ -30435,6 +30471,28 @@ async fn compliance_finding_resolve(
         return Err(status_400("resolution cannot be empty"));
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: compliance_findings has no site column — scope on the parent report's
+    // site (join). An out-of-scope or missing finding -> the same 404 "Finding not
+    // found" before the resolve write (no oracle, no cross-site resolve).
+    if is_scoped(&session) {
+        let site: Option<String> = sqlx::query_scalar(
+            "SELECT cr.site FROM compliance_findings cf \
+             JOIN compliance_reports cr ON cf.report_id = cr.id WHERE cf.id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Finding '{}' not found", id)})),
+            ));
+        }
+    }
     use crate::repos::compliance_reporting::MutationOutcome;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let outcome = crate::repos::compliance_reporting::resolve_finding(&mut *tx, &id, &b.resolution)
@@ -30478,6 +30536,27 @@ async fn compliance_finding_waive(
         return Err(status_400(&format!("Invalid waiver expiry: {}", b.expiry)));
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
+    // #2: scope on the finding's parent report site (join) before the waiver write;
+    // out-of-scope or missing -> the same 404 "Finding not found".
+    if is_scoped(&session) {
+        let site: Option<String> = sqlx::query_scalar(
+            "SELECT cr.site FROM compliance_findings cf \
+             JOIN compliance_reports cr ON cf.report_id = cr.id WHERE cf.id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Finding '{}' not found", id)})),
+            ));
+        }
+    }
     use crate::repos::compliance_reporting::MutationOutcome;
     let mut tx = pool.begin().await.map_err(db_error)?;
     let outcome = crate::repos::compliance_reporting::create_waiver(
@@ -39499,6 +39578,77 @@ mod db_lifecycle_tests {
             all_total > scoped_total,
             "scoped report must exclude other sites' devices: scoped={scoped_total} all={all_total}"
         );
+    }
+
+    /// #2 RBAC: the compliance handlers are site-scoped (controls/reports have
+    /// site; findings scope via the parent-report join; frameworks are global). A
+    /// GBLON principal gets 404 reading a DEFRA control/report or resolving a DEFRA
+    /// finding (no oracle, no cross-site mutation); in-scope + unrestricted pass.
+    /// Ids resolved at runtime (migration 082 seeds).
+    #[tokio::test]
+    async fn compliance_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let q = |sql: &'static str| async move {
+            sqlx::query_scalar::<_, String>(sql)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+        };
+        let defra_ctrl = q("SELECT id FROM compliance_controls WHERE site = 'DEFRA' LIMIT 1").await;
+        let gblon_ctrl = q("SELECT id FROM compliance_controls WHERE site = 'GBLON' LIMIT 1").await;
+        let defra_report =
+            q("SELECT id FROM compliance_reports WHERE site = 'DEFRA' LIMIT 1").await;
+        let defra_finding = q("SELECT cf.id FROM compliance_findings cf JOIN compliance_reports cr ON cf.report_id = cr.id WHERE cr.site = 'DEFRA' LIMIT 1").await;
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        if let Some(id) = defra_ctrl.clone() {
+            let got = compliance_control_get(AuthExtractor(gblon.clone()), Path(id.clone())).await;
+            assert!(
+                matches!(got, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope compliance_control_get must 404: {got:?}"
+            );
+            let any =
+                compliance_control_get(AuthExtractor(AuthSession::static_dry_run()), Path(id))
+                    .await;
+            assert!(
+                !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+                "unrestricted compliance_control_get must pass: {any:?}"
+            );
+        }
+        if let Some(id) = gblon_ctrl {
+            let own = compliance_control_get(AuthExtractor(gblon.clone()), Path(id)).await;
+            assert!(
+                !matches!(own, Err((StatusCode::NOT_FOUND, _))),
+                "in-scope compliance_control_get must pass: {own:?}"
+            );
+        }
+        if let Some(id) = defra_report {
+            let got = compliance_report_get(AuthExtractor(gblon.clone()), Path(id)).await;
+            assert!(
+                matches!(got, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope compliance_report_get must 404: {got:?}"
+            );
+        }
+        if let Some(id) = defra_finding {
+            let resolved = compliance_finding_resolve(
+                AuthExtractor(gblon),
+                Path(id),
+                Json(ComplianceResolveRequest {
+                    resolution: "scope-test".into(),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(resolved, Err((StatusCode::NOT_FOUND, _))),
+                "out-of-scope compliance_finding_resolve must 404: {resolved:?}"
+            );
+        }
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
