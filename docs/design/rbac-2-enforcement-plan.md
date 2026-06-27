@@ -35,6 +35,20 @@
 - [x] **slo** — `45b7d1b` (slo_definitions DUAL-AXIS nullable; update/delete subset-containment guard (multi_scope_permits) w/ SELECT…FOR UPDATE before the write; platform-wide-on-a-scoped-axis denied; codex APPROVED, TOCTOU caveat closed via row lock)
 - [x] **decommission** — `5bfe1d5` (site-only domain; new site_scope_guard_or_404 by-id 404 guard; plan body 403; approve/quarantine/execute/rollback guard before engine 409; verify/get/inventory were SESSIONLESS now scoped; validate left stateless; codex APPROVED)
 - [x] **linux_deploy** — `8dd3a9f` (site-only domain; plan body 403 via guard_body_site_scope; validate/execute/verify by-id site_scope_guard_or_404 before the lifecycle 409; env-scoped fail-closed; codex APPROVED. also fix(test) deploymentId→deployment_id 99e9091)
+- [x] **approvals** — `285d4d1` (approvals_pending narrows the pending queue via enforce_scope_filters, mirrors requests_list; multi-scope-ambiguous → 403)
+- [x] **software** — `285d4d1` (software_compliance +AuthExtractor; guard_body_site_scope on the required site, covers DB + no-DB fallback)
+- [x] **backup** — `285d4d1` (restore dual-axis: plan body-guard, validate/approve/execute/get by-id 404, list filtered; coverage reports multi-axis within_multi_scope create/list/get; restore-test recency scoped in-SQL before GROUP BY — last two were codex-found gaps)
+- [x] **on_call** — `285d4d1` (on_call_contacts NULLABLE site, new nullable_site_scope_guard_or_404 STRICT containment; get/update/delete/list + create 403)
+- [x] **cancel** — `285d4d1` (cancel_one no-DB in-memory branch guarded; DB branch already guarded; covers requests_cancel + batch)
+- [x] **events** — `285d4d1` (events_alert_ack PERMISSIVE NULL matching domain_events::list_alerts; new repo fn event_scope)
+- [x] **aiops** — `ef54efa` (aiops_review 404 guard + site-aware CAS write; accept/reject/implement 403→404 oracle fix)
+- [x] **repo_capacity** — `ef54efa` (forecast/trend/recommendations +AuthExtractor + by-id 404 on loaded repo)
+- [x] **firewall** — `ef54efa` (rule_set_list +AuthExtractor enforce/retain; get/apply/revoke 403→404 oracle fix)
+- [x] **apply (chokepoint)** — `b6b3e45` (apply_transition_audited guards site+environment once for every request transition; confirmed)
+- [x] **dr** — pre-existing (dr_tests_due enforce_site_scope; confirmed guarded)
+- [x] **requests_approve_live_apply** — `2385b05` (admin≠unrestricted; dual-axis scope_guard_or_404 before the mint/409s; audit missed it)
+
+**SWEEP COMPLETE (2026-06-27):** every confirmed-gap handler across all 44 domain groups is now site/environment-scope enforced, codex-reviewed, and tested. A whole-file audit script confirmed no handler named in any box remains unguarded (the 3 it flagged were a false positive on dr, a transitive guard via cancel_one, and the now-fixed live-apply). Below: the original per-domain work-list, all ticked.
 
 Resume with the next unchecked domain below (lb / logs / immutability / patch / secrets / emergency / decommission / …). Per-domain cadence: confirm the table has site (and/or environment), apply guards, add a scoped DB test, clippy + router-build, commit.
 
@@ -43,33 +57,33 @@ Authoritative work-list from the 203-agent verified audit (149 handlers already 
 Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment,&id)?` right after load (SITE-ONLY tables pass `""` for environment, which fails-closed for env-scoped principals); list/query -> `enforce_site_scope` / `retain_site_scoped`; write-from-body -> `enforce_scope_filters`. CAVEATS: some handlers take no session (need AuthExtractor added = makes an open read require auth); some read child tables (e.g. rotation_runs) needing the parent's site via join; confirm each table actually has a site column before guarding.
 
 ## requests  (15)
-- [ ] **requests_create** [high] `sources/ryuki-api/src/contracts.rs:13742` — Insert a dual-axis body-scope guard immediately AFTER the check_permission gate (after line 13767, before the engine create_request call at 13769 and the INSERT at 13820). Source o
-- [ ] **requests_approve_live_apply** [high] `sources/ryuki-api/src/contracts.rs:14168` — Add the by-id scope guard before the grant is minted, mirroring requests_get / requests_execution_job. 1) Add `environment: String` to the PlanJobRow struct (14206-14213). 2) Add `
-- [ ] **requests_validate** [high] `sources/ryuki-api/src/contracts.rs:14439` — DB path: immediately after loading `current` (after contracts.rs:14458, before validate_request at 14461) insert `scope_guard_or_404(&session, &current.site, &current.environment, 
-- [ ] **requests_approve** [high] `sources/ryuki-api/src/contracts.rs:15121` — In requests_approve, insert a scope guard immediately after the row is loaded in BOTH paths, before check_sod / approve_request / apply_transition_audited. DB path: after the `.ok_
-- [ ] **requests_lock** [high] `sources/ryuki-api/src/contracts.rs:15234` — DB path: right after loading `current` (after contracts.rs:15251), add scope_guard_or_404(&session, &current.site, &current.environment, &request_id)? so an out-of-scope row 404s e
-- [ ] **requests_execute** [high] `sources/ryuki-api/src/contracts.rs:15309` — DB path: after the row is loaded (insert after line 15352, before request_lifecycle::begin_execution at 15363) add scope_guard_or_404(&session, &current.site, &current.environment,
-- [ ] **requests_verify** [high] `sources/ryuki-api/src/contracts.rs:15487` — 
-- [ ] **requests_protect** [high] `sources/ryuki-api/src/contracts.rs:15618` — Add a scope guard immediately after loading the row, before the engine transition / before returning, in BOTH branches. DB branch (after line 15635, mirroring requests_get:14376): 
-- [ ] **requests_publish** [high] `sources/ryuki-api/src/contracts.rs:15726` — In the DB branch, after loading `current` (line 15743) and before apply_transition_audited (15761), insert: scope_guard_or_404(&session, &current.site, &current.environment, &reque
-- [ ] **requests_retire** [high] `sources/ryuki-api/src/contracts.rs:15835` — Add the canonical by-id guard immediately after the DB row loads (after line 15852, before retire_request at 15855): scope_guard_or_404(&session, &current.site, &current.environmen
-- [ ] **requests_reject** [high] `sources/ryuki-api/src/contracts.rs:15951` — DB path: immediately after the `current` row loads (after 15975, before check_sod at 15979) insert `scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
-- [ ] **requests_rework** [high] `sources/ryuki-api/src/contracts.rs:16072` — Add a post-load by-id scope guard in BOTH paths, mirroring request_evidence_pack (:16814). DB path: immediately after building `let request = db_row_to_request(&current, &request_i
-- [ ] **requests_batch_cancel** [high] `sources/ryuki-api/src/contracts.rs:16372` — Fix in the shared core cancel_one (contracts.rs:16276) so BOTH batch (16372) and single (16254) paths are covered in one place. DB branch: after loading `current` (line 16290) and 
-- [ ] **requests_fail** [medium] `sources/ryuki-api/src/contracts.rs:16161` — After loading `current` (line 16189), add scope_guard_or_404(&session, &current.site, &current.environment, &request_id)? before the fail_request/apply_transition_audited write — (
-- [ ] **requests_plan** [?] `sources/ryuki-api/src/contracts.rs:14991` — 
+- [x] **requests_create** [high] `sources/ryuki-api/src/contracts.rs:13742` — Insert a dual-axis body-scope guard immediately AFTER the check_permission gate (after line 13767, before the engine create_request call at 13769 and the INSERT at 13820). Source o
+- [x] **requests_approve_live_apply** [high] `sources/ryuki-api/src/contracts.rs:14168` — Add the by-id scope guard before the grant is minted, mirroring requests_get / requests_execution_job. 1) Add `environment: String` to the PlanJobRow struct (14206-14213). 2) Add `
+- [x] **requests_validate** [high] `sources/ryuki-api/src/contracts.rs:14439` — DB path: immediately after loading `current` (after contracts.rs:14458, before validate_request at 14461) insert `scope_guard_or_404(&session, &current.site, &current.environment, 
+- [x] **requests_approve** [high] `sources/ryuki-api/src/contracts.rs:15121` — In requests_approve, insert a scope guard immediately after the row is loaded in BOTH paths, before check_sod / approve_request / apply_transition_audited. DB path: after the `.ok_
+- [x] **requests_lock** [high] `sources/ryuki-api/src/contracts.rs:15234` — DB path: right after loading `current` (after contracts.rs:15251), add scope_guard_or_404(&session, &current.site, &current.environment, &request_id)? so an out-of-scope row 404s e
+- [x] **requests_execute** [high] `sources/ryuki-api/src/contracts.rs:15309` — DB path: after the row is loaded (insert after line 15352, before request_lifecycle::begin_execution at 15363) add scope_guard_or_404(&session, &current.site, &current.environment,
+- [x] **requests_verify** [high] `sources/ryuki-api/src/contracts.rs:15487` — 
+- [x] **requests_protect** [high] `sources/ryuki-api/src/contracts.rs:15618` — Add a scope guard immediately after loading the row, before the engine transition / before returning, in BOTH branches. DB branch (after line 15635, mirroring requests_get:14376): 
+- [x] **requests_publish** [high] `sources/ryuki-api/src/contracts.rs:15726` — In the DB branch, after loading `current` (line 15743) and before apply_transition_audited (15761), insert: scope_guard_or_404(&session, &current.site, &current.environment, &reque
+- [x] **requests_retire** [high] `sources/ryuki-api/src/contracts.rs:15835` — Add the canonical by-id guard immediately after the DB row loads (after line 15852, before retire_request at 15855): scope_guard_or_404(&session, &current.site, &current.environmen
+- [x] **requests_reject** [high] `sources/ryuki-api/src/contracts.rs:15951` — DB path: immediately after the `current` row loads (after 15975, before check_sod at 15979) insert `scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+- [x] **requests_rework** [high] `sources/ryuki-api/src/contracts.rs:16072` — Add a post-load by-id scope guard in BOTH paths, mirroring request_evidence_pack (:16814). DB path: immediately after building `let request = db_row_to_request(&current, &request_i
+- [x] **requests_batch_cancel** [high] `sources/ryuki-api/src/contracts.rs:16372` — Fix in the shared core cancel_one (contracts.rs:16276) so BOTH batch (16372) and single (16254) paths are covered in one place. DB branch: after loading `current` (line 16290) and 
+- [x] **requests_fail** [medium] `sources/ryuki-api/src/contracts.rs:16161` — After loading `current` (line 16189), add scope_guard_or_404(&session, &current.site, &current.environment, &request_id)? before the fail_request/apply_transition_audited write — (
+- [x] **requests_plan** [?] `sources/ryuki-api/src/contracts.rs:14991` — 
 
 ## certificates  (10)
-- [ ] **certificates_request** [high] `sources/ryuki-api/src/contracts.rs:21857` — Add `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = get_db()...?;` (after contracts.rs:21861) and before building the CertificateRequest, mirroring th
-- [ ] **certificates_get / certificates_approve / certificates_install / certificates_verify** [high] `sources/ryuki-api/src/contracts.rs:22077` — For each handler add `AuthExtractor(session): AuthExtractor` as the first param, then after loading the record and before returning, call `scope_guard_or_404(&session, &record.site
-- [ ] **certificates_renew / certificates_revoke** [high] `sources/ryuki-api/src/contracts.rs:21952` — In certificates_renew (contracts.rs:21952), immediately after the `cert` load+404 (after line 21962, before the Revoked-status 409 check at 21965), add `guard_body_site_scope(&sess
-- [ ] **certificates_inventory** [high] `sources/ryuki-api/src/contracts.rs:22067` — In sources/ryuki-api/src/contracts.rs:22067, change the signature to take `AuthExtractor(session): AuthExtractor` and an optional `?site` query param (mirror CertificateExpiringQue
-- [ ] **certificates_get** [high] `sources/ryuki-api/src/contracts.rs:22077` — Extract the session and add a post-load scope guard, mirroring certificates_expiring on the same table. Change signature to `async fn certificates_get(AuthExtractor(session): AuthE
-- [ ] **certificates_renew** [high] `sources/ryuki-api/src/contracts.rs:21952` — Add the by-id WRITE scope guard immediately after the row is loaded, before any state transition. In certificates_renew, right after line 21962 (`.ok_or_else(|| status_404(&id))?`)
-- [ ] **certificates_revoke** [high] `sources/ryuki-api/src/contracts.rs:22003` — In certificates_revoke, after loading the row (contracts.rs:22012) and BEFORE the engine guard at :22017, add `scope_guard_or_404(&session, &cert.site, "", &id)?;`. The (site,env) 
-- [ ] **certificates_approve** [medium] `sources/ryuki-api/src/contracts.rs:21919` — Add scope enforcement to the by-id read. (1) Change the signature to take the session: `async fn certificates_approve(AuthExtractor(session): AuthExtractor, Path(id): Path<String>)
-- [ ] **certificates_install** [medium] `sources/ryuki-api/src/contracts.rs:21930` — Add `AuthExtractor(session): AuthExtractor` as the first param of certificates_install, then immediately after loading `record` (line 21937, before the return at 21938) enforce SIT
-- [ ] **certificates_verify** [?] `sources/ryuki-api/src/contracts.rs:21941` — Add AuthExtractor(session): AuthExtractor to the certificates_verify signature, then after loading the record call scope_guard_or_404(&session, &record.site, "", &id)? BEFORE retur
+- [x] **certificates_request** [high] `sources/ryuki-api/src/contracts.rs:21857` — Add `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = get_db()...?;` (after contracts.rs:21861) and before building the CertificateRequest, mirroring th
+- [x] **certificates_get / certificates_approve / certificates_install / certificates_verify** [high] `sources/ryuki-api/src/contracts.rs:22077` — For each handler add `AuthExtractor(session): AuthExtractor` as the first param, then after loading the record and before returning, call `scope_guard_or_404(&session, &record.site
+- [x] **certificates_renew / certificates_revoke** [high] `sources/ryuki-api/src/contracts.rs:21952` — In certificates_renew (contracts.rs:21952), immediately after the `cert` load+404 (after line 21962, before the Revoked-status 409 check at 21965), add `guard_body_site_scope(&sess
+- [x] **certificates_inventory** [high] `sources/ryuki-api/src/contracts.rs:22067` — In sources/ryuki-api/src/contracts.rs:22067, change the signature to take `AuthExtractor(session): AuthExtractor` and an optional `?site` query param (mirror CertificateExpiringQue
+- [x] **certificates_get** [high] `sources/ryuki-api/src/contracts.rs:22077` — Extract the session and add a post-load scope guard, mirroring certificates_expiring on the same table. Change signature to `async fn certificates_get(AuthExtractor(session): AuthE
+- [x] **certificates_renew** [high] `sources/ryuki-api/src/contracts.rs:21952` — Add the by-id WRITE scope guard immediately after the row is loaded, before any state transition. In certificates_renew, right after line 21962 (`.ok_or_else(|| status_404(&id))?`)
+- [x] **certificates_revoke** [high] `sources/ryuki-api/src/contracts.rs:22003` — In certificates_revoke, after loading the row (contracts.rs:22012) and BEFORE the engine guard at :22017, add `scope_guard_or_404(&session, &cert.site, "", &id)?;`. The (site,env) 
+- [x] **certificates_approve** [medium] `sources/ryuki-api/src/contracts.rs:21919` — Add scope enforcement to the by-id read. (1) Change the signature to take the session: `async fn certificates_approve(AuthExtractor(session): AuthExtractor, Path(id): Path<String>)
+- [x] **certificates_install** [medium] `sources/ryuki-api/src/contracts.rs:21930` — Add `AuthExtractor(session): AuthExtractor` as the first param of certificates_install, then immediately after loading `record` (line 21937, before the return at 21938) enforce SIT
+- [x] **certificates_verify** [?] `sources/ryuki-api/src/contracts.rs:21941` — Add AuthExtractor(session): AuthExtractor to the certificates_verify signature, then after loading the record call scope_guard_or_404(&session, &record.site, "", &id)? BEFORE retur
 
 ## lb  (9)
 - [x] **lb_provision** [high] `sources/ryuki-api/src/contracts.rs:30508` — Add `AuthExtractor(session): AuthExtractor` to the lb_provision signature, then before build_provision call `let (eff_site, _) = enforce_scope_filters(&session, norm(&b.site), None
@@ -112,13 +126,13 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **ad_get** [medium] `sources/ryuki-api/src/contracts.rs:4341` — In ad_get (contracts.rs:4341): change the signature to bind the session (AuthExtractor(session): AuthExtractor) instead of _session, then gate on the loaded site BEFORE returning. 
 
 ## gmsa  (7)
-- [ ] **gmsa_assign** [high] `sources/ryuki-api/src/contracts.rs:4436` — Load the account's site before the mutation and guard it with the site-only write helper. Cleanest oracle-safe approach: extend add_host in sources/ryuki-api/src/repos/gmsa_account
-- [ ] **gmsa_remove** [high] `sources/ryuki-api/src/contracts.rs:4485` — Load the account's site before mutating and gate it, failing CLOSED with a 404 (same as a missing row, to avoid a cross-scope existence oracle). In gmsa_remove at contracts.rs:4485
-- [ ] **gmsa_rotate** [high] `sources/ryuki-api/src/contracts.rs:4540` — In gmsa_rotate, immediately after loading `account` (contracts.rs:4546) and before the revoked pre-check / CAS rotate, add a by-id-style scope guard using row_scope_permits (the he
-- [ ] **gmsa_test** [high] `sources/ryuki-api/src/contracts.rs:4593` — Add `AuthExtractor(session): AuthExtractor` as the first parameter of gmsa_test (mirroring gmsa_inventory at line 4607). After loading `account` (line 4599) and BEFORE the `test_re
-- [ ] **gmsa_expiring** [high] `sources/ryuki-api/src/contracts.rs:4623` — Add `AuthExtractor(session): AuthExtractor` to the gmsa_expiring signature (and optionally `Query(query): Query<GmsaInventoryQuery>` to accept an optional ?site), mirroring gmsa_in
-- [ ] **gmsa_assign / gmsa_remove / gmsa_rotate** [high] `sources/ryuki-api/src/contracts.rs:4436` — 
-- [ ] **gmsa_create** [?] `sources/ryuki-api/src/contracts.rs:4376` — Add the canonical site-only write guard at the top of gmsa_create, immediately after the session is extracted and before any DB work. body.site is the required CONCRETE (non-Option
+- [x] **gmsa_assign** [high] `sources/ryuki-api/src/contracts.rs:4436` — Load the account's site before the mutation and guard it with the site-only write helper. Cleanest oracle-safe approach: extend add_host in sources/ryuki-api/src/repos/gmsa_account
+- [x] **gmsa_remove** [high] `sources/ryuki-api/src/contracts.rs:4485` — Load the account's site before mutating and gate it, failing CLOSED with a 404 (same as a missing row, to avoid a cross-scope existence oracle). In gmsa_remove at contracts.rs:4485
+- [x] **gmsa_rotate** [high] `sources/ryuki-api/src/contracts.rs:4540` — In gmsa_rotate, immediately after loading `account` (contracts.rs:4546) and before the revoked pre-check / CAS rotate, add a by-id-style scope guard using row_scope_permits (the he
+- [x] **gmsa_test** [high] `sources/ryuki-api/src/contracts.rs:4593` — Add `AuthExtractor(session): AuthExtractor` as the first parameter of gmsa_test (mirroring gmsa_inventory at line 4607). After loading `account` (line 4599) and BEFORE the `test_re
+- [x] **gmsa_expiring** [high] `sources/ryuki-api/src/contracts.rs:4623` — Add `AuthExtractor(session): AuthExtractor` to the gmsa_expiring signature (and optionally `Query(query): Query<GmsaInventoryQuery>` to accept an optional ?site), mirroring gmsa_in
+- [x] **gmsa_assign / gmsa_remove / gmsa_rotate** [high] `sources/ryuki-api/src/contracts.rs:4436` — 
+- [x] **gmsa_create** [?] `sources/ryuki-api/src/contracts.rs:4376` — Add the canonical site-only write guard at the top of gmsa_create, immediately after the session is extracted and before any DB work. body.site is the required CONCRETE (non-Option
 
 ## patch  (7)
 - [x] **patch_plan** [high] `sources/ryuki-api/src/contracts.rs:8062` — Insert the canonical site-only write guard at the top of patch_plan, before plan_patch_wave: add `guard_body_site_scope(&session, &body.site)?;` immediately after `let pool = get_d
@@ -147,12 +161,12 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **emergency_active** [high] `sources/ryuki-api/src/contracts.rs:6888` — Make emergency_active mirror its siblings. 1) Change the signature to `async fn emergency_active(AuthExtractor(session): AuthExtractor, Query(params): Query<EmergencySiteQuery>) ->
 
 ## storage  (6)
-- [ ] **storage_volume_get** [high] `sources/ryuki-api/src/contracts.rs:28228` — Add `AuthExtractor(session): AuthExtractor` to the signature of storage_volume_get (contracts.rs:28228), then after loading the row (after L28237) and before returning, call `scope
-- [ ] **storage_volume_extend** [high] `sources/ryuki-api/src/contracts.rs:28242` — 
-- [ ] **storage_volume_map** [high] `sources/ryuki-api/src/contracts.rs:28268` — 
-- [ ] **storage_volume_unmap** [high] `sources/ryuki-api/src/contracts.rs:28287` — Add `AuthExtractor(session): AuthExtractor` to the storage_volume_unmap signature. Before mutating, load the row's site and guard: `let v = crate::repos::storage_provisioning::get_
-- [ ] **storage_volume_retire** [high] `sources/ryuki-api/src/contracts.rs:28303` — Add `AuthExtractor(session): AuthExtractor` to storage_volume_retire's signature, then before the retire_volume call load the volume and guard: `let volume = crate::repos::storage_
-- [ ] **storage_array_get** [high] `sources/ryuki-api/src/contracts.rs:28335` — Add `AuthExtractor(session): AuthExtractor` to the storage_array_get signature (matching storage_array_register at contracts.rs:28363). After loading the row (`let array = ... .ok_
+- [x] **storage_volume_get** [high] `sources/ryuki-api/src/contracts.rs:28228` — Add `AuthExtractor(session): AuthExtractor` to the signature of storage_volume_get (contracts.rs:28228), then after loading the row (after L28237) and before returning, call `scope
+- [x] **storage_volume_extend** [high] `sources/ryuki-api/src/contracts.rs:28242` — 
+- [x] **storage_volume_map** [high] `sources/ryuki-api/src/contracts.rs:28268` — 
+- [x] **storage_volume_unmap** [high] `sources/ryuki-api/src/contracts.rs:28287` — Add `AuthExtractor(session): AuthExtractor` to the storage_volume_unmap signature. Before mutating, load the row's site and guard: `let v = crate::repos::storage_provisioning::get_
+- [x] **storage_volume_retire** [high] `sources/ryuki-api/src/contracts.rs:28303` — Add `AuthExtractor(session): AuthExtractor` to storage_volume_retire's signature, then before the retire_volume call load the volume and guard: `let volume = crate::repos::storage_
+- [x] **storage_array_get** [high] `sources/ryuki-api/src/contracts.rs:28335` — Add `AuthExtractor(session): AuthExtractor` to the storage_array_get signature (matching storage_array_register at contracts.rs:28363). After loading the row (`let array = ... .ok_
 
 ## secrets  (6)
 - [x] **secrets_register** [high] `sources/ryuki-api/src/contracts.rs:29849` — Insert `guard_body_site_scope(&session, &b.site)?;` as the first statement of secrets_register, before the `if let Some(pool) = get_db()` at L29853. The (site) source is the reques
@@ -206,11 +220,11 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **firmware_exceptions_list** [medium] `sources/ryuki-api/src/contracts.rs:25731` — Two coordinated changes. (1) Repo: change list_active_exceptions(pool) in sources/ryuki-api/src/repos/firmware_lifecycle.rs:194 to accept a `site: &str` (mirroring list_devices at 
 
 ## k8s  (5)
-- [ ] **k8s_namespace_get** [high] `sources/ryuki-api/src/contracts.rs:28690` — 1) Add the session to the handler signature: change `Path(id): Path<String>,` to also take `AuthExtractor(session): AuthExtractor,` first, matching sibling handlers like k8s_namesp
-- [ ] **k8s_namespace_update_quota** [high] `sources/ryuki-api/src/contracts.rs:28702` — The repo already returns the full row's site+environment. Capture the model and guard AFTER the update, BEFORE commit/return: in k8s_namespace_update_quota, on `TransitionOutcome::
-- [ ] **k8s_namespace_suspend** [high] `sources/ryuki-api/src/contracts.rs:28749` — Add a by-id scope guard BEFORE the mutation. Load the namespace's site first via the existing repo read (repos/container_namespace.rs:253 `SELECT {NS_COLUMNS} FROM k8s_namespaces W
-- [ ] **k8s_namespace_resume** [high] `sources/ryuki-api/src/contracts.rs:28792` — Add a post-load by-id scope guard after the UPDATE returns the row but BEFORE commit, and roll back if out of scope so the mutation is never persisted. After `let ns = match outcom
-- [ ] **k8s_namespace_terminate** [high] `sources/ryuki-api/src/contracts.rs:28835` — The handler already loads the row as `ns` (TransitionOutcome::Updated(ns), L28853), and ns carries ns.site. Because the namespace has ONLY a site dimension (no environment), use a 
+- [x] **k8s_namespace_get** [high] `sources/ryuki-api/src/contracts.rs:28690` — 1) Add the session to the handler signature: change `Path(id): Path<String>,` to also take `AuthExtractor(session): AuthExtractor,` first, matching sibling handlers like k8s_namesp
+- [x] **k8s_namespace_update_quota** [high] `sources/ryuki-api/src/contracts.rs:28702` — The repo already returns the full row's site+environment. Capture the model and guard AFTER the update, BEFORE commit/return: in k8s_namespace_update_quota, on `TransitionOutcome::
+- [x] **k8s_namespace_suspend** [high] `sources/ryuki-api/src/contracts.rs:28749` — Add a by-id scope guard BEFORE the mutation. Load the namespace's site first via the existing repo read (repos/container_namespace.rs:253 `SELECT {NS_COLUMNS} FROM k8s_namespaces W
+- [x] **k8s_namespace_resume** [high] `sources/ryuki-api/src/contracts.rs:28792` — Add a post-load by-id scope guard after the UPDATE returns the row but BEFORE commit, and roll back if out of scope so the mutation is never persisted. After `let ns = match outcom
+- [x] **k8s_namespace_terminate** [high] `sources/ryuki-api/src/contracts.rs:28835` — The handler already loads the row as `ns` (TransitionOutcome::Updated(ns), L28853), and ns carries ns.site. Because the namespace has ONLY a site dimension (no environment), use a 
 
 ## compliance  (5)
 - [x] **compliance_control_get** [high] `sources/ryuki-api/src/contracts.rs:29381` — Add `AuthExtractor(session): AuthExtractor` (matching the sibling compliance_controls_list signature) to compliance_control_get at contracts.rs:29381. After loading `ctrl` (L29388-
@@ -286,36 +300,36 @@ Guard patterns: by-id -> `scope_guard_or_404(&session,&row.site,&row.environment
 - [x] **linux_deploy_validate / linux_deploy_execute / linux_deploy_verify** [high] `sources/ryuki-api/src/contracts.rs:21529` — Insert guard_body_site_scope(&session, &req.site)?; in each handler immediately after the load line that yields req (right after .ok_or_else(|| status_404(&body.operation_id))? at 
 
 ## approvals  (1)
-- [ ] **approvals_pending** [high] `sources/ryuki-api/src/contracts.rs:3980` — Mirror the sibling requests_list pattern. After computing `role` (3987), derive the effective scope filters and push them into the SQL as bound params:    let (f_site, f_env) = enf
+- [x] **approvals_pending** [high] `sources/ryuki-api/src/contracts.rs:3980` — Mirror the sibling requests_list pattern. After computing `role` (3987), derive the effective scope filters and push them into the SQL as bound params:    let (f_site, f_env) = enf
 
 ## software  (1)
-- [ ] **software_compliance** [high] `sources/ryuki-api/src/contracts.rs:8763` — Add `AuthExtractor(session): AuthExtractor` as the first param of software_compliance (mirror software_packages_list at contracts.rs:8412-8414). Then, before the VALID_SITES check 
+- [x] **software_compliance** [high] `sources/ryuki-api/src/contracts.rs:8763` — Add `AuthExtractor(session): AuthExtractor` as the first param of software_compliance (mirror software_packages_list at contracts.rs:8412-8414). Then, before the VALID_SITES check 
 
 ## aiops  (1)
-- [ ] **aiops_review** [high] `sources/ryuki-api/src/contracts.rs:11898` — Add the sibling guard in aiops_review (sources/ryuki-api/src/contracts.rs) immediately after the suggestion is loaded and before the `guard_review` / `review` write, exactly mirror
+- [x] **aiops_review** [high] `sources/ryuki-api/src/contracts.rs:11898` — Add the sibling guard in aiops_review (sources/ryuki-api/src/contracts.rs) immediately after the suggestion is loaded and before the `guard_review` / `review` write, exactly mirror
 
 ## apply  (1)
-- [ ] **apply_transition_audited** [high] `sources/ryuki-api/src/contracts.rs:13319` — Enforce scope inside the helper itself — it is the single chokepoint every transition flows through and it already holds `session` + `current.site`/`current.environment`. At the to
+- [x] **apply_transition_audited** [high] `sources/ryuki-api/src/contracts.rs:13319` — Enforce scope inside the helper itself — it is the single chokepoint every transition flows through and it already holds `session` + `current.site`/`current.environment`. At the to
 
 ## backup  (1)
-- [ ] **backup_restore_approve / backup_restore_execute / backup_restore_validate / backup_restores_list / backup_restore_get / backup_restore_plan** [high] `sources/ryuki-api/src/contracts.rs:20592` — By-id reads/actions (validate:20626, approve:20639, execute:20689, get:20753): after loading r (or record), add scope_guard_or_404(&session, &r.target_site, &r.target_environment, 
+- [x] **backup_restore_approve / backup_restore_execute / backup_restore_validate / backup_restores_list / backup_restore_get / backup_restore_plan** [high] `sources/ryuki-api/src/contracts.rs:20592` — By-id reads/actions (validate:20626, approve:20639, execute:20689, get:20753): after loading r (or record), add scope_guard_or_404(&session, &r.target_site, &r.target_environment, 
 
 ## repo_capacity  (1)
-- [ ] **repo_capacity_forecast / repo_capacity_trend / repo_capacity_recommendations** [high] `sources/ryuki-api/src/contracts.rs:23936` — Add `AuthExtractor(session): AuthExtractor` as the first param to each handler, then guard on the LOADED row's site before returning, mirroring hardware_firmware_check (contracts.r
+- [x] **repo_capacity_forecast / repo_capacity_trend / repo_capacity_recommendations** [high] `sources/ryuki-api/src/contracts.rs:23936` — Add `AuthExtractor(session): AuthExtractor` as the first param to each handler, then guard on the LOADED row's site before returning, mirroring hardware_firmware_check (contracts.r
 
 ## firewall  (1)
-- [ ] **firewall_rule_set_list** [high] `sources/ryuki-api/src/contracts.rs:27958` — Add `AuthExtractor(session): AuthExtractor` to the handler signature alongside Query(q) (mirror firewall_rule_set_get). For the ?site path, replace the bare list_by_site with `let 
+- [x] **firewall_rule_set_list** [high] `sources/ryuki-api/src/contracts.rs:27958` — Add `AuthExtractor(session): AuthExtractor` to the handler signature alongside Query(q) (mirror firewall_rule_set_get). For the ?site path, replace the bare list_by_site with `let 
 
 ## on_call  (3)
-- [ ] **on_call_contact_create** [medium] `sources/ryuki-api/src/contracts.rs:17365` — 
-- [ ] **on_call_contact_get** [medium] `sources/ryuki-api/src/contracts.rs:17445` — 1) Add AuthExtractor(session): AuthExtractor to the on_call_contact_get signature (contracts.rs:17445-17447). 2) After loading the row (the Some(r) arm at 17457), guard on the row'
-- [ ] **on_call_contact_delete** [medium] `sources/ryuki-api/src/contracts.rs:17567` — In on_call_contact_delete (contracts.rs:17567), enforce site scope on the target row BEFORE the DELETE. on_call_contacts has no environment column, so use the site-only helper, NOT
+- [x] **on_call_contact_create** [medium] `sources/ryuki-api/src/contracts.rs:17365` — 
+- [x] **on_call_contact_get** [medium] `sources/ryuki-api/src/contracts.rs:17445` — 1) Add AuthExtractor(session): AuthExtractor to the on_call_contact_get signature (contracts.rs:17445-17447). 2) After loading the row (the Some(r) arm at 17457), guard on the row'
+- [x] **on_call_contact_delete** [medium] `sources/ryuki-api/src/contracts.rs:17567` — In on_call_contact_delete (contracts.rs:17567), enforce site scope on the target row BEFORE the DELETE. on_call_contacts has no environment column, so use the site-only helper, NOT
 
 ## cancel  (1)
-- [ ] **cancel_one (shared by requests_cancel / POST /requests/{id}/cancel and requests_batch_cancel / POST /requests/batch/cancel)** [medium] `sources/ryuki-api/src/contracts.rs:16276` — Add the post-load by-id guard using the already-loaded row values (no extra query). DB path: immediately after the cancel_permitted check (after line 16296), insert `scope_guard_or
+- [x] **cancel_one (shared by requests_cancel / POST /requests/{id}/cancel and requests_batch_cancel / POST /requests/batch/cancel)** [medium] `sources/ryuki-api/src/contracts.rs:16276` — Add the post-load by-id guard using the already-loaded row values (no extra query). DB path: immediately after the cancel_permitted check (after line 16296), insert `scope_guard_or
 
 ## events  (1)
-- [ ] **events_alert_ack** [medium] `sources/ryuki-api/src/contracts.rs:17064` — Apply the canonical by-id guard before the mutation. Step 1: add a loader in sources/ryuki-api/src/repos/domain_events.rs, e.g. pub async fn event_site_env(pool, event_id: i64) -> 
+- [x] **events_alert_ack** [medium] `sources/ryuki-api/src/contracts.rs:17064` — Apply the canonical by-id guard before the mutation. Step 1: add a loader in sources/ryuki-api/src/repos/domain_events.rs, e.g. pub async fn event_site_env(pool, event_id: i64) -> 
 
 ## dr_  (1)
-- [ ] **dr_tests_due** [medium] `sources/ryuki-api/src/contracts.rs:29243-29247` — Mirror the sibling handlers. In contracts.rs change the signature to `async fn dr_tests_due(AuthExtractor(session): AuthExtractor, Query(q): Query<DrSiteQuery>)`, then before the e
+- [x] **dr_tests_due** [medium] `sources/ryuki-api/src/contracts.rs:29243-29247` — Mirror the sibling handlers. In contracts.rs change the signature to `async fn dr_tests_due(AuthExtractor(session): AuthExtractor, Query(q): Query<DrSiteQuery>)`, then before the e
