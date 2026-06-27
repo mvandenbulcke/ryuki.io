@@ -10923,12 +10923,17 @@ async fn observe_synthetic_health_check_contract() -> Json<Value> {
     )
 }
 
-async fn synthetic_run_check(Path(check_id): Path<String>) -> ApiResult {
+async fn synthetic_run_check(
+    AuthExtractor(session): AuthExtractor,
+    Path(check_id): Path<String>,
+) -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
     let check = crate::repos::synthetic_health::get_check(pool, &check_id)
         .await
         .map_err(db_error)?
         .ok_or_else(|| status_404(&check_id))?;
+    // #2: out-of-scope -> 404 before running / persisting the check.
+    scope_guard_or_404(&session, &check.site, "", &check_id)?;
     let result = synthetic_health::run_check(&check);
     let persisted = crate::repos::synthetic_health::insert_result(pool, &result)
         .await
@@ -10965,9 +10970,24 @@ async fn synthetic_run_all(
     ))
 }
 
-async fn synthetic_status(Path(check_id): Path<String>) -> ApiResult {
+async fn synthetic_status(
+    AuthExtractor(session): AuthExtractor,
+    Path(check_id): Path<String>,
+) -> ApiResult {
     match get_db() {
         Some(pool) => {
+            // #2: the result row has no site — scope on the parent check's site;
+            // out-of-scope or missing -> 404 before exposing the latest result.
+            if is_scoped(&session) {
+                let in_scope = crate::repos::synthetic_health::get_check(pool, &check_id)
+                    .await
+                    .map_err(db_error)?
+                    .map(|c| row_scope_permits(&session, &c.site, ""))
+                    .unwrap_or(false);
+                if !in_scope {
+                    return Err(status_404(&check_id));
+                }
+            }
             match crate::repos::synthetic_health::get_latest_result(pool, &check_id)
                 .await
                 .map_err(db_error)?
@@ -40616,6 +40636,48 @@ mod db_lifecycle_tests {
                 "out-of-scope outage_notices_get must 404 (not 403): {got:?}"
             );
         }
+    }
+
+    /// #2 RBAC: the synthetic-health by-id handlers are site-scoped (health_checks
+    /// has site). A GBLON principal gets 404 running or statusing a DEFRA check
+    /// (the status result row has no site, so it scopes via the parent check);
+    /// unrestricted passes. Check id resolved at runtime.
+    #[tokio::test]
+    async fn synthetic_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let Some(defra) = sqlx::query_scalar::<_, String>(
+            "SELECT id::text FROM health_checks WHERE site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None) else {
+            eprintln!("SKIP: no DEFRA health check seeded");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+
+        let run = synthetic_run_check(AuthExtractor(gblon.clone()), Path(defra.clone())).await;
+        assert!(
+            matches!(run, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope synthetic_run_check must 404: {run:?}"
+        );
+        let status = synthetic_status(AuthExtractor(gblon), Path(defra.clone())).await;
+        assert!(
+            matches!(status, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope synthetic_status must 404: {status:?}"
+        );
+        let any =
+            synthetic_run_check(AuthExtractor(AuthSession::static_dry_run()), Path(defra)).await;
+        assert!(
+            !matches!(any, Err((StatusCode::NOT_FOUND, _))),
+            "unrestricted synthetic_run_check must pass: {any:?}"
+        );
     }
 
     /// Read the raw persisted row through the global pool (so it observes what
