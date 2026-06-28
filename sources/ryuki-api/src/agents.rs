@@ -334,20 +334,49 @@ pub async fn register_agent(
 /// the `admin` permission and agent-token auth cannot reach it.
 pub async fn admin_approve_agent(
     Path(agent_id): Path<String>,
-    _headers: HeaderMap,
+    Extension(session): Extension<AuthSession>,
     Json(body): Json<ApproveBody>,
 ) -> ApiResult<Json<Value>> {
+    // Defense in depth: the `/api/admin/` middleware already enforces `admin`, but
+    // re-check here so the verified principal is also the audit actor.
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to approve an agent",
+        ));
+    }
     let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
 
     if body.platform.trim().is_empty() {
         return Err(bad_request("platform must not be empty"));
     }
 
-    // Always overwrite platform (and capabilities when provided) with the
-    // admin-supplied authoritative values. The agent's self-declared
-    // registration data is never trusted for job dispatch.
     let now = Utc::now();
-    let rows_affected = if let Some(caps) = &body.capabilities {
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // Lock the row: 404 an unknown agent, and enforce that revoke is TERMINAL — a
+    // revoked (e.g. compromised) agent can never be silently re-approved; it must
+    // re-enroll (a fresh record + rotated token). Without this guard, an admin
+    // mistake or a stale UI could undo a revocation and re-arm a bad credential.
+    let prior: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1 FOR UPDATE")
+            .bind(&agent_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let Some((prior_status,)) = prior else {
+        return Err(not_found(format!("agent '{}' not found", agent_id)));
+    };
+    if prior_status == "revoked" {
+        return Err(conflict(format!(
+            "agent '{}' is revoked and cannot be re-approved; it must re-enroll",
+            agent_id
+        )));
+    }
+
+    // Always overwrite platform with the admin-authoritative value; capabilities
+    // are RESET to empty unless the admin explicitly supplies them (the agent's
+    // self-declared registration capabilities are never trusted for dispatch).
+    if let Some(caps) = &body.capabilities {
         let caps_json = serde_json::to_value(caps).map_err(db_err)?;
         sqlx::query(
             "UPDATE agents SET status = 'approved', platform = $1, capabilities = $2, \
@@ -357,14 +386,10 @@ pub async fn admin_approve_agent(
         .bind(&caps_json)
         .bind(now)
         .bind(&agent_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .map_err(db_err)?
-        .rows_affected()
+        .map_err(db_err)?;
     } else {
-        // No admin-supplied capabilities: RESET to empty rather than keep the
-        // agent's self-declared registration capabilities (never authoritative).
-        // The admin must explicitly grant capabilities for dispatch to match.
         sqlx::query(
             "UPDATE agents SET status = 'approved', platform = $1, \
              capabilities = '{}'::jsonb, updated_at = $2 WHERE agent_id = $3",
@@ -372,15 +397,26 @@ pub async fn admin_approve_agent(
         .bind(&body.platform)
         .bind(now)
         .bind(&agent_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
-        .map_err(db_err)?
-        .rows_affected()
-    };
-
-    if rows_affected == 0 {
-        return Err(not_found(format!("agent '{}' not found", agent_id)));
+        .map_err(db_err)?;
     }
+
+    // Audit ATOMICALLY with the status change (previously only traced — a gap):
+    // actor is the verified admin; detail carries no token hash / public key / caps.
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-approve",
+            Some(&prior_status),
+            "approved",
+            json!({ "agent_id": &agent_id, "platform": &body.platform }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
 
     tracing::info!(
         agent_id = %agent_id,
@@ -390,6 +426,73 @@ pub async fn admin_approve_agent(
     Ok(Json(
         json!({"agent_id": agent_id, "status": "approved", "platform": body.platform}),
     ))
+}
+
+/// POST /api/admin/agents/{agent_id}/revoke
+///
+/// Sets an agent's status to 'revoked' (from `pending` or `approved`). Revocation
+/// is TERMINAL: `authenticate_agent` rejects any status other than 'approved', so
+/// the agent's token is refused on its next call, and `admin_approve_agent` cannot
+/// move it back. Already-leased jobs are NOT force-cancelled here — they wind down
+/// via the lease/fencing/reconcile path; this closes the door to NEW work. Admin-
+/// tier (the `/api/admin/` middleware blocks agent-token auth). Idempotent: re-
+/// revoking an already-revoked agent returns 200 without a duplicate audit row.
+/// 404 if the agent is unknown.
+pub async fn admin_revoke_agent(
+    Path(agent_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission is required to revoke an agent"));
+    }
+    let pool = get_db().ok_or_else(|| db_err("database unavailable"))?;
+    let now = Utc::now();
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    let prior: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1 FOR UPDATE")
+            .bind(&agent_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let Some((prior_status,)) = prior else {
+        return Err(not_found(format!("agent '{}' not found", agent_id)));
+    };
+
+    // Idempotent: already revoked → 200, no second state-change audit row.
+    if prior_status == "revoked" {
+        return Ok(Json(json!({
+            "agent_id": agent_id, "status": "revoked", "already_revoked": true
+        })));
+    }
+
+    sqlx::query("UPDATE agents SET status = 'revoked', updated_at = $1 WHERE agent_id = $2")
+        .bind(now)
+        .bind(&agent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-revoke",
+            Some(&prior_status),
+            "revoked",
+            json!({ "agent_id": &agent_id }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::warn!(
+        agent_id = %agent_id,
+        prior_status = %prior_status,
+        "agent revoked (its token will be refused on the next call)"
+    );
+    Ok(Json(json!({"agent_id": agent_id, "status": "revoked"})))
 }
 
 /// GET /api/agents/{agent_id}/jobs
@@ -2257,6 +2360,10 @@ pub fn admin_routes() -> Router {
             post(admin_approve_agent),
         )
         .route(
+            "/api/admin/agents/{agent_id}/revoke",
+            post(admin_revoke_agent),
+        )
+        .route(
             "/api/admin/agents/live-apply-jobs",
             post(admin_approve_live_apply_job),
         )
@@ -2419,6 +2526,205 @@ mod tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// Initialises the PROCESS-GLOBAL `database::POOL` so handler calls routed
+    /// through `get_db()` (admin_approve_agent / admin_revoke_agent) hit the real
+    /// DB. Serialise with DB_TEST_SERIAL since the pool is process-global.
+    async fn handler_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    fn non_admin_session() -> AuthSession {
+        AuthSession {
+            user_id: "requester-1".into(),
+            display_name: "Requester".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "test".into(),
+            ..Default::default()
+        }
+    }
+
+    // ── #3 agent revoke ──────────────────────────────────────────────────────
+
+    /// Revoking an approved agent flips it to 'revoked' and its token is refused on
+    /// the next authenticated call (authenticate_agent rejects status != approved).
+    #[tokio::test]
+    async fn db_revoke_approved_agent_blocks_token() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("revoke-approved-{}", Uuid::new_v4());
+        let token = seed_agent(pool, &agent_id, "ci", "approved").await;
+
+        // Token works while approved.
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(
+            authenticate_agent(&headers, pool).await.is_ok(),
+            "approved agent token must authenticate before revoke"
+        );
+
+        // Revoke.
+        let resp = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("revoke must succeed");
+        assert_eq!(resp.0["status"], json!("revoked"));
+
+        // Status persisted + token now refused.
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch status");
+        assert_eq!(status, "revoked");
+        let auth = authenticate_agent(&headers, pool).await;
+        assert!(
+            matches!(auth, Err((StatusCode::FORBIDDEN, _))),
+            "a revoked agent's token must be refused: {auth:?}"
+        );
+
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    /// A pending agent can be revoked (deny enrollment); unknown agent → 404;
+    /// re-revoke is idempotent (200, already_revoked).
+    #[tokio::test]
+    async fn db_revoke_pending_unknown_and_idempotent() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let pending = format!("revoke-pending-{}", Uuid::new_v4());
+        seed_agent(pool, &pending, "ci", "pending").await;
+        let r = admin_revoke_agent(
+            Path(pending.clone()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("revoke pending must succeed");
+        assert_eq!(r.0["status"], json!("revoked"));
+
+        // Idempotent re-revoke.
+        let again = admin_revoke_agent(
+            Path(pending.clone()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("re-revoke must succeed");
+        assert_eq!(again.0["already_revoked"], json!(true));
+
+        // Unknown agent → 404.
+        let missing = admin_revoke_agent(
+            Path(format!("nope-{}", Uuid::new_v4())),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown agent revoke must 404: {missing:?}"
+        );
+
+        cleanup_agent(pool, &pending).await;
+    }
+
+    /// Revoke is TERMINAL: a revoked agent cannot be re-approved (409); it must
+    /// re-enroll. Guards against undoing a revocation of a compromised credential.
+    #[tokio::test]
+    async fn db_approve_after_revoke_is_conflict() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("revoke-terminal-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, "ci", "approved").await;
+        let _ = admin_revoke_agent(
+            Path(agent_id.clone()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("revoke");
+        let reapprove = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ApproveBody {
+                platform: "ci".into(),
+                capabilities: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(reapprove, Err((StatusCode::CONFLICT, _))),
+            "re-approving a revoked agent must 409: {reapprove:?}"
+        );
+        // Still revoked.
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch");
+        assert_eq!(status, "revoked", "agent must remain revoked");
+
+        cleanup_agent(pool, &agent_id).await;
+    }
+
+    /// Both approve and revoke require admin (defense in depth beyond middleware).
+    #[tokio::test]
+    async fn db_revoke_and_approve_require_admin() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let agent_id = format!("revoke-authz-{}", Uuid::new_v4());
+        seed_agent(pool, &agent_id, "ci", "approved").await;
+
+        let revoke_denied =
+            admin_revoke_agent(Path(agent_id.clone()), Extension(non_admin_session())).await;
+        assert!(
+            matches!(revoke_denied, Err((StatusCode::FORBIDDEN, _))),
+            "non-admin revoke must 403: {revoke_denied:?}"
+        );
+        let approve_denied = admin_approve_agent(
+            Path(agent_id.clone()),
+            Extension(non_admin_session()),
+            Json(ApproveBody {
+                platform: "ci".into(),
+                capabilities: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(approve_denied, Err((StatusCode::FORBIDDEN, _))),
+            "non-admin approve must 403: {approve_denied:?}"
+        );
+        // Unchanged.
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM agents WHERE agent_id = $1")
+            .bind(&agent_id)
+            .fetch_one(pool)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            status, "approved",
+            "a denied call must not mutate the agent"
+        );
+
+        cleanup_agent(pool, &agent_id).await;
     }
 
     // ── register persists pending ─────────────────────────────────────────
