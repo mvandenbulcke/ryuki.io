@@ -23,7 +23,8 @@ use crate::api::{
 };
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
-    admin_agent_approve_path, admin_session_revoke_path, admin_token_revoke_path,
+    admin_agent_approve_path, admin_agent_revoke_path, admin_session_revoke_path,
+    admin_token_revoke_path,
     notifications_read_path, request_approve_path, request_audit_path, request_cancel_path,
     request_detail_path, request_evidence_path, request_execute_path, request_lock_path,
     request_plan_path, request_protect_path, request_publish_path, request_reject_path,
@@ -367,6 +368,35 @@ fn is_allowed_admin_agent_approve_path(path: &str) -> bool {
     matches!((segments.next(), segments.next()), (Some("approve"), None))
 }
 
+/// Validates `/api/admin/agents/{id}/revoke` — mirrors the approve-path guard with
+/// a `revoke` suffix. Only a single safe id segment is accepted.
+fn is_allowed_admin_agent_revoke_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/admin/agents/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    let Some(agent_id) = segments.next() else {
+        return false;
+    };
+    if agent_id.is_empty()
+        || agent_id == "."
+        || agent_id == ".."
+        || agent_id.contains("..")
+        || agent_id.contains('\\')
+        || agent_id.contains('?')
+        || agent_id.contains('#')
+        || agent_id.contains("://")
+        || agent_id.starts_with("//")
+        || !agent_id
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_'))
+    {
+        return false;
+    }
+    // Exactly `/agents/{id}/revoke` — the suffix is `revoke` and nothing else.
+    matches!((segments.next(), segments.next()), (Some("revoke"), None))
+}
+
 /// Validates `/api/notifications/{id}/read` — the per-item mark-read path, which
 /// carries a notification id and a static `read` suffix and so cannot live in the
 /// static allowlist. Only a single safe id segment is accepted, and the suffix
@@ -485,6 +515,19 @@ impl PortalServerBoundary {
     ) -> Result<&'a str, PortalBoundaryError> {
         let guarded = same_origin_api_path(path)?;
         if is_allowed_admin_agent_approve_path(guarded) {
+            return Ok(guarded);
+        }
+        Err(PortalBoundaryError::OutsidePortalAllowlist)
+    }
+
+    /// Validates the id-bearing agent revocation path
+    /// (`/api/admin/agents/{id}/revoke`) before a POST is dispatched.
+    pub fn validate_admin_agent_revoke_path<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<&'a str, PortalBoundaryError> {
+        let guarded = same_origin_api_path(path)?;
+        if is_allowed_admin_agent_revoke_path(guarded) {
             return Ok(guarded);
         }
         Err(PortalBoundaryError::OutsidePortalAllowlist)
@@ -3381,6 +3424,39 @@ pub async fn approve_agent(
     })
 }
 
+/// `POST /api/admin/agents/{id}/revoke` — take an enrolled agent offline. The API
+/// sets status='revoked' (terminal) so the agent's token is refused on its next
+/// call. No body. Mutations never degrade to a fallback — a static/unreachable
+/// upstream errors.
+#[server(prefix = "/portal/api", endpoint = "admin-agents-revoke")]
+pub async fn revoke_agent(agent_id: String) -> Result<RevokeResult, ServerFnError> {
+    let boundary = PortalServerBoundary::static_dry_run();
+    let path = admin_agent_revoke_path(&agent_id)
+        .map_err(|_| ServerFnError::new("admin agent revoke API path failed same-origin guard"))?;
+    boundary
+        .validate_admin_agent_revoke_path(&path)
+        .map_err(|_| ServerFnError::new("admin agent revoke API path failed same-origin guard"))?;
+    let upstream = upstream_context();
+    if !upstream.live() {
+        return reject_static_preview_revoke("agent");
+    }
+    let session_id = session_id_from_request().await;
+    let response = upstream
+        .post(&path, None, session_id.as_deref())
+        .await
+        .map_err(|_| ServerFnError::new(MUTATION_UNREACHABLE_MESSAGE))?;
+    if !response.is_success() {
+        return Err(ServerFnError::new(api_error_text(
+            &response,
+            "agent revocation was rejected by the API",
+        )));
+    }
+    Ok(RevokeResult {
+        status: "revoked".to_string(),
+        id: agent_id,
+    })
+}
+
 #[server(prefix = "/portal/api", endpoint = "integration-create")]
 pub async fn create_integration(
     payload: CreateIntegrationPayload,
@@ -3969,6 +4045,42 @@ mod tests {
         assert!(admin_agent_approve_path("").is_err());
         assert!(admin_agent_approve_path("..").is_err());
         assert!(admin_agent_approve_path("a/b").is_err());
+    }
+
+    #[test]
+    fn boundary_validates_admin_agent_revoke_path_and_rejects_traversal() {
+        let boundary = PortalServerBoundary::static_dry_run();
+        let id = "3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b";
+
+        let path = admin_agent_revoke_path(id).expect("agent revoke path must build");
+        assert_eq!(
+            path,
+            "/api/admin/agents/3f2b8d44-9c1a-4e5f-8a2b-1c9d3e4f5a6b/revoke"
+        );
+        assert_eq!(
+            boundary.validate_admin_agent_revoke_path(&path),
+            Ok(path.as_str())
+        );
+
+        for path in [
+            "/api/admin/agents",
+            "/api/admin/agents/id",
+            "/api/admin/agents/id/approve",
+            "/api/admin/agents/id/revoke/extra",
+            "/api/admin/agents/../platform-settings/revoke",
+            "/api/admin/agents/id?x=1/revoke",
+            "/api/admin/tokens/id/revoke",
+        ] {
+            assert_eq!(
+                boundary.validate_admin_agent_revoke_path(path),
+                Err(PortalBoundaryError::OutsidePortalAllowlist),
+                "path {path} must be rejected"
+            );
+        }
+
+        assert!(admin_agent_revoke_path("").is_err());
+        assert!(admin_agent_revoke_path("..").is_err());
+        assert!(admin_agent_revoke_path("a/b").is_err());
     }
 
     #[test]

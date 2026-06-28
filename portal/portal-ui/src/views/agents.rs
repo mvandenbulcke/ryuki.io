@@ -1,6 +1,6 @@
 use crate::api::{admin_agents_path, platform_summary_path, same_origin_api_path};
 use crate::models::{condense_timestamp, AgentSummary, AuthSession};
-use crate::server_boundary::{approve_agent, get_admin_agents};
+use crate::server_boundary::{approve_agent, get_admin_agents, revoke_agent};
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 
@@ -77,6 +77,27 @@ pub fn AgentListView() -> impl IntoView {
             match approve_agent(agent_id, platform).await {
                 Ok(result) => {
                     set_action_feedback.set(format!("Agent {} approved.", result.id));
+                    set_action_class.set("badge good");
+                    list_resource.refetch();
+                }
+                Err(e) => {
+                    set_action_feedback.set(server_error_message(&e));
+                    set_action_class.set("badge bad");
+                }
+            }
+        }
+    });
+
+    // Revoke an enrolled agent (pending or approved). Revocation is terminal on the
+    // API side, so on success the list is refetched and the row flips to "revoked".
+    let revoke_action = Action::new(move |agent_id: &String| {
+        let agent_id = agent_id.clone();
+        set_action_feedback.set("Revoking...".to_string());
+        set_action_class.set("badge neutral");
+        async move {
+            match revoke_agent(agent_id).await {
+                Ok(result) => {
+                    set_action_feedback.set(format!("Agent {} revoked.", result.id));
                     set_action_class.set("badge good");
                     list_resource.refetch();
                 }
@@ -181,8 +202,13 @@ pub fn AgentListView() -> impl IntoView {
                                                     // pending enrollment; the values needed to
                                                     // dispatch are captured before the row view.
                                                     let is_pending = agent.status == "pending";
+                                                    // Revoke is offered for any non-revoked agent
+                                                    // (pending = deny enrollment; approved = take
+                                                    // offline). A revoked agent shows no action.
+                                                    let is_revoked = agent.status == "revoked";
                                                     let approve_id = agent.agent_id.clone();
                                                     let approve_platform = agent.platform.clone();
+                                                    let revoke_id = agent.agent_id.clone();
 
                                                     view! {
                                                         <tr class="request-row">
@@ -269,29 +295,49 @@ pub fn AgentListView() -> impl IntoView {
                                                             </td>
                                                             <Show when=move || can_admin>
                                                                 <td>
-                                                                    {if is_pending {
-                                                                        let approve_id = approve_id.clone();
-                                                                        let approve_platform = approve_platform
-                                                                            .clone();
+                                                                    {if is_revoked {
                                                                         view! {
-                                                                            <button
-                                                                                type="button"
-                                                                                class="btn btn-primary"
-                                                                                on:click=move |_| {
-                                                                                    approve_action
-                                                                                        .dispatch((
-                                                                                            approve_id.clone(),
-                                                                                            approve_platform.clone(),
-                                                                                        ));
-                                                                                }
-                                                                            >
-                                                                                "Approve"
-                                                                            </button>
+                                                                            <span class="table-note">"—"</span>
                                                                         }
                                                                             .into_any()
                                                                     } else {
+                                                                        let approve_id = approve_id.clone();
+                                                                        let approve_platform = approve_platform
+                                                                            .clone();
+                                                                        let revoke_id = revoke_id.clone();
                                                                         view! {
-                                                                            <span class="table-note">"—"</span>
+                                                                            <div class="agent-actions">
+                                                                                {is_pending
+                                                                                    .then(|| {
+                                                                                        let approve_id = approve_id.clone();
+                                                                                        let approve_platform = approve_platform
+                                                                                            .clone();
+                                                                                        view! {
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="btn btn-primary"
+                                                                                                on:click=move |_| {
+                                                                                                    approve_action
+                                                                                                        .dispatch((
+                                                                                                            approve_id.clone(),
+                                                                                                            approve_platform.clone(),
+                                                                                                        ));
+                                                                                                }
+                                                                                            >
+                                                                                                "Approve"
+                                                                                            </button>
+                                                                                        }
+                                                                                    })}
+                                                                                <button
+                                                                                    type="button"
+                                                                                    class="btn btn-danger"
+                                                                                    on:click=move |_| {
+                                                                                        revoke_action.dispatch(revoke_id.clone());
+                                                                                    }
+                                                                                >
+                                                                                    "Revoke"
+                                                                                </button>
+                                                                            </div>
                                                                         }
                                                                             .into_any()
                                                                     }}

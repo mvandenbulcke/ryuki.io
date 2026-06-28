@@ -628,6 +628,15 @@ pub fn admin_agent_approve_path(agent_id: &str) -> Result<String, ApiPathError> 
     Ok(path)
 }
 
+/// Builds `/api/admin/agents/{id}/revoke` after validating the id as a single safe
+/// URL path segment. Mirrors `admin_agent_approve_path` with the `revoke` suffix.
+pub fn admin_agent_revoke_path(agent_id: &str) -> Result<String, ApiPathError> {
+    let agent_id = safe_request_id(agent_id)?;
+    let path = format!("/api/admin/agents/{agent_id}/revoke");
+    same_origin_api_path(&path)?;
+    Ok(path)
+}
+
 fn safe_integration_id(integration_id: &str) -> Result<&str, ApiPathError> {
     let integration_id = integration_id.trim();
     if integration_id.is_empty() {
