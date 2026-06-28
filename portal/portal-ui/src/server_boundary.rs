@@ -2154,6 +2154,12 @@ fn filter_request_summaries(
     };
     let status = normalize(&query.status);
     let site = normalize(&query.site);
+    let environment = normalize(&query.environment);
+    let request_type = normalize(&query.request_type);
+    // `created_by` is forwarded verbatim to the upstream via the query string;
+    // the local fallback row does not carry that field, so the normalized value
+    // is intentionally unused here.
+    let _created_by = normalize(&query.created_by);
     let needle = normalize(&query.q);
     let mut filtered: Vec<RequestSummary> = rows
         .into_iter()
@@ -2163,6 +2169,14 @@ fn filter_request_summaries(
         })
         .filter(|row| match &site {
             Some(s) => row.site.to_ascii_lowercase() == *s,
+            None => true,
+        })
+        .filter(|row| match &environment {
+            Some(e) => row.environment.to_ascii_lowercase() == *e,
+            None => true,
+        })
+        .filter(|row| match &request_type {
+            Some(t) => row.request_type.to_ascii_lowercase() == *t,
             None => true,
         })
         .filter(|row| match &needle {
@@ -2195,20 +2209,24 @@ fn filter_request_summaries(
     filtered
 }
 
-/// Faceted request-list read (#15). Optional `status`/`site`/`q` filters and
-/// `sort`/`direction` ordering are forwarded to the upstream
-/// `GET /api/requests` endpoint (API contract fa1df10). All-`None` arguments
-/// reproduce the unfiltered default list, so existing call sites are
-/// unaffected.
+/// Faceted request-list read (#15). Optional `status`/`site`/`environment`/
+/// `request_type`/`created_by`/`q` filters and `sort`/`direction` ordering are
+/// forwarded to the upstream `GET /api/requests` endpoint (API contract
+/// fa1df10). All-`None` arguments reproduce the unfiltered default list, so
+/// existing call sites are unaffected.
 ///
 /// The same-origin allowlist validates the *base* path; the query suffix is
 /// appended only after validation and carries solely allowlist-validated keys
 /// and percent-encoded values (see `RequestListQuery::to_query_string`), so no
 /// caller input ever reaches the upstream unescaped.
+#[allow(clippy::too_many_arguments)]
 #[server(prefix = "/portal/api", endpoint = "request-list-data")]
 pub async fn get_request_list(
     status: Option<String>,
     site: Option<String>,
+    environment: Option<String>,
+    request_type: Option<String>,
+    created_by: Option<String>,
     q: Option<String>,
     sort: Option<String>,
     direction: Option<String>,
@@ -2224,6 +2242,9 @@ pub async fn get_request_list(
     let query = RequestListQuery {
         status,
         site,
+        environment,
+        request_type,
+        created_by,
         q,
         sort,
         direction,
@@ -3862,6 +3883,50 @@ mod tests {
             desc.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
             vec!["Charlie", "Bravo", "alpha"]
         );
+    }
+
+    #[test]
+    fn filter_request_summaries_applies_environment_case_insensitively() {
+        let rows = vec![
+            summary_row("Web", "ams1", "intake", "2026-01-01"),
+            summary_row("Db", "fra1", "intake", "2026-01-02"),
+        ];
+        // summary_row sets environment = "prod" for all rows
+        let query = RequestListQuery {
+            environment: Some("PROD".to_string()),
+            ..Default::default()
+        };
+        let out = filter_request_summaries(rows.clone(), &query);
+        assert_eq!(out.len(), 2, "all rows have environment=prod, PROD should match all");
+
+        let query_miss = RequestListQuery {
+            environment: Some("staging".to_string()),
+            ..Default::default()
+        };
+        let out_miss = filter_request_summaries(rows, &query_miss);
+        assert!(out_miss.is_empty(), "no rows have environment=staging");
+    }
+
+    #[test]
+    fn filter_request_summaries_applies_request_type_case_insensitively() {
+        let rows = vec![
+            summary_row("Web", "ams1", "intake", "2026-01-01"),
+            summary_row("Db", "fra1", "intake", "2026-01-02"),
+        ];
+        // summary_row sets request_type = "server" for all rows
+        let query = RequestListQuery {
+            request_type: Some("SERVER".to_string()),
+            ..Default::default()
+        };
+        let out = filter_request_summaries(rows.clone(), &query);
+        assert_eq!(out.len(), 2, "all rows have request_type=server, SERVER should match all");
+
+        let query_miss = RequestListQuery {
+            request_type: Some("network".to_string()),
+            ..Default::default()
+        };
+        let out_miss = filter_request_summaries(rows, &query_miss);
+        assert!(out_miss.is_empty(), "no rows have request_type=network");
     }
 
     #[test]

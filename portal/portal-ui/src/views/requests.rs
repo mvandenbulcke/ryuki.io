@@ -56,6 +56,9 @@ pub(crate) const STATUS_FILTER_OPTIONS: &[(&str, &str)] = &[
 pub struct RequestFacets {
     pub status: String,
     pub site: String,
+    pub environment: String,
+    pub request_type: String,
+    pub created_by: String,
     pub q: String,
     pub sort: String,
     pub direction: String,
@@ -68,6 +71,9 @@ impl RequestFacets {
     pub fn is_active(&self) -> bool {
         !self.status.trim().is_empty()
             || !self.site.trim().is_empty()
+            || !self.environment.trim().is_empty()
+            || !self.request_type.trim().is_empty()
+            || !self.created_by.trim().is_empty()
             || !self.q.trim().is_empty()
             || !self.normalized_sort().is_empty()
     }
@@ -105,12 +111,24 @@ pub fn build_request_filter_url(facets: &RequestFacets) -> String {
     // not end up as `?q=%20` in the URL (the server drops it anyway).
     let status = facets.status.trim();
     let site = facets.site.trim();
+    let environment = facets.environment.trim();
+    let request_type = facets.request_type.trim();
+    let created_by = facets.created_by.trim();
     let q = facets.q.trim();
     if !status.is_empty() {
         pairs.push(("status", status));
     }
     if !site.is_empty() {
         pairs.push(("site", site));
+    }
+    if !environment.is_empty() {
+        pairs.push(("environment", environment));
+    }
+    if !request_type.is_empty() {
+        pairs.push(("request_type", request_type));
+    }
+    if !created_by.is_empty() {
+        pairs.push(("created_by", created_by));
     }
     if !q.is_empty() {
         pairs.push(("q", q));
@@ -242,6 +260,9 @@ pub fn RequestList() -> impl IntoView {
         query.with(|map| RequestFacets {
             status: map.get("status").unwrap_or_default(),
             site: map.get("site").unwrap_or_default(),
+            environment: map.get("environment").unwrap_or_default(),
+            request_type: map.get("request_type").unwrap_or_default(),
+            created_by: map.get("created_by").unwrap_or_default(),
             q: map.get("q").unwrap_or_default(),
             sort: map.get("sort").unwrap_or_default(),
             direction: map.get("direction").unwrap_or_default(),
@@ -259,6 +280,9 @@ pub fn RequestList() -> impl IntoView {
             get_request_list(
                 opt(&facets.status),
                 opt(&facets.site),
+                opt(&facets.environment),
+                opt(&facets.request_type),
+                opt(&facets.created_by),
                 opt(&facets.q),
                 opt(sort),
                 opt(direction),
@@ -286,6 +310,24 @@ pub fn RequestList() -> impl IntoView {
         let mut next = facets_memo.get_untracked();
         next.site = event_target_value(&ev).trim().to_string();
         nav_site(&build_request_filter_url(&next), NavigateOptions::default());
+    };
+    let nav_environment = navigate.clone();
+    let on_environment_input = move |ev: leptos::ev::Event| {
+        let mut next = facets_memo.get_untracked();
+        next.environment = event_target_value(&ev).trim().to_string();
+        nav_environment(&build_request_filter_url(&next), NavigateOptions::default());
+    };
+    let nav_request_type = navigate.clone();
+    let on_request_type_input = move |ev: leptos::ev::Event| {
+        let mut next = facets_memo.get_untracked();
+        next.request_type = event_target_value(&ev).trim().to_string();
+        nav_request_type(&build_request_filter_url(&next), NavigateOptions::default());
+    };
+    let nav_created_by = navigate.clone();
+    let on_created_by_input = move |ev: leptos::ev::Event| {
+        let mut next = facets_memo.get_untracked();
+        next.created_by = event_target_value(&ev).trim().to_string();
+        nav_created_by(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_search = navigate.clone();
     let on_search_input = move |ev: leptos::ev::Event| {
@@ -363,6 +405,39 @@ pub fn RequestList() -> impl IntoView {
                             })}
                         </Suspense>
                     </datalist>
+                </div>
+                <div class="filter-field">
+                    <label for="request-filter-environment">"Environment"</label>
+                    <input
+                        id="request-filter-environment"
+                        type="text"
+                        placeholder="Any environment"
+                        autocomplete="off"
+                        prop:value=move || facets_memo.get().environment
+                        on:change=on_environment_input
+                    />
+                </div>
+                <div class="filter-field">
+                    <label for="request-filter-request-type">"Request type"</label>
+                    <input
+                        id="request-filter-request-type"
+                        type="text"
+                        placeholder="Any type"
+                        autocomplete="off"
+                        prop:value=move || facets_memo.get().request_type
+                        on:change=on_request_type_input
+                    />
+                </div>
+                <div class="filter-field">
+                    <label for="request-filter-created-by">"Created by"</label>
+                    <input
+                        id="request-filter-created-by"
+                        type="text"
+                        placeholder="Any user"
+                        autocomplete="off"
+                        prop:value=move || facets_memo.get().created_by
+                        on:change=on_created_by_input
+                    />
                 </div>
                 <Show when=move || facets_memo.get().is_active()>
                     <button class="btn btn-secondary filter-clear" type="button" on:click=on_clear.clone()>
@@ -642,12 +717,59 @@ mod tests {
             q: "web db".to_string(),
             sort: "name".to_string(),
             direction: "desc".to_string(),
+            ..Default::default()
         };
         assert!(facets.is_active());
         assert_eq!(
             build_request_filter_url(&facets),
             "/requests?status=approved&site=site-alpha&q=web%20db&sort=name&direction=desc"
         );
+    }
+
+    #[test]
+    fn new_facets_serialize_in_canonical_order_with_encoding() {
+        let facets = RequestFacets {
+            environment: "prod".to_string(),
+            request_type: "server deploy".to_string(),
+            created_by: "alice@example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(facets.is_active());
+        assert_eq!(
+            build_request_filter_url(&facets),
+            "/requests?environment=prod&request_type=server%20deploy&created_by=alice%40example.com"
+        );
+    }
+
+    #[test]
+    fn all_facets_serialize_in_canonical_order() {
+        let facets = RequestFacets {
+            status: "approved".to_string(),
+            site: "site-a".to_string(),
+            environment: "prod".to_string(),
+            request_type: "server".to_string(),
+            created_by: "bob".to_string(),
+            q: "web".to_string(),
+            sort: "name".to_string(),
+            direction: "asc".to_string(),
+        };
+        assert!(facets.is_active());
+        assert_eq!(
+            build_request_filter_url(&facets),
+            "/requests?status=approved&site=site-a&environment=prod&request_type=server&created_by=bob&q=web&sort=name&direction=asc"
+        );
+    }
+
+    #[test]
+    fn blank_new_facets_produce_clean_url() {
+        let facets = RequestFacets {
+            environment: "   ".to_string(),
+            request_type: "".to_string(),
+            created_by: " ".to_string(),
+            ..Default::default()
+        };
+        assert!(!facets.is_active());
+        assert_eq!(build_request_filter_url(&facets), "/requests");
     }
 
     #[test]

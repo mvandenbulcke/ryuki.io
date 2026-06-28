@@ -424,14 +424,18 @@ pub const REQUEST_LIST_SORT_DIRECTIONS: &[&str] = &["asc", "desc"];
 /// is optional; an all-`None`/empty value reproduces the unfiltered default
 /// list (backward compatible with the pre-facet behavior).
 ///
-/// String facets (`status`, `site`, `q`) carry caller-supplied values and are
-/// percent-encoded when serialized. `sort`/`direction` are validated against
-/// the API allowlists and silently dropped when out of range, so a malformed
-/// value degrades to the default ordering rather than reaching the upstream.
+/// String facets (`status`, `site`, `environment`, `request_type`,
+/// `created_by`, `q`) carry caller-supplied values and are percent-encoded
+/// when serialized. `sort`/`direction` are validated against the API allowlists
+/// and silently dropped when out of range, so a malformed value degrades to the
+/// default ordering rather than reaching the upstream.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RequestListQuery {
     pub status: Option<String>,
     pub site: Option<String>,
+    pub environment: Option<String>,
+    pub request_type: Option<String>,
+    pub created_by: Option<String>,
     pub q: Option<String>,
     pub sort: Option<String>,
     pub direction: Option<String>,
@@ -444,6 +448,9 @@ impl RequestListQuery {
     pub fn is_empty(&self) -> bool {
         self.normalized_status().is_none()
             && self.normalized_site().is_none()
+            && self.normalized_environment().is_none()
+            && self.normalized_request_type().is_none()
+            && self.normalized_created_by().is_none()
             && self.normalized_q().is_none()
             && self.normalized_sort().is_none()
             && self.normalized_direction().is_none()
@@ -457,6 +464,18 @@ impl RequestListQuery {
 
     fn normalized_site(&self) -> Option<&str> {
         non_empty(self.site.as_deref())
+    }
+
+    fn normalized_environment(&self) -> Option<&str> {
+        non_empty(self.environment.as_deref())
+    }
+
+    fn normalized_request_type(&self) -> Option<&str> {
+        non_empty(self.request_type.as_deref())
+    }
+
+    fn normalized_created_by(&self) -> Option<&str> {
+        non_empty(self.created_by.as_deref())
     }
 
     fn normalized_q(&self) -> Option<&str> {
@@ -483,6 +502,15 @@ impl RequestListQuery {
         }
         if let Some(site) = self.normalized_site() {
             pairs.push(("site", percent_encode_query_value(site)));
+        }
+        if let Some(environment) = self.normalized_environment() {
+            pairs.push(("environment", percent_encode_query_value(environment)));
+        }
+        if let Some(request_type) = self.normalized_request_type() {
+            pairs.push(("request_type", percent_encode_query_value(request_type)));
+        }
+        if let Some(created_by) = self.normalized_created_by() {
+            pairs.push(("created_by", percent_encode_query_value(created_by)));
         }
         if let Some(q) = self.normalized_q() {
             pairs.push(("q", percent_encode_query_value(q)));
@@ -947,6 +975,7 @@ mod tests {
             direction: Some("asc".to_string()),
             limit: Some(25),
             offset: Some(50),
+            ..Default::default()
         };
         assert!(!query.is_empty());
         assert_eq!(
@@ -957,6 +986,54 @@ mod tests {
             request_list_path_with_query(&query),
             "/api/requests?status=approved&site=ams1&q=web&sort=name&direction=asc&limit=25&offset=50"
         );
+    }
+
+    #[test]
+    fn request_list_query_new_facets_serialize_in_canonical_order() {
+        let query = RequestListQuery {
+            environment: Some("prod".to_string()),
+            request_type: Some("server deploy".to_string()),
+            created_by: Some("alice@example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(!query.is_empty());
+        assert_eq!(
+            query.to_query_string(),
+            "?environment=prod&request_type=server%20deploy&created_by=alice%40example.com"
+        );
+    }
+
+    #[test]
+    fn request_list_query_all_facets_canonical_order() {
+        let query = RequestListQuery {
+            status: Some("approved".to_string()),
+            site: Some("ams1".to_string()),
+            environment: Some("prod".to_string()),
+            request_type: Some("server".to_string()),
+            created_by: Some("bob".to_string()),
+            q: Some("web".to_string()),
+            sort: Some("name".to_string()),
+            direction: Some("asc".to_string()),
+            limit: None,
+            offset: None,
+        };
+        assert!(!query.is_empty());
+        assert_eq!(
+            query.to_query_string(),
+            "?status=approved&site=ams1&environment=prod&request_type=server&created_by=bob&q=web&sort=name&direction=asc"
+        );
+    }
+
+    #[test]
+    fn blank_new_facets_are_dropped() {
+        let query = RequestListQuery {
+            environment: Some("   ".to_string()),
+            request_type: Some(String::new()),
+            created_by: Some("\t".to_string()),
+            ..Default::default()
+        };
+        assert!(query.is_empty());
+        assert_eq!(query.to_query_string(), "");
     }
 
     #[test]
