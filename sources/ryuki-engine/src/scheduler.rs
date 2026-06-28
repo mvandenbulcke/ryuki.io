@@ -75,6 +75,20 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
     matches!(job_kind, "health_probe")
 }
 
+/// Whether a job kind may be run by the durable scheduler. This is the widened
+/// safety boundary: it admits the read-only kinds PLUS explicitly enumerated
+/// SAFE-INTERNAL-WRITE kinds — ones that persist only to our own tables via pure
+/// dry-run engine logic and make NO provider / live / network / destructive call.
+///
+/// `synthetic_health_run` qualifies: it records simulated probe results
+/// (`check_results`) computed by the pure `synthetic_health::run_all_checks`. It is
+/// an EXPLICIT allowlist entry, never a category or prefix match — a live or
+/// destructive kind must still be added here deliberately, and only behind a real
+/// policy gate (#11). Anything not listed is refused (recorded `skipped`).
+pub fn job_is_schedulable(job_kind: &str) -> bool {
+    job_is_read_only(job_kind) || matches!(job_kind, "synthetic_health_run")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +155,19 @@ mod tests {
         assert!(!job_is_read_only("destroy_everything"));
         assert!(!job_is_read_only("live_apply"));
         assert!(!job_is_read_only(""));
+    }
+
+    #[test]
+    fn schedulable_admits_read_only_plus_synthetic_health_only() {
+        // Read-only kinds remain schedulable.
+        assert!(job_is_schedulable("health_probe"));
+        // The safe-internal-write kind is schedulable but is NOT read-only.
+        assert!(job_is_schedulable("synthetic_health_run"));
+        assert!(!job_is_read_only("synthetic_health_run"));
+        // Nothing else is admitted — no live/destructive kind, no prefix match.
+        assert!(!job_is_schedulable("live_apply"));
+        assert!(!job_is_schedulable("destroy_everything"));
+        assert!(!job_is_schedulable("synthetic_health_run_live"));
+        assert!(!job_is_schedulable(""));
     }
 }

@@ -246,6 +246,24 @@ pub async fn list_checks_for_site(
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+/// Return every ENABLED health check across all sites, for the platform-wide
+/// background scheduler (`synthetic_health_run`). Unlike `list_checks_for_site`
+/// this has no site filter — the scheduler runs as an internal platform principal,
+/// not a scoped user. Executor-generic so the scheduler can run it INSIDE its tick
+/// transaction (pass `&mut *conn`), keeping the run atomic with its savepoint.
+pub async fn list_all_enabled_checks<'e, E>(executor: E) -> Result<Vec<HealthCheck>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let rows: Vec<HealthCheckRow> = sqlx::query_as(&format!(
+        "SELECT {HC_COLUMNS} FROM health_checks WHERE enabled = true ORDER BY site, name"
+    ))
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter().map(|r| r.into_model()).collect()
+}
+
 // ─── check_results repository functions ───────────────────────────────────────
 
 /// Insert a new check result and return the persisted row. The caller supplies
@@ -253,8 +271,13 @@ pub async fn list_checks_for_site(
 ///
 /// `check_id` must reference an existing `health_checks.id` (FK constraint).
 /// `executed_at` is bound as `::timestamptz` from the RFC-3339 string in the
-/// model. `latency_ms` is bound as `i32` after range-checking.
-pub async fn insert_result(pool: &PgPool, r: &CheckResult) -> Result<CheckResult, sqlx::Error> {
+/// model. `latency_ms` is bound as `i32` after range-checking. Executor-generic so
+/// it works with both a `&PgPool` (handlers) and a `&mut *tx` (the scheduler tick,
+/// so a failed insert rolls back within that schedule's savepoint).
+pub async fn insert_result<'e, E>(executor: E, r: &CheckResult) -> Result<CheckResult, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let id = Uuid::parse_str(&r.id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
     let check_id = Uuid::parse_str(&r.check_id).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
@@ -274,7 +297,7 @@ pub async fn insert_result(pool: &PgPool, r: &CheckResult) -> Result<CheckResult
     .bind(latency_ms_i32)
     .bind(&r.message)
     .bind(&r.executed_at)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.into_model()

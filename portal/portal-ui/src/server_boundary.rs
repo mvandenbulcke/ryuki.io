@@ -24,11 +24,10 @@ use crate::api::{
 #[cfg(any(feature = "ssr", test))]
 use crate::api::{
     admin_agent_approve_path, admin_agent_revoke_path, admin_session_revoke_path,
-    admin_token_revoke_path,
-    notifications_read_path, request_approve_path, request_audit_path, request_cancel_path,
-    request_detail_path, request_evidence_path, request_execute_path, request_lock_path,
-    request_plan_path, request_protect_path, request_publish_path, request_reject_path,
-    request_retire_path, request_validate_path, request_verify_path,
+    admin_token_revoke_path, notifications_read_path, request_approve_path, request_audit_path,
+    request_cancel_path, request_detail_path, request_evidence_path, request_execute_path,
+    request_lock_path, request_plan_path, request_protect_path, request_publish_path,
+    request_reject_path, request_retire_path, request_validate_path, request_verify_path,
 };
 // Used only by `#[server]` (ssr-only) bodies; gating them to `ssr` keeps the
 // `test` build (no ssr feature) free of unused-import warnings.

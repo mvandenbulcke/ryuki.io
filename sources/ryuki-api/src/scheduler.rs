@@ -67,16 +67,19 @@ pub struct ExecutionView {
 }
 
 /// Run a single job kind inside the tick transaction and return its
-/// `(status, detail)`. A non-read-only or unknown kind is REFUSED — recorded as
-/// `skipped`, never executed — which is the slice-1 safety boundary: the durable
-/// engine cannot run a side-effecting kind until a later slice adds it behind a
-/// policy gate. The only runnable kind today is the read-only `health_probe`,
-/// which proves the scheduler and DB are alive.
+/// `(status, detail)`. A kind that is not schedulable (unknown, or live/
+/// side-effecting) is REFUSED — recorded as `skipped`, never executed. The
+/// safety boundary is `job_is_schedulable`: read-only kinds plus explicitly
+/// enumerated SAFE-INTERNAL-WRITE kinds (which persist only to our own tables via
+/// pure dry-run engine logic, no provider/live call). Runnable kinds today:
+/// `health_probe` (read-only liveness) and `synthetic_health_run` (records
+/// simulated probe results). Every write happens on `tx`, so a failure rolls back
+/// within the schedule's savepoint.
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
 ) -> Result<(String, Option<String>), sqlx::Error> {
-    if !ryuki_engine::scheduler::job_is_read_only(job_kind) {
+    if !ryuki_engine::scheduler::job_is_schedulable(job_kind) {
         return Ok((
             "skipped".to_string(),
             Some(format!("unsupported job kind: {job_kind}")),
@@ -96,7 +99,24 @@ async fn run_job(
                 Some(format!("probe ok; requests_observed={count}")),
             ))
         }
-        // Unreachable: job_is_read_only gated above. Kept exhaustive and safe.
+        "synthetic_health_run" => {
+            // Safe-internal dry-run: list every ENABLED check across all sites
+            // (the scheduler is a platform-wide internal principal, not scoped),
+            // run the PURE engine simulation, and persist each result on `tx` so a
+            // failure rolls back with this schedule's savepoint. `detail` is kept
+            // aggregate-only (a count) — never per-site/tenant data — because it is
+            // surfaced via /api/ops/scheduler/executions.
+            let checks = crate::repos::synthetic_health::list_all_enabled_checks(&mut **tx).await?;
+            let results = ryuki_engine::synthetic_health::run_all_checks(&checks);
+            for result in &results {
+                crate::repos::synthetic_health::insert_result(&mut **tx, result).await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("ran {} synthetic health check(s)", results.len())),
+            ))
+        }
+        // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
         other => Ok((
             "skipped".to_string(),
             Some(format!("unsupported job kind: {other}")),
@@ -400,6 +420,105 @@ mod db_tests {
 
         sqlx::query("DELETE FROM schedules WHERE id = $1")
             .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #40: a due `synthetic_health_run` schedule runs every ENABLED check inside
+    /// the tick tx, persists a result per check, records a succeeded execution, and
+    /// advances. Proves the safe-internal-write kind is dispatched (not skipped).
+    #[tokio::test]
+    async fn tick_runs_synthetic_health_and_persists_results() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Seed one enabled health check; capture its generated id.
+        let check_id: String = sqlx::query_scalar(
+            "INSERT INTO health_checks (name, check_type, endpoint, site, enabled) \
+             VALUES ('sched-synth-test', 'http', 'https://example.test/health', 'GBLON', true) \
+             RETURNING id::text",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let sched_id = "sched-test-synth-9c2";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test synth run', 'synthetic_health_run', 3600, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(sched_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_results WHERE check_id = $1::uuid")
+                .bind(&check_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted synthetic schedule ran");
+
+        // A result was persisted for our seeded check (proves the arm ran, not
+        // skipped, and wrote inside the tx).
+        let after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_results WHERE check_id = $1::uuid")
+                .bind(&check_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(
+            after > before,
+            "the scheduled synthetic run persisted a result for the seeded check"
+        );
+
+        // The schedule recorded a succeeded execution and was advanced.
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions \
+             WHERE schedule_id = $1 AND status = 'succeeded' AND job_kind = 'synthetic_health_run'",
+        )
+        .bind(sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(
+            succeeded >= 1,
+            "a succeeded synthetic_health_run execution was recorded"
+        );
+        let still_due: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedules WHERE id = $1 AND next_run_at <= NOW()",
+        )
+        .bind(sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(still_due, 0, "schedule was advanced past now");
+
+        // Cleanup: results (FK) before the check.
+        sqlx::query("DELETE FROM check_results WHERE check_id = $1::uuid")
+            .bind(&check_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM health_checks WHERE id = $1::uuid")
+            .bind(&check_id)
             .execute(pool)
             .await
             .ok();
