@@ -37,3 +37,6 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rsa = "0.9"
 ryuki-agent = { workspace = true }
 tempfile = "3"
+# `test-util` enables the paused-clock test runtime (`start_paused = true`) used
+# by the background-loop timeout unit tests; kept dev-only so it never ships.
+tokio = { version = "1", features = ["full", "test-util"] }

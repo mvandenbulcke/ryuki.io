@@ -1606,29 +1606,39 @@ pub async fn create_agent_job(
 pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
+        // #26 follow-on: Skip missed ticks so a recovered loop resumes on the next
+        // aligned boundary rather than bursting catch-up ticks after a backoff/timeout.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick (just started)
                              // #31: exponential backoff on consecutive failures so a persistent
                              // outage (DB down, pool exhausted, lock contention) is retried with
                              // increasing spacing instead of hammering + log-spamming at the base
-                             // interval. The extra sleep is the real delay; the ticker's Burst
-                             // catch-up tick after it returns immediately, so it does not double-wait.
+                             // interval. The extra sleep is the real delay; the ticker's Skip
+                             // behavior means a recovered loop resumes on the next boundary.
+        let timeout = crate::background::iteration_timeout(interval_secs);
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match expire_leases(&pool).await {
+            match crate::background::run_bounded(timeout, expire_leases(&pool)).await {
                 Ok(_) => consecutive_failures = 0,
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    // 1, 3, 7, 15, 15… extra intervals (capped at 2^4-1).
-                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        backoff_intervals,
-                        "lease expiry sweep failed; backing off"
-                    );
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "lease expiry sweep failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "lease expiry sweep exceeded its iteration timeout; backing off"
+                        ),
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        interval_secs.saturating_mul(backoff_intervals),
+                        interval_secs.saturating_mul(backoff),
                     ))
                     .await;
                 }
@@ -1735,27 +1745,40 @@ pub fn spawn_agent_offline_scan(pool: PgPool, interval_secs: u64, threshold_secs
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
+        let timeout = crate::background::iteration_timeout(interval_secs);
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match agent_offline_scan_once(&pool, threshold_secs).await {
+            match crate::background::run_bounded(
+                timeout,
+                agent_offline_scan_once(&pool, threshold_secs),
+            )
+            .await
+            {
                 Ok(emitted) => {
                     consecutive_failures = 0;
                     if emitted > 0 {
                         tracing::info!(emitted, "agent-offline scan emitted transition events");
                     }
                 }
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        backoff_intervals,
-                        "agent-offline scan failed; backing off"
-                    );
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "agent-offline scan failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "agent-offline scan exceeded its iteration timeout; backing off"
+                        ),
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        interval_secs.saturating_mul(backoff_intervals),
+                        interval_secs.saturating_mul(backoff),
                     ))
                     .await;
                 }

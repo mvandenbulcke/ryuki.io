@@ -20688,27 +20688,35 @@ pub fn spawn_slo_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
+        let timeout = crate::background::iteration_timeout(interval_secs);
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match slo_breach_scan_once(&pool).await {
+            match crate::background::run_bounded(timeout, slo_breach_scan_once(&pool)).await {
                 Ok(emitted) => {
                     consecutive_failures = 0;
                     if emitted > 0 {
                         tracing::info!(emitted, "slo-breach scan emitted transition events");
                     }
                 }
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        backoff_intervals,
-                        "slo-breach scan failed; backing off"
-                    );
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "slo-breach scan failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "slo-breach scan exceeded its iteration timeout; backing off"
+                        ),
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        interval_secs.saturating_mul(backoff_intervals),
+                        interval_secs.saturating_mul(backoff),
                     ))
                     .await;
                 }
@@ -20866,27 +20874,35 @@ pub fn spawn_budget_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
+        let timeout = crate::background::iteration_timeout(interval_secs);
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match budget_breach_scan_once(&pool).await {
+            match crate::background::run_bounded(timeout, budget_breach_scan_once(&pool)).await {
                 Ok(emitted) => {
                     consecutive_failures = 0;
                     if emitted > 0 {
                         tracing::info!(emitted, "budget-breach scan emitted transition events");
                     }
                 }
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        backoff_intervals,
-                        "budget-breach scan failed; backing off"
-                    );
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "budget-breach scan failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "budget-breach scan exceeded its iteration timeout; backing off"
+                        ),
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        interval_secs.saturating_mul(backoff_intervals),
+                        interval_secs.saturating_mul(backoff),
                     ))
                     .await;
                 }

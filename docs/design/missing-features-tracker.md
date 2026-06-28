@@ -149,6 +149,18 @@ prior work: #14 (deny_unknown_fields present), #24 (scope via #2), #25 (DB-backe
 via #8), #35 (audited via #5). Remaining findings deferred-with-rationale — see
 the triage close-out in [swarm-findings-2026-06-25.md](swarm-findings-2026-06-25.md).
 
+**Swarm wave 2026-06-28:** fresh post-batch analysis (after #19/#23/#58/#52/#17
+shipped). Top finding implemented — **per-iteration timeouts for the 5 standalone
+background loops** (#26 follow-on): the durable scheduler bounds each tick with a
+`tokio::time::timeout`, but `spawn_{lease_expiry,agent_offline,idempotency,slo_breach,budget_breach}`
+did not — a stall beyond the pool's 30s statement timeout pinned the loop forever.
+New `background.rs` (`iteration_timeout`/`loop_backoff`/`note_failure`/`run_bounded`,
+all unit-tested) wraps every loop iteration; a timeout counts as a failure driving
+the existing #31 backoff; `MissedTickBehavior::Skip` unified across all 5. codex
+plan(rd2)+impl APPROVE. See [background-loop-timeouts.md](background-loop-timeouts.md).
+Follow-ups (also swarm findings): background-loop liveness in platform_self_health;
+integration-connection CRUD endpoints (needs verification); DR-plan update/delete.
+
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
 #8 agent approve — revoke deferred (`6d6fb5b`), #63 observability deploy

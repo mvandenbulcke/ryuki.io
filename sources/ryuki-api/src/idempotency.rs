@@ -423,28 +423,38 @@ pub async fn sweep_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> {
 pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
     tokio::spawn(async move {
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
+        // #26 follow-on: Skip missed ticks so a recovered loop resumes on the next
+        // aligned boundary rather than bursting catch-up ticks after a backoff/timeout.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick (just started)
                              // #31: exponential backoff on consecutive failures so a persistent outage
                              // is retried with increasing spacing instead of hammering + log-spamming
                              // at the base interval. The extra sleep is the real delay; the ticker's
-                             // Burst catch-up tick after it returns immediately (no double-wait).
+                             // Skip behavior means a recovered loop resumes on the next boundary.
+        let timeout = crate::background::iteration_timeout(interval_secs);
         let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
-            match sweep_expired_records(&pool).await {
+            match crate::background::run_bounded(timeout, sweep_expired_records(&pool)).await {
                 Ok(_) => consecutive_failures = 0,
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    // 1, 3, 7, 15, 15… extra intervals (capped at 2^4-1).
-                    let backoff_intervals = (1u64 << consecutive_failures.min(4)) - 1;
-                    tracing::error!(
-                        error = %e,
-                        consecutive_failures,
-                        backoff_intervals,
-                        "idempotency sweep failed; backing off"
-                    );
+                Err(err) => {
+                    let backoff = crate::background::note_failure(&mut consecutive_failures);
+                    match err {
+                        crate::background::IterError::Failed(e) => tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "idempotency sweep failed; backing off"
+                        ),
+                        crate::background::IterError::TimedOut => tracing::error!(
+                            timeout_secs = timeout.as_secs(),
+                            consecutive_failures,
+                            backoff_intervals = backoff,
+                            "idempotency sweep exceeded its iteration timeout; backing off"
+                        ),
+                    }
                     tokio::time::sleep(std::time::Duration::from_secs(
-                        interval_secs.saturating_mul(backoff_intervals),
+                        interval_secs.saturating_mul(backoff),
                     ))
                     .await;
                 }

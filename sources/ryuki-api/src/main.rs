@@ -2,6 +2,7 @@
 
 mod agents;
 mod audit;
+mod background;
 mod boundary;
 mod config;
 mod config_store;
