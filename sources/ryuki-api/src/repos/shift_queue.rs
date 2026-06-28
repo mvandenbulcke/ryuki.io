@@ -2,8 +2,8 @@
 //!
 //! The shift queue is the operations work-item surface (migration 029). Until
 //! #52 every INSERT into it lived inline in tests/seeds; this is the first
-//! reusable writer, kept minimal and scoped to the `restore-test-overdue`
-//! producer.
+//! reusable writer, kept minimal and scoped to the restore-test producers
+//! (`restore-test-overdue`, `restore-test-failed`).
 //!
 //! # Dedup (no natural key)
 //! `shift_queue` has only a PK on `id`. To enqueue at-most-one OPEN item per
@@ -11,21 +11,32 @@
 //! `INSERT … SELECT … WHERE NOT EXISTS … ON CONFLICT DO NOTHING`. The `WHERE NOT
 //! EXISTS` skips the insert in the common already-queued case; the untargeted
 //! `ON CONFLICT DO NOTHING` is the belt-and-suspenders that makes a racing
-//! insert hit the partial unique index `uq_shift_queue_open_restore_overdue`
-//! (migration 122) and be silently dropped instead of aborting the caller's
-//! transaction. Under the single-leader scheduler tick the race is already
-//! impossible; the ON CONFLICT just makes it structurally safe.
+//! insert hit the matching partial unique index
+//! (`uq_shift_queue_open_restore_overdue` in migration 122,
+//! `uq_shift_queue_open_restore_failed` in migration 123) and be silently
+//! dropped instead of aborting the caller's transaction. Under the
+//! single-leader scheduler tick the race is already impossible; the ON CONFLICT
+//! just makes it structurally safe.
 
 use sqlx::PgExecutor;
 
-/// The only `item_type` this writer produces. Fixed so the dedup key and the
-/// partial unique index always agree.
-const RESTORE_OVERDUE_ITEM_TYPE: &str = "restore-test-overdue";
+/// The overdue/never-tested restore signal (#52 slice 1). Fixed so the dedup key
+/// and the partial unique index always agree.
+pub const RESTORE_OVERDUE_ITEM_TYPE: &str = "restore-test-overdue";
 
-/// Enqueue ONE open `restore-test-overdue` work item for `source_ci_key` iff no
-/// OPEN (`resolved = false`) item already exists for that system+type. Returns
+/// The FAILED-latest restore signal (#52 slice 2). Fixed so the dedup key and the
+/// partial unique index always agree.
+pub const RESTORE_FAILED_ITEM_TYPE: &str = "restore-test-failed";
+
+/// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
+/// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already
 /// existed (or a concurrent writer raced and the ON CONFLICT dropped this one).
+///
+/// `item_type` is a code-controlled constant (`RESTORE_OVERDUE_ITEM_TYPE` /
+/// `RESTORE_FAILED_ITEM_TYPE`), never user input; it is bound into BOTH the
+/// INSERT and the NOT EXISTS dedup predicate so the produced row and the dedup
+/// key can never drift.
 ///
 /// `metadata` is bound as a JSON string and cast to `jsonb`. Rejects an empty/
 /// whitespace `source_ci_key`: it is not a meaningful asset identity, and a blank
@@ -38,6 +49,7 @@ const RESTORE_OVERDUE_ITEM_TYPE: &str = "restore-test-overdue";
 /// `&mut *tx` and any future caller can run it on a pool.
 pub async fn enqueue_if_absent(
     executor: impl PgExecutor<'_>,
+    item_type: &str,
     source_ci_key: &str,
     title: &str,
     description: &str,
@@ -60,7 +72,7 @@ pub async fn enqueue_if_absent(
          ) \
          ON CONFLICT DO NOTHING",
     )
-    .bind(RESTORE_OVERDUE_ITEM_TYPE)
+    .bind(item_type)
     .bind(title)
     .bind(description)
     .bind(priority)

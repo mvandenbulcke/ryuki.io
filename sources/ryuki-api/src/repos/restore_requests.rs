@@ -280,6 +280,43 @@ pub async fn restore_test_recency(
     .await
 }
 
+/// Systems whose MOST RECENT restore_request is in `Failed` status (#52 slice 2).
+///
+/// "Latest is Failed" — NOT "has ever failed". A system that failed last month
+/// but succeeded yesterday is excluded (its newest attempt succeeded). The inner
+/// `DISTINCT ON (source_ci_key) ... ORDER BY source_ci_key, updated_at DESC,
+/// created_at DESC, id DESC` picks the newest row per system; the outer
+/// `WHERE status = 'Failed'` keeps only systems whose newest attempt failed.
+///
+/// Tie-break: `id` is a `gen_random_uuid()` (NOT chronological), so `id DESC`
+/// alone could pick the wrong row on an equal-`updated_at` tie. `created_at`
+/// (NOT NULL) is the chronological discriminator; `id` is only a final
+/// deterministic fallback.
+///
+/// Blank `source_ci_key` exclusion is done in the SCHEDULER arm in Rust (the same
+/// `trim().is_empty()` check `enqueue_if_absent` uses), NOT here in SQL: a SQL
+/// `btrim` only strips spaces, so a tab/newline-only key would pass a SQL filter
+/// yet still be rejected by the Rust check and abort the tick. Skipping per-row in
+/// Rust matches ANY whitespace exactly and mirrors the overdue arm.
+///
+/// Executor-generic (`impl PgExecutor`) so it runs over a `&PgPool` or inside the
+/// `restore_overdue_scan` tick's `&mut *tx`.
+pub async fn latest_failed_systems(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT source_ci_key FROM ( \
+             SELECT DISTINCT ON (source_ci_key) source_ci_key, status \
+             FROM restore_requests \
+             ORDER BY source_ci_key, updated_at DESC, created_at DESC, id DESC \
+         ) latest \
+         WHERE status = 'Failed' \
+         ORDER BY source_ci_key",
+    )
+    .fetch_all(executor)
+    .await
+}
+
 /// Atomically transition a restore request to its new state IFF its current DB
 /// status still equals `expected_status` (optimistic lock). Returns `Ok(None)`
 /// when the row is absent or its status had already changed (caller → 409), or

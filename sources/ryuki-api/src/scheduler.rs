@@ -315,7 +315,43 @@ async fn run_job(
                 .to_string();
                 enqueued += crate::repos::shift_queue::enqueue_if_absent(
                     &mut **tx,
+                    crate::repos::shift_queue::RESTORE_OVERDUE_ITEM_TYPE,
                     &row.source_ci_key,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            // Second signal (#52 slice 2): systems whose MOST RECENT restore test
+            // FAILED — a known, fresh recoverability failure (vs merely stale).
+            // Blank asset keys are skipped PER-ROW below (in Rust, matching
+            // enqueue_if_absent's trim()), so any whitespace key is excluded. A
+            // system can receive BOTH an overdue AND a failed item (distinct
+            // signals, distinct item_types); dedup is per item_type.
+            let failed = crate::repos::restore_requests::latest_failed_systems(&mut **tx).await?;
+            let mut failed_enqueued: u64 = 0;
+            for source_ci_key in &failed {
+                // Skip a blank asset key with the SAME trim() check enqueue_if_absent
+                // uses, so a tab/newline/space-only key can never abort the tick
+                // (mirrors the overdue arm). The query no longer SQL-filters blanks.
+                if source_ci_key.trim().is_empty() {
+                    continue;
+                }
+                let title = format!("Restore test FAILED (latest): {source_ci_key}");
+                let description = "The most recent restore test for this system FAILED. \
+                                   Investigate recoverability."
+                    .to_string();
+                let metadata = serde_json::json!({
+                    "source_ci_key": source_ci_key,
+                    "reason": "failed_latest",
+                })
+                .to_string();
+                failed_enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::RESTORE_FAILED_ITEM_TYPE,
+                    source_ci_key,
                     &title,
                     &description,
                     "P2",
@@ -325,7 +361,9 @@ async fn run_job(
             }
             Ok((
                 "succeeded".to_string(),
-                Some(format!("enqueued {enqueued} restore-overdue item(s)")),
+                Some(format!(
+                    "enqueued {enqueued} overdue, {failed_enqueued} failed restore item(s)"
+                )),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -1595,6 +1633,53 @@ mod db_tests {
         .unwrap()
     }
 
+    /// Count OPEN restore-test-failed shift_queue items for a system (#52 slice 2).
+    async fn open_failed_count(pool: &PgPool, source_ci_key: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'restore-test-failed' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(source_ci_key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Seed one restore_request with EXPLICIT `updated_at` AND `created_at`
+    /// backdated by the given second offsets. The latest-Failed detection's
+    /// tie-break orders by `updated_at DESC, created_at DESC, id DESC`, so the
+    /// precedence test needs to pin both timestamps independently.
+    /// Seed a restore request with an EXPLICIT id, an EXPLICIT `updated_at` instant
+    /// (bound directly — NOT `NOW()`, so two rows can share the EXACT same
+    /// `updated_at`), and an age-based `created_at`. Lets a tie-break test pin an
+    /// exact `updated_at` tie and make `id` ordering OPPOSE the correct `created_at`
+    /// answer — proving `created_at` (not `id`) decides the latest row.
+    async fn seed_restore_request_at_id(
+        pool: &PgPool,
+        id: &str,
+        source_ci_key: &str,
+        status: &str,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        created_age_secs: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (id, source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at, created_at) \
+             VALUES ($1::uuid, $2, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $3, \
+                     $4, NOW() - make_interval(secs => $5::double precision))",
+        )
+        .bind(id)
+        .bind(source_ci_key)
+        .bind(status)
+        .bind(updated_at)
+        .bind(created_age_secs as f64)
+        .execute(pool)
+        .await
+        .expect("seed restore request (explicit id + timestamps)");
+    }
+
     async fn cleanup_restore_fixtures(pool: &PgPool, source_ci_key: &str, sched_id: &str) {
         sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
             .bind(source_ci_key)
@@ -1664,8 +1749,8 @@ mod db_tests {
         assert_eq!(meta_key, key, "metadata.source_ci_key");
         assert_eq!(succ_count, 1, "metadata.successful_test_count");
 
-        // Aggregate-only detail contract: EXACTLY "enqueued <N> restore-overdue
-        // item(s)" with a bare count token.
+        // Aggregate-only detail contract: EXACTLY "enqueued <O> overdue, <F>
+        // failed restore item(s)" with two bare count tokens.
         let detail: Option<String> = sqlx::query_scalar(
             "SELECT detail FROM job_executions \
              WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
@@ -1677,12 +1762,13 @@ mod db_tests {
         .await
         .unwrap();
         let detail = detail.unwrap_or_default();
-        let count_token = detail
+        let counts = detail
             .strip_prefix("enqueued ")
-            .and_then(|s| s.strip_suffix(" restore-overdue item(s)"));
+            .and_then(|s| s.strip_suffix(" failed restore item(s)"))
+            .and_then(|s| s.split_once(" overdue, "));
         assert!(
-            count_token.is_some_and(|n| n.parse::<u64>().is_ok()),
-            "detail must be exactly 'enqueued <N> restore-overdue item(s)': {detail:?}"
+            counts.is_some_and(|(o, f)| o.parse::<u64>().is_ok() && f.parse::<u64>().is_ok()),
+            "detail must be exactly 'enqueued <O> overdue, <F> failed restore item(s)': {detail:?}"
         );
 
         // Dedup: a second tick does NOT create a duplicate open item.
@@ -1974,5 +2060,389 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    // ---- #52 slice 2: FAILED-latest signal ----------------------------------
+
+    /// Slice-2 test 1: a system whose newest restore_request is `Failed` → exactly
+    /// ONE open restore-test-failed item with the right metadata, and the detail
+    /// reports the failed count.
+    #[tokio::test]
+    async fn restore_scan_flags_latest_failed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-failed-{suffix}");
+        // Latest (and only) attempt is Failed. Age is irrelevant for the failed
+        // signal — keep it recent so it is NOT also overdue.
+        seed_restore_request(pool, &key, "Failed", 1).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "the planted restore scan ran");
+        assert_eq!(
+            open_failed_count(pool, &key).await,
+            1,
+            "exactly one open restore-test-failed item"
+        );
+
+        let (item_type, title, priority, reason): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT item_type, title, priority, metadata->>'reason' \
+                 FROM shift_queue \
+                 WHERE item_type = 'restore-test-failed' AND resolved = false \
+                   AND metadata->>'source_ci_key' = $1",
+            )
+            .bind(&key)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(item_type, "restore-test-failed", "item_type");
+        assert_eq!(
+            title,
+            format!("Restore test FAILED (latest): {key}"),
+            "title"
+        );
+        assert_eq!(priority, "P2", "priority");
+        assert_eq!(reason, "failed_latest", "metadata.reason");
+
+        let detail = latest_scan_detail(pool, &sched_id).await;
+        let failed = parse_failed_count(&detail);
+        // Deterministic: one latest-Failed system is seeded and the suite is
+        // serialized + self-cleaning, so the count is exactly 1 (not just >= 1).
+        assert_eq!(failed, 1, "detail reports exactly one failed: {detail:?}");
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Slice-2 test 2: an OLD Failed then a NEWER Verified → NOT flagged (only the
+    /// latest status matters; the system's most recent attempt succeeded).
+    #[tokio::test]
+    async fn restore_scan_latest_success_not_failed_flagged() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-recovered-{suffix}");
+        // Older Failed, newer Verified — latest is success. Keep the Verified
+        // recent so it is not overdue either.
+        seed_restore_request(pool, &key, "Failed", 30 * 86_400).await;
+        seed_restore_request(pool, &key, "Verified", 1).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_failed_count(pool, &key).await,
+            0,
+            "a system whose latest attempt succeeded is NOT failed-flagged"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Slice-2 test 3: dedup + count accounting — a second tick adds no duplicate
+    /// failed item AND its detail reports `failed = 0` (the count is
+    /// `rows_affected`, not candidates).
+    #[tokio::test]
+    async fn restore_scan_failed_dedups_and_counts_rows_affected() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-dedup-{suffix}");
+        seed_restore_request(pool, &key, "Failed", 1).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(open_failed_count(pool, &key).await, 1, "first tick flags");
+
+        // Second tick: still latest-Failed, but an open item already exists → no
+        // duplicate AND the failed count for THIS tick is 0 (rows_affected).
+        let sched_id2 = seed_due_restore_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_failed_count(pool, &key).await,
+            1,
+            "a second tick does not duplicate the open failed item"
+        );
+        let detail = latest_scan_detail(pool, &sched_id2).await;
+        assert_eq!(
+            parse_failed_count(&detail),
+            0,
+            "the second tick's detail reports failed = 0 (rows_affected): {detail:?}"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_restore_scan(pool).await;
+    }
+
+    /// Slice-2 test 4: both signals — a system that is overdue AND latest-failed →
+    /// BOTH a restore-test-overdue and a restore-test-failed open item.
+    #[tokio::test]
+    async fn restore_scan_both_signals() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-both-{suffix}");
+        // An OLD success (overdue: >90d, last success long ago) plus a NEWER Failed
+        // (latest is Failed). Both signals must fire independently.
+        seed_restore_request(pool, &key, "Completed", 120 * 86_400).await;
+        seed_restore_request(pool, &key, "Failed", 1).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            1,
+            "overdue item present (last success is stale)"
+        );
+        assert_eq!(
+            open_failed_count(pool, &key).await,
+            1,
+            "failed item present (latest attempt failed)"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Slice-2 test 5: the combined detail format is EXACTLY
+    /// "enqueued <O> overdue, <F> failed restore item(s)" with both counts ≥ 1
+    /// when one system is overdue and another is latest-failed.
+    #[tokio::test]
+    async fn restore_scan_combined_detail_format() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let overdue_key = format!("ci-rf-cd-overdue-{suffix}");
+        let failed_key = format!("ci-rf-cd-failed-{suffix}");
+        seed_restore_request(pool, &overdue_key, "Completed", 120 * 86_400).await;
+        seed_restore_request(pool, &failed_key, "Failed", 1).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+
+        let detail = latest_scan_detail(pool, &sched_id);
+        let detail = detail.await;
+        let counts = detail
+            .strip_prefix("enqueued ")
+            .and_then(|s| s.strip_suffix(" failed restore item(s)"))
+            .and_then(|s| s.split_once(" overdue, "));
+        let (overdue, failed) = counts.unwrap_or_else(|| {
+            panic!(
+                "detail must match 'enqueued <O> overdue, <F> failed restore item(s)': {detail:?}"
+            )
+        });
+        assert!(
+            overdue.parse::<u64>().unwrap() >= 1,
+            "overdue count ≥ 1: {detail:?}"
+        );
+        assert!(
+            failed.parse::<u64>().unwrap() >= 1,
+            "failed count ≥ 1: {detail:?}"
+        );
+
+        cleanup_restore_fixtures(pool, &overdue_key, &sched_id).await;
+        cleanup_restore_fixtures(pool, &failed_key, &sched_id).await;
+    }
+
+    /// Slice-2 test 6: latest-status precedence on equal `updated_at` — a Failed
+    /// and a Verified row with the SAME `updated_at` but
+    /// `created_at(Verified) > created_at(Failed)` → NOT flagged (the
+    /// chronologically-newer success wins the `created_at DESC` tiebreak).
+    #[tokio::test]
+    async fn restore_scan_latest_precedence_equal_updated_at() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-prec-{suffix}");
+        // Same updated_at (10s ago for both); Verified created MORE recently
+        // (created 5s ago) than Failed (created 20s ago) → newer attempt is the
+        // success, so NOT flagged.
+        //
+        // To make this a TRUE guard for the `created_at` tiebreak (and not pass by
+        // luck of random UUIDs), give the WRONG-answer row (Failed) the
+        // HIGHER-sorting id and the right one (Verified) the LOWER. Then a buggy
+        // `updated_at DESC, id DESC` tiebreak (no created_at) would pick Failed →
+        // flagged; only the correct `created_at DESC` precedence picks Verified →
+        // NOT flagged. The id node keeps the random suffix so runs never collide.
+        let node = &suffix.simple().to_string()[20..32];
+        let failed_id = format!("ffffffff-ffff-4fff-8fff-{node}");
+        let verified_id = format!("00000000-0000-4000-8000-{node}");
+        // ONE shared updated_at instant bound to BOTH rows, so the tie is EXACT
+        // (per-statement NOW() would give the second row a newer updated_at and the
+        // tiebreak would never reach created_at/id). Verified is created later.
+        let shared_updated = chrono::Utc::now();
+        seed_restore_request_at_id(pool, &failed_id, &key, "Failed", shared_updated, 20).await;
+        seed_restore_request_at_id(pool, &verified_id, &key, "Verified", shared_updated, 5).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_failed_count(pool, &key).await,
+            0,
+            "on an equal-updated_at tie, the chronologically-newer success wins \
+             (created_at decides, NOT the id fallback)"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Slice-2 test 7: blank-`source_ci_key` latest-Failed rows — both a
+    /// SPACES-only key AND a TAB/NEWLINE-only key — alongside a valid latest-Failed
+    /// system → the valid one is flagged and the scan succeeds. The arm skips blanks
+    /// in Rust with the same `trim()` `enqueue_if_absent` uses, so ANY whitespace
+    /// kind is excluded and never aborts the tick (a SQL `btrim` would miss
+    /// tab/newline).
+    #[tokio::test]
+    async fn restore_scan_blank_failed_key_does_not_abort() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let good = format!("ci-rf-good-{suffix}");
+        let spaces = "   ";
+        let tabnl = "\t\n"; // tab/newline-only: would survive a SQL btrim filter
+        seed_restore_request(pool, spaces, "Failed", 1).await; // latest-Failed, blank key
+        seed_restore_request(pool, tabnl, "Failed", 1).await; // latest-Failed, ws key
+        seed_restore_request(pool, &good, "Failed", 1).await; // latest-Failed, valid key
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "the scan ran (not aborted by the blank-key rows)");
+        assert_eq!(
+            open_failed_count(pool, &good).await,
+            1,
+            "the valid latest-Failed system is flagged despite the blank-key rows"
+        );
+        assert_eq!(
+            open_failed_count(pool, spaces).await,
+            0,
+            "the spaces-only key is skipped, not enqueued"
+        );
+        assert_eq!(
+            open_failed_count(pool, tabnl).await,
+            0,
+            "the tab/newline-only key is skipped, not enqueued"
+        );
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+               AND status = 'succeeded'",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(succeeded >= 1, "the scan execution succeeded (no rollback)");
+
+        cleanup_restore_fixtures(pool, &good, &sched_id).await;
+        for blank in [spaces, tabnl] {
+            sqlx::query("DELETE FROM restore_requests WHERE source_ci_key = $1")
+                .bind(blank)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// Slice-2 test 8: migration 123's partial unique index is idempotent (a
+    /// re-create is a no-op) AND rejects a SECOND open restore-test-failed
+    /// duplicate for the same system.
+    #[tokio::test]
+    async fn migration_123_is_idempotent_and_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Re-running the index DDL is a clean no-op (IF NOT EXISTS).
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_restore_failed \
+             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
+             WHERE resolved = false AND item_type = 'restore-test-failed'",
+        )
+        .execute(pool)
+        .await
+        .expect("re-creating the index is idempotent");
+
+        // The partial unique index rejects a SECOND open item for the same
+        // item_type+source_ci_key. First insert succeeds; the direct second
+        // insert (bypassing enqueue_if_absent's NOT EXISTS) hits the index.
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-rf-idx-{suffix}");
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('restore-test-failed', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first open failed item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('restore-test-failed', 't2', 'd2', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the partial unique index rejects a second OPEN failed duplicate"
+        );
+
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Fetch the most recent succeeded `restore_overdue_scan` detail for a schedule.
+    async fn latest_scan_detail(pool: &PgPool, sched_id: &str) -> String {
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        detail.unwrap_or_default()
+    }
+
+    /// Parse the `<F>` failed-count token out of the combined detail string.
+    fn parse_failed_count(detail: &str) -> u64 {
+        detail
+            .strip_prefix("enqueued ")
+            .and_then(|s| s.strip_suffix(" failed restore item(s)"))
+            .and_then(|s| s.split_once(" overdue, "))
+            .and_then(|(_, f)| f.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("unparseable combined detail: {detail:?}"))
     }
 }
