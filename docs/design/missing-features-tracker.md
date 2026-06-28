@@ -44,7 +44,7 @@ implementing **all 66**. This file tracks execution.
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
 | 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
-| 15 | [x] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | facets `3a32da0` (env/request_type/created_by) + pagination `a62a80b` (offset/limit page-nav, over-fetch has_next since the portal can't read X-Total-Count, offset clamp, pure tested helpers; codex APPROVED). Note: exact-total display deferred — needs UpstreamResponse to expose headers |
+| 15 | [x] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | facets `3a32da0` (env/request_type/created_by) + pagination `a62a80b` (offset/limit page-nav, over-fetch has_next since the portal can't read X-Total-Count, offset clamp, pure tested helpers; codex APPROVED). exact total via X-Total-Count `2535fee` (UpstreamResponse now carries the header; "Showing X-Y of N", inverted-label guarded). FULLY complete |
 | 16 | [x] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [~] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
