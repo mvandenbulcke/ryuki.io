@@ -44,7 +44,7 @@ implementing **all 66**. This file tracks execution.
 | 12 | [ ] | Agent-side vault-backed secret resolution | Exec | L | H | ✓ |
 | 13 | [~] | Request rework/fail/soft-delete transitions | API | M | H | ✓ |
 | 14 | [~] | List filtering/search + pagination envelope (API) | API | M | H | ✓ |
-| 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | — |
+| 15 | [~] | Faceted request filtering/sort/pagination (portal) | Portal | M | H | `3a32da0` — filter facets extended (environment, request_type, created_by added to the existing status/site/q + sort/direction; codex-reviewed post-merge, APPROVED). Remaining for [x]: pagination page-nav UI + X-Total-Count display |
 | 16 | [x] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [~] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
