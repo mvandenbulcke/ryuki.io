@@ -1342,6 +1342,7 @@ pub fn routes() -> Router {
         )
         .route("/api/admin/tokens", post(admin_tokens_create))
         .route("/api/admin/tokens", get(admin_tokens_list))
+        .route("/api/admin/tokens/{id}", get(admin_tokens_get))
         .route("/api/admin/tokens/{id}", delete(admin_tokens_revoke))
         .route("/api/admin/sessions", get(admin_sessions_list))
         .route(
@@ -13642,28 +13643,62 @@ async fn admin_tokens_list(
         "list",
     )?;
 
-    let tokens: Vec<Value> = rows
-        .into_iter()
-        .map(|row| {
-            json!({
-                "id": row.id,
-                "name": row.name,
-                "owner_principal": row.owner_principal,
-                "roles": row.roles,
-                "site_scope": row.site_scope,
-                "environment_scope": row.environment_scope,
-                "token_valid": row.token_valid,
-                "created_at": row.created_at,
-                "expires_at": row.expires_at,
-                "last_used_at": row.last_used_at,
-                "revoked_at": row.revoked_at,
-                // Hash is never exposed; plaintext is unrecoverable by design.
-                "token_hash": Value::Null,
-            })
-        })
-        .collect();
+    let tokens: Vec<Value> = rows.into_iter().map(token_row_to_json).collect();
 
     Ok(Json(json!({ "tokens": tokens })))
+}
+
+/// The secret-safe JSON projection of one API token row, SHARED by the list and
+/// the by-id read so they can never drift. The token hash is NEVER exposed (it is
+/// emitted as `null`; the plaintext is unrecoverable by design).
+fn token_row_to_json(row: TokenListRow) -> Value {
+    json!({
+        "id": row.id,
+        "name": row.name,
+        "owner_principal": row.owner_principal,
+        "roles": row.roles,
+        "site_scope": row.site_scope,
+        "environment_scope": row.environment_scope,
+        "token_valid": row.token_valid,
+        "created_at": row.created_at,
+        "expires_at": row.expires_at,
+        "last_used_at": row.last_used_at,
+        "revoked_at": row.revoked_at,
+        // Hash is never exposed; plaintext is unrecoverable by design.
+        "token_hash": Value::Null,
+    })
+}
+
+/// GET /api/admin/tokens/{id} — one token's metadata (to inspect roles/owner/expiry
+/// before revoking). Mirrors `admin_tokens_list`'s secret-safe projection via the
+/// shared `token_row_to_json`. `WHERE id = $1` only (NO `revoked_at` filter), so a
+/// revoked token is still readable like the list; a genuinely-absent id is 404.
+async fn admin_tokens_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_admin_permission(&session)?;
+    let Some(pool) = get_db() else {
+        return Err(api_token_db_required());
+    };
+    let row: Option<TokenListRow> = map_api_token_result(
+        sqlx::query_as::<_, TokenListRow>(
+            "SELECT id, name, owner_principal, roles, site_scope, environment_scope, \
+                    token_valid, created_at, expires_at, last_used_at, revoked_at \
+             FROM api_tokens WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await,
+        "get",
+    )?;
+    match row {
+        Some(row) => Ok(Json(token_row_to_json(row))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new("NOT_FOUND", "API token not found")),
+        )),
+    }
 }
 
 /// DELETE /api/admin/tokens/{id} — soft-revoke (sets revoked_at). 404 when no
@@ -36557,6 +36592,47 @@ mod unit_tests {
             panic!("auditor must be forbidden from listing tokens");
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_admin_tokens_get_rejects_non_admin() {
+        let mut session = AuthSession::static_dry_run();
+        session.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
+        // require_admin_permission runs before get_db, so this is 403 with no DB.
+        let Err((status, _)) = admin_tokens_get(AuthExtractor(session), Path(Uuid::new_v4())).await
+        else {
+            panic!("auditor must be forbidden from reading a token");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The load-bearing secret-hygiene test: the SHARED projection (used by both the
+    /// list and the by-id read) NEVER emits the real token hash — `token_hash` is
+    /// `null` and only metadata fields are present.
+    #[test]
+    fn test_token_row_to_json_never_exposes_the_hash() {
+        let row = TokenListRow {
+            id: Uuid::new_v4(),
+            name: "svc-account".into(),
+            owner_principal: "ops-team".into(),
+            roles: vec!["requester".into()],
+            site_scope: Some("DEFRA".into()),
+            environment_scope: None,
+            token_valid: true,
+            created_at: chrono::Utc::now(),
+            expires_at: None,
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let json = token_row_to_json(row);
+        assert_eq!(
+            json["token_hash"],
+            Value::Null,
+            "the token hash must NEVER be exposed"
+        );
+        assert_eq!(json["name"], "svc-account");
+        assert_eq!(json["owner_principal"], "ops-team");
+        assert_eq!(json["token_valid"], true);
     }
 
     #[tokio::test]
