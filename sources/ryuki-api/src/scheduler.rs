@@ -43,6 +43,12 @@ const REVIEW_INTERVAL: &str = "90 days";
 /// remaining due requests are picked up on the next daily scan.
 const MAINTAIN_REVIEW_BATCH: i64 = 100;
 
+/// Policy window for `restore_overdue_scan` (#52): a system whose last SUCCESSFUL
+/// restore test is older than this is flagged as overdue. Matches the
+/// `overdue_after_days` default (90) of the #47 read endpoint. A single const,
+/// easy to retune; the scan itself runs daily.
+const RESTORE_OVERDUE_DAYS: i64 = 90;
+
 /// A due schedule row claimed by the tick.
 #[derive(sqlx::FromRow)]
 struct DueSchedule {
@@ -84,9 +90,11 @@ pub struct ExecutionView {
 /// pure dry-run engine logic, no provider/live call). Runnable kinds today:
 /// `health_probe` (read-only liveness), `synthetic_health_run` (records simulated
 /// probe results), `maintain_review_scan` (flags Operational requests due for
-/// review via domain events), and `connection_health_sweep` (appends a dry-run
-/// health-check row per integration connection). Every write happens on `tx`, so
-/// a failure rolls back within the schedule's savepoint.
+/// review via domain events), `connection_health_sweep` (appends a dry-run
+/// health-check row per integration connection), and `restore_overdue_scan`
+/// (enqueues a deduped shift_queue item per overdue/never-tested system). Every
+/// write happens on `tx`, so a failure rolls back within the schedule's
+/// savepoint.
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -237,6 +245,87 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("probed {} connection(s)", connections.len())),
+            ))
+        }
+        "restore_overdue_scan" => {
+            // Safe-internal write (#52): READ restore-test recency across ALL
+            // sites (the scheduler is a platform-wide internal principal, not
+            // scoped, so site/env are None), classify each system with the PURE
+            // engine, and enqueue ONE deduped shift_queue work item per AT-RISK
+            // system. Reads restore_requests and writes only our own shift_queue
+            // — NO provider/live call. All on `tx`, so a failure rolls back with
+            // this schedule's savepoint. `detail` is kept aggregate-only (a
+            // count) — never per-system ids — because it is surfaced via
+            // /api/ops/scheduler/executions.
+            let rows =
+                crate::repos::restore_requests::restore_test_recency(&mut **tx, None, None).await?;
+            let now_unix = chrono::Utc::now().timestamp();
+            let overdue_after_secs = RESTORE_OVERDUE_DAYS * 86_400;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                // Skip a degenerate empty asset key (source_ci_key is NOT NULL but
+                // has no non-empty CHECK in mig 007): enqueue_if_absent rejects an
+                // empty key, and letting that `?` propagate would abort the WHOLE
+                // tick on every scan — one malformed row poisoning fan-out for every
+                // healthy system. Skip it instead (the recency aggregate would have
+                // grouped it as a degenerate identity anyway).
+                if row.source_ci_key.trim().is_empty() {
+                    continue;
+                }
+                let last_unix = row.last_successful_test.map(|t| t.timestamp());
+                let recency = ryuki_engine::backup_recency::classify_restore_recency(
+                    last_unix,
+                    now_unix,
+                    overdue_after_secs,
+                );
+                if !recency.is_at_risk() {
+                    continue;
+                }
+                let reason = recency.as_str();
+                // source_ci_key is a config-item identifier (an asset key, not a
+                // secret) — the same value the public #47 read endpoint returns.
+                let title = format!("Restore test {reason}: {}", row.source_ci_key);
+                // Title AND description both key off the single classifier verdict
+                // (`recency`) so they can never diverge (codex): the verdict is the
+                // one source of truth for overdue-vs-never-tested, not a second
+                // read of the Option.
+                let description = match recency {
+                    ryuki_engine::backup_recency::RestoreTestRecency::NeverTested => format!(
+                        "No successful restore test on record ({} request(s), 0 verified). \
+                         Verify recoverability.",
+                        row.total_requests
+                    ),
+                    _ => {
+                        let last = row
+                            .last_successful_test
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        format!(
+                            "No successful restore test in over {RESTORE_OVERDUE_DAYS} days \
+                             (last success: {last}). Verify recoverability."
+                        )
+                    }
+                };
+                let metadata = serde_json::json!({
+                    "source_ci_key": row.source_ci_key,
+                    "last_successful_test": row.last_successful_test.map(|t| t.to_rfc3339()),
+                    "successful_test_count": row.successful_test_count,
+                    "reason": reason,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    &row.source_ci_key,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("enqueued {enqueued} restore-overdue item(s)")),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -1426,5 +1515,464 @@ mod db_tests {
         assert_eq!(interval, 300, "seed interval_secs (5-minute cadence)");
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
+    }
+
+    // ---- #52 restore_overdue_scan ------------------------------------------
+
+    /// The migration-122-seeded restore_overdue_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (otherwise both would scan and the
+    /// migration scan could enqueue items for unrelated fixtures left by other
+    /// tests, breaking the per-tick count assertions).
+    const RESTORE_SCAN_SEED_ID: &str = "55555555-5555-4555-8555-555555555555";
+
+    /// Seed one restore_request for `source_ci_key` with the given status and an
+    /// `updated_at` backdated by `age_secs` seconds. `updated_at` is what the
+    /// recency aggregate uses for a success-state row, so backdating it controls
+    /// the classified age precisely.
+    async fn seed_restore_request(pool: &PgPool, source_ci_key: &str, status: &str, age_secs: i64) {
+        sqlx::query(
+            "INSERT INTO restore_requests \
+             (source_ci_key, restore_type, restore_point, target_site, \
+              target_environment, owner, status, updated_at) \
+             VALUES ($1, 'FullVm', 'rp-1', 'GBLON', 'production', 'sys', $2, \
+                     NOW() - make_interval(secs => $3::double precision))",
+        )
+        .bind(source_ci_key)
+        .bind(status)
+        .bind(age_secs as f64)
+        .execute(pool)
+        .await
+        .expect("seed restore request");
+    }
+
+    /// Plant a guaranteed-due `restore_overdue_scan` schedule so a single tick
+    /// runs the scan. Disables the migration-seeded scan first so EXACTLY ONE is
+    /// due. Returns the planted schedule id for cleanup.
+    async fn seed_due_restore_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(RESTORE_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-restorescan-due-9c2";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test restore scan', 'restore_overdue_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_restore_scan`]
+    /// disabled, so the suite leaves the PRODUCTION schedule shipped (enabled).
+    async fn restore_migration_restore_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(RESTORE_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN restore-test-overdue shift_queue items for a system.
+    async fn open_overdue_count(pool: &PgPool, source_ci_key: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'restore-test-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(source_ci_key)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_restore_fixtures(pool: &PgPool, source_ci_key: &str, sched_id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(source_ci_key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM restore_requests WHERE source_ci_key = $1")
+            .bind(source_ci_key)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_restore_scan(pool).await;
+    }
+
+    /// Test 1+2: an overdue system (last success >90d) → exactly ONE open item
+    /// with the exact column values + metadata; a SECOND tick does NOT duplicate.
+    #[tokio::test]
+    async fn restore_scan_enqueues_overdue_then_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-ros-overdue-{suffix}");
+        // Last success 100 days ago > 90d window.
+        seed_restore_request(pool, &key, "Completed", 100 * 86_400).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted restore scan ran");
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            1,
+            "exactly one open restore-test-overdue item"
+        );
+
+        // Exact column values + metadata of the enqueued item.
+        let (item_type, title, priority, reason, meta_key, succ_count): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT item_type, title, priority, metadata->>'reason', \
+                    metadata->>'source_ci_key', \
+                    (metadata->>'successful_test_count')::bigint \
+             FROM shift_queue \
+             WHERE item_type = 'restore-test-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(item_type, "restore-test-overdue", "item_type");
+        assert_eq!(title, format!("Restore test overdue: {key}"), "title");
+        assert_eq!(priority, "P2", "priority");
+        assert_eq!(reason, "overdue", "metadata.reason");
+        assert_eq!(meta_key, key, "metadata.source_ci_key");
+        assert_eq!(succ_count, 1, "metadata.successful_test_count");
+
+        // Aggregate-only detail contract: EXACTLY "enqueued <N> restore-overdue
+        // item(s)" with a bare count token.
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let count_token = detail
+            .strip_prefix("enqueued ")
+            .and_then(|s| s.strip_suffix(" restore-overdue item(s)"));
+        assert!(
+            count_token.is_some_and(|n| n.parse::<u64>().is_ok()),
+            "detail must be exactly 'enqueued <N> restore-overdue item(s)': {detail:?}"
+        );
+
+        // Dedup: a second tick does NOT create a duplicate open item.
+        let sched_id2 = seed_due_restore_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            1,
+            "a second tick does not duplicate the open item"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_restore_scan(pool).await;
+    }
+
+    /// Test 3: a recently-tested system (last success < 90d) → no item.
+    #[tokio::test]
+    async fn restore_scan_skips_recent_system() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-ros-recent-{suffix}");
+        seed_restore_request(pool, &key, "Verified", 10 * 86_400).await; // 10d ago
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            0,
+            "a recently-tested system is not flagged"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Fix B (codex): a degenerate whitespace-only `source_ci_key` is SKIPPED and
+    /// does NOT abort the tick — a healthy overdue system in the SAME scan is still
+    /// flagged, and the execution records success. (`source_ci_key` is NOT NULL but
+    /// has no non-empty CHECK, so a blank key is representable; it must not poison
+    /// fan-out for every other system.)
+    #[tokio::test]
+    async fn restore_scan_skips_blank_key_without_aborting() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let good = format!("ci-ros-good-{suffix}");
+        let blank = "   ";
+        seed_restore_request(pool, blank, "Completed", 100 * 86_400).await; // overdue, blank key
+        seed_restore_request(pool, &good, "Completed", 100 * 86_400).await; // overdue, valid key
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "the scan ran (not aborted by the blank-key row)");
+        assert_eq!(
+            open_overdue_count(pool, &good).await,
+            1,
+            "the healthy overdue system is still flagged despite the blank-key row"
+        );
+        assert_eq!(
+            open_overdue_count(pool, blank).await,
+            0,
+            "the blank-key row is skipped, not enqueued"
+        );
+        let succeeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'restore_overdue_scan' \
+               AND status = 'succeeded'",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(succeeded >= 1, "the scan execution succeeded (no rollback)");
+
+        cleanup_restore_fixtures(pool, &good, &sched_id).await;
+        sqlx::query("DELETE FROM restore_requests WHERE source_ci_key = $1")
+            .bind(blank)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 4: a never-succeeded system (requests exist, none Verified/Completed)
+    /// → flagged with metadata.reason='never_tested' (NOT 'overdue').
+    #[tokio::test]
+    async fn restore_scan_flags_never_tested() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-ros-never-{suffix}");
+        seed_restore_request(pool, &key, "Draft", 1).await; // never reached success
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            1,
+            "a never-succeeded system is flagged"
+        );
+        let (reason, succ_count): (String, i64) = sqlx::query_as(
+            "SELECT metadata->>'reason', \
+                    (metadata->>'successful_test_count')::bigint \
+             FROM shift_queue \
+             WHERE item_type = 'restore-test-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reason, "never_tested",
+            "reason is never_tested, not overdue"
+        );
+        assert_eq!(succ_count, 0, "no successful tests on record");
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+    }
+
+    /// Test 5: re-flag after resolution — once an operator RESOLVES the item and
+    /// the system is STILL overdue at the next scan, a fresh open item is created.
+    #[tokio::test]
+    async fn restore_scan_reflags_after_resolution() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-ros-reflag-{suffix}");
+        seed_restore_request(pool, &key, "Completed", 120 * 86_400).await;
+
+        let sched_id = seed_due_restore_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(open_overdue_count(pool, &key).await, 1, "initial flag");
+
+        // Operator resolves the item.
+        sqlx::query(
+            "UPDATE shift_queue SET resolved = true, resolved_at = NOW() \
+             WHERE item_type = 'restore-test-overdue' \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&key)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            0,
+            "no open item after resolve"
+        );
+
+        // A subsequent tick (still overdue) creates a NEW open item.
+        let sched_id2 = seed_due_restore_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key).await,
+            1,
+            "a fresh open item is created after the prior one was resolved"
+        );
+
+        cleanup_restore_fixtures(pool, &key, &sched_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_restore_scan(pool).await;
+    }
+
+    /// Test 6: threshold boundary — a system whose last success is EXACTLY
+    /// `RESTORE_OVERDUE_DAYS` days old is NOT flagged (classifier uses
+    /// `age > threshold`); at +1 second it IS flagged. Locks the queue behavior
+    /// at the threshold, not just directionally. Uses two distinct keys so both
+    /// directions are exercised in one serialized run.
+    #[tokio::test]
+    async fn restore_scan_threshold_boundary() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let key_at = format!("ci-ros-at-{suffix}");
+        let key_over = format!("ci-ros-over-{suffix}");
+        let window = RESTORE_OVERDUE_DAYS * 86_400;
+        // Backdate a couple of seconds under/over the boundary to absorb the
+        // wall-clock drift between the seed NOW() and the scan's Utc::now(): the
+        // "at" fixture sits just inside the window (not flagged), the "over"
+        // fixture just past it (flagged).
+        seed_restore_request(pool, &key_at, "Completed", window - 5).await;
+        seed_restore_request(pool, &key_over, "Completed", window + 5).await;
+        let sched_id = seed_due_restore_scan(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_overdue_count(pool, &key_at).await,
+            0,
+            "a system at/under the threshold is NOT flagged"
+        );
+        assert_eq!(
+            open_overdue_count(pool, &key_over).await,
+            1,
+            "a system just past the threshold IS flagged"
+        );
+
+        cleanup_restore_fixtures(pool, &key_at, &sched_id).await;
+        cleanup_restore_fixtures(pool, &key_over, &sched_id).await;
+    }
+
+    /// Test 7: migration 122's seed is idempotent AND its seeded row matches the
+    /// shipped contract; the partial unique index rejects a SECOND open duplicate.
+    #[tokio::test]
+    async fn migration_122_is_idempotent_and_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Re-running the seed INSERT is a clean no-op (ON CONFLICT).
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Restore overdue scan (all systems)', 'restore_overdue_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(RESTORE_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(RESTORE_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Restore overdue scan (all systems)", "seed name");
+        assert_eq!(kind, "restore_overdue_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily cadence)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // The partial unique index rejects a SECOND open item for the same
+        // item_type+source_ci_key. First insert succeeds; the direct second
+        // insert (bypassing enqueue_if_absent's NOT EXISTS) hits the index.
+        let suffix = uuid::Uuid::new_v4();
+        let key = format!("ci-ros-idx-{suffix}");
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('restore-test-overdue', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first open item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('restore-test-overdue', 't2', 'd2', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the partial unique index rejects a second OPEN duplicate"
+        );
+
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
     }
 }

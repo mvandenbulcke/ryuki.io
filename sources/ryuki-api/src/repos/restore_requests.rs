@@ -247,8 +247,13 @@ pub struct RestoreTestRecencyRow {
 /// test could read as recent; the precise fix would be a dedicated `succeeded_at`
 /// column. Systems that have NEVER had a restore request do not appear (that is a
 /// coverage question, not a recency one).
+///
+/// Executor-generic (`impl PgExecutor`) so it runs both over a `&PgPool` (the
+/// #47 read handler) and inside a `&mut *tx` (the #52 `restore_overdue_scan`
+/// tick) — `&PgPool` already satisfies `PgExecutor`, so existing callers are
+/// unaffected.
 pub async fn restore_test_recency(
-    pool: &PgPool,
+    executor: impl sqlx::PgExecutor<'_>,
     site: Option<&str>,
     environment: Option<&str>,
 ) -> Result<Vec<RestoreTestRecencyRow>, sqlx::Error> {
@@ -271,7 +276,7 @@ pub async fn restore_test_recency(
     )
     .bind(site)
     .bind(environment)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 

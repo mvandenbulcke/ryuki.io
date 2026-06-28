@@ -95,11 +95,20 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// connection, runs the pure `test_connection_stub` (a DRY-RUN, no provider/live
 /// call), and appends a `connection_health_checks` row plus refreshes each
 /// connection's `last_test_*` — writes only to our own tables.
+///
+/// `restore_overdue_scan` (#52) also qualifies: it reads `restore_requests`
+/// recency, classifies each system with the pure
+/// `backup_recency::classify_restore_recency`, and enqueues ONE deduped
+/// `shift_queue` work item per at-risk system — writes only to our own tables,
+/// NO provider/live/destructive call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
             job_kind,
-            "synthetic_health_run" | "maintain_review_scan" | "connection_health_sweep"
+            "synthetic_health_run"
+                | "maintain_review_scan"
+                | "connection_health_sweep"
+                | "restore_overdue_scan"
         )
 }
 
@@ -182,12 +191,15 @@ mod tests {
         assert!(!job_is_read_only("maintain_review_scan"));
         assert!(job_is_schedulable("connection_health_sweep"));
         assert!(!job_is_read_only("connection_health_sweep"));
+        assert!(job_is_schedulable("restore_overdue_scan"));
+        assert!(!job_is_read_only("restore_overdue_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("destroy_everything"));
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));
         assert!(!job_is_schedulable("connection_health_sweep_live"));
+        assert!(!job_is_schedulable("restore_overdue_scan_live"));
         assert!(!job_is_schedulable(""));
     }
 }

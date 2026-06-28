@@ -81,7 +81,7 @@ implementing **all 66**. This file tracks execution.
 | 49 | [x] | Secret update & deregistration | API | S | M | — |
 | 50 | [x] | Evidence pack file download / export | Portal | S | M | — |
 | 51 | [x] | Per-vendor connection capability catalog | Integ | M | M | — |
-| 52 | [ ] | Route DR-overdue/failed tests into work queue | Resil | S | M | — |
+| 52 | [x] | Route DR-overdue/failed tests into work queue | Resil | S | M | shipped (overdue/never-tested slice) — leader-elected durable-scheduler `restore_overdue_scan` reuses the #47 recency classifier, and for each at-risk system (`is_at_risk()` = Overdue OR NeverTested) enqueues ONE open `shift_queue` item (`restore-test-overdue`, P2) deduped via INSERT…WHERE NOT EXISTS…ON CONFLICT DO NOTHING backed by a partial unique index (mig 122). New `repos/shift_queue.rs::enqueue_if_absent`; `restore_test_recency` generalized to `impl PgExecutor`. codex plan (rd2) + impl both APPROVE. Follow-ups: FAILED-latest routing, DR-plan drill overdue, auto-assignment |
 | 53 | [x] | Cost/capacity budget thresholds + alerts | AIOps | M | M | — |
 | 54 | [x] | Reserved-capacity / commitment cost modeling | AIOps | M | M | — |
 | 55 | [x] | DNS record update endpoint | API | S | M | — |

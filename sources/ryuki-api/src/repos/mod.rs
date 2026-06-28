@@ -46,6 +46,7 @@ pub mod patch_waves;
 pub mod repository_capacity;
 pub mod restore_requests;
 pub mod runbook_executions;
+pub mod shift_queue;
 pub mod site_registry;
 pub mod snapshots;
 pub mod sql_deployment;
