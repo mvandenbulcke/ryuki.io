@@ -87,7 +87,7 @@ implementing **all 66**. This file tracks execution.
 | 55 | [x] | DNS record update endpoint | API | S | M | — |
 | 56 | [x] | IPAM subnet CRUD | API | M | M | — |
 | 57 | [x] | Load-balancer virtual-server delete/update | API | M | M | — |
-| 58 | [ ] | Connection usage audit trail | Integ | M | M | — |
+| 58 | [x] | Connection usage audit trail | Integ | M | M | shipped — `integration_test` (the one CP-side credential-resolution site) now records ONE durable hash-chained `audit_log` row per access (`integration.connection.tested`, actor from the session, AUTHORITATIVE in DB mode → 500 on audit-write failure, local store in no-DB), recorded whether resolution succeeds or fails, BEFORE the best-effort telemetry writes. detail carries connection_id/vendor_type/`cred_source`/endpoint_status — NEVER the ref/secret/CredError text. Reuses audit.rs as-is (no migration). codex plan + impl both APPROVE; 7 tests incl. redaction-survival (cred_source key avoids the `credential` redaction pattern). Follow-ups: live-execution credential-use audit (owner-domain), per-connection usage read view |
 | 59 | [~] | Scope (site/env) selector + user preferences | Portal | M | M | ✓ |
 | 60 | [ ] | Evidence blob store for large artifacts | Exec | M | M | — |
 | 61 | [x] | On-call / escalation contact registry | Observ | M | M | — |

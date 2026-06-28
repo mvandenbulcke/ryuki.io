@@ -1,8 +1,16 @@
 # #58 — Connection usage audit trail
 
-Status: design — codex plan-review APPROVE (round 2). Round 1 NEEDS-CHANGES fixed:
-audit is now AUTHORITATIVE in DB mode (propagates failure), not best-effort; no
-audit.rs change; chain-link + leak-risk + append + actor tests specified.
+Status: SHIPPED — codex plan-review APPROVE (round 2) + codex impl-review APPROVE.
+Round-1 plan fix: audit is AUTHORITATIVE in DB mode (propagates failure), not
+best-effort; no audit.rs change; chain-link + leak-risk + append + actor tests.
+Impl-review MAJOR fix: the detail source-type key is `cred_source`, NOT
+`credential_source` — `redact_detail` blanks any key containing the `credential`
+SENSITIVE_KEY_PATTERN, so a `credential_*` key would read back ***REDACTED*** on
+the feed/SIEM export, hiding the field. A redaction-survival test
+(usage_audit_cred_source_survives_redaction_on_read) reads the row back through
+`audit_feed` and asserts the real value survives. Deferred (codex LOW, documented):
+an audit-write-failure-injection test (would corrupt the shared hash chain) and a
+no-DB/local-store test (fights the global_pool test-unit/test-db split).
 
 ## Goal
 When the control plane USES an integration connection — i.e. resolves its
@@ -50,7 +58,9 @@ let outcome = if cred_status == "resolved" { "success" } else { "failure" };
 let detail = json!({
     "connection_id": id,
     "vendor_type": conn.vendor_type,
-    "credential_source": conn.credential_source.as_str(), // TYPE only (vault/db-encrypted/env-var)
+    // KEY is `cred_source` (NOT `credential_source`): redact_detail blanks any key
+    // containing the `credential` SENSITIVE_KEY_PATTERN. TYPE only (vault/db-encrypted/env-var).
+    "cred_source": conn.credential_source.as_str(),
     "endpoint_status": test_result.status,
 });
 let record = audit::AuditRecord {
@@ -92,7 +102,7 @@ are stored.
    exactly one `audit_log` row with `action='integration.connection.tested'`,
    `actor_principal` = the session user, `to_status='resolved'`,
    `outcome='success'`, `to_stage='security'`, and `detail` carrying
-   `connection_id` + `vendor_type` + `credential_source` (the TYPE).
+   `connection_id` + `vendor_type` + `cred_source` (the TYPE).
 2. **Failure path with leak risk (codex).** Seed an env-var connection whose ref
    names a MISSING key (e.g. `RYUKI_INTEGRATION__R58_MISSING`) so resolution fails;
    call `integration_test`; assert one row with `to_status='error'`,

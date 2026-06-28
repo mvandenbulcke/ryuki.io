@@ -23,6 +23,7 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::audit;
 use crate::database::get_db;
 use ryuki_engine::integration_connections::{
     test_connection_stub, CredentialSource, ExecutionMode, IntegrationConnection, TestResult,
@@ -1072,6 +1073,49 @@ pub async fn integration_test(
 
     // Run the generic stub (no live vendor call).
     let test_result: TestResult = test_connection_stub(&conn);
+
+    // #58: record ONE durable, hash-chained connection-usage audit row for this
+    // credential resolution BEFORE any best-effort telemetry write. This is the
+    // sensitive event ("who accessed which integration's credentials, when, and
+    // did it succeed"), so the audit is AUTHORITATIVE in DB mode — an audit-write
+    // failure 500s the call rather than completing an unreported access. A failed
+    // resolution is itself audit-worthy (an attempted credential access).
+    // SECRET HYGIENE: detail carries only the connection id, vendor type,
+    // credential SOURCE type, and the stub endpoint status — NEVER credential_ref,
+    // cred_message (CredError Display can name env keys / vault text), or the
+    // resolved secret (already zeroized).
+    // NOTE: the source-type key is `cred_source`, NOT `credential_source` — the
+    // audit read paths run redact_detail, which blanks any key containing
+    // "credential" (a SENSITIVE_KEY_PATTERN). A `credential_*` key would be
+    // ***REDACTED*** on the feed/SIEM export, hiding the very field this audit
+    // exists to surface. `cred_source` conveys the same meaning, redaction-safe.
+    let outcome = if cred_status == "resolved" {
+        "success"
+    } else {
+        "failure"
+    };
+    let detail = json!({
+        "connection_id": id,
+        "vendor_type": conn.vendor_type,
+        "cred_source": conn.credential_source.as_str(),
+        "endpoint_status": test_result.status,
+    });
+    let audit_record = audit::AuditRecord {
+        action: "integration.connection.tested",
+        request_id: None,
+        from_status: None,
+        to_status: cred_status,
+        from_stage: None,
+        to_stage: "security",
+        detail,
+        outcome,
+    };
+    match get_db() {
+        Some(pool) => audit::record_audit(pool, &session, &audit_record)
+            .await
+            .map_err(db_err)?,
+        None => audit::record_audit_local(&session, &audit_record).await,
+    }
 
     // Update last_test_at and last_test_result in DB if available.
     let now = now_iso();
@@ -3279,6 +3323,413 @@ pub mod integration_db_tests {
             "resolve_credentials must return EnvVarDenied for denied key, got: {:?}",
             resolve_result
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #58: connection-usage audit trail (integration_test records ONE durable,
+    // hash-chained audit_log row per credential resolution).
+    //
+    // integration_test reads/writes through the GLOBAL pool (get_db()), so these
+    // tests seed and assert against that same global pool — not the isolated
+    // test_pool() used elsewhere — otherwise the handler would not see the seeded
+    // connection nor write where we read.
+    // -----------------------------------------------------------------------
+
+    /// Connect (idempotently) the GLOBAL pool the handlers use and run migrations.
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()
+            .expect("RYUKI_DATABASE_URL is set but the DB connection failed");
+        let _ = crate::database::run_migrations(pool).await;
+        Some(pool)
+    }
+
+    /// Seed an env-var connection whose credential_ref names `env_key` (which must
+    /// pass the env-var allow-list, i.e. start with `RYUKI_INTEGRATION__`).
+    async fn seed_env_var_connection(pool: &PgPool, id: &str, env_key: &str) {
+        let now = now_iso();
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              status, readiness, execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 'r58', 'https://x.example', 'env-var', $2, \
+                     'configured', 'configured', 'static-dry-run', 'sys', $3, $3)",
+        )
+        .bind(id)
+        .bind(env_key)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .expect("seed env-var connection");
+    }
+
+    /// Best-effort cleanup of the audit rows this connection produced. audit_log
+    /// is append-only (a BEFORE DELETE trigger raises), so this is swallowed via
+    /// `.ok()` exactly like the other audit cleanups in the codebase; isolation is
+    /// really provided by the UNIQUE connection id baked into each row's detail.
+    async fn cleanup_usage_audit(pool: &PgPool, conn_id: &str) {
+        sqlx::query(
+            "DELETE FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(conn_id)
+        .execute(pool)
+        .await
+        .ok();
+    }
+
+    /// Count the connection-usage audit rows for one connection.
+    async fn usage_audit_count(pool: &PgPool, conn_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(conn_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// 1. Success path: a resolvable env-var connection records exactly one row
+    /// with the expected attribution, status pair, stage, outcome, and detail.
+    #[tokio::test]
+    async fn usage_audit_records_resolved_success_row() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-ok-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_OK";
+        std::env::set_var(env_key, "fixture-value");
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        let session = AuthSession::static_dry_run();
+        let _ = integration_test(Extension(session.clone()), Path(conn_id.clone()))
+            .await
+            .expect("integration_test must succeed");
+
+        let row: (String, String, String, String, String, Value) = sqlx::query_as(
+            "SELECT actor_principal, to_status, to_stage, outcome, action, detail \
+             FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("exactly one usage audit row");
+
+        assert_eq!(
+            usage_audit_count(pool, &conn_id).await,
+            1,
+            "exactly one row"
+        );
+        assert_eq!(row.0, session.user_id, "actor is the session user");
+        assert_eq!(row.1, "resolved");
+        assert_eq!(row.2, "security");
+        assert_eq!(row.3, "success");
+        assert_eq!(row.4, "integration.connection.tested");
+        assert_eq!(row.5["connection_id"], conn_id);
+        assert_eq!(row.5["vendor_type"], "servicenow");
+        // credential SOURCE type, never the ref/secret. Key is `cred_source`
+        // (not `credential_source`) so redact_detail does not blank it on read.
+        assert_eq!(row.5["cred_source"], "env-var");
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
+    }
+
+    /// 2. Failure path (missing env key) records a failure row AND leaks neither
+    /// the credential_ref, the (absent) env value, nor any credential message.
+    #[tokio::test]
+    async fn usage_audit_records_failure_row_without_leak() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-missing-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_MISSING";
+        // Ensure the key is genuinely absent so resolution fails.
+        std::env::remove_var(env_key);
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        let _ = integration_test(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+        )
+        .await
+        .expect("integration_test must still 200 on a failed resolution");
+
+        let (to_status, outcome, detail_text): (String, String, String) = sqlx::query_as(
+            "SELECT to_status, outcome, detail::text \
+             FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("exactly one usage audit row");
+
+        assert_eq!(
+            usage_audit_count(pool, &conn_id).await,
+            1,
+            "exactly one row"
+        );
+        assert_eq!(to_status, "error");
+        assert_eq!(outcome, "failure");
+        // The env KEY NAME (credential_ref) must NOT appear in the stored detail
+        // — it is the only field that carries the missing-key name, and it is the
+        // exact string CredError::EnvVarMissing's Display would surface.
+        assert!(
+            !detail_text.contains(env_key),
+            "detail must not leak the credential_ref env key name: {detail_text}"
+        );
+        assert!(
+            !detail_text.contains("R58_MISSING"),
+            "detail must not leak the missing key name in any form: {detail_text}"
+        );
+        // No credential-message text / field is stored (cred_message is omitted).
+        assert!(
+            !detail_text.contains("credential_message"),
+            "detail must not carry a credential_message field: {detail_text}"
+        );
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// 3. No secret leak on the success path: the stored detail carries neither
+    /// the credential_ref env key name nor the resolved secret value.
+    #[tokio::test]
+    async fn usage_audit_success_detail_has_no_secret() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-nosecret-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_NOSECRET";
+        let secret_value = "super-secret-fixture-value";
+        std::env::set_var(env_key, secret_value);
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        let _ = integration_test(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+        )
+        .await
+        .expect("integration_test must succeed");
+
+        let detail_text: String = sqlx::query_scalar(
+            "SELECT detail::text FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one usage audit row");
+
+        assert!(
+            !detail_text.contains(secret_value),
+            "detail must not leak the resolved secret: {detail_text}"
+        );
+        assert!(
+            !detail_text.contains(env_key),
+            "detail must not leak the credential_ref env key name: {detail_text}"
+        );
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
+    }
+
+    /// 4. Hash chain linked: the new row's prev_hash equals the chain tip captured
+    /// BEFORE the call, and its entry_hash is populated (proves it chains the
+    /// predecessor, not just that "a hash exists").
+    #[tokio::test]
+    async fn usage_audit_row_links_the_chain() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-chain-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_CHAIN";
+        std::env::set_var(env_key, "fixture-value");
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        // Capture the chain tip BEFORE the call (genesis if the chain is empty).
+        let tip: String = sqlx::query_scalar(
+            "SELECT entry_hash FROM audit_log \
+             WHERE entry_hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("read chain tip")
+        .unwrap_or_else(|| "GENESIS".to_string());
+
+        let _ = integration_test(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+        )
+        .await
+        .expect("integration_test must succeed");
+
+        let (prev_hash, entry_hash): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT prev_hash, entry_hash FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one usage audit row");
+
+        assert_eq!(
+            prev_hash.as_deref(),
+            Some(tip.as_str()),
+            "new row chains off the captured tip"
+        );
+        assert!(entry_hash.is_some(), "entry_hash IS NOT NULL");
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
+    }
+
+    /// 5. Append: testing the same connection twice yields two usage audit rows
+    /// (the trail accumulates rather than overwriting).
+    #[tokio::test]
+    async fn usage_audit_appends_on_repeat_test() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-append-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_APPEND";
+        std::env::set_var(env_key, "fixture-value");
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        for _ in 0..2 {
+            let _ = integration_test(
+                Extension(AuthSession::static_dry_run()),
+                Path(conn_id.clone()),
+            )
+            .await
+            .expect("integration_test must succeed");
+        }
+
+        assert_eq!(
+            usage_audit_count(pool, &conn_id).await,
+            2,
+            "the usage trail accumulates one row per test"
+        );
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
+    }
+
+    /// 6. Actor attribution: actor_principal is the session user (structurally
+    /// guaranteed — AuditRecord has no actor field — locked in here).
+    #[tokio::test]
+    async fn usage_audit_actor_is_the_session_user() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-actor-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_ACTOR";
+        std::env::set_var(env_key, "fixture-value");
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        // Distinct admin identity so the assertion is meaningful.
+        let mut session = AuthSession::static_dry_run();
+        session.user_id = format!("r58-actor-{}", uuid::Uuid::new_v4());
+        let expected_actor = session.user_id.clone();
+
+        let _ = integration_test(Extension(session), Path(conn_id.clone()))
+            .await
+            .expect("integration_test must succeed");
+
+        let actor: String = sqlx::query_scalar(
+            "SELECT actor_principal FROM audit_log \
+             WHERE action = 'integration.connection.tested' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one usage audit row");
+
+        assert_eq!(actor, expected_actor, "actor is the verified session user");
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
+    }
+
+    /// 7. Redaction survival (codex). The source-type field must come back through
+    /// the audit READ path — `audit_feed`, which runs `redact_detail` on every
+    /// entry — as its REAL value, not `***REDACTED***`. This is the whole reason
+    /// the key is `cred_source` and not `credential_source` (the latter contains
+    /// the `credential` SENSITIVE_KEY_PATTERN and would be blanked, hiding the very
+    /// field this audit exists to surface). Guards against a future pattern
+    /// addition silently re-redacting it.
+    #[tokio::test]
+    async fn usage_audit_cred_source_survives_redaction_on_read() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-r58-redact-{}", uuid::Uuid::new_v4());
+        let env_key = "RYUKI_INTEGRATION__R58_REDACT";
+        std::env::set_var(env_key, "fixture-value");
+        seed_env_var_connection(pool, &conn_id, env_key).await;
+
+        let session = AuthSession::static_dry_run();
+        let _ = integration_test(Extension(session), Path(conn_id.clone()))
+            .await
+            .expect("integration_test must succeed");
+
+        // Read back through the REDACTED feed (newest-first; the just-recorded row
+        // is near the top).
+        let feed = audit::audit_feed(Some(pool), 200, 0).await;
+        let entry = feed["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .find(|e| {
+                e["action"].as_str() == Some("integration.connection.tested")
+                    && e["detail"]["connection_id"].as_str() == Some(conn_id.as_str())
+            })
+            .expect("the usage-audit entry is present in the redacted feed");
+
+        assert_eq!(
+            entry["detail"]["cred_source"].as_str(),
+            Some("env-var"),
+            "cred_source must survive redact_detail with its real value on read"
+        );
+        assert_ne!(
+            entry["detail"]["cred_source"].as_str(),
+            Some("***REDACTED***"),
+            "cred_source must NOT be blanked by redaction"
+        );
+
+        cleanup_usage_audit(pool, &conn_id).await;
+        cleanup_connection(pool, &conn_id).await;
+        std::env::remove_var(env_key);
     }
 }
 
