@@ -447,6 +447,39 @@ pub fn update_rpo_rto_pure(plan: &DrPlan, rpo: u32, rto: u32) -> Result<DrPlan, 
     Ok(updated)
 }
 
+/// Pure update: returns a cloned DrPlan with the descriptive fields replaced.
+/// Mirrors `build_dr_plan`'s validation (trim-non-empty name/target_site,
+/// non-empty systems, rpo>0, rto>0). PRESERVES server-owned/immutable fields:
+/// `id`, `site` (the RBAC scope key), `status`, `last_tested`, `next_test_due`.
+pub fn update_dr_plan_pure(
+    plan: &DrPlan,
+    name: &str,
+    target_site: &str,
+    systems: Vec<String>,
+    rpo: u32,
+    rto: u32,
+) -> Result<DrPlan, String> {
+    if name.trim().is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if target_site.trim().is_empty() {
+        return Err("target_site cannot be empty".into());
+    }
+    if systems.is_empty() {
+        return Err("systems cannot be empty".into());
+    }
+    if rpo == 0 || rto == 0 {
+        return Err("rpo and rto must be greater than zero".into());
+    }
+    let mut updated = plan.clone();
+    updated.name = name.to_string();
+    updated.target_site = target_site.to_string();
+    updated.systems = systems;
+    updated.rpo_minutes = rpo;
+    updated.rto_minutes = rto;
+    Ok(updated)
+}
+
 /// Insert-or-replace a plan in the in-memory store by id. The API layer is the
 /// durable source of truth for plans (DB), but the static store is still the
 /// cross-domain read surface for test-run creation (`start_test` resolves the
@@ -812,6 +845,119 @@ mod tests {
         let updated = update_rpo_rto(plan_id, 10, 45).unwrap();
         assert_eq!(updated["rpo_minutes"], 10);
         assert_eq!(updated["rto_minutes"], 45);
+    }
+
+    #[test]
+    fn test_update_dr_plan_pure_happy() {
+        let plan = build_dr_plan(
+            "Original name",
+            "DEFRA",
+            "GBLON",
+            vec!["sys-01".into()],
+            15,
+            60,
+        )
+        .unwrap();
+
+        let updated = update_dr_plan_pure(
+            &plan,
+            "New name",
+            "FRPAR",
+            vec!["sys-02".into(), "sys-03".into()],
+            30,
+            120,
+        )
+        .unwrap();
+
+        assert_eq!(updated.name, "New name");
+        assert_eq!(updated.target_site, "FRPAR");
+        assert_eq!(updated.systems, vec!["sys-02", "sys-03"]);
+        assert_eq!(updated.rpo_minutes, 30);
+        assert_eq!(updated.rto_minutes, 120);
+    }
+
+    #[test]
+    fn test_update_dr_plan_pure_validation_errors() {
+        let plan = build_dr_plan(
+            "Original name",
+            "DEFRA",
+            "GBLON",
+            vec!["sys-01".into()],
+            15,
+            60,
+        )
+        .unwrap();
+
+        // empty name
+        assert!(
+            update_dr_plan_pure(&plan, "   ", "FRPAR", vec!["sys-02".into()], 30, 120)
+                .unwrap_err()
+                .contains("name")
+        );
+        // empty target_site
+        assert!(
+            update_dr_plan_pure(&plan, "New name", " ", vec!["sys-02".into()], 30, 120)
+                .unwrap_err()
+                .contains("target_site")
+        );
+        // empty systems
+        assert!(
+            update_dr_plan_pure(&plan, "New name", "FRPAR", vec![], 30, 120)
+                .unwrap_err()
+                .contains("systems")
+        );
+        // rpo = 0
+        assert!(
+            update_dr_plan_pure(&plan, "New name", "FRPAR", vec!["sys-02".into()], 0, 120)
+                .unwrap_err()
+                .contains("greater than zero")
+        );
+        // rto = 0
+        assert!(
+            update_dr_plan_pure(&plan, "New name", "FRPAR", vec!["sys-02".into()], 30, 0)
+                .unwrap_err()
+                .contains("greater than zero")
+        );
+    }
+
+    #[test]
+    fn test_update_dr_plan_pure_preserves_server_owned_fields() {
+        // Build a plan and force a non-default status + last_tested to prove
+        // those fields survive the update untouched.
+        let mut plan = build_dr_plan(
+            "Original name",
+            "DEFRA",
+            "GBLON",
+            vec!["sys-01".into()],
+            15,
+            60,
+        )
+        .unwrap();
+        plan.status = DrPlanStatus::Active;
+        plan.last_tested = Some("2026-01-01T00:00:00Z".to_string());
+        let original_id = plan.id.clone();
+        let original_next_due = plan.next_test_due.clone();
+
+        let updated =
+            update_dr_plan_pure(&plan, "New name", "FRPAR", vec!["sys-02".into()], 30, 120)
+                .unwrap();
+
+        assert_eq!(updated.id, original_id, "id must be preserved");
+        assert_eq!(updated.site, "DEFRA", "site must be preserved (immutable)");
+        assert_eq!(
+            updated.status,
+            DrPlanStatus::Active,
+            "status must be preserved"
+        );
+        assert_eq!(
+            updated.last_tested,
+            Some("2026-01-01T00:00:00Z".to_string()),
+            "last_tested must be preserved"
+        );
+        assert_eq!(
+            updated.next_test_due, original_next_due,
+            "next_test_due must be preserved"
+        );
     }
 
     #[test]

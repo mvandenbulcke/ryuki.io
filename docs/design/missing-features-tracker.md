@@ -158,8 +158,15 @@ New `background.rs` (`iteration_timeout`/`loop_backoff`/`note_failure`/`run_boun
 all unit-tested) wraps every loop iteration; a timeout counts as a failure driving
 the existing #31 backoff; `MissedTickBehavior::Skip` unified across all 5. codex
 plan(rd2)+impl APPROVE. See [background-loop-timeouts.md](background-loop-timeouts.md).
-Follow-ups (also swarm findings): background-loop liveness in platform_self_health;
-integration-connection CRUD endpoints (needs verification); DR-plan update/delete.
+Follow-ups (also swarm findings): background-loop liveness in platform_self_health.
+**DR-plan general update (PUT)** shipped — `PUT /api/protect/dr/plans/{id}` mirrors
+the rpo-rto handler (pure `update_dr_plan_pure`, xmin CAS, site/status immutable via
+deny_unknown_fields→422, scalar `name` synced in `transition`, central
+/api/protect→execute gate + site-scope); codex plan(rd2)+impl APPROVE. See
+[dr-plan-update-delete.md](dr-plan-update-delete.md). DELETE deferred (needs an
+ON DELETE RESTRICT FK reconciled with dr_test_start's store-based resolution).
+Integration-connection CRUD was a FALSE POSITIVE — already built in integration.rs
+(create/list/get/update/delete/test at /api/integrations).
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),

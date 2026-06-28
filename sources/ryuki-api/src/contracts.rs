@@ -1500,6 +1500,7 @@ pub fn routes() -> Router {
         .route("/api/protect/dr/plans", get(dr_plans_list))
         .route("/api/protect/dr/plans", post(dr_plan_create))
         .route("/api/protect/dr/plans/{id}", get(dr_plan_get))
+        .route("/api/protect/dr/plans/{id}", put(dr_plan_update))
         .route(
             "/api/protect/dr/plans/{id}/rpo-rto",
             post(dr_plan_update_rpo_rto),
@@ -31161,6 +31162,22 @@ struct DrRpoRtoRequest {
     rpo: u32,
     rto: u32,
 }
+/// Body for a general DR-plan PUT. Edits the descriptive fields only.
+/// `deny_unknown_fields` so a `site`/`status` smuggling attempt is rejected
+/// (axum 0.8 maps the serde error on a plain `Json<T>` to 422), not silently
+/// ignored. `site` is the immutable RBAC scope key and `status` has no PUT path,
+/// so neither is a field here.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+struct DrPlanUpdateRequest {
+    name: String,
+    #[serde(rename = "targetSite")]
+    target_site: String,
+    systems: Vec<String>,
+    rpo: u32,
+    rto: u32,
+}
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct DrTestStartRequest {
@@ -31273,6 +31290,50 @@ async fn dr_plan_update_rpo_rto(
         &session,
         &audit::security_audit(
             "dr-plan-update-rpo-rto",
+            None,
+            "updated",
+            json!({"plan_id": &id, "site": &plan.site}),
+        ),
+    )
+    .await
+    .map_err(db_error)?;
+    tx.commit().await.map_err(db_error)?;
+    // Write-through: mirror the persisted update into the in-memory store (only
+    // reached when the DB CAS won, so the static reflects the DB winner).
+    dr_testing::upsert_plan(&updated);
+    Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
+}
+async fn dr_plan_update(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+    Json(b): Json<DrPlanUpdateRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (plan, version) = crate::repos::dr_plans::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only update a plan in its own site. The site is
+    // checked on the loaded row (site is immutable via PUT); the version CAS below
+    // fails the write if the row changed concurrently, so there is no TOCTOU window.
+    guard_body_site_scope(&session, &plan.site)?;
+    let updated =
+        dr_testing::update_dr_plan_pure(&plan, &b.name, &b.target_site, b.systems, b.rpo, b.rto)
+            .map_err(|e| status_400(&e))?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let ok = crate::repos::dr_plans::transition(&mut tx, &id, &version, &updated)
+        .await
+        .map_err(db_error)?;
+    if !ok {
+        return Err(status_409(
+            "plan was modified concurrently; reload and retry",
+        ));
+    }
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "dr-plan-update",
             None,
             "updated",
             json!({"plan_id": &id, "site": &plan.site}),
@@ -31461,7 +31522,7 @@ async fn dr_scenarios(
 }
 async fn dr_contract() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/dr/plans"},{"method":"POST","path":"/api/protect/dr/plans"},{"method":"GET","path":"/api/protect/dr/plans/{id}"},{"method":"POST","path":"/api/protect/dr/plans/{id}/rpo-rto"},{"method":"POST","path":"/api/protect/dr/tests/start"},{"method":"POST","path":"/api/protect/dr/tests/complete"},{"method":"GET","path":"/api/protect/dr/tests/results/{id}"},{"method":"GET","path":"/api/protect/dr/due-tests"},{"method":"GET","path":"/api/protect/dr/readiness"},{"method":"GET","path":"/api/protect/dr/scenarios"}]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/dr/plans"},{"method":"POST","path":"/api/protect/dr/plans"},{"method":"GET","path":"/api/protect/dr/plans/{id}"},{"method":"PUT","path":"/api/protect/dr/plans/{id}"},{"method":"POST","path":"/api/protect/dr/plans/{id}/rpo-rto"},{"method":"POST","path":"/api/protect/dr/tests/start"},{"method":"POST","path":"/api/protect/dr/tests/complete"},{"method":"GET","path":"/api/protect/dr/tests/results/{id}"},{"method":"GET","path":"/api/protect/dr/due-tests"},{"method":"GET","path":"/api/protect/dr/readiness"},{"method":"GET","path":"/api/protect/dr/scenarios"}]}),
     )
 }
 
@@ -34073,6 +34134,44 @@ mod router_tests {
             .expect("body reads");
         let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, json)
+    }
+
+    /// The DR-plan PUT extractor REJECTS an immutable-field smuggle (`site` /
+    /// `status`) at the WIRE with 422 — axum 0.8's `deny_unknown_fields` Json
+    /// rejection fires before the handler/DB, so the immutability contract is
+    /// proven on the real request path, not just in isolated serde. No DB needed
+    /// (the extractor rejects before `dr_plan_update` runs).
+    #[tokio::test]
+    async fn router_rejects_dr_plan_update_unknown_field() {
+        // Realistic per-field values (a valid site, a valid status) so the
+        // rejection is proven to come from `deny_unknown_fields` on an UNKNOWN
+        // field — not a bad value — and would still catch a future typed
+        // `site`/`status` field being added.
+        for (smuggled, value) in [("site", "GBLON"), ("status", "active")] {
+            let app = routes();
+            let mut body = serde_json::json!({
+                "name": "x", "targetSite": "FRPAR", "systems": ["sys-a"],
+                "rpo": 45, "rto": 200
+            });
+            body[smuggled] = serde_json::json!(value);
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/api/protect/dr/plans/some-id")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("body serializes"),
+                ))
+                .expect("request builds");
+            request
+                .extensions_mut()
+                .insert(AuthSession::static_dry_run());
+            let response = app.oneshot(request).await.expect("router responds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a smuggled `{smuggled}` must be rejected by the Json extractor (422), never reaching the handler"
+            );
+        }
     }
 
     /// The cluster-capacity-admission engine, reached through the real router.
@@ -60520,6 +60619,375 @@ mod dr_plans_db_tests {
             ryuki_engine::dr_testing::DrPlanStatus::Draft,
             "status must remain Draft after same-status race"
         );
+    }
+
+    fn scoped_session(site: &[&str]) -> ryuki_engine::auth::AuthSession {
+        let mut s = ryuki_engine::auth::AuthSession::static_dry_run();
+        s.site_scope = site.iter().map(|x| x.to_string()).collect();
+        s
+    }
+
+    /// #1 update happy: PUT new descriptive fields → 200; the row's plan_json AND
+    /// the scalar `name` column reflect the new name; status/site/id/last_tested/
+    /// next_test_due are preserved; a `dr-plan-update` audit row exists.
+    #[tokio::test]
+    async fn test_dr_plan_update_happy() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        let original_status = plan.status.clone();
+        let original_site = plan.site.clone();
+        let original_last_tested = plan.last_tested.clone();
+        let original_next_due = plan.next_test_due.clone();
+
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        let new_name = format!("updated-dr-{suffix}");
+        let res = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: new_name.clone(),
+                target_site: "FRPAR".into(),
+                systems: vec!["sys-a".into(), "sys-b".into()],
+                rpo: 45,
+                rto: 200,
+            }),
+        )
+        .await;
+        assert!(res.is_ok(), "dr_plan_update must succeed: {res:?}");
+
+        // Scalar `name` column reflects the new name.
+        let scalar_name: String = sqlx::query_scalar("SELECT name FROM dr_plans WHERE id = $1")
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .expect("scalar name");
+        assert_eq!(
+            scalar_name, new_name,
+            "scalar name column must reflect the PUT"
+        );
+
+        // plan_json reflects the new fields + preserves server-owned ones.
+        let (fetched, _) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found after update");
+        assert_eq!(fetched.name, new_name, "plan_json name must be updated");
+        assert_eq!(fetched.target_site, "FRPAR", "target_site must be updated");
+        assert_eq!(
+            fetched.systems,
+            vec!["sys-a".to_string(), "sys-b".to_string()],
+            "systems must be updated"
+        );
+        assert_eq!(fetched.rpo_minutes, 45, "rpo must be updated");
+        assert_eq!(fetched.rto_minutes, 200, "rto must be updated");
+        assert_eq!(fetched.id, id, "id must be preserved");
+        assert_eq!(fetched.site, original_site, "site must be preserved");
+        assert_eq!(fetched.status, original_status, "status must be preserved");
+        assert_eq!(
+            fetched.last_tested, original_last_tested,
+            "last_tested must be preserved"
+        );
+        assert_eq!(
+            fetched.next_test_due, original_next_due,
+            "next_test_due must be preserved"
+        );
+
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'dr-plan-update' AND detail->>'plan_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query audit");
+
+        cleanup(pool, &id).await;
+        assert!(audited, "dr_plan_update must write a durable audit row");
+    }
+
+    /// #2 validation: an empty name / empty systems / rpo=0 via the handler → 400.
+    #[tokio::test]
+    async fn test_dr_plan_update_validation_400() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // empty name
+        let err = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: "   ".into(),
+                target_site: "FRPAR".into(),
+                systems: vec!["sys-a".into()],
+                rpo: 45,
+                rto: 200,
+            }),
+        )
+        .await
+        .expect_err("empty name must be 400");
+        assert_eq!(err.0, super::StatusCode::BAD_REQUEST);
+
+        // empty systems
+        let err = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: "ok".into(),
+                target_site: "FRPAR".into(),
+                systems: vec![],
+                rpo: 45,
+                rto: 200,
+            }),
+        )
+        .await
+        .expect_err("empty systems must be 400");
+        assert_eq!(err.0, super::StatusCode::BAD_REQUEST);
+
+        // rpo = 0
+        let err = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: "ok".into(),
+                target_site: "FRPAR".into(),
+                systems: vec!["sys-a".into()],
+                rpo: 0,
+                rto: 200,
+            }),
+        )
+        .await
+        .expect_err("rpo=0 must be 400");
+        assert_eq!(err.0, super::StatusCode::BAD_REQUEST);
+
+        cleanup(pool, &id).await;
+    }
+
+    /// #3 unknown-field rejection: a body carrying `site` or `status` is rejected
+    /// by `deny_unknown_fields`. For a plain `Json<T>` extractor in axum 0.8 the
+    /// serde error surfaces as 422 Unprocessable Entity. We verify the rejection
+    /// at the extractor level by deserializing the same bytes the extractor would.
+    #[tokio::test]
+    async fn test_dr_plan_update_rejects_unknown_field() {
+        // The DR handlers use a plain `Json<DrPlanUpdateRequest>` extractor, which
+        // in axum 0.8 returns 422 on a serde failure. deny_unknown_fields turns a
+        // smuggled immutable field into exactly that serde failure.
+        let smuggle_site = serde_json::json!({
+            "name": "x",
+            "targetSite": "FRPAR",
+            "systems": ["sys-a"],
+            "rpo": 45,
+            "rto": 200,
+            "site": "GBLON"
+        });
+        let rejected: Result<super::DrPlanUpdateRequest, _> = serde_json::from_value(smuggle_site);
+        assert!(
+            rejected.is_err(),
+            "a body smuggling `site` must be rejected by deny_unknown_fields"
+        );
+
+        let smuggle_status = serde_json::json!({
+            "name": "x",
+            "targetSite": "FRPAR",
+            "systems": ["sys-a"],
+            "rpo": 45,
+            "rto": 200,
+            "status": "active"
+        });
+        let rejected: Result<super::DrPlanUpdateRequest, _> =
+            serde_json::from_value(smuggle_status);
+        assert!(
+            rejected.is_err(),
+            "a body smuggling `status` must be rejected by deny_unknown_fields"
+        );
+    }
+
+    /// #4 404: unknown id → 404.
+    #[tokio::test]
+    async fn test_dr_plan_update_unknown_id_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let err = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path("drp-does-not-exist-00000000".into()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: "x".into(),
+                target_site: "FRPAR".into(),
+                systems: vec!["sys-a".into()],
+                rpo: 45,
+                rto: 200,
+            }),
+        )
+        .await
+        .expect_err("unknown id must be 404");
+        assert_eq!(err.0, super::StatusCode::NOT_FOUND);
+    }
+
+    /// #5 concurrency — repo-CAS regression: prove `repos::dr_plans::transition`
+    /// returns `false` on a stale `xmin` (a concurrent write bumped the row between
+    /// read and write). This is the exact condition `dr_plan_update` maps to 409
+    /// (`if !ok { return Err(status_409(...)) }`) — a one-line mapping IDENTICAL to
+    /// the covered `dr_plan_update_rpo_rto` handler. The handler's own between-read
+    /// window is not interceptable inline, so the load-bearing CAS-miss is asserted
+    /// here at the repo layer (the handler mapping is structurally shared).
+    #[tokio::test]
+    async fn test_dr_plan_update_stale_version_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "GBLON");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // Capture a version, then commit a write that bumps xmin (the concurrent
+        // modification). A second write reusing the now-stale version must be a CAS
+        // miss — the exact `transition() == false` the handler maps to 409.
+        let (original, stale_version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        // First write bumps xmin (concurrent modification).
+        let bumped = ryuki_engine::dr_testing::update_dr_plan_pure(
+            &original,
+            "concurrent",
+            "FRPAR",
+            vec!["sys-z".into()],
+            10,
+            40,
+        )
+        .expect("pure fn must succeed");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let ok = crate::repos::dr_plans::transition(&mut tx, &id, &stale_version, &bumped)
+                .await
+                .expect("first transition must succeed");
+            assert!(ok);
+            tx.commit().await.expect("commit");
+        }
+
+        // A second write with the now-stale version must be a CAS miss → 409.
+        let stale = ryuki_engine::dr_testing::update_dr_plan_pure(
+            &original,
+            "stale",
+            "FRPAR",
+            vec!["sys-y".into()],
+            12,
+            48,
+        )
+        .expect("pure fn must succeed");
+        let applied = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            crate::repos::dr_plans::transition(&mut tx, &id, &stale_version, &stale)
+                .await
+                .expect("transition query must not error")
+        };
+
+        cleanup(pool, &id).await;
+        assert!(
+            !applied,
+            "PUT with a stale version must be a CAS miss (handler maps to 409)"
+        );
+    }
+
+    /// #6 scope: an out-of-scope plan for a site-scoped session → 403,
+    /// mirroring `dr_plan_get`'s scope behavior.
+    #[tokio::test]
+    async fn test_dr_plan_update_denies_out_of_scope() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // A GBLON-scoped principal cannot update a DEFRA plan.
+        let err = super::dr_plan_update(
+            super::AuthExtractor(scoped_session(&["GBLON"])),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: "x".into(),
+                target_site: "FRPAR".into(),
+                systems: vec!["sys-a".into()],
+                rpo: 45,
+                rto: 200,
+            }),
+        )
+        .await
+        .expect_err("out-of-scope PUT must be 403");
+
+        cleanup(pool, &id).await;
+        assert_eq!(err.0, super::StatusCode::FORBIDDEN);
+    }
+
+    /// #7 no-op PUT: identical values → 200 (idempotent; the xmin CAS still
+    /// advances the row version).
+    #[tokio::test]
+    async fn test_dr_plan_update_noop_succeeds() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // Re-PUT the exact same descriptive values.
+        let res = super::dr_plan_update(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+            super::Json(super::DrPlanUpdateRequest {
+                name: plan.name.clone(),
+                target_site: plan.target_site.clone(),
+                systems: plan.systems.clone(),
+                rpo: plan.rpo_minutes,
+                rto: plan.rto_minutes,
+            }),
+        )
+        .await;
+
+        cleanup(pool, &id).await;
+        assert!(res.is_ok(), "a no-op PUT must succeed: {res:?}");
     }
 }
 

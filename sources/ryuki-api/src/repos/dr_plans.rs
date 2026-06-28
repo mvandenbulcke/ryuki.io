@@ -112,14 +112,19 @@ pub async fn transition(
 ) -> Result<bool, sqlx::Error> {
     let plan_json = serde_json::to_value(updated)
         .map_err(|e| sqlx::Error::Decode(format!("dr_plans: serialize failed: {e}").into()))?;
+    // The scalar `name` column is denormalized for queryability and kept in sync
+    // here so a general PUT (which may edit the name) does not leave it stale.
+    // `site` stays OUT of the UPDATE: it is the immutable RBAC scope key.
     let res = sqlx::query(
         "UPDATE dr_plans SET \
-         status = $2, \
-         plan_json = $3, \
+         name = $2, \
+         status = $3, \
+         plan_json = $4, \
          updated_at = NOW() \
-         WHERE id = $1 AND xmin = $4::xid",
+         WHERE id = $1 AND xmin = $5::xid",
     )
     .bind(id)
+    .bind(&updated.name)
     .bind(status_str(&updated.status))
     .bind(plan_json)
     .bind(expected_version)
