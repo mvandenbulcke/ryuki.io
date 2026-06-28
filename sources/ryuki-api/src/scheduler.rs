@@ -33,6 +33,16 @@ const SCHEDULER_TICK_LOCK_KEY: i64 = 0x5343_4845_4400;
 /// tick cannot do unbounded work; remaining due rows are picked up next tick.
 const MAX_BATCH: i64 = 100;
 
+/// How far ahead `maintain_review_scan` (#39) advances a request's
+/// `next_maintain_review_at` after flagging it — the recurring operational-review
+/// cadence. A single constant, easy to retune; the scan itself runs daily.
+const REVIEW_INTERVAL: &str = "90 days";
+
+/// Most Operational requests a single `maintain_review_scan` claims and flags per
+/// tick. Bounds the per-tick work the same way [`MAX_BATCH`] bounds schedules;
+/// remaining due requests are picked up on the next daily scan.
+const MAINTAIN_REVIEW_BATCH: i64 = 100;
+
 /// A due schedule row claimed by the tick.
 #[derive(sqlx::FromRow)]
 struct DueSchedule {
@@ -72,9 +82,10 @@ pub struct ExecutionView {
 /// safety boundary is `job_is_schedulable`: read-only kinds plus explicitly
 /// enumerated SAFE-INTERNAL-WRITE kinds (which persist only to our own tables via
 /// pure dry-run engine logic, no provider/live call). Runnable kinds today:
-/// `health_probe` (read-only liveness) and `synthetic_health_run` (records
-/// simulated probe results). Every write happens on `tx`, so a failure rolls back
-/// within the schedule's savepoint.
+/// `health_probe` (read-only liveness), `synthetic_health_run` (records simulated
+/// probe results), and `maintain_review_scan` (flags Operational requests due for
+/// review via domain events). Every write happens on `tx`, so a failure rolls
+/// back within the schedule's savepoint.
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -114,6 +125,74 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("ran {} synthetic health check(s)", results.len())),
+            ))
+        }
+        "maintain_review_scan" => {
+            // Safe-internal write (#39): flag Operational requests due for a
+            // recurring review. The claim+advance is ONE atomic UPDATE on `tx`:
+            // it selects due Operational rows (FOR UPDATE SKIP LOCKED), advances
+            // their next_maintain_review_at by REVIEW_INTERVAL, and RETURNs the
+            // rows it claimed. This races a concurrent retire safely — that
+            // request either already left 'operational' (not matched) or runs
+            // after and sees the advanced timestamp; SKIP LOCKED plus the
+            // single-leader tick prevent any double-emit. Lock order (requests
+            // row → domain_events) matches apply_transition_audited, so no
+            // deadlock. NULL = initial review due, ordered first.
+            #[derive(sqlx::FromRow)]
+            struct DueRequest {
+                id: String,
+                site: String,
+                environment: String,
+            }
+            // REVIEW_INTERVAL is a code-controlled const (never user input), so
+            // interpolating it into the interval literal is safe; the batch bound
+            // is still a parameter.
+            let sql = format!(
+                "UPDATE requests \
+                 SET next_maintain_review_at = NOW() + INTERVAL '{REVIEW_INTERVAL}', updated_at = NOW() \
+                 WHERE id IN ( \
+                     SELECT id FROM requests \
+                     WHERE status = 'operational' \
+                       AND (next_maintain_review_at IS NULL OR next_maintain_review_at <= NOW()) \
+                     ORDER BY next_maintain_review_at NULLS FIRST, id \
+                     LIMIT $1 \
+                     FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING id::text, site, environment"
+            );
+            let due: Vec<DueRequest> = sqlx::query_as(&sql)
+                .bind(MAINTAIN_REVIEW_BATCH)
+                .fetch_all(&mut **tx)
+                .await?;
+
+            // One review-due domain event per claimed request, on the SAME tx so
+            // the flags and events commit (or roll back) together. Payload is
+            // minimal and non-sensitive, and carries NO `to_status` — so it stays
+            // a NORMAL /api/events entry, not an alert-feed item.
+            for req in &due {
+                let payload = serde_json::json!({
+                    "request_id": req.id,
+                    "note": "operational review due",
+                });
+                crate::repos::domain_events::insert(
+                    &mut **tx,
+                    crate::repos::domain_events::NewEvent {
+                        event_type: "request.maintain-review-due",
+                        aggregate_type: "request",
+                        aggregate_id: &req.id,
+                        site: Some(&req.site),
+                        environment: Some(&req.environment),
+                        actor: "system",
+                        payload,
+                    },
+                )
+                .await?;
+            }
+            // Aggregate-only detail (a count) — never per-request/tenant data —
+            // because it is surfaced via /api/ops/scheduler/executions.
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("queued {} maintain review(s)", due.len())),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -638,5 +717,333 @@ mod db_tests {
         // Not asserting non-empty (another test may have cleaned up its rows),
         // only that the view query shape is valid and bounded.
         assert!(execs.len() <= 50, "the execution view honors its limit");
+    }
+
+    // ---- #39 maintain_review_scan ------------------------------------------
+
+    /// Seed one request with an explicit status and `next_maintain_review_at`,
+    /// returning its generated id. `review_at` is raw SQL (e.g. `NULL` or
+    /// `NOW() + INTERVAL '30 days'`) so a test can plant a due / not-due row.
+    async fn seed_maintain_request(pool: &PgPool, status: &str, review_at_sql: &str) -> String {
+        let sql = format!(
+            "INSERT INTO requests \
+             (request_type, status, stage, site, environment, name, created_by, next_maintain_review_at) \
+             VALUES ('server-deployment', $1, 'operational', 'GBLON', 'production', \
+                     'maintain-test', 'system', {review_at_sql}) \
+             RETURNING id::text"
+        );
+        sqlx::query_scalar(&sql)
+            .bind(status)
+            .fetch_one(pool)
+            .await
+            .expect("seed maintain request")
+    }
+
+    /// Plant a guaranteed-due `maintain_review_scan` schedule so a single tick
+    /// runs the scan, regardless of when the migration-seeded daily schedule last
+    /// advanced (an earlier test's tick may already have pushed it into the
+    /// future). Returns its id for cleanup.
+    async fn seed_due_maintain_schedule(pool: &PgPool) -> String {
+        let id = "sched-test-maintain-due-1f3";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test maintain scan', 'maintain_review_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    async fn maintain_event_count(pool: &PgPool, request_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE event_type = 'request.maintain-review-due' AND aggregate_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_maintain_request(pool: &PgPool, request_id: &str) {
+        sqlx::query("DELETE FROM domain_events WHERE aggregate_id = $1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1::uuid")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 1: a due Operational request (NULL next_maintain_review_at) gets
+    /// exactly one review-due event after a tick AND its timestamp is advanced
+    /// ~REVIEW_INTERVAL into the future.
+    #[tokio::test]
+    async fn maintain_scan_flags_due_operational_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_maintain_request(pool, "operational", "NULL").await;
+        let sched_id = seed_due_maintain_schedule(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+
+        assert_eq!(
+            maintain_event_count(pool, &req_id).await,
+            1,
+            "exactly one review-due event for the due Operational request"
+        );
+        // Payload contract (load-bearing): {request_id, note} and crucially NO
+        // `to_status` — that absence keeps the event a normal /api/events entry and
+        // OUT of the alert feed (codex fix #1). A regression that added to_status,
+        // renamed request_id, or dropped note must fail here.
+        let (p_req, p_note, has_to_status): (Option<String>, Option<String>, bool) =
+            sqlx::query_as(
+                "SELECT payload->>'request_id', payload->>'note', (payload ? 'to_status') \
+                 FROM domain_events \
+                 WHERE aggregate_id = $1 AND event_type = 'request.maintain-review-due' \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .bind(&req_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            p_req.as_deref(),
+            Some(req_id.as_str()),
+            "payload request_id"
+        );
+        assert_eq!(
+            p_note.as_deref(),
+            Some("operational review due"),
+            "payload note"
+        );
+        assert!(
+            !has_to_status,
+            "maintain-review-due must NOT carry to_status (normal event, not an alert)"
+        );
+
+        // The timestamp was advanced ~90d (REVIEW_INTERVAL) — bracketed so a wrong
+        // interval is caught, not merely 'sometime after 80 days'.
+        let advanced: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests \
+             WHERE id = $1::uuid \
+               AND next_maintain_review_at BETWEEN NOW() + INTERVAL '89 days' \
+                                               AND NOW() + INTERVAL '91 days'",
+        )
+        .bind(&req_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(advanced, 1, "next_maintain_review_at advanced to ~90d");
+
+        // The scheduler execution detail is the aggregate count ONLY — no per-
+        // request / tenant data leaks via /api/ops/scheduler/executions.
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'maintain_review_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        // Aggregate-only contract: EXACTLY "queued <N> maintain review(s)" where the
+        // middle token is a bare number — no site/env/request identifiers can leak
+        // in. "queued GBLON production maintain review(s)" or "queued many ..." fail.
+        let count_token = detail
+            .strip_prefix("queued ")
+            .and_then(|s| s.strip_suffix(" maintain review(s)"));
+        assert!(
+            count_token.is_some_and(|n| n.parse::<u64>().is_ok()),
+            "detail must be exactly 'queued <N> maintain review(s)': {detail:?}"
+        );
+
+        cleanup_maintain_request(pool, &req_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 2: a not-due Operational request (review_at = NOW()+30d) gets no
+    /// event and its timestamp is left unchanged.
+    #[tokio::test]
+    async fn maintain_scan_skips_not_due_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_maintain_request(pool, "operational", "NOW() + INTERVAL '30 days'").await;
+        let sched_id = seed_due_maintain_schedule(pool).await;
+        let before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT next_maintain_review_at FROM requests WHERE id = $1::uuid")
+                .bind(&req_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        let _ = tick_once(pool).await.unwrap();
+
+        assert_eq!(
+            maintain_event_count(pool, &req_id).await,
+            0,
+            "a not-due request is never flagged"
+        );
+        let after: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT next_maintain_review_at FROM requests WHERE id = $1::uuid")
+                .bind(&req_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after, "a not-due request's timestamp is unchanged");
+
+        cleanup_maintain_request(pool, &req_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 3: a non-Operational request (even with a NULL/overdue timestamp) is
+    /// never selected by the scan.
+    #[tokio::test]
+    async fn maintain_scan_ignores_non_operational_request() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // A completed (not yet Operational) request with NULL review timestamp.
+        let req_id = seed_maintain_request(pool, "completed", "NULL").await;
+        let sched_id = seed_due_maintain_schedule(pool).await;
+
+        let _ = tick_once(pool).await.unwrap();
+
+        assert_eq!(
+            maintain_event_count(pool, &req_id).await,
+            0,
+            "a non-Operational request is never flagged"
+        );
+        let untouched: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests \
+             WHERE id = $1::uuid AND next_maintain_review_at IS NULL",
+        )
+        .bind(&req_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(untouched, 1, "its timestamp stays NULL");
+
+        cleanup_maintain_request(pool, &req_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 4: a second immediate tick does NOT re-emit — the first tick advanced
+    /// the timestamp into the future, so the request is no longer due.
+    #[tokio::test]
+    async fn maintain_scan_does_not_re_emit_on_second_tick() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = seed_maintain_request(pool, "operational", "NULL").await;
+
+        let sched_id = seed_due_maintain_schedule(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            maintain_event_count(pool, &req_id).await,
+            1,
+            "first tick flags the request once"
+        );
+
+        // Re-plant a due scan schedule so the scan ACTUALLY runs a second time —
+        // proving the request-level guard (the advanced timestamp), not merely
+        // the schedule-level one, is what prevents a re-emit.
+        let _ = seed_due_maintain_schedule(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            maintain_event_count(pool, &req_id).await,
+            1,
+            "a second immediate tick does not re-emit (timestamp now in the future)"
+        );
+
+        cleanup_maintain_request(pool, &req_id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 6: migration 119's guarded DDL is idempotent — re-running each
+    /// statement (the migration already ran in global_pool) is a clean no-op and
+    /// leaves exactly one seeded scan schedule.
+    #[tokio::test]
+    async fn migration_119_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Re-apply the guarded statements; each must be a no-op, not an error.
+        sqlx::query(
+            "ALTER TABLE requests ADD COLUMN IF NOT EXISTS next_maintain_review_at TIMESTAMPTZ",
+        )
+        .execute(pool)
+        .await
+        .expect("ADD COLUMN IF NOT EXISTS re-runs cleanly");
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_requests_next_maintain_review \
+             ON requests (next_maintain_review_at) WHERE status = 'operational'",
+        )
+        .execute(pool)
+        .await
+        .expect("CREATE INDEX IF NOT EXISTS re-runs cleanly");
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ('33333333-3333-4333-8333-333333333333', \
+                     'Maintain review scan (operational requests)', 'maintain_review_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+
+        // Exactly one seeded scan schedule exists (the ON CONFLICT prevented a dup).
+        let seeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedules WHERE id = '33333333-3333-4333-8333-333333333333'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seeded, 1,
+            "exactly one maintain_review_scan schedule is seeded"
+        );
     }
 }

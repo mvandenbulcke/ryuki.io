@@ -85,8 +85,14 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// an EXPLICIT allowlist entry, never a category or prefix match — a live or
 /// destructive kind must still be added here deliberately, and only behind a real
 /// policy gate (#11). Anything not listed is refused (recorded `skipped`).
+///
+/// `maintain_review_scan` (#39) also qualifies: it flags Operational requests due
+/// for a recurring review by recording `request.maintain-review-due` domain events
+/// and advancing each request's review-due timestamp — writes only to our own
+/// tables, NO provider/live/destructive call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
-    job_is_read_only(job_kind) || matches!(job_kind, "synthetic_health_run")
+    job_is_read_only(job_kind)
+        || matches!(job_kind, "synthetic_health_run" | "maintain_review_scan")
 }
 
 #[cfg(test)]
@@ -161,13 +167,16 @@ mod tests {
     fn schedulable_admits_read_only_plus_synthetic_health_only() {
         // Read-only kinds remain schedulable.
         assert!(job_is_schedulable("health_probe"));
-        // The safe-internal-write kind is schedulable but is NOT read-only.
+        // The safe-internal-write kinds are schedulable but are NOT read-only.
         assert!(job_is_schedulable("synthetic_health_run"));
         assert!(!job_is_read_only("synthetic_health_run"));
+        assert!(job_is_schedulable("maintain_review_scan"));
+        assert!(!job_is_read_only("maintain_review_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("destroy_everything"));
         assert!(!job_is_schedulable("synthetic_health_run_live"));
+        assert!(!job_is_schedulable("maintain_review_scan_live"));
         assert!(!job_is_schedulable(""));
     }
 }

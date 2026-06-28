@@ -52,6 +52,15 @@ by recording a domain event, so operators have a maintenance feedback loop.
    double-emit. Lock order (requests row → domain_events) matches the existing
    apply_transition_audited order — no deadlock.
 
+   Single-emit also relies on exactly ONE enabled `maintain_review_scan` schedule
+   (this migration's seed; there is no operator-facing create-schedule endpoint).
+   Even if a second ever came due in the same tick, no request would be
+   double-flagged: each run's atomic claim advances `next_maintain_review_at` and
+   commits its savepoint before the next runs, so the second run's predicate no
+   longer matches the claimed rows. If a schedule-creation API is ever added, a
+   partial UNIQUE index on `schedules(job_kind)` for the internal scan kinds would
+   make this structural (codex nit).
+
 4. **No DbRequestRow / REQUEST_COLUMNS change** (codex): the scan uses its own
    targeted UPDATE...RETURNING, so the new column is never read through
    DbRequestRow — avoids an unread-private-field and keeps REQUEST_COLUMNS stable.
