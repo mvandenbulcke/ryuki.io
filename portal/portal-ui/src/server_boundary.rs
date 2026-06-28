@@ -2209,11 +2209,72 @@ fn filter_request_summaries(
     filtered
 }
 
+/// One page of the faceted request list (#15). Carries the page rows plus the
+/// pagination cursor so the view can render Prev/Next without a separate total.
+///
+/// `has_next` is derived by over-fetching one row beyond `page_size`: when the
+/// upstream returns more than a page, there is a next page. X-Total-Count is not
+/// reachable here (the upstream client drops response headers), so this page
+/// deliberately exposes no exact total — the view shows a range, not "N of M".
+///
+/// Serde-derived because `#[server]` return types cross the wire, matching the
+/// snapshot structs in this file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestListPage {
+    pub rows: Vec<RequestSummary>,
+    pub offset: u32,
+    pub page_size: u32,
+    pub has_next: bool,
+}
+
+/// Build a page from an OVER-FETCHED row set (the upstream live branch asks for
+/// `page_size + 1` rows): the presence of the extra row signals a next page
+/// without an exact total. Truncates to `page_size`. Pure — unit-tested below.
+fn finalize_overfetched_page(
+    mut rows: Vec<RequestSummary>,
+    offset: u32,
+    page_size: u32,
+) -> RequestListPage {
+    let has_next = rows.len() as u32 > page_size;
+    if has_next {
+        rows.truncate(page_size as usize);
+    }
+    RequestListPage {
+        rows,
+        offset,
+        page_size,
+        has_next,
+    }
+}
+
+/// Build a page from the FULL in-memory filtered set (static/degraded mode):
+/// slice `[offset, offset + page_size)` and derive `has_next` from the true
+/// total. Pure — unit-tested below.
+fn paginate_in_memory(full: Vec<RequestSummary>, offset: u32, page_size: u32) -> RequestListPage {
+    let total = full.len() as u32;
+    let has_next = total > offset.saturating_add(page_size);
+    let rows: Vec<RequestSummary> = full
+        .into_iter()
+        .skip(offset as usize)
+        .take(page_size as usize)
+        .collect();
+    RequestListPage {
+        rows,
+        offset,
+        page_size,
+        has_next,
+    }
+}
+
 /// Faceted request-list read (#15). Optional `status`/`site`/`environment`/
 /// `request_type`/`created_by`/`q` filters and `sort`/`direction` ordering are
 /// forwarded to the upstream `GET /api/requests` endpoint (API contract
-/// fa1df10). All-`None` arguments reproduce the unfiltered default list, so
-/// existing call sites are unaffected.
+/// fa1df10). All-`None` filter arguments with `offset = None` reproduce the
+/// unfiltered first page, so existing call sites are unaffected.
+///
+/// Pagination is offset/limit based: the page size is fixed at `PAGE_SIZE` and
+/// the upstream is asked for `PAGE_SIZE + 1` rows so the extra row signals a
+/// next page without needing a total count.
 ///
 /// The same-origin allowlist validates the *base* path; the query suffix is
 /// appended only after validation and carries solely allowlist-validated keys
@@ -2230,9 +2291,20 @@ pub async fn get_request_list(
     q: Option<String>,
     sort: Option<String>,
     direction: Option<String>,
-) -> Result<Vec<RequestSummary>, ServerFnError> {
+    offset: Option<u32>,
+) -> Result<RequestListPage, ServerFnError> {
     use crate::api::{request_list_path_with_query, RequestListQuery};
 
+    // Fixed page size for the request list. Over-fetched by one (see `limit`)
+    // so `has_next` can be derived without an exact total.
+    const PAGE_SIZE: u32 = 25;
+    // Ceiling on the caller-supplied offset (it arrives verbatim from the URL).
+    // Well above any realistic list size, but bounded so a hostile deep link
+    // (?offset=4294967295) cannot translate into an unbounded upstream OFFSET
+    // (a cheap DB resource-amplification vector) or overflow the range label.
+    const MAX_OFFSET: u32 = 1_000_000;
+
+    let offset = offset.unwrap_or(0).min(MAX_OFFSET);
     let boundary = PortalServerBoundary::static_dry_run();
     // Validate the base path against the same-origin allowlist BEFORE appending
     // the facet query string. The allowlist matches the path without a query.
@@ -2248,16 +2320,20 @@ pub async fn get_request_list(
         q,
         sort,
         direction,
-        limit: None,
-        offset: None,
+        // Over-fetch by one row so a full page that has a successor is
+        // distinguishable from the last page without an exact total.
+        limit: Some(PAGE_SIZE + 1),
+        offset: Some(offset),
     };
     let path = request_list_path_with_query(&query);
     let upstream = upstream_context();
     if !upstream.live() {
         // Static/degraded mode filters the synthetic fallback rows locally so
-        // the facet UI stays interactive even without an upstream.
+        // the facet UI stays interactive even without an upstream. It holds the
+        // full filtered set in memory, so it can compute an honest page slice.
         let rows = request_summary_fallbacks();
-        return Ok(filter_request_summaries(rows, &query));
+        let full = filter_request_summaries(rows, &query);
+        return Ok(paginate_in_memory(full, offset, PAGE_SIZE));
     }
     let session_id = session_id_from_request().await;
     match upstream.get(&path, session_id.as_deref()).await {
@@ -2265,7 +2341,10 @@ pub async fn get_request_list(
             let list: Vec<ApiRequestSummary> = response
                 .json()
                 .map_err(|_| ServerFnError::new("request list response was malformed"))?;
-            Ok(list.into_iter().map(RequestSummary::from).collect())
+            let rows: Vec<RequestSummary> = list.into_iter().map(RequestSummary::from).collect();
+            // The over-fetched extra row (if present) means there is a next page;
+            // finalize_overfetched_page derives has_next and truncates to PAGE_SIZE.
+            Ok(finalize_overfetched_page(rows, offset, PAGE_SIZE))
         }
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
@@ -3834,6 +3913,55 @@ mod tests {
         assert_eq!(out, rows);
     }
 
+    fn n_rows(n: usize) -> Vec<RequestSummary> {
+        (0..n)
+            .map(|i| summary_row(&format!("r{i}"), "ams1", "intake", "2026-01-01"))
+            .collect()
+    }
+
+    #[test]
+    fn finalize_overfetched_page_signals_next_only_when_over_fetched() {
+        // Exactly page_size rows: no extra row → last page, kept intact.
+        let p = finalize_overfetched_page(n_rows(25), 0, 25);
+        assert_eq!(p.rows.len(), 25);
+        assert!(!p.has_next);
+        // Under a full page → last page.
+        let p = finalize_overfetched_page(n_rows(24), 0, 25);
+        assert_eq!(p.rows.len(), 24);
+        assert!(!p.has_next);
+        // page_size + 1: the extra row signals a next page and is truncated away.
+        let p = finalize_overfetched_page(n_rows(26), 25, 25);
+        assert_eq!(p.rows.len(), 25);
+        assert!(p.has_next);
+        assert_eq!(p.offset, 25);
+        assert_eq!(p.page_size, 25);
+    }
+
+    #[test]
+    fn paginate_in_memory_slices_and_derives_has_next_at_boundaries() {
+        // First page of 26 → 25 rows, more remain.
+        let first = paginate_in_memory(n_rows(26), 0, 25);
+        assert_eq!(first.rows.len(), 25);
+        assert!(first.has_next);
+        // Exact last full page: total == offset + page_size → no next.
+        let exact = paginate_in_memory(n_rows(50), 25, 25);
+        assert_eq!(exact.rows.len(), 25);
+        assert!(!exact.has_next);
+        // One beyond the exact page → next page exists.
+        let beyond = paginate_in_memory(n_rows(51), 25, 25);
+        assert_eq!(beyond.rows.len(), 25);
+        assert!(beyond.has_next);
+        // Partial last page.
+        let partial = paginate_in_memory(n_rows(30), 25, 25);
+        assert_eq!(partial.rows.len(), 5);
+        assert!(!partial.has_next);
+        // Offset past the end → empty page, no next, offset preserved.
+        let past = paginate_in_memory(n_rows(10), 100, 25);
+        assert!(past.rows.is_empty());
+        assert!(!past.has_next);
+        assert_eq!(past.offset, 100);
+    }
+
     #[test]
     fn filter_request_summaries_applies_status_site_and_q_case_insensitively() {
         let rows = vec![
@@ -3897,7 +4025,11 @@ mod tests {
             ..Default::default()
         };
         let out = filter_request_summaries(rows.clone(), &query);
-        assert_eq!(out.len(), 2, "all rows have environment=prod, PROD should match all");
+        assert_eq!(
+            out.len(),
+            2,
+            "all rows have environment=prod, PROD should match all"
+        );
 
         let query_miss = RequestListQuery {
             environment: Some("staging".to_string()),
@@ -3919,7 +4051,11 @@ mod tests {
             ..Default::default()
         };
         let out = filter_request_summaries(rows.clone(), &query);
-        assert_eq!(out.len(), 2, "all rows have request_type=server, SERVER should match all");
+        assert_eq!(
+            out.len(),
+            2,
+            "all rows have request_type=server, SERVER should match all"
+        );
 
         let query_miss = RequestListQuery {
             request_type: Some("network".to_string()),

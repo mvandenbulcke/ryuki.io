@@ -3,7 +3,7 @@ use crate::api::{
     REQUEST_LIST_SORT_KEYS,
 };
 use crate::models::{condense_timestamp, AuthSession, RequestSummary};
-use crate::server_boundary::get_request_list;
+use crate::server_boundary::{get_request_list, RequestListPage};
 use crate::workspace_catalog::session_can;
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_query_map};
@@ -49,6 +49,10 @@ pub(crate) const STATUS_FILTER_OPTIONS: &[(&str, &str)] = &[
     ("cancelled", "Cancelled"),
 ];
 
+/// Page size for the request list. Mirrors `PAGE_SIZE` inside `get_request_list`
+/// so the view's Prev/Next offsets step by the same amount the server pages by.
+const PAGE_SIZE: u32 = 25;
+
 /// The active facet selection, read from the URL query string. The URL is the
 /// single source of truth so filters survive reload, deep-linking, and the
 /// browser back button.
@@ -62,6 +66,9 @@ pub struct RequestFacets {
     pub q: String,
     pub sort: String,
     pub direction: String,
+    /// Pagination cursor (row offset). Default 0 is the first page; omitted from
+    /// the URL when 0 so the default view stays a clean `/requests`.
+    pub offset: u32,
 }
 
 impl RequestFacets {
@@ -137,6 +144,13 @@ pub fn build_request_filter_url(facets: &RequestFacets) -> String {
     if !sort.is_empty() {
         pairs.push(("sort", sort));
         pairs.push(("direction", facets.normalized_direction()));
+    }
+    // The pagination cursor is appended only when past the first page so the
+    // default view keeps a clean `/requests` URL. `offset` is a numeric value
+    // that needs no percent-encoding; its owned string outlives `pairs`.
+    let offset_value = facets.offset.to_string();
+    if facets.offset > 0 {
+        pairs.push(("offset", offset_value.as_str()));
     }
     if pairs.is_empty() {
         return "/requests".to_string();
@@ -266,6 +280,11 @@ pub fn RequestList() -> impl IntoView {
             q: map.get("q").unwrap_or_default(),
             sort: map.get("sort").unwrap_or_default(),
             direction: map.get("direction").unwrap_or_default(),
+            // A malformed/absent offset degrades to the first page.
+            offset: map
+                .get("offset")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
         })
     });
 
@@ -286,6 +305,7 @@ pub fn RequestList() -> impl IntoView {
                 opt(&facets.q),
                 opt(sort),
                 opt(direction),
+                Some(facets.offset),
             )
             .await
         },
@@ -299,40 +319,48 @@ pub fn RequestList() -> impl IntoView {
 
     // ── Filter-bar event handlers ─────────────────────────────────────────
     // Each control rewrites the URL; the resource and view react to the change.
+    // Every FILTER change resets `offset` to 0 so a narrower filter never
+    // strands the user on a now-empty later page. Only Prev/Next change offset.
     let nav_status = navigate.clone();
     let on_status_change = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.status = event_target_value(&ev);
+        next.offset = 0;
         nav_status(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_site = navigate.clone();
     let on_site_input = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.site = event_target_value(&ev).trim().to_string();
+        next.offset = 0;
         nav_site(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_environment = navigate.clone();
     let on_environment_input = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.environment = event_target_value(&ev).trim().to_string();
+        next.offset = 0;
         nav_environment(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_request_type = navigate.clone();
     let on_request_type_input = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.request_type = event_target_value(&ev).trim().to_string();
+        next.offset = 0;
         nav_request_type(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_created_by = navigate.clone();
     let on_created_by_input = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.created_by = event_target_value(&ev).trim().to_string();
+        next.offset = 0;
         nav_created_by(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_search = navigate.clone();
     let on_search_input = move |ev: leptos::ev::Event| {
         let mut next = facets_memo.get_untracked();
         next.q = event_target_value(&ev);
+        next.offset = 0;
         nav_search(&build_request_filter_url(&next), NavigateOptions::default());
     };
     let nav_clear = navigate.clone();
@@ -382,29 +410,18 @@ pub fn RequestList() -> impl IntoView {
                 </div>
                 <div class="filter-field">
                     <label for="request-filter-site">"Site"</label>
+                    // Free-text like the other facets; the API filters server-side.
+                    // (No datalist: with pagination the loaded page is only 25 rows,
+                    // so page-derived suggestions would shrink and shift as the user
+                    // pages — a stable site source is a separate future enhancement.)
                     <input
                         id="request-filter-site"
                         type="text"
                         placeholder="Any site"
-                        list="request-filter-site-options"
                         autocomplete="off"
                         prop:value=move || facets_memo.get().site
                         on:change=on_site_input
                     />
-                    <datalist id="request-filter-site-options">
-                        <Suspense>
-                            {move || Suspend::new(async move {
-                                let sites = match list_resource.await {
-                                    Ok(rows) => site_options(&rows),
-                                    Err(_) => Vec::new(),
-                                };
-                                sites
-                                    .into_iter()
-                                    .map(|site| view! { <option value=site></option> })
-                                    .collect_view()
-                            })}
-                        </Suspense>
-                    </datalist>
                 </div>
                 <div class="filter-field">
                     <label for="request-filter-environment">"Environment"</label>
@@ -457,8 +474,8 @@ pub fn RequestList() -> impl IntoView {
                     let navigate = navigate.clone();
                     let facets = facets_memo.get();
                     Suspend::new(async move {
-                        let requests: Vec<RequestSummary> = match list_resource.await {
-                            Ok(list) => list,
+                        let page: RequestListPage = match list_resource.await {
+                            Ok(page) => page,
                             // Live mode with the API unreachable: an explicit
                             // error state, never demo rows.
                             Err(_) => {
@@ -478,9 +495,42 @@ pub fn RequestList() -> impl IntoView {
                             }
                         };
 
+                        let requests: Vec<RequestSummary> = page.rows;
+                        let has_next = page.has_next;
+                        let offset = page.offset;
                         let active = facets.is_active();
 
-                        if requests.is_empty() {
+                        // The server already filtered by `q`; re-apply locally so the
+                        // rendered set, the range note, and the empty-state all agree
+                        // even if the API contract drifts. Empty-state + range are
+                        // derived from THIS set (not the raw page) so a re-filter that
+                        // drops every row can never render an inverted "Showing 1-0".
+                        let display_rows: Vec<RequestSummary> = filter_requests(&requests, &facets.q)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        let page_count = display_rows.len();
+
+                        if display_rows.is_empty() {
+                            // A past-the-end page (e.g. a stale deep link to a
+                            // high offset) is empty without meaning "no results":
+                            // point the user back to page 1 of this same view.
+                            if offset > 0 {
+                                let mut first = facets.clone();
+                                first.offset = 0;
+                                let first_url = build_request_filter_url(&first);
+                                return view! {
+                                    <div class="request-list-empty" aria-label="No requests on this page">
+                                        <p>"No requests on this page."</p>
+                                        <p class="table-note">
+                                            "Return to "
+                                            <a href=first_url>"the first page"</a>
+                                            "."
+                                        </p>
+                                    </div>
+                                }
+                                    .into_any();
+                            }
                             // Distinguish "no requests at all" from "filters
                             // matched nothing" so the empty state is honest.
                             if active {
@@ -505,21 +555,47 @@ pub fn RequestList() -> impl IntoView {
                                 .into_any();
                         }
 
-                        // The server already filtered by `q`; re-apply locally so
-                        // the rendered count stays consistent if the contract drifts.
-                        let filtered: Vec<&RequestSummary> = filter_requests(&requests, &facets.q);
-                        let match_count = filtered.len();
-                        let display_rows: Vec<RequestSummary> =
-                            filtered.into_iter().cloned().collect();
+                        // No exact filtered total is reachable here (the upstream
+                        // client drops X-Total-Count), so the note shows the page
+                        // RANGE rather than "N of M". `range_from` is 1-based. Both
+                        // are saturating and derived from `page_count` (the rendered
+                        // set) so the label can never invert or overflow on a large
+                        // offset.
+                        let range_from = offset.saturating_add(1);
+                        let range_to = offset.saturating_add(page_count as u32);
+                        let range_note = format!("Showing {range_from}-{range_to}");
+                        // A second owned copy: the note appears once above the
+                        // table and once inside the pager, each in its own view
+                        // closure (which capture by move).
+                        let range_note_pager = range_note.clone();
+                        let has_prev = offset > 0;
+                        let show_pager = has_prev || has_next;
+
+                        // Prev/Next rewrite only the offset, never the facets, so
+                        // they page within the current filter/sort selection.
+                        let mut prev_facets = facets.clone();
+                        prev_facets.offset = offset.saturating_sub(PAGE_SIZE);
+                        let prev_url = build_request_filter_url(&prev_facets);
+                        let mut next_facets = facets.clone();
+                        next_facets.offset = offset.saturating_add(PAGE_SIZE);
+                        let next_url = build_request_filter_url(&next_facets);
+                        let nav_prev = navigate.clone();
+                        let nav_next = navigate.clone();
+                        let on_prev = move |_| {
+                            nav_prev(&prev_url, NavigateOptions::default());
+                        };
+                        let on_next = move |_| {
+                            nav_next(&next_url, NavigateOptions::default());
+                        };
 
                         let active_sort = facets.normalized_sort().to_string();
                         let active_direction = facets.normalized_direction().to_string();
 
                         view! {
                             <div class="table-wrap">
-                                <Show when=move || active>
+                                <Show when=move || active || show_pager>
                                     <p class="search-result-note table-note">
-                                        {match_count} " matching request" {if match_count == 1 { "" } else { "s" }}
+                                        {range_note.clone()}
                                     </p>
                                 </Show>
                                 <table
@@ -603,6 +679,32 @@ pub fn RequestList() -> impl IntoView {
                                             .collect_view()}
                                     </tbody>
                                 </table>
+                                <Show when=move || show_pager>
+                                    <nav class="request-pagination" aria-label="Request list pages">
+                                        <button
+                                            class="btn btn-secondary"
+                                            type="button"
+                                            disabled=!has_prev
+                                            on:click=on_prev.clone()
+                                        >
+                                            "Previous"
+                                        </button>
+                                        <span
+                                            class="pagination-range table-note"
+                                            aria-hidden="true"
+                                        >
+                                            {range_note_pager.clone()}
+                                        </span>
+                                        <button
+                                            class="btn btn-secondary"
+                                            type="button"
+                                            disabled=!has_next
+                                            on:click=on_next.clone()
+                                        >
+                                            "Next"
+                                        </button>
+                                    </nav>
+                                </Show>
                             </div>
                         }
                             .into_any()
@@ -621,19 +723,6 @@ fn opt(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
-}
-
-/// The distinct, sorted set of site values present in the loaded rows — used to
-/// populate the site filter's `<datalist>` suggestions.
-fn site_options(rows: &[RequestSummary]) -> Vec<String> {
-    let mut sites: Vec<String> = rows
-        .iter()
-        .map(|row| row.site.clone())
-        .filter(|site| !site.is_empty())
-        .collect();
-    sites.sort();
-    sites.dedup();
-    sites
 }
 
 /// Renders a sortable `<th>`: clicking it toggles the sort direction for that
@@ -673,6 +762,8 @@ fn sortable_header(
         let mut next = facets_memo.get_untracked();
         next.sort = key.to_string();
         next.direction = next_direction.clone();
+        // Re-sorting changes which rows lead the list, so return to page 1.
+        next.offset = 0;
         navigate(&build_request_filter_url(&next), NavigateOptions::default());
     };
     view! {
@@ -752,6 +843,7 @@ mod tests {
             q: "web".to_string(),
             sort: "name".to_string(),
             direction: "asc".to_string(),
+            offset: 0,
         };
         assert!(facets.is_active());
         assert_eq!(
@@ -828,20 +920,78 @@ mod tests {
     }
 
     #[test]
-    fn site_options_are_sorted_and_deduped() {
-        let rows = vec![
-            row("a", "x", "site-bravo", "intake"),
-            row("b", "y", "site-alpha", "intake"),
-            row("c", "z", "site-bravo", "intake"),
-            row("d", "w", "", "intake"),
-        ];
-        assert_eq!(site_options(&rows), vec!["site-alpha", "site-bravo"]);
-    }
-
-    #[test]
     fn opt_maps_blank_to_none() {
         assert_eq!(opt(""), None);
         assert_eq!(opt("   "), None);
         assert_eq!(opt("approved"), Some("approved".to_string()));
+    }
+
+    #[test]
+    fn default_offset_is_omitted_from_url() {
+        // The first page (offset 0) keeps the URL clean — no `offset=0` noise.
+        let facets = RequestFacets {
+            status: "approved".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(facets.offset, 0);
+        assert_eq!(
+            build_request_filter_url(&facets),
+            "/requests?status=approved"
+        );
+    }
+
+    #[test]
+    fn nonzero_offset_is_appended_last() {
+        // A later page carries `offset` after every facet, encoded clean.
+        let facets = RequestFacets {
+            status: "approved".to_string(),
+            offset: 50,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_request_filter_url(&facets),
+            "/requests?status=approved&offset=50"
+        );
+    }
+
+    #[test]
+    fn offset_only_facet_builds_offset_url() {
+        let facets = RequestFacets {
+            offset: 25,
+            ..Default::default()
+        };
+        // A bare offset is not an "active" filter, but it must still page.
+        assert!(!facets.is_active());
+        assert_eq!(build_request_filter_url(&facets), "/requests?offset=25");
+    }
+
+    #[test]
+    fn resetting_offset_on_facet_change_drops_it_from_url() {
+        // Mirrors the on:change handlers: a facet edit sets offset back to 0 so
+        // the user lands on page 1, leaving a clean URL.
+        let mut next = RequestFacets {
+            status: "approved".to_string(),
+            offset: 75,
+            ..Default::default()
+        };
+        // Simulate changing the status facet, which resets the page.
+        next.status = "failed".to_string();
+        next.offset = 0;
+        assert_eq!(build_request_filter_url(&next), "/requests?status=failed");
+    }
+
+    #[test]
+    fn request_list_page_serde_round_trip() {
+        use crate::server_boundary::RequestListPage;
+
+        let page = RequestListPage {
+            rows: vec![row("a", "Alpha", "site-a", "intake")],
+            offset: 25,
+            page_size: 25,
+            has_next: true,
+        };
+        let json = serde_json::to_string(&page).expect("serialize page");
+        let back: RequestListPage = serde_json::from_str(&json).expect("deserialize page");
+        assert_eq!(back, page);
     }
 }

@@ -989,6 +989,23 @@ mod tests {
     }
 
     #[test]
+    fn request_list_query_pagination_only_serializes_limit_and_offset() {
+        // Pagination params with no facets still serialize (and mark the query
+        // non-empty) so the request-list view can page the default list.
+        let query = RequestListQuery {
+            limit: Some(26),
+            offset: Some(50),
+            ..Default::default()
+        };
+        assert!(!query.is_empty());
+        assert_eq!(query.to_query_string(), "?limit=26&offset=50");
+        assert_eq!(
+            request_list_path_with_query(&query),
+            "/api/requests?limit=26&offset=50"
+        );
+    }
+
+    #[test]
     fn request_list_query_new_facets_serialize_in_canonical_order() {
         let query = RequestListQuery {
             environment: Some("prod".to_string()),
