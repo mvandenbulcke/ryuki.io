@@ -68,7 +68,7 @@ implementing **all 66**. This file tracks execution.
 | 36 | [x] | AIOps suggestion-generation engine | AIOps | M | H | — |
 | 37 | [x] | What-if capacity & cost planning | AIOps | M | H | — |
 | 38 | [x] | Storage array registration / lifecycle | API | M | M | — |
-| 39 | [ ] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | ✓ |
+| 39 | [x] | Maintain lifecycle stage (recurring review) | Roadmap | M | M | `9e1d425` — scheduled maintain_review_scan flags due Operational requests via request.maintain-review-due domain events (atomic FOR UPDATE SKIP LOCKED claim+advance, 90d, mig 119); reuses #40 pattern; codex-approved plan+impl. Follow-ups: alert-feed promotion + per-criticality interval |
 | 40 | [x] | Scheduled/recurring synthetic health checks | Observ | S | M | `715f126` — durable scheduler runs synthetic_health_run (first safe-internal-write kind: job_is_schedulable allowlist); hourly seed (mig 116) + tx-aware result writes |
 | 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
