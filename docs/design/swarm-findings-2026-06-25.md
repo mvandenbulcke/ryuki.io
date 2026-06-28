@@ -756,8 +756,10 @@ their value:
   in-DB CHECK: preventing `ALTER SEQUENCE ... RESTART IDENTITY` belongs in
   database role grants / runbook policy, not application code. Documented as an
   ops control rather than a code change.
-- **#30 (scheduler lease heartbeat)** and **#33 (agent_jobs composite index)** —
-  tracked as background-task chips (own sessions/worktrees).
+- **#33 (agent_jobs composite index)** — SHIPPED `33a7ded`: migration 117 swaps the
+  (platform, status) index for (platform, status, created_at) so the lease query
+  satisfies filter + ORDER BY from the index (EXPLAIN confirms no Sort); codex APPROVED.
+- **#30 (scheduler lease heartbeat)** — still tracked as a background-task chip.
 - **#34 (client ids in error messages)** — 72+ instances, `low` severity; the
   reviewer noted these ids are not secrets. A full opaque-error-code sweep is a
   large mechanical change with marginal value; deferred.
