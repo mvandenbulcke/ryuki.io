@@ -33,7 +33,7 @@ implementing **all 66**. This file tracks execution.
 | 1 | [x] | Durable scheduler / background job engine | Roadmap | L | H | ✓ |
 | 2 | [x] | Administrable, site/env-scoped RBAC | Security | L | H | ✓ |
 | 3 | [x] | Separation-of-duties on approval (no self-approve) | Security | S | H | ✓ |
-| 4 | [~] | Multi-role approval quorum | Security | M | H | ✓ |
+| 4 | [x] | Multi-role approval quorum | Security | M | H | ENFORCED `1fc0e6d` (mig 118 requests.required_approval_roles DEFAULT 1; FOR UPDATE-locked quorum eval in apply_approval_decision_audited; engine unchanged; codex-approved over 3 rounds — caught lost-completion + lost-evidence races + a 409/400 regression). Deferred follow-up: policy SOURCE that raises required_approval_roles above 1 from the offering/criticality at plan time (today the column defaults to 1, so enforcement is wired + tested but exercised only when a request sets it) |
 | 5 | [x] | Tamper-evident audit hash chain + verify | Security | M | H | ✓ |
 | 6 | [x] | Dependency-backed platform self-health probes | Roadmap | L | H | ✓ |
 | 7 | [x] | Protect/Publish/Retire actions in portal | Portal | M | H | ✓ |
