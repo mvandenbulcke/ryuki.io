@@ -74,6 +74,19 @@ pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
     }
 }
 
+/// Classify an agent-job lifecycle event (#23) by its `to_status`. A
+/// `dead-lettered` job is CRITICAL — it exhausted every lease-expiry redispatch
+/// (the poison-job cap), so that request's work will never run without operator
+/// intervention. That ranks it with a `failed` request (a hard execution
+/// failure), above the recoverable `offline` agent (a warning). Every other
+/// agent-job status is normal flow and NOT an alert.
+pub fn severity_for_agent_job_status(to_status: &str) -> Option<AlertSeverity> {
+    match to_status {
+        "dead-lettered" => Some(AlertSeverity::Critical),
+        _ => None,
+    }
+}
+
 /// The UNION of every alert-worthy `to_status` across all aggregate types.
 /// Exposed so the alert feed can push this filter INTO its SQL query — alerts
 /// are rare relative to all events, so filtering a recent-N page in memory would
@@ -82,7 +95,14 @@ pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
 /// and drops any spurious (aggregate, status) pair. A unit test keeps this union
 /// in lock-step with the per-aggregate classifiers.
 pub fn alert_worthy_statuses() -> &'static [&'static str] {
-    &["failed", "rejected", "cancelled", "breached", "offline"]
+    &[
+        "failed",
+        "rejected",
+        "cancelled",
+        "breached",
+        "offline",
+        "dead-lettered",
+    ]
 }
 
 /// Classify any domain event into an optional alert severity. `request`
@@ -94,6 +114,7 @@ pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSe
         "slo" => to_status.and_then(severity_for_slo_status),
         "budget" => to_status.and_then(severity_for_budget_status),
         "agent" => to_status.and_then(severity_for_agent_status),
+        "agent_job" => to_status.and_then(severity_for_agent_job_status),
         _ => None,
     }
 }
@@ -135,6 +156,23 @@ mod tests {
     }
 
     #[test]
+    fn dead_lettered_agent_job_is_critical_others_are_not() {
+        // A poison-capped job is a hard execution failure → Critical.
+        assert_eq!(
+            severity_for_agent_job_status("dead-lettered"),
+            Some(AlertSeverity::Critical)
+        );
+        // Every normal agent-job status is not an alert.
+        for ok in ["pending", "leased", "running", "succeeded", "reconcile"] {
+            assert_eq!(
+                severity_for_agent_job_status(ok),
+                None,
+                "{ok} must not alert"
+            );
+        }
+    }
+
+    #[test]
     fn alert_status_union_matches_the_classifiers() {
         // Every status in the coarse SQL-filter union must classify as an alert
         // for SOME aggregate, so the in-SQL filter and the per-aggregate severity
@@ -144,7 +182,8 @@ mod tests {
                 severity_for_request_status(s).is_some()
                     || severity_for_slo_status(s).is_some()
                     || severity_for_budget_status(s).is_some()
-                    || severity_for_agent_status(s).is_some(),
+                    || severity_for_agent_status(s).is_some()
+                    || severity_for_agent_job_status(s).is_some(),
                 "{s} is in the alert union but no aggregate classifies it as an alert"
             );
         }
@@ -176,6 +215,17 @@ mod tests {
             Some(AlertSeverity::Warning)
         );
         assert_eq!(classify("agent", Some("online")), None);
+        // A dead-lettered agent job is critical (poison-job cap reached); a
+        // non-dead-letter agent_job status is not an alert.
+        assert_eq!(
+            classify("agent_job", Some("dead-lettered")),
+            Some(AlertSeverity::Critical)
+        );
+        assert_eq!(classify("agent_job", Some("running")), None);
+        // Cross-aggregate spurious pairs never alert (a request can't be
+        // 'dead-lettered', an agent_job can't be 'failed').
+        assert_eq!(classify("request", Some("dead-lettered")), None);
+        assert_eq!(classify("agent_job", Some("failed")), None);
         // Cross-aggregate spurious pairs never alert (a request can't be
         // 'breached', an slo can't be 'failed').
         assert_eq!(classify("slo", Some("failed")), None);

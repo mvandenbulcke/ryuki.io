@@ -1429,9 +1429,85 @@ pub async fn heartbeat(
 // LiveApply: → ReconcileRequired (operator must reconcile before re-dispatch).
 // ---------------------------------------------------------------------------
 
+/// #23 poison-job cap: a non-mutating job is redispatched at most this many
+/// times. On the next lease expiry once `delivery_attempts >= MAX_REDISPATCHES`
+/// it is dead-lettered instead of redispatched. Total dispatch attempts before
+/// dead-letter = MAX_REDISPATCHES + 1 (1 initial + MAX_REDISPATCHES redispatches).
+// INT4 in the DB (migration 121), so an i32 here keeps the bind + RETURNING
+// decode aligned with the column type.
+const MAX_REDISPATCHES: i32 = 5;
+
+/// One dead-lettered job, returned by the cap UPDATE so we can emit its event.
+#[derive(sqlx::FromRow)]
+struct DeadLetteredJobRow {
+    id: String,
+    request_id: String,
+    platform: String,
+    mode: String,
+    delivery_attempts: i32,
+}
+
 /// Returns the number of jobs transitioned.
+///
+/// Runs as ONE transaction so each dead-letter UPDATE and its domain event are
+/// atomic — an event can never be emitted for a job that was not actually
+/// dead-lettered, and vice versa.
+///
+/// This sweep is PER-REPLICA (not leader-elected): every replica's
+/// `spawn_lease_expiry_sweep` runs it every 30s. It is safe under concurrent
+/// sweepers because PostgreSQL serializes concurrent UPDATEs on the same row and
+/// RECHECKS the `status` + `delivery_attempts` predicates after waiting on the
+/// row lock, so two replicas cannot both increment 4→5 (the second sees 5,
+/// `< MAX` fails) nor both dead-letter at 5 (the second sees `DeadLettered`, the
+/// `Leased/Running` predicate fails) — exactly one increment and exactly one
+/// dead-letter + event per job.
 pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    // Non-mutating (OfflineDryRun / LivePlan): reset to Pending, new attempt.
+    let mut tx = pool.begin().await?;
+
+    // 1. Dead-letter the at-cap non-mutating rows (terminal, no redispatch).
+    //    A job that exhausted every redispatch is poison: surface it and stop.
+    let dead_lettered: Vec<DeadLetteredJobRow> = sqlx::query_as(
+        "UPDATE agent_jobs \
+         SET status = 'DeadLettered', updated_at = NOW() \
+         WHERE status IN ('Leased', 'Running') \
+           AND mode IN ('OfflineDryRun', 'LivePlan') \
+           AND lease_deadline < NOW() \
+           AND delivery_attempts >= $1 \
+         RETURNING id::text, request_id::text, platform, mode, delivery_attempts",
+    )
+    .bind(MAX_REDISPATCHES)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // Emit one alert-worthy domain event per dead-lettered job. Agent jobs are
+    // platform-wide infra (like agent-offline), so site/environment are NULL.
+    for job in &dead_lettered {
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: "job.dead_lettered",
+                aggregate_type: "agent_job",
+                aggregate_id: &job.id,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({
+                    "to_status": "dead-lettered",
+                    "platform": &job.platform,
+                    "mode": &job.mode,
+                    "request_id": &job.request_id,
+                    "delivery_attempts": job.delivery_attempts,
+                    "note": "lease expired repeatedly; poison-job cap reached",
+                }),
+            },
+        )
+        .await?;
+    }
+    let dead_count = dead_lettered.len() as u64;
+
+    // 2. Redispatch + increment the under-cap non-mutating rows (the existing
+    //    reset, now counting). Mutually exclusive with the dead-letter predicate
+    //    on delivery_attempts, so order is immaterial.
     let redispatched = sqlx::query(
         "UPDATE agent_jobs \
          SET status = 'Pending', \
@@ -1440,16 +1516,20 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
              fencing_token = NULL, \
              cp_nonce = NULL, \
              lease_deadline = NULL, \
+             delivery_attempts = delivery_attempts + 1, \
              updated_at = NOW() \
          WHERE status IN ('Leased', 'Running') \
            AND mode IN ('OfflineDryRun', 'LivePlan') \
-           AND lease_deadline < NOW()",
+           AND lease_deadline < NOW() \
+           AND delivery_attempts < $1",
     )
-    .execute(pool)
+    .bind(MAX_REDISPATCHES)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
-    // LiveApply: → ReconcileRequired (never auto-redispatched).
+    // 3. LiveApply: → ReconcileRequired (never auto-redispatched, so it cannot
+    //    poison-loop and is out of the cap's scope).
     let reconcile = sqlx::query(
         "UPDATE agent_jobs \
          SET status = 'ReconcileRequired', updated_at = NOW() \
@@ -1457,19 +1537,22 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
            AND mode = 'LiveApply' \
            AND lease_deadline < NOW()",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
-    if redispatched + reconcile > 0 {
+    tx.commit().await?;
+
+    if dead_count + redispatched + reconcile > 0 {
         tracing::info!(
             redispatched,
             reconcile_required = reconcile,
+            dead_lettered = dead_count,
             "agent lease expiry sweep"
         );
     }
 
-    Ok(redispatched + reconcile)
+    Ok(dead_count + redispatched + reconcile)
 }
 
 // ---------------------------------------------------------------------------
@@ -3239,6 +3322,461 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        pool.close().await;
+    }
+
+    // ── #23 poison-job cap / dead-letter ──────────────────────────────────
+
+    /// Seed a Leased non-mutating (OfflineDryRun) job with a past deadline and a
+    /// chosen `delivery_attempts`. Returns the job id.
+    async fn seed_expired_leased_job(pool: &PgPool, platform: &str, attempts: i32) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
+             delivery_attempts) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(platform)
+        .bind(attempts)
+        .fetch_one(pool)
+        .await
+        .expect("seed expired leased job")
+    }
+
+    /// Re-Lease a job with a past deadline so the next sweep sees it expired.
+    async fn release_expired(pool: &PgPool, job_id: Uuid) {
+        sqlx::query(
+            "UPDATE agent_jobs SET status = 'Leased', agent_id = 'some-agent', \
+             attempt_id = gen_random_uuid(), fencing_token = 'fence', cp_nonce = 'nonce', \
+             lease_deadline = NOW() - INTERVAL '1 minute', updated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("re-lease");
+    }
+
+    async fn job_status_and_attempts(pool: &PgPool, job_id: Uuid) -> (String, i32) {
+        sqlx::query_as("SELECT status, delivery_attempts FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .expect("read status/attempts")
+    }
+
+    async fn dead_letter_event_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE event_type = 'job.dead_lettered' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count dead-letter events")
+    }
+
+    async fn cleanup_dead_letter_events(pool: &PgPool, job_id: Uuid) {
+        sqlx::query(
+            "DELETE FROM domain_events WHERE aggregate_id = $1 AND aggregate_type = 'agent_job'",
+        )
+        .bind(job_id.to_string())
+        .execute(pool)
+        .await
+        .ok();
+    }
+
+    /// Cap reached → dead-letter + exactly one alert event. Six lease-expiry
+    /// cycles: the first five redispatch (Pending, delivery_attempts 1..=5), the
+    /// sixth (delivery_attempts == MAX) dead-letters and emits one event.
+    #[tokio::test]
+    async fn db_poison_cap_dead_letters_and_alerts() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let job_id = seed_expired_leased_job(&pool, &platform, 0).await;
+
+        for cycle in 1..=5_i32 {
+            expire_leases(&pool).await.expect("expire");
+            let (status, attempts) = job_status_and_attempts(&pool, job_id).await;
+            assert_eq!(status, "Pending", "cycle {cycle} must redispatch");
+            assert_eq!(attempts, cycle, "cycle {cycle} must increment attempts");
+            assert_eq!(
+                dead_letter_event_count(&pool, job_id).await,
+                0,
+                "no dead-letter event before the cap"
+            );
+            release_expired(&pool, job_id).await;
+        }
+
+        // 6th expiry: delivery_attempts == MAX_REDISPATCHES → dead-letter.
+        expire_leases(&pool).await.expect("expire");
+        let (status, attempts) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(status, "DeadLettered", "at cap the job is dead-lettered");
+        assert_eq!(attempts, MAX_REDISPATCHES, "attempts frozen at MAX");
+        assert_eq!(
+            dead_letter_event_count(&pool, job_id).await,
+            1,
+            "exactly one dead-letter event"
+        );
+
+        // The event is the agent_job aggregate, system-actored, and its payload
+        // carries the cap details. aggregate_type/actor are asserted directly so a
+        // future refactor of either is caught (not just via the count helper).
+        let (payload, aggregate_type, actor): (serde_json::Value, String, String) = sqlx::query_as(
+            "SELECT payload, aggregate_type, actor FROM domain_events \
+                 WHERE event_type = 'job.dead_lettered' AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("read event");
+        assert_eq!(
+            aggregate_type, "agent_job",
+            "dead-letter is the agent_job aggregate"
+        );
+        assert_eq!(actor, "system", "dead-letter is system-actored");
+        assert_eq!(payload["to_status"], json!("dead-lettered"));
+        assert_eq!(payload["delivery_attempts"], json!(MAX_REDISPATCHES));
+
+        cleanup_dead_letter_events(&pool, job_id).await;
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// Under-cap redispatch increments delivery_attempts and emits no event.
+    #[tokio::test]
+    async fn db_under_cap_redispatch_increments_no_event() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let job_id = seed_expired_leased_job(&pool, &platform, 0).await;
+
+        expire_leases(&pool).await.expect("expire");
+
+        let (status, attempts) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(status, "Pending");
+        assert_eq!(attempts, 1, "one redispatch increments to 1");
+        assert_eq!(dead_letter_event_count(&pool, job_id).await, 0);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// LiveApply is out of the cap's scope: a past-deadline LiveApply job becomes
+    /// ReconcileRequired with delivery_attempts untouched and no event, even when
+    /// delivery_attempts is forced past the cap.
+    #[tokio::test]
+    async fn db_live_apply_never_dead_lettered() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let job_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline, \
+             delivery_attempts) \
+             VALUES ($1, $2, '{}'::jsonb, 'LiveApply', 'Running', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute', $3) \
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&platform)
+        .bind(MAX_REDISPATCHES + 1)
+        .fetch_one(&pool)
+        .await
+        .expect("seed");
+
+        expire_leases(&pool).await.expect("expire");
+
+        let (status, attempts) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(status, "ReconcileRequired");
+        assert_eq!(
+            attempts,
+            MAX_REDISPATCHES + 1,
+            "LiveApply never touches delivery_attempts"
+        );
+        assert_eq!(dead_letter_event_count(&pool, job_id).await, 0);
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// DeadLettered is terminal: a second sweep does not touch the row (status no
+    /// longer Leased/Running) and emits no new event.
+    #[tokio::test]
+    async fn db_dead_lettered_is_terminal() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let job_id = seed_expired_leased_job(&pool, &platform, MAX_REDISPATCHES).await;
+
+        expire_leases(&pool)
+            .await
+            .expect("first expire dead-letters");
+        let (status, _) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(status, "DeadLettered");
+        assert_eq!(dead_letter_event_count(&pool, job_id).await, 1);
+
+        // Second sweep: no-op for this row, no new event.
+        expire_leases(&pool).await.expect("second expire");
+        let (status2, _) = job_status_and_attempts(&pool, job_id).await;
+        assert_eq!(status2, "DeadLettered", "still terminal");
+        assert_eq!(
+            dead_letter_event_count(&pool, job_id).await,
+            1,
+            "no duplicate event on a re-sweep"
+        );
+
+        cleanup_dead_letter_events(&pool, job_id).await;
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// Per-replica concurrency (codex): two sweeps racing on ONE expired job.
+    /// At delivery_attempts = MAX-1 → exactly one increment (→MAX) and zero
+    /// dead-letter events. At delivery_attempts = MAX → exactly one DeadLettered
+    /// row and exactly one event. Proves the row-lock predicate recheck prevents
+    /// a double-increment / double-emit across replicas.
+    #[tokio::test]
+    async fn db_concurrent_sweeps_increment_and_dead_letter_once() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+
+        // Case A: under cap → exactly one increment, no event.
+        let job_a = seed_expired_leased_job(&pool, &platform, MAX_REDISPATCHES - 1).await;
+        let (r1, r2) = tokio::join!(expire_leases(&pool), expire_leases(&pool));
+        r1.expect("sweep 1");
+        r2.expect("sweep 2");
+        let (status_a, attempts_a) = job_status_and_attempts(&pool, job_a).await;
+        assert_eq!(status_a, "Pending", "under cap stays redispatched");
+        assert_eq!(
+            attempts_a, MAX_REDISPATCHES,
+            "exactly one increment across two concurrent sweeps"
+        );
+        assert_eq!(
+            dead_letter_event_count(&pool, job_a).await,
+            0,
+            "no dead-letter event under the cap"
+        );
+
+        // Case B: at cap → exactly one dead-letter + exactly one event.
+        let job_b = seed_expired_leased_job(&pool, &platform, MAX_REDISPATCHES).await;
+        let (r3, r4) = tokio::join!(expire_leases(&pool), expire_leases(&pool));
+        r3.expect("sweep 3");
+        r4.expect("sweep 4");
+        let (status_b, _) = job_status_and_attempts(&pool, job_b).await;
+        assert_eq!(status_b, "DeadLettered");
+        assert_eq!(
+            dead_letter_event_count(&pool, job_b).await,
+            1,
+            "exactly one event across two concurrent sweeps"
+        );
+
+        cleanup_dead_letter_events(&pool, job_b).await;
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// Brand-new insert (codex): a fresh create_agent_job (which omits
+    /// delivery_attempts) reads back delivery_attempts = 0 — the NOT NULL DEFAULT
+    /// 0 column is safe for existing INSERTs and needs no AGENT_JOB_COLUMNS change.
+    #[tokio::test]
+    async fn db_new_job_defaults_delivery_attempts_to_zero() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        let job_id = seed_pending_job(&pool, &platform).await;
+
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT delivery_attempts FROM agent_jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read delivery_attempts");
+        assert_eq!(attempts, 0, "a brand-new job defaults to 0 attempts");
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// Migration 121 idempotency + contract. Re-applying the SQL on the
+    /// already-applied schema is safe (guarded ADD COLUMN IF NOT EXISTS + DROP/ADD
+    /// CONSTRAINT), and the result still enforces the contract: the
+    /// delivery_attempts column is present (defaults 0), the widened
+    /// agent_jobs_status_check ACCEPTS the new terminal 'DeadLettered' AND a
+    /// pre-existing value ('Pending'), and an out-of-set status is still REJECTED.
+    /// Holds EXPIRE_TEST_LOCK because the DROP/ADD constraint briefly re-validates
+    /// the whole agent_jobs table.
+    #[tokio::test]
+    async fn db_migration_121_is_idempotent() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        let sql = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../migrations/121_agent_jobs_delivery_attempts.sql"
+        ))
+        .expect("read migration 121");
+        sqlx::raw_sql(&sql)
+            .execute(&pool)
+            .await
+            .expect("re-running migration 121 must be safe (no-op on applied schema)");
+
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+
+        // The widened CHECK accepts the new terminal value, and the column is
+        // present and defaults to 0.
+        let dl: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'DeadLettered') RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&platform)
+        .fetch_one(&pool)
+        .await
+        .expect("'DeadLettered' passes the widened CHECK");
+        let attempts: i32 =
+            sqlx::query_scalar("SELECT delivery_attempts FROM agent_jobs WHERE id = $1")
+                .bind(dl)
+                .fetch_one(&pool)
+                .await
+                .expect("delivery_attempts column present");
+        assert_eq!(attempts, 0, "delivery_attempts defaults to 0");
+
+        // A pre-existing status value still inserts cleanly (widening preserves it).
+        sqlx::query(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Pending')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .expect("pre-existing value 'Pending' still passes the widened CHECK");
+
+        // An out-of-set status is still rejected — the CHECK is still enforced.
+        let bad = sqlx::query(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Bogus')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&platform)
+        .execute(&pool)
+        .await;
+        assert!(
+            bad.is_err(),
+            "an out-of-set status must still violate the widened CHECK"
+        );
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        pool.close().await;
+    }
+
+    /// `expire_leases` returns the TOTAL across all three branches — dead-letter +
+    /// redispatch + reconcile. A regression dropping any branch (e.g. omitting
+    /// `dead_count` from the sum) would change this count. Drains any pre-existing
+    /// expired leases first so the asserted total is exactly this test's three jobs.
+    #[tokio::test]
+    async fn db_expire_leases_returns_mixed_total() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let _expire_guard = EXPIRE_TEST_LOCK.lock().await;
+        // Drain any stray expired leases so the total below is exactly our three.
+        expire_leases(&pool).await.expect("drain");
+
+        let platform = format!(
+            "plt-{}",
+            Uuid::new_v4().to_string().replace('-', "")[..8].to_owned()
+        );
+        // (a) at-cap non-mutating → dead-letter.
+        let dead = seed_expired_leased_job(&pool, &platform, MAX_REDISPATCHES).await;
+        // (b) fresh non-mutating → redispatch.
+        let redispatch = seed_expired_leased_job(&pool, &platform, 0).await;
+        // (c) expired LiveApply → reconcile.
+        let reconcile: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, agent_id, \
+             attempt_id, lease_generation, fencing_token, cp_nonce, lease_deadline) \
+             VALUES ($1, $2, '{}'::jsonb, 'LiveApply', 'Running', 'some-agent', \
+             gen_random_uuid(), 1, 'fence', 'nonce', NOW() - INTERVAL '1 minute') \
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&platform)
+        .fetch_one(&pool)
+        .await
+        .expect("seed live-apply");
+
+        let total = expire_leases(&pool).await.expect("expire");
+        assert_eq!(
+            total, 3,
+            "dead-letter + redispatch + reconcile are all counted"
+        );
+
+        assert_eq!(
+            job_status_and_attempts(&pool, dead).await.0,
+            "DeadLettered",
+            "at-cap job dead-lettered"
+        );
+        assert_eq!(
+            job_status_and_attempts(&pool, redispatch).await.0,
+            "Pending",
+            "fresh job redispatched"
+        );
+        assert_eq!(
+            job_status_and_attempts(&pool, reconcile).await.0,
+            "ReconcileRequired",
+            "live-apply job reconcile-required"
+        );
+
+        cleanup_dead_letter_events(&pool, dead).await;
+        cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }
 

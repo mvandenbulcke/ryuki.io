@@ -52,7 +52,7 @@ implementing **all 66**. This file tracks execution.
 | 20 | [ ] | Step-up / MFA re-auth for high-risk actions | Security | M | H | — |
 | 21 | [ ] | Live secret rotation (Vault) + break-glass | Security | L | H | ✓ |
 | 22 | [x] | Domain-event alert generation | Observ | M | H | — |
-| 23 | [ ] | CP-side poison-job cap / dead-letter | Resil | M | H | — |
+| 23 | [x] | CP-side poison-job cap / dead-letter | Resil | M | H | shipped — `expire_leases` now caps non-mutating (OfflineDryRun/LivePlan) lease-expiry redispatches at `MAX_REDISPATCHES=5` via a `delivery_attempts` counter (mig 121); at the cap the job becomes terminal `DeadLettered` and emits ONE alert-worthy `job.dead_lettered` domain event (to_status='dead-lettered', `event_alerts` → Critical), all in one tx. Per-replica-safe (row-lock predicate recheck). LiveApply (→ReconcileRequired) unchanged. codex plan + impl both APPROVE; tests incl. concurrency + mixed-count + migration idempotency. Follow-ups: operator list/requeue endpoint for dead-lettered jobs |
 | 24 | [x] | Audit-trail export / streaming to SIEM | Observ | M | H | — |
 | 25 | [x] | SLO / error-budget tracking | Observ | M | H | — |
 | 26 | [x] | CP database backup/restore + DR runbook | Roadmap | M | H | ✓ |
