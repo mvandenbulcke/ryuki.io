@@ -147,6 +147,7 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/fail", post(requests_fail))
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route("/api/requests/batch/cancel", post(requests_batch_cancel))
+        .route("/api/requests/batch/reject", post(requests_batch_reject))
         .route(
             "/api/requests/{id}/approve-live-apply",
             post(requests_approve_live_apply),
@@ -17060,14 +17061,34 @@ async fn requests_reject(
         record_transition_denied(&session, &request_id, "request.reject").await;
         return Err(status_403());
     }
+    // The single handler keeps its EXACT historic reason validation —
+    // reject_control_chars + non-empty, with NO length cap. The >2000 cap is a
+    // batch-only policy (see requests_batch_reject), so single reject stays
+    // behavior-preserving.
     reject_control_chars("rejection reason", &body.reason)?;
     let reason = body.reason.trim();
     if reason.is_empty() {
         return Err(status_400("Rejection reason is required"));
     }
 
+    reject_one(&session, &request_id, reason).await.map(Json)
+}
+
+/// Reject a SINGLE request: scope-guarded, SoD-gated (creator != approver),
+/// engine transition, persisted + audited. `reason` must already be validated
+/// (control-char-free and non-empty) by the caller — exactly like `cancel_one`.
+/// The `approve` capability is a FLAT capability checked ONCE at each caller
+/// (single + batch handler), so it is NOT re-checked here; `check_sod` is the
+/// per-item gate. Returns the engine-produced rejected request JSON, or an
+/// (status, body) error. Extracted so single-reject and batch-reject share ONE
+/// copy of the scope/SoD/transition/audit logic.
+async fn reject_one(
+    session: &AuthSession,
+    request_id: &str,
+    reason: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
         ))
@@ -17075,21 +17096,21 @@ async fn requests_reject(
         .fetch_optional(pool)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
         // #2: by-id scope guard immediately after load (before SoD/engine logic).
-        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+        scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         // Separation of duties: the rejecting approver must not be the creator
         // (the creator withdraws via cancel, not a self-rejection).
         check_sod(
-            &session,
-            &request_id,
+            session,
+            request_id,
             "request.reject",
             current.created_by.as_deref(),
         )
         .await?;
 
-        let request = db_row_to_request(&current, &request_id);
+        let request = db_row_to_request(&current, request_id);
         let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
@@ -17107,7 +17128,7 @@ async fn requests_reject(
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Rejected);
         apply_transition_audited(
             pool,
-            &session,
+            session,
             uid,
             &current,
             "request.reject",
@@ -17120,14 +17141,14 @@ async fn requests_reject(
                 plan_json: None,
                 validation_json: None,
                 approval_route_json: None,
-                approval_role: Some(approval_role_for(&session)),
+                approval_role: Some(approval_role_for(session)),
                 approval_decision: Some("rejected"),
                 approval_reason: Some(reason.to_string()),
             },
         )
         .await?;
 
-        return Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()));
+        return Ok(serde_json::to_value(&rejected).unwrap_or_default());
     }
 
     // Separation of duties: the rejecting approver must not be the creator. Read
@@ -17138,12 +17159,22 @@ async fn requests_reject(
         let idx = store
             .iter()
             .position(|r| r.id == request_id)
-            .ok_or_else(|| status_404(&request_id))?;
+            .ok_or_else(|| status_404(request_id))?;
+        // #2 (no-DB scope hardening): the in-memory store must enforce the same
+        // by-id scope guard as the DB branch and as cancel_one — an out-of-scope
+        // request 404s exactly like a missing one, so the dry-run reject path is
+        // never a cross-scope reject or existence oracle. (This closes the lone
+        // no-DB reject gap; DB reject and both cancel paths already scoped.)
+        if is_scoped(session)
+            && !row_scope_permits(session, &store[idx].site, &store[idx].environment)
+        {
+            return Err(status_404(request_id));
+        }
         store[idx].requester.clone()
     };
     check_sod(
-        &session,
-        &request_id,
+        session,
+        request_id,
         "request.reject",
         Some(requester.as_str()),
     )
@@ -17153,7 +17184,7 @@ async fn requests_reject(
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
 
     let rejected = request_lifecycle::reject_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
@@ -17162,10 +17193,10 @@ async fn requests_reject(
     let from_stage = current_stage_name(&store[idx]);
     store[idx] = rejected.clone();
     audit::record_audit_local(
-        &session,
+        session,
         &AuditRecord {
             action: "request.reject",
-            request_id: Some(&request_id),
+            request_id: Some(request_id),
             from_status: Some(&from_status),
             to_status: "rejected",
             from_stage: Some(&from_stage),
@@ -17176,7 +17207,7 @@ async fn requests_reject(
     )
     .await;
 
-    Ok(Json(serde_json::to_value(&rejected).unwrap_or_default()))
+    Ok(serde_json::to_value(&rejected).unwrap_or_default())
 }
 
 /// POST /api/requests/{id}/rework — send a request back to Intake for the
@@ -17531,6 +17562,88 @@ async fn requests_batch_cancel(
     let mut failed = 0u64;
     for id in unique_ids {
         match cancel_one(&session, id, reason).await {
+            Ok(_) => {
+                succeeded += 1;
+                results.push(json!({ "id": id, "ok": true }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
+}
+
+/// Body for a batch reject: the request ids and a shared reason.
+#[derive(Debug, Deserialize)]
+struct BatchRejectRequest {
+    ids: Vec<String>,
+    reason: String,
+}
+
+/// POST /api/requests/batch/reject — reject up to 100 requests in one call (#17,
+/// slice 2). Each id is rejected INDEPENDENTLY through the same `reject_one` core
+/// (so the scope/SoD rule and the per-item transaction are identical to a single
+/// reject); partial success is normal and the response reports a per-id outcome.
+/// Items are NOT atomic with each other — a failure on one does not roll back the
+/// rest. NOTE: even an all-failed batch returns HTTP 200; clients MUST inspect
+/// `failed`/`results`. Duplicate ids are deduped (each request is acted on once).
+///
+/// The `approve` capability is a FLAT capability, so it is checked ONCE up front:
+/// a caller lacking it gets a single 403 for the WHOLE batch (never per-item),
+/// audited EXACTLY ONCE with a non-id sentinel — looping the ids would be wasteful
+/// and risk an existence oracle on a denied caller. `check_sod` (creator !=
+/// approver) remains the per-item gate inside `reject_one`.
+async fn requests_batch_reject(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<BatchRejectRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        // Audit the denial ONCE with a clear non-id placeholder for request_id.
+        // The durable audit parses the non-UUID "batch" sentinel to NULL.
+        record_transition_denied(&session, "batch", "request.reject").await;
+        return Err(status_403());
+    }
+    // The control-char + non-empty checks mirror the single handler; the >2000
+    // cap is BATCH-ONLY (mirrors requests_batch_cancel). The single handler is
+    // intentionally left without a length cap (unchanged).
+    reject_control_chars("rejection reason", &b.reason)?;
+    let reason = b.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Rejection reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Rejection reason is too long (max 2000 characters)",
+        ));
+    }
+    if b.ids.is_empty() {
+        return Err(status_400("ids cannot be empty"));
+    }
+    if b.ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    // Dedupe (preserving order) so the same request is never processed twice in
+    // one batch — otherwise the second attempt fails the state transition and
+    // the counts become "attempts", not unique requests.
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<&String> = b.ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for id in unique_ids {
+        match reject_one(&session, id, reason).await {
             Ok(_) => {
                 succeeded += 1;
                 results.push(json!({ "id": id, "ok": true }));
@@ -36483,6 +36596,247 @@ mod unit_tests {
         }));
     }
 
+    /// #17 (slice 2): the >2000-char reason cap is BATCH-ONLY. The SINGLE reject
+    /// handler has no length cap and must still ACCEPT a long reason — proving the
+    /// reject_one extraction left single-reject validation behavior-preserving.
+    #[tokio::test]
+    async fn requests_reject_accepts_long_reason_no_cap() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let long = "x".repeat(2500);
+        let Json(body) = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(approver),
+            Json(ReasonBody {
+                reason: long.clone(),
+            }),
+        )
+        .await
+        .expect("single reject must accept a >2000-char reason (no cap)");
+        assert_eq!(body["status"], "Rejected");
+    }
+
+    /// #17 (slice 2): the batch-reject handler rejects an empty batch, an empty
+    /// reason, control chars, an over-2000 reason (BATCH-only cap), and an
+    /// over-100 batch BEFORE touching any request. The per-item reject logic is
+    /// covered by the single-reject tests via the shared `reject_one`.
+    #[tokio::test]
+    async fn requests_batch_reject_validates_inputs() {
+        let sess = || {
+            AuthExtractor(single_role_session(
+                "approver-1",
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            ))
+        };
+        let bad = |ids: Vec<String>, reason: &str| {
+            requests_batch_reject(
+                sess(),
+                Json(BatchRejectRequest {
+                    ids,
+                    reason: reason.to_string(),
+                }),
+            )
+        };
+        assert!(
+            matches!(
+                bad(vec![], "cleanup").await,
+                Err((StatusCode::BAD_REQUEST, _))
+            ),
+            "empty ids is a 400"
+        );
+        assert!(
+            matches!(
+                bad(vec!["x".into()], "   ").await,
+                Err((StatusCode::BAD_REQUEST, _))
+            ),
+            "empty reason is a 400"
+        );
+        assert!(
+            matches!(
+                bad(vec!["x".into()], "log\nforge").await,
+                Err((StatusCode::BAD_REQUEST, _))
+            ),
+            "a control char in the reason is a 400"
+        );
+        assert!(
+            matches!(
+                bad(vec!["x".into()], &"y".repeat(2001)).await,
+                Err((StatusCode::BAD_REQUEST, _))
+            ),
+            "an over-2000-char reason is a 400 (batch-only cap)"
+        );
+        // Boundary: EXACTLY 2000 chars is ACCEPTED (the cap is `> 2000`, not
+        // `>= 2000`). Paired with a non-existent id so the call returns Ok with a
+        // per-item 404 — proving the reason PASSED the gate rather than 400'ing.
+        let at_cap = requests_batch_reject(
+            sess(),
+            Json(BatchRejectRequest {
+                ids: vec![format!("req-test-{}", Uuid::new_v4())],
+                reason: "y".repeat(2000),
+            }),
+        )
+        .await;
+        assert!(
+            at_cap.is_ok(),
+            "a 2000-char reason is accepted (cap is > 2000, not >= 2000)"
+        );
+        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        assert!(
+            matches!(
+                bad(many, "cleanup").await,
+                Err((StatusCode::BAD_REQUEST, _))
+            ),
+            "an over-100 batch is a 400"
+        );
+    }
+
+    /// #17 (slice 2): a non-approver (auditor) gets a single 403 for the WHOLE
+    /// batch — nothing is rejected — mirroring requests_reject_rejected_for_auditor.
+    #[tokio::test]
+    async fn requests_batch_reject_forbidden_for_auditor() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+        let auditor = single_role_session("auditor-1", ryuki_engine::auth::APP_ROLE_AUDITOR);
+        let Err((status, _)) = requests_batch_reject(
+            AuthExtractor(auditor),
+            Json(BatchRejectRequest {
+                ids: vec![id.clone()],
+                reason: "no".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("auditor (no approve) must be forbidden from batch reject");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Nothing was rejected: the request is still in its planned state.
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Planned);
+    }
+
+    /// #17 (slice 2): duplicate ids are deduped — a request is acted on once, so
+    /// the second occurrence does not surface as a failed "already terminal"
+    /// attempt. Two unique planned ids + a duplicate of the first → 2 results, 2
+    /// succeeded, 0 failed.
+    #[tokio::test]
+    async fn requests_batch_reject_dedupes_ids() {
+        let id_a = format!("req-test-{}", Uuid::new_v4());
+        let id_b = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id_a, "requester-1").await;
+        seed_planned_request(&id_b, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(approver),
+            Json(BatchRejectRequest {
+                ids: vec![id_a.clone(), id_b.clone(), id_a.clone()],
+                reason: "cleanup".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200");
+        assert_eq!(out["succeeded"], 2);
+        assert_eq!(out["failed"], 0);
+        assert_eq!(out["results"].as_array().unwrap().len(), 2);
+    }
+
+    /// #17 (slice 2): a happy in-memory batch — three planned requests rejected in
+    /// one call → all ok, succeeded=3, each row terminal in the store.
+    #[tokio::test]
+    async fn requests_batch_reject_happy_path_no_db() {
+        let ids: Vec<String> = (0..3)
+            .map(|_| format!("req-test-{}", Uuid::new_v4()))
+            .collect();
+        for id in &ids {
+            seed_planned_request(id, "requester-1").await;
+        }
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(approver),
+            Json(BatchRejectRequest {
+                ids: ids.clone(),
+                reason: "insufficient capacity".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200");
+        assert_eq!(out["succeeded"], 3);
+        assert_eq!(out["failed"], 0);
+        for r in out["results"].as_array().unwrap() {
+            assert_eq!(r["ok"], true);
+        }
+        let store = request_store().lock().await;
+        for id in &ids {
+            let stored = store.iter().find(|r| &r.id == id).unwrap();
+            assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Rejected);
+        }
+    }
+
+    /// #17 (slice 2, no-DB scope hardening): the in-memory reject path now applies
+    /// the SAME by-id scope guard as the DB path and as cancel_one. A scoped
+    /// principal rejecting an out-of-scope in-memory request gets a 404 — both via
+    /// the SINGLE handler and INSIDE a batch (where it surfaces as a per-id 404).
+    /// This proves reject_one closed the lone no-DB scope gap.
+    #[tokio::test]
+    async fn requests_reject_no_db_is_site_scoped_single_and_batch() {
+        // seed_planned_request creates a DEFRA/production in-memory request.
+        let id = format!("req-scope-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+
+        // A GBLON-scoped approver is OUT of scope for the DEFRA request.
+        let mut gblon = single_role_session(
+            "approver-gblon",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        gblon.site_scope = vec!["GBLON".into()];
+
+        // Single handler → 404 (scope guard), not a cross-scope reject.
+        let single = requests_reject(
+            Path(id.clone()),
+            AuthExtractor(gblon.clone()),
+            Json(ReasonBody {
+                reason: "out of scope".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(single, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope single reject must 404: {single:?}"
+        );
+
+        // Batch handler → HTTP 200 with a per-id 404 result (no oracle), 0 succeeded.
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(gblon),
+            Json(BatchRejectRequest {
+                ids: vec![id.clone()],
+                reason: "out of scope".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200 even when every item fails");
+        assert_eq!(out["succeeded"], 0);
+        assert_eq!(out["failed"], 1);
+        let item = &out["results"].as_array().unwrap()[0];
+        assert_eq!(item["ok"], false);
+        assert_eq!(item["status"], 404);
+
+        // The request was never rejected — still planned in the store.
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Planned);
+    }
+
     #[tokio::test]
     async fn requests_cancel_by_owning_requester_succeeds_and_audits() {
         let id = format!("req-test-{}", Uuid::new_v4());
@@ -43784,6 +44138,217 @@ mod db_lifecycle_tests {
         assert_eq!(read_global_row(pool, id).await.status, "rejected");
 
         cleanup_request(pool, id).await;
+    }
+
+    /// #17 (slice 2) happy batch: three planned DEFRA requests rejected in one
+    /// call → all ok, succeeded=3, each row 'rejected', and per id a 'rejected'
+    /// decision row + an applied reject audit row.
+    #[tokio::test]
+    async fn requests_batch_reject_db_happy_path() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            ids.push(seed_request(pool, "planned", "approve").await);
+        }
+        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(approver_session()),
+            Json(BatchRejectRequest {
+                ids: id_strs.clone(),
+                reason: "policy violation".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200");
+        assert_eq!(out["succeeded"], 3);
+        assert_eq!(out["failed"], 0);
+        for r in out["results"].as_array().unwrap() {
+            assert_eq!(r["ok"], true);
+        }
+        for id in &ids {
+            assert_eq!(read_global_row(pool, *id).await.status, "rejected");
+            let decisions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_approval_decisions WHERE request_id = $1 AND decision = 'rejected'",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count decisions");
+            assert_eq!(decisions, 1, "one rejection decision row per id");
+            assert_eq!(count_audit(pool, *id, "request.reject", "applied").await, 1);
+        }
+        for id in &ids {
+            cleanup_request(pool, *id).await;
+        }
+    }
+
+    /// #17 (slice 2) partial batch: a valid planned id, a non-existent id (404),
+    /// and an already-terminal id (engine 4xx) → succeeded=1, failed=2, per-id
+    /// statuses correct, HTTP 200.
+    #[tokio::test]
+    async fn requests_batch_reject_db_partial() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let valid = seed_request(pool, "planned", "approve").await;
+        // An already-terminal (rejected) request: the engine refuses re-rejection.
+        let terminal = seed_request(pool, "rejected", "approve").await;
+        let missing = Uuid::new_v4();
+
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(approver_session()),
+            Json(BatchRejectRequest {
+                ids: vec![valid.to_string(), missing.to_string(), terminal.to_string()],
+                reason: "policy violation".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200 with partial success");
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 2);
+        let by_id = |id: &Uuid| {
+            out["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&valid)["ok"], true);
+        assert_eq!(by_id(&missing)["ok"], false);
+        assert_eq!(by_id(&missing)["status"], 404);
+        assert_eq!(by_id(&terminal)["ok"], false);
+        // The engine rejects the wrong-state transition with a 4xx (not a 404).
+        assert!(by_id(&terminal)["status"].as_u64().unwrap() >= 400);
+
+        assert_eq!(read_global_row(pool, valid).await.status, "rejected");
+        cleanup_request(pool, valid).await;
+        cleanup_request(pool, terminal).await;
+    }
+
+    /// #17 (slice 2) permission: a non-approver (auditor) gets a single 403 for
+    /// the WHOLE batch — nothing is rejected — and the denial is audited EXACTLY
+    /// ONCE. The non-UUID "batch" sentinel parses to a NULL request_id in the
+    /// durable trail, so the denial is asserted by action/outcome/actor (a count
+    /// delta), NOT by request_id = 'batch'.
+    #[tokio::test]
+    async fn requests_batch_reject_db_forbidden_for_auditor_audits_once() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_request(pool, "planned", "approve").await;
+        let actor = "batch-reject-auditor-p2";
+        let mut auditor = AuthSession::static_dry_run();
+        auditor.user_id = actor.into();
+        auditor.provider_mode = "local".into();
+        auditor.roles = vec![ryuki_engine::auth::APP_ROLE_AUDITOR.to_string()];
+
+        let denied_count = |actor: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'request.reject' AND outcome = 'denied' AND actor_principal = $1",
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .expect("count denied")
+        };
+        let before = denied_count(actor).await;
+
+        let Err((status, _)) = requests_batch_reject(
+            AuthExtractor(auditor),
+            Json(BatchRejectRequest {
+                ids: vec![id.to_string()],
+                reason: "no".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup_request(pool, id).await;
+            panic!("auditor (no approve) must get a 403 for the whole batch");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Exactly one denial audit row was written for the whole batch.
+        assert_eq!(denied_count(actor).await - before, 1);
+        // The request was never rejected.
+        assert_eq!(read_global_row(pool, id).await.status, "planned");
+
+        cleanup_request(pool, id).await;
+    }
+
+    /// #17 (slice 2) DB scope: a scoped session batch-rejecting a mix of an
+    /// out-of-scope id and an in-scope id → the out-of-scope id 404s (no oracle)
+    /// while the in-scope id is rejected.
+    #[tokio::test]
+    async fn requests_batch_reject_db_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Both rows are DEFRA/production (seed_request); the principal is scoped to
+        // DEFRA so the in-scope id passes. A GBLON-only id stands in for "out of
+        // scope": seed a GBLON row directly.
+        let in_scope = seed_request(pool, "planned", "approve").await;
+        let out_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', 'scope-test', 2, 4, 'requester-db')",
+        )
+        .bind(out_id)
+        .execute(pool)
+        .await
+        .expect("seed GBLON request");
+
+        let mut defra = approver_session();
+        defra.site_scope = vec!["DEFRA".into()];
+        defra.environment_scope = vec!["production".into()];
+
+        let Json(out) = requests_batch_reject(
+            AuthExtractor(defra),
+            Json(BatchRejectRequest {
+                ids: vec![in_scope.to_string(), out_id.to_string()],
+                reason: "policy violation".into(),
+            }),
+        )
+        .await
+        .expect("batch reject returns 200");
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 1);
+        let by_id = |id: &Uuid| {
+            out["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&in_scope)["ok"], true);
+        assert_eq!(by_id(&out_id)["ok"], false);
+        assert_eq!(
+            by_id(&out_id)["status"],
+            404,
+            "out-of-scope is a 404, no oracle"
+        );
+
+        assert_eq!(read_global_row(pool, in_scope).await.status, "rejected");
+        // The out-of-scope request was never touched.
+        assert_eq!(read_global_row(pool, out_id).await.status, "planned");
+
+        cleanup_request(pool, in_scope).await;
+        cleanup_request(pool, out_id).await;
     }
 
     // ─── approvals_pending — DB-backed integration tests (T3 / T4) ───
