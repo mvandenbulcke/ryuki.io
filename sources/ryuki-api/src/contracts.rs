@@ -1036,6 +1036,10 @@ pub fn routes() -> Router {
         )
         .route("/api/protect/repository-capacity", get(repo_capacity_list))
         .route(
+            "/api/protect/repository-capacity/{id}",
+            get(repo_capacity_get),
+        )
+        .route(
             "/api/protect/repository-capacity/update/{id}",
             post(repo_capacity_update),
         )
@@ -25741,9 +25745,11 @@ struct RepoCapacitySiteQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepoCapacityUpdateBody {
     // The API/response field is `used_capacity_tb`; accept the legacy `used_tb`
-    // key too so existing callers keep working.
+    // key too so existing callers keep working. (`alias` is a KNOWN field name, so
+    // deny_unknown_fields still accepts it — it only rejects truly-unknown keys.)
     #[serde(alias = "used_tb")]
     used_capacity_tb: Option<f64>,
 }
@@ -25772,6 +25778,33 @@ async fn repo_capacity_list(
         None => Vec::new(),
     };
     Ok(Json(repository_capacity::get_repositories(&repos, site)))
+}
+
+/// GET /api/protect/repository-capacity/{id} — one repository's current capacity.
+/// Mirrors the by-id READ pattern of `repo_capacity_forecast`: load → 404 if absent
+/// → `site_scope_guard_or_404` (an out-of-scope repo 404s like a missing one, no
+/// existence oracle). The projection matches `repo_capacity_update`'s single-repo
+/// view. No-DB resolves to None ⇒ 404 (read consistency, not the update's 503).
+async fn repo_capacity_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let repo = match get_db() {
+        Some(pool) => crate::repos::repository_capacity::get(pool, &id)
+            .await
+            .map_err(db_error)?,
+        None => None,
+    }
+    .ok_or_else(|| status_404(&id))?;
+    site_scope_guard_or_404(&session, &repo.site, &id)?;
+    Ok(Json(json!({
+        "repository_id": repo.id,
+        "name": repo.name,
+        "used_capacity_tb": repo.used_capacity_tb,
+        "days_until_full": repository_capacity::repo_days(&repo),
+        "status": repository_capacity::repo_status(&repo),
+        "last_forecast": repo.last_forecast,
+    })))
 }
 
 async fn repo_capacity_update(
@@ -34182,6 +34215,70 @@ mod router_tests {
                 "a smuggled `{smuggled}` must be rejected by the Json extractor (422), never reaching the handler"
             );
         }
+    }
+
+    /// repository-capacity GET-by-id: the new `/{id}` route resolves (no-DB ⇒ 404,
+    /// read consistency) and does NOT shadow the static siblings `at-risk`/`report`
+    /// (matchit static-beats-param). All no-DB, through the real router.
+    #[tokio::test]
+    async fn router_repo_capacity_get_by_id_and_static_siblings() {
+        let (status, _) =
+            get_json("/api/protect/repository-capacity/e0000380-3800-3800-3800-000000000099").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no-DB GET-by-id is 404");
+        // Static siblings hit their own handlers (200), not the by-id 404 — proving
+        // the new `/{id}` param does not shadow them.
+        for sib in [
+            "/api/protect/repository-capacity/at-risk",
+            "/api/protect/repository-capacity/report",
+        ] {
+            let (status, _) = get_json(sib).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{sib} must route to its own handler"
+            );
+        }
+    }
+
+    /// The repository-capacity update body REJECTS an unknown EXTRA field at the
+    /// wire (deny_unknown_fields ⇒ 422 before the handler), while the legacy
+    /// `used_tb` ALIAS still deserializes (so it is NOT 422 — it proceeds past the
+    /// extractor).
+    #[tokio::test]
+    async fn router_repo_capacity_update_rejects_unknown_field() {
+        async fn post_status(body: serde_json::Value) -> StatusCode {
+            let app = routes();
+            // An UNKNOWN id (not a seeded UUID): even if the process-global DB pool
+            // is already initialized by another test, the alias body resolves to a
+            // 404 (get -> None) and never MUTATES a seeded row — keeping this a pure
+            // extractor test (codex). The unknown-field case 422s before the handler
+            // regardless of id.
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/protect/repository-capacity/update/e0000380-3800-3800-3800-000000000099")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).expect("serializes")))
+                .expect("request builds");
+            request
+                .extensions_mut()
+                .insert(AuthSession::static_dry_run());
+            app.oneshot(request)
+                .await
+                .expect("router responds")
+                .status()
+        }
+        // Unknown extra field ⇒ 422 (deny_unknown_fields, before the handler runs).
+        assert_eq!(
+            post_status(serde_json::json!({"used_capacity_tb": 1.2, "junk": true})).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        );
+        // The `used_tb` alias is a KNOWN field ⇒ deserializes ⇒ NOT 422 (it gets
+        // past the extractor; no-DB then 503s — the point is it is not rejected).
+        assert_ne!(
+            post_status(serde_json::json!({"used_tb": 1.2})).await,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the used_tb alias must still deserialize"
+        );
     }
 
     /// The cluster-capacity-admission engine, reached through the real router.

@@ -173,6 +173,15 @@ deny_unknown_fields→422, scalar `name` synced in `transition`, central
 ON DELETE RESTRICT FK reconciled with dr_test_start's store-based resolution).
 Integration-connection CRUD was a FALSE POSITIVE — already built in integration.rs
 (create/list/get/update/delete/test at /api/integrations).
+**repository-capacity GET-by-id + deny_unknown_fields** shipped (small narrow-scan
+win) — `GET /api/protect/repository-capacity/{id}` (mirrors forecast's by-id read:
+get→404, site_scope_guard_or_404 no-oracle, the update projection) + the update
+body now rejects unknown fields (422); codex plan(rd2)+impl APPROVE; router tests
+prove the route builds, static siblings (at-risk/report) aren't shadowed, and the
+alias survives. Further small wins for follow-up: GET-by-id for /api/admin/tokens
+and /api/admin/agents (secret-hygiene: mirror each list's secret-safe projection).
+**DR-plan DELETE** designed + codex-reviewed but DEFERRED (needs the DR store made
+DB-authoritative — a startup-hydration refactor — see dr-plan-delete.md).
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
