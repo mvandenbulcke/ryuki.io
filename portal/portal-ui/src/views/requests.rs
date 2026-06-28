@@ -214,6 +214,24 @@ pub fn filter_requests<'a>(requests: &'a [RequestSummary], q: &str) -> Vec<&'a R
         .collect()
 }
 
+/// Builds the "Showing X-Y" page-range note. When the exact filtered total is
+/// known (`X-Total-Count` in live mode, full set length in static mode) it is
+/// appended as "of N"; otherwise the bare range is returned. Display-only —
+/// `range_from`/`range_to` are the already-saturated 1-based page bounds and
+/// `total` does not affect them.
+pub(crate) fn request_range_note(range_from: u32, range_to: u32, total: Option<u64>) -> String {
+    match total {
+        // Only append "of N" when the server total is consistent with the page
+        // bound. If the count disagrees (API-contract drift, a delete between the
+        // count and the fetch, or a stale count) we fall back to the range alone
+        // rather than render an inverted/incoherent "Showing 26-50 of 12".
+        Some(total) if total >= range_to as u64 => {
+            format!("Showing {range_from}-{range_to} of {total}")
+        }
+        _ => format!("Showing {range_from}-{range_to}"),
+    }
+}
+
 pub(crate) fn status_badge_class(status: &str) -> &'static str {
     match status {
         "intake" => "badge neutral",
@@ -498,6 +516,9 @@ pub fn RequestList() -> impl IntoView {
                         let requests: Vec<RequestSummary> = page.rows;
                         let has_next = page.has_next;
                         let offset = page.offset;
+                        // Exact filtered total when the upstream reported it (or in
+                        // static mode where the full set is known); display only.
+                        let total = page.total;
                         let active = facets.is_active();
 
                         // The server already filtered by `q`; re-apply locally so the
@@ -555,15 +576,16 @@ pub fn RequestList() -> impl IntoView {
                                 .into_any();
                         }
 
-                        // No exact filtered total is reachable here (the upstream
-                        // client drops X-Total-Count), so the note shows the page
-                        // RANGE rather than "N of M". `range_from` is 1-based. Both
-                        // are saturating and derived from `page_count` (the rendered
+                        // When the upstream reports the filtered total via
+                        // X-Total-Count (or static mode knows it exactly), the note
+                        // reads "Showing X-Y of N"; otherwise it falls back to the
+                        // bare page RANGE. `range_from` is 1-based. Both bounds are
+                        // saturating and derived from `page_count` (the rendered
                         // set) so the label can never invert or overflow on a large
                         // offset.
                         let range_from = offset.saturating_add(1);
                         let range_to = offset.saturating_add(page_count as u32);
-                        let range_note = format!("Showing {range_from}-{range_to}");
+                        let range_note = request_range_note(range_from, range_to, total);
                         // A second owned copy: the note appears once above the
                         // table and once inside the pager, each in its own view
                         // closure (which capture by move).
@@ -794,6 +816,24 @@ mod tests {
     }
 
     #[test]
+    fn range_note_appends_total_when_known_and_falls_back_otherwise() {
+        // Exact total → "of N" form.
+        assert_eq!(
+            request_range_note(26, 50, Some(142)),
+            "Showing 26-50 of 142"
+        );
+        // First page with a small total.
+        assert_eq!(request_range_note(1, 25, Some(25)), "Showing 1-25 of 25");
+        // No total → bare range fallback (live API dropped X-Total-Count).
+        assert_eq!(request_range_note(1, 25, None), "Showing 1-25");
+        // Inconsistent total (< range_to: stale count / delete between count and
+        // fetch) → suppress "of N", never render an inverted "Showing 26-50 of 12".
+        assert_eq!(request_range_note(26, 50, Some(12)), "Showing 26-50");
+        // Boundary: total == range_to is consistent and keeps the suffix.
+        assert_eq!(request_range_note(1, 25, Some(25)), "Showing 1-25 of 25");
+    }
+
+    #[test]
     fn empty_facets_build_clean_default_url() {
         let facets = RequestFacets::default();
         assert!(!facets.is_active());
@@ -989,6 +1029,7 @@ mod tests {
             offset: 25,
             page_size: 25,
             has_next: true,
+            total: Some(120),
         };
         let json = serde_json::to_string(&page).expect("serialize page");
         let back: RequestListPage = serde_json::from_str(&json).expect("deserialize page");

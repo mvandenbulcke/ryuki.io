@@ -45,6 +45,10 @@ impl std::error::Error for UpstreamUnreachable {}
 pub struct UpstreamResponse {
     pub status: u16,
     pub body: String,
+    /// Parsed `X-Total-Count` header, when present and a valid `u64`. The API
+    /// emits it on list endpoints (e.g. `GET /api/requests`) as the filtered
+    /// total BEFORE limit/offset. Display-only — never used to derive paging.
+    pub total_count: Option<u64>,
 }
 
 impl UpstreamResponse {
@@ -125,10 +129,17 @@ impl UpstreamClient {
                 detail: format!("upstream returned status {status}"),
             });
         }
+        // Read the total-count header BEFORE consuming the body (response.text()
+        // takes ownership). Absent/non-numeric headers degrade to None.
+        let total_count = parse_total_count_header(response.headers());
         let body = response.text().await.map_err(|_| UpstreamUnreachable {
             detail: "upstream body read failed".to_string(),
         })?;
-        Ok(UpstreamResponse { status, body })
+        Ok(UpstreamResponse {
+            status,
+            body,
+            total_count,
+        })
     }
 
     /// GET an allowlisted API path, forwarding the session id when present.
@@ -176,6 +187,19 @@ impl UpstreamClient {
         let request = self.http.put(self.url(path)).json(body);
         self.dispatch(request, session_id).await
     }
+}
+
+/// Canonical name of the filtered-total header emitted by list endpoints.
+pub const TOTAL_COUNT_HEADER: &str = "x-total-count";
+
+/// Extracts the filtered total from an `X-Total-Count` header map. Returns
+/// `None` when the header is absent, non-ASCII, or not a valid `u64` so a
+/// contract drift degrades the display total rather than the whole read.
+fn parse_total_count_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(TOTAL_COUNT_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 /// Transport errors can embed full URLs; keep only the failure class.
@@ -512,6 +536,7 @@ mod tests {
             status: 409,
             body: r#"{"error":"LIFECYCLE_GUARD","message":"Request is not in a valid stage"}"#
                 .to_string(),
+            total_count: None,
         };
         assert!(!response.is_success());
         assert_eq!(
@@ -522,7 +547,44 @@ mod tests {
         let unparseable = UpstreamResponse {
             status: 404,
             body: "not json".to_string(),
+            total_count: None,
         };
         assert_eq!(unparseable.api_error_message(), None);
+    }
+
+    #[test]
+    fn total_count_header_parses_only_valid_unsigned_integers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(TOTAL_COUNT_HEADER, HeaderValue::from_static("142"));
+        assert_eq!(parse_total_count_header(&headers), Some(142));
+
+        // Surrounding whitespace is tolerated.
+        let mut padded = HeaderMap::new();
+        padded.insert(TOTAL_COUNT_HEADER, HeaderValue::from_static("  7 "));
+        assert_eq!(parse_total_count_header(&padded), Some(7));
+
+        // Absent header → None.
+        assert_eq!(parse_total_count_header(&HeaderMap::new()), None);
+
+        // Non-numeric / negative / empty values degrade to None.
+        for bad in ["", "abc", "-1", "1.0", "12x"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(TOTAL_COUNT_HEADER, HeaderValue::from_str(bad).unwrap());
+            assert_eq!(
+                parse_total_count_header(&headers),
+                None,
+                "{bad:?} must not parse"
+            );
+        }
+
+        // A non-ASCII / opaque header value (to_str() fails) → None, not a panic.
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            TOTAL_COUNT_HEADER,
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        assert_eq!(parse_total_count_header(&opaque), None);
     }
 }

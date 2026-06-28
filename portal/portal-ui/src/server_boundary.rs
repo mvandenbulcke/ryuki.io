@@ -2213,9 +2213,11 @@ fn filter_request_summaries(
 /// pagination cursor so the view can render Prev/Next without a separate total.
 ///
 /// `has_next` is derived by over-fetching one row beyond `page_size`: when the
-/// upstream returns more than a page, there is a next page. X-Total-Count is not
-/// reachable here (the upstream client drops response headers), so this page
-/// deliberately exposes no exact total — the view shows a range, not "N of M".
+/// upstream returns more than a page, there is a next page. `total` carries the
+/// exact filtered count when known (the upstream `X-Total-Count` header in live
+/// mode, or the in-memory set length in static mode) so the view can render
+/// "Showing X-Y of N"; it is DISPLAY-ONLY and `has_next` never depends on it, and
+/// it falls back to a bare range when absent.
 ///
 /// Serde-derived because `#[server]` return types cross the wire, matching the
 /// snapshot structs in this file.
@@ -2225,15 +2227,24 @@ pub struct RequestListPage {
     pub offset: u32,
     pub page_size: u32,
     pub has_next: bool,
+    /// Exact filtered total (from the upstream `X-Total-Count` header in live
+    /// mode, or the full in-memory set length in static/degraded mode), when
+    /// known. DISPLAY-ONLY: `has_next` is never recomputed from it. `None`
+    /// falls back to a bare page range in the view.
+    pub total: Option<u64>,
 }
 
 /// Build a page from an OVER-FETCHED row set (the upstream live branch asks for
 /// `page_size + 1` rows): the presence of the extra row signals a next page
 /// without an exact total. Truncates to `page_size`. Pure — unit-tested below.
+// Only reached from the ssr-gated `get_request_list` server impl; the client
+// (wasm) build compiles the fn but never calls it.
+#[cfg_attr(not(feature = "ssr"), allow(dead_code))]
 fn finalize_overfetched_page(
     mut rows: Vec<RequestSummary>,
     offset: u32,
     page_size: u32,
+    total: Option<u64>,
 ) -> RequestListPage {
     let has_next = rows.len() as u32 > page_size;
     if has_next {
@@ -2244,12 +2255,14 @@ fn finalize_overfetched_page(
         offset,
         page_size,
         has_next,
+        total,
     }
 }
 
 /// Build a page from the FULL in-memory filtered set (static/degraded mode):
 /// slice `[offset, offset + page_size)` and derive `has_next` from the true
 /// total. Pure — unit-tested below.
+#[cfg_attr(not(feature = "ssr"), allow(dead_code))]
 fn paginate_in_memory(full: Vec<RequestSummary>, offset: u32, page_size: u32) -> RequestListPage {
     let total = full.len() as u32;
     let has_next = total > offset.saturating_add(page_size);
@@ -2263,6 +2276,8 @@ fn paginate_in_memory(full: Vec<RequestSummary>, offset: u32, page_size: u32) ->
         offset,
         page_size,
         has_next,
+        // The full filtered set is held in memory, so the total is known exactly.
+        total: Some(total as u64),
     }
 }
 
@@ -2344,7 +2359,14 @@ pub async fn get_request_list(
             let rows: Vec<RequestSummary> = list.into_iter().map(RequestSummary::from).collect();
             // The over-fetched extra row (if present) means there is a next page;
             // finalize_overfetched_page derives has_next and truncates to PAGE_SIZE.
-            Ok(finalize_overfetched_page(rows, offset, PAGE_SIZE))
+            // The X-Total-Count header carries the real filtered total (pre-paging)
+            // for display only — has_next stays over-fetch derived.
+            Ok(finalize_overfetched_page(
+                rows,
+                offset,
+                PAGE_SIZE,
+                response.total_count,
+            ))
         }
         Ok(response) => Err(ServerFnError::new(api_error_text(
             &response,
@@ -3922,15 +3944,15 @@ mod tests {
     #[test]
     fn finalize_overfetched_page_signals_next_only_when_over_fetched() {
         // Exactly page_size rows: no extra row → last page, kept intact.
-        let p = finalize_overfetched_page(n_rows(25), 0, 25);
+        let p = finalize_overfetched_page(n_rows(25), 0, 25, None);
         assert_eq!(p.rows.len(), 25);
         assert!(!p.has_next);
         // Under a full page → last page.
-        let p = finalize_overfetched_page(n_rows(24), 0, 25);
+        let p = finalize_overfetched_page(n_rows(24), 0, 25, None);
         assert_eq!(p.rows.len(), 24);
         assert!(!p.has_next);
         // page_size + 1: the extra row signals a next page and is truncated away.
-        let p = finalize_overfetched_page(n_rows(26), 25, 25);
+        let p = finalize_overfetched_page(n_rows(26), 25, 25, None);
         assert_eq!(p.rows.len(), 25);
         assert!(p.has_next);
         assert_eq!(p.offset, 25);
@@ -3938,15 +3960,30 @@ mod tests {
     }
 
     #[test]
+    fn finalize_overfetched_page_carries_total_without_touching_has_next() {
+        // A supplied total is passed through for display only; has_next stays
+        // over-fetch derived (no extra row here → false), independent of total.
+        let page = finalize_overfetched_page(n_rows(25), 0, 25, Some(142));
+        assert_eq!(page.total, Some(142));
+        assert!(!page.has_next);
+        // Absent header → None total, page still valid.
+        let none = finalize_overfetched_page(n_rows(26), 0, 25, None);
+        assert_eq!(none.total, None);
+        assert!(none.has_next);
+    }
+
+    #[test]
     fn paginate_in_memory_slices_and_derives_has_next_at_boundaries() {
-        // First page of 26 → 25 rows, more remain.
+        // First page of 26 → 25 rows, more remain. Total is the full length.
         let first = paginate_in_memory(n_rows(26), 0, 25);
         assert_eq!(first.rows.len(), 25);
         assert!(first.has_next);
+        assert_eq!(first.total, Some(26));
         // Exact last full page: total == offset + page_size → no next.
         let exact = paginate_in_memory(n_rows(50), 25, 25);
         assert_eq!(exact.rows.len(), 25);
         assert!(!exact.has_next);
+        assert_eq!(exact.total, Some(50));
         // One beyond the exact page → next page exists.
         let beyond = paginate_in_memory(n_rows(51), 25, 25);
         assert_eq!(beyond.rows.len(), 25);
@@ -3955,11 +3992,13 @@ mod tests {
         let partial = paginate_in_memory(n_rows(30), 25, 25);
         assert_eq!(partial.rows.len(), 5);
         assert!(!partial.has_next);
-        // Offset past the end → empty page, no next, offset preserved.
+        // Offset past the end → empty page, no next, offset preserved, but the
+        // total still reflects the full known set.
         let past = paginate_in_memory(n_rows(10), 100, 25);
         assert!(past.rows.is_empty());
         assert!(!past.has_next);
         assert_eq!(past.offset, 100);
+        assert_eq!(past.total, Some(10));
     }
 
     #[test]
