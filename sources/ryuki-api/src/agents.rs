@@ -1603,8 +1603,12 @@ pub async fn create_agent_job(
 /// Call once at server startup (after the DB pool is available).
 /// The task runs forever; it is cancelled when the tokio runtime shuts down.
 /// `expire_leases` is idempotent, so duplicate sweeps are harmless.
+/// Heartbeat registry name for the lease-expiry sweep loop.
+const LEASE_EXPIRY_SWEEP_NAME: &str = "lease_expiry_sweep";
+
 pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
     tokio::spawn(async move {
+        crate::background::register_loop(LEASE_EXPIRY_SWEEP_NAME, interval_secs);
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
         // #26 follow-on: Skip missed ticks so a recovered loop resumes on the next
         // aligned boundary rather than bursting catch-up ticks after a backoff/timeout.
@@ -1620,7 +1624,10 @@ pub fn spawn_lease_expiry_sweep(pool: PgPool, interval_secs: u64) {
         loop {
             ticker.tick().await;
             match crate::background::run_bounded(timeout, expire_leases(&pool)).await {
-                Ok(_) => consecutive_failures = 0,
+                Ok(_) => {
+                    consecutive_failures = 0;
+                    crate::background::record_loop_success(LEASE_EXPIRY_SWEEP_NAME);
+                }
                 Err(err) => {
                     let backoff = crate::background::note_failure(&mut consecutive_failures);
                     match err {
@@ -1740,8 +1747,12 @@ pub async fn agent_offline_scan_once(
 /// separate from the read-only scheduler); #31-style backoff. `threshold_secs`
 /// is the liveness deadline (no check-in within it ⇒ offline). Call once at
 /// startup.
+/// Heartbeat registry name for the agent-offline scan loop.
+const AGENT_OFFLINE_SCAN_NAME: &str = "agent_offline_scan";
+
 pub fn spawn_agent_offline_scan(pool: PgPool, interval_secs: u64, threshold_secs: i64) {
     tokio::spawn(async move {
+        crate::background::register_loop(AGENT_OFFLINE_SCAN_NAME, interval_secs);
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
@@ -1757,6 +1768,7 @@ pub fn spawn_agent_offline_scan(pool: PgPool, interval_secs: u64, threshold_secs
             {
                 Ok(emitted) => {
                     consecutive_failures = 0;
+                    crate::background::record_loop_success(AGENT_OFFLINE_SCAN_NAME);
                     if emitted > 0 {
                         tracing::info!(emitted, "agent-offline scan emitted transition events");
                     }

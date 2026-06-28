@@ -20684,8 +20684,12 @@ pub(crate) async fn slo_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, sql
 /// SEPARATE from the read-only scheduler (which may not emit). Runs on a fixed
 /// interval with #31-style exponential backoff on consecutive failures so a
 /// persistent outage does not hammer the DB. Call once at startup.
+/// Heartbeat registry name for the SLO-breach scan loop.
+const SLO_BREACH_SCAN_NAME: &str = "slo_breach_scan";
+
 pub fn spawn_slo_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
     tokio::spawn(async move {
+        crate::background::register_loop(SLO_BREACH_SCAN_NAME, interval_secs);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
@@ -20696,6 +20700,7 @@ pub fn spawn_slo_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
             match crate::background::run_bounded(timeout, slo_breach_scan_once(&pool)).await {
                 Ok(emitted) => {
                     consecutive_failures = 0;
+                    crate::background::record_loop_success(SLO_BREACH_SCAN_NAME);
                     if emitted > 0 {
                         tracing::info!(emitted, "slo-breach scan emitted transition events");
                     }
@@ -20870,8 +20875,12 @@ pub(crate) async fn budget_breach_scan_once(pool: &sqlx::PgPool) -> Result<u64, 
 /// Spawn the background budget-breach scan (#11 slice 2c). Write-capable, so
 /// separate from the read-only scheduler; #31-style backoff on consecutive
 /// failures. Call once at startup.
+/// Heartbeat registry name for the budget-breach scan loop.
+const BUDGET_BREACH_SCAN_NAME: &str = "budget_breach_scan";
+
 pub fn spawn_budget_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
     tokio::spawn(async move {
+        crate::background::register_loop(BUDGET_BREACH_SCAN_NAME, interval_secs);
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick
@@ -20882,6 +20891,7 @@ pub fn spawn_budget_breach_scan(pool: sqlx::PgPool, interval_secs: u64) {
             match crate::background::run_bounded(timeout, budget_breach_scan_once(&pool)).await {
                 Ok(emitted) => {
                     consecutive_failures = 0;
+                    crate::background::record_loop_success(BUDGET_BREACH_SCAN_NAME);
                     if emitted > 0 {
                         tracing::info!(emitted, "budget-breach scan emitted transition events");
                     }

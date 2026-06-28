@@ -420,8 +420,12 @@ pub async fn sweep_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// `interval_secs`. Call once at startup after the DB pool is available; the
 /// task runs until the runtime shuts down. The sweep is idempotent, so a
 /// duplicate spawn is harmless.
+/// Heartbeat registry name for the idempotency retention sweep loop.
+const IDEMPOTENCY_SWEEP_NAME: &str = "idempotency_sweep";
+
 pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
     tokio::spawn(async move {
+        crate::background::register_loop(IDEMPOTENCY_SWEEP_NAME, interval_secs);
         let mut ticker = interval(std::time::Duration::from_secs(interval_secs));
         // #26 follow-on: Skip missed ticks so a recovered loop resumes on the next
         // aligned boundary rather than bursting catch-up ticks after a backoff/timeout.
@@ -436,7 +440,10 @@ pub fn spawn_idempotency_sweep(pool: PgPool, interval_secs: u64) {
         loop {
             ticker.tick().await;
             match crate::background::run_bounded(timeout, sweep_expired_records(&pool)).await {
-                Ok(_) => consecutive_failures = 0,
+                Ok(_) => {
+                    consecutive_failures = 0;
+                    crate::background::record_loop_success(IDEMPOTENCY_SWEEP_NAME);
+                }
                 Err(err) => {
                     let backoff = crate::background::note_failure(&mut consecutive_failures);
                     match err {

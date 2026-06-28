@@ -8,7 +8,9 @@
 //! pure helpers + `run_bounded` extend the same defense-in-depth to all of them
 //! without duplicating the timeout/backoff arithmetic in each loop.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Per-iteration timeout: 4x the interval, floor 300s — the same formula as
 /// `spawn_scheduler`'s `tick_timeout` in `scheduler.rs`. Generous (>= 10x the 30s
@@ -69,6 +71,128 @@ pub async fn run_bounded<T, E>(
         Ok(Err(e)) => Err(IterError::Failed(e)),
         Err(_elapsed) => Err(IterError::TimedOut),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat registry — per-loop last-success liveness for platform_self_health.
+// ---------------------------------------------------------------------------
+
+/// One registered loop's heartbeat state. `last_success` is a monotonic
+/// `Instant` (immune to wall-clock jumps), refreshed on each successful
+/// iteration; `interval_secs` is the loop's cadence, used to derive the
+/// timeout-and-backoff-aware silence budget.
+struct LoopHeartbeat {
+    interval_secs: u64,
+    last_success: Instant,
+}
+
+/// Process-global registry of each background loop's last successful iteration.
+/// Best-effort heartbeats: a poisoned lock must never crash the health handler,
+/// so all access goes through `lock_or_recover`. Guarded by a `std::sync::Mutex`
+/// (never held across an await — all registry fns are synchronous).
+static LOOP_HEARTBEATS: LazyLock<Mutex<HashMap<&'static str, LoopHeartbeat>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A snapshot of one loop's liveness for the pure classifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopLiveness {
+    pub name: &'static str,
+    pub interval_secs: u64,
+    pub age_secs: u64,
+}
+
+/// Acquire a mutex guard, recovering from poisoning instead of panicking. These
+/// heartbeats are best-effort; a poisoned lock (from a panic elsewhere) must
+/// never cascade into a health-handler outage. Mirrors `main.rs:lock_or_recover`.
+fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Register a loop at spawn with its cadence. Seeds `last_success = now()` as the
+/// baseline, so a loop that NEVER completes a first iteration goes overdue once
+/// it passes the timeout-aware threshold (no separate "never ran" state needed).
+/// Call as the FIRST statement of the spawned future, before any await.
+pub fn register_loop(name: &'static str, interval_secs: u64) {
+    let mut map = lock_or_recover(&LOOP_HEARTBEATS);
+    map.insert(
+        name,
+        LoopHeartbeat {
+            interval_secs,
+            last_success: Instant::now(),
+        },
+    );
+}
+
+/// Stamp a successful iteration (called in each loop's Ok arm). `register_loop`
+/// is the sole owner of a loop's cadence and always runs FIRST (the first
+/// statement of the spawned future), so the entry exists. If it is somehow
+/// missing (a `record` before `register` — a programming error), this is a no-op
+/// rather than inserting a cadence-less (`interval=0`) entry that would carry a
+/// wrong silence budget.
+pub fn record_loop_success(name: &'static str) {
+    let mut map = lock_or_recover(&LOOP_HEARTBEATS);
+    if let Some(hb) = map.get_mut(name) {
+        hb.last_success = Instant::now();
+    }
+}
+
+/// Snapshot for the probe: `(name, interval_secs, age_secs)` per loop, where
+/// `age_secs = last_success.elapsed().as_secs()` computed under the lock. Copies
+/// every entry into the returned `Vec` and DROPS the lock before returning, so
+/// the (pure) classifier never runs while holding the mutex.
+pub fn loop_liveness() -> Vec<LoopLiveness> {
+    let map = lock_or_recover(&LOOP_HEARTBEATS);
+    map.iter()
+        .map(|(name, hb)| LoopLiveness {
+            name,
+            interval_secs: hb.interval_secs,
+            age_secs: hb.last_success.elapsed().as_secs(),
+        })
+        .collect()
+    // guard dropped here, before classify_loop_liveness runs
+}
+
+/// Pure verdict: a loop is overdue when
+/// `age_secs > 2*iteration_timeout(interval) + 2*interval` (all saturating) —
+/// two full timed iterations plus the inter-attempt waits, so one slow/timed-out
+/// iteration plus a backoff retry never false-positives. ANY overdue loop ⇒
+/// `down` (a persistently-wedged loop is page-worthy on this status endpoint);
+/// `healthy` when none overdue; `degraded` only when no loops are registered
+/// (informational). The `down` detail NAMES each overdue loop (sorted) with its
+/// age + threshold, so the aggregate probe is actionable.
+pub fn classify_loop_liveness(
+    entries: &[LoopLiveness],
+) -> ryuki_engine::self_health::DependencyProbe {
+    use ryuki_engine::self_health::DependencyProbe;
+    if entries.is_empty() {
+        return DependencyProbe::degraded("background_loops", "no background loops registered");
+    }
+    let mut overdue: Vec<(&'static str, u64, u64)> = entries
+        .iter()
+        .filter_map(|e| {
+            let threshold = 2u64
+                .saturating_mul(iteration_timeout(e.interval_secs).as_secs())
+                .saturating_add(2u64.saturating_mul(e.interval_secs));
+            if e.age_secs > threshold {
+                Some((e.name, e.age_secs, threshold))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if overdue.is_empty() {
+        return DependencyProbe::healthy("background_loops");
+    }
+    overdue.sort_by(|a, b| a.0.cmp(b.0));
+    let detail = overdue
+        .iter()
+        .map(|(name, age, threshold)| format!("{name} (age {age}s > threshold {threshold}s)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    DependencyProbe::down(
+        "background_loops",
+        format!("{} background loop(s) wedged: {detail}", overdue.len()),
+    )
 }
 
 #[cfg(test)]
@@ -140,5 +264,145 @@ mod tests {
         assert_eq!(iteration_timeout(100), Duration::from_secs(400));
         // The saturating_mul guard does not overflow at the ceiling.
         assert_eq!(iteration_timeout(u64::MAX), Duration::from_secs(u64::MAX));
+    }
+
+    use ryuki_engine::self_health::DependencyHealth;
+
+    fn entry(name: &'static str, interval_secs: u64, age_secs: u64) -> LoopLiveness {
+        LoopLiveness {
+            name,
+            interval_secs,
+            age_secs,
+        }
+    }
+
+    /// `2*iteration_timeout(interval) + 2*interval` — the silence budget the
+    /// classifier compares against. Pinned here independently so a regression in
+    /// the formula is caught, not silently mirrored.
+    fn threshold(interval_secs: u64) -> u64 {
+        2 * iteration_timeout(interval_secs).as_secs() + 2 * interval_secs
+    }
+
+    #[test]
+    fn classify_empty_is_degraded() {
+        let probe = classify_loop_liveness(&[]);
+        assert_eq!(probe.health, DependencyHealth::Degraded);
+        assert_eq!(probe.name, "background_loops");
+    }
+
+    #[test]
+    fn classify_all_fresh_is_healthy() {
+        let entries = [entry("a", 30, 0), entry("b", 3600, 10)];
+        let probe = classify_loop_liveness(&entries);
+        assert_eq!(probe.health, DependencyHealth::Healthy);
+        assert_eq!(probe.name, "background_loops");
+        assert_eq!(probe.detail, None);
+    }
+
+    #[test]
+    fn classify_one_overdue_is_down_and_names_the_loop() {
+        let entries = [
+            entry("fresh_loop", 30, 0),
+            entry("wedged_loop", 30, threshold(30) + 1),
+        ];
+        let probe = classify_loop_liveness(&entries);
+        assert_eq!(probe.health, DependencyHealth::Down);
+        let detail = probe.detail.expect("down probe must carry a detail");
+        assert!(detail.contains("wedged_loop"), "detail: {detail}");
+        assert!(!detail.contains("fresh_loop"), "detail: {detail}");
+        // The detail must be ACTIONABLE: the overdue count PREFIX and the
+        // age/threshold numbers, not just the name. Pin "1 background loop"
+        // specifically (a bare '1' would also match the age digits).
+        assert!(
+            detail.contains("1 background loop"),
+            "detail names the overdue count: {detail}"
+        );
+        assert!(
+            detail.contains("threshold"),
+            "detail names the threshold: {detail}"
+        );
+    }
+
+    #[test]
+    fn classify_multiple_overdue_are_sorted_by_name() {
+        let entries = [
+            entry("zeta", 30, threshold(30) + 1),
+            entry("alpha", 30, threshold(30) + 1),
+        ];
+        let probe = classify_loop_liveness(&entries);
+        assert_eq!(probe.health, DependencyHealth::Down);
+        let detail = probe.detail.expect("down probe must carry a detail");
+        let alpha = detail.find("alpha").expect("alpha named");
+        let zeta = detail.find("zeta").expect("zeta named");
+        assert!(alpha < zeta, "overdue loops must be sorted: {detail}");
+    }
+
+    #[test]
+    fn classify_boundary_interval_30_exact_is_healthy_plus_one_is_down() {
+        // interval 30 ⇒ 2*300 + 60 = 660s.
+        assert_eq!(threshold(30), 660);
+        let at = [entry("loop30", 30, threshold(30))];
+        assert_eq!(
+            classify_loop_liveness(&at).health,
+            DependencyHealth::Healthy,
+            "exactly at threshold ⇒ healthy (strict >)"
+        );
+        let over = [entry("loop30", 30, threshold(30) + 1)];
+        assert_eq!(classify_loop_liveness(&over).health, DependencyHealth::Down);
+    }
+
+    #[test]
+    fn classify_boundary_interval_3600_exact_is_healthy_plus_one_is_down() {
+        // interval 3600 ⇒ 2*14400 + 7200 = 36000s.
+        assert_eq!(threshold(3600), 36000);
+        let at = [entry("loop3600", 3600, threshold(3600))];
+        assert_eq!(
+            classify_loop_liveness(&at).health,
+            DependencyHealth::Healthy,
+            "exactly at threshold ⇒ healthy (strict >)"
+        );
+        let over = [entry("loop3600", 3600, threshold(3600) + 1)];
+        assert_eq!(classify_loop_liveness(&over).health, DependencyHealth::Down);
+    }
+
+    #[test]
+    fn registry_round_trip_records_a_fresh_loop_with_tiny_age() {
+        // Unique name avoids cross-test contention on the process-global static.
+        let name: &'static str =
+            Box::leak(format!("test-loop-{}", uuid::Uuid::new_v4()).into_boxed_str());
+        register_loop(name, 10);
+        record_loop_success(name);
+        let snapshot = loop_liveness();
+        let mine = snapshot
+            .iter()
+            .find(|e| e.name == name)
+            .expect("registered loop must appear in the snapshot");
+        assert_eq!(mine.interval_secs, 10);
+        // Freshly recorded ⇒ effectively zero age (well under the budget).
+        assert!(mine.age_secs <= 1, "age_secs was {}", mine.age_secs);
+    }
+
+    #[test]
+    fn register_only_loop_is_fresh_and_healthy_on_its_baseline() {
+        // Pins the baseline-at-register design (no separate "never ran" state): a
+        // just-registered loop with NO success yet has a tiny age and classifies
+        // Healthy on its register-time baseline — not a false positive before its
+        // first iteration.
+        let name: &'static str =
+            Box::leak(format!("test-loop-baseline-{}", uuid::Uuid::new_v4()).into_boxed_str());
+        register_loop(name, 30);
+        // No record_loop_success — only the register baseline.
+        let snapshot = loop_liveness();
+        let mine = snapshot
+            .iter()
+            .find(|e| e.name == name)
+            .expect("registered loop appears even without a success yet");
+        assert_eq!(mine.interval_secs, 30);
+        assert!(mine.age_secs <= 1, "baseline age was {}", mine.age_secs);
+        assert_eq!(
+            classify_loop_liveness(std::slice::from_ref(mine)).health,
+            DependencyHealth::Healthy,
+            "a just-registered loop must not be a false-positive overdue"
+        );
     }
 }

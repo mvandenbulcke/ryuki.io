@@ -2192,6 +2192,13 @@ async fn platform_self_health() -> (StatusCode, Json<serde_json::Value>) {
         },
     }
 
+    // 4. Background-loop liveness — in-memory heartbeats, no DB needed. A loop
+    //    wedged past its timeout-and-backoff-aware budget reports `down`, which
+    //    makes the aggregate non-serving (503) exactly like a down scheduler.
+    probes.push(crate::background::classify_loop_liveness(
+        &crate::background::loop_liveness(),
+    ));
+
     let overall = aggregate(&probes);
     let http = if overall.is_serving() {
         StatusCode::OK

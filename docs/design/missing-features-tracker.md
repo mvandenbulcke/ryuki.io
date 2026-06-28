@@ -158,7 +158,13 @@ New `background.rs` (`iteration_timeout`/`loop_backoff`/`note_failure`/`run_boun
 all unit-tested) wraps every loop iteration; a timeout counts as a failure driving
 the existing #31 backoff; `MissedTickBehavior::Skip` unified across all 5. codex
 plan(rd2)+impl APPROVE. See [background-loop-timeouts.md](background-loop-timeouts.md).
-Follow-ups (also swarm findings): background-loop liveness in platform_self_health.
+**Background-loop liveness** shipped — a per-loop last-success heartbeat registry in
+background.rs (register_loop/record_loop_success/loop_liveness + a pure
+classify_loop_liveness) wired into all 5 loops + a 4th `background_loops` probe in
+platform_self_health; overdue past a timeout-AND-backoff-aware budget
+(2*iteration_timeout(interval)+2*interval) ⇒ down (a page on the status endpoint,
+not a k8s drain). codex plan (3 rounds) + impl APPROVE. See
+[background-loop-liveness.md](background-loop-liveness.md).
 **DR-plan general update (PUT)** shipped — `PUT /api/protect/dr/plans/{id}` mirrors
 the rpo-rto handler (pure `update_dr_plan_pure`, xmin CAS, site/status immutable via
 deny_unknown_fields→422, scalar `name` synced in `transition`, central
