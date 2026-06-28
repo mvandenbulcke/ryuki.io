@@ -2668,6 +2668,11 @@ struct DbRequestRow {
     // serde of the last ValidationResult or null.
     validation_results: serde_json::Value,
     criticality: String,
+    // #4: number of DISTINCT approving roles required before Planned->Approved.
+    // DEFAULT 1 (migration 118) preserves single-approval semantics; raised above
+    // 1 by a deferred policy source, a request holds at Planned until the quorum
+    // is met (apply_approval_decision_audited enforces it).
+    required_approval_roles: i32,
     requester: Option<String>,
     owner: Option<String>,
     evidence_manifest_id: Option<String>,
@@ -2680,7 +2685,8 @@ struct DbRequestRow {
 /// but a single source of truth keeps all ~10 sites identical).
 const REQUEST_COLUMNS: &str = "id, request_type, status, stage, site, environment, name, cpu, \
      memory_gb, justification, created_by, created_at, updated_at, payload, stages, \
-     approval_route, plan, validation_results, criticality, requester, owner, evidence_manifest_id";
+     approval_route, plan, validation_results, criticality, required_approval_roles, requester, \
+     owner, evidence_manifest_id";
 
 // ─── Request store (in-memory fallback) ───
 
@@ -14088,15 +14094,66 @@ async fn apply_transition_audited(
         return Err(transition_conflict_409(&request_id));
     };
 
+    // Shared inner block: audit row + (optional) approval-decision ledger row +
+    // domain event, all in THIS tx, then commit and the detached notification.
+    // Factored out so apply_approval_decision_audited keeps audit/event PARITY
+    // with this path while applying its own status-flip-vs-partial branch.
+    commit_transition_side_effects(
+        tx,
+        pool,
+        session,
+        &request_id,
+        action,
+        &current.status,
+        &current.stage,
+        current.created_by.as_deref(),
+        &row,
+        detail,
+        artifacts.approval_role.as_deref(),
+        artifacts.approval_decision,
+        artifacts.approval_reason.as_deref(),
+        /* notify_owner */ true,
+    )
+    .await?;
+    Ok(row)
+}
+
+/// The shared inner block both `apply_transition_audited` and
+/// `apply_approval_decision_audited` run inside their (already-mutated) tx: the
+/// `audit_log` row, the optional `request_approval_decisions` ledger row, and the
+/// `#11` domain event, then `tx.commit()` and the detached best-effort owner
+/// notification. Factored out so the approve-quorum helper keeps full audit/event
+/// PARITY with the generic transition path while branching on quorum-met vs
+/// partial. `from_status`/`from_stage`/`created_by` are the pre-transition row's
+/// values; `row` is the post-mutation row that supplies the to_status/to_stage and
+/// the event's site/environment. `notify_owner` lets a PARTIAL approve commit its
+/// audit + distinct event WITHOUT telling the owner the request was approved.
+#[allow(clippy::too_many_arguments)]
+async fn commit_transition_side_effects(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    pool: &sqlx::PgPool,
+    session: &AuthSession,
+    request_id: &str,
+    action: &str,
+    from_status: &str,
+    from_stage: &str,
+    created_by: Option<&str>,
+    row: &DbRequestRow,
+    detail: Value,
+    approval_role: Option<&str>,
+    approval_decision: Option<&str>,
+    approval_reason: Option<&str>,
+    notify_owner: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
     audit::record_audit_tx(
         &mut tx,
         session,
         &AuditRecord {
             action,
-            request_id: Some(&request_id),
-            from_status: Some(&current.status),
+            request_id: Some(request_id),
+            from_status: Some(from_status),
             to_status: &row.status,
-            from_stage: Some(&current.stage),
+            from_stage: Some(from_stage),
             to_stage: &row.stage,
             detail,
             outcome: "applied",
@@ -14109,10 +14166,7 @@ async fn apply_transition_audited(
     // decision row in the SAME tx as the status flip. ON CONFLICT makes a
     // re-approve after the CAS idempotent (it never aborts the tx on the
     // UNIQUE). The no-DB path does NOT touch this table.
-    if let (Some(role), Some(decision)) = (
-        artifacts.approval_role.as_deref(),
-        artifacts.approval_decision,
-    ) {
+    if let (Some(role), Some(decision)) = (approval_role, approval_decision) {
         sqlx::query(
             "INSERT INTO request_approval_decisions (request_id, role, decision, actor, reason) \
              VALUES ($1, $2, $3, $4, $5) \
@@ -14120,11 +14174,11 @@ async fn apply_transition_audited(
              DO UPDATE SET decision = EXCLUDED.decision, actor = EXCLUDED.actor, \
                            decided_at = NOW(), reason = EXCLUDED.reason",
         )
-        .bind(uid)
+        .bind(row.id)
         .bind(role)
         .bind(decision)
         .bind(&session.user_id)
-        .bind(&artifacts.approval_reason)
+        .bind(approval_reason)
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
@@ -14133,19 +14187,19 @@ async fn apply_transition_audited(
     // #11: emit an operational domain event mirroring this committed transition,
     // in the SAME tx as the audit row so the event stream faithfully reflects
     // every applied lifecycle change (no event without the transition, and none
-    // lost after it). event_type = the audit action (e.g. "request.approve");
-    // payload carries only non-secret status/stage references.
+    // lost after it). event_type = the audit action (e.g. "request.approve" or
+    // "request.approval_recorded"); payload carries only non-secret references.
     crate::repos::domain_events::insert(
         &mut *tx,
         crate::repos::domain_events::NewEvent {
             event_type: action,
             aggregate_type: "request",
-            aggregate_id: &request_id,
+            aggregate_id: request_id,
             site: Some(&row.site),
             environment: Some(&row.environment),
             actor: &session.user_id,
             payload: json!({
-                "from_status": &current.status,
+                "from_status": from_status,
                 "to_status": &row.status,
                 "to_stage": &row.stage,
             }),
@@ -14160,11 +14214,13 @@ async fn apply_transition_audited(
     // locked notifications table can neither roll back the transition NOR delay the
     // HTTP response into a timeout. Fail-open: errors are logged, never surfaced.
     // At-most-once: a crash before the task runs simply drops the convenience entry.
-    {
+    // A PARTIAL approve passes notify_owner=false so the owner is not told the
+    // request is approved when it still sits at Planned (codex fix #2).
+    if notify_owner {
         let pool: sqlx::PgPool = pool.clone();
         let action = action.to_string();
-        let request_id = request_id.clone();
-        let owner = current.created_by.clone();
+        let request_id = request_id.to_string();
+        let owner = created_by.map(|s| s.to_string());
         tokio::spawn(async move {
             if let Err(e) = crate::repos::notifications::emit_for_transition(
                 &pool,
@@ -14178,7 +14234,237 @@ async fn apply_transition_audited(
             }
         });
     }
-    Ok(row)
+    Ok(())
+}
+
+/// Records ONE approval decision and ENFORCES the multi-role quorum (#4), ALL in
+/// one transaction. Unlike `apply_transition_audited` (which CAS-flips the status
+/// unconditionally), this helper only flips Planned->Approved once the request's
+/// `required_approval_roles` distinct roles AND approvers have approved; a partial
+/// approve records the decision, keeps the request at Planned, and emits a
+/// DISTINCT `request.approval_recorded` event with NO "approved" owner
+/// notification.
+///
+/// Ordering (codex fix #1 — the row lock serializes concurrent quorum evals):
+/// 1. SELECT ... FOR UPDATE — lock the request row first, re-verify status is
+///    still `planned` (else 409 transition_conflict).
+/// 2. Idempotent short-circuit (codex fix #3): if THIS role already has an
+///    `approved` decision, do NOT re-run/re-audit/re-emit — recompute and return.
+/// 3. INSERT-ON-CONFLICT the decision row.
+/// 4. Re-read all decisions and evaluate quorum with both thresholds pinned to
+///    `required_approval_roles` (the distinct-approver floor blocks one actor from
+///    self-forming a quorum — codex fix #4).
+/// 5. quorum_met -> CAS flip to `approved` + `request.approve` audit/event/owner
+///    notification; partial -> persist stages/route only, status stays `planned`,
+///    `request.approval_recorded` audit/event, no owner notification.
+///
+/// Returns the post-state row and the evaluated quorum so the handler can return
+/// 200 with the request JSON + the quorum block even on a partial approve.
+async fn apply_approval_decision_audited(
+    pool: &sqlx::PgPool,
+    session: &AuthSession,
+    uid: Uuid,
+) -> Result<(DbRequestRow, ryuki_engine::approval_quorum::QuorumStatus), (StatusCode, Json<Value>)>
+{
+    use ryuki_engine::approval_quorum::{evaluate_quorum, ApprovalDecision};
+
+    let request_id = uid.to_string();
+    let mut tx = pool.begin().await.map_err(db_error)?;
+
+    // (1) Lock the request row FIRST so concurrent approvals serialize through
+    // this row's lock — the quorum eval below reads a stable decision set, and the
+    // CAS flip cannot race another approver's flip. The from-status check is the
+    // engine's (run on the locked row below): a non-Planned row yields its clear
+    // 400. A vanished row is the only 409 here (a true concurrent delete).
+    let current: Option<DbRequestRow> = sqlx::query_as(&format!(
+        "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_error)?;
+    let Some(current) = current else {
+        tx.rollback().await.ok();
+        return Err(transition_conflict_409(&request_id));
+    };
+    // Validate the approval on the LOCKED row via the engine's from-status guard:
+    // a non-Planned (terminal / already-decided) request yields the engine's clear
+    // 400 ("Cannot approve request in status ..."), NOT a misleading 409. Running it
+    // here also produces the approve stage / evidence / approval_route on the LOCKED
+    // state, so a concurrent completing approver builds on any prior approver's
+    // persisted partial and cannot drop their route/evidence. Before the idempotent
+    // short-circuit so re-approving a non-approvable request still 400s.
+    let request = db_row_to_request(&current, &request_id);
+    let approved = match request_lifecycle::approve_request(&request, &session.user_id) {
+        Ok(a) => a,
+        Err(e) => {
+            tx.rollback().await.ok();
+            return Err(map_engine_error(e));
+        }
+    };
+
+    let role = approval_role_for(session);
+    let req = current.required_approval_roles.max(1) as usize;
+
+    let decision_sql = "SELECT role, decision, actor FROM request_approval_decisions \
+         WHERE request_id = $1";
+    let to_decisions = |rows: Vec<(String, String, String)>| -> Vec<ApprovalDecision> {
+        // Destructure to distinct names so the per-decision role is never confused
+        // with the session's `role` used in the short-circuit comparison below.
+        rows.into_iter()
+            .map(|(dec_role, dec, dec_actor)| ApprovalDecision {
+                role: dec_role,
+                decision: dec,
+                actor: dec_actor,
+            })
+            .collect()
+    };
+
+    // Read all decisions under the lock so the short-circuit and quorum eval see
+    // a consistent set.
+    let existing: Vec<(String, String, String)> = sqlx::query_as(decision_sql)
+        .bind(uid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+    // (2) Idempotent short-circuit (codex fix #3): this exact role already has an
+    // `approved` decision recorded -> do not re-insert, re-audit, or re-emit.
+    // Recompute the quorum over the current set and return the unchanged row.
+    if existing
+        .iter()
+        .any(|(r, d, _)| r == &role && d.trim().eq_ignore_ascii_case("approved"))
+    {
+        let decisions = to_decisions(existing);
+        let quorum = evaluate_quorum(&decisions, req, req);
+        tx.rollback().await.ok();
+        return Ok((current, quorum));
+    }
+
+    // (3) Record THIS role's approval decision. ON CONFLICT keeps it idempotent at
+    // the storage layer even though the short-circuit above already filtered the
+    // common re-approve case.
+    sqlx::query(
+        "INSERT INTO request_approval_decisions (request_id, role, decision, actor, reason) \
+         VALUES ($1, $2, 'approved', $3, NULL) \
+         ON CONFLICT (request_id, role) \
+         DO UPDATE SET decision = EXCLUDED.decision, actor = EXCLUDED.actor, \
+                       decided_at = NOW(), reason = EXCLUDED.reason",
+    )
+    .bind(uid)
+    .bind(&role)
+    .bind(&session.user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_error)?;
+
+    // (4) Re-read the decision set (now including this one) and evaluate quorum.
+    // Both thresholds are pinned to required_approval_roles: the distinct-APPROVER
+    // floor blocks one actor wearing many role hats from self-forming a quorum.
+    let after: Vec<(String, String, String)> = sqlx::query_as(decision_sql)
+        .bind(uid)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+    let decisions = to_decisions(after);
+    let quorum = evaluate_quorum(&decisions, req, req);
+
+    let stages_json = serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([]));
+    let approval_route_json =
+        serde_json::to_value(&approved.approval_route).unwrap_or_else(|_| json!([]));
+    let planned_db = request_status_to_db(&ryuki_engine::models::RequestStatus::Planned);
+
+    // (5) Branch on quorum. `quorum.rejected` is impossible here (reject is
+    // terminal and would have moved the row off `planned`, caught at the lock).
+    if quorum.quorum_met {
+        // The REAL approval: CAS flip Planned->Approved, persisting the engine's
+        // stages/route, with audit action `request.approve`, the matching event,
+        // and the owner notification.
+        let approved_db = request_status_to_db(&ryuki_engine::models::RequestStatus::Approved);
+        let row: Option<DbRequestRow> = sqlx::query_as(&format!(
+            "UPDATE requests SET status = $1, stage = $2, stages = $3::jsonb, \
+             approval_route = COALESCE($4::jsonb, approval_route), updated_at = NOW() \
+             WHERE id = $5 AND status = $6 RETURNING {REQUEST_COLUMNS}"
+        ))
+        .bind(approved_db)
+        .bind("approve")
+        .bind(&stages_json)
+        .bind(&approval_route_json)
+        .bind(uid)
+        .bind(planned_db)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Err(transition_conflict_409(&request_id));
+        };
+        commit_transition_side_effects(
+            tx,
+            pool,
+            session,
+            &request_id,
+            "request.approve",
+            &current.status,
+            &current.stage,
+            current.created_by.as_deref(),
+            &row,
+            json!({}),
+            // The decision row is already inserted above (step 3), so do NOT ask
+            // the shared block to re-insert it.
+            None,
+            None,
+            None,
+            /* notify_owner */ true,
+        )
+        .await?;
+        Ok((row, quorum))
+    } else {
+        // PARTIAL approve: record the decision + stages/route, but the request
+        // STAYS at Planned. Audit as `request.approval_recorded` and emit a
+        // DISTINCT event; do NOT notify the owner of an approval that has not
+        // happened yet (codex fix #2). The UPDATE keeps status='planned' so a
+        // Planned->Planned write is not a false 409.
+        let row: Option<DbRequestRow> = sqlx::query_as(&format!(
+            "UPDATE requests SET stages = $1::jsonb, \
+             approval_route = COALESCE($2::jsonb, approval_route), updated_at = NOW() \
+             WHERE id = $3 AND status = $4 RETURNING {REQUEST_COLUMNS}"
+        ))
+        .bind(&stages_json)
+        .bind(&approval_route_json)
+        .bind(uid)
+        .bind(planned_db)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = row else {
+            tx.rollback().await.ok();
+            return Err(transition_conflict_409(&request_id));
+        };
+        commit_transition_side_effects(
+            tx,
+            pool,
+            session,
+            &request_id,
+            "request.approval_recorded",
+            &current.status,
+            &current.stage,
+            current.created_by.as_deref(),
+            &row,
+            json!({
+                "approved_roles": quorum.approved_roles,
+                "required_roles": quorum.required_roles,
+                "distinct_approvers": quorum.distinct_approvers,
+                "required_approvers": quorum.required_approvers,
+            }),
+            None,
+            None,
+            None,
+            /* notify_owner */ false,
+        )
+        .await?;
+        Ok((row, quorum))
+    }
 }
 
 /// The approval-route role a verified session satisfies, used as the
@@ -15909,48 +16195,40 @@ async fn requests_approve(
         )
         .await?;
 
-        let request = db_row_to_request(&current, &request_id);
-        // Attribution: the REAL verified approver from the session, never a
-        // literal. The engine threads this into the approval-decision evidence
-        // and approval_route.
-        let approved = request_lifecycle::approve_request(&request, &session.user_id)
-            .map_err(map_engine_error)?;
+        // #4: record THIS approver's decision and ENFORCE the multi-role quorum in
+        // one tx. The helper locks the request row, re-runs the engine approval
+        // UNDER the lock (validates from-status==Planned + completed plan stage and
+        // produces the approve stage/evidence/route on the *locked* state, so
+        // concurrent approvers cannot lose each other's route/evidence), records
+        // the decision, and flips to Approved only once required_approval_roles
+        // distinct roles+approvers have approved; otherwise it stays Planned and the
+        // decision is recorded (200 with quorum_met=false). The engine does NOT
+        // decide advancement — that is the quorum helper's job.
+        let (row, quorum) = apply_approval_decision_audited(pool, &session, uid).await?;
 
-        // Persist the engine-produced stages + the updated approval_route, and
-        // write the durable approval-decision row in the SAME tx.
-        let stages_json = serde_json::to_value(&approved.stages).unwrap_or_else(|_| json!([]));
-        let approval_route_json =
-            serde_json::to_value(&approved.approval_route).unwrap_or_else(|_| json!([]));
-
-        let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Approved);
-        apply_transition_audited(
-            pool,
-            &session,
-            uid,
-            &current,
-            "request.approve",
-            &current.status,
-            db_status,
-            "approve",
-            json!({}),
-            TransitionArtifacts {
-                stages_json,
-                plan_json: None,
-                validation_json: None,
-                approval_route_json: Some(approval_route_json),
-                approval_role: Some(approval_role_for(&session)),
-                approval_decision: Some("approved"),
-                approval_reason: None,
-            },
-        )
-        .await?;
-
-        return Ok(Json(serde_json::to_value(&approved).unwrap_or_default()));
+        // 200 body = the request JSON (rehydrated from the post-state row) with a
+        // `quorum` sibling key. Flattened (not a {request,quorum} envelope) so the
+        // top-level request fields — incl. `status` — stay in place: no breaking
+        // change for clients reading the bare object, and SHAPE PARITY with the
+        // no-DB arm below. A PARTIAL approve returns 200 with status still
+        // 'planned', so callers MUST read `quorum.quorum_met` rather than assume
+        // approval.
+        let mut request_json =
+            serde_json::to_value(db_row_to_request(&row, &request_id)).unwrap_or_default();
+        if let Some(obj) = request_json.as_object_mut() {
+            obj.insert(
+                "quorum".to_string(),
+                serde_json::to_value(&quorum).unwrap_or_else(|_| json!({})),
+            );
+        }
+        return Ok(Json(request_json));
     }
 
     // Separation of duties: the approver must not be the request's creator. Read
     // the creator (the in-memory `requester`) under a brief lock, release it, then
     // run the gate — never hold the store lock across the await.
+    // NOTE: quorum enforcement is DB-only — the no-DB / dry-run arm has no
+    // decision ledger, so it stays single-approval unconditionally.
     let requester = {
         let store = request_store().lock().await;
         let idx = store
@@ -15991,7 +16269,26 @@ async fn requests_approve(
     )
     .await;
 
-    Ok(Json(serde_json::to_value(&approved).unwrap_or_default()))
+    // Shape parity with the DB arm: the bare request object PLUS a `quorum`
+    // sibling. No decision ledger exists here, so synthesize the single-approval
+    // quorum (one role, met) the dry-run path always represents.
+    let quorum = ryuki_engine::approval_quorum::evaluate_quorum(
+        &[ryuki_engine::approval_quorum::ApprovalDecision {
+            role: approval_role_for(&session),
+            decision: "approved".to_string(),
+            actor: session.user_id.clone(),
+        }],
+        1,
+        1,
+    );
+    let mut approved_json = serde_json::to_value(&approved).unwrap_or_default();
+    if let Some(obj) = approved_json.as_object_mut() {
+        obj.insert(
+            "quorum".to_string(),
+            serde_json::to_value(&quorum).unwrap_or_else(|_| json!({})),
+        );
+    }
+    Ok(Json(approved_json))
 }
 
 async fn requests_lock(
@@ -16796,6 +17093,14 @@ async fn requests_reject(
         let rejected = request_lifecycle::reject_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
 
+        // #4 lock-ordering: apply_transition_audited's CAS `UPDATE requests`
+        // acquires the requests-row lock BEFORE it inserts the decision row —
+        // exactly the order apply_approval_decision_audited uses (request row via
+        // SELECT ... FOR UPDATE, then the decision INSERT). Both approve and
+        // reject therefore lock {requests row -> request_approval_decisions row}
+        // in the same order, so a concurrent approve+reject on one request cannot
+        // deadlock. A single 'rejected' row makes evaluate_quorum return
+        // rejected=true unconditionally.
         // Persist the engine-produced stages (the failed approve stage) and the
         // durable rejection decision row (with reason) in the SAME tx.
         let stages_json = serde_json::to_value(&rejected.stages).unwrap_or_else(|_| json!([]));
@@ -17536,12 +17841,18 @@ async fn requests_approval_quorum(
             Json(json!({"error": "Audit-tier access is required to read approval quorum"})),
         ));
     }
-    let required_roles = q.required_roles.unwrap_or(2);
-    let required_approvers = q.required_approvers.unwrap_or(2);
-    if !(1..=10).contains(&required_roles) || !(1..=10).contains(&required_approvers) {
-        return Err(status_400(
-            "required_roles and required_approvers must be between 1 and 10",
-        ));
+    // Validate any EXPLICIT query overrides up front; the per-request DEFAULT
+    // (codex fix #6) is resolved below from the row's required_approval_roles so
+    // the REPORTED quorum matches the ENFORCED quorum.
+    if let Some(rr) = q.required_roles {
+        if !(1..=10).contains(&rr) {
+            return Err(status_400("required_roles must be between 1 and 10"));
+        }
+    }
+    if let Some(ra) = q.required_approvers {
+        if !(1..=10).contains(&ra) {
+            return Err(status_400("required_approvers must be between 1 and 10"));
+        }
     }
 
     // Same shape both paths so clients never special-case no-DB.
@@ -17556,23 +17867,37 @@ async fn requests_approval_quorum(
     let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
 
     let Some(pool) = get_db() else {
+        // No-DB / dry-run: no row to read required_approval_roles from, so the
+        // per-request default (codex fix #6) is DB-only — keep the historical
+        // 2/2 default here when not overridden (the no-DB approve arm is
+        // single-approval regardless; this read is purely informational).
+        let required_roles = q.required_roles.unwrap_or(2);
+        let required_approvers = q.required_approvers.unwrap_or(2);
         let status = evaluate_quorum(&[], required_roles, required_approvers);
         return Ok(Json(render(&status, false)));
     };
 
     // 404 an unknown request so "no approvals yet" is distinguishable from "no
-    // such request". The same SELECT yields site/environment for the scope guard.
-    let exists: Option<(String, String)> =
-        sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
-            .bind(uid)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_error)?;
-    let Some((site, environment)) = exists else {
+    // such request". The same SELECT yields site/environment for the scope guard
+    // and required_approval_roles for the default thresholds.
+    let exists: Option<(String, String, i32)> = sqlx::query_as(
+        "SELECT site, environment, required_approval_roles FROM requests WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_error)?;
+    let Some((site, environment, required_approval_roles)) = exists else {
         return Err(status_404(&request_id));
     };
     // #2: an out-of-scope request's quorum is a 404 (same as unknown — no oracle).
     scope_guard_or_404(&session, &site, &environment, &request_id)?;
+
+    // codex fix #6: default BOTH thresholds to the request's required_approval_roles
+    // so the reported quorum matches what apply_approval_decision_audited enforces.
+    let req = required_approval_roles.max(1) as usize;
+    let required_roles = q.required_roles.unwrap_or(req);
+    let required_approvers = q.required_approvers.unwrap_or(req);
 
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT role, decision, actor FROM request_approval_decisions \
@@ -43842,6 +44167,492 @@ mod db_lifecycle_tests {
         .await
         .expect_err("deleting an absent budget must 404");
         assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+}
+
+/// DB integration tests for the multi-role approval quorum ENFORCEMENT (#4).
+///
+/// These tests REQUIRE a live Postgres instance (RYUKI_DATABASE_URL set) and SKIP
+/// automatically when the variable is unset so CI without Postgres stays green.
+/// The module suffix `_db_tests` makes `make test-db` auto-include them.
+///
+/// They drive the REAL handlers (create -> validate -> plan -> approve) and assert
+/// the enforcement: a request whose required_approval_roles is raised above 1
+/// holds at Planned until N distinct roles+approvers approve, while the default
+/// (required=1) still Approves on a single approval.
+#[cfg(test)]
+mod quorum_enforcement_db_tests {
+    use super::*;
+    use crate::database::DB_TEST_SERIAL;
+    use sqlx::PgPool;
+
+    async fn global_pool() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        crate::database::run_migrations(pool).await.ok()?;
+        Some(pool)
+    }
+
+    /// A verified approver session with an explicit principal AND approval role,
+    /// so distinct (user_id, role) pairs can form (or fail to form) a quorum.
+    fn approver(user_id: &str, role: &str) -> AuthSession {
+        let mut s = AuthSession::static_dry_run();
+        s.user_id = user_id.into();
+        s.display_name = format!("{user_id} (test)");
+        s.provider_mode = "local".into();
+        s.roles = vec![role.to_string()];
+        s
+    }
+
+    fn create_body(name: &str) -> CreateRequest {
+        CreateRequest {
+            request_type: "server-deployment".into(),
+            site: "DEFRA".into(),
+            environment: "production".into(),
+            name: name.into(),
+            cpu: 4,
+            memory_gb: 8,
+            justification: "quorum enforcement test".into(),
+            fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    async fn read_row(pool: &PgPool, id: Uuid) -> DbRequestRow {
+        sqlx::query_as(&format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
+        ))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read row")
+    }
+
+    async fn set_required_roles(pool: &PgPool, id: Uuid, n: i32) {
+        sqlx::query("UPDATE requests SET required_approval_roles = $1 WHERE id = $2")
+            .bind(n)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("set required_approval_roles");
+    }
+
+    async fn count_decisions(pool: &PgPool, id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_approval_decisions WHERE request_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count decisions")
+    }
+
+    async fn count_audit(pool: &PgPool, id: Uuid, action: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE request_id = $1 AND action = $2 AND outcome = 'applied'",
+        )
+        .bind(id)
+        .bind(action)
+        .fetch_one(pool)
+        .await
+        .expect("count audit")
+    }
+
+    async fn count_events(pool: &PgPool, id: Uuid, event_type: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events WHERE aggregate_type = 'request' \
+             AND aggregate_id = $1 AND event_type = $2",
+        )
+        .bind(id.to_string())
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .expect("count events")
+    }
+
+    async fn cleanup(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM audit_log WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM request_approval_decisions WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        // domain_events is append-only (migration 111) — leave its rows; they are
+        // harmless test history and cannot be deleted by design.
+        sqlx::query("DELETE FROM agent_jobs WHERE request_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Create -> validate -> plan a server-deployment, returning its id at Planned.
+    async fn seed_planned(pool: &PgPool, name: &str) -> Uuid {
+        let creator = approver("creator-q", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let Ok(Json(created)) =
+            requests_create(AuthExtractor(creator.clone()), Json(create_body(name))).await
+        else {
+            panic!("create must succeed");
+        };
+        let id_s = created["id"].as_str().expect("id").to_string();
+        let id = Uuid::parse_str(&id_s).expect("uuid");
+        let _ = requests_validate(Path(id_s.clone()), AuthExtractor(creator.clone()))
+            .await
+            .expect("validate");
+        let _ = requests_plan(Path(id_s.clone()), AuthExtractor(creator))
+            .await
+            .expect("plan");
+        let _ = pool; // pool used by callers for assertions
+        id
+    }
+
+    /// Spec test 1: the default single-approval (required=1) still Approves.
+    #[tokio::test]
+    async fn default_single_approval_still_approves() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-default").await;
+        // The migration backfills required_approval_roles = 1 by default.
+        assert_eq!(read_row(pool, id).await.required_approval_roles, 1);
+
+        let approver = approver("dc-1", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(body) = requests_approve(Path(id.to_string()), AuthExtractor(approver))
+            .await
+            .expect("single approval must succeed");
+        assert_eq!(body["quorum"]["quorum_met"], json!(true));
+        assert_eq!(read_row(pool, id).await.status, "approved");
+        assert_eq!(count_decisions(pool, id).await, 1);
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 2: a 2-role request HOLDS on the first approve then COMPLETES on
+    /// a distinct second approver+role.
+    #[tokio::test]
+    async fn two_role_quorum_holds_then_completes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-two-role").await;
+        set_required_roles(pool, id, 2).await;
+
+        // First approval (DatacenterApprover / dc-2) -> PARTIAL, stays Planned.
+        let dc = approver("dc-2", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(first) = requests_approve(Path(id.to_string()), AuthExtractor(dc))
+            .await
+            .expect("first partial approve is 200");
+        assert_eq!(first["quorum"]["quorum_met"], json!(false));
+        assert_eq!(first["quorum"]["approved_roles"], json!(1));
+        assert_eq!(read_row(pool, id).await.status, "planned");
+        // Partial emits the DISTINCT event and NO request.approve yet.
+        assert_eq!(count_events(pool, id, "request.approval_recorded").await, 1);
+        assert_eq!(count_events(pool, id, "request.approve").await, 0);
+
+        // Second, DISTINCT approver+role (PlatformAdmin / pa-2) -> quorum met.
+        let pa = approver("pa-2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let Json(second) = requests_approve(Path(id.to_string()), AuthExtractor(pa))
+            .await
+            .expect("second approve completes quorum");
+        assert_eq!(second["quorum"]["quorum_met"], json!(true));
+        assert_eq!(read_row(pool, id).await.status, "approved");
+        assert_eq!(count_decisions(pool, id).await, 2);
+        assert_eq!(count_events(pool, id, "request.approve").await, 1);
+        // Audit PARITY across the branches (the point of commit_transition_side_effects):
+        // the partial wrote one request.approval_recorded row, the completion one
+        // request.approve row.
+        assert_eq!(count_audit(pool, id, "request.approval_recorded").await, 1);
+        assert_eq!(count_audit(pool, id, "request.approve").await, 1);
+        // The completing approver's route was built on the LOCKED current row, so
+        // it preserves the first approver's entry — both are on the request row.
+        let final_req = db_row_to_request(&read_row(pool, id).await, &id.to_string());
+        assert!(
+            final_req.approval_route.iter().any(|r| r.contains("dc-2")),
+            "first approver must survive in the route: {:?}",
+            final_req.approval_route
+        );
+        assert!(
+            final_req.approval_route.iter().any(|r| r.contains("pa-2")),
+            "second approver must be in the route: {:?}",
+            final_req.approval_route
+        );
+        cleanup(pool, id).await;
+    }
+
+    /// Two approvers racing the SAME required=2 request must both end up on the
+    /// request-row route (no lost-evidence): the engine approval is recomputed
+    /// under the FOR UPDATE lock, so whoever completes the quorum builds on the
+    /// other's already-persisted partial. Without that, the completer would
+    /// overwrite stages/route with its own stale (lockless) view and drop the
+    /// first approver. Driven via two concurrent handler calls; the row lock
+    /// serializes them at the DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_two_approvers_keep_both_in_route() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-concurrent").await;
+        set_required_roles(pool, id, 2).await;
+
+        let a = approver("dc-cc", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let b = approver("pa-cc", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let (ra, rb) = tokio::join!(
+            requests_approve(Path(id.to_string()), AuthExtractor(a)),
+            requests_approve(Path(id.to_string()), AuthExtractor(b)),
+        );
+        assert!(ra.is_ok(), "approver A call failed: {ra:?}");
+        assert!(rb.is_ok(), "approver B call failed: {rb:?}");
+
+        // Final invariant: quorum met (approved) with BOTH approvers on the route.
+        let final_row = read_row(pool, id).await;
+        assert_eq!(
+            final_row.status, "approved",
+            "two distinct approvers complete the quorum"
+        );
+        assert_eq!(count_decisions(pool, id).await, 2);
+        let final_req = db_row_to_request(&final_row, &id.to_string());
+        assert!(
+            final_req.approval_route.iter().any(|r| r.contains("dc-cc"))
+                && final_req.approval_route.iter().any(|r| r.contains("pa-cc")),
+            "both racing approvers must survive in the route: {:?}",
+            final_req.approval_route
+        );
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 3: a rejection blocks quorum (terminal); a later approve is
+    /// refused by the from-status guard.
+    #[tokio::test]
+    async fn rejection_blocks_quorum() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-reject").await;
+        set_required_roles(pool, id, 2).await;
+
+        // One partial approve.
+        let dc = approver("dc-3", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc))
+            .await
+            .expect("partial approve");
+        assert_eq!(read_row(pool, id).await.status, "planned");
+
+        // A distinct third principal REJECTS -> terminal.
+        let rej = approver("pa-3", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let _ = requests_reject(
+            Path(id.to_string()),
+            AuthExtractor(rej),
+            Json(ReasonBody {
+                reason: "blocked by security".into(),
+            }),
+        )
+        .await
+        .expect("reject from planned");
+        assert_eq!(read_row(pool, id).await.status, "rejected");
+        // The reject persisted its OWN ledger row (partial-approve row + rejected
+        // row) — the mechanism by which evaluate_quorum returns rejected=true.
+        assert_eq!(count_decisions(pool, id).await, 2);
+
+        // A subsequent approve is refused by the engine from-status guard (400).
+        let late = approver("dc-3b", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let err = requests_approve(Path(id.to_string()), AuthExtractor(late))
+            .await
+            .expect_err("approve after reject must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        cleanup(pool, id).await;
+    }
+
+    /// Under the row lock, a request that has left `planned` (raced to a terminal /
+    /// already-decided state between the handler's lockless pre-read and the helper's
+    /// FOR UPDATE) is rejected by the engine's from-status guard with a clear 400 —
+    /// not a misleading 409 — and records NO decision against the moved-on row.
+    /// Driven deterministically by flipping the row off `planned` before the helper.
+    #[tokio::test]
+    async fn non_planned_at_lock_time_is_engine_400_no_decision() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-race-400").await;
+        // Simulate the race: the row moves off `planned` before the helper locks.
+        sqlx::query("UPDATE requests SET status = 'approved' WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("force status off planned");
+
+        let sess = approver("racer", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let res = apply_approval_decision_audited(pool, &sess, id).await;
+        assert!(
+            matches!(res, Err((StatusCode::BAD_REQUEST, _))),
+            "a non-planned status at lock time must be the engine 400: {res:?}"
+        );
+        // No decision row was recorded against the moved-on request.
+        assert_eq!(count_decisions(pool, id).await, 0);
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 4: SoD is preserved for every tier — a creator approving their
+    /// OWN required=2 request is blocked under live identity. (The handler runs in
+    /// MockDryRun in tests where SoD is warn-only, so this asserts the pure SoD
+    /// decision that the handler enforces under EntraId/Local.)
+    #[tokio::test]
+    async fn sod_blocks_self_approval_on_quorum_request() {
+        let creator = approver("self-q", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        // Creator == approver under live identity -> Block (403 in the handler).
+        assert_eq!(
+            sod_decision(&creator, Some("self-q"), &AuthMode::Local),
+            SodDecision::Block
+        );
+        assert_eq!(
+            sod_decision(&creator, Some("self-q"), &AuthMode::EntraId),
+            SodDecision::Block
+        );
+        // A distinct approver is always allowed.
+        assert_eq!(
+            sod_decision(&creator, Some("someone-else"), &AuthMode::Local),
+            SodDecision::Allow
+        );
+    }
+
+    /// Spec test 5: one actor cannot self-form a quorum — the SAME principal
+    /// approving "twice" (idempotent re-approve) on a required=2 request stays
+    /// Planned (the distinct-approver floor is never reached).
+    #[tokio::test]
+    async fn one_actor_cannot_self_form_quorum() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-self").await;
+        set_required_roles(pool, id, 2).await;
+
+        let same = approver("solo-q", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let _ = requests_approve(Path(id.to_string()), AuthExtractor(same.clone()))
+            .await
+            .expect("first approve");
+        // Same principal + role approves again -> idempotent, still Planned.
+        let Json(again) = requests_approve(Path(id.to_string()), AuthExtractor(same))
+            .await
+            .expect("re-approve is 200");
+        assert_eq!(again["quorum"]["quorum_met"], json!(false));
+        assert_eq!(again["quorum"]["distinct_approvers"], json!(1));
+        assert_eq!(read_row(pool, id).await.status, "planned");
+        assert_eq!(count_decisions(pool, id).await, 1);
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 6: idempotent re-approve writes exactly one decision row and does
+    /// NOT duplicate the audit/event; the quorum is unchanged.
+    #[tokio::test]
+    async fn idempotent_reapprove_no_duplicate_audit_or_event() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-idem").await;
+        set_required_roles(pool, id, 2).await;
+
+        let dc = approver("dc-idem", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc.clone()))
+            .await
+            .expect("first approve");
+        let audit_after_first = count_audit(pool, id, "request.approval_recorded").await;
+        let events_after_first = count_events(pool, id, "request.approval_recorded").await;
+
+        // Re-approve by the SAME role -> short-circuit: no new decision/audit/event.
+        let _ = requests_approve(Path(id.to_string()), AuthExtractor(dc))
+            .await
+            .expect("re-approve is 200");
+        assert_eq!(
+            count_decisions(pool, id).await,
+            1,
+            "exactly one decision row"
+        );
+        assert_eq!(
+            count_audit(pool, id, "request.approval_recorded").await,
+            audit_after_first,
+            "no duplicate audit row on idempotent re-approve"
+        );
+        assert_eq!(
+            count_events(pool, id, "request.approval_recorded").await,
+            events_after_first,
+            "no duplicate event on idempotent re-approve"
+        );
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 7: the partial-approve Planned->Planned path returns 200, not a
+    /// false 409 (the partial UPDATE keeps status='planned' and must not trip the
+    /// CAS conflict).
+    #[tokio::test]
+    async fn partial_approve_self_transition_no_false_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "q-no409").await;
+        set_required_roles(pool, id, 2).await;
+
+        let dc = approver("dc-no409", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let res = requests_approve(Path(id.to_string()), AuthExtractor(dc)).await;
+        assert!(
+            res.is_ok(),
+            "a partial Planned->Planned approve must be 200, not a 409: {res:?}"
+        );
+        assert_eq!(read_row(pool, id).await.status, "planned");
+        cleanup(pool, id).await;
+    }
+
+    /// Spec test 8: re-running migration 118 is a no-op (idempotent).
+    #[tokio::test]
+    async fn migration_118_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let sql = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../migrations/118_request_required_approval_roles.sql"
+        ))
+        .expect("read migration 118");
+        // Apply it a second time directly — the guarded DO block + IF NOT EXISTS
+        // make it a no-op rather than erroring on a duplicate column/constraint.
+        sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .expect("re-running migration 118 must be a no-op");
+        // The column + CHECK constraint still exist and enforce the 1..=10 range.
+        let bad = sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, required_approval_roles) \
+             VALUES ($1, 'server-deployment', 'intake', 'intake', 'DEFRA', 'production', 'q-mig', 1, 1, 0)",
+        )
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await;
+        assert!(
+            bad.is_err(),
+            "required_approval_roles = 0 must violate the CHECK constraint"
+        );
     }
 }
 
