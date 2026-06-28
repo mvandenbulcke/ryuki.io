@@ -29,6 +29,22 @@ migration touching run history + a sensitive handler). Completes DR-plan CRUD
   rows ⇒ `NotFound`/`StaleVersion`. (Parent-row `SELECT … FOR UPDATE` is the
   alternative; the 23503-catch is simpler and codex-accepted.)
 
+## Codex round-2 — the deeper blocker (why this needs a dedicated session)
+Round 2 confirmed the four fixes above but found a STORE-MODEL major: DELETE is not
+durable for SEED plans across a restart. `DR_STORE` is initialized from
+`seed_data()` at every startup (`dr_testing.rs:105`) and hydration only UPSERTS DB
+rows on top (`main.rs:1567`) — it never REMOVES store rows absent from `dr_plans`.
+So deleting a seed plan (e.g. `drp-defra-001`) with no DB history is undone on the
+next restart: `seed_data()` resurrects it into the store, which `dr_test_start`,
+due-tests, and readiness still read. The FK + 23503 catches prevent orphaning/500s,
+but the invariant "every store plan has a DB row" no longer holds after a seed
+delete. The proper fix is to make DB-mode startup RECONCILE the store to be
+DB-authoritative (replace, not just upsert-on-top-of-seed) — an architectural change
+to the DR domain's bootstrap, plus a restart/hydration regression test. THIS is why
+implementation is deferred to a dedicated session: across the PUT review + two DELETE
+reviews, codex has peeled back three layers of store-vs-DB entanglement, and a
+correct DELETE requires making the DR store DB-authoritative — not a CRUD add-on.
+
 ## Goal
 `DELETE /api/protect/dr/plans/{id}` so an operator can remove a mistaken/stale DR
 plan. A plan with test-run HISTORY must NOT be silently deletable (the runs are
