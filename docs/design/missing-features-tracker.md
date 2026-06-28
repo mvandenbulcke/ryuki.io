@@ -73,7 +73,7 @@ implementing **all 66**. This file tracks execution.
 | 41 | [x] | Integration credential rotation / expiry | Integ | M | M | — |
 | 42 | [ ] | Multi-step orchestration / job dependencies | Exec | L | M | ✓ |
 | 43 | [ ] | Post-apply verification (re-plan → Verified) | Exec | M | M | — |
-| 44 | [~] | Agent liveness sweep + offline detection | Exec | M | M | — |
+| 44 | [x] | Agent liveness sweep + offline detection | Exec | M | M | ALREADY DONE — spawn_agent_offline_scan (main.rs, 60s/180s) + agent_offline_scan_once emits agent.offline/agent.online on state transitions, deduped via offline_alerted (mig 114), with notifications + to_status warning alert. (A durable-scheduler port was scoped but abandoned as redundant — codex plan-review caught the existing emitter.) |
 | 45 | [x] | Per-site / per-tenant usage metering | Observ | M | M | — |
 | 46 | [x] | Chargeback / showback cost allocation | AIOps | M | M | — |
 | 47 | [x] | Backup verification + restore-test recency | Resil | M | M | — |
