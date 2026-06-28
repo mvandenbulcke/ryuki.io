@@ -90,9 +90,17 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// for a recurring review by recording `request.maintain-review-due` domain events
 /// and advancing each request's review-due timestamp — writes only to our own
 /// tables, NO provider/live/destructive call.
+///
+/// `connection_health_sweep` (#19) also qualifies: it lists every integration
+/// connection, runs the pure `test_connection_stub` (a DRY-RUN, no provider/live
+/// call), and appends a `connection_health_checks` row plus refreshes each
+/// connection's `last_test_*` — writes only to our own tables.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
-        || matches!(job_kind, "synthetic_health_run" | "maintain_review_scan")
+        || matches!(
+            job_kind,
+            "synthetic_health_run" | "maintain_review_scan" | "connection_health_sweep"
+        )
 }
 
 #[cfg(test)]
@@ -172,11 +180,14 @@ mod tests {
         assert!(!job_is_read_only("synthetic_health_run"));
         assert!(job_is_schedulable("maintain_review_scan"));
         assert!(!job_is_read_only("maintain_review_scan"));
+        assert!(job_is_schedulable("connection_health_sweep"));
+        assert!(!job_is_read_only("connection_health_sweep"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("destroy_everything"));
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));
+        assert!(!job_is_schedulable("connection_health_sweep_live"));
         assert!(!job_is_schedulable(""));
     }
 }

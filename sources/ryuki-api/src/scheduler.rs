@@ -83,9 +83,10 @@ pub struct ExecutionView {
 /// enumerated SAFE-INTERNAL-WRITE kinds (which persist only to our own tables via
 /// pure dry-run engine logic, no provider/live call). Runnable kinds today:
 /// `health_probe` (read-only liveness), `synthetic_health_run` (records simulated
-/// probe results), and `maintain_review_scan` (flags Operational requests due for
-/// review via domain events). Every write happens on `tx`, so a failure rolls
-/// back within the schedule's savepoint.
+/// probe results), `maintain_review_scan` (flags Operational requests due for
+/// review via domain events), and `connection_health_sweep` (appends a dry-run
+/// health-check row per integration connection). Every write happens on `tx`, so
+/// a failure rolls back within the schedule's savepoint.
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -193,6 +194,49 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("queued {} maintain review(s)", due.len())),
+            ))
+        }
+        "connection_health_sweep" => {
+            // Safe-internal dry-run (#19): list EVERY integration connection
+            // (there is no `enabled` column — probe them all), run the PURE
+            // `test_connection_stub` (no live provider call, no live credential
+            // resolver), append a connection_health_checks history row, AND
+            // refresh each connection's last_test_* — all on `tx`, so a failure
+            // rolls back with this schedule's savepoint. `credential_status` is a
+            // DETERMINISTIC STUB value derived from credential_ref presence (the
+            // same verdict the stub implies); the live `resolve_credentials` is
+            // never called here, keeping the sweep stub-only. `detail` is kept
+            // aggregate-only (a count) — never per-connection ids — because it is
+            // surfaced via /api/ops/scheduler/executions.
+            let connections =
+                crate::repos::integration_connections::list_all_connections(&mut **tx).await?;
+            let tested_at = chrono::Utc::now().to_rfc3339();
+            for conn in &connections {
+                let result = ryuki_engine::integration_connections::test_connection_stub(conn);
+                // Deterministic stub verdict: the stub only inspects ref presence
+                // (it never resolves the secret), so mirror that here.
+                let credential_status = if conn.credential_ref.is_empty() {
+                    "ref-missing"
+                } else {
+                    "ref-present"
+                };
+                crate::repos::integration_connections::insert_health_check(
+                    &mut **tx,
+                    &conn.id,
+                    &result.status,
+                    credential_status,
+                    &result.message,
+                )
+                .await?;
+                let combined = format!("{};creds={}", result.status, credential_status);
+                crate::repos::integration_connections::update_last_test(
+                    &mut **tx, &conn.id, &tested_at, &combined,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("probed {} connection(s)", connections.len())),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -1045,5 +1089,342 @@ mod db_tests {
             seeded, 1,
             "exactly one maintain_review_scan schedule is seeded"
         );
+    }
+
+    // ---- #19 connection_health_sweep ---------------------------------------
+
+    /// Seed one integration connection with the given id and credential_ref,
+    /// returning its id. `created_at`/`updated_at` have no DB default, so they are
+    /// supplied explicitly.
+    async fn seed_connection(pool: &PgPool, id: &str, credential_ref: &str) {
+        sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              created_by, created_at, updated_at) \
+             VALUES ($1, 'vmware', 'sweep-test', 'https://vcenter.example.test', 'env-var', \
+                     $2, 'system', NOW()::text, NOW()::text)",
+        )
+        .bind(id)
+        .bind(credential_ref)
+        .execute(pool)
+        .await
+        .expect("seed integration connection");
+    }
+
+    /// Plant a guaranteed-due `connection_health_sweep` schedule so a single tick
+    /// runs the sweep regardless of when the migration-seeded one last advanced.
+    /// Returns its id for cleanup.
+    ///
+    /// Disables the migration-seeded sweep (id `4444…`) first so EXACTLY ONE sweep
+    /// is due in the tick — otherwise both would run and append two rows per
+    /// connection, breaking the per-tick count assertions. Disabling (not
+    /// deleting) is safe: the next `global_pool()` re-runs the migration whose
+    /// `ON CONFLICT DO NOTHING` leaves the disabled row untouched.
+    async fn seed_due_sweep_schedule(pool: &PgPool) -> String {
+        sqlx::query(
+            "UPDATE schedules SET enabled = FALSE \
+             WHERE id = '44444444-4444-4444-8444-444444444444'",
+        )
+        .execute(pool)
+        .await
+        .ok();
+        let id = "sched-test-connsweep-due-2e4";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test conn sweep', 'connection_health_sweep', 300, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded sweep (id `4444…`) that
+    /// [`seed_due_sweep_schedule`] disabled, so the suite leaves the PRODUCTION
+    /// schedule in its shipped (enabled) state. Without this, `ON CONFLICT DO
+    /// NOTHING` on re-migration would preserve the disabled row and silently turn
+    /// the real sweep off for any later reader (and `migration_120_is_idempotent`
+    /// asserts it is enabled).
+    async fn restore_migration_sweep(pool: &PgPool) {
+        sqlx::query(
+            "UPDATE schedules SET enabled = TRUE \
+             WHERE id = '44444444-4444-4444-8444-444444444444'",
+        )
+        .execute(pool)
+        .await
+        .ok();
+    }
+
+    async fn health_check_count(pool: &PgPool, connection_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM connection_health_checks WHERE connection_id = $1")
+            .bind(connection_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The most recent connection_health_checks row content for a connection,
+    /// returned as (endpoint_status, credential_status, message). Used to verify
+    /// the swept row's COLUMN VALUES (not just its existence) and that the
+    /// persisted message is secret-free.
+    async fn latest_health_check(pool: &PgPool, connection_id: &str) -> (String, String, String) {
+        sqlx::query_as(
+            "SELECT endpoint_status, credential_status, message FROM connection_health_checks \
+             WHERE connection_id = $1 ORDER BY checked_at DESC LIMIT 1",
+        )
+        .bind(connection_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_connection(pool: &PgPool, connection_id: &str) {
+        // connection_health_checks cascades on the connection FK, but delete it
+        // explicitly so the assertions of other tests are not perturbed.
+        sqlx::query("DELETE FROM connection_health_checks WHERE connection_id = $1")
+            .bind(connection_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+            .bind(connection_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Test 1: three connections (two with a credential_ref, one WITHOUT) + a
+    /// guaranteed-due sweep. One tick → each gains a fresh connection_health_checks
+    /// row AND its last_test_at/last_test_result are updated. Verifies BOTH stub
+    /// branches (ref-present→reachable-stub, ref-missing→unreachable), the EXACT
+    /// row column values, the exact `<status>;creds=<verdict>` last_test_result
+    /// format the portal parses, that the persisted message is secret-free (never
+    /// contains the credential_ref), and that the execution detail is EXACTLY
+    /// `probed <N> connection(s)` with a bare count token (no per-connection leak).
+    #[tokio::test]
+    async fn connection_sweep_probes_all_and_updates_freshness() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id_a = "ic-sweep-test-aaaa0001";
+        let id_b = "ic-sweep-test-bbbb0002";
+        let id_c = "ic-sweep-test-cccc0001"; // empty credential_ref → ref-missing
+        seed_connection(pool, id_a, "API_KEY_A").await;
+        seed_connection(pool, id_b, "API_KEY_B").await;
+        seed_connection(pool, id_c, "").await;
+        let sched_id = seed_due_sweep_schedule(pool).await;
+
+        let before_a = health_check_count(pool, id_a).await;
+        let before_b = health_check_count(pool, id_b).await;
+        let before_c = health_check_count(pool, id_c).await;
+
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted sweep schedule ran");
+
+        // Each connection gained exactly one new history row.
+        assert_eq!(
+            health_check_count(pool, id_a).await,
+            before_a + 1,
+            "connection A gained one health-check row"
+        );
+        assert_eq!(
+            health_check_count(pool, id_b).await,
+            before_b + 1,
+            "connection B gained one health-check row"
+        );
+        assert_eq!(
+            health_check_count(pool, id_c).await,
+            before_c + 1,
+            "connection C (no ref) gained one health-check row"
+        );
+
+        // ref-present branch (A): the swept row stores the exact stub verdict and
+        // the FULL secret-free stub message — and NEVER the credential_ref value.
+        let (ep_a, cred_a, msg_a) = latest_health_check(pool, id_a).await;
+        assert_eq!(ep_a, "reachable-stub", "A endpoint_status");
+        assert_eq!(cred_a, "ref-present", "A credential_status");
+        assert_eq!(
+            msg_a,
+            "DRY-RUN: endpoint URL shape valid; credential_source=env-var ref present. \
+             No live call made.",
+            "A message is the exact stub output"
+        );
+        assert!(
+            !msg_a.contains("API_KEY_A"),
+            "A message must NOT leak the credential_ref: {msg_a}"
+        );
+
+        // ref-missing branch (C): empty ref flips the stub to unreachable; the
+        // deterministic credential verdict is ref-missing, with the exact message.
+        let (ep_c, cred_c, msg_c) = latest_health_check(pool, id_c).await;
+        assert_eq!(ep_c, "unreachable", "C endpoint_status (empty ref)");
+        assert_eq!(cred_c, "ref-missing", "C credential_status (empty ref)");
+        assert_eq!(
+            msg_c, "DRY-RUN: validation failed — credential_ref is empty",
+            "C message is the exact stub output"
+        );
+
+        // last_test_* refreshed with the EXACT `<status>;creds=<verdict>` format the
+        // portal integrations table parses (mirrors the on-demand probe).
+        let expect = [
+            (id_a, "reachable-stub;creds=ref-present"),
+            (id_b, "reachable-stub;creds=ref-present"),
+            (id_c, "unreachable;creds=ref-missing"),
+        ];
+        for (id, want) in expect {
+            let (at, result): (Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT last_test_at, last_test_result FROM integration_connections WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(at.is_some(), "last_test_at set for {id}");
+            assert_eq!(
+                result.as_deref(),
+                Some(want),
+                "last_test_result exact format for {id}"
+            );
+        }
+
+        // Aggregate-only detail contract: EXACTLY "probed <N> connection(s)" with a
+        // bare number — no connection ids can leak via /api/ops/scheduler/executions.
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'connection_health_sweep' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let count_token = detail
+            .strip_prefix("probed ")
+            .and_then(|s| s.strip_suffix(" connection(s)"));
+        assert!(
+            count_token.is_some_and(|n| n.parse::<u64>().is_ok()),
+            "detail must be exactly 'probed <N> connection(s)': {detail:?}"
+        );
+
+        cleanup_connection(pool, id_a).await;
+        cleanup_connection(pool, id_b).await;
+        cleanup_connection(pool, id_c).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_sweep(pool).await;
+    }
+
+    /// Test 2: a SECOND tick appends another row per connection — the sweep records
+    /// a time series, NOT a one-shot (no dedup, unlike the maintain scan).
+    #[tokio::test]
+    async fn connection_sweep_grows_time_series_no_dedup() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "ic-sweep-test-cccc0003";
+        seed_connection(pool, id, "API_KEY_C").await;
+
+        let before = health_check_count(pool, id).await;
+
+        let _ = seed_due_sweep_schedule(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        let after_first = health_check_count(pool, id).await;
+        assert_eq!(after_first, before + 1, "first tick appends one row");
+
+        // Re-plant a due sweep so it ACTUALLY runs a second time, proving the
+        // sweep itself appends again (no per-connection dedup guard).
+        let sched_id = seed_due_sweep_schedule(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        let after_second = health_check_count(pool, id).await;
+        assert_eq!(
+            after_second,
+            before + 2,
+            "a second tick appends another row (time series, not one-shot)"
+        );
+
+        cleanup_connection(pool, id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_sweep(pool).await;
+    }
+
+    /// Test 3: migration 120's seed is idempotent AND its seeded row matches the
+    /// shipped contract. Re-running the seed INSERT is a clean no-op (ON CONFLICT),
+    /// leaving exactly one row with the exact id/name/kind/interval/enabled/creator
+    /// the migration ships — so a prior test leaving it disabled or a future
+    /// retune of the seed is caught here, not silently.
+    #[tokio::test]
+    async fn migration_120_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ('44444444-4444-4444-8444-444444444444', \
+                     'Connection health sweep (all connections)', 'connection_health_sweep', \
+                     300, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+
+        // Exactly one row for the fixed id (no duplicate from the re-run).
+        let seeded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM schedules WHERE id = '44444444-4444-4444-8444-444444444444'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            seeded, 1,
+            "exactly one connection_health_sweep schedule is seeded"
+        );
+
+        // The seeded row matches the shipped migration contract verbatim. Asserting
+        // enabled=TRUE here is the guard that catches any test (or future code) that
+        // disables the production sweep and fails to restore it.
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = '44444444-4444-4444-8444-444444444444'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            name, "Connection health sweep (all connections)",
+            "seed name"
+        );
+        assert_eq!(kind, "connection_health_sweep", "seed job_kind");
+        assert_eq!(interval, 300, "seed interval_secs (5-minute cadence)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
     }
 }

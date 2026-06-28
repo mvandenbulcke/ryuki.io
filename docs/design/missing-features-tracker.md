@@ -48,7 +48,7 @@ implementing **all 66**. This file tracks execution.
 | 16 | [x] | Enforced site degradation mode (write gating) | Resil | L | H | — |
 | 17 | [~] | Bulk / batch operations | API | M | H | — |
 | 18 | [ ] | Inbound integration webhook receivers | Integ | L | H | — |
-| 19 | [~] | Connection health monitoring (scheduled + history) | Integ | M | H | — |
+| 19 | [x] | Connection health monitoring (scheduled + history) | Integ | M | H | scheduled sweep shipped — durable-scheduler `connection_health_sweep` (leader-elected, #40 safe-internal-write recipe): lists ALL connections, runs the pure `test_connection_stub` (NO live resolve_credentials), appends a `connection_health_checks` row + refreshes `last_test_*` on the tick tx, deterministic stub credential verdict, aggregate-only detail, no dedup (time series). mig 120 seeds the schedule only (mig 102 already had the index). codex APPROVED round 2 (3 test-quality fixes folded in: restore-seeded-sweep, full seed-contract idempotency, exact-message branch coverage). On-demand probe + history read already existed |
 | 20 | [ ] | Step-up / MFA re-auth for high-risk actions | Security | M | H | — |
 | 21 | [ ] | Live secret rotation (Vault) + break-glass | Security | L | H | ✓ |
 | 22 | [x] | Domain-event alert generation | Observ | M | H | — |
