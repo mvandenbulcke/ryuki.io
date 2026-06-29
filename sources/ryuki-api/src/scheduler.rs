@@ -2813,6 +2813,136 @@ mod db_tests {
             .ok();
     }
 
+    /// #7: migration 125's seed is idempotent AND its TWO partial unique indexes
+    /// (secret-rotation-due + secret-rotation-invalid-due) each dedup an open item.
+    #[tokio::test]
+    async fn migration_125_is_idempotent_and_indexes_dedup() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Re-running the seed INSERT is a clean no-op (ON CONFLICT).
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Secret rotation due scan (all secrets)', 'secret_rotation_due_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(SECRET_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(SECRET_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Secret rotation due scan (all secrets)", "seed name");
+        assert_eq!(kind, "secret_rotation_due_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // BOTH partial unique indexes reject a second open item for the same key.
+        for item_type in ["secret-rotation-due", "secret-rotation-invalid-due"] {
+            let key = format!("sr-idx-{}-{}", item_type, uuid::Uuid::new_v4());
+            let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+            sqlx::query(
+                "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+                 VALUES ($1, 't', 'd', 'P2', $2::jsonb)",
+            )
+            .bind(item_type)
+            .bind(&meta)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("first {item_type} item inserts: {e}"));
+            let dup = sqlx::query(
+                "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+                 VALUES ($1, 't2', 'd2', 'P2', $2::jsonb)",
+            )
+            .bind(item_type)
+            .bind(&meta)
+            .execute(pool)
+            .await;
+            assert!(
+                dup.is_err(),
+                "the {item_type} index rejects a second OPEN duplicate"
+            );
+            sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+                .bind(&key)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// #17: migration 126's seed is idempotent AND its partial unique index
+    /// (legal-hold-expiring) dedups an open item.
+    #[tokio::test]
+    async fn migration_126_is_idempotent_and_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Legal hold expiry scan (all holds)', 'legal_hold_expiry_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(LEGAL_HOLD_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(LEGAL_HOLD_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Legal hold expiry scan (all holds)", "seed name");
+        assert_eq!(kind, "legal_hold_expiry_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        let key = format!("lh-idx-{}", uuid::Uuid::new_v4());
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('legal-hold-expiring', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first legal-hold-expiring item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('legal-hold-expiring', 't2', 'd2', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the legal-hold-expiring index rejects a second OPEN duplicate"
+        );
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
     // ---- #52 slice 2: FAILED-latest signal ----------------------------------
 
     /// Slice-2 test 1: a system whose newest restore_request is `Failed` → exactly

@@ -765,7 +765,15 @@ fn read_permission_for(path: &str) -> &'static str {
 fn is_audit_read_path(path: &str) -> bool {
     path == "/api/activity/audit"
         || (path.starts_with("/api/requests/")
-            && (path.ends_with("/audit") || path.ends_with("/evidence")))
+            && (path.ends_with("/audit")
+                || path.ends_with("/evidence")
+                // The approval ledger + quorum reads are audit-grade (approver
+                // identities/decisions/reasons), like the per-request audit trail —
+                // their handlers check `audit`, so the central gate must too (else a
+                // `request`-only Requester passes the gate and is only stopped by the
+                // handler — a defense-in-depth gap).
+                || path.ends_with("/approval-decisions")
+                || path.ends_with("/approval-quorum")))
 }
 
 /// Whether `session` may read `path`. Sensitive prefixes require `admin`; audit
@@ -4088,6 +4096,13 @@ mod tests {
         assert!(is_audit_read_path(
             "/api/requests/00000000-0000-0000-0000-000000000000/evidence"
         ));
+        // The approval ledger + quorum reads are audit-grade too (2nd-swarm hardening).
+        assert!(is_audit_read_path(
+            "/api/requests/00000000-0000-0000-0000-000000000000/approval-decisions"
+        ));
+        assert!(is_audit_read_path(
+            "/api/requests/00000000-0000-0000-0000-000000000000/approval-quorum"
+        ));
         assert!(!is_audit_read_path(
             "/api/requests/00000000-0000-0000-0000-000000000000"
         ));
@@ -4107,6 +4122,8 @@ mod tests {
             "/api/activity/audit",
             "/api/requests/00000000-0000-0000-0000-000000000000/audit",
             "/api/requests/00000000-0000-0000-0000-000000000000/evidence",
+            "/api/requests/00000000-0000-0000-0000-000000000000/approval-decisions",
+            "/api/requests/00000000-0000-0000-0000-000000000000/approval-quorum",
         ] {
             assert!(read_authorized(&auditor, path), "auditor reads {path}");
             assert!(
