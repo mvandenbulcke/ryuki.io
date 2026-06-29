@@ -1483,6 +1483,16 @@ struct DeadLetteredJobRow {
     delivery_attempts: i32,
 }
 
+/// One LiveApply job moved to `ReconcileRequired` by lease expiry. `mode` is
+/// constant (`LiveApply`) and `delivery_attempts` is never touched on this path,
+/// so the dead-letter struct's extra columns are omitted.
+#[derive(sqlx::FromRow)]
+struct ReconcileRequiredJobRow {
+    id: String,
+    request_id: String,
+    platform: String,
+}
+
 /// Returns the number of jobs transitioned.
 ///
 /// Runs as ONE transaction so each dead-letter UPDATE and its domain event are
@@ -1566,16 +1576,43 @@ pub async fn expire_leases(pool: &PgPool) -> Result<u64, sqlx::Error> {
 
     // 3. LiveApply: → ReconcileRequired (never auto-redispatched, so it cannot
     //    poison-loop and is out of the cap's scope).
-    let reconcile = sqlx::query(
+    let reconciled: Vec<ReconcileRequiredJobRow> = sqlx::query_as(
         "UPDATE agent_jobs \
          SET status = 'ReconcileRequired', updated_at = NOW() \
          WHERE status IN ('Leased', 'Running') \
            AND mode = 'LiveApply' \
-           AND lease_deadline < NOW()",
+           AND lease_deadline < NOW() \
+         RETURNING id::text, request_id::text, platform",
     )
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .fetch_all(&mut *tx)
+    .await?;
+
+    // Emit one alert-worthy domain event per reconcile — parity with the
+    // dead-letter branch. A LiveApply job whose agent died mid-run touched real
+    // infra; the operator-recovery transition must NOT be silent. Platform-wide
+    // infra (like agent-offline / dead-letter), so site/environment are NULL.
+    for job in &reconciled {
+        crate::repos::domain_events::insert(
+            &mut *tx,
+            crate::repos::domain_events::NewEvent {
+                event_type: "job.reconcile_required",
+                aggregate_type: "agent_job",
+                aggregate_id: &job.id,
+                site: None,
+                environment: None,
+                actor: "system",
+                payload: json!({
+                    "to_status": "reconcile-required",
+                    "platform": &job.platform,
+                    "mode": "LiveApply",
+                    "request_id": &job.request_id,
+                    "note": "live-apply lease expired mid-run; operator reconciliation required",
+                }),
+            },
+        )
+        .await?;
+    }
+    let reconcile = reconciled.len() as u64;
 
     tx.commit().await?;
 
@@ -3848,6 +3885,18 @@ mod tests {
         .expect("count dead-letter events")
     }
 
+    async fn reconcile_required_event_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE event_type = 'job.reconcile_required' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count reconcile-required events")
+    }
+
     async fn cleanup_dead_letter_events(pool: &PgPool, job_id: Uuid) {
         sqlx::query(
             "DELETE FROM domain_events WHERE aggregate_id = $1 AND aggregate_type = 'agent_job'",
@@ -3948,8 +3997,9 @@ mod tests {
     }
 
     /// LiveApply is out of the cap's scope: a past-deadline LiveApply job becomes
-    /// ReconcileRequired with delivery_attempts untouched and no event, even when
-    /// delivery_attempts is forced past the cap.
+    /// ReconcileRequired with delivery_attempts untouched, even when
+    /// delivery_attempts is forced past the cap — and it emits a
+    /// `job.reconcile_required` event (NEVER a dead-letter event).
     #[tokio::test]
     async fn db_live_apply_never_dead_lettered() {
         let Some(pool) = test_pool().await else {
@@ -3985,8 +4035,16 @@ mod tests {
             MAX_REDISPATCHES + 1,
             "LiveApply never touches delivery_attempts"
         );
+        // No dead-letter event (LiveApply reconciles), but a reconcile event so the
+        // operator-recovery transition is not silent.
         assert_eq!(dead_letter_event_count(&pool, job_id).await, 0);
+        assert_eq!(
+            reconcile_required_event_count(&pool, job_id).await,
+            1,
+            "the LiveApply→ReconcileRequired transition emits one event"
+        );
 
+        cleanup_dead_letter_events(&pool, job_id).await;
         cleanup_jobs_for_platform(&pool, &platform).await;
         pool.close().await;
     }

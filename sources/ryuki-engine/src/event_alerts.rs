@@ -77,12 +77,15 @@ pub fn severity_for_agent_status(to_status: &str) -> Option<AlertSeverity> {
 /// Classify an agent-job lifecycle event (#23) by its `to_status`. A
 /// `dead-lettered` job is CRITICAL — it exhausted every lease-expiry redispatch
 /// (the poison-job cap), so that request's work will never run without operator
-/// intervention. That ranks it with a `failed` request (a hard execution
-/// failure), above the recoverable `offline` agent (a warning). Every other
-/// agent-job status is normal flow and NOT an alert.
+/// intervention. A `reconcile-required` job is ALSO CRITICAL — a LiveApply lease
+/// expired mid-run, so REAL provider infrastructure is in an unknown state and an
+/// operator MUST reconcile before any re-dispatch; the costliest job mode must not
+/// fail more quietly than the recoverable dead-letter path. Both rank with a
+/// `failed` request, above the recoverable `offline` agent (a warning). Every
+/// other agent-job status is normal flow and NOT an alert.
 pub fn severity_for_agent_job_status(to_status: &str) -> Option<AlertSeverity> {
     match to_status {
-        "dead-lettered" => Some(AlertSeverity::Critical),
+        "dead-lettered" | "reconcile-required" => Some(AlertSeverity::Critical),
         _ => None,
     }
 }
@@ -102,6 +105,7 @@ pub fn alert_worthy_statuses() -> &'static [&'static str] {
         "breached",
         "offline",
         "dead-lettered",
+        "reconcile-required",
     ]
 }
 
@@ -156,13 +160,20 @@ mod tests {
     }
 
     #[test]
-    fn dead_lettered_agent_job_is_critical_others_are_not() {
+    fn dead_lettered_and_reconcile_required_agent_jobs_are_critical_others_are_not() {
         // A poison-capped job is a hard execution failure → Critical.
         assert_eq!(
             severity_for_agent_job_status("dead-lettered"),
             Some(AlertSeverity::Critical)
         );
-        // Every normal agent-job status is not an alert.
+        // A LiveApply lease expiry leaves real infra in an unknown state → Critical
+        // (the costliest mode must not alert weaker than the dead-letter path).
+        assert_eq!(
+            severity_for_agent_job_status("reconcile-required"),
+            Some(AlertSeverity::Critical)
+        );
+        // Every normal agent-job status is not an alert (incl. a bare "reconcile"
+        // that is NOT the real "reconcile-required" status).
         for ok in ["pending", "leased", "running", "succeeded", "reconcile"] {
             assert_eq!(
                 severity_for_agent_job_status(ok),

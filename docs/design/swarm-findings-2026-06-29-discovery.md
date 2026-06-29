@@ -17,7 +17,7 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
 - **ReconcileRequired emits no alert + strands the parent request** (H/S): unlike the dead-letter
   branch (emits a Critical `job.dead_lettered` event, agents.rs:1520), the ReconcileRequired branch
   emits NOTHING and never touches the requests row — the request sits in `Executing` silently.
-  Slice: emit a `job.reconcile_required` event in that branch, mirroring the dead-letter block.
+  Slice: emit a `job.reconcile_required` event in that branch, mirroring the dead-letter block. ✅ SHIPPED — emits the event + made `reconcile-required` alert-worthy (Critical) so the alert feed surfaces it (parity with dead-letter). codex APPROVE.
 - **Cancel/abort a Pending agent job** (M/M, needs a `Cancelled` status + 1-line CHECK migration):
   create/reprioritize/requeue exist but NO cancel — a job dispatched to a platform with no healthy
   agent sits Pending forever (parent stuck Executing). Slice: `POST .../jobs/{id}/cancel` CAS
