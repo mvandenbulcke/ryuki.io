@@ -16449,6 +16449,17 @@ async fn approve_one(
             .iter()
             .position(|r| r.id == request_id)
             .ok_or_else(|| status_404(request_id))?;
+        // #2 (no-DB scope hardening): mirror the DB branch (scope_guard_or_404 above)
+        // and reject/rework/fail/cancel — an out-of-scope request 404s exactly like a
+        // missing one, so the dry-run approve path is never a cross-scope approve or
+        // an existence oracle. Closes the lone no-DB approve gap from the batch-approve
+        // slice (6d4daf0); placed in the FIRST lock block so the 404 precedes the SoD
+        // lookup and the engine call, matching the DB ordering (load -> scope -> SoD).
+        if is_scoped(session)
+            && !row_scope_permits(session, &store[idx].site, &store[idx].environment)
+        {
+            return Err(status_404(request_id));
+        }
         store[idx].requester.clone()
     };
     check_sod(
@@ -37939,6 +37950,75 @@ mod unit_tests {
         // The out-of-scope row was never failed (still Planned).
         assert_eq!(
             store.iter().find(|r| r.id == f_out).unwrap().status,
+            ryuki_engine::models::RequestStatus::Planned
+        );
+    }
+
+    /// no-DB BATCH approve scope closure (codex: approve_one was the LONE batch-mutation
+    /// core missing the no-DB scope guard the siblings have — 6d4daf0). A site-scoped
+    /// approver running requests_batch_approve over an in-scope + an out-of-scope id
+    /// approves only the in-scope one; the out-of-scope id fails per-item with EXACTLY
+    /// 404 (codex MINOR: assert the precise 404, not merely "failed" — a 403/400 would
+    /// also leave the row untouched, so only the 404 proves the no-ORACLE contract) and
+    /// is never approved (no cross-scope mutation).
+    #[tokio::test]
+    async fn batch_approve_no_db_is_site_scoped() {
+        let in_scope = format!("req-defra-{}", Uuid::new_v4());
+        let out_scope = format!("req-defra2-{}", Uuid::new_v4());
+        // seed_planned_request seeds DEFRA/production, validated+planned (approvable).
+        seed_planned_request(&in_scope, "requester-1").await;
+        seed_planned_request(&out_scope, "requester-1").await;
+
+        // Mark out_scope GBLON so it is out of a DEFRA approver's scope.
+        request_store()
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.id == out_scope)
+            .unwrap()
+            .site = "GBLON".to_string();
+
+        // DEFRA-scoped DatacenterApprover, distinct from the "requester-1" creator
+        // (so SoD allows), holding `approve`.
+        let mut approver = single_role_session(
+            "approver-defra",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        approver.site_scope = vec!["DEFRA".into()];
+        let Json(out) = requests_batch_approve(
+            AuthExtractor(approver),
+            Json(BatchApproveRequest {
+                ids: vec![in_scope.clone(), out_scope.clone()],
+            }),
+        )
+        .await
+        .expect("batch approve returns 200");
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 1);
+
+        // codex MINOR: the out-of-scope id must fail with EXACTLY 404 (no-oracle
+        // contract) — locate its per-item result and assert ok=false + status=404.
+        let results = out["results"].as_array().expect("results array");
+        let out_res = results
+            .iter()
+            .find(|r| r["id"].as_str() == Some(out_scope.as_str()))
+            .expect("out-of-scope id has a per-item result");
+        assert_eq!(out_res["ok"], false, "out-of-scope item must fail");
+        assert_eq!(
+            out_res["status"], 404,
+            "out-of-scope item must 404 (no oracle), not 403/400"
+        );
+
+        let store = request_store().lock().await;
+        // In-scope row was approved (single-approval no-DB) — proves the guard is
+        // PER-ITEM and the in-scope item still processes.
+        assert_eq!(
+            store.iter().find(|r| r.id == in_scope).unwrap().status,
+            ryuki_engine::models::RequestStatus::Approved
+        );
+        // Out-of-scope row was never touched (still Planned) — no cross-scope mutation.
+        assert_eq!(
+            store.iter().find(|r| r.id == out_scope).unwrap().status,
             ryuki_engine::models::RequestStatus::Planned
         );
     }
