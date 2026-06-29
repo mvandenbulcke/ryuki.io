@@ -10,7 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use ryuki_engine::certificate_lifecycle::{CertificateRecord, CertificateStatus};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 // ─── Column list ─────────────────────────────────────────────────────────────
@@ -179,6 +179,73 @@ pub async fn list(pool: &PgPool) -> Result<Vec<CertificateRecord>, sqlx::Error> 
     .await?;
 
     rows.into_iter().map(|r| r.into_model()).collect()
+}
+
+/// Only a TERMINAL certificate (`Expired`|`Revoked`) may be DELETED — operational
+/// cleanup of a record that no longer represents a usable certificate. An
+/// `Active`/`Expiring` certificate is LIVE (still serving or imminently so); removing
+/// its record at the `execute` tier would lose tracking of an in-use certificate (the
+/// patch-wave delete lesson). SINGLE source of truth for the handler 409 gate AND the
+/// repo defense-in-depth guard below. (A mistaken Active cert still has an audited path
+/// to removal: revoke it → `Revoked` → then deletable.)
+pub fn certificate_status_deletable(status: &CertificateStatus) -> bool {
+    matches!(
+        status,
+        CertificateStatus::Expired | CertificateStatus::Revoked
+    )
+}
+
+/// Outcome of a certificate delete attempt (status+site CAS + deletability guard).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The certificate row was deleted (certificates are a leaf table — no cascade).
+    Deleted,
+    /// No row with this id (already gone).
+    NotFound,
+    /// The row's status OR site moved since it was read (CAS miss) — caller reloads.
+    StaleStatus,
+    /// `expected` is not a deletable status — defense-in-depth if a caller bypassed
+    /// the handler's `certificate_status_deletable` check.
+    BlockedStatus,
+}
+
+/// Delete a certificate IFF it still matches `expected` status AND `expected_site`
+/// (CAS) AND `expected` is a deletable (terminal) status. The `site` guard closes the
+/// window where a concurrent `transition` (which rewrites `site`) moves the cert out of
+/// the scope the handler authorized between the load and the delete (codex). No FK
+/// references `certificates`, so there is no cascade. On 0 rows we re-read to
+/// disambiguate `NotFound` vs `StaleStatus`.
+pub async fn delete(
+    conn: &mut PgConnection,
+    id: &str,
+    expected: &CertificateStatus,
+    expected_site: &str,
+) -> Result<DeleteOutcome, sqlx::Error> {
+    if !certificate_status_deletable(expected) {
+        return Ok(DeleteOutcome::BlockedStatus);
+    }
+    let Ok(uid) = Uuid::parse_str(id) else {
+        return Ok(DeleteOutcome::NotFound);
+    };
+    let res = sqlx::query("DELETE FROM certificates WHERE id = $1 AND status = $2 AND site = $3")
+        .bind(uid)
+        .bind(status_str(expected))
+        .bind(expected_site)
+        .execute(&mut *conn)
+        .await?;
+    if res.rows_affected() == 1 {
+        return Ok(DeleteOutcome::Deleted);
+    }
+    // 0 rows: the row is gone, or its status/site moved since the read.
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT status FROM certificates WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+    match current {
+        None => Ok(DeleteOutcome::NotFound),
+        Some(_) => Ok(DeleteOutcome::StaleStatus),
+    }
 }
 
 /// Atomically transition a certificate to its new state IFF the DB row still

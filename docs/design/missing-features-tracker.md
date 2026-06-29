@@ -208,6 +208,18 @@ Tombstone-rich audit. Codex plan(rd2)+impl APPROVE; impl-review MINORs both clos
 (audit before/after delta assertion; explicit DELETE route-gate test). See
 patch-wave-delete.md.
 
+**Certificate DELETE** SHIPPED — `DELETE /api/maintain/certificates/{id}` completes cert
+CRUD (verify-first swarm 2026-06-29 #14). Clones the patch-wave-delete pattern, simpler:
+certs are a LEAF table (no FK references them → no cascade) and SITE-only scoped. Boundary
+(patch-wave lesson): only TERMINAL certs (Expired/Revoked) deletable; Active/Expiring are
+LIVE → 409 (revoke first → Revoked → then deletable). Repo `delete` does a status+SITE CAS
+(`WHERE id AND status=$2 AND site=$3` — codex caveat: `transition` rewrites site, so the
+site guard closes the concurrent-scope-change window) with a 0-row re-read (NotFound vs
+StaleStatus) + a `certificate_status_deletable` single-source-of-truth classifier (handler
+409 + repo BlockedStatus). execute-tier (method-agnostic /api/maintain gate) + site
+scope_guard_or_404 (404, no oracle). Tombstone audit (no key/CSR — leaf table has none).
+codex plan+impl APPROVE. See certificate-delete.md.
+
 **Certificate list pagination/filtering** SHIPPED — `GET /api/maintain/certificates/
 inventory` enhanced in place (verify-first swarm 2026-06-29 #8). DIVERGED from the swarm's
 "new endpoint" rec: /inventory ALREADY IS the cert list, so it gained opt-in q/status/

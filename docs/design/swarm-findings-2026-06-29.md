@@ -23,7 +23,7 @@ PARTIAL = some exists, a specific additive slice is missing.
 | 11 | H | M | PARTIAL | Per-agent/per-principal rate limiting — rate limiter is IP/path-group keyed only; no principal_id in the key |
 | 12 | H | M | CONFIRMED | Enforced access recertification w/ scheduled revocation — campaigns are read-only; no deadline-enforcement scheduler job; status never transitions to Completed |
 | 13 | H | M | PARTIAL | API token per-usage audit trail + activity metrics — last_used_at is non-durable; no per-usage audit_log; no usage endpoint |
-| 14 | M | S | CONFIRMED | Certificate DELETE endpoint — repos/certificates.rs has no delete(); mirror patch-wave-delete pattern |
+| 14 | M | S | CONFIRMED | Certificate DELETE endpoint — repos/certificates.rs has no delete(); mirror patch-wave-delete pattern. ✅ SHIPPED — DELETE /api/maintain/certificates/{id}, only TERMINAL (Expired/Revoked) deletable; status+site CAS; leaf table (no cascade); tombstone audit. codex plan+impl APPROVE. See certificate-delete.md. |
 | 15 | M | M | CONFIRMED | Job prioritization / fair queuing per platform — dispatch is FIFO by created_at; no priority column |
 | 16 | M | M | CONFIRMED | Job execution deadline (distinct from lease TTL) + SLA tracking — only the 300s lease boundary exists |
 | 17 | M | M | CONFIRMED | Scheduled scan for legal-hold expiry — GET /legal-hold/expiring is on-demand; no scheduler job kind |

@@ -1501,7 +1501,10 @@ pub fn routes() -> Router {
             "/api/maintain/certificates/inventory",
             get(certificates_inventory),
         )
-        .route("/api/maintain/certificates/{id}", get(certificates_get))
+        .route(
+            "/api/maintain/certificates/{id}",
+            get(certificates_get).delete(certificates_delete),
+        )
         .route(
             "/api/maintain/certificate-contract",
             get(certificate_lifecycle_contract),
@@ -24619,6 +24622,74 @@ async fn certificates_get(
     Ok(Json(serde_json::to_value(&record).unwrap_or_default()))
 }
 
+/// DELETE /api/maintain/certificates/{id} — operational cleanup of a TERMINAL
+/// certificate. Only an `Expired`/`Revoked` cert is deletable: an `Active`/`Expiring`
+/// cert is LIVE, and removing its record from the `execute` tier would lose tracking of
+/// an in-use certificate (the patch-wave delete lesson). Certificates are a leaf table
+/// (no FK references them) — no cascade. Site-scoped (out-of-scope → 404, no oracle).
+async fn certificates_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let cert = crate::repos::certificates::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    // #2: site-only — an out-of-scope cert 404s exactly like a missing one.
+    scope_guard_or_404(&session, &cert.site, "", &id)?;
+    if !crate::repos::certificates::certificate_status_deletable(&cert.status) {
+        return Err(status_409(
+            "only an Expired or Revoked certificate can be deleted (an Active/Expiring certificate is in use)",
+        ));
+    }
+    let before = crate::repos::certificates::status_str(&cert.status);
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    match crate::repos::certificates::delete(&mut tx, &id, &cert.status, &cert.site)
+        .await
+        .map_err(db_error)?
+    {
+        crate::repos::certificates::DeleteOutcome::Deleted => {
+            // Tombstone audit: the row is gone, so capture the cert's identity + scope
+            // for the durable trail. The table stores NO key material / CSR — these are
+            // the same identity fields the cert read endpoints already expose.
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "certificate-delete",
+                    Some(before),
+                    "deleted",
+                    json!({
+                        "certificate_id": &id,
+                        "common_name": &cert.common_name,
+                        "hostname": &cert.hostname,
+                        "site": &cert.site,
+                    }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({ "deleted": id })))
+        }
+        crate::repos::certificates::DeleteOutcome::BlockedStatus => {
+            tx.rollback().await.ok();
+            Err(status_409("certificate status does not permit deletion"))
+        }
+        crate::repos::certificates::DeleteOutcome::StaleStatus => {
+            tx.rollback().await.ok();
+            Err(status_409(
+                "certificate changed concurrently; reload and retry",
+            ))
+        }
+        crate::repos::certificates::DeleteOutcome::NotFound => {
+            tx.rollback().await.ok();
+            Err(status_404(&id))
+        }
+    }
+}
+
 async fn certificate_lifecycle_contract() -> Json<Value> {
     Json(json!({
         "source": "static-seed",
@@ -40139,6 +40210,214 @@ mod db_lifecycle_tests {
             matches!(bad_dir, Err((StatusCode::BAD_REQUEST, _))),
             "bad direction must 400: {bad_dir:?}"
         );
+    }
+
+    /// #14 (pure): only a TERMINAL certificate (Expired|Revoked) is deletable; a live
+    /// Active/Expiring cert is not. Single source of truth for the handler + repo guard.
+    #[test]
+    fn certificate_status_deletable_only_terminal() {
+        use crate::repos::certificates::certificate_status_deletable as deletable;
+        use ryuki_engine::certificate_lifecycle::CertificateStatus as S;
+        assert!(deletable(&S::Expired));
+        assert!(deletable(&S::Revoked));
+        assert!(!deletable(&S::Active));
+        assert!(!deletable(&S::Expiring));
+    }
+
+    /// #14: a terminal (Expired/Revoked) cert DELETEs (cascade-free) + a tombstone audit
+    /// row is written; a subsequent GET 404s.
+    #[tokio::test]
+    async fn certificate_delete_happy_terminal_and_audits() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        for status in ["Expired", "Revoked"] {
+            let id = seed_cert(
+                pool,
+                &format!("cdel-{status}-{suffix}"),
+                status,
+                "h.test",
+                "GBLON",
+            )
+            .await;
+            let Json(body) = certificates_delete(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path(id.clone()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("delete of a {status} cert must succeed: {e:?}"));
+            assert_eq!(body["deleted"], id);
+            // Gone.
+            let gone: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM certificates WHERE id = $1::uuid")
+                    .bind(&id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(gone, 0, "the {status} cert row is deleted");
+            // Audit row exists (the cert id is a fresh UUID, so EXISTS can't false-pass).
+            let audited: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM audit_log WHERE action = 'certificate-delete' \
+                 AND detail->>'certificate_id' = $1)",
+            )
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(
+                audited,
+                "a certificate-delete audit row must exist for {id}"
+            );
+        }
+    }
+
+    /// #14: a LIVE cert (Active/Expiring) cannot be deleted → 409; it still exists.
+    #[tokio::test]
+    async fn certificate_delete_blocked_for_live() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        for status in ["Active", "Expiring"] {
+            let id = seed_cert(
+                pool,
+                &format!("cdel-live-{status}-{suffix}"),
+                status,
+                "h.test",
+                "GBLON",
+            )
+            .await;
+            let res = certificates_delete(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path(id.clone()),
+            )
+            .await;
+            assert!(
+                matches!(res, Err((StatusCode::CONFLICT, _))),
+                "a {status} cert must be 409-blocked: {res:?}"
+            );
+            let still: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM certificates WHERE id = $1::uuid")
+                    .bind(&id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(still, 1, "the blocked {status} cert still exists");
+            cleanup_cert(pool, &id).await;
+        }
+    }
+
+    /// #14: an unknown id → 404; an out-of-scope cert (wrong site) → 404 (no oracle).
+    #[tokio::test]
+    async fn certificate_delete_404_and_scope() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Unknown id → 404.
+        let unknown = certificates_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(Uuid::new_v4().to_string()),
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err((StatusCode::NOT_FOUND, _))),
+            "{unknown:?}"
+        );
+
+        // Out-of-scope (the cert is at GBLON; the session is scoped to DEFRA) → 404,
+        // BEFORE the deletability check (no status oracle). Seed a deletable (Revoked)
+        // cert so a leak would otherwise delete it.
+        let id = seed_cert(
+            pool,
+            &format!("cdel-scope-{}", Uuid::new_v4()),
+            "Revoked",
+            "h.test",
+            "GBLON",
+        )
+        .await;
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let denied = certificates_delete(AuthExtractor(defra), Path(id.clone())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope cert delete must 404: {denied:?}"
+        );
+        // The out-of-scope cert was NOT deleted.
+        let still: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM certificates WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(still, 1, "an out-of-scope cert must never be deleted");
+        cleanup_cert(pool, &id).await;
+    }
+
+    /// #14 (repo): a stale status (CAS miss) → StaleStatus; a non-deletable expected →
+    /// BlockedStatus (defense-in-depth, even though the handler gates it first).
+    #[tokio::test]
+    async fn certificate_delete_repo_stale_and_blocked() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        use ryuki_engine::certificate_lifecycle::CertificateStatus as S;
+        let id = seed_cert(
+            pool,
+            &format!("cdel-repo-{}", Uuid::new_v4()),
+            "Revoked",
+            "h.test",
+            "GBLON",
+        )
+        .await;
+        let mut conn = pool.acquire().await.unwrap();
+
+        // BlockedStatus: a non-deletable expected status short-circuits (no DELETE run).
+        let blocked = crate::repos::certificates::delete(&mut conn, &id, &S::Active, "GBLON")
+            .await
+            .unwrap();
+        assert_eq!(
+            blocked,
+            crate::repos::certificates::DeleteOutcome::BlockedStatus
+        );
+
+        // StaleStatus: the row is Revoked, but we pass a stale expected (Expired) → the
+        // status CAS misses → re-read finds the row present → StaleStatus.
+        let stale = crate::repos::certificates::delete(&mut conn, &id, &S::Expired, "GBLON")
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            crate::repos::certificates::DeleteOutcome::StaleStatus
+        );
+        // StaleStatus via the SITE CAS (codex): the right status (Revoked) but a WRONG
+        // expected_site → the site guard misses → 0 rows → StaleStatus, never a
+        // cross-scope delete. Pins the folded site-CAS caveat.
+        let wrong_site = crate::repos::certificates::delete(&mut conn, &id, &S::Revoked, "DEFRA")
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_site,
+            crate::repos::certificates::DeleteOutcome::StaleStatus,
+            "a site mismatch must not delete (site CAS)"
+        );
+        // The cert still exists (no attempt deleted it).
+        let still: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM certificates WHERE id = $1::uuid")
+                .bind(&id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(still, 1);
+        cleanup_cert(pool, &id).await;
     }
 
     /// #2 RBAC (storage, site-only): a by-id volume read is 404 out-of-scope and
