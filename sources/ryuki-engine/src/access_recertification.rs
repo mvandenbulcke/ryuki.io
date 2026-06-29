@@ -368,6 +368,50 @@ pub fn get_review_response(review: &AccessReview) -> Value {
     review_response(review)
 }
 
+// ---------------------------------------------------------------------------
+// Recertification overdue classification (durable-scheduler scan)
+// ---------------------------------------------------------------------------
+
+/// Whether an `Active` recertification campaign has blown its `end_date`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecertificationDueState {
+    /// Past (or exactly at) the deadline while still Active — actionable work.
+    Overdue,
+    /// The deadline is still in the future — not yet actionable.
+    NotYetDue,
+}
+
+impl RecertificationDueState {
+    /// Only `Overdue` becomes queue work. Used as the post-SQL clock-skew guard
+    /// (the scan re-checks with the CP clock so a near-edge row the DB clock
+    /// selected but the CP clock says is not-yet-due is skipped).
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, RecertificationDueState::Overdue)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecertificationDueState::Overdue => "overdue",
+            RecertificationDueState::NotYetDue => "not-yet-due",
+        }
+    }
+}
+
+/// Pure: is a campaign overdue at `now`? A campaign is overdue once the current
+/// time reaches its `end_date` (`>=`, so exactly-at-deadline counts). Mirrors the
+/// shape of `legal_hold::classify_legal_hold_expiry` but binary (no "soon"
+/// window in slice 1).
+pub fn classify_recertification_overdue(
+    end_date_unix_ms: i64,
+    now_unix_ms: i64,
+) -> RecertificationDueState {
+    if now_unix_ms >= end_date_unix_ms {
+        RecertificationDueState::Overdue
+    } else {
+        RecertificationDueState::NotYetDue
+    }
+}
+
 #[cfg(test)]
 pub fn seed_reviews() -> Vec<AccessReview> {
     let now = Utc::now();
@@ -542,6 +586,26 @@ pub fn seed_campaigns() -> Vec<RecertificationCampaign> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_recertification_overdue_boundaries() {
+        let end = 1_000_000_000_000_i64;
+        // Past the deadline → overdue (actionable).
+        let v = classify_recertification_overdue(end, end + 1);
+        assert_eq!(v, RecertificationDueState::Overdue);
+        assert!(v.is_actionable());
+        assert_eq!(v.as_str(), "overdue");
+        // Exactly at the deadline (now == end) → overdue (>=).
+        assert_eq!(
+            classify_recertification_overdue(end, end),
+            RecertificationDueState::Overdue
+        );
+        // Before the deadline → not yet due (non-actionable; the scan skips it).
+        let nyd = classify_recertification_overdue(end, end - 1);
+        assert_eq!(nyd, RecertificationDueState::NotYetDue);
+        assert!(!nyd.is_actionable());
+        assert_eq!(nyd.as_str(), "not-yet-due");
+    }
 
     #[test]
     fn test_list_reviews_returns_seed_entries() {

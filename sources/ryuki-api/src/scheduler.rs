@@ -565,6 +565,97 @@ async fn run_job(
                 Some(format!("enqueued {enqueued} expiring legal hold(s)")),
             ))
         }
+        "recertification_overdue_scan" => {
+            // Safe-internal write (#12): surface Active recertification campaigns past their
+            // end_date as deduped shift_queue work — mirrors legal_hold_expiry_scan. Reads
+            // recertification_campaigns, writes only our own shift_queue — NO state change to the
+            // campaign and NO access revocation / provider change (the recertification system is
+            // deliberately review-only: "no-live-access-changes"). recertification_campaigns has
+            // NO sensitive free-text column, so the surfaced governance metadata (name / type /
+            // reviewer group / counts / dates) is safe for the execute-tier queue.
+            #[derive(sqlx::FromRow)]
+            struct RecertScanRow {
+                id: String,
+                name: String,
+                start_date: chrono::DateTime<chrono::Utc>,
+                end_date: chrono::DateTime<chrono::Utc>,
+                review_type: String,
+                reviewer_group: String,
+                reviews_count: i32,
+                completed_count: i32,
+            }
+            // `end_date <= NOW()` is a SUPERSET of the `>=` classifier; the classifier then
+            // double-guards against DB/Rust clock skew (a near-edge row that the CP clock says is
+            // not-yet-due is skipped — a queue item never carries a non-actionable verdict).
+            let rows: Vec<RecertScanRow> = sqlx::query_as(
+                "SELECT id, name, start_date, end_date, review_type, reviewer_group, \
+                        reviews_count, completed_count \
+                 FROM recertification_campaigns \
+                 WHERE status = 'Active' AND end_date <= NOW() ORDER BY id",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                let verdict =
+                    ryuki_engine::access_recertification::classify_recertification_overdue(
+                        row.end_date.timestamp_millis(),
+                        now_ms,
+                    );
+                if !verdict.is_actionable() {
+                    continue;
+                }
+                // INSTANCE-specific dedup key (codex): a reused campaign id never lets a stale
+                // item suppress a new overdue campaign; stable across a deadline extension
+                // (start_date does not move). Microsecond precision matches the stored
+                // TIMESTAMPTZ exactly (codex MINOR).
+                let source_ci_key = format!("{}@{}", row.id, row.start_date.timestamp_micros());
+                let title = format!("Recertification overdue: {}", row.name);
+                let description = format!(
+                    "{} campaign '{}' (reviewer group {}) blew its recertification deadline {} — \
+                     {}/{} reviews complete. Review and close it.",
+                    row.review_type,
+                    row.name,
+                    row.reviewer_group,
+                    row.end_date.to_rfc3339(),
+                    row.completed_count,
+                    row.reviews_count,
+                );
+                let metadata = serde_json::json!({
+                    "source_ci_key": source_ci_key,
+                    "campaign_id": row.id,
+                    "name": row.name,
+                    "review_type": row.review_type,
+                    "reviewer_group": row.reviewer_group,
+                    "start_date": row.start_date.to_rfc3339(),
+                    "end_date": row.end_date.to_rfc3339(),
+                    "reviews_count": row.reviews_count,
+                    "completed_count": row.completed_count,
+                    "due_state": verdict.as_str(),
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::RECERTIFICATION_OVERDUE_ITEM_TYPE,
+                    &source_ci_key,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "enqueued {enqueued} overdue recertification campaign(s)"
+                )),
+            ))
+        }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
         other => Ok((
             "skipped".to_string(),
@@ -2938,6 +3029,243 @@ mod db_tests {
         );
         sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
             .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ---- #12: recertification overdue scan ----------------------------------
+
+    const RECERT_SCAN_SEED_ID: &str = "88888888-8888-4888-8888-888888888888";
+
+    /// Seed an Active|Completed recertification campaign with a chosen end_date.
+    async fn seed_recert_campaign(pool: &PgPool, id: &str, end_date: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO recertification_campaigns \
+             (id, name, start_date, end_date, review_type, reviewer_group, \
+              reviews_count, completed_count, status) \
+             VALUES ($1, $2, NOW() - INTERVAL '60 days', $3::timestamptz, 'ADGroup', \
+                     'identity-governance', 3, 1, $4)",
+        )
+        .bind(id)
+        .bind(format!("test campaign {id}"))
+        .bind(end_date)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed campaign");
+    }
+
+    async fn open_recert_item_count(pool: &PgPool, campaign_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'recertification-overdue' AND resolved = false \
+               AND metadata->>'campaign_id' = $1",
+        )
+        .bind(campaign_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_129_is_idempotent_and_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Recertification overdue scan (all campaigns)', 'recertification_overdue_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(RECERT_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(RECERT_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            name, "Recertification overdue scan (all campaigns)",
+            "seed name"
+        );
+        assert_eq!(kind, "recertification_overdue_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        let key = format!("recert-idx-{}@123", uuid::Uuid::new_v4());
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('recertification-overdue', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first recertification-overdue item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('recertification-overdue', 't2', 'd2', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the recertification-overdue index rejects a second OPEN duplicate"
+        );
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn recertification_scan_enqueues_overdue_only_and_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let overdue = format!("arcamp-overdue-{suffix}");
+        let future = format!("arcamp-future-{suffix}");
+        let completed = format!("arcamp-completed-{suffix}");
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let ahead = (chrono::Utc::now() + chrono::Duration::days(20)).to_rfc3339();
+        seed_recert_campaign(pool, &overdue, &past, "Active").await;
+        seed_recert_campaign(pool, &future, &ahead, "Active").await;
+        seed_recert_campaign(pool, &completed, &past, "Completed").await;
+
+        // Run the scan directly (twice) to prove enqueue + dedup.
+        for _ in 0..2 {
+            let mut tx = pool.begin().await.unwrap();
+            let (status, _) = run_job(&mut tx, "recertification_overdue_scan")
+                .await
+                .unwrap();
+            assert_eq!(status, "succeeded");
+            tx.commit().await.unwrap();
+        }
+
+        // Overdue Active → exactly one item (dedup held across the two runs).
+        assert_eq!(
+            open_recert_item_count(pool, &overdue).await,
+            1,
+            "an overdue Active campaign enqueues exactly one item"
+        );
+        // Future Active + overdue Completed → none.
+        assert_eq!(
+            open_recert_item_count(pool, &future).await,
+            0,
+            "a not-yet-due campaign is not enqueued"
+        );
+        assert_eq!(
+            open_recert_item_count(pool, &completed).await,
+            0,
+            "a Completed campaign is not enqueued"
+        );
+
+        // The enqueued item's fields + the instance-specific source_ci_key + due_state.
+        let (title, priority, due_state, source_key): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT title, priority, metadata->>'due_state', metadata->>'source_ci_key' \
+                 FROM shift_queue WHERE item_type = 'recertification-overdue' AND resolved = false \
+                   AND metadata->>'campaign_id' = $1",
+            )
+            .bind(&overdue)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            title,
+            format!("Recertification overdue: test campaign {overdue}")
+        );
+        assert_eq!(priority, "P2");
+        assert_eq!(due_state, "overdue");
+        assert!(
+            source_key.starts_with(&format!("{overdue}@")),
+            "source_ci_key is instance-specific ({{id}}@{{start_ms}}): {source_key}"
+        );
+
+        // Cleanup.
+        for id in [&overdue, &future, &completed] {
+            sqlx::query("DELETE FROM shift_queue WHERE metadata->>'campaign_id' = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM recertification_campaigns WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// codex MAJOR fix lock: a STALE open item from a previous instance of a reused
+    /// campaign id (a DIFFERENT `{id}@{start}` key) must NOT suppress a genuinely-new
+    /// overdue campaign that reused the id.
+    #[tokio::test]
+    async fn recertification_scan_instance_key_does_not_suppress_reused_id() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let id = format!("arcamp-reused-{suffix}");
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+
+        // A STALE open item from a "previous instance" of this id — an OLD instance key.
+        let stale_meta = serde_json::json!({
+            "source_ci_key": format!("{id}@1"),
+            "campaign_id": id,
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('recertification-overdue', 'stale', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&stale_meta)
+        .execute(pool)
+        .await
+        .expect("seed stale item");
+
+        // A NEW overdue campaign instance that REUSES the id (start_date NOW()-60d, so its
+        // instance key `{id}@{micros}` differs from the stale `{id}@1`).
+        seed_recert_campaign(pool, &id, &past, "Active").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        run_job(&mut tx, "recertification_overdue_scan")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Both items are open: the stale one was NOT a dedup match for the new instance key.
+        assert_eq!(
+            open_recert_item_count(pool, &id).await,
+            2,
+            "a stale item with a different instance key must not suppress the new campaign"
+        );
+
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'campaign_id' = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM recertification_campaigns WHERE id = $1")
+            .bind(&id)
             .execute(pool)
             .await
             .ok();

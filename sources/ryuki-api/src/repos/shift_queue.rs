@@ -42,6 +42,11 @@ pub const SECRET_ROTATION_INVALID_ITEM_TYPE: &str = "secret-rotation-invalid-due
 /// past) its `expiry_date`. Fixed so the dedup key and the partial unique index agree.
 pub const LEGAL_HOLD_EXPIRY_ITEM_TYPE: &str = "legal-hold-expiring";
 
+/// The OVERDUE recertification-campaign signal (#12). An `Active` campaign past its
+/// `end_date`. The dedup `source_ci_key` is INSTANCE-specific (`{id}@{start_date_ms}`),
+/// not the bare campaign id, so a reused id never suppresses a new overdue campaign.
+pub const RECERTIFICATION_OVERDUE_ITEM_TYPE: &str = "recertification-overdue";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already
