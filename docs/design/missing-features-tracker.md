@@ -190,6 +190,24 @@ FK 23503 to 409. xmin CAS + NOT-EXISTS precheck in `repos::dr_plans::delete`
 (`DeleteOutcome`). Codex plan review 3 rounds + impl review 4 rounds. See
 dr-plan-delete.md.
 
+**Patch-wave DELETE** SHIPPED — `DELETE /api/maintain/patch/waves/{id}` completes
+patch-wave CRUD. VERIFY-FIRST corrected the swarm's "patch-wave CRUD" candidate:
+CREATE (`POST /api/maintain/patch/plan`) and UPDATE (the validate/approve/execute/
+verify lifecycle transitions) ALREADY existed — only DELETE was missing. Boundary
+(codex MAJOR): only an UNAPPROVED draft (`Draft`|`Validated`) is deletable —
+`Approved`/`Scheduled` (approver-reviewed; deleting them would cancel approve-tier
+work from the execute tier) and `InProgress`/`Completed`/`Failed` (executed; carry
+evidence) are blocked 409. The pure `patch_wave_status_deletable` classifier is the
+SINGLE source of truth, used by BOTH the handler 409 AND a repo-level `BlockedStatus`
+guard (codex MINOR, defense-in-depth). Status-CAS delete (`WHERE id=$1 AND
+status=$2`) closes the load→delete race; 0-row re-read disambiguates NotFound vs
+StaleStatus. `patch_wave_servers` cascade away (mig 010 ON DELETE CASCADE — plan
+membership, not execution evidence). execute-tier via the central gate (method-
+agnostic) + per-wave site/env scope guard (out-of-scope → 404, no oracle).
+Tombstone-rich audit. Codex plan(rd2)+impl APPROVE; impl-review MINORs both closed
+(audit before/after delta assertion; explicit DELETE route-gate test). See
+patch-wave-delete.md.
+
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
 #8 agent approve — revoke deferred (`6d6fb5b`), #63 observability deploy

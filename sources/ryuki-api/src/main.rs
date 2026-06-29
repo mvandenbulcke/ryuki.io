@@ -3570,6 +3570,16 @@ mod tests {
             route_permission_for(&Method::POST, "/api/identity/ad/delete/host1"),
             "execute"
         );
+        // patch-wave DELETE is operator-tier (execute) via the /api/maintain prefix —
+        // the method is irrelevant (route_permission_for ignores it), so the DELETE
+        // route inherits the same execute gate the patch mutations already enforce.
+        assert_eq!(
+            route_permission_for(
+                &Method::DELETE,
+                "/api/maintain/patch/waves/cccccccc-0000-0000-0000-0000000000c1"
+            ),
+            "execute"
+        );
         // request lifecycle split
         assert_eq!(
             route_permission_for(&Method::POST, "/api/requests"),

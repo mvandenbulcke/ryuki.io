@@ -292,3 +292,61 @@ pub async fn transition(
 
     Ok(res.rows_affected() > 0)
 }
+
+/// Only an UNAPPROVED-draft patch wave (`Draft`|`Validated`) may be DELETED: an
+/// `Approved`/`Scheduled` wave is approver-reviewed (deleting it is an approval-tier
+/// cancellation, out of scope for the delete slice), and an `InProgress`/`Completed`/
+/// `Failed` wave has executed (its run is evidence). SINGLE source of truth for the
+/// handler 409 gate AND the repo defense-in-depth guard below.
+pub fn patch_wave_status_deletable(status: &PatchWaveStatus) -> bool {
+    matches!(status, PatchWaveStatus::Draft | PatchWaveStatus::Validated)
+}
+
+/// Outcome of a patch-wave delete attempt (status CAS + deletability guard).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The wave row was deleted (its `patch_wave_servers` cascade with it).
+    Deleted,
+    /// No row with this id (already gone).
+    NotFound,
+    /// The row's status moved since it was read (CAS miss) — caller reloads.
+    StaleStatus,
+    /// `expected` is not a deletable status — defense-in-depth if a caller bypassed
+    /// the handler's `patch_wave_status_deletable` check.
+    BlockedStatus,
+}
+
+/// Delete a patch wave IFF it still matches `expected` (status CAS) AND `expected` is
+/// a deletable status. `patch_wave_servers` rows are removed by the DB
+/// (`ON DELETE CASCADE`, migration 010). On 0 rows we re-read to disambiguate
+/// `NotFound` vs `StaleStatus`.
+pub async fn delete(
+    conn: &mut PgConnection,
+    id: &str,
+    expected: &PatchWaveStatus,
+) -> Result<DeleteOutcome, sqlx::Error> {
+    if !patch_wave_status_deletable(expected) {
+        return Ok(DeleteOutcome::BlockedStatus);
+    }
+    let Ok(uid) = Uuid::parse_str(id) else {
+        return Ok(DeleteOutcome::NotFound);
+    };
+    let res = sqlx::query("DELETE FROM patch_waves WHERE id = $1 AND status = $2")
+        .bind(uid)
+        .bind(status_str(expected))
+        .execute(&mut *conn)
+        .await?;
+    if res.rows_affected() == 1 {
+        return Ok(DeleteOutcome::Deleted);
+    }
+    // 0 rows: the row is gone, or its status moved since the read.
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT status FROM patch_waves WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await?;
+    match current {
+        None => Ok(DeleteOutcome::NotFound),
+        Some(_) => Ok(DeleteOutcome::StaleStatus),
+    }
+}

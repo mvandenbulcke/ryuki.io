@@ -974,7 +974,10 @@ pub fn routes() -> Router {
         .route("/api/maintain/patch/verify", post(patch_verify))
         .route("/api/maintain/patch/reboot", post(patch_reboot))
         .route("/api/maintain/patch/waves", get(patch_waves_list))
-        .route("/api/maintain/patch/waves/{id}", get(patch_wave_get))
+        .route(
+            "/api/maintain/patch/waves/{id}",
+            get(patch_wave_get).delete(patch_wave_delete),
+        )
         .route("/api/maintain/patch/compliance", get(patch_compliance))
         .route(
             "/api/maintain/patch/pending-reboots",
@@ -8701,6 +8704,74 @@ async fn patch_wave_get(
         };
     }
     Err(status_404(&id))
+}
+
+/// DELETE /api/maintain/patch/waves/{id} — remove a mistaken patch wave. Only an
+/// UNAPPROVED draft (`Draft`/`Validated`) is deletable at this `execute`-tier route:
+/// an `Approved`/`Scheduled` wave is approver-reviewed (deleting it is an
+/// approval-tier cancellation — out of scope) and an `InProgress`/`Completed`/`Failed`
+/// wave has executed (its run is evidence). The `patch_wave_servers` rows cascade.
+async fn patch_wave_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let wave = crate::repos::patch_waves::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    // #2: an out-of-scope wave 404s exactly like a missing one (no existence oracle).
+    multi_scope_guard_or_404(&session, &wave.site_scope, &wave.environment_scope, &id)?;
+    if !crate::repos::patch_waves::patch_wave_status_deletable(&wave.status) {
+        return Err(status_409(
+            "only a Draft or Validated patch wave can be deleted (an approved/scheduled/executed wave cannot)",
+        ));
+    }
+    let before = crate::repos::patch_waves::status_str(&wave.status);
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    match crate::repos::patch_waves::delete(&mut tx, &id, &wave.status)
+        .await
+        .map_err(db_error)?
+    {
+        crate::repos::patch_waves::DeleteOutcome::Deleted => {
+            // Tombstone-rich audit: the row (and its cascade) is gone, so capture the
+            // wave's identity + scope + size for the durable trail.
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "patch-wave-delete",
+                    Some(before),
+                    "deleted",
+                    json!({
+                        "wave_id": &id,
+                        "name": &wave.name,
+                        "site_scope": &wave.site_scope,
+                        "environment_scope": &wave.environment_scope,
+                        "server_count": wave.servers.len(),
+                    }),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            Ok(Json(json!({ "deleted": id })))
+        }
+        crate::repos::patch_waves::DeleteOutcome::BlockedStatus => {
+            tx.rollback().await.ok();
+            Err(status_409("patch wave status does not permit deletion"))
+        }
+        crate::repos::patch_waves::DeleteOutcome::StaleStatus => {
+            tx.rollback().await.ok();
+            Err(status_409(
+                "patch wave changed concurrently; reload and retry",
+            ))
+        }
+        crate::repos::patch_waves::DeleteOutcome::NotFound => {
+            tx.rollback().await.ok();
+            Err(status_404(&id))
+        }
+    }
 }
 
 async fn patch_compliance(AuthExtractor(session): AuthExtractor) -> ApiResult {
@@ -41610,6 +41681,225 @@ mod db_lifecycle_tests {
                 .unwrap_or(false),
             "env-scoped compliance must be empty (site-keyed data cannot honor env): {compl_env}"
         );
+    }
+
+    // ── patch-wave DELETE (CRUD completion) ──────────────────────────────────
+
+    async fn seed_wave(pool: &PgPool, id: &str, status: &str, site: &str) {
+        sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO patch_waves (id, site, os_family, status, name, site_scope, environment_scope, schedule) \
+             VALUES ($1::uuid, $2, 'windows', $3, 'pwd-test', jsonb_build_array($2), '[\"production\"]'::jsonb, \
+                     '{\"start\":\"2099-01-01T00:00:00Z\",\"end\":\"2099-01-01T04:00:00Z\",\"maintenance_window\":\"Sat 00:00-04:00\",\"patch_group\":null}'::jsonb)",
+        )
+        .bind(id)
+        .bind(site)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed patch wave");
+    }
+
+    /// Pure deletability classifier: only an UNAPPROVED draft is deletable.
+    #[test]
+    fn patch_wave_status_deletable_only_unapproved_drafts() {
+        use crate::repos::patch_waves::patch_wave_status_deletable as d;
+        use ryuki_engine::models::PatchWaveStatus::*;
+        assert!(d(&Draft) && d(&Validated));
+        for s in [Approved, Scheduled, InProgress, Completed, Failed] {
+            assert!(!d(&s), "{s:?} must NOT be deletable");
+        }
+    }
+
+    /// Delete happy: a Draft wave + its child servers → 200; GET 404; the
+    /// patch_wave_servers rows cascade away; a patch-wave-delete audit row exists.
+    #[tokio::test]
+    async fn patch_wave_delete_happy_cascades_and_audits() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "cccccccc-0000-0000-0000-0000000000c1";
+        seed_wave(pool, id, "Draft", "DEFRA").await;
+        // Codex MINOR: count the audit rows for THIS wave_id before the delete so the
+        // assertion proves *this* delete wrote exactly one row — an EXISTS check could
+        // false-pass on a stale row left by a prior run of this fixed-id test.
+        let audit_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'patch-wave-delete' AND detail->>'wave_id' = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        for s in ["srv-a", "srv-b"] {
+            sqlx::query(
+                "INSERT INTO patch_wave_servers (wave_id, server_name, patch_status, reboot_required) \
+                 VALUES ($1::uuid, $2, 'pending', false)",
+            )
+            .bind(id)
+            .bind(s)
+            .execute(pool)
+            .await
+            .expect("seed child server");
+        }
+
+        let Json(body) = patch_wave_delete(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.to_string()),
+        )
+        .await
+        .expect("delete of a Draft wave must succeed");
+        assert_eq!(body["deleted"], id);
+
+        let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, 0, "the wave row is deleted");
+        let children: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM patch_wave_servers WHERE wave_id = $1::uuid")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(children, 0, "child servers cascade-delete");
+        let audit_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'patch-wave-delete' AND detail->>'wave_id' = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit_after,
+            audit_before + 1,
+            "exactly one patch-wave-delete audit row must be written by this delete"
+        );
+    }
+
+    /// Delete blocked for an Approved (approver-reviewed) and a Completed (executed)
+    /// wave → 409; the wave still exists.
+    #[tokio::test]
+    async fn patch_wave_delete_blocked_for_approved_and_executed() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for (id, status) in [
+            ("cccccccc-0000-0000-0000-0000000000c2", "Approved"),
+            ("cccccccc-0000-0000-0000-0000000000c3", "Completed"),
+        ] {
+            seed_wave(pool, id, status, "DEFRA").await;
+            let err = patch_wave_delete(
+                AuthExtractor(AuthSession::static_dry_run()),
+                Path(id.to_string()),
+            )
+            .await
+            .expect_err("delete of a non-draft wave must be refused");
+            assert_eq!(err.0, StatusCode::CONFLICT, "{status} → 409");
+            let still: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves WHERE id = $1::uuid")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(still, 1, "{status} wave must NOT be deleted");
+            sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    /// Delete unknown id → 404; out-of-scope wave → 404 (no oracle), wave intact.
+    #[tokio::test]
+    async fn patch_wave_delete_404_and_scope() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let unknown = uuid::Uuid::new_v4().to_string();
+        let err = patch_wave_delete(AuthExtractor(AuthSession::static_dry_run()), Path(unknown))
+            .await
+            .expect_err("unknown id must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        // Out-of-scope: a DEFRA-only Draft wave, a GBLON-scoped principal.
+        let id = "cccccccc-0000-0000-0000-0000000000c4";
+        seed_wave(pool, id, "Draft", "DEFRA").await;
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        let err = patch_wave_delete(AuthExtractor(gblon), Path(id.to_string()))
+            .await
+            .expect_err("out-of-scope delete must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(still, 1, "out-of-scope wave must be untouched");
+        sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Repo-level (codex MINOR): the status CAS + deletability guard. A stale expected
+    /// status (the row moved) → StaleStatus; a non-deletable expected status →
+    /// BlockedStatus even if a caller bypassed the handler check.
+    #[tokio::test]
+    async fn patch_wave_delete_repo_stale_and_blocked() {
+        use ryuki_engine::models::PatchWaveStatus;
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "cccccccc-0000-0000-0000-0000000000c5";
+        seed_wave(pool, id, "Validated", "DEFRA").await;
+
+        // BlockedStatus: a non-deletable expected status is refused by the repo.
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let out = crate::repos::patch_waves::delete(&mut tx, id, &PatchWaveStatus::Completed)
+                .await
+                .unwrap();
+            tx.rollback().await.ok();
+            assert_eq!(out, crate::repos::patch_waves::DeleteOutcome::BlockedStatus);
+        }
+        // StaleStatus: the row is Validated, but we pass Draft (deletable) → the CAS
+        // misses (status != 'Draft') → re-read finds the row → StaleStatus.
+        {
+            let mut tx = pool.begin().await.unwrap();
+            let out = crate::repos::patch_waves::delete(&mut tx, id, &PatchWaveStatus::Draft)
+                .await
+                .unwrap();
+            tx.rollback().await.ok();
+            assert_eq!(out, crate::repos::patch_waves::DeleteOutcome::StaleStatus);
+        }
+        // The wave is untouched (both attempts rolled back / missed).
+        let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(still, 1);
+        sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #2 RBAC: the legal-hold handlers are site-scoped, each failing closed with
