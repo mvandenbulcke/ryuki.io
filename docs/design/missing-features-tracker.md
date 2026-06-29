@@ -230,6 +230,18 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**CMDB CI GET** SHIPPED — `GET /api/cmdb/cis/{ci_name}` (verify-first swarm 2026-06-29
+#18). The `configuration_items` table (mig 014) was SEEDED but NO API/repo read it — every
+`/api/cmdb/*` endpoint served an in-memory mock (the impact graph) or a hardcoded export.
+This is the FIRST authenticated, DB-backed CMDB read. New `repos/configuration_items.rs`
+(get_by_name by the UNIQUE ci_name — consistent with the impact endpoints' {ci_name}). codex
+MAJOR: the central read gate is `audit OR request`, so the handler adds an EXPLICIT
+`check_permission("audit")` → audit-only (CI criticality/owner are inventory signals). Site-
+scoped via `site_scope_guard_or_404` (out-of-scope → 404, no oracle); 503 with no DB (the
+table is the only CI source). A ci_name with a `/` won't route as one matchit segment
+(documented; the body returns `id` for a future by-UUID variant). codex plan(NEEDS-CHANGES→
+fixed)+impl APPROVE. See cmdb-ci-get.md.
+
 **Bulk alert acknowledge** SHIPPED — `POST /api/events/alerts/batch/ack` (verify-first
 swarm 2026-06-29 #19). Only single-event ack existed (operators cleared alerts one-by-one).
 Mirrors the #17 requests_batch_* pattern: extracted an `ack_alert_one` core (the per-event

@@ -1238,6 +1238,7 @@ pub fn routes() -> Router {
         .route("/api/observe/logs/disable/{hostname}", post(logs_disable))
         .route("/api/observe/logs-contract", get(logs_contract))
         // ─── CMDB Engine ───
+        .route("/api/cmdb/cis/{ci_name}", get(cmdb_ci_get))
         .route("/api/cmdb/import", post(cmdb_import_records))
         .route("/api/cmdb/reconcile", post(cmdb_run_reconciliation))
         .route("/api/cmdb/export", get(cmdb_export_records))
@@ -28043,6 +28044,36 @@ async fn cmdb_export_records(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 
+/// GET /api/cmdb/cis/{ci_name} — read one configuration item from the REAL
+/// `configuration_items` table by its unique `ci_name` (#18). The FIRST authenticated,
+/// DB-backed CMDB read — the impact/export endpoints serve an in-memory mock. AUDIT-tier
+/// (an explicit check, NOT the central gate's looser `audit OR request`): CI criticality
+/// and owner are inventory signals, kept audit-grade. Site-scoped (out-of-scope → 404, no
+/// oracle), like `certificates_get`. 503 with no DB (the table is the only CI source).
+/// NOTE: a `ci_name` containing `/` will not route as one path segment (404) — a by-UUID
+/// variant (the response carries `id`) is the follow-up for such names.
+async fn cmdb_ci_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(ci_name): Path<String>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(
+                json!({"error": "Audit-tier access is required to read CMDB configuration items"}),
+            ),
+        ));
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let ci = crate::repos::configuration_items::get_by_name(pool, &ci_name)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&ci_name))?;
+    // #2: site-only — an out-of-scope CI 404s exactly like a missing one (no oracle).
+    site_scope_guard_or_404(&session, &ci.site, &ci_name)?;
+    Ok(Json(serde_json::to_value(&ci).unwrap_or_default()))
+}
+
 // ─── Inventory Sync handlers ───
 
 async fn inventory_run_sync(
@@ -39292,6 +39323,37 @@ mod unit_tests {
         );
     }
 
+    /// #18: CMDB CI GET is AUDIT-only — a `request`-only principal is 403'd BEFORE any DB
+    /// access (codex MAJOR); an audit principal with no DB gets 503 (the table is the only
+    /// CI source). Both resolve without a global pool.
+    #[tokio::test]
+    async fn cmdb_ci_get_rbac_403_and_no_db_503() {
+        // A request-only Requester (no audit, not a superuser) → 403.
+        let requester = AuthSession {
+            user_id: "req-user".into(),
+            display_name: "R".into(),
+            roles: vec![ryuki_engine::auth::APP_ROLE_REQUESTER.to_string()],
+            token_valid: true,
+            provider_mode: "local".into(),
+            ..Default::default()
+        };
+        let denied = cmdb_ci_get(AuthExtractor(requester), Path("any-ci".into())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "a request-only principal must 403 (audit-only): {denied:?}"
+        );
+        // An audit-holder with no DB → 503 (the permission check precedes get_db).
+        let no_db = cmdb_ci_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("any-ci".into()),
+        )
+        .await;
+        assert!(
+            matches!(no_db, Err((StatusCode::SERVICE_UNAVAILABLE, _))),
+            "no DB must 503: {no_db:?}"
+        );
+    }
+
     // ── approval-decisions ledger read — auth / no-DB / malformed (no global pool) ──
 
     #[tokio::test]
@@ -41068,6 +41130,67 @@ mod db_lifecycle_tests {
 
         sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
             .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #18: CMDB CI GET reads the real configuration_items table by ci_name — 200 with
+    /// the full record for an in-scope audit principal; 404 for an unknown name AND for an
+    /// out-of-scope CI (no oracle).
+    #[tokio::test]
+    async fn cmdb_ci_get_happy_unknown_and_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let ci_name = format!("ci-test-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO configuration_items (ci_name, ci_type, criticality, site, owner) \
+             VALUES ($1, 'Server', 'High', 'GBLON', 'team-x')",
+        )
+        .bind(&ci_name)
+        .execute(pool)
+        .await
+        .expect("seed CI");
+
+        // Happy: an unscoped audit principal reads the full record.
+        let Json(body) = cmdb_ci_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(ci_name.clone()),
+        )
+        .await
+        .expect("CI get must succeed");
+        assert_eq!(body["ci_name"], json!(ci_name));
+        assert_eq!(body["ci_type"], json!("Server"));
+        assert_eq!(body["criticality"], json!("High"));
+        assert_eq!(body["site"], json!("GBLON"));
+        assert_eq!(body["owner"], json!("team-x"));
+        assert!(body["id"].as_str().is_some(), "the UUID id is returned");
+
+        // Unknown ci_name → 404.
+        let unknown = cmdb_ci_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(format!("nope-{}", Uuid::new_v4())),
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err((StatusCode::NOT_FOUND, _))),
+            "{unknown:?}"
+        );
+
+        // Out-of-scope: a DEFRA-scoped audit principal can't see the GBLON CI → 404.
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let oos = cmdb_ci_get(AuthExtractor(defra), Path(ci_name.clone())).await;
+        assert!(
+            matches!(oos, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope CI must 404 (no oracle): {oos:?}"
+        );
+
+        sqlx::query("DELETE FROM configuration_items WHERE ci_name = $1")
+            .bind(&ci_name)
             .execute(pool)
             .await
             .ok();

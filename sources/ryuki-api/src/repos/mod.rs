@@ -17,6 +17,7 @@ pub mod aiops;
 pub mod backup_coverage_reports;
 pub mod certificates;
 pub mod compliance_reporting;
+pub mod configuration_items;
 pub mod container_namespace;
 pub mod cost_capacity;
 pub mod datacenter_readiness;
