@@ -26,10 +26,12 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
 ## CONFIRMED, open — security / audit (NON-hot-path)
 - **Integration-connection MUTATION handlers write no audit_log row** (H/S): only `integration_test`
   audits (integration.rs:1114); create/update/delete/circuit_reset/set_credential_expiry mutate
-  credential-bearing connections with NO forensic trail. Slice: add `audit::record_audit` to each
-  (richest for the destructive `integration_delete` via `DELETE … RETURNING` for the detail).
-  NOTE: create/update are multi-branch tx-bearing handlers — careful, separate work.
-  (The companion "no site-scope guard" finding is MOOT: admin = superuser in this RBAC.)
+  credential-bearing connections with NO forensic trail. ✅ DELETE SHIPPED (352c80b) — atomic
+  DELETE+audit (tx + `DELETE … RETURNING` + record_audit_tx; engine `delete_connection_returning`
+  fixes the no-DB TOCTOU; secret-safe detail). codex plan+impl APPROVE. See
+  integration-delete-audit.md. STILL OPEN: create/update/circuit_reset/set_credential_expiry
+  (multi-branch tx-bearing handlers — careful, separate work). (The companion "no site-scope guard"
+  finding is MOOT: admin = superuser in this RBAC.)
 
 ## CONFIRMED, open — scheduled automation (the durable-scheduler scan pattern, now shipped 3×)
 Each is an on-demand `…/expiring` endpoint with NO proactive scan job — the exact pattern
