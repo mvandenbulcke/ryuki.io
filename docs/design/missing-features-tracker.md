@@ -230,6 +230,21 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Legal-hold expiry scan** SHIPPED — `legal_hold_expiry_scan` durable-scheduler job
+(verify-first swarm 2026-06-29 #17). Mirrors `secret_rotation_due_scan` but SIMPLER
+(`legal_holds.expiry_date` is a real TIMESTAMPTZ — no parse/malformed signal). Daily
+SAFE-INTERNAL-WRITE scan enumerates Active holds within 30 days of (or past) expiry — the
+SAME predicate as GET /legal-hold/expiring — classifies via pure
+`legal_hold::classify_legal_hold_expiry` and enqueues ONE deduped shift_queue item per
+hold; NEVER mutates hold state (release/expire is a deliberate audited human action).
+codex MAJOR (boundary/clock): classifier upper bound INCLUSIVE to match the SQL `<=`, PLUS
+an `is_actionable` guard so a clock-skew row never yields an `active`-verdict item.
+SECRET-HYGIENE: NEVER selects/surfaces the sensitive `reason`/`audit_trail`; the verdict is
+keyed `expiry_state` (not `reason`, to avoid the column collision). Cross-tier: shift-queue
+reads are execute-tier ⊆ legal-hold audit-tier readers (now pinned by a pure
+`execute_holders_also_hold_audit` invariant test). mig 126 seeds the schedule + a partial
+unique index. codex plan(NEEDS-CHANGES→all folded)+impl APPROVE. See legal-hold-expiry-scan.md.
+
 **Secret-rotation-due scan** SHIPPED — `secret_rotation_due_scan` durable-scheduler job
 (verify-first swarm 2026-06-29 #7). `managed_secrets.next_rotation_due` existed but only
 the on-demand `GET /secrets/due` surfaced overdue secrets. New daily SAFE-INTERNAL-WRITE

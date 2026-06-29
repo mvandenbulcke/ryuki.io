@@ -26,7 +26,7 @@ PARTIAL = some exists, a specific additive slice is missing.
 | 14 | M | S | CONFIRMED | Certificate DELETE endpoint — repos/certificates.rs has no delete(); mirror patch-wave-delete pattern. ✅ SHIPPED — DELETE /api/maintain/certificates/{id}, only TERMINAL (Expired/Revoked) deletable; status+site CAS; leaf table (no cascade); tombstone audit. codex plan+impl APPROVE. See certificate-delete.md. |
 | 15 | M | M | CONFIRMED | Job prioritization / fair queuing per platform — dispatch is FIFO by created_at; no priority column |
 | 16 | M | M | CONFIRMED | Job execution deadline (distinct from lease TTL) + SLA tracking — only the 300s lease boundary exists |
-| 17 | M | M | CONFIRMED | Scheduled scan for legal-hold expiry — GET /legal-hold/expiring is on-demand; no scheduler job kind |
+| 17 | M | M | CONFIRMED | Scheduled scan for legal-hold expiry — GET /legal-hold/expiring is on-demand; no scheduler job kind. ✅ SHIPPED — `legal_hold_expiry_scan` durable-scheduler job (mig 126); inclusive-boundary classifier + is_actionable guard (no clock-skew 'active' item); secret-hygiene (NEVER surfaces the hold `reason`; cross-tier safe via execute⊆audit, now invariant-tested). codex plan(NEEDS-CHANGES→fixed)+impl APPROVE. See legal-hold-expiry-scan.md. |
 | 18 | M | M | CONFIRMED | CMDB CI GET endpoint (GET /api/cmdb/cis/{id}) — configuration_items table seeded but no API/repo reads it; impact graph is in-memory mock |
 | 19 | M | M | CONFIRMED | Bulk alert acknowledge/suppress (POST /api/events/alerts/batch/ack) — only single-event ack; mirror requests_batch_* |
 

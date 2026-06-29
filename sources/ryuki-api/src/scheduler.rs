@@ -481,6 +481,90 @@ async fn run_job(
                 )),
             ))
         }
+        "legal_hold_expiry_scan" => {
+            // Safe-internal write (#17): surface Active legal holds within 30 days of (or
+            // past) their expiry as deduped shift_queue work — mirrors the on-demand
+            // /api/protect/legal-hold/expiring predicate. Reads legal_holds, writes only
+            // our own shift_queue — NO state change to the hold (releasing/expiring a hold
+            // is a deliberate audited human action). All on `tx`. SECRET HYGIENE: the
+            // SELECT NEVER reads `reason` (sensitive litigation/investigation free text)
+            // or `audit_trail` — only operator-triage identity. Shift-queue readers are
+            // `execute`-tier ⊆ the `audit`-tier legal-hold readers, so name/type are safe.
+            #[derive(sqlx::FromRow)]
+            struct LegalHoldScanRow {
+                id: String,
+                server_or_app_name: String,
+                hold_type: String,
+                expiry_date: chrono::DateTime<chrono::Utc>,
+                site: String,
+            }
+            // The DB filters to the actionable window (TIMESTAMPTZ <= NOW()+30d — safe,
+            // no string cast). The classifier then sets expired-vs-soon AND double-guards
+            // against DB/Rust clock skew (codex MAJOR: a near-edge row that classifies
+            // Active is skipped — a queue item never carries an `active` verdict).
+            let rows: Vec<LegalHoldScanRow> = sqlx::query_as(
+                "SELECT id, server_or_app_name, hold_type, expiry_date, site FROM legal_holds \
+                 WHERE status = 'Active' AND expiry_date <= NOW() + INTERVAL '30 days' \
+                 ORDER BY id",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let soon_window_ms: i64 = 30 * 86_400_000;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                let verdict = ryuki_engine::legal_hold::classify_legal_hold_expiry(
+                    row.expiry_date.timestamp_millis(),
+                    now_ms,
+                    soon_window_ms,
+                );
+                // Belt-and-suspenders against clock skew: never enqueue a non-actionable
+                // (active) verdict even if SQL selected it near the window edge.
+                if !verdict.is_actionable() {
+                    continue;
+                }
+                let state = verdict.as_str();
+                // server_or_app_name + hold_type are operator-triage identity (safe for
+                // the execute-tier queue); the hold `reason`/`audit_trail` are NEVER here.
+                let title = format!("Legal hold {state}: {}", row.server_or_app_name);
+                let description = format!(
+                    "{} legal hold on '{}' ({}, {}) — expiry {}. Decide to release or extend.",
+                    row.hold_type,
+                    row.server_or_app_name,
+                    row.site,
+                    state,
+                    row.expiry_date.to_rfc3339()
+                );
+                let metadata = serde_json::json!({
+                    "source_ci_key": row.id,
+                    "name": row.server_or_app_name,
+                    "hold_type": row.hold_type,
+                    "site": row.site,
+                    "expiry_date": row.expiry_date.to_rfc3339(),
+                    // `expiry_state` (NOT `reason`) — legal_holds has a sensitive `reason`
+                    // column, so the verdict uses a distinct key (codex MINOR).
+                    "expiry_state": state,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::LEGAL_HOLD_EXPIRY_ITEM_TYPE,
+                    &row.id,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("enqueued {enqueued} expiring legal hold(s)")),
+            ))
+        }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
         other => Ok((
             "skipped".to_string(),
@@ -2064,6 +2148,253 @@ mod db_tests {
                 .ok();
         }
         restore_migration_secret_scan(pool).await;
+    }
+
+    // ---- #17 legal_hold_expiry_scan ----------------------------------------
+
+    /// The migration-126-seeded legal_hold_expiry_scan id (disabled in tests).
+    const LEGAL_HOLD_SCAN_SEED_ID: &str = "77777777-7777-4777-8777-777777777777";
+
+    /// Seed one Active/Released legal hold with the given expiry. The `reason` is a
+    /// recognizable SENSITIVE marker so the hygiene test can assert it never leaks into
+    /// the shift_queue item.
+    async fn seed_legal_hold(
+        pool: &PgPool,
+        id: &str,
+        status: &str,
+        expiry: chrono::DateTime<chrono::Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO legal_holds \
+             (id, server_or_app_name, hold_type, reason, initiated_by, expiry_date, status, site) \
+             VALUES ($1, $2, 'Litigation', 'SENSITIVE-litigation-detail-must-not-leak', \
+                     'legal-team', $3, $4, 'GBLON')",
+        )
+        .bind(id)
+        .bind(format!("asset-{id}"))
+        .bind(expiry)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed legal hold");
+    }
+
+    async fn seed_due_legal_hold_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(LEGAL_HOLD_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-legalholdscan-due-7a4";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test legal hold scan', 'legal_hold_expiry_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    async fn restore_migration_legal_hold_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(LEGAL_HOLD_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn open_lh_item_count(pool: &PgPool, id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'legal-hold-expiring' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_legal_hold(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM legal_holds WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Active holds that are EXPIRED or EXPIRING-SOON (≤30d) are enqueued with the right
+    /// expiry_state; FAR-FUTURE + RELEASED holds are NOT; the sensitive `reason` NEVER
+    /// leaks into the item; no item carries an `active` verdict.
+    #[tokio::test]
+    async fn legal_hold_scan_enqueues_and_protects_reason() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let expired = format!("lh-expired-{suffix}");
+        let soon = format!("lh-soon-{suffix}");
+        let far = format!("lh-far-{suffix}");
+        let released = format!("lh-released-{suffix}");
+        // Seed comfortably away from the 30d boundary to avoid wall-clock edge flakiness.
+        seed_legal_hold(pool, &expired, "Active", now - chrono::Duration::days(2)).await;
+        seed_legal_hold(pool, &soon, "Active", now + chrono::Duration::days(10)).await;
+        seed_legal_hold(pool, &far, "Active", now + chrono::Duration::days(60)).await;
+        seed_legal_hold(pool, &released, "Released", now - chrono::Duration::days(2)).await;
+
+        let sched_id = seed_due_legal_hold_scan(pool).await;
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "the planted legal-hold scan ran");
+
+        assert_eq!(
+            open_lh_item_count(pool, &expired).await,
+            1,
+            "expired enqueued"
+        );
+        assert_eq!(
+            open_lh_item_count(pool, &soon).await,
+            1,
+            "expiring-soon enqueued"
+        );
+        assert_eq!(
+            open_lh_item_count(pool, &far).await,
+            0,
+            "far-future NOT enqueued"
+        );
+        assert_eq!(
+            open_lh_item_count(pool, &released).await,
+            0,
+            "released NOT enqueued"
+        );
+
+        // expiry_state verdicts are correct (and there is NO 'active' verdict anywhere).
+        let state = |id: String| async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT metadata->>'expiry_state' FROM shift_queue \
+                 WHERE item_type = 'legal-hold-expiring' AND metadata->>'source_ci_key' = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(state(expired.clone()).await, "expired");
+        assert_eq!(state(soon.clone()).await, "expiring_soon");
+        let active_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue WHERE item_type = 'legal-hold-expiring' \
+             AND metadata->>'expiry_state' = 'active'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_items, 0,
+            "no queue item ever carries an 'active' verdict"
+        );
+
+        // Secret hygiene: the sensitive hold `reason` NEVER appears in the item (title,
+        // description, or metadata) — only operator-triage identity is surfaced.
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue WHERE item_type = 'legal-hold-expiring' \
+             AND (title LIKE '%SENSITIVE-litigation%' OR description LIKE '%SENSITIVE-litigation%' \
+                  OR metadata::text LIKE '%SENSITIVE-litigation%')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "the hold reason must NEVER leak into the work item"
+        );
+
+        // Aggregate detail format.
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'legal_hold_expiry_scan' \
+               AND status = 'succeeded' ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let count = detail
+            .strip_prefix("enqueued ")
+            .and_then(|s| s.strip_suffix(" expiring legal hold(s)"));
+        assert!(
+            count.is_some_and(|n| n.parse::<u64>().is_ok()),
+            "detail must be 'enqueued <N> expiring legal hold(s)': {detail:?}"
+        );
+
+        for id in [&expired, &soon, &far, &released] {
+            cleanup_legal_hold(pool, id).await;
+        }
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_legal_hold_scan(pool).await;
+    }
+
+    /// A second tick (re-planted due) does NOT duplicate the open item (dedup).
+    #[tokio::test]
+    async fn legal_hold_scan_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = format!("lh-dedup-{}", uuid::Uuid::new_v4());
+        seed_legal_hold(
+            pool,
+            &id,
+            "Active",
+            chrono::Utc::now() - chrono::Duration::days(3),
+        )
+        .await;
+
+        let s1 = seed_due_legal_hold_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_lh_item_count(pool, &id).await,
+            1,
+            "first tick enqueues one"
+        );
+
+        let s2 = seed_due_legal_hold_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_lh_item_count(pool, &id).await,
+            1,
+            "second tick does not duplicate"
+        );
+
+        cleanup_legal_hold(pool, &id).await;
+        for s in [&s1, &s2] {
+            sqlx::query("DELETE FROM schedules WHERE id = $1")
+                .bind(s)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        restore_migration_legal_hold_scan(pool).await;
     }
 
     /// Seed one restore_request with EXPLICIT `updated_at` AND `created_at`

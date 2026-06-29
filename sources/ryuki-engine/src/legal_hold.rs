@@ -424,9 +424,99 @@ pub fn check_compliance(server_name: &str) -> Result<ComplianceResult, String> {
     })
 }
 
+/// Expiry recency for the `legal_hold_expiry_scan` durable-scheduler job (#17) — the
+/// pure classifier that decides whether an Active hold needs operator attention.
+/// Mirrors `secrets_rotation::SecretRotationRecency`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegalHoldExpiry {
+    /// `expiry_date` is comfortably in the future — no action needed.
+    Active,
+    /// `expiry_date` is within the soon-window (decide to release or extend).
+    ExpiringSoon,
+    /// `expiry_date` has been reached or passed — overdue for release/extension.
+    Expired,
+}
+
+impl LegalHoldExpiry {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LegalHoldExpiry::Active => "active",
+            LegalHoldExpiry::ExpiringSoon => "expiring_soon",
+            LegalHoldExpiry::Expired => "expired",
+        }
+    }
+    pub fn is_actionable(&self) -> bool {
+        matches!(
+            self,
+            LegalHoldExpiry::ExpiringSoon | LegalHoldExpiry::Expired
+        )
+    }
+}
+
+/// Classify an Active legal hold's expiry from its `expiry_date` and "now", BOTH as
+/// epoch MILLISECONDS, with a `soon_window_ms` lead time. Reached/passed (`now >=
+/// expiry`) → `Expired`; within the window (`now < expiry <= now + soon_window`, upper
+/// bound INCLUSIVE to match the SQL `expiry_date <= NOW() + INTERVAL '30 days'`) →
+/// `ExpiringSoon`; further out → `Active`. Pure, no IO.
+pub fn classify_legal_hold_expiry(
+    expiry_unix_ms: i64,
+    now_unix_ms: i64,
+    soon_window_ms: i64,
+) -> LegalHoldExpiry {
+    if now_unix_ms >= expiry_unix_ms {
+        LegalHoldExpiry::Expired
+    } else if expiry_unix_ms <= now_unix_ms.saturating_add(soon_window_ms) {
+        LegalHoldExpiry::ExpiringSoon
+    } else {
+        LegalHoldExpiry::Active
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DAY_MS: i64 = 86_400_000;
+
+    #[test]
+    fn classify_legal_hold_expiry_boundaries() {
+        let now = 1_000_000_000_000;
+        let window = 30 * DAY_MS;
+        // Already past → Expired; the exact boundary (now == expiry) is Expired.
+        assert_eq!(
+            classify_legal_hold_expiry(now - DAY_MS, now, window),
+            LegalHoldExpiry::Expired
+        );
+        assert_eq!(
+            classify_legal_hold_expiry(now, now, window),
+            LegalHoldExpiry::Expired,
+            "now == expiry is Expired (boundary)"
+        );
+        // Within 30d → ExpiringSoon, INCLUDING exactly now+window (inclusive upper).
+        assert_eq!(
+            classify_legal_hold_expiry(now + 10 * DAY_MS, now, window),
+            LegalHoldExpiry::ExpiringSoon
+        );
+        assert_eq!(
+            classify_legal_hold_expiry(now + window, now, window),
+            LegalHoldExpiry::ExpiringSoon,
+            "exactly now+window is ExpiringSoon (inclusive, matches the SQL <=)"
+        );
+        // Beyond the window → Active (not actionable).
+        assert_eq!(
+            classify_legal_hold_expiry(now + window + 1, now, window),
+            LegalHoldExpiry::Active
+        );
+        assert_eq!(
+            classify_legal_hold_expiry(now + 60 * DAY_MS, now, window),
+            LegalHoldExpiry::Active
+        );
+        assert!(LegalHoldExpiry::Expired.is_actionable());
+        assert!(LegalHoldExpiry::ExpiringSoon.is_actionable());
+        assert!(!LegalHoldExpiry::Active.is_actionable());
+        assert_eq!(LegalHoldExpiry::ExpiringSoon.as_str(), "expiring_soon");
+    }
 
     #[test]
     fn test_place_hold_success() {

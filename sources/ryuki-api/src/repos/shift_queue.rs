@@ -38,6 +38,10 @@ pub const SECRET_ROTATION_DUE_ITEM_TYPE: &str = "secret-rotation-due";
 /// index always agree.
 pub const SECRET_ROTATION_INVALID_ITEM_TYPE: &str = "secret-rotation-invalid-due";
 
+/// The EXPIRING/EXPIRED legal-hold signal (#17). An Active hold within 30 days of (or
+/// past) its `expiry_date`. Fixed so the dedup key and the partial unique index agree.
+pub const LEGAL_HOLD_EXPIRY_ITEM_TYPE: &str = "legal-hold-expiring";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

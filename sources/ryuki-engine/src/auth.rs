@@ -577,6 +577,29 @@ mod tests {
         assert_eq!(auditor.permissions, vec!["audit"]);
     }
 
+    /// Invariant: every role that holds `execute` ALSO holds `audit`. This is what
+    /// makes the shift-queue model sound — the queue reads at the `execute` tier
+    /// (is_execute_read_path), and scans surface OTHER domains' identity data there
+    /// (e.g. #17 legal-hold names/types, whose own reads are `audit`-tier). Because
+    /// every execute-holder is also an audit-holder, an execute-tier queue reader can
+    /// already read those audit-tier domains directly — so the queue is never a
+    /// cross-tier leak. If a future role were given `execute` WITHOUT `audit`, that
+    /// premise (and the legal-hold/secret/restore scan hygiene argument) would break —
+    /// this test fails loudly first.
+    #[test]
+    fn execute_holders_also_hold_audit() {
+        for role in get_rbac_roles() {
+            if role.permissions.iter().any(|p| p == "execute") {
+                assert!(
+                    role.permissions.iter().any(|p| p == "audit"),
+                    "role {:?} holds execute but NOT audit — this breaks the shift-queue \
+                     execute-read cross-tier hygiene invariant",
+                    role.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_platform_admin_is_superuser() {
         // PlatformAdmin's role permissions are [admin, approve, audit] — it does
