@@ -548,7 +548,7 @@ pub async fn poll_job(Path(agent_id): Path<String>, headers: HeaderMap) -> impl 
          WHERE id = ( \
              SELECT id FROM agent_jobs \
              WHERE platform = $6 AND status = 'Pending' \
-             ORDER BY created_at \
+             ORDER BY priority DESC, created_at, id \
              FOR UPDATE SKIP LOCKED \
              LIMIT 1 \
          ) \
@@ -2630,6 +2630,81 @@ pub async fn admin_requeue_dead_lettered_job(
     ))
 }
 
+/// Body for POST /api/admin/agents/jobs/{job_id}/priority (#15).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetJobPriorityBody {
+    priority: i32,
+}
+
+/// POST /api/admin/agents/jobs/{job_id}/priority — re-prioritize a PENDING agent job (#15).
+/// Admin-tier. Only a Pending (not-yet-leased) job is reprioritizable — a leased/running/
+/// terminal job's queue priority is moot, so the UPDATE CASes on `status = 'Pending'`.
+/// Higher = more urgent (0..=9). Audited.
+pub async fn admin_set_job_priority(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<SetJobPriorityBody>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to reprioritize a job",
+        ));
+    }
+    if !(0..=9).contains(&body.priority) {
+        return Err(bad_request("priority must be between 0 and 9"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+    // Status CAS: only a pending job is reprioritizable.
+    let updated: Option<(String, i32)> = sqlx::query_as(
+        "UPDATE agent_jobs SET priority = $1, updated_at = NOW() \
+         WHERE id = $2 AND status = 'Pending' RETURNING status, priority",
+    )
+    .bind(body.priority)
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    match updated {
+        Some((status, priority)) => {
+            crate::audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &crate::audit::security_audit(
+                    "agent-job-reprioritize",
+                    None,
+                    "reprioritized",
+                    json!({ "job_id": &job_id, "priority": priority }),
+                ),
+            )
+            .await
+            .map_err(db_err)?;
+            tx.commit().await.map_err(db_err)?;
+            tracing::info!(job_id = %job_id, priority, "agent job reprioritized");
+            Ok(Json(
+                json!({ "job_id": job_id, "status": status, "priority": priority }),
+            ))
+        }
+        None => {
+            tx.rollback().await.ok();
+            // 0 rows: the job is gone, or it is no longer Pending.
+            let current: Option<String> =
+                sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+                    .bind(uid)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(db_err)?;
+            match current {
+                None => Err(not_found(format!("agent job '{job_id}' not found"))),
+                Some(_) => Err(conflict("only a pending agent job can be reprioritized")),
+            }
+        }
+    }
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -2662,6 +2737,12 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/dead-lettered-jobs/{job_id}/requeue",
             post(admin_requeue_dead_lettered_job),
+        )
+        // Static `jobs` in the `{agent_id}` slot — matchit routes the literal over the
+        // param (same pattern as `liveness`/`dead-lettered-jobs`).
+        .route(
+            "/api/admin/agents/jobs/{job_id}/priority",
+            post(admin_set_job_priority),
         )
 }
 
@@ -3213,7 +3294,7 @@ mod tests {
                  cp_nonce = $4, lease_deadline = $5, updated_at = NOW() \
              WHERE id = ( \
                  SELECT id FROM agent_jobs WHERE platform = $6 AND status = 'Pending' \
-                 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1 \
+                 ORDER BY priority DESC, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING {AGENT_JOB_COLUMNS}"
         ))
         .bind(&agent_id)
@@ -3329,7 +3410,7 @@ mod tests {
                  cp_nonce = $4, lease_deadline = $5, updated_at = NOW() \
              WHERE id = ( \
                  SELECT id FROM agent_jobs WHERE platform = $6 AND status = 'Pending' \
-                 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1 \
+                 ORDER BY priority DESC, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING {AGENT_JOB_COLUMNS}"
         ))
         .bind(&agent_id)
@@ -4278,7 +4359,7 @@ mod tests {
                  updated_at = NOW() \
              WHERE id = ( \
                  SELECT id FROM agent_jobs WHERE platform = $6 AND status = 'Pending' \
-                 ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1 \
+                 ORDER BY priority DESC, created_at, id FOR UPDATE SKIP LOCKED LIMIT 1 \
              ) RETURNING {AGENT_JOB_COLUMNS}"
         ))
         .bind(agent_id)
@@ -7944,6 +8025,167 @@ mod tests {
 
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
+    }
+
+    /// #15: dispatch orders by priority DESC, then created_at (FIFO), then id — a higher-
+    /// priority job leases before an OLDER lower-priority one; equal priority falls back to
+    /// FIFO; and a freshly-inserted job inherits the migration default priority 5.
+    #[tokio::test]
+    async fn agent_job_dispatch_prefers_priority_then_fifo() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-prio-{}", Uuid::new_v4().simple());
+        let j_old = seed_pending_job(pool, &platform).await;
+        let j_new = seed_pending_job(pool, &platform).await;
+
+        // The migration default is applied to a job inserted without a priority.
+        let def: i32 = sqlx::query_scalar("SELECT priority FROM agent_jobs WHERE id = $1")
+            .bind(j_old)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(def, 5, "the migration default priority is 5");
+
+        // j_old: OLDER + LOW priority; j_new: newer + HIGH priority.
+        sqlx::query(
+            "UPDATE agent_jobs SET priority = 2, created_at = NOW() - INTERVAL '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(j_old)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_jobs SET priority = 8 WHERE id = $1")
+            .bind(j_new)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let dispatch = |plat: String| async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM agent_jobs WHERE platform = $1 AND status = 'Pending' \
+                 ORDER BY priority DESC, created_at, id LIMIT 1",
+            )
+            .bind(plat)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        };
+        // Priority beats FIFO: the newer-but-higher-priority job dispatches first.
+        assert_eq!(
+            dispatch(platform.clone()).await,
+            j_new,
+            "the higher-priority job dispatches first despite a later created_at"
+        );
+
+        // Equal priority → FIFO: the OLDER job wins.
+        sqlx::query("UPDATE agent_jobs SET priority = 5 WHERE id = ANY($1)")
+            .bind(vec![j_old, j_new])
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatch(platform.clone()).await,
+            j_old,
+            "equal priority falls back to FIFO (oldest first)"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+    }
+
+    /// #15: POST .../jobs/{id}/priority reprioritizes a PENDING job (audited); a non-admin
+    /// is 403; an out-of-range priority is 400; a non-pending job is 409; an unknown id is
+    /// 404.
+    #[tokio::test]
+    async fn agent_job_reprioritize_pending_only_and_guards() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-rp-{}", Uuid::new_v4().simple());
+        let job = seed_pending_job(pool, &platform).await;
+
+        // Non-admin → 403 (before any DB work).
+        let denied = admin_set_job_priority(
+            Path(job.to_string()),
+            Extension(non_admin_session()),
+            Json(SetJobPriorityBody { priority: 9 }),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "{denied:?}"
+        );
+
+        // Out-of-range priority → 400.
+        let bad = admin_set_job_priority(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(SetJobPriorityBody { priority: 99 }),
+        )
+        .await;
+        assert!(matches!(bad, Err((StatusCode::BAD_REQUEST, _))), "{bad:?}");
+
+        // Happy: reprioritize the pending job to 9 → 200; the row is updated; audited.
+        let Json(out) = admin_set_job_priority(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(SetJobPriorityBody { priority: 9 }),
+        )
+        .await
+        .expect("reprioritize must succeed");
+        assert_eq!(out["priority"], json!(9));
+        let row_prio: i32 = sqlx::query_scalar("SELECT priority FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(row_prio, 9, "the row priority is persisted");
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log WHERE action = 'agent-job-reprioritize' \
+             AND detail->>'job_id' = $1)",
+        )
+        .bind(job.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(audited, "a reprioritize audit row must exist");
+
+        // A NON-pending (Leased) job → 409 (the status CAS misses).
+        let leased = seed_pending_job(pool, &platform).await;
+        sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = 'a' WHERE id = $1")
+            .bind(leased)
+            .execute(pool)
+            .await
+            .unwrap();
+        let conflict = admin_set_job_priority(
+            Path(leased.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(SetJobPriorityBody { priority: 7 }),
+        )
+        .await;
+        assert!(
+            matches!(conflict, Err((StatusCode::CONFLICT, _))),
+            "a non-pending job must 409: {conflict:?}"
+        );
+
+        // Unknown id → 404.
+        let unknown = admin_set_job_priority(
+            Path(Uuid::new_v4().to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(SetJobPriorityBody { priority: 5 }),
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err((StatusCode::NOT_FOUND, _))),
+            "{unknown:?}"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
     }
 
     /// requeue happy: an ACTIVE parent + a DeadLettered job → Pending with a fresh

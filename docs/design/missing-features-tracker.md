@@ -230,6 +230,18 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Job prioritization** SHIPPED — priority-weighted agent-job dispatch (verify-first swarm
+2026-06-29 #15). Dispatch was strict FIFO by created_at, so a critical job queued behind a
+backlog waited. mig 127 adds `priority INT NOT NULL DEFAULT 5 CHECK (0..=9)` + a partial
+dispatch index `(platform, priority DESC, created_at, id) WHERE status='Pending'`; the
+poll_job ORDER BY is now `priority DESC, created_at, id` (higher first, ties FIFO, id as a
+deterministic tie-breaker — codex MINOR). Every existing INSERT omits priority → inherits
+the default (no insert changes). New admin endpoint POST /api/admin/agents/jobs/{job_id}/
+priority (Extension<AuthSession>, admin-tier, audited) reprioritizes a PENDING job via a
+status CAS (a leased/terminal job's queue priority is moot → 409; missing → 404; out-of-
+range → 400). Deferred: a pending-jobs-by-platform view exposing priorities (the existing
+admin list shows LEASED jobs). codex plan+impl APPROVE. See job-prioritization.md.
+
 **CMDB CI GET** SHIPPED — `GET /api/cmdb/cis/{ci_name}` (verify-first swarm 2026-06-29
 #18). The `configuration_items` table (mig 014) was SEEDED but NO API/repo read it — every
 `/api/cmdb/*` endpoint served an in-memory mock (the impact graph) or a hardcoded export.
