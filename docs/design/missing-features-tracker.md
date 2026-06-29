@@ -230,6 +230,18 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Bulk alert acknowledge** SHIPPED — `POST /api/events/alerts/batch/ack` (verify-first
+swarm 2026-06-29 #19). Only single-event ack existed (operators cleared alerts one-by-one).
+Mirrors the #17 requests_batch_* pattern: extracted an `ack_alert_one` core (the per-event
+scope-visibility check + ack upsert) shared by the single + batch handlers (behavior-
+preserving refactor); the batch checks the `request` capability ONCE, caps at 100, dedups
+(order-preserving), runs the SAME per-item scope/ack core (so a batch can NEVER ack an
+out-of-scope alert — out-of-scope → per-item 404, no oracle), partial success, HTTP 200
+always with {results, succeeded, failed}. Static `/batch/ack` coexists with `/{event_id}/ack`
+(matchit static-wins, route-smoke confirms). codex plan+impl APPROVE (MINORs: whole-batch
+403 test w/ ack-specific body; dedup proven by the RESPONSE contract not the upsert row;
+embedded-control-char note test). See bulk-alert-ack.md.
+
 **Metric series aggregation** SHIPPED — `GET /api/metrics/series/aggregated` (verify-first
 swarm 2026-06-29 #10). The raw /metrics/series returned only the most-recent 10k raw
 samples; multi-month trend analysis forced client-side aggregation. New endpoint returns

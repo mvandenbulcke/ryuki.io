@@ -173,6 +173,7 @@ pub fn routes() -> Router {
         .route("/api/events", get(events_list))
         .route("/api/events/alerts", get(events_alerts))
         .route("/api/events/alerts/{event_id}/ack", post(events_alert_ack))
+        .route("/api/events/alerts/batch/ack", post(events_alert_batch_ack))
         .route("/api/audit/log/verify", post(audit_log_verify))
         .route("/api/audit/export", get(audit_export))
         .route("/api/audit/retention", get(audit_retention_report))
@@ -18950,10 +18951,26 @@ async fn events_alert_ack(
         reject_control_chars("note", n)?;
     }
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    // #2: enforce the SAME visibility model the alert feed uses (domain_events::
-    // list_alerts) — a scoped principal may ack an alert it can see, i.e. one
-    // tagged to an in-scope site/environment OR platform-wide (NULL) on that axis.
-    // Anything outside its scope 404s exactly like a missing event (no oracle).
+    ack_alert_one(&session, pool, event_id, note).await?;
+    Ok(Json(
+        json!({"acknowledged": true, "event_id": event_id, "acknowledged_by": session.user_id}),
+    ))
+}
+
+/// Acknowledge ONE alert: the shared single + batch core. Enforces the SAME visibility
+/// model the alert feed uses (domain_events::list_alerts) — a scoped principal may ack an
+/// alert it can see (an in-scope site/environment OR platform-wide NULL on that axis);
+/// anything outside its scope 404s exactly like a missing event (no oracle). `ack_alert`
+/// upserts (re-ack updates in place) and returns false only for a non-existent event.
+/// Extracted so the single + batch ack handlers share ONE scope/ack core (the batch loops
+/// this), exactly as `approve_one`/`reject_one` back the request batches. The caller has
+/// already done the capability check + note validation + DB acquisition.
+async fn ack_alert_one(
+    session: &AuthSession,
+    pool: &sqlx::PgPool,
+    event_id: i64,
+    note: Option<&str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
     use ryuki_engine::auth::scope_permits;
     match crate::repos::domain_events::event_scope(pool, event_id)
         .await
@@ -18969,15 +18986,90 @@ async fn events_alert_ack(
         }
         None => return Err(status_404(&event_id.to_string())),
     }
-    let acked = crate::repos::domain_events::ack_alert(pool, event_id, &session.user_id, note)
+    if !crate::repos::domain_events::ack_alert(pool, event_id, &session.user_id, note)
         .await
-        .map_err(db_error)?;
-    if !acked {
+        .map_err(db_error)?
+    {
         return Err(status_404(&event_id.to_string()));
     }
-    Ok(Json(
-        json!({"acknowledged": true, "event_id": event_id, "acknowledged_by": session.user_id}),
-    ))
+    Ok(())
+}
+
+/// Body for a BULK alert acknowledge (#19). Up to 100 event ids share one optional note.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct BatchAlertAckBody {
+    event_ids: Vec<i64>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// POST /api/events/alerts/batch/ack — acknowledge up to 100 alerts in one call (#19).
+/// Mirrors the `requests_batch_*` (#17) shape: the `request` capability is checked ONCE up
+/// front, ids are deduped + capped at 100, then each id runs the SAME per-item scope/ack
+/// core (`ack_alert_one`) as the single endpoint — so a batch can NEVER ack an out-of-scope
+/// alert, and one bad id never aborts the rest. Per-item independent; partial success;
+/// HTTP 200 always with `{results, succeeded, failed}`.
+async fn events_alert_batch_ack(
+    AuthExtractor(session): AuthExtractor,
+    Json(body): Json<BatchAlertAckBody>,
+) -> ApiResult {
+    // The flat capability ONCE up front (the ack-specific 403 body, not the generic one).
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to acknowledge alerts"})),
+        ));
+    }
+    if body.event_ids.is_empty() {
+        return Err(status_400("event_ids cannot be empty"));
+    }
+    if body.event_ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(n) = note {
+        reject_control_chars("note", n)?;
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    // Dedup (preserving order) so the same alert is never processed — and counted — twice.
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<i64> = body
+        .event_ids
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for id in unique_ids {
+        match ack_alert_one(&session, pool, id, note).await {
+            Ok(()) => {
+                succeeded += 1;
+                results.push(json!({ "event_id": id, "ok": true }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "event_id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
 }
 
 /// Query params for the SIEM audit export.
@@ -39126,6 +39218,80 @@ mod unit_tests {
         );
     }
 
+    /// #19: batch-ack validation — a non-`request` caller gets ONE whole-batch 403 (with
+    /// the ack-specific body), and empty / over-100 ids / a control-char note → 400. All
+    /// resolved BEFORE any DB access (no global pool here).
+    #[tokio::test]
+    async fn events_alert_batch_ack_validation_400_403() {
+        // Non-request principal → 403 with the ack-specific message (not generic).
+        let no_perm = AuthSession {
+            user_id: "u".into(),
+            display_name: "U".into(),
+            roles: vec![],
+            token_valid: true,
+            provider_mode: "test".into(),
+            ..Default::default()
+        };
+        let Err((status, body)) = events_alert_batch_ack(
+            AuthExtractor(no_perm),
+            Json(BatchAlertAckBody {
+                event_ids: vec![1, 2],
+                note: None,
+            }),
+        )
+        .await
+        else {
+            panic!("a non-request caller must 403");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.0["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("acknowledge"),
+            "the 403 must use the ack-specific body: {body:?}"
+        );
+        // Empty ids → 400.
+        let empty = events_alert_batch_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(BatchAlertAckBody {
+                event_ids: vec![],
+                note: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(empty, Err((StatusCode::BAD_REQUEST, _))),
+            "empty: {empty:?}"
+        );
+        // > 100 ids → 400.
+        let too_many = events_alert_batch_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(BatchAlertAckBody {
+                event_ids: (0..101).collect(),
+                note: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(too_many, Err((StatusCode::BAD_REQUEST, _))),
+            "cap: {too_many:?}"
+        );
+        // An EMBEDDED control char in the note → 400 (trim doesn't strip an interior \n).
+        let bad_note = events_alert_batch_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(BatchAlertAckBody {
+                event_ids: vec![1],
+                note: Some("bad\nnote".into()),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(bad_note, Err((StatusCode::BAD_REQUEST, _))),
+            "control-char note: {bad_note:?}"
+        );
+    }
+
     // ── approval-decisions ledger read — auth / no-DB / malformed (no global pool) ──
 
     #[tokio::test]
@@ -45943,6 +46109,122 @@ mod db_lifecycle_tests {
         // alert_acks is mutable; clean it (domain_events is append-only, kept).
         sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
             .bind(event_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #19: seed one alert-worthy domain event with the given scope; return its id.
+    async fn seed_alert_event(pool: &PgPool, agg: &str, site: Option<&str>) -> i64 {
+        crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.reject",
+                aggregate_type: "request",
+                aggregate_id: agg,
+                site,
+                environment: None,
+                actor: "creator",
+                payload: json!({ "to_status": "rejected" }),
+            },
+        )
+        .await
+        .expect("insert alert event")
+    }
+
+    async fn ack_count(pool: &PgPool, event_id: i64) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM alert_acks WHERE event_id = $1")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// #19: batch-ack — in-scope (incl. platform-wide NULL) alerts succeed, an
+    /// out-of-scope one fails per-item with 404 (no oracle); partial success, HTTP 200.
+    #[tokio::test]
+    async fn events_alert_batch_ack_partial_and_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let agg = format!("back-{}", Uuid::new_v4());
+        let e1 = seed_alert_event(pool, &agg, None).await; // platform-wide
+        let e2 = seed_alert_event(pool, &agg, None).await; // platform-wide
+        let e3 = seed_alert_event(pool, &agg, Some("GBLON")).await; // GBLON-only
+
+        // A DEFRA-scoped operator: sees the platform-wide ones, NOT the GBLON one.
+        let mut defra = AuthSession::static_dry_run();
+        defra.user_id = "ops-batch".into();
+        defra.site_scope = vec!["DEFRA".into()];
+        let Json(out) = events_alert_batch_ack(
+            AuthExtractor(defra),
+            Json(BatchAlertAckBody {
+                event_ids: vec![e1, e2, e3],
+                note: Some("triage".into()),
+            }),
+        )
+        .await
+        .expect("batch ack returns 200");
+        assert_eq!(out["succeeded"], 2, "the two platform-wide alerts acked");
+        assert_eq!(out["failed"], 1, "the GBLON alert is out of scope");
+        let results = out["results"].as_array().unwrap();
+        let g = results
+            .iter()
+            .find(|r| r["event_id"] == json!(e3))
+            .expect("the GBLON id has a per-item result");
+        assert_eq!(g["ok"], json!(false));
+        assert_eq!(
+            g["status"],
+            json!(404),
+            "out-of-scope is 404, not a status oracle"
+        );
+
+        assert_eq!(ack_count(pool, e1).await, 1, "e1 acked");
+        assert_eq!(ack_count(pool, e2).await, 1, "e2 acked");
+        assert_eq!(
+            ack_count(pool, e3).await,
+            0,
+            "out-of-scope alert must NOT be acked"
+        );
+
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = ANY($1)")
+            .bind(vec![e1, e2, e3])
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #19: duplicate ids in one batch are deduped — proven by the RESPONSE contract
+    /// (codex: ack_alert is an upsert, so the DB row count alone wouldn't prove dedup).
+    #[tokio::test]
+    async fn events_alert_batch_ack_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let agg = format!("bdedup-{}", Uuid::new_v4());
+        let id = seed_alert_event(pool, &agg, None).await;
+        let Json(out) = events_alert_batch_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(BatchAlertAckBody {
+                event_ids: vec![id, id, id],
+                note: None,
+            }),
+        )
+        .await
+        .expect("batch ack returns 200");
+        assert_eq!(
+            out["results"].as_array().unwrap().len(),
+            1,
+            "deduped to one result"
+        );
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 0);
+        sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")
+            .bind(id)
             .execute(pool)
             .await
             .ok();
