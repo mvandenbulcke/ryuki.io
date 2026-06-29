@@ -1876,12 +1876,37 @@ pub async fn integration_circuit_reset(
     if exists.is_none() {
         return Err(integration_not_found(&id));
     }
-    // Absence of a row IS the healthy default, so a reset just clears it.
-    sqlx::query("DELETE FROM circuit_breakers WHERE connection_id = $1")
-        .bind(&id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
+    // Absence of a row IS the healthy default, so a reset just clears it. DELETE …
+    // RETURNING the prior state so the audit reflects what was ACTUALLY reset: a row
+    // can be persisted as 'closed' (a healthy upsert), so the mere existence of a row
+    // is NOT a tripped breaker — `breaker_cleared` is true only when the prior state
+    // was tripped ('open' / 'half_open'). `previous_state` (or null when no row
+    // existed) carries the full signal — codex.
+    let previous_state: Option<String> =
+        sqlx::query_scalar("DELETE FROM circuit_breakers WHERE connection_id = $1 RETURNING state")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let breaker_cleared = matches!(previous_state.as_deref(), Some("open") | Some("half_open"));
+    // Audit the admin reset atomically with the clear (mirrors the other integration
+    // mutations; record_audit_tx's `?` aborts the tx). Redaction-safe, non-secret keys.
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "integration.connection.circuit_reset",
+            None,
+            "closed",
+            json!({
+                "connection_id": id,
+                "previous_state": previous_state,
+                "breaker_cleared": breaker_cleared,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
 
     // Healthy default (now is irrelevant for a Closed breaker).
@@ -4489,6 +4514,87 @@ pub mod integration_db_tests {
             entry["detail"]["cred_source"].as_str(),
             Some("***REDACTED***"),
             "cred_source must NOT be blanked by redaction"
+        );
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// circuit_reset audits the PRIOR breaker state. breaker_cleared is true ONLY for
+    /// a tripped prior state ('open'/'half_open') — a persisted healthy 'closed' row
+    /// is NOT a real reset (codex), and an absent row is a no-op. Each reset audits
+    /// (admin action history); an unknown id is a 404 with NO audit row.
+    #[tokio::test]
+    async fn integration_circuit_reset_audits_with_breaker_state() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = create_conn_via_handler("vault", "", "secret/data/cb").await;
+
+        // Re-insert a breaker in a given state, then reset. The PK is connection_id,
+        // so each prior reset's DELETE leaves the row absent for the next insert.
+        async fn reset_from_state(pool: &PgPool, conn_id: &str, insert: Option<&str>) {
+            if let Some(values) = insert {
+                sqlx::query(&format!(
+                    "INSERT INTO circuit_breakers \
+                     (connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix) \
+                     VALUES ($1, {values})"
+                ))
+                .bind(conn_id)
+                .execute(pool)
+                .await
+                .expect("insert breaker");
+            }
+            let _ = integration_circuit_reset(
+                Extension(AuthSession::static_dry_run()),
+                Path(conn_id.to_string()),
+            )
+            .await
+            .expect("reset must succeed");
+        }
+
+        // Both tripped states clear: 1) 'open', 2) 'half_open'. 3) persisted healthy
+        // 'closed' (opened_at NULL per the mig-106 CHECK) → NOT cleared. 4) absent row
+        // → not cleared, prior null.
+        reset_from_state(pool, &conn_id, Some("'open', 5, 0, 12345")).await;
+        reset_from_state(pool, &conn_id, Some("'half_open', 0, 1, NULL")).await;
+        reset_from_state(pool, &conn_id, Some("'closed', 0, 0, NULL")).await;
+        reset_from_state(pool, &conn_id, None).await;
+
+        let rows: Vec<(bool, Option<String>)> = sqlx::query_as(
+            "SELECT (detail->>'breaker_cleared')::bool, detail->>'previous_state' FROM audit_log \
+             WHERE action = 'integration.connection.circuit_reset' \
+               AND detail->>'connection_id' = $1 ORDER BY id",
+        )
+        .bind(&conn_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (true, Some("open".to_string())),
+                (true, Some("half_open".to_string())),
+                (false, Some("closed".to_string())),
+                (false, None),
+            ],
+            "breaker_cleared reflects the TRIPPED prior state only; previous_state is recorded"
+        );
+
+        // Unknown id → 404 and NO audit row.
+        let unknown = format!("ic-cb-missing-{}", uuid::Uuid::new_v4());
+        let err = integration_circuit_reset(
+            Extension(AuthSession::static_dry_run()),
+            Path(unknown.clone()),
+        )
+        .await
+        .expect_err("unknown id is a 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            audit_count(pool, "integration.connection.circuit_reset", &unknown).await,
+            0,
+            "an unknown-id reset writes no audit row"
         );
 
         cleanup_connection(pool, &conn_id).await;

@@ -19,8 +19,15 @@ For a compliance-relevant control plane, an irreversible / credential-bearing mu
 leaves no forensic trail is a real audit-trail hole. This change closes it for the three
 config-mutation handlers, completing the security fix the DELETE half started.
 
-`integration_circuit_reset` (operational breaker reset, not a credential/config mutation) is a
-SEPARATE, lower-priority concern — **deferred** to a noted follow-up, not in this slice.
+`integration_circuit_reset` (operational breaker reset, not a credential/config mutation) was a
+SEPARATE, lower-priority concern — shipped as an immediate follow-up commit (same
+`record_audit_tx`-before-commit pattern; it already had the tx + `FOR UPDATE` existence row +
+`DELETE`). The reset audits the PRIOR state via `DELETE … RETURNING state`: detail carries
+`previous_state` (the breaker's state before reset, or null when no row existed) and
+`breaker_cleared` — true ONLY for a tripped prior state (`open`/`half_open`), since a row can be
+persisted as healthy `closed`, so row-existence alone is not a real reset (codex). With it, EVERY
+integration mutation (create / update / delete / set-credential-expiry / circuit_reset) now writes
+an atomic, secret-safe audit row.
 
 ## Approach
 

@@ -34,9 +34,12 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
   row; plain-update RETURNING also closed a latent TOCTOU); redaction-safe detail keys
   (`cred_source`/`cred_rotated`/`cred_expires_at` — the #58 convention, with a read-path-redaction
   test); 6 DB tests incl. no-secret-leak + read-path. codex plan+impl reviewed. See
-  integration-mutation-audit.md. STILL OPEN: `circuit_reset` only (operational breaker reset —
-  lower compliance value, separate follow-up). (The companion "no site-scope guard" finding is
-  MOOT: admin = superuser in this RBAC.)
+  integration-mutation-audit.md. ✅ CIRCUIT_RESET SHIPPED — same atomic record_audit_tx-before-commit
+  pattern (it already had the tx + FOR-UPDATE existence row + DELETE); audits the PRIOR state via
+  `DELETE … RETURNING state` — `previous_state` + `breaker_cleared` (true only for a tripped prior
+  state, since a healthy `closed` row can be persisted — codex). ✅ THEME COMPLETE: every integration mutation (create / update /
+  delete / set-credential-expiry / circuit_reset) now writes an atomic, secret-safe audit row.
+  (The companion "no site-scope guard" finding is MOOT: admin = superuser in this RBAC.)
 
 ## CONFIRMED, open — scheduled automation (the durable-scheduler scan pattern, now shipped 3×)
 Each is an on-demand `…/expiring` endpoint with NO proactive scan job — the exact pattern
