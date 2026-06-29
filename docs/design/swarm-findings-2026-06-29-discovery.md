@@ -35,7 +35,10 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
 Each is an on-demand `…/expiring` endpoint with NO proactive scan job — the exact pattern
 secret-rotation/legal-hold/recertification filled (engine classifier + run_job arm + seed migration
 + partial-unique-index dedup; instance-specific dedup key where the id may be reused):
-- **TLS certificate expiry scan** (M/S) — `certificate_lifecycle`. (migration check: a seed table.)
+- **TLS certificate expiry scan** (M/S) — `certificate_lifecycle`. ✅ SHIPPED (592942c) —
+  `certificate_expiry_scan` (mig 130); predicate on valid_to (not stale status); priority-by-state
+  (Expired→P1, ExpiringSoon→P2) + open-item REFRESH so soon→expired upgrades in place. codex
+  plan+impl APPROVE. See certificate-expiry-scan.md.
 - **OOB-management cert-endpoint expiry scan** (M/S) — `oob_endpoints`.
 - **gMSA service-account expiry scan** (M/S) — `gmsa_lifecycle::get_expiring`.
 
