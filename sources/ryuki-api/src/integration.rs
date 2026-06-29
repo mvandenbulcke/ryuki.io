@@ -1521,6 +1521,86 @@ pub async fn integration_circuit_get(
     Ok(Json(breaker_json(&breaker, &cfg, now_unix)))
 }
 
+/// One persisted circuit_breakers row WITH its connection_id, for the fleet list
+/// (`BreakerRow` omits connection_id because the single-connection read binds it).
+#[derive(sqlx::FromRow)]
+struct BreakerListRow {
+    connection_id: String,
+    state: String,
+    consecutive_failures: i32,
+    consecutive_successes: i32,
+    opened_at_unix: Option<i64>,
+}
+
+impl BreakerListRow {
+    /// (connection_id, Breaker) — mirrors `breaker_from_row`'s state-match + clamps.
+    fn into_parts(self) -> (String, Breaker) {
+        let state = match self.state.as_str() {
+            "open" => BreakerState::Open,
+            "half_open" => BreakerState::HalfOpen,
+            _ => BreakerState::Closed,
+        };
+        let breaker = Breaker {
+            state,
+            consecutive_failures: self.consecutive_failures.max(0) as u32,
+            consecutive_successes: self.consecutive_successes.max(0) as u32,
+            opened_at_unix: self.opened_at_unix,
+        };
+        (self.connection_id, breaker)
+    }
+}
+
+/// GET /api/integrations/circuits — the fleet-wide list of NON-closed integration
+/// circuit breakers (the actionable failing-integration set; a reset DELETEs the
+/// row, so only open/half_open rows persist). Admin-gated. The one durable
+/// time-sensitive signal that previously had no aggregate operator view — an
+/// operator can now answer "which integration breakers are OPEN right now?"
+/// without polling every connection id. Carries only state + counters + timestamp
+/// + connection_id (no credential/endpoint material).
+pub async fn integration_circuits_list(Extension(session): Extension<AuthSession>) -> ApiResult {
+    require_admin(&session)?;
+    let cfg = BreakerConfig::DEFAULT;
+
+    let Some(pool) = get_db() else {
+        // No DB: no durable breaker state exists to report.
+        return Ok(Json(json!({ "source": "no-db", "breakers": [] })));
+    };
+
+    // Explicit state allow-list (defense beyond the mig-106 CHECK) so no unknown
+    // state can enter the actionable list.
+    let rows: Vec<BreakerListRow> = sqlx::query_as(
+        "SELECT connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix \
+         FROM circuit_breakers WHERE state IN ('open', 'half_open') \
+         ORDER BY opened_at_unix DESC NULLS LAST, connection_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    // Sample the shared DB clock AFTER the SELECT so no listed breaker can have
+    // opened_at_unix > now_unix (which would make the derived cooldown math odd).
+    let now_unix: i64 = sqlx::query_scalar(DB_NOW_UNIX)
+        .fetch_one(pool)
+        .await
+        .map_err(db_err)?;
+
+    let breakers: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            let (connection_id, breaker) = row.into_parts();
+            let mut body = breaker_json(&breaker, &cfg, now_unix);
+            body["connection_id"] = json!(connection_id);
+            body
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "source": "db",
+        "now_unix": now_unix,
+        "breakers": breakers,
+    })))
+}
+
 /// POST /api/integrations/{id}/circuit/record — fold one guarded-call outcome
 /// into the breaker and persist it. Admin-gated; 404 unknown connection; 503 no
 /// DB (a state change must not be faked). The read-modify-write is serialized on
@@ -1715,6 +1795,9 @@ pub fn routes() -> axum::Router {
             "/api/integrations/credentials/expiring",
             get(integration_expiring_credentials),
         )
+        // Fleet-wide breaker list — also a static segment in the `{id}` slot
+        // (connection ids are `ic-{vendor}-{hex}`, never the literal `circuits`).
+        .route("/api/integrations/circuits", get(integration_circuits_list))
         .route(
             "/api/integrations/{id}/circuit",
             get(integration_circuit_get),
@@ -1938,6 +2021,93 @@ pub mod integration_db_tests {
             .await
             .expect("DB_NOW_UNIX must be valid SQL");
         assert!(now > 1_700_000_000, "epoch seconds look sane: {now}");
+    }
+
+    /// The fleet list returns NON-closed breakers with their connection_id, and a
+    /// healthy connection (no breaker row) does not appear.
+    #[tokio::test]
+    async fn circuits_list_returns_non_closed_breakers() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        // global_pool sets the process-wide get_db() the handler reads (test_pool
+        // returns an owned pool that the handler's get_db() would not see).
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple();
+        let open_id = format!("ic-test-open-{suffix}");
+        let healthy_id = format!("ic-test-healthy-{suffix}");
+        seed_env_var_connection(pool, &open_id, "RYUKI_INTEGRATION__CBLISTA").await;
+        seed_env_var_connection(pool, &healthy_id, "RYUKI_INTEGRATION__CBLISTB").await;
+        // open_id has an OPEN breaker; healthy_id has none.
+        sqlx::query(
+            "INSERT INTO circuit_breakers \
+             (connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix) \
+             VALUES ($1, 'open', 5, 0, 12345)",
+        )
+        .bind(&open_id)
+        .execute(pool)
+        .await
+        .expect("insert open breaker");
+        // A half_open breaker IS actionable (in the allow-list); a closed one is NOT.
+        // The mig-106 CHECK `(state='open') = (opened_at IS NOT NULL)` forces a NULL
+        // opened_at for any non-open state.
+        let half_id = format!("ic-test-half-{suffix}");
+        let closed_id = format!("ic-test-closed-{suffix}");
+        seed_env_var_connection(pool, &half_id, "RYUKI_INTEGRATION__CBLISTC").await;
+        seed_env_var_connection(pool, &closed_id, "RYUKI_INTEGRATION__CBLISTD").await;
+        sqlx::query(
+            "INSERT INTO circuit_breakers \
+             (connection_id, state, consecutive_failures, consecutive_successes, opened_at_unix) \
+             VALUES ($1, 'half_open', 0, 1, NULL), ($2, 'closed', 0, 0, NULL)",
+        )
+        .bind(&half_id)
+        .bind(&closed_id)
+        .execute(pool)
+        .await
+        .expect("insert half_open + closed breakers");
+
+        let resp = integration_circuits_list(Extension(AuthSession::static_dry_run()))
+            .await
+            .expect("list ok");
+        assert_eq!(resp.0["source"], serde_json::json!("db"));
+        let breakers = resp.0["breakers"].as_array().expect("breakers array");
+
+        let mine: Vec<_> = breakers
+            .iter()
+            .filter(|b| b["connection_id"] == serde_json::json!(open_id))
+            .collect();
+        assert_eq!(mine.len(), 1, "the open breaker is listed exactly once");
+        assert_eq!(mine[0]["state"], serde_json::json!("open"));
+        assert_eq!(mine[0]["consecutive_failures"], serde_json::json!(5));
+        assert_eq!(mine[0]["opened_at_unix"], serde_json::json!(12345));
+        // allow_now / cooldown_remaining_secs are derived from breaker timing
+        // (covered by breaker_json's own tests); the list contract is the row's
+        // state + counters + connection_id. Assert the derived field is present.
+        assert!(mine[0]["allow_now"].is_boolean(), "allow_now is rendered");
+        // half_open IS in the actionable allow-list.
+        assert!(
+            breakers
+                .iter()
+                .any(|b| b["connection_id"] == serde_json::json!(half_id)
+                    && b["state"] == serde_json::json!("half_open")),
+            "a half_open breaker is listed"
+        );
+        // A healthy connection (no row) and a 'closed' breaker are BOTH excluded.
+        for excluded in [&healthy_id, &closed_id] {
+            assert!(
+                !breakers
+                    .iter()
+                    .any(|b| b["connection_id"] == serde_json::json!(excluded)),
+                "excluded from the actionable list: {excluded}"
+            );
+        }
+
+        // CASCADE removes the breaker with its connection.
+        cleanup_connection(pool, &half_id).await;
+        cleanup_connection(pool, &closed_id).await;
+        cleanup_connection(pool, &open_id).await;
+        cleanup_connection(pool, &healthy_id).await;
     }
 
     /// #30: a circuit_breakers row persists, round-trips through breaker_from_row,
@@ -3909,6 +4079,15 @@ mod unit_tests {
         assert_eq!(resp.0["state"], serde_json::json!("closed"));
         assert_eq!(resp.0["allow_now"], serde_json::json!(true));
         assert_eq!(resp.0["durable"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn circuits_list_without_db_is_empty() {
+        let resp = integration_circuits_list(Extension(AuthSession::static_dry_run()))
+            .await
+            .expect("no DB returns an empty list, not an error");
+        assert_eq!(resp.0["source"], serde_json::json!("no-db"));
+        assert_eq!(resp.0["breakers"], serde_json::json!([]));
     }
 
     #[tokio::test]
