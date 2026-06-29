@@ -208,6 +208,16 @@ Tombstone-rich audit. Codex plan(rd2)+impl APPROVE; impl-review MINORs both clos
 (audit before/after delta assertion; explicit DELETE route-gate test). See
 patch-wave-delete.md.
 
+**Certificate list pagination/filtering** SHIPPED — `GET /api/maintain/certificates/
+inventory` enhanced in place (verify-first swarm 2026-06-29 #8). DIVERGED from the swarm's
+"new endpoint" rec: /inventory ALREADY IS the cert list, so it gained opt-in q/status/
+hostname filters + allowlisted sort + limit/offset pagination + an additive X-Total-Count
+header, mirroring requests_list — backward-compatible (no params = unchanged bare array,
+newest-first). Scope is UNCHANGED (filtering/sort/pagination applied AFTER retain_site_scoped
+so they can only reduce the authorized set; env-scoped → empty + X-Total-Count 0). Invalid
+sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
+plan+impl APPROVE. See certificate-list-pagination.md.
+
 **Secret-rotation-due scan** SHIPPED — `secret_rotation_due_scan` durable-scheduler job
 (verify-first swarm 2026-06-29 #7). `managed_secrets.next_rotation_due` existed but only
 the on-demand `GET /secrets/due` surfaced overdue secrets. New daily SAFE-INTERNAL-WRITE

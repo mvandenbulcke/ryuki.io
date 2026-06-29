@@ -24432,17 +24432,176 @@ async fn certificates_expiring(
     Ok(Json(serde_json::to_value(results).unwrap_or_default()))
 }
 
-async fn certificates_inventory(AuthExtractor(session): AuthExtractor) -> ApiResult {
+/// Optional server-side filtering + pagination + sort for the certificate
+/// inventory (#8). ALL fields are opt-in (a blank/absent value = no filter), so the
+/// no-param response is unchanged — a bare array of all scoped certs, newest-first,
+/// plus an additive `X-Total-Count` header. Mirrors `RequestListParams`.
+#[derive(Debug, Deserialize, Default)]
+struct CertListParams {
+    /// Absent = ALL (the inventory is historically unbounded; a default page size
+    /// would truncate existing callers). An explicit value only reduces the page.
+    limit: Option<usize>,
+    offset: Option<usize>,
+    /// Exact, case-insensitive match on the lifecycle status (Active/Expiring/
+    /// Expired/Revoked); an unknown value simply matches nothing.
+    status: Option<String>,
+    /// Case-insensitive substring on hostname.
+    hostname: Option<String>,
+    /// Case-insensitive substring on common_name OR subject.
+    q: Option<String>,
+    sort: Option<String>,
+    direction: Option<String>,
+}
+
+/// Allowlisted certificate sort keys (in-memory sort — an unknown key is a 400, not
+/// a silent fallback, for a predictable API contract). Date keys are parsed to
+/// `DateTime` for a correct chronological compare regardless of string offset.
+#[derive(Clone, Copy)]
+enum CertSortKey {
+    CommonName,
+    Hostname,
+    Site,
+    Status,
+    ValidFrom,
+    ValidTo,
+    CreatedAt,
+}
+
+fn cert_sort_key(sort: &str) -> Option<CertSortKey> {
+    match sort {
+        "common_name" => Some(CertSortKey::CommonName),
+        "hostname" => Some(CertSortKey::Hostname),
+        "site" => Some(CertSortKey::Site),
+        "status" => Some(CertSortKey::Status),
+        "valid_from" => Some(CertSortKey::ValidFrom),
+        "valid_to" => Some(CertSortKey::ValidTo),
+        "created_at" => Some(CertSortKey::CreatedAt),
+        _ => None,
+    }
+}
+
+/// Ascending compare of two cert records by a sort key. Date columns are parsed to
+/// `DateTime` (fall back to the raw string only if a value is somehow unparseable).
+fn cert_sort_cmp(
+    key: CertSortKey,
+    a: &ryuki_engine::certificate_lifecycle::CertificateRecord,
+    b: &ryuki_engine::certificate_lifecycle::CertificateRecord,
+) -> std::cmp::Ordering {
+    let cmp_dt = |x: &str, y: &str| -> std::cmp::Ordering {
+        match (
+            chrono::DateTime::parse_from_rfc3339(x),
+            chrono::DateTime::parse_from_rfc3339(y),
+        ) {
+            (Ok(dx), Ok(dy)) => dx.cmp(&dy),
+            _ => x.cmp(y),
+        }
+    };
+    match key {
+        CertSortKey::CommonName => a.common_name.cmp(&b.common_name),
+        CertSortKey::Hostname => a.hostname.cmp(&b.hostname),
+        CertSortKey::Site => a.site.cmp(&b.site),
+        CertSortKey::Status => a.status.to_string().cmp(&b.status.to_string()),
+        CertSortKey::ValidFrom => cmp_dt(&a.valid_from, &b.valid_from),
+        CertSortKey::ValidTo => cmp_dt(&a.valid_to, &b.valid_to),
+        CertSortKey::CreatedAt => cmp_dt(&a.created_at, &b.created_at),
+    }
+}
+
+async fn certificates_inventory(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<CertListParams>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
+    // Validate sort/direction UP FRONT so a malformed query is a 400 in BOTH the DB
+    // and no-DB paths (consistent contract). Absent `sort` = preserve repo order.
+    let sort_key = match params
+        .sort
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(s) => Some(cert_sort_key(s).ok_or_else(|| status_400("unknown sort field"))?),
+    };
+    let descending = match params
+        .direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => true, // default newest/last-first, matching the repo order
+        Some(d) if d.eq_ignore_ascii_case("asc") => false,
+        Some(d) if d.eq_ignore_ascii_case("desc") => true,
+        Some(_) => return Err(status_400("direction must be 'asc' or 'desc'")),
+    };
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_lowercase)
+    };
+    let f_status = norm(&params.status);
+    let f_hostname = norm(&params.hostname);
+    let f_q = norm(&params.q);
+    let offset = params.offset.unwrap_or(0);
+
     let Some(pool) = get_db() else {
-        return Ok(Json(serde_json::Value::Array(vec![])));
+        return Ok((
+            total_count_headers(0),
+            Json(serde_json::Value::Array(vec![])),
+        ));
     };
     let records = crate::repos::certificates::list(pool)
         .await
         .map_err(db_error)?;
     // #2: site-only — a scoped principal sees only its site's certs; an
     // environment-scoped principal sees none (retain_site_scoped fails closed).
-    let records = retain_site_scoped(&session, records, |r| r.site.as_str());
-    Ok(Json(serde_json::to_value(&records).unwrap_or_default()))
+    // Filtering/pagination/sort happen AFTER this so they can only REDUCE/reorder
+    // the already-authorized set — never widen access (codex).
+    let mut records = retain_site_scoped(&session, records, |r| r.site.as_str());
+
+    // Opt-in, case-insensitive filters (absent = no filter).
+    if let Some(s) = &f_status {
+        records.retain(|r| r.status.to_string().eq_ignore_ascii_case(s));
+    }
+    if let Some(h) = &f_hostname {
+        records.retain(|r| r.hostname.to_ascii_lowercase().contains(h));
+    }
+    if let Some(q) = &f_q {
+        records.retain(|r| {
+            r.common_name.to_ascii_lowercase().contains(q)
+                || r.subject.to_ascii_lowercase().contains(q)
+        });
+    }
+
+    // X-Total-Count is the filtered total BEFORE limit/offset (so a paginating client
+    // knows how many pages exist). Computed AFTER retain_site_scoped, so an
+    // environment-scoped principal correctly gets 0.
+    let total = records.len() as i64;
+
+    // Sort ONLY if requested. Rust's sort_by is STABLE and the input is already in
+    // repo order (created_at DESC, id DESC), so equal sort keys keep that order →
+    // deterministic pagination (codex). Absent sort = the repo order is preserved.
+    if let Some(key) = sort_key {
+        records.sort_by(|a, b| {
+            let ord = cert_sort_cmp(key, a, b);
+            if descending {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+    }
+
+    // Paginate: absent limit = ALL (backward-compat — the inventory was unbounded).
+    let page: Vec<_> = match params.limit {
+        Some(n) => records.into_iter().skip(offset).take(n).collect(),
+        None => records.into_iter().skip(offset).collect(),
+    };
+
+    Ok((
+        total_count_headers(total),
+        Json(serde_json::to_value(&page).unwrap_or_default()),
+    ))
 }
 
 async fn certificates_get(
@@ -39748,6 +39907,238 @@ mod db_lifecycle_tests {
         ins.site_scope = vec![site.clone()];
         let ok = certificates_get(AuthExtractor(ins), Path(id.clone())).await;
         assert!(ok.is_ok(), "in-scope cert get must succeed: {ok:?}");
+    }
+
+    /// #8 cert inventory: seed a cert with the given common_name/status/hostname at
+    /// the given site and return its id. valid_from/valid_to are well-formed UTC.
+    async fn seed_cert(
+        pool: &PgPool,
+        common_name: &str,
+        status: &str,
+        hostname: &str,
+        site: &str,
+    ) -> String {
+        sqlx::query_scalar(
+            "INSERT INTO certificates \
+             (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             VALUES ($1, $2, NOW() - INTERVAL '10 days', NOW() + INTERVAL '90 days', \
+                     'Custom', $3, $4, $5) RETURNING id::text",
+        )
+        .bind(common_name)
+        .bind(format!("CN={common_name}"))
+        .bind(hostname)
+        .bind(site)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("seed certificate")
+    }
+
+    async fn cleanup_cert(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM certificates WHERE id = $1::uuid")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #8: the inventory list supports opt-in q/status/hostname filtering, allowlisted
+    /// sort, and limit/offset pagination with an X-Total-Count reflecting the FULL
+    /// filtered total. A unique CN prefix isolates these fixtures from the shared DB.
+    #[tokio::test]
+    async fn cert_inventory_filters_paginate_and_sort() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let suffix = Uuid::new_v4();
+        let prefix = format!("clp-{suffix}");
+        // Three certs, all matching `q=prefix` so they isolate cleanly.
+        let id_a = seed_cert(
+            pool,
+            &format!("{prefix}-alpha"),
+            "Active",
+            "host-a.test",
+            "GBLON",
+        )
+        .await;
+        let id_b = seed_cert(
+            pool,
+            &format!("{prefix}-bravo"),
+            "Expiring",
+            "host-b.test",
+            "GBLON",
+        )
+        .await;
+        let id_c = seed_cert(
+            pool,
+            &format!("{prefix}-charlie"),
+            "Active",
+            "other.test",
+            "GBLON",
+        )
+        .await;
+
+        let session = AuthSession::static_dry_run(); // unscoped → sees all
+        let list = |params: CertListParams| {
+            let s = session.clone();
+            async move { certificates_inventory(AuthExtractor(s), Query(params)).await }
+        };
+        let total_of = |h: &HeaderMap| -> i64 {
+            h.get("x-total-count")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let cns = |body: &Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["common_name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // q isolates exactly my three.
+        let (h, Json(body)) = list(CertListParams {
+            q: Some(prefix.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(total_of(&h), 3, "X-Total-Count = filtered total");
+        assert_eq!(cns(&body).len(), 3);
+
+        // status filter (case-insensitive) → the two Active ones.
+        let (h, Json(body)) = list(CertListParams {
+            q: Some(prefix.clone()),
+            status: Some("active".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(total_of(&h), 2, "two Active certs");
+        let mut got = cns(&body);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![format!("{prefix}-alpha"), format!("{prefix}-charlie")]
+        );
+
+        // hostname substring → alpha + bravo (both host-*).
+        let (h, _) = list(CertListParams {
+            q: Some(prefix.clone()),
+            hostname: Some("host-".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(total_of(&h), 2, "two host-* certs");
+
+        // sort by common_name ASC → alpha, bravo, charlie.
+        let (_, Json(body)) = list(CertListParams {
+            q: Some(prefix.clone()),
+            sort: Some("common_name".into()),
+            direction: Some("asc".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cns(&body),
+            vec![
+                format!("{prefix}-alpha"),
+                format!("{prefix}-bravo"),
+                format!("{prefix}-charlie")
+            ]
+        );
+
+        // pagination: limit=1 offset=1 over the asc sort → exactly [bravo]; the
+        // X-Total-Count is the FULL filtered total (3), not the page length.
+        let (h, Json(body)) = list(CertListParams {
+            q: Some(prefix.clone()),
+            sort: Some("common_name".into()),
+            direction: Some("asc".into()),
+            limit: Some(1),
+            offset: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(total_of(&h), 3, "X-Total-Count is the full filtered total");
+        assert_eq!(
+            cns(&body),
+            vec![format!("{prefix}-bravo")],
+            "the 2nd item only"
+        );
+
+        for id in [&id_a, &id_b, &id_c] {
+            cleanup_cert(pool, id).await;
+        }
+    }
+
+    /// #8: an environment-scoped principal sees NO certs (site-only fail-closed) and
+    /// X-Total-Count is 0 — preserved from the original retain_site_scoped contract.
+    #[tokio::test]
+    async fn cert_inventory_env_scoped_is_empty() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_cert(
+            pool,
+            &format!("clp-env-{}", Uuid::new_v4()),
+            "Active",
+            "h.test",
+            "GBLON",
+        )
+        .await;
+        let mut env_scoped = AuthSession::static_dry_run();
+        env_scoped.environment_scope = vec!["production".into()];
+        let (h, Json(body)) =
+            certificates_inventory(AuthExtractor(env_scoped), Query(CertListParams::default()))
+                .await
+                .unwrap();
+        assert_eq!(
+            h.get("x-total-count").unwrap().to_str().unwrap(),
+            "0",
+            "an environment-scoped principal sees zero certs"
+        );
+        assert_eq!(body.as_array().unwrap().len(), 0, "empty body");
+        cleanup_cert(pool, &id).await;
+    }
+
+    /// #8: an unknown sort field or a bad direction is a 400 (predictable contract),
+    /// validated before any DB access.
+    #[tokio::test]
+    async fn cert_inventory_invalid_sort_or_direction_is_400() {
+        let bad_sort = certificates_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CertListParams {
+                sort: Some("drop_table".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(bad_sort, Err((StatusCode::BAD_REQUEST, _))),
+            "unknown sort field must 400: {bad_sort:?}"
+        );
+        let bad_dir = certificates_inventory(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(CertListParams {
+                direction: Some("sideways".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(bad_dir, Err((StatusCode::BAD_REQUEST, _))),
+            "bad direction must 400: {bad_dir:?}"
+        );
     }
 
     /// #2 RBAC (storage, site-only): a by-id volume read is 404 out-of-scope and
