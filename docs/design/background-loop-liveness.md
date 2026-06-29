@@ -134,7 +134,9 @@ the DB is down (and the DB probe already covers that case separately).
 - NO migration, NO engine change (DependencyProbe reused).
 
 ## Out of scope (follow-ups)
-- A per-loop breakdown in the health JSON (this slice adds one aggregate
-  `background_loops` probe, like the single `scheduler` probe).
+- ~~A per-loop breakdown in the health JSON~~ SHIPPED — `GET
+  /api/platform/health/loops` (see loop-liveness-breakdown.md): per-loop name /
+  interval / age / threshold / overdue, sharing the extracted `loop_overdue_threshold`
+  with this aggregate so the two never drift.
 - Persisting heartbeats to the DB for cross-replica visibility (in-memory is the
   right scope — each replica reports its OWN loops' health).

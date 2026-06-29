@@ -2227,6 +2227,22 @@ async fn platform_self_health() -> (StatusCode, Json<serde_json::Value>) {
     (http, Json(body))
 }
 
+/// GET /api/platform/health/loops — per-loop breakdown of the background-loop
+/// heartbeat registry. The aggregate `/api/platform/health/dependencies` reports
+/// only THAT a loop is wedged; this reports WHICH loop, its cadence, how long it has
+/// been silent (`age_secs`), and its overdue `threshold_secs`, so an operator can
+/// diagnose. Authenticated like its sibling (it lives in the human-gated router; the
+/// loop names are already surfaced by the aggregate's `down` detail). A wedged loop
+/// maps to 503 (else 200); the body always carries the full breakdown.
+async fn platform_loop_liveness() -> (StatusCode, Json<serde_json::Value>) {
+    let report = crate::background::loop_status_report(&crate::background::loop_liveness());
+    let (code, body) = crate::background::loop_liveness_payload(report);
+    (
+        StatusCode::from_u16(code).unwrap_or(StatusCode::OK),
+        Json(body),
+    )
+}
+
 /// Probe whether the scheduler tick is advancing its schedules. A LIVE leader
 /// tick advances EVERY due schedule's next_run_at within its own interval, so
 /// ANY enabled schedule slipping past 2x its interval means the tick failed to
@@ -2305,6 +2321,7 @@ fn build_human_gated_routes() -> Router {
             "/api/platform/health/dependencies",
             get(platform_self_health),
         )
+        .route("/api/platform/health/loops", get(platform_loop_liveness))
         .merge(agents::admin_routes())
         .merge(contracts::routes())
         .merge(boundary::routes())
@@ -2341,6 +2358,33 @@ mod tests {
         let mut g = lock_or_recover(&m); // would panic with .lock().unwrap()
         *g += 1;
         assert_eq!(*g, 1);
+    }
+
+    #[tokio::test]
+    async fn platform_loop_liveness_lists_a_registered_loop() {
+        // Register a uniquely-named fresh loop; the per-loop endpoint must include it
+        // with overdue=false and a positive threshold. We do NOT assert the HTTP code
+        // or `overall` — the registry is process-global and other tests' loops + the
+        // wall clock make those non-deterministic (the 200/503 logic is covered by
+        // background.rs's pure loop_liveness_payload test). Status must be 200 OR 503.
+        let name: &'static str =
+            Box::leak(format!("test-loops-endpoint-{}", uuid::Uuid::new_v4()).into_boxed_str());
+        crate::background::register_loop(name, 30);
+
+        let (code, Json(body)) = platform_loop_liveness().await;
+        assert!(
+            code == StatusCode::OK || code == StatusCode::SERVICE_UNAVAILABLE,
+            "loops endpoint returns 200 or 503, got {code}"
+        );
+        let mine = body["loops"]
+            .as_array()
+            .expect("loops is an array")
+            .iter()
+            .find(|l| l["name"] == name)
+            .expect("the registered loop appears in the breakdown");
+        assert_eq!(mine["interval_secs"], 30);
+        assert_eq!(mine["overdue"], false, "a fresh loop is not overdue");
+        assert!(mine["threshold_secs"].as_u64().unwrap() > 0);
     }
 
     #[test]

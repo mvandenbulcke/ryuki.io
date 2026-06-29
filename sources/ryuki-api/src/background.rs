@@ -8,6 +8,7 @@
 //! pure helpers + `run_bounded` extend the same defense-in-depth to all of them
 //! without duplicating the timeout/backoff arithmetic in each loop.
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -152,14 +153,22 @@ pub fn loop_liveness() -> Vec<LoopLiveness> {
     // guard dropped here, before classify_loop_liveness runs
 }
 
-/// Pure verdict: a loop is overdue when
-/// `age_secs > 2*iteration_timeout(interval) + 2*interval` (all saturating) —
-/// two full timed iterations plus the inter-attempt waits, so one slow/timed-out
-/// iteration plus a backoff retry never false-positives. ANY overdue loop ⇒
-/// `down` (a persistently-wedged loop is page-worthy on this status endpoint);
-/// `healthy` when none overdue; `degraded` only when no loops are registered
-/// (informational). The `down` detail NAMES each overdue loop (sorted) with its
-/// age + threshold, so the aggregate probe is actionable.
+/// Silence budget: a loop is overdue once `age_secs` EXCEEDS this — two full timed
+/// iterations plus the inter-attempt waits (`2*iteration_timeout(interval) +
+/// 2*interval`, all saturating), so one slow/timed-out iteration plus a backoff
+/// retry never false-positives. The SINGLE source of truth shared by
+/// `classify_loop_liveness` (aggregate) and `loop_status_report` (per-loop), so the
+/// two views cannot drift.
+pub fn loop_overdue_threshold(interval_secs: u64) -> u64 {
+    2u64.saturating_mul(iteration_timeout(interval_secs).as_secs())
+        .saturating_add(2u64.saturating_mul(interval_secs))
+}
+
+/// Pure verdict: ANY overdue loop ⇒ `down` (a persistently-wedged loop is
+/// page-worthy on this status endpoint); `healthy` when none overdue; `degraded`
+/// only when no loops are registered (informational). The `down` detail NAMES each
+/// overdue loop (sorted) with its age + threshold, so the aggregate probe is
+/// actionable.
 pub fn classify_loop_liveness(
     entries: &[LoopLiveness],
 ) -> ryuki_engine::self_health::DependencyProbe {
@@ -170,9 +179,7 @@ pub fn classify_loop_liveness(
     let mut overdue: Vec<(&'static str, u64, u64)> = entries
         .iter()
         .filter_map(|e| {
-            let threshold = 2u64
-                .saturating_mul(iteration_timeout(e.interval_secs).as_secs())
-                .saturating_add(2u64.saturating_mul(e.interval_secs));
+            let threshold = loop_overdue_threshold(e.interval_secs);
             if e.age_secs > threshold {
                 Some((e.name, e.age_secs, threshold))
             } else {
@@ -192,6 +199,70 @@ pub fn classify_loop_liveness(
     DependencyProbe::down(
         "background_loops",
         format!("{} background loop(s) wedged: {detail}", overdue.len()),
+    )
+}
+
+/// One loop's per-loop status for the `/api/platform/health/loops` breakdown.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LoopStatus {
+    pub name: &'static str,
+    pub interval_secs: u64,
+    pub age_secs: u64,
+    pub threshold_secs: u64,
+    pub overdue: bool,
+}
+
+/// Per-loop breakdown (pure): each snapshot mapped to its silence budget + overdue
+/// verdict, sorted by name for a stable response. Uses the SAME
+/// `loop_overdue_threshold` + `age > threshold` rule as `classify_loop_liveness`, so
+/// the per-loop view and the aggregate always agree.
+pub fn loop_status_report(entries: &[LoopLiveness]) -> Vec<LoopStatus> {
+    let mut report: Vec<LoopStatus> = entries
+        .iter()
+        .map(|e| {
+            let threshold = loop_overdue_threshold(e.interval_secs);
+            LoopStatus {
+                name: e.name,
+                interval_secs: e.interval_secs,
+                age_secs: e.age_secs,
+                threshold_secs: threshold,
+                overdue: e.age_secs > threshold,
+            }
+        })
+        .collect();
+    report.sort_by(|a, b| a.name.cmp(b.name));
+    report
+}
+
+/// Aggregate verdict derived from the per-loop breakdown — kept consistent with
+/// `classify_loop_liveness`: no loops ⇒ `degraded`; any overdue ⇒ `down`; else
+/// `healthy`.
+pub fn loop_overall_status(report: &[LoopStatus]) -> &'static str {
+    if report.is_empty() {
+        "degraded"
+    } else if report.iter().any(|l| l.overdue) {
+        "down"
+    } else {
+        "healthy"
+    }
+}
+
+/// Build the `(http_status, body)` for the loops endpoint as a PURE fn, so the
+/// 200/503 mapping is deterministically testable WITHOUT the process-global
+/// registry. Alerting-safe + consistent with the sibling `/dependencies` probe: a
+/// wedged loop ⇒ 503, else 200. The body always carries the full breakdown.
+pub fn loop_liveness_payload(report: Vec<LoopStatus>) -> (u16, serde_json::Value) {
+    let overall = loop_overall_status(&report);
+    let overdue = report.iter().filter(|l| l.overdue).count();
+    let code = if overall == "down" { 503 } else { 200 };
+    (
+        code,
+        serde_json::json!({
+            "loops": report,
+            "overall": overall,
+            "overdue_count": overdue,
+            "registered_count": report.len(),
+        }),
     )
 }
 
@@ -403,6 +474,84 @@ mod tests {
             classify_loop_liveness(std::slice::from_ref(mine)).health,
             DependencyHealth::Healthy,
             "a just-registered loop must not be a false-positive overdue"
+        );
+    }
+
+    // ── per-loop breakdown (pure) ────────────────────────────────────────────
+
+    #[test]
+    fn loop_overdue_threshold_matches_formula_and_saturates() {
+        // iteration_timeout(i) = max(i*4, 300); threshold = 2*that + 2*i.
+        assert_eq!(loop_overdue_threshold(10), 2 * 300 + 2 * 10); // 620
+        assert_eq!(loop_overdue_threshold(30), 2 * 300 + 2 * 30); // 660
+        assert_eq!(loop_overdue_threshold(3600), 2 * 14400 + 2 * 3600); // 36000
+                                                                        // Saturating: an absurd interval must not overflow/panic.
+        assert_eq!(loop_overdue_threshold(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn loop_status_report_marks_overdue_and_sorts_by_name() {
+        // interval 10 → threshold 620. age 619 fresh, 621 overdue.
+        let entries = [
+            entry("zeta", 10, 621),
+            entry("alpha", 10, 619),
+            entry("mid", 30, 660), // exactly at threshold (660) is NOT overdue (>)
+        ];
+        let report = loop_status_report(&entries);
+        // Sorted by name.
+        assert_eq!(
+            report.iter().map(|l| l.name).collect::<Vec<_>>(),
+            vec!["alpha", "mid", "zeta"]
+        );
+        let by = |n: &str| report.iter().find(|l| l.name == n).unwrap();
+        assert!(!by("alpha").overdue, "619 <= 620 is fresh");
+        assert_eq!(by("alpha").threshold_secs, 620);
+        assert!(
+            !by("mid").overdue,
+            "age == threshold is NOT overdue (strict >)"
+        );
+        assert!(by("zeta").overdue, "621 > 620 is overdue");
+    }
+
+    #[test]
+    fn loop_overall_status_and_payload_cases() {
+        // Empty → degraded, HTTP 200.
+        let (code, body) = loop_liveness_payload(loop_status_report(&[]));
+        assert_eq!(code, 200);
+        assert_eq!(body["overall"], "degraded");
+        assert_eq!(body["registered_count"], 0);
+
+        // All fresh → healthy, HTTP 200.
+        let fresh = [entry("a", 10, 5), entry("b", 30, 5)];
+        let (code, body) = loop_liveness_payload(loop_status_report(&fresh));
+        assert_eq!(code, 200);
+        assert_eq!(body["overall"], "healthy");
+        assert_eq!(body["overdue_count"], 0);
+        assert_eq!(body["loops"].as_array().unwrap().len(), 2);
+
+        // Any overdue → down, HTTP 503.
+        let wedged = [entry("a", 10, 5), entry("b", 10, 9999)];
+        let (code, body) = loop_liveness_payload(loop_status_report(&wedged));
+        assert_eq!(code, 503);
+        assert_eq!(body["overall"], "down");
+        assert_eq!(body["overdue_count"], 1);
+    }
+
+    #[test]
+    fn per_loop_overdue_set_agrees_with_the_aggregate() {
+        // The per-loop view and classify_loop_liveness share the threshold, so a
+        // report with any overdue loop ⇔ the aggregate is Down; all-fresh ⇔ Healthy.
+        let wedged = [entry("a", 10, 5), entry("b", 10, 9999)];
+        assert!(loop_status_report(&wedged).iter().any(|l| l.overdue));
+        assert_eq!(
+            classify_loop_liveness(&wedged).health,
+            DependencyHealth::Down
+        );
+        let fresh = [entry("a", 10, 5), entry("b", 30, 5)];
+        assert!(!loop_status_report(&fresh).iter().any(|l| l.overdue));
+        assert_eq!(
+            classify_loop_liveness(&fresh).health,
+            DependencyHealth::Healthy
         );
     }
 }
