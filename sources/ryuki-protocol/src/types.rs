@@ -260,6 +260,29 @@ pub struct VerifiedLiveContext {
 }
 
 // ---------------------------------------------------------------------------
+// Redaction policy vocabulary — the shared CP/agent contract
+// ---------------------------------------------------------------------------
+
+/// The redaction policy version the agent stamps into every `SignedEnvelope`
+/// (the agent emits this; the CP recognises it). It is an opaque identifier
+/// SLUG, not a semver number — bump it (e.g. `ryuki-redaction-v2`) when the
+/// redaction rules change, and add the new value to
+/// [`SUPPORTED_REDACTION_POLICY_VERSIONS`] so the CP will accept results under
+/// it. Both sides reference this one constant so emission and acceptance can
+/// never silently drift.
+pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
+
+/// The closed set of `redaction_policy_version` values the control plane will
+/// accept at result ingestion. `redaction_policy_version` is the ONE
+/// `SignedEnvelope` string field with no authoritative per-result counterpart to
+/// cross-check, so the CP gates it against this allowlist (fail-closed): a result
+/// redacted under a policy the CP does not recognise is rejected, which both
+/// closes the field as a free-form text channel and refuses evidence the CP
+/// cannot interpret. Keep this in lockstep with the policies the CP actually
+/// understands.
+pub const SUPPORTED_REDACTION_POLICY_VERSIONS: &[&str] = &[REDACTION_POLICY_VERSION];
+
+// ---------------------------------------------------------------------------
 // SignedEnvelope — tamper-evident result binding
 // ---------------------------------------------------------------------------
 
@@ -298,7 +321,10 @@ pub struct SignedEnvelope {
     pub approved_plan_digest: Option<String>,
     /// SHA-256 hex digest of the (post-redaction) evidence pack.
     pub evidence_digest: String,
-    /// Semver string of the redaction policy the agent applied (e.g. `"1.0.0"`).
+    /// Identifier of the redaction policy the agent applied — an opaque slug
+    /// (e.g. [`REDACTION_POLICY_VERSION`] = `"ryuki-redaction-v1"`), NOT a semver
+    /// number. The CP accepts only values in
+    /// [`SUPPORTED_REDACTION_POLICY_VERSIONS`] at ingestion.
     pub redaction_policy_version: String,
     /// Agent-local timestamp at the moment of signing (informational; CP uses its
     /// own clock for the authoritative timestamp).

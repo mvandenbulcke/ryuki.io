@@ -41,3 +41,23 @@ Still gated by the same 2-part constraint documented in criticality-approval-pol
 requests.criticality is hardcoded "standard", so a criticality→threshold policy alone is
 inert. A dedicated change must add the create-side criticality input first. An
 offering/approval_policies table is the alternative policy source.
+
+## Run-2 follow-on findings (post-swarm re-sweep)
+A second verify-first re-sweep over THIS session's own work surfaced gaps the run-1 table
+did not number:
+
+- **Agent-job result retrieval** — H, CONFIRMED. Agents POST a signed result to
+  `/api/agents/{agent_id}/jobs/{job_id}/result` (stored on `agent_jobs`), but NO GET surfaced
+  the signed attestation: `GET /api/admin/agents` + `/api/requests/{id}/execution-job` return
+  only metadata. ✅ SHIPPED — `GET /api/admin/agents/jobs/{job_id}/result` (admin) returns the
+  typed `SignedEnvelope` attestation + result metadata, deliberately EXCLUDING the raw
+  agent-submitted `evidence_json` (no server-side redaction guarantee — secret hygiene). codex
+  impl review NEEDS-CHANGES×2 → APPROVE: (1) **MAJOR** — `redaction_policy_version` was the one
+  envelope string field with no CP cross-check; a first charset/length guard was too loose (a
+  bare token like `SUPERSECRET` passed), so it became a CLOSED allowlist
+  (`ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS`) enforced at BOTH ingestion (Step 5b)
+  and the read side (defense-in-depth: signed_envelope predates the guard). Verify-first caught
+  that real agents emit `ryuki-redaction-v1` (a slug, not `1.0.0`/semver) — a naive allowlist
+  would have broken production. (2) **MAJOR** — the read happy test seeded `result_status`
+  with the wrong casing; fixed to `check_ok` (the mig 055 CHECK + production value). See
+  agent-job-result-retrieval.md.

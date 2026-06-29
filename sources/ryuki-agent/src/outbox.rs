@@ -454,7 +454,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "ryuki-redaction-v1".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: identity.public_key_b64(),
             cp_nonce: Uuid::new_v4().to_string(),

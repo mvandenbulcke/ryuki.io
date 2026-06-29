@@ -69,10 +69,14 @@ pub struct ResultBody {
 // Redaction policy version
 // ---------------------------------------------------------------------------
 
-/// Semver label for the redaction policy applied by this agent.
-/// Bound into the signed envelope so the CP can track which scrubbing rules
-/// were applied.  Bump when the scrubbing ruleset changes.
-pub const REDACTION_POLICY_VERSION: &str = "ryuki-redaction-v1";
+/// Identifier (opaque slug, not a semver number) for the redaction policy this
+/// agent applies. Bound into the signed envelope so the CP can track which
+/// scrubbing rules were applied — and the CP only accepts results under a policy
+/// it recognises. Re-exported from `ryuki_protocol` so agent emission and CP
+/// acceptance ([`ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS`]) share one
+/// source of truth and cannot drift. Bump the protocol constant when the
+/// scrubbing ruleset changes.
+pub const REDACTION_POLICY_VERSION: &str = ryuki_protocol::REDACTION_POLICY_VERSION;
 
 // ---------------------------------------------------------------------------
 // RunStatus → JobResultStatus mapping

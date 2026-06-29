@@ -795,6 +795,27 @@ fn map_result_status_to_job_status(s: &JobResultStatus) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// redaction_policy_version ingestion guard
+// ---------------------------------------------------------------------------
+
+/// `redaction_policy_version` is the ONE `SignedEnvelope` string field with no
+/// authoritative per-result CP counterpart to cross-check at ingestion —
+/// `agent_id`, `platform`, `key_id`, and `cp_nonce` are all verified against
+/// stored enrolment/lease state, but the policy version is whatever the agent
+/// signed. Without a bound, a buggy or compromised agent could sign arbitrary
+/// text (a bare token like `SUPERSECRET` included) into it that would later ride
+/// through the admin result-retrieval view (which re-serialises the typed
+/// envelope, known fields included). So the CP gates it against the CLOSED
+/// allowlist of policy versions it actually recognises — a slug match, not a
+/// charset/shape heuristic — which fully closes the free-form channel AND
+/// refuses evidence redacted under a policy the CP cannot interpret. The
+/// allowlist lives in `ryuki_protocol` so agent emission and CP acceptance share
+/// one source of truth and cannot drift.
+fn redaction_policy_version_is_supported(v: &str) -> bool {
+    ryuki_protocol::SUPPORTED_REDACTION_POLICY_VERSIONS.contains(&v)
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/agents/{agent_id}/jobs/{job_id}/result
 // ---------------------------------------------------------------------------
 
@@ -1082,6 +1103,21 @@ async fn post_job_result_with_pool(
     if result.evidence_digest != env.evidence_digest {
         return Err(bad_request(
             "outer result.evidence_digest does not match envelope.evidence_digest",
+        ));
+    }
+
+    // ── Step 5b: redaction_policy_version must be a CP-recognised policy ──────
+    //
+    // Every other envelope string field is cross-checked against authoritative
+    // CP state. redaction_policy_version has no such counterpart, so a
+    // compromised agent could otherwise smuggle arbitrary text here that the
+    // admin result-retrieval view would surface. Gate it against the closed
+    // allowlist of policies the CP recognises (fail-closed like every other
+    // check): this closes the free-form channel and refuses evidence redacted
+    // under a policy the CP cannot interpret.
+    if !redaction_policy_version_is_supported(&env.redaction_policy_version) {
+        return Err(bad_request(
+            "envelope.redaction_policy_version is not a recognised redaction policy",
         ));
     }
 
@@ -2753,6 +2789,87 @@ pub async fn admin_agent_queue_depth(
     Ok(Json(json!({ "queues": queues })))
 }
 
+/// One agent job's stored result — the SIGNED ATTESTATION + result metadata. The SELECT
+/// deliberately OMITS `evidence_json` (agent-submitted free-form; no server-side redaction
+/// guarantee), `spec`, and `live_context` (secret-bearing) — same hygiene as the
+/// dead-lettered list.
+#[derive(sqlx::FromRow)]
+struct JobResultRow {
+    result_status: Option<String>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    result_id: Option<String>,
+    evidence_digest: Option<String>,
+    signed_envelope: Option<Value>,
+}
+
+/// GET /api/admin/agents/jobs/{job_id}/result — retrieve one agent job's SIGNED result
+/// attestation + metadata (#agent-job-result). Admin-only. The `signed_envelope` is a pure
+/// cryptographic attestation (digests + signature + ids, NO raw evidence); the raw
+/// agent-submitted `evidence_json` is NEVER exposed (no server-side redaction guarantee — a
+/// redacted-evidence view is a separate slice). 404 if the job is unknown OR has no result
+/// yet (`signed_envelope IS NULL`). No scope guard (agent jobs are platform-scoped,
+/// admin-wide, like the dead-lettered list).
+pub async fn admin_agent_job_result(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to read an agent job result",
+        ));
+    }
+    // Parse the id BEFORE get_db (codex) so a malformed id 404s even during a DB outage.
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let row: Option<JobResultRow> = sqlx::query_as(
+        "SELECT result_status, completed_at, result_id::text AS result_id, \
+                evidence_digest, signed_envelope \
+         FROM agent_jobs WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let Some(row) = row else {
+        return Err(not_found(format!("agent job '{job_id}' not found")));
+    };
+    let Some(envelope_json) = row.signed_envelope else {
+        return Err(not_found(format!(
+            "no result recorded for agent job '{job_id}' yet"
+        )));
+    };
+    // Hardening (codex): pin the response to the TYPED attestation — deserialize the stored
+    // JSONB into the verified SignedEnvelope and reserialize, so no stray JSONB key (and
+    // certainly no raw evidence) can ride along in the response.
+    let envelope: ryuki_protocol::SignedEnvelope =
+        serde_json::from_value(envelope_json).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "stored signed envelope is corrupt"})),
+            )
+        })?;
+    // Defense-in-depth (codex): Step 5b guards the policy version at INGESTION,
+    // but signed_envelope predates that guard (mig 055), so a pre-guard or
+    // back-door row could carry an unrecognised redaction_policy_version. Re-gate
+    // it at the read side and fail closed with a GENERIC, non-echoing error —
+    // never serve (and never reflect) a value the CP does not recognise.
+    if !redaction_policy_version_is_supported(&envelope.redaction_policy_version) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "stored signed envelope failed validation"})),
+        ));
+    }
+    Ok(Json(json!({
+        "job_id": job_id,
+        "result_status": row.result_status,
+        "completed_at": row.completed_at.map(|t| t.to_rfc3339()),
+        "result_id": row.result_id,
+        "evidence_digest": row.evidence_digest,
+        "signed_envelope": serde_json::to_value(&envelope).unwrap_or_default(),
+    })))
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -2791,6 +2908,10 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/priority",
             post(admin_set_job_priority),
+        )
+        .route(
+            "/api/admin/agents/jobs/{job_id}/result",
+            get(admin_agent_job_result),
         )
         // Static `queue-depth` in the `{agent_id}` slot (same matchit pattern).
         .route(
@@ -4474,7 +4595,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: cp_nonce.to_string(),
@@ -4580,6 +4701,140 @@ mod tests {
         assert!(db_row.result_id.is_some());
         assert!(db_row.evidence_digest.is_some());
         assert!(db_row.completed_at.is_some());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    // ── redaction_policy_version allowlist guard (pure, no DB) ───────────────
+    //
+    // codex (impl review): this is the one envelope string field with no
+    // authoritative CP counterpart, so its ingestion guard is what stops a
+    // compromised agent from using it as a free-form text channel. The guard is
+    // a CLOSED allowlist (not a charset/shape heuristic) — a bare token like
+    // `SUPERSECRET` is alphanumeric and short, so only an exact-match allowlist
+    // actually closes the channel.
+    #[test]
+    fn redaction_policy_version_guard_is_a_closed_allowlist() {
+        // Accepts ONLY the CP-recognised policy version the real agent emits.
+        assert!(redaction_policy_version_is_supported(
+            ryuki_protocol::REDACTION_POLICY_VERSION
+        ));
+        assert!(redaction_policy_version_is_supported("ryuki-redaction-v1"));
+        // Rejects everything else: bare alphanumeric tokens (codex's bypass),
+        // token-shaped strings, an unknown-but-valid semver, free text, and empty.
+        for bad in [
+            "",
+            "SUPERSECRET",
+            "tokenabc123def456",
+            "1.0.0",
+            "2.0.0",
+            "ryuki-redaction-v2",
+            "SUPERSECRET leaked via policy version",
+        ] {
+            assert!(
+                !redaction_policy_version_is_supported(bad),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    // ── S3b: redaction_policy_version free-text is rejected at ingestion ──────
+    //
+    // codex (impl review): a VALIDLY-SIGNED envelope whose policy version carries
+    // arbitrary text (a smuggled secret) must be rejected at POST — fail-closed,
+    // BEFORE it can be stored and later surfaced by the admin result-retrieval
+    // view. Signature verification passes (the agent really signed it); the
+    // step-5b format guard is what rejects it, and nothing is recorded.
+    #[tokio::test]
+    async fn db_s3b_redaction_policy_version_free_text_rejected() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("s3b-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let evidence = b"check output here";
+        let result_id = Uuid::new_v4();
+        let evidence_digest = proto_sha256(evidence);
+        let spec_digest = job_spec_digest(&spec);
+
+        // A validly-signed envelope that smuggles a bare-token secret into the
+        // one un-cross-checked string field — exactly the bypass codex flagged
+        // (alphanumeric, short, so a charset guard would have let it through).
+        let unsigned_env = SignedEnvelope {
+            agent_id: agent_id.clone(),
+            platform: platform.clone(),
+            job_id: job_row.id,
+            attempt_id,
+            lease_generation: gen as u64,
+            request_id: spec.request_id,
+            result_id,
+            mode: spec.mode.clone(),
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: spec_digest,
+            approved_plan_digest: None,
+            evidence_digest: evidence_digest.clone(),
+            redaction_policy_version: "SUPERSECRET".to_string(),
+            timestamp: Utc::now(),
+            key_id: encode_verifying_key(&key.verifying_key()),
+            cp_nonce: nonce.clone(),
+            signature: String::new(),
+        };
+        let signed_env = sign(unsigned_env, &key);
+        let job_result = JobResult {
+            job_id: job_row.id,
+            attempt_id,
+            result_id,
+            status: JobResultStatus::CheckOk,
+            evidence_digest,
+            signed_envelope: signed_env,
+        };
+        let result_body = ResultBody {
+            job_result,
+            evidence: evidence.to_vec(),
+            evidence_json: None,
+        };
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            result_body,
+            &pool,
+        )
+        .await;
+
+        let (status, Json(err_body)) = resp.expect_err("free-text policy version must be rejected");
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err_body.to_string().contains("redaction_policy_version"),
+            "error must name the offending field: {err_body}"
+        );
+        // The smuggled secret must not have been persisted anywhere either.
+        assert!(
+            !err_body.to_string().contains("SUPERSECRET"),
+            "rejection must not echo the smuggled text: {err_body}"
+        );
+
+        // Nothing was recorded — the job is still mid-flight, not terminal, and
+        // none of the result columns were written (fully fail-closed).
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_ne!(db_row.status.as_str(), "Succeeded", "must not record");
+        assert!(db_row.result_status.is_none());
+        assert!(db_row.result_id.is_none());
+        assert!(db_row.evidence_digest.is_none());
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;
@@ -5098,7 +5353,7 @@ mod tests {
                 job_spec_digest: spec_digest,
                 approved_plan_digest: plan.clone(),
                 evidence_digest: evidence_digest_str.clone(),
-                redaction_policy_version: "1.0.0".to_string(),
+                redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
                 timestamp: Utc::now(),
                 key_id: encode_verifying_key(&key.verifying_key()),
                 cp_nonce: nonce.clone(),
@@ -5215,7 +5470,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: Some(proto_sha256(b"bad plan")),
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: nonce.clone(),
@@ -5299,7 +5554,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: nonce.clone(),
@@ -5494,7 +5749,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: nonce.clone(),
@@ -5576,7 +5831,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: nonce.clone(),
@@ -5658,7 +5913,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest: None,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: nonce.clone(),
@@ -6134,7 +6389,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: cp_nonce.to_string(),
@@ -7102,7 +7357,7 @@ mod tests {
             job_spec_digest: spec_digest,
             approved_plan_digest,
             evidence_digest: evidence_digest.clone(),
-            redaction_policy_version: "1.0.0".to_string(),
+            redaction_policy_version: ryuki_protocol::REDACTION_POLICY_VERSION.to_string(),
             timestamp: Utc::now(),
             key_id: encode_verifying_key(&key.verifying_key()),
             cp_nonce: cp_nonce.to_string(),
@@ -8315,6 +8570,209 @@ mod tests {
 
         cleanup_jobs_for_platform(pool, &plat_a).await;
         cleanup_jobs_for_platform(pool, &plat_b).await;
+    }
+
+    /// #agent-job-result: the result endpoint returns the SIGNED ATTESTATION + metadata and
+    /// NEVER the raw evidence_json — a sentinel secret seeded into evidence_json must not
+    /// appear anywhere in the response. The top-level evidence_digest matches the envelope's.
+    #[tokio::test]
+    async fn agent_job_result_returns_attestation_not_raw_evidence() {
+        use ryuki_protocol::{JobMode, JobResultStatus, SignedEnvelope, REDACTION_POLICY_VERSION};
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-res-{}", Uuid::new_v4().simple());
+        let job = seed_pending_job(pool, &platform).await;
+        let result_id = Uuid::new_v4();
+        let digest = "b".repeat(64);
+        let envelope = SignedEnvelope {
+            agent_id: "agent-x".into(),
+            platform: platform.clone(),
+            job_id: job,
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            request_id: Uuid::new_v4(),
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: "a".repeat(64),
+            approved_plan_digest: None,
+            evidence_digest: digest.clone(),
+            redaction_policy_version: REDACTION_POLICY_VERSION.into(),
+            timestamp: Utc::now(),
+            key_id: "key-1".into(),
+            cp_nonce: "nonce-1".into(),
+            signature: "sig".into(),
+        };
+        let env_json = serde_json::to_string(&envelope).unwrap();
+        // The raw evidence_json carries a SENTINEL that must NEVER reach the response.
+        let evidence = serde_json::json!({ "raw": "SUPERSECRET-DO-NOT-LEAK" }).to_string();
+        sqlx::query(
+            // 'check_ok' is the value the production POST path stores and the only
+            // casing the mig 055 result_status CHECK accepts (codex).
+            "UPDATE agent_jobs SET result_status = 'check_ok', completed_at = NOW(), \
+             result_id = $1, evidence_digest = $2, signed_envelope = $3::jsonb, \
+             evidence_json = $4::jsonb WHERE id = $5",
+        )
+        .bind(result_id)
+        .bind(&digest)
+        .bind(&env_json)
+        .bind(&evidence)
+        .bind(job)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let Json(out) = admin_agent_job_result(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("result must succeed");
+        assert_eq!(out["result_status"], json!("check_ok"));
+        assert_eq!(out["evidence_digest"], json!(digest), "top-level digest");
+        assert!(
+            out["signed_envelope"].is_object(),
+            "the attestation is returned"
+        );
+        // codex: top-level evidence_digest == signed_envelope.evidence_digest.
+        assert_eq!(
+            out["evidence_digest"],
+            out["signed_envelope"]["evidence_digest"]
+        );
+        // SECRET HYGIENE: the raw evidence_json sentinel NEVER appears in the body.
+        let body = out.to_string();
+        assert!(
+            !body.contains("SUPERSECRET"),
+            "raw evidence must not leak: {body}"
+        );
+        assert!(out.get("evidence_json").is_none(), "no evidence_json key");
+        assert!(
+            out.get("spec").is_none() && out.get("live_context").is_none(),
+            "no spec/live_context"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+    }
+
+    /// #agent-job-result: defense-in-depth (codex re-review #2) — a row stored BEFORE the
+    /// Step 5b ingestion guard (mig 055 predates it) whose signed_envelope carries an
+    /// unrecognised redaction_policy_version must NOT ride into the read view. The read side
+    /// re-gates against the allowlist and fails closed with a GENERIC, non-echoing error.
+    #[tokio::test]
+    async fn agent_job_result_unsupported_stored_policy_version_is_not_served() {
+        use ryuki_protocol::{JobMode, JobResultStatus, SignedEnvelope};
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-badpol-{}", Uuid::new_v4().simple());
+        let job = seed_pending_job(pool, &platform).await;
+        let result_id = Uuid::new_v4();
+        let digest = "c".repeat(64);
+        // A pre-guard stored envelope smuggling a secret into the policy-version slot.
+        let envelope = SignedEnvelope {
+            agent_id: "agent-x".into(),
+            platform: platform.clone(),
+            job_id: job,
+            attempt_id: Uuid::new_v4(),
+            lease_generation: 1,
+            request_id: Uuid::new_v4(),
+            result_id,
+            mode: JobMode::OfflineDryRun,
+            status: JobResultStatus::CheckOk,
+            job_spec_digest: "a".repeat(64),
+            approved_plan_digest: None,
+            evidence_digest: digest.clone(),
+            redaction_policy_version: "SUPERSECRET".into(),
+            timestamp: Utc::now(),
+            key_id: "key-1".into(),
+            cp_nonce: "nonce-1".into(),
+            signature: "sig".into(),
+        };
+        let env_json = serde_json::to_string(&envelope).unwrap();
+        sqlx::query(
+            "UPDATE agent_jobs SET result_status = 'check_ok', completed_at = NOW(), \
+             result_id = $1, evidence_digest = $2, signed_envelope = $3::jsonb WHERE id = $4",
+        )
+        .bind(result_id)
+        .bind(&digest)
+        .bind(&env_json)
+        .bind(job)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let err = admin_agent_job_result(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect_err("an unsupported stored policy version must not be served");
+        let (status, Json(body)) = err;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // The generic error must NOT echo the smuggled secret.
+        assert!(
+            !body.to_string().contains("SUPERSECRET"),
+            "read-side rejection must not echo the secret: {body}"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+    }
+
+    /// #agent-job-result: a job with NO result yet (signed_envelope NULL) → 404; an unknown
+    /// id → 404.
+    #[tokio::test]
+    async fn agent_job_result_no_result_and_unknown_404() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-nr-{}", Uuid::new_v4().simple());
+        let job = seed_pending_job(pool, &platform).await; // no result set
+        let no_result = admin_agent_job_result(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await;
+        assert!(
+            matches!(no_result, Err((StatusCode::NOT_FOUND, _))),
+            "no-result -> 404: {no_result:?}"
+        );
+        let unknown = admin_agent_job_result(
+            Path(Uuid::new_v4().to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await;
+        assert!(
+            matches!(unknown, Err((StatusCode::NOT_FOUND, _))),
+            "unknown -> 404"
+        );
+        cleanup_jobs_for_platform(pool, &platform).await;
+    }
+
+    /// #agent-job-result: a non-admin → 403; a malformed id → 404 (parsed BEFORE get_db, so
+    /// it 404s even with no DB — codex). Neither needs a pool.
+    #[tokio::test]
+    async fn agent_job_result_403_and_malformed_404() {
+        let denied = admin_agent_job_result(Path("x".into()), Extension(non_admin_session())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "{denied:?}"
+        );
+        let bad = admin_agent_job_result(
+            Path("not-a-uuid".into()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err((StatusCode::NOT_FOUND, _))),
+            "malformed id -> 404 (parsed before get_db): {bad:?}"
+        );
     }
 
     /// requeue happy: an ACTIVE parent + a DeadLettered job → Pending with a fresh
