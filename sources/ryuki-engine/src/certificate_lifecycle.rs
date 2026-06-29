@@ -44,6 +44,13 @@ pub struct CertificateRequest {
     pub validity_days: u32,
 }
 
+/// Upper bound on a certificate's requested validity (100 years). An UNBOUNDED
+/// `validity_days` flows into `now + Duration::days(validity_days)`, which PANICS
+/// on `DateTime` overflow — so the value MUST be capped at the validation boundary
+/// (a panic on attacker-chosen in-range u32 input is a DoS; see
+/// `validate_certificate_request` / `renew_certificate`).
+pub const MAX_CERTIFICATE_VALIDITY_DAYS: u32 = 36_500;
+
 /// Validate the fields of a certificate request. Pure; no I/O.
 pub fn validate_certificate_request(req: &CertificateRequest) -> Result<(), String> {
     if req.common_name.is_empty() {
@@ -61,8 +68,12 @@ pub fn validate_certificate_request(req: &CertificateRequest) -> Result<(), Stri
     if req.site.is_empty() {
         return Err("site cannot be empty".into());
     }
-    if req.validity_days == 0 {
-        return Err("validity_days must be greater than 0".into());
+    // Bounded BELOW and ABOVE: 0 is meaningless and an unbounded value overflows
+    // the `now + Duration::days(...)` below into a panic (DoS).
+    if !(1..=MAX_CERTIFICATE_VALIDITY_DAYS).contains(&req.validity_days) {
+        return Err(format!(
+            "validity_days must be between 1 and {MAX_CERTIFICATE_VALIDITY_DAYS}"
+        ));
     }
     Ok(())
 }
@@ -96,8 +107,12 @@ pub fn renew_certificate(
     cert: &CertificateRecord,
     validity_days: u32,
 ) -> Result<CertificateRecord, String> {
-    if validity_days == 0 {
-        return Err("validity_days must be greater than 0".into());
+    // Same bound as request (see MAX_CERTIFICATE_VALIDITY_DAYS): an unbounded
+    // value overflows the `now + Duration::days(...)` below into a panic.
+    if !(1..=MAX_CERTIFICATE_VALIDITY_DAYS).contains(&validity_days) {
+        return Err(format!(
+            "validity_days must be between 1 and {MAX_CERTIFICATE_VALIDITY_DAYS}"
+        ));
     }
     if cert.status == CertificateStatus::Revoked {
         return Err("Cannot renew a revoked certificate".into());
@@ -291,6 +306,34 @@ mod tests {
         let mut req = valid_request();
         req.validity_days = 0;
         assert!(validate_certificate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validity_days_is_bounded_above_no_overflow_panic() {
+        // An unbounded validity_days overflows `now + Duration::days(...)` into a
+        // panic (a DoS reachable by an execute-tier caller). The validation now
+        // caps it, so request_certificate/renew_certificate return Err — NOT panic.
+        for bad in [MAX_CERTIFICATE_VALIDITY_DAYS + 1, 100_000_000, u32::MAX] {
+            let mut req = valid_request();
+            req.validity_days = bad;
+            assert!(
+                validate_certificate_request(&req).is_err(),
+                "validity_days {bad} must be rejected"
+            );
+            // The handler entry point returns Err rather than panicking.
+            assert!(
+                request_certificate(&req).is_err(),
+                "request_certificate({bad}) must not panic"
+            );
+            assert!(
+                renew_certificate(&active_cert(), bad).is_err(),
+                "renew_certificate({bad}) must not panic"
+            );
+        }
+        // The boundary (exactly MAX) is accepted and does NOT overflow.
+        let mut ok = valid_request();
+        ok.validity_days = MAX_CERTIFICATE_VALIDITY_DAYS;
+        assert!(request_certificate(&ok).is_ok(), "MAX validity is accepted");
     }
 
     #[test]

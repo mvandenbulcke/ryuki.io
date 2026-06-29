@@ -104,6 +104,7 @@ pub struct ExecutionView {
 enum PruneTarget {
     JobExecutions,
     ConnectionHealthChecks,
+    CheckResults,
 }
 
 impl PruneTarget {
@@ -114,6 +115,7 @@ impl PruneTarget {
             PruneTarget::ConnectionHealthChecks => {
                 ("connection_health_checks", "connection_id", "checked_at")
             }
+            PruneTarget::CheckResults => ("check_results", "check_id", "executed_at"),
         }
     }
 }
@@ -873,6 +875,21 @@ async fn run_job(
                 Some(format!(
                     "pruned {pruned} old connection_health_checks row(s)"
                 )),
+            ))
+        }
+        "check_results_prune" => {
+            // Safe-internal write (correctness swarm): bound the synthetic-health-probe history.
+            // The hourly synthetic_health_run appends one check_results row PER enabled health_check
+            // per tick. Keep the newest per check_id. Runs HOURLY (codex): a DAILY cap of 20000 only
+            // keeps up below ~833 checks (#checks × 24/day); hourly → ~20000-check headroom.
+            const KEEP_PER_CHECK: i64 = 10_000;
+            const MAX_PER_RUN: i64 = 20_000;
+            let pruned =
+                prune_history_newest_n(tx, PruneTarget::CheckResults, KEEP_PER_CHECK, MAX_PER_RUN)
+                    .await?;
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("pruned {pruned} old check_results row(s)")),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -4010,6 +4027,112 @@ mod db_tests {
         );
         assert!(enabled, "seed ships enabled");
         assert_eq!(created_by, "system", "seed created_by");
+    }
+
+    // ---- correctness swarm: check_results prune (reuses the generalized helper) ----
+
+    const CHECK_RESULTS_PRUNE_SEED_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+    #[tokio::test]
+    async fn check_results_prune_keeps_newest_n_per_check() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Seed a parent health_check (FK target), then > keep check_results for it.
+        let check_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO health_checks (name, check_type, endpoint, expected_status, \
+             interval_seconds, site, enabled) \
+             VALUES ($1, 'http', 'x.example', 200, 60, 'DEFRA', false) RETURNING id",
+        )
+        .bind(format!("crp-{}", uuid::Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .expect("seed health_check");
+        // The prune is GLOBAL, so clear the whole (run-history) table for a deterministic
+        // `deleted` count (DB tests are serialized; check_results is re-populated by ticks).
+        sqlx::query("DELETE FROM check_results")
+            .execute(pool)
+            .await
+            .expect("clear check_results");
+        for age in [50, 40, 30, 20, 10] {
+            sqlx::query(
+                "INSERT INTO check_results (check_id, status, executed_at) \
+                 VALUES ($1, 'pass', NOW() - ($2 * INTERVAL '1 second'))",
+            )
+            .bind(check_id)
+            .bind(age as i64)
+            .execute(pool)
+            .await
+            .expect("seed check_result");
+        }
+
+        let mut tx = pool.begin().await.unwrap();
+        let deleted = prune_history_newest_n(&mut tx, PruneTarget::CheckResults, 3, 1_000_000)
+            .await
+            .expect("prune check_results");
+        tx.commit().await.unwrap();
+        assert_eq!(deleted, 2, "the 2 oldest of 5 are pruned (keep 3)");
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM check_results WHERE check_id = $1")
+                .bind(check_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(kept, 3, "keeps the newest 3 per check_id");
+
+        sqlx::query("DELETE FROM check_results WHERE check_id = $1")
+            .bind(check_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM health_checks WHERE id = $1")
+            .bind(check_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn migration_133_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        // Start from a clean slot so the test is deterministic for a FRESH DB (and corrects a
+        // local DB that applied an earlier interval before this migration was finalized). The FK
+        // cascade clears this schedule's job_executions (re-populated by later ticks).
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(CHECK_RESULTS_PRUNE_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        // The migration's seed, run TWICE — the second is a clean no-op (idempotent).
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+                 VALUES ($1, 'Check-results history prune (all health checks)', 'check_results_prune', \
+                         3600, TRUE, NOW(), 'system') \
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(CHECK_RESULTS_PRUNE_SEED_ID)
+            .execute(pool)
+            .await
+            .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        }
+        let (kind, interval): (String, i64) =
+            sqlx::query_as("SELECT job_kind, interval_secs FROM schedules WHERE id = $1")
+                .bind(CHECK_RESULTS_PRUNE_SEED_ID)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(kind, "check_results_prune", "seed job_kind");
+        assert_eq!(
+            interval, 3600,
+            "seed interval_secs (HOURLY — keeps the cap ahead of per-check growth)"
+        );
     }
 
     // ---- #52 slice 2: FAILED-latest signal ----------------------------------

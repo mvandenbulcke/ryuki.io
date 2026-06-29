@@ -13410,7 +13410,10 @@ async fn admin_platform_settings_history(
         return Ok(Json(json!({"history": [], "durable": false})));
     };
     let limit = params.limit.unwrap_or(50).clamp(1, 200) as i64;
-    let offset = params.offset.unwrap_or(0) as i64;
+    // Clamp the offset like the limit: an unclamped `usize as i64` wraps a huge
+    // `?offset=` to NEGATIVE, which Postgres rejects (`OFFSET must not be negative`)
+    // → a 500 instead of a clean read (codex correctness swarm).
+    let offset = params.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
         String,
