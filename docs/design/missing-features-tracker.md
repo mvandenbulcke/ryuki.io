@@ -230,6 +230,21 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Metric series aggregation** SHIPPED — `GET /api/metrics/series/aggregated` (verify-first
+swarm 2026-06-29 #10). The raw /metrics/series returned only the most-recent 10k raw
+samples; multi-month trend analysis forced client-side aggregation. New endpoint returns
+time-bucketed (hourly/daily/weekly/monthly) MIN/MAX/MEAN/COUNT rollups. codex caught two
+real defects: (impl MAJOR) the bounded-scan window (`observed_at >= now - span*limit`, added
+for the plan MAJOR so it doesn't aggregate all history) is NOT bucket-aligned, so it can
+straddle > limit labels — the LIMIT must run NEWEST-first (`ORDER BY bucket DESC LIMIT`
+subquery, re-sorted ASC) or the newest buckets get dropped; (impl MINOR) the non-UTC test
+must `SET LOCAL TIME ZONE` in a tx so it doesn't leak onto the pooled connection.
+UTC-deterministic via the 3-arg `date_trunc(field, observed_at, 'UTC')` (proven under a
+non-UTC session); allowlisted+bound granularity; coherent scope via enforce_scope_filters +
+IS NOT DISTINCT FROM; request-tier (matches raw /series). SQL aggregation, no migration, no
+engine change. codex plan(NEEDS-CHANGES→fixed)+impl(NEEDS-CHANGES→rd2 APPROVE). See
+metric-series-aggregated.md.
+
 **Legal-hold expiry scan** SHIPPED — `legal_hold_expiry_scan` durable-scheduler job
 (verify-first swarm 2026-06-29 #17). Mirrors `secret_rotation_due_scan` but SIMPLER
 (`legal_holds.expiry_date` is a real TIMESTAMPTZ — no parse/malformed signal). Daily

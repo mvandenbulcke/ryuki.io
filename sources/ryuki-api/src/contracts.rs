@@ -194,6 +194,10 @@ pub fn routes() -> Router {
         .route("/api/ops/scheduler/executions", get(scheduler_executions))
         .route("/api/metrics/samples", post(metrics_record_sample))
         .route("/api/metrics/series", get(metrics_series))
+        .route(
+            "/api/metrics/series/aggregated",
+            get(metrics_series_aggregated),
+        )
         .route("/api/metrics/insights", get(metrics_insights))
         .route(
             "/api/metrics/insights/generate",
@@ -19917,6 +19921,183 @@ async fn metrics_series(
     })))
 }
 
+/// Query params for the time-bucketed metric aggregation (#10).
+#[derive(Debug, Deserialize, Default)]
+struct MetricAggregatedParams {
+    metric_key: Option<String>,
+    site: Option<String>,
+    environment: Option<String>,
+    /// hourly | daily | weekly | monthly (allowlisted → a Postgres date_trunc field).
+    granularity: Option<String>,
+    /// Max buckets (default 365, clamped 1..=2000). Also bounds the scan window.
+    limit: Option<usize>,
+}
+
+/// Map a client-friendly granularity to (the Postgres `date_trunc` field, the bucket
+/// span in seconds). The field is a fixed `&'static str` from this allowlist — never raw
+/// client text — and the span derives the scan's time-window lower bound. `None` → 400.
+fn metric_granularity(granularity: &str) -> Option<(&'static str, i64)> {
+    match granularity {
+        "hourly" => Some(("hour", 3_600)),
+        "daily" => Some(("day", 86_400)),
+        "weekly" => Some(("week", 604_800)),
+        "monthly" => Some(("month", 2_678_400)), // 31d — an upper bound for the window
+        _ => None,
+    }
+}
+
+/// One aggregated time bucket.
+#[derive(sqlx::FromRow)]
+struct MetricBucketRow {
+    bucket: chrono::DateTime<chrono::Utc>,
+    min_value: f64,
+    max_value: f64,
+    mean_value: f64,
+    sample_count: i64,
+}
+
+/// Fetch COHERENT-scope time buckets for `metric_key`. `date_trunc($4, observed_at,
+/// 'UTC')` buckets at UTC boundaries DETERMINISTICALLY (independent of the DB session
+/// timezone). `observed_at >= $5` is the scan's time-window lower bound (codex: bounds
+/// the otherwise-all-history aggregation; the (metric_key, site, environment,
+/// observed_at) index makes it a bounded range scan). The inner `ORDER BY bucket DESC
+/// LIMIT $6` keeps the NEWEST `limit` buckets (codex: the window lower-bound is NOT
+/// bucket-aligned, so it can span > limit labels — taking them ASC would drop the most
+/// recent ones); the outer `ORDER BY bucket ASC` returns them oldest-first.
+/// `IS NOT DISTINCT FROM` → a single coherent scope (a specific site/env OR the
+/// platform-wide NULL rows, never a mix).
+async fn fetch_metric_buckets(
+    pool: &sqlx::PgPool,
+    metric_key: &str,
+    site: &Option<String>,
+    environment: &Option<String>,
+    trunc_field: &str,
+    lower_bound: chrono::DateTime<chrono::Utc>,
+    limit: i64,
+) -> Result<Vec<MetricBucketRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT bucket, min_value, max_value, mean_value, sample_count FROM ( \
+             SELECT date_trunc($4, observed_at, 'UTC') AS bucket, \
+                    MIN(value) AS min_value, MAX(value) AS max_value, \
+                    AVG(value) AS mean_value, COUNT(*) AS sample_count \
+             FROM metric_samples \
+             WHERE metric_key = $1 \
+               AND site IS NOT DISTINCT FROM $2 \
+               AND environment IS NOT DISTINCT FROM $3 \
+               AND observed_at >= $5 \
+             GROUP BY bucket ORDER BY bucket DESC LIMIT $6 \
+         ) recent ORDER BY bucket ASC",
+    )
+    .bind(metric_key)
+    .bind(site)
+    .bind(environment)
+    .bind(trunc_field)
+    .bind(lower_bound)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// GET /api/metrics/series/aggregated — time-bucketed (hourly/daily/weekly/monthly)
+/// MIN/MAX/MEAN/COUNT rollups of a metric series for historical trend analysis. Mirrors
+/// `metrics_series`'s gating + #2 coherent-scope handling. Buckets are NON-EMPTY only (no
+/// gap filling); `weekly` is the ISO-8601 Monday-start week at UTC. `request`-tier (a
+/// metrics read). The scan is bounded to the last `limit` buckets' worth of time.
+async fn metrics_series_aggregated(
+    AuthExtractor(session): AuthExtractor,
+    Query(params): Query<MetricAggregatedParams>,
+) -> ApiResult {
+    if !check_permission(&session, "request") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "authentication is required to read metrics"})),
+        ));
+    }
+    let Some(metric_key) = params
+        .metric_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(status_400("metric_key is required"));
+    };
+    if let Some(msg) = metric_key_rejection(metric_key) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))));
+    }
+    let Some(granularity) = params
+        .granularity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(status_400(
+            "granularity is required (hourly|daily|weekly|monthly)",
+        ));
+    };
+    let Some((trunc_field, span_secs)) = metric_granularity(granularity) else {
+        return Err(status_400(
+            "granularity must be one of hourly, daily, weekly, monthly",
+        ));
+    };
+    if metric_scope_too_long(&params.site) || metric_scope_too_long(&params.environment) {
+        return Err(status_400(
+            "site/environment must be at most 200 characters",
+        ));
+    }
+    let norm = |o: &Option<String>| {
+        o.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    // #2: enforce the session's site/environment scopes BEFORE touching the DB.
+    let (f_site, f_env) =
+        enforce_scope_filters(&session, norm(&params.site), norm(&params.environment))?;
+    let limit = params.limit.unwrap_or(365).clamp(1, 2000) as i64;
+    // Bound the scan to the last `limit` buckets' worth of time (codex MAJOR).
+    let lower_bound = chrono::Utc::now() - chrono::Duration::seconds(span_secs * limit);
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let rows = match fetch_metric_buckets(
+        pool,
+        metric_key,
+        &f_site,
+        &f_env,
+        trunc_field,
+        lower_bound,
+        limit,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "querying aggregated metric series failed");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not query aggregated metric series"})),
+            ));
+        }
+    };
+    let buckets: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "bucket_start": r.bucket.to_rfc3339(),
+                "min": r.min_value,
+                "max": r.max_value,
+                "mean": r.mean_value,
+                "count": r.sample_count,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "metric_key": metric_key,
+        "granularity": granularity,
+        "site": f_site,
+        "environment": f_env,
+        "buckets": buckets,
+    })))
+}
+
 /// Query params for metric insight detection (#35).
 #[derive(Debug, Deserialize, Default)]
 struct MetricInsightsParams {
@@ -38909,6 +39090,42 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
+    // ── metric aggregation (#10) — validation (no global pool: 400s precede the DB) ──
+
+    #[tokio::test]
+    async fn metric_aggregated_validation_400() {
+        let s = || AuthExtractor(AuthSession::static_dry_run());
+        let p = |metric_key: Option<&str>, granularity: Option<&str>| MetricAggregatedParams {
+            metric_key: metric_key.map(str::to_string),
+            granularity: granularity.map(str::to_string),
+            ..Default::default()
+        };
+        // metric_key required.
+        let r = metrics_series_aggregated(s(), Query(p(None, Some("daily")))).await;
+        assert!(
+            matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+            "missing metric_key: {r:?}"
+        );
+        // granularity required.
+        let r = metrics_series_aggregated(s(), Query(p(Some("cost.x"), None))).await;
+        assert!(
+            matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+            "missing granularity: {r:?}"
+        );
+        // unknown granularity → 400.
+        let r = metrics_series_aggregated(s(), Query(p(Some("cost.x"), Some("fortnightly")))).await;
+        assert!(
+            matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+            "bad granularity: {r:?}"
+        );
+        // malformed metric_key (illegal char) → 400.
+        let r = metrics_series_aggregated(s(), Query(p(Some("bad key!"), Some("daily")))).await;
+        assert!(
+            matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+            "bad metric_key: {r:?}"
+        );
+    }
+
     // ── approval-decisions ledger read — auth / no-DB / malformed (no global pool) ──
 
     #[tokio::test]
@@ -40418,6 +40635,276 @@ mod db_lifecycle_tests {
                 .unwrap();
         assert_eq!(still, 1);
         cleanup_cert(pool, &id).await;
+    }
+
+    /// #10: record a sample with a specific id/scope/value/observed_at.
+    async fn seed_metric_sample(
+        pool: &PgPool,
+        metric_key: &str,
+        site: Option<&str>,
+        value: f64,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        sqlx::query(
+            "INSERT INTO metric_samples (id, metric_key, site, environment, value, observed_at) \
+             VALUES ($1, $2, $3, NULL, $4, $5)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(metric_key)
+        .bind(site)
+        .bind(value)
+        .bind(observed_at)
+        .execute(pool)
+        .await
+        .expect("seed metric sample");
+    }
+
+    /// #10: daily buckets carry correct MIN/MAX/MEAN/COUNT, ascending, at UTC day starts.
+    #[tokio::test]
+    async fn metric_aggregated_buckets_by_day() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = format!("cap.cpu.{}", Uuid::new_v4().simple());
+        // Fixed mid-day UTC instants WITHIN the daily/limit=365 window (recent days, away
+        // from midnight). day_b (11d ago) precedes day_a (10d ago).
+        let today = chrono::Utc::now().date_naive();
+        let at = |days_ago: i64| {
+            (today - chrono::Duration::days(days_ago))
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        let day_a = at(10);
+        let day_b = at(11);
+        // day_b: [5, 15] → min5/max15/mean10/count2; day_a: [10,20,30] → min10/max30/mean20/count3.
+        seed_metric_sample(pool, &key, None, 5.0, day_b).await;
+        seed_metric_sample(pool, &key, None, 15.0, day_b).await;
+        seed_metric_sample(pool, &key, None, 10.0, day_a).await;
+        seed_metric_sample(pool, &key, None, 20.0, day_a).await;
+        seed_metric_sample(pool, &key, None, 30.0, day_a).await;
+
+        let Json(body) = metrics_series_aggregated(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(MetricAggregatedParams {
+                metric_key: Some(key.clone()),
+                granularity: Some("daily".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("aggregated read");
+        let buckets = body["buckets"].as_array().expect("buckets array");
+        assert_eq!(buckets.len(), 2, "two day buckets");
+        // Ascending: day_b first.
+        let day_start = |days_ago: i64| {
+            (today - chrono::Duration::days(days_ago))
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .to_rfc3339()
+        };
+        assert_eq!(buckets[0]["bucket_start"], serde_json::json!(day_start(11)));
+        assert_eq!(buckets[0]["min"], serde_json::json!(5.0));
+        assert_eq!(buckets[0]["max"], serde_json::json!(15.0));
+        assert_eq!(buckets[0]["mean"], serde_json::json!(10.0));
+        assert_eq!(buckets[0]["count"], serde_json::json!(2));
+        assert_eq!(buckets[1]["bucket_start"], serde_json::json!(day_start(10)));
+        assert_eq!(buckets[1]["min"], serde_json::json!(10.0));
+        assert_eq!(buckets[1]["max"], serde_json::json!(30.0));
+        assert_eq!(buckets[1]["mean"], serde_json::json!(20.0));
+        assert_eq!(buckets[1]["count"], serde_json::json!(3));
+        assert_eq!(body["granularity"], serde_json::json!("daily"));
+
+        // limit clamps: 0 → 1 (window shrinks to ~1 day → only day_a's bucket is in range).
+        let Json(clamped) = metrics_series_aggregated(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Query(MetricAggregatedParams {
+                metric_key: Some(key.clone()),
+                granularity: Some("daily".into()),
+                limit: Some(0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("clamped read");
+        // limit=0 clamps to 1 → window = now-1day, so the 10/11-day-old seeds are OUTSIDE
+        // it → empty (proves clamp(1,..) is applied, not a 0-limit error or full scan).
+        assert_eq!(
+            clamped["buckets"].as_array().unwrap().len(),
+            0,
+            "limit clamped to 1"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #10: scope is coherent (a scoped principal sees only its site) and an explicit
+    /// out-of-scope site is a 403.
+    #[tokio::test]
+    async fn metric_aggregated_scope_coherent_and_oos_403() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = format!("cap.scope.{}", Uuid::new_v4().simple());
+        let day = (chrono::Utc::now().date_naive() - chrono::Duration::days(5))
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        seed_metric_sample(pool, &key, Some("GBLON"), 42.0, day).await;
+        seed_metric_sample(pool, &key, None, 99.0, day).await; // platform-wide
+
+        // A GBLON-scoped principal omitting site is NARROWED to GBLON (coherent) → sees
+        // only the GBLON sample (42), not the platform-wide one (99).
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        let Json(body) = metrics_series_aggregated(
+            AuthExtractor(gblon),
+            Query(MetricAggregatedParams {
+                metric_key: Some(key.clone()),
+                granularity: Some("daily".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("gblon read");
+        let buckets = body["buckets"].as_array().unwrap();
+        assert_eq!(buckets.len(), 1, "one GBLON bucket");
+        assert_eq!(
+            buckets[0]["mean"],
+            serde_json::json!(42.0),
+            "only GBLON's sample"
+        );
+        assert_eq!(
+            body["site"],
+            serde_json::json!("GBLON"),
+            "scope is observable"
+        );
+
+        // A DEFRA-scoped principal NAMING site=GBLON → out of scope → 403.
+        let mut defra = AuthSession::static_dry_run();
+        defra.site_scope = vec!["DEFRA".into()];
+        let oos = metrics_series_aggregated(
+            AuthExtractor(defra),
+            Query(MetricAggregatedParams {
+                metric_key: Some(key.clone()),
+                granularity: Some("daily".into()),
+                site: Some("GBLON".into()),
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(oos, Err((StatusCode::FORBIDDEN, _))),
+            "an out-of-scope site must 403: {oos:?}"
+        );
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// #10: the 3-arg date_trunc(field, ts, 'UTC') buckets at UTC boundaries even when
+    /// the DB SESSION timezone is non-UTC (a bare 2-arg form would bucket in the session
+    /// TZ). Proven on a TZ-set connection (codex).
+    #[tokio::test]
+    async fn metric_aggregated_utc_truncation_ignores_session_tz() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // SET LOCAL inside a tx (codex MINOR): the non-UTC session TZ reverts on
+        // rollback, so it NEVER persists on the pooled connection for later reuse.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL TIME ZONE 'America/New_York'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // 2026-03-10T02:00:00Z is UTC day Mar 10, but in New York (UTC-5) it is
+        // 2026-03-09 21:00 — NY day Mar 9. The 3-arg UTC form must bucket to Mar 10.
+        let instant = chrono::DateTime::parse_from_rfc3339("2026-03-10T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let bucket: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT date_trunc('day', $1::timestamptz, 'UTC')")
+                .bind(instant)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        tx.rollback().await.ok();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-03-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            bucket, expected,
+            "3-arg date_trunc must bucket at the UTC day, ignoring the session TZ"
+        );
+    }
+
+    /// #10 (codex MAJOR): when the bounded window spans MORE than `limit` bucket labels,
+    /// the NEWEST `limit` buckets survive (inner ORDER BY bucket DESC LIMIT), returned
+    /// ascending. Calls fetch_metric_buckets with FIXED dates + an explicit lower_bound
+    /// so it is deterministic (no wall-clock window).
+    #[tokio::test]
+    async fn metric_aggregated_limit_keeps_newest_buckets() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let key = format!("cap.newest.{}", Uuid::new_v4().simple());
+        let at = |d: &str| {
+            chrono::DateTime::parse_from_rfc3339(d)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        // Three day-buckets; values 1/2/3 so each is identifiable by its mean.
+        seed_metric_sample(pool, &key, None, 1.0, at("2025-01-10T12:00:00Z")).await;
+        seed_metric_sample(pool, &key, None, 2.0, at("2025-01-11T12:00:00Z")).await;
+        seed_metric_sample(pool, &key, None, 3.0, at("2025-01-12T12:00:00Z")).await;
+
+        // Window includes all 3; limit=2 → keep the 2 NEWEST (Jan 11, Jan 12), ascending.
+        let rows = fetch_metric_buckets(
+            pool,
+            &key,
+            &None,
+            &None,
+            "day",
+            at("2025-01-09T00:00:00Z"),
+            2,
+        )
+        .await
+        .expect("fetch buckets");
+        assert_eq!(rows.len(), 2, "limit=2 keeps two buckets");
+        assert_eq!(
+            rows[0].bucket,
+            at("2025-01-11T00:00:00Z"),
+            "the OLDER-of-the-kept (Jan 11) is first (ascending) — Jan 10 was dropped"
+        );
+        assert_eq!(rows[0].mean_value, 2.0);
+        assert_eq!(
+            rows[1].bucket,
+            at("2025-01-12T00:00:00Z"),
+            "the NEWEST (Jan 12) is last"
+        );
+        assert_eq!(rows[1].mean_value, 3.0);
+
+        sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// #2 RBAC (storage, site-only): a by-id volume read is 404 out-of-scope and
