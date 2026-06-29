@@ -14631,7 +14631,7 @@ pub(crate) fn db_status_to_request_status(s: &str) -> ryuki_engine::models::Requ
     }
 }
 
-fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str {
+pub(crate) fn request_status_to_db(s: &ryuki_engine::models::RequestStatus) -> &'static str {
     use ryuki_engine::models::RequestStatus;
     match s {
         RequestStatus::Draft => "draft",

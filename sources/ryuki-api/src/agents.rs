@@ -2463,6 +2463,173 @@ pub async fn admin_agents_liveness(
     agents_liveness_with(pool, offline_after_secs, now_unix).await
 }
 
+/// One dead-lettered agent job in the operator list. Secret-safe projection: the
+/// job `spec` (opaque payload) and `live_context` (CP-signed grant) are NEVER
+/// included — only operational metadata.
+#[derive(serde::Serialize, sqlx::FromRow)]
+struct DeadLetteredJobView {
+    job_id: String,
+    request_id: String,
+    platform: String,
+    mode: String,
+    delivery_attempts: i32,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+/// GET /api/admin/agents/dead-lettered-jobs
+///
+/// Lists every terminal `DeadLettered` agent job (poison jobs that exhausted the
+/// redispatch cap, #23) so an operator can SEE them — otherwise they are an
+/// operational black hole. Admin-only (re-checked in-handler as defense-in-depth).
+/// Newest first, capped at 500. `spec`/`live_context` are excluded (secret hygiene).
+pub async fn admin_dead_lettered_jobs(
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission required"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let rows: Vec<DeadLetteredJobView> = sqlx::query_as(
+        "SELECT id::text AS job_id, request_id::text AS request_id, platform, mode, \
+         delivery_attempts, created_at, updated_at \
+         FROM agent_jobs WHERE status = 'DeadLettered' \
+         ORDER BY updated_at DESC LIMIT 500",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(Json(json!({
+        "dead_lettered_jobs": serde_json::to_value(&rows).unwrap_or_default(),
+        "count": rows.len(),
+    })))
+}
+
+/// POST /api/admin/agents/dead-lettered-jobs/{job_id}/requeue
+///
+/// Recovers a `DeadLettered` job: returns it to `Pending` with a fresh redispatch
+/// budget (`delivery_attempts = 0`) + cleared lease state, so the agent fleet can
+/// pick it up again. Admin-only + audited. Guards (in the project lock order
+/// requests -> agent_jobs, which cannot deadlock since no path locks job -> request):
+/// - the job must still be `DeadLettered` (idempotent: a second requeue 409s);
+/// - the PARENT REQUEST must still be ACTIVE — a job whose request has concluded
+///   (failed/cancelled/rejected/completed/...) or is orphaned/unknown is REFUSED
+///   (409), so requeue can never re-dispatch stale work for a closed request.
+pub async fn admin_requeue_dead_lettered_job(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission is required to requeue a job"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // 1. Read the job UNLOCKED (keeps the lock order requests-first). We validate
+    //    against the dispatched JobSpec (the `spec` JSONB), NOT the scalar
+    //    request_id/mode columns: the AGENT executes and routes by spec.request_id /
+    //    spec.mode (run.rs routes on spec.mode; the result backlink uses
+    //    spec.request_id), and create_agent_job does NOT pin the columns to the spec.
+    //    So the spec is the source of truth for "which request" and "is this live".
+    let job: Option<(sqlx::types::Json<serde_json::Value>, String, String)> =
+        sqlx::query_as("SELECT spec, status, platform FROM agent_jobs WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let Some((spec_json, status, platform)) = job else {
+        return Err(not_found(format!("agent job '{job_id}' not found")));
+    };
+    if status != "DeadLettered" {
+        return Err(conflict(format!(
+            "job is in status '{status}'; only DeadLettered jobs can be requeued"
+        )));
+    }
+
+    // 2. Decode the dispatched spec — the source of truth the agent acts on. A
+    //    malformed spec is unrequeueable (the agent could not run it). Only
+    //    non-mutating jobs may be requeued: a LiveApply spec must NEVER be
+    //    re-dispatched as Pending work (the agent routes LivePlan/LiveApply through
+    //    the LIVE executor by spec.mode — the column mode is not load-bearing).
+    let spec: JobSpec = serde_json::from_value(spec_json.0)
+        .map_err(|_| conflict("job spec is malformed; cannot requeue"))?;
+    match spec.mode {
+        JobMode::OfflineDryRun | JobMode::LivePlan => {}
+        JobMode::LiveApply => {
+            return Err(conflict(
+                "a LiveApply job cannot be requeued (it reconciles, it does not redispatch)",
+            ));
+        }
+    }
+    let exec_request_id = spec.request_id;
+
+    // 3. PARENT-REQUEST GUARD on spec.request_id (the request the agent will act on).
+    //    Lock it FOR UPDATE (requests -> agent_jobs order) and refuse to revive a job
+    //    whose request has concluded; the FOR UPDATE serializes against a concurrent
+    //    reject/fail/cancel (those CAS the request row).
+    let parent_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(exec_request_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let Some(parent_status) = parent_status else {
+        return Err(conflict(
+            "parent request not found; cannot requeue an orphaned job",
+        ));
+    };
+    // Fail closed: only a recognized ACTIVE status permits requeue. An unknown string
+    // decodes to the Draft fallback, so require the decode to ROUND-TRIP as well.
+    let decoded = crate::contracts::db_status_to_request_status(&parent_status);
+    if decoded.is_concluded() || crate::contracts::request_status_to_db(&decoded) != parent_status {
+        return Err(conflict(format!(
+            "parent request status '{parent_status}' does not permit requeue (concluded or unknown)"
+        )));
+    }
+
+    // 4. Requeue. The WHERE status='DeadLettered' makes the job-status race fail
+    //    closed (a concurrent requeue/expire that moved it off DeadLettered yields 0
+    //    rows). spec.mode was validated above, so no column-mode predicate is needed.
+    let updated = sqlx::query(
+        "UPDATE agent_jobs \
+         SET status = 'Pending', agent_id = NULL, attempt_id = NULL, \
+             fencing_token = NULL, cp_nonce = NULL, lease_deadline = NULL, \
+             delivery_attempts = 0, updated_at = NOW() \
+         WHERE id = $1 AND status = 'DeadLettered'",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    if updated != 1 {
+        return Err(conflict(
+            "job was not in a requeueable state; reload and retry",
+        ));
+    }
+
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-job-requeue",
+            Some("dead-lettered"),
+            "pending",
+            json!({ "job_id": &job_id, "request_id": exec_request_id.to_string(), "platform": platform }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::info!(job_id = %job_id, "dead-lettered agent job requeued to Pending");
+    Ok(Json(
+        json!({ "job_id": job_id, "status": "Pending", "requeued": true }),
+    ))
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -2484,6 +2651,17 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/live-apply-jobs",
             post(admin_approve_live_apply_job),
+        )
+        // Static `dead-lettered-jobs` in the `{agent_id}` slot — matchit routes the
+        // literal over the param (same pattern as `liveness`), so it does not shadow
+        // `/{agent_id}/approve|revoke`.
+        .route(
+            "/api/admin/agents/dead-lettered-jobs",
+            get(admin_dead_lettered_jobs),
+        )
+        .route(
+            "/api/admin/agents/dead-lettered-jobs/{job_id}/requeue",
+            post(admin_requeue_dead_lettered_job),
         )
 }
 
@@ -7637,5 +7815,456 @@ mod tests {
             .await
             .ok();
         pool.close().await;
+    }
+
+    // ── #23 follow-up: dead-lettered job list + requeue ──────────────────────
+
+    /// Seed a requests row at a given status (returns its id). Active statuses
+    /// ('executing') permit requeue; concluded ones ('cancelled'/'failed') do not.
+    async fn seed_request_row(pool: &PgPool, status: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, \
+             name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', $2, 'execute', 'DEFRA', 'production', \
+             'dlq-test', 2, 4, 'requester')",
+        )
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed request row");
+        id
+    }
+
+    /// Build a valid OfflineDryRun JobSpec whose `request_id` is the agent's source
+    /// of truth for the parent request.
+    fn dead_letter_spec(request_id: Uuid, mode: JobMode) -> JobSpec {
+        JobSpec {
+            request_id,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: std::collections::BTreeMap::new(),
+            mode,
+        }
+    }
+
+    /// Seed a terminal DeadLettered job (delivery_attempts at the cap) directly. The
+    /// `spec.request_id` (what the agent acts on) == `request_id`, and the scalar
+    /// column also == `request_id` (the common, consistent case).
+    async fn seed_dead_lettered_job(pool: &PgPool, platform: &str, request_id: Uuid) -> Uuid {
+        seed_dead_lettered_job_full(
+            pool,
+            platform,
+            request_id,
+            request_id,
+            JobMode::OfflineDryRun,
+        )
+        .await
+    }
+
+    /// Seed a DeadLettered job with EXPLICIT column vs spec request ids + spec mode —
+    /// to exercise the spec-is-source-of-truth guards (column may differ from spec).
+    async fn seed_dead_lettered_job_full(
+        pool: &PgPool,
+        platform: &str,
+        column_request_id: Uuid,
+        spec_request_id: Uuid,
+        spec_mode: JobMode,
+    ) -> Uuid {
+        let spec = dead_letter_spec(spec_request_id, spec_mode);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, delivery_attempts) \
+             VALUES ($1, $2, $3, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
+        )
+        .bind(column_request_id)
+        .bind(platform)
+        .bind(&spec_json)
+        .fetch_one(pool)
+        .await
+        .expect("seed dead-lettered job")
+    }
+
+    async fn cleanup_request_row(pool: &PgPool, id: Uuid) {
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    async fn requeue_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'agent-job-requeue' AND detail->>'job_id' = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count requeue audit")
+    }
+
+    /// list returns DeadLettered jobs with secret-safe metadata only; non-dead
+    /// jobs are excluded.
+    #[tokio::test]
+    async fn db_dead_lettered_jobs_list_happy() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let dl1 = seed_dead_lettered_job(pool, &platform, req).await;
+        let dl2 = seed_dead_lettered_job(pool, &platform, req).await;
+        let pending = seed_pending_job(pool, &platform).await;
+
+        let Json(out) = admin_dead_lettered_jobs(Extension(AuthSession::static_dry_run()))
+            .await
+            .expect("list must succeed");
+        let jobs = out["dead_lettered_jobs"].as_array().unwrap();
+        let ids: Vec<&str> = jobs.iter().map(|j| j["job_id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&dl1.to_string().as_str()), "dl1 listed");
+        assert!(ids.contains(&dl2.to_string().as_str()), "dl2 listed");
+        assert!(
+            !ids.contains(&pending.to_string().as_str()),
+            "a Pending job must NOT be listed"
+        );
+        // Secret hygiene: NO spec / live_context in any entry.
+        for j in jobs {
+            assert!(j.get("spec").is_none(), "spec must not be exposed");
+            assert!(
+                j.get("live_context").is_none(),
+                "live_context must not be exposed"
+            );
+            assert!(j["request_id"].is_string(), "request_id present");
+        }
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// requeue happy: an ACTIVE parent + a DeadLettered job → Pending with a fresh
+    /// budget + cleared lease state, audited.
+    #[tokio::test]
+    async fn db_requeue_dead_lettered_happy() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_dead_lettered_job(pool, &platform, req).await;
+
+        let Json(out) = admin_requeue_dead_lettered_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("requeue must succeed");
+        assert_eq!(out["status"], "Pending");
+        assert_eq!(out["requeued"], true);
+
+        let (status, attempts) = job_status_and_attempts(pool, job).await;
+        assert_eq!(status, "Pending", "job back to Pending");
+        assert_eq!(attempts, 0, "delivery budget reset");
+        let agent_id: Option<String> =
+            sqlx::query_scalar("SELECT agent_id FROM agent_jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(pool)
+                .await
+                .expect("read agent_id");
+        assert!(agent_id.is_none(), "lease state cleared");
+        assert_eq!(requeue_audit_count(pool, job).await, 1, "one requeue audit");
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// requeue rejects a non-DeadLettered job (and is idempotent: a second requeue
+    /// of an already-requeued job 409s because it is now Pending).
+    #[tokio::test]
+    async fn db_requeue_rejects_non_dead_lettered_and_is_idempotent() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+
+        // A plain Pending job → 409.
+        let pending = seed_pending_job(pool, &platform).await;
+        let Err((s1, _)) = admin_requeue_dead_lettered_job(
+            Path(pending.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("requeue of a non-dead-lettered job must 409");
+        };
+        assert_eq!(s1, StatusCode::CONFLICT);
+
+        // Idempotency: requeue a DeadLettered job (200), then a second requeue 409s.
+        let job = seed_dead_lettered_job(pool, &platform, req).await;
+        let _ = admin_requeue_dead_lettered_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("first requeue 200");
+        let Err((s2, _)) = admin_requeue_dead_lettered_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("second requeue (now Pending) must 409");
+        };
+        assert_eq!(s2, StatusCode::CONFLICT);
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// requeue unknown / malformed id → 404.
+    #[tokio::test]
+    async fn db_requeue_unknown_id_404() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        for id in [Uuid::new_v4().to_string(), "not-a-uuid".to_string()] {
+            let Err((status, _)) =
+                admin_requeue_dead_lettered_job(Path(id), Extension(AuthSession::static_dry_run()))
+                    .await
+            else {
+                panic!("unknown/malformed id must 404");
+            };
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// requeue REFUSES a job whose parent request has concluded (codex MAJOR):
+    /// cancelled, failed, and orphaned parents all 409, and the job is UNCHANGED.
+    #[tokio::test]
+    async fn db_requeue_rejects_concluded_parent() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let cancelled = seed_request_row(pool, "cancelled").await;
+        let failed = seed_request_row(pool, "failed").await;
+
+        for parent in [cancelled, failed] {
+            let job = seed_dead_lettered_job(pool, &platform, parent).await;
+            let Err((status, _)) = admin_requeue_dead_lettered_job(
+                Path(job.to_string()),
+                Extension(AuthSession::static_dry_run()),
+            )
+            .await
+            else {
+                panic!("requeue with a concluded parent must 409");
+            };
+            assert_eq!(status, StatusCode::CONFLICT);
+            // The job is untouched — still DeadLettered with its attempts intact.
+            let (s, a) = job_status_and_attempts(pool, job).await;
+            assert_eq!(s, "DeadLettered", "job must NOT be requeued");
+            assert_eq!(a, 5, "delivery_attempts must NOT be reset");
+        }
+
+        // Orphan: a job whose request_id has no requests row → 409.
+        let orphan = seed_dead_lettered_job(pool, &platform, Uuid::new_v4()).await;
+        let Err((status, _)) = admin_requeue_dead_lettered_job(
+            Path(orphan.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("requeue of an orphan job must 409");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, cancelled).await;
+        cleanup_request_row(pool, failed).await;
+    }
+
+    /// requeue validates the dispatched SPEC, not the scalar columns (codex MAJOR):
+    /// the agent acts on spec.request_id / spec.mode, and create_agent_job does not
+    /// pin the columns to the spec. So requeue must guard the spec.
+    #[tokio::test]
+    async fn db_requeue_validates_the_spec_not_the_columns() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let active = seed_request_row(pool, "executing").await;
+        let concluded = seed_request_row(pool, "cancelled").await;
+
+        // A) column request_id ACTIVE but spec.request_id CONCLUDED → 409 (the guard
+        //    must follow the spec, which is what the agent executes).
+        let job_a =
+            seed_dead_lettered_job_full(pool, &platform, active, concluded, JobMode::OfflineDryRun)
+                .await;
+        let Err((sa, _)) = admin_requeue_dead_lettered_job(
+            Path(job_a.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("spec.request_id concluded must 409 even when the column is active");
+        };
+        assert_eq!(sa, StatusCode::CONFLICT);
+        assert_eq!(job_status_and_attempts(pool, job_a).await.0, "DeadLettered");
+
+        // B) column request_id CONCLUDED but spec.request_id ACTIVE → 200 (the spec's
+        //    parent is active, so requeue is allowed regardless of the stale column).
+        let job_b =
+            seed_dead_lettered_job_full(pool, &platform, concluded, active, JobMode::OfflineDryRun)
+                .await;
+        let _ = admin_requeue_dead_lettered_job(
+            Path(job_b.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("spec.request_id active must requeue (200) even if the column is concluded");
+        assert_eq!(job_status_and_attempts(pool, job_b).await.0, "Pending");
+
+        // C) spec.mode = LiveApply (column says OfflineDryRun) → 409: a live job must
+        //    never be re-dispatched as non-mutating Pending work.
+        let job_c =
+            seed_dead_lettered_job_full(pool, &platform, active, active, JobMode::LiveApply).await;
+        let Err((sc, _)) = admin_requeue_dead_lettered_job(
+            Path(job_c.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("a LiveApply spec must 409 even when the column mode is OfflineDryRun");
+        };
+        assert_eq!(sc, StatusCode::CONFLICT);
+        assert_eq!(job_status_and_attempts(pool, job_c).await.0, "DeadLettered");
+
+        // D) malformed spec → 409 (the agent could not have run it).
+        let job_d: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status, delivery_attempts) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'DeadLettered', 5) RETURNING id",
+        )
+        .bind(active)
+        .bind(&platform)
+        .fetch_one(pool)
+        .await
+        .expect("seed malformed-spec job");
+        let Err((sd, _)) = admin_requeue_dead_lettered_job(
+            Path(job_d.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        else {
+            panic!("a malformed spec must 409");
+        };
+        assert_eq!(sd, StatusCode::CONFLICT);
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, active).await;
+        cleanup_request_row(pool, concluded).await;
+    }
+
+    /// The audited reset does NOT let a poisoned job escape the automatic cap
+    /// (codex MINOR): after requeue (budget reset to 0), driving the job back
+    /// through lease-expiry re-dead-letters it once the fresh budget is exhausted.
+    #[tokio::test]
+    async fn db_requeue_then_cap_reapplies() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let _expire = EXPIRE_TEST_LOCK.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_dead_lettered_job(pool, &platform, req).await;
+
+        let _ = admin_requeue_dead_lettered_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+        )
+        .await
+        .expect("requeue 200");
+        assert_eq!(
+            job_status_and_attempts(pool, job).await,
+            ("Pending".into(), 0)
+        );
+
+        // Fresh budget: five redispatches, then the sixth expiry dead-letters again.
+        for cycle in 1..=5_i32 {
+            release_expired(pool, job).await;
+            expire_leases(pool).await.expect("expire");
+            let (status, attempts) = job_status_and_attempts(pool, job).await;
+            assert_eq!(
+                status, "Pending",
+                "cycle {cycle} redispatches on the fresh budget"
+            );
+            assert_eq!(attempts, cycle, "cycle {cycle} increments attempts");
+        }
+        release_expired(pool, job).await;
+        expire_leases(pool).await.expect("expire");
+        assert_eq!(
+            job_status_and_attempts(pool, job).await.0,
+            "DeadLettered",
+            "the fresh budget is exactly the cap — it re-dead-letters, not escapes it"
+        );
+
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// Both endpoints are admin-only: a non-admin session → 403, no state change.
+    #[tokio::test]
+    async fn db_dead_letter_endpoints_admin_gated() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_dead_lettered_job(pool, &platform, req).await;
+
+        let Err((s_list, _)) = admin_dead_lettered_jobs(Extension(non_admin_session())).await
+        else {
+            panic!("non-admin list must 403");
+        };
+        assert_eq!(s_list, StatusCode::FORBIDDEN);
+
+        let Err((s_req, _)) =
+            admin_requeue_dead_lettered_job(Path(job.to_string()), Extension(non_admin_session()))
+                .await
+        else {
+            panic!("non-admin requeue must 403");
+        };
+        assert_eq!(s_req, StatusCode::FORBIDDEN);
+        // Unchanged.
+        assert_eq!(job_status_and_attempts(pool, job).await.0, "DeadLettered");
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// The admin router builds (no matchit panic) with the new static
+    /// `dead-lettered-jobs` path sitting beside the `{agent_id}` param.
+    #[test]
+    fn admin_routes_build_with_dead_letter_paths() {
+        let _router = admin_routes();
     }
 }
