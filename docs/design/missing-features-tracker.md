@@ -208,6 +208,18 @@ Tombstone-rich audit. Codex plan(rd2)+impl APPROVE; impl-review MINORs both clos
 (audit before/after delta assertion; explicit DELETE route-gate test). See
 patch-wave-delete.md.
 
+**Approval-decisions ledger read** SHIPPED — `GET /api/requests/{id}/approval-decisions`
+(verify-first swarm 2026-06-29 #2). The audit-tier quorum endpoint returns only breadth
+AGGREGATES; the per-decision ledger (`request_approval_decisions`: role/decision/actor/
+decided_at/reason) was never surfaced. New audit-tier read returns the full ordered
+ledger (DETERMINISTIC `ORDER BY decided_at ASC, id ASC` — Postgres now() is tx-scoped, so
+the BIGSERIAL id is the tie-breaker for same-tx decisions, not exposed). DIVERGED from the
+swarm's approve-tier recommendation (FALSE premise: every approve-holder ALSO holds audit,
+and approve-tier would wrongly exclude the audit-only Auditor from an audit ledger). Guard
+order mirrors quorum: permission → uuid → no-DB empty → existence+scope (404, no oracle) →
+ledger. `reason` documented as audit-visible free text (write-side redaction is the
+mitigation). codex plan+impl APPROVE. See approval-decisions-read.md.
+
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),
 #8 agent approve — revoke deferred (`6d6fb5b`), #63 observability deploy

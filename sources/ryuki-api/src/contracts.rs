@@ -164,6 +164,10 @@ pub fn routes() -> Router {
             "/api/requests/{id}/approval-quorum",
             get(requests_approval_quorum),
         )
+        .route(
+            "/api/requests/{id}/approval-decisions",
+            get(requests_approval_decisions),
+        )
         .route("/api/requests/{id}/evidence", get(request_evidence_pack))
         .route("/api/activity/audit", get(activity_audit_feed))
         .route("/api/events", get(events_list))
@@ -18537,6 +18541,93 @@ async fn requests_approval_quorum(
 
     let status = evaluate_quorum(&decisions, required_roles, required_approvers);
     Ok(Json(render(&status, true)))
+}
+
+/// GET /api/requests/{id}/approval-decisions — the individual approval-decision
+/// LEDGER for one request: every recorded `request_approval_decisions` row (role,
+/// decision, actor, decided_at, reason), the per-decision DETAIL the quorum endpoint
+/// deliberately omits (it returns only breadth aggregates). The companion to
+/// `requests_approval_quorum`: quorum = the verdict, this = the records behind it.
+///
+/// Audit-tier — same identity-grade sensitivity as the quorum endpoint and the audit
+/// trail. NOT approve-tier: every approve-holding role (DatacenterApprover,
+/// PlatformAdmin) ALSO holds `audit`, and gating on `approve` would wrongly exclude
+/// the audit-only `Auditor` from an audit ledger. `actor` is already exposed by the
+/// quorum endpoint's approvers list; `reason` is the approver's free-text reject
+/// justification — treat it as AUDIT-VISIBLE free text (any secret/PII redaction is a
+/// write-side concern, out of scope for this read). 404 for an unknown OR out-of-scope
+/// request (no oracle). Empty ledger + `durable:false` with no DB (the dry-run approve
+/// arm writes no ledger), distinct from a durable-but-empty `{decisions:[],durable:true}`.
+async fn requests_approval_decisions(
+    AuthExtractor(session): AuthExtractor,
+    Path(request_id): Path<String>,
+) -> ApiResult {
+    if !check_permission(&session, "audit") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Audit-tier access is required to read approval decisions"})),
+        ));
+    }
+
+    // Validate the id format UP FRONT so a malformed request_id is a 404 in BOTH the
+    // DB and no-DB paths (consistent with the quorum endpoint).
+    let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+
+    let Some(pool) = get_db() else {
+        // No-DB / dry-run: the dry-run approve arm keeps no decision ledger, so the
+        // ledger is empty and non-durable. Shape parity with the quorum endpoint.
+        return Ok(Json(json!({ "decisions": [], "durable": false })));
+    };
+
+    // 404 an unknown request so "no decisions yet" is distinguishable from "no such
+    // request"; the same SELECT yields site/environment for the scope guard.
+    let exists: Option<(String, String)> =
+        sqlx::query_as("SELECT site, environment FROM requests WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_error)?;
+    let Some((site, environment)) = exists else {
+        return Err(status_404(&request_id));
+    };
+    // #2: an out-of-scope request's ledger is a 404 (same as unknown — no oracle).
+    scope_guard_or_404(&session, &site, &environment, &request_id)?;
+
+    // The full ledger in stable order. ORDER BY decided_at ASC, id ASC: decided_at
+    // alone is NOT deterministic (codex) — Postgres now() is transaction-scoped, so
+    // decisions recorded in one tx can share a timestamp; the BIGSERIAL id is the
+    // monotonic tie-breaker (not exposed in the response).
+    #[derive(sqlx::FromRow)]
+    struct DecisionRow {
+        role: String,
+        decision: String,
+        actor: String,
+        decided_at: chrono::DateTime<chrono::Utc>,
+        reason: Option<String>,
+    }
+    let rows: Vec<DecisionRow> = sqlx::query_as(
+        "SELECT role, decision, actor, decided_at, reason FROM request_approval_decisions \
+             WHERE request_id = $1 ORDER BY decided_at ASC, id ASC",
+    )
+    .bind(uid)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+
+    let decisions: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "role": r.role,
+                "decision": r.decision,
+                "actor": r.actor,
+                "decided_at": r.decided_at.to_rfc3339(),
+                "reason": r.reason,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({ "decisions": decisions, "durable": true })))
 }
 
 /// GET /api/requests/{id}/evidence — a tamper-evident compliance evidence pack
@@ -38588,6 +38679,53 @@ mod unit_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
+    // ── approval-decisions ledger read — auth / no-DB / malformed (no global pool) ──
+
+    #[tokio::test]
+    async fn approval_decisions_requires_audit_permission() {
+        let no_perm = AuthSession {
+            user_id: "u".into(),
+            display_name: "U".into(),
+            roles: vec![],
+            token_valid: true,
+            provider_mode: "test".into(),
+            ..Default::default()
+        };
+        let err = requests_approval_decisions(AuthExtractor(no_perm), Path("r1".into()))
+            .await
+            .expect_err("non-audit must be forbidden");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn approval_decisions_without_db_is_empty_not_durable() {
+        // A well-formed UUID reaches the no-DB empty-ledger path (a malformed id is a
+        // 404 in BOTH paths — see approval_decisions_malformed_id_is_404).
+        let Ok(Json(body)) = requests_approval_decisions(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(uuid::Uuid::new_v4().to_string()),
+        )
+        .await
+        else {
+            panic!("no-DB approval-decisions should be 200, not an error");
+        };
+        assert_eq!(body["durable"], serde_json::json!(false));
+        assert_eq!(body["decisions"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn approval_decisions_malformed_id_is_404() {
+        // The id is validated UP FRONT, so a malformed request_id is a 404 even with
+        // no DB (consistent with the DB path — not a 200).
+        let err = requests_approval_decisions(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("not-a-uuid".into()),
+        )
+        .await
+        .expect_err("a malformed request_id must 404, not return an empty 200");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
     // ── #59 user scope preferences — no-DB handler paths ──
 
     #[tokio::test]
@@ -46254,6 +46392,137 @@ mod db_lifecycle_tests {
         assert_eq!(err.0, StatusCode::NOT_FOUND);
 
         cleanup(pool).await;
+    }
+
+    /// GET approval-decisions returns the full ledger (role/decision/actor/decided_at/
+    /// reason) in DETERMINISTIC order — decided_at ASC, then BIGSERIAL id ASC as the
+    /// tie-breaker for same-transaction timestamps (codex). reason is NULL for the
+    /// approve and present for the reject; durable:true; unknown request → 404.
+    #[tokio::test]
+    async fn approval_decisions_returns_ledger_ordered_with_reasons() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned_empty_route(pool).await;
+        // Two decisions in ONE tx share decided_at (Postgres now() is tx-scoped), so
+        // the id tie-breaker decides order: the approve (inserted first → lower id →
+        // NULL reason) precedes the reject (present reason). This exercises exactly the
+        // deterministic-ordering fix codex required.
+        sqlx::query(
+            "INSERT INTO request_approval_decisions (request_id, role, decision, actor, reason) \
+             VALUES ($1, 'DatacenterApprover', 'approved', 'alice', NULL), \
+                    ($1, 'SecurityApprover', 'rejected', 'bob', 'insufficient change window')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed decisions");
+
+        let cleanup = |pool: &'static PgPool| async move {
+            sqlx::query("DELETE FROM request_approval_decisions WHERE request_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+            cleanup_request(pool, id).await;
+        };
+
+        let Ok(Json(body)) = requests_approval_decisions(
+            AuthExtractor(dc_approver_session("alice")),
+            Path(id.to_string()),
+        )
+        .await
+        else {
+            cleanup(pool).await;
+            panic!("approval-decisions handler failed");
+        };
+        assert_eq!(body["durable"], serde_json::json!(true));
+        let decisions = body["decisions"].as_array().expect("decisions array");
+        assert_eq!(decisions.len(), 2, "both decisions returned");
+        // Deterministic: the approve (lower id) is first, the reject second.
+        assert_eq!(
+            decisions[0]["role"],
+            serde_json::json!("DatacenterApprover")
+        );
+        assert_eq!(decisions[0]["decision"], serde_json::json!("approved"));
+        assert_eq!(decisions[0]["actor"], serde_json::json!("alice"));
+        assert_eq!(
+            decisions[0]["reason"],
+            serde_json::Value::Null,
+            "approve reason is null"
+        );
+        assert!(
+            decisions[0]["decided_at"].as_str().is_some(),
+            "decided_at present as rfc3339"
+        );
+        assert_eq!(decisions[1]["decision"], serde_json::json!("rejected"));
+        assert_eq!(
+            decisions[1]["reason"],
+            serde_json::json!("insufficient change window")
+        );
+        // codex: make the tie-breaker premise EXPLICIT — both rows were inserted in
+        // one tx so they share decided_at; the deterministic [approve, reject] order
+        // therefore comes from the BIGSERIAL id ASC tie-breaker, not from timestamps.
+        assert_eq!(
+            decisions[0]["decided_at"], decisions[1]["decided_at"],
+            "same-tx decisions share decided_at — id is the deciding tie-breaker"
+        );
+
+        // Unknown request → 404.
+        let err = requests_approval_decisions(
+            AuthExtractor(dc_approver_session("alice")),
+            Path(Uuid::new_v4().to_string()),
+        )
+        .await
+        .expect_err("unknown request must 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        cleanup(pool).await;
+    }
+
+    /// An existing, in-scope request with NO decisions → {decisions:[], durable:true}
+    /// (codex: a DURABLE-but-empty ledger, distinct from the no-DB durable:false).
+    #[tokio::test]
+    async fn approval_decisions_empty_is_durable() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned_empty_route(pool).await;
+        let Ok(Json(body)) = requests_approval_decisions(
+            AuthExtractor(dc_approver_session("alice")),
+            Path(id.to_string()),
+        )
+        .await
+        else {
+            cleanup_request(pool, id).await;
+            panic!("approval-decisions handler failed");
+        };
+        assert_eq!(body["durable"], serde_json::json!(true));
+        assert_eq!(body["decisions"], serde_json::json!([]));
+        cleanup_request(pool, id).await;
+    }
+
+    /// An out-of-scope request's ledger is a 404 (no oracle) for a scoped audit session.
+    #[tokio::test]
+    async fn approval_decisions_out_of_scope_is_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned_empty_route(pool).await; // DEFRA/production
+                                                       // A GBLON-scoped approver (holds audit) → DEFRA request is out of scope → 404.
+        let mut gblon = dc_approver_session("approver-gblon");
+        gblon.site_scope = vec!["GBLON".into()];
+        let err = requests_approval_decisions(AuthExtractor(gblon), Path(id.to_string()))
+            .await
+            .expect_err("out-of-scope request must 404 (no oracle)");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        cleanup_request(pool, id).await;
     }
 
     /// #59: a user's scope preferences round-trip (set → read → clear), keyed on

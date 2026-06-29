@@ -11,7 +11,7 @@ PARTIAL = some exists, a specific additive slice is missing.
 | # | Val | Eff | Verdict | Feature |
 |---|-----|-----|---------|---------|
 | 1 | H | S | PARTIAL | **approve_one no-DB scope guard** — lone batch-mutation core missing the no-DB scope 404 (cross-scope approve + oracle in dry-run). ✅ SHIPPED — codex plan+impl APPROVE; see approve-one-nodb-scope-guard.md. |
-| 2 | H | S | PARTIAL | GET /api/requests/{id}/approval-decisions at approve-tier — quorum endpoint returns only audit-tier aggregates; individual (role, decision, actor, decided_at, reason) never surfaced |
+| 2 | H | S | PARTIAL | GET /api/requests/{id}/approval-decisions — quorum endpoint returns only aggregates; individual (role, decision, actor, decided_at, reason) never surfaced. ✅ SHIPPED (at AUDIT-tier, not the swarm's approve-tier: every approve-holder also holds audit, and approve-tier would wrongly exclude Auditor from an audit ledger). codex plan+impl APPROVE. See approval-decisions-read.md. |
 | 3 | H | M | CONFIRMED | Approval decision withdrawal/recall (POST .../approval/{role}/withdraw) — own-role only, pre-quorum; no withdrawal path exists |
 | 4 | H | M | CONFIRMED | Policy-driven required_approval_roles (the #4 quorum capstone) — needs a policy SOURCE; 2-part (criticality input + plan-time policy). See criticality-approval-policy-4.md (DEFERRED) |
 | 5 | H | M | CONFIRMED | Operator-initiated failed-job retry (non-dead-lettered) — only DeadLettered requeue exists; a Failed request can't re-execute without full rework |
