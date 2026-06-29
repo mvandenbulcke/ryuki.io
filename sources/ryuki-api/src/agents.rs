@@ -2705,6 +2705,54 @@ pub async fn admin_set_job_priority(
     }
 }
 
+/// One platform's pending-queue summary.
+#[derive(sqlx::FromRow)]
+struct QueueDepthRow {
+    platform: String,
+    pending_count: i64,
+    oldest_pending_at: chrono::DateTime<chrono::Utc>,
+    top_priority: i32,
+}
+
+/// GET /api/admin/agents/queue-depth — the pending (queued) agent-job backlog per platform
+/// (#6 read slice; the pending-jobs view #15 deferred). For each platform with pending
+/// work: the pending count, the oldest pending job's age, and the highest priority waiting.
+/// Admin-only (explicit re-check — GET routes under /api/admin/ may not be gated by the RBAC
+/// middleware). Only `Pending` jobs are "queued" (leased/running/terminal are excluded).
+/// Exposes ONLY aggregates + the platform name — no spec/live_context/request_id/agent ids.
+pub async fn admin_agent_queue_depth(
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to read queue depth",
+        ));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let rows: Vec<QueueDepthRow> = sqlx::query_as(
+        "SELECT platform, COUNT(*) AS pending_count, \
+                MIN(created_at) AS oldest_pending_at, MAX(priority) AS top_priority \
+         FROM agent_jobs WHERE status = 'Pending' \
+         GROUP BY platform ORDER BY platform",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+    // Map each row to JSON manually (codex) so the timestamp is an explicit rfc3339.
+    let queues: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "platform": r.platform,
+                "pending_count": r.pending_count,
+                "oldest_pending_at": r.oldest_pending_at.to_rfc3339(),
+                "top_priority": r.top_priority,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "queues": queues })))
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -2743,6 +2791,11 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/priority",
             post(admin_set_job_priority),
+        )
+        // Static `queue-depth` in the `{agent_id}` slot (same matchit pattern).
+        .route(
+            "/api/admin/agents/queue-depth",
+            get(admin_agent_queue_depth),
         )
 }
 
@@ -8186,6 +8239,82 @@ mod tests {
         );
 
         cleanup_jobs_for_platform(pool, &platform).await;
+    }
+
+    /// #6: queue-depth reports the PENDING backlog per platform — count (a Leased job is
+    /// EXCLUDED), top priority, and the oldest pending instant (a FIXED created_at, codex).
+    /// A non-admin is 403.
+    #[tokio::test]
+    async fn agent_queue_depth_reports_pending_per_platform() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = Uuid::new_v4().simple();
+        let plat_a = format!("plt-qa-{suffix}");
+        let plat_b = format!("plt-qb-{suffix}");
+        // Platform A: 3 pending (one bumped to priority 9, one with a FIXED oldest
+        // created_at) + 1 Leased that must be EXCLUDED from the pending count.
+        let oldest = chrono::DateTime::parse_from_rfc3339("2025-02-01T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let a1 = seed_pending_job(pool, &plat_a).await;
+        let a2 = seed_pending_job(pool, &plat_a).await;
+        let _a3 = seed_pending_job(pool, &plat_a).await;
+        let a_leased = seed_pending_job(pool, &plat_a).await;
+        sqlx::query("UPDATE agent_jobs SET created_at = $1 WHERE id = $2")
+            .bind(oldest)
+            .bind(a1)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_jobs SET priority = 9 WHERE id = $1")
+            .bind(a2)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = 'x' WHERE id = $1")
+            .bind(a_leased)
+            .execute(pool)
+            .await
+            .unwrap();
+        let _b1 = seed_pending_job(pool, &plat_b).await;
+
+        let Json(out) = admin_agent_queue_depth(Extension(AuthSession::static_dry_run()))
+            .await
+            .expect("queue depth must succeed");
+        let queues = out["queues"].as_array().unwrap();
+        let a = queues
+            .iter()
+            .find(|q| q["platform"] == json!(plat_a))
+            .expect("platform A present");
+        assert_eq!(a["pending_count"], json!(3), "the Leased job is excluded");
+        assert_eq!(
+            a["top_priority"],
+            json!(9),
+            "the bumped job sets top_priority"
+        );
+        assert_eq!(
+            a["oldest_pending_at"],
+            json!(oldest.to_rfc3339()),
+            "the oldest pending instant"
+        );
+        let b = queues
+            .iter()
+            .find(|q| q["platform"] == json!(plat_b))
+            .expect("platform B present");
+        assert_eq!(b["pending_count"], json!(1));
+
+        // Non-admin → 403.
+        let denied = admin_agent_queue_depth(Extension(non_admin_session())).await;
+        assert!(
+            matches!(denied, Err((StatusCode::FORBIDDEN, _))),
+            "{denied:?}"
+        );
+
+        cleanup_jobs_for_platform(pool, &plat_a).await;
+        cleanup_jobs_for_platform(pool, &plat_b).await;
     }
 
     /// requeue happy: an ACTIVE parent + a DeadLettered job → Pending with a fresh

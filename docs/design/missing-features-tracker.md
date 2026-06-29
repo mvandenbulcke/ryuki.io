@@ -230,6 +230,16 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Agent queue-depth visibility** SHIPPED — `GET /api/admin/agents/queue-depth` (verify-first
+swarm 2026-06-29 #6 READ slice; also the pending-jobs view deferred from #15). Operators had
+no view of the pending agent-job backlog per platform (admin_list_agents shows LEASED jobs).
+New admin-only aggregate read: per platform with pending work, the `pending_count`,
+`oldest_pending_at`, and `top_priority` (`COUNT/MIN/MAX ... WHERE status='Pending' GROUP BY
+platform`). Explicit in-handler `check_permission("admin")` (GET routes under /api/admin/ may
+not be RBAC-gated). Exposes ONLY aggregates + platform name (no spec/live_context/request_id/
+agent ids). The WRITE half of #6 — a MAX_PENDING cap + reject-on-create backpressure (touches
+the job-creation critical path) — is DEFERRED. codex plan+impl APPROVE. See agent-queue-depth.md.
+
 **Job prioritization** SHIPPED — priority-weighted agent-job dispatch (verify-first swarm
 2026-06-29 #15). Dispatch was strict FIFO by created_at, so a critical job queued behind a
 backlog waited. mig 127 adds `priority INT NOT NULL DEFAULT 5 CHECK (0..=9)` + a partial
