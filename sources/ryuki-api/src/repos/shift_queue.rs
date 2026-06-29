@@ -47,6 +47,12 @@ pub const LEGAL_HOLD_EXPIRY_ITEM_TYPE: &str = "legal-hold-expiring";
 /// not the bare campaign id, so a reused id never suppresses a new overdue campaign.
 pub const RECERTIFICATION_OVERDUE_ITEM_TYPE: &str = "recertification-overdue";
 
+/// The EXPIRING/EXPIRED TLS-certificate signal (run-3). A cert whose `valid_to` is
+/// within (or past) the actionable window. `source_ci_key` is the bare cert id (a
+/// UUID, never reused; renewal updates the same row's `valid_to`). The open item is
+/// REFRESHED each scan so an expiring-soon item upgrades to expired (+ P2→P1).
+pub const CERTIFICATE_EXPIRY_ITEM_TYPE: &str = "certificate-expiring";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

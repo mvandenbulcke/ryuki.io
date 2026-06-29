@@ -150,6 +150,57 @@ pub fn check_expiry(certs: &[CertificateRecord], site: &str, days: i64) -> Vec<C
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Certificate expiry classification (durable-scheduler scan)
+// ---------------------------------------------------------------------------
+
+/// How close a certificate is to (or past) its `valid_to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateExpiry {
+    /// `valid_to` is in the past — an outage NOW.
+    Expired,
+    /// Within the soon-window of `valid_to` — renew before it lapses.
+    ExpiringSoon,
+    /// Not yet within the window — not actionable.
+    Valid,
+}
+
+impl CertificateExpiry {
+    /// Only `Expired` / `ExpiringSoon` become queue work. Used as the post-SQL
+    /// clock-skew guard (the scan re-checks with the CP clock).
+    pub fn is_actionable(&self) -> bool {
+        matches!(
+            self,
+            CertificateExpiry::Expired | CertificateExpiry::ExpiringSoon
+        )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CertificateExpiry::Expired => "expired",
+            CertificateExpiry::ExpiringSoon => "expiring-soon",
+            CertificateExpiry::Valid => "valid",
+        }
+    }
+}
+
+/// Pure: classify a certificate by its `valid_to` relative to `now` and a
+/// `soon_window`. Mirrors `legal_hold::classify_legal_hold_expiry` exactly
+/// (inclusive boundaries: `now == valid_to` is Expired).
+pub fn classify_certificate_expiry(
+    valid_to_unix_ms: i64,
+    now_unix_ms: i64,
+    soon_window_ms: i64,
+) -> CertificateExpiry {
+    if now_unix_ms >= valid_to_unix_ms {
+        CertificateExpiry::Expired
+    } else if valid_to_unix_ms <= now_unix_ms.saturating_add(soon_window_ms) {
+        CertificateExpiry::ExpiringSoon
+    } else {
+        CertificateExpiry::Valid
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +243,33 @@ mod tests {
     fn test_validate_certificate_request_succeeds() {
         let req = valid_request();
         assert!(validate_certificate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn classify_certificate_expiry_boundaries() {
+        const DAY_MS: i64 = 86_400_000;
+        let now = 1_000_000_000_000_i64;
+        let soon = 30 * DAY_MS;
+        // Past valid_to → Expired (actionable).
+        let exp = classify_certificate_expiry(now - DAY_MS, now, soon);
+        assert_eq!(exp, CertificateExpiry::Expired);
+        assert!(exp.is_actionable());
+        assert_eq!(exp.as_str(), "expired");
+        // Exactly now → Expired (inclusive >=).
+        assert_eq!(
+            classify_certificate_expiry(now, now, soon),
+            CertificateExpiry::Expired
+        );
+        // Within the soon window → ExpiringSoon (actionable).
+        let soon_v = classify_certificate_expiry(now + 10 * DAY_MS, now, soon);
+        assert_eq!(soon_v, CertificateExpiry::ExpiringSoon);
+        assert!(soon_v.is_actionable());
+        assert_eq!(soon_v.as_str(), "expiring-soon");
+        // Far future → Valid (non-actionable; the scan skips it).
+        let valid = classify_certificate_expiry(now + 60 * DAY_MS, now, soon);
+        assert_eq!(valid, CertificateExpiry::Valid);
+        assert!(!valid.is_actionable());
+        assert_eq!(valid.as_str(), "valid");
     }
 
     #[test]

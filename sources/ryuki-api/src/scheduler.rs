@@ -656,6 +656,110 @@ async fn run_job(
                 )),
             ))
         }
+        "certificate_expiry_scan" => {
+            // Safe-internal write (run-3): surface TLS certs within (or past) the 30-day
+            // actionable window as deduped shift_queue work — mirrors legal_hold_expiry_scan.
+            // Reads certificates, writes only our own shift_queue — NO cert mutation (renewal /
+            // revoke stays a deliberate action). `certificates` holds only cert METADATA (no
+            // private key), so every surfaced field is safe for the execute-tier queue.
+            #[derive(sqlx::FromRow)]
+            struct CertScanRow {
+                id: String,
+                common_name: String,
+                hostname: String,
+                service_type: String,
+                site: String,
+                valid_to: chrono::DateTime<chrono::Utc>,
+                status: String,
+            }
+            // Predicate on valid_to (NOT the un-synced status column): a genuinely-past cert is
+            // surfaced even if its stored status is stale.
+            let rows: Vec<CertScanRow> = sqlx::query_as(
+                "SELECT id::text, common_name, hostname, service_type, site, valid_to, status \
+                 FROM certificates WHERE valid_to <= NOW() + INTERVAL '30 days' ORDER BY valid_to",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let soon_window_ms: i64 = 30 * 86_400_000;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                let verdict = ryuki_engine::certificate_lifecycle::classify_certificate_expiry(
+                    row.valid_to.timestamp_millis(),
+                    now_ms,
+                    soon_window_ms,
+                );
+                if !verdict.is_actionable() {
+                    continue;
+                }
+                let state = verdict.as_str();
+                // Priority by state: an expired cert is an outage NOW (P1); expiring-soon is P2.
+                let priority = if matches!(
+                    verdict,
+                    ryuki_engine::certificate_lifecycle::CertificateExpiry::Expired
+                ) {
+                    "P1"
+                } else {
+                    "P2"
+                };
+                let title = format!("Certificate {state}: {}", row.common_name);
+                let description = format!(
+                    "{} certificate '{}' on {} ({}) — valid_to {}. Renew or replace it.",
+                    row.service_type,
+                    row.common_name,
+                    row.hostname,
+                    row.site,
+                    row.valid_to.to_rfc3339(),
+                );
+                let metadata = serde_json::json!({
+                    "source_ci_key": row.id,
+                    "common_name": row.common_name,
+                    "hostname": row.hostname,
+                    "service_type": row.service_type,
+                    "site": row.site,
+                    "valid_to": row.valid_to.to_rfc3339(),
+                    "cert_status": row.status,
+                    "expiry_state": state,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::CERTIFICATE_EXPIRY_ITEM_TYPE,
+                    &row.id,
+                    &title,
+                    &description,
+                    priority,
+                    &metadata,
+                )
+                .await?;
+                // REFRESH the OPEN item to the CURRENT state so an expiring-soon item upgrades to
+                // expired (and P2→P1) on a later scan — enqueue_if_absent's ON CONFLICT DO NOTHING
+                // would otherwise leave the first-seen label/priority stale (codex).
+                sqlx::query(
+                    "UPDATE shift_queue \
+                     SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
+                         updated_at = NOW() \
+                     WHERE item_type = 'certificate-expiring' AND resolved = false \
+                       AND metadata->>'source_ci_key' = $1",
+                )
+                .bind(&row.id)
+                .bind(&title)
+                .bind(&description)
+                .bind(priority)
+                .bind(&metadata)
+                .execute(&mut **tx)
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "enqueued {enqueued} expiring/expired certificate(s)"
+                )),
+            ))
+        }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
         other => Ok((
             "skipped".to_string(),
@@ -3269,6 +3373,183 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    // ---- run-3: certificate expiry scan -------------------------------------
+
+    const CERT_SCAN_SEED_ID: &str = "99999999-9999-4999-8999-999999999999";
+
+    /// Seed a certificate with a chosen `valid_to` (an rfc3339 string) + status. Returns its id.
+    async fn seed_certificate(pool: &PgPool, valid_to: &str, status: &str) -> String {
+        let cn = format!("test-{}.local", uuid::Uuid::new_v4().simple());
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO certificates \
+             (common_name, subject, valid_from, valid_to, service_type, hostname, site, status) \
+             VALUES ($1, 'CN=test', NOW() - INTERVAL '365 days', $2::timestamptz, 'IIS', \
+                     'web.test.local', 'GBLON', $3) RETURNING id",
+        )
+        .bind(&cn)
+        .bind(valid_to)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("seed certificate")
+        .to_string()
+    }
+
+    async fn open_cert_item(pool: &PgPool, cert_id: &str) -> Option<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT priority, metadata->>'expiry_state' FROM shift_queue \
+             WHERE item_type = 'certificate-expiring' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(cert_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_cert(pool: &PgPool, cert_id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(cert_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM certificates WHERE id = $1::uuid")
+            .bind(cert_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn migration_130_is_idempotent_and_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Certificate expiry scan (all certs)', 'certificate_expiry_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(CERT_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(CERT_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Certificate expiry scan (all certs)", "seed name");
+        assert_eq!(kind, "certificate_expiry_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        let key = format!("cert-idx-{}", uuid::Uuid::new_v4());
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('certificate-expiring', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first certificate-expiring item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('certificate-expiring', 't2', 'd2', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the certificate-expiring index rejects a second OPEN duplicate"
+        );
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn certificate_scan_enqueues_by_state_and_refreshes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let past = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let soon = (chrono::Utc::now() + chrono::Duration::days(10)).to_rfc3339();
+        let far = (chrono::Utc::now() + chrono::Duration::days(120)).to_rfc3339();
+        // A stale 'Active'-status cert with a PAST valid_to is still surfaced (predicate on valid_to).
+        let expired = seed_certificate(pool, &past, "Active").await;
+        let expiring = seed_certificate(pool, &soon, "Active").await;
+        let healthy = seed_certificate(pool, &far, "Active").await;
+
+        let run = |pool: &'static PgPool| async move {
+            let mut tx = pool.begin().await.unwrap();
+            let (status, _) = run_job(&mut tx, "certificate_expiry_scan").await.unwrap();
+            assert_eq!(status, "succeeded");
+            tx.commit().await.unwrap();
+        };
+        run(pool).await;
+
+        // Expired → P1/"expired"; expiring-soon → P2/"expiring-soon"; far-future → none.
+        assert_eq!(
+            open_cert_item(pool, &expired).await,
+            Some(("P1".into(), "expired".into())),
+            "an expired cert is P1/expired"
+        );
+        assert_eq!(
+            open_cert_item(pool, &expiring).await,
+            Some(("P2".into(), "expiring-soon".into())),
+            "an expiring-soon cert is P2/expiring-soon"
+        );
+        assert_eq!(
+            open_cert_item(pool, &healthy).await,
+            None,
+            "far-future not surfaced"
+        );
+
+        // REFRESH: move the expiring-soon cert's valid_to into the past, re-scan → the SAME open
+        // item upgrades to expired/P1 (no duplicate).
+        sqlx::query(
+            "UPDATE certificates SET valid_to = NOW() - INTERVAL '1 day' WHERE id = $1::uuid",
+        )
+        .bind(&expiring)
+        .execute(pool)
+        .await
+        .unwrap();
+        run(pool).await;
+        assert_eq!(
+            open_cert_item(pool, &expiring).await,
+            Some(("P1".into(), "expired".into())),
+            "the open item upgraded expiring-soon → expired (P2 → P1) on re-scan"
+        );
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue WHERE item_type = 'certificate-expiring' \
+             AND resolved = false AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&expiring)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1, "refresh upgrades in place — no duplicate item");
+
+        cleanup_cert(pool, &expired).await;
+        cleanup_cert(pool, &expiring).await;
+        cleanup_cert(pool, &healthy).await;
     }
 
     // ---- #52 slice 2: FAILED-latest signal ----------------------------------
