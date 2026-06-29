@@ -366,6 +366,121 @@ async fn run_job(
                 )),
             ))
         }
+        "secret_rotation_due_scan" => {
+            // Safe-internal write (#7): READ secret rotation metadata across ALL sites
+            // (platform-wide internal principal — not scoped), classify each with the
+            // PURE engine, and enqueue ONE deduped shift_queue item per OVERDUE secret.
+            // Reads managed_secrets and writes only our own shift_queue — NO Vault/live
+            // call. All on `tx` (rolls back with this schedule's savepoint). `detail` is
+            // aggregate-only (counts), never per-secret data — it is surfaced via
+            // /api/ops/scheduler/executions. SELECTs ONLY non-sensitive columns — NEVER
+            // `vault_path` (a Vault pointer) or `secret_type`. Excludes `retired`
+            // (decommissioned) and `rotating` (a rotation in flight — its stale past due
+            // date would be a spurious duplicate); `expired`/`failed` ARE kept (overdue,
+            // need attention).
+            #[derive(sqlx::FromRow)]
+            struct SecretScanRow {
+                id: String,
+                name: String,
+                next_rotation_due: String,
+                site: String,
+                owner: String,
+            }
+            let rows: Vec<SecretScanRow> = sqlx::query_as(
+                "SELECT id, name, next_rotation_due, site, owner FROM managed_secrets \
+                 WHERE status NOT IN ('retired', 'rotating') ORDER BY id",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let mut overdue: u64 = 0;
+            let mut invalid: u64 = 0;
+            for row in &rows {
+                // Skip a degenerate empty id with the SAME trim() check
+                // enqueue_if_absent uses, so it can never abort the tick.
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                match chrono::DateTime::parse_from_rfc3339(&row.next_rotation_due) {
+                    Ok(due) => {
+                        // Compare in MILLIS so a fractional-second due time is not marked
+                        // overdue ~1s early (codex). Future → skip; reached/passed → enqueue.
+                        let recency =
+                            ryuki_engine::secrets_rotation::classify_secret_rotation_recency(
+                                due.timestamp_millis(),
+                                now_ms,
+                            );
+                        if !recency.is_due() {
+                            continue;
+                        }
+                        // name/site/owner are operator-facing work fields (not secret
+                        // material); vault_path/secret_type are NEVER surfaced.
+                        let title = format!("Secret rotation overdue: {}", row.name);
+                        let description = format!(
+                            "Secret '{}' ({}, owner {}) is overdue for rotation \
+                             (due {}). Rotate it.",
+                            row.name, row.site, row.owner, row.next_rotation_due
+                        );
+                        let metadata = serde_json::json!({
+                            "source_ci_key": row.id,
+                            "name": row.name,
+                            "site": row.site,
+                            "owner": row.owner,
+                            "next_rotation_due": row.next_rotation_due,
+                            "reason": "overdue",
+                        })
+                        .to_string();
+                        overdue += crate::repos::shift_queue::enqueue_if_absent(
+                            &mut **tx,
+                            crate::repos::shift_queue::SECRET_ROTATION_DUE_ITEM_TYPE,
+                            &row.id,
+                            &title,
+                            &description,
+                            "P2",
+                            &metadata,
+                        )
+                        .await?;
+                    }
+                    Err(_) => {
+                        // Second signal (codex MAJOR): a malformed next_rotation_due is a
+                        // data-integrity problem — SURFACE it as its own deduped item
+                        // rather than silently skipping (a permanent blind spot). The bad
+                        // value is a (corrupt) date string, not secret material.
+                        let title = format!("Secret rotation date invalid: {}", row.name);
+                        let description = format!(
+                            "Secret '{}' ({}, owner {}) has an unparseable \
+                             next_rotation_due ('{}'). Fix its rotation schedule.",
+                            row.name, row.site, row.owner, row.next_rotation_due
+                        );
+                        let metadata = serde_json::json!({
+                            "source_ci_key": row.id,
+                            "name": row.name,
+                            "site": row.site,
+                            "owner": row.owner,
+                            "invalid_next_rotation_due": row.next_rotation_due,
+                            "reason": "invalid-due-date",
+                        })
+                        .to_string();
+                        invalid += crate::repos::shift_queue::enqueue_if_absent(
+                            &mut **tx,
+                            crate::repos::shift_queue::SECRET_ROTATION_INVALID_ITEM_TYPE,
+                            &row.id,
+                            &title,
+                            &description,
+                            "P2",
+                            &metadata,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "enqueued {overdue} overdue, {invalid} invalid secret rotation item(s)"
+                )),
+            ))
+        }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
         other => Ok((
             "skipped".to_string(),
@@ -1644,6 +1759,311 @@ mod db_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    // ---- #7 secret_rotation_due_scan ---------------------------------------
+
+    /// The migration-125-seeded secret_rotation_due_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (mirrors RESTORE_SCAN_SEED_ID).
+    const SECRET_SCAN_SEED_ID: &str = "66666666-6666-4666-8666-666666666666";
+
+    /// Seed one managed_secrets row. `next_rotation_due` is bound as a TEXT value
+    /// (caller passes an RFC3339 string for overdue/future, or a malformed string to
+    /// exercise the invalid-date signal). All columns are NOT NULL; `vault_path` is a
+    /// dummy pointer — the scan must NEVER read or surface it.
+    async fn seed_managed_secret(pool: &PgPool, id: &str, status: &str, next_rotation_due: &str) {
+        let last_rotated = (chrono::Utc::now() - chrono::Duration::days(120)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+              next_rotation_due, status, owner, site) \
+             VALUES ($1, $2, 'token', 'secret/data/dummy', 90, $3, $4, $5, 'team-x', 'DEFRA')",
+        )
+        .bind(id)
+        .bind(id) // name == id for a unique, recognizable fixture
+        .bind(&last_rotated)
+        .bind(next_rotation_due)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed managed secret");
+    }
+
+    /// Plant a guaranteed-due `secret_rotation_due_scan` schedule so a single tick
+    /// runs the scan. Disables the migration-seeded scan first so EXACTLY ONE is due.
+    async fn seed_due_secret_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(SECRET_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-secretscan-due-6f3";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test secret scan', 'secret_rotation_due_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_secret_scan`] disabled.
+    async fn restore_migration_secret_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(SECRET_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN shift_queue items of `item_type` for a secret id (source_ci_key).
+    async fn open_secret_item_count(pool: &PgPool, item_type: &str, id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = $1 AND resolved = false AND metadata->>'source_ci_key' = $2",
+        )
+        .bind(item_type)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_secret_fixture(pool: &PgPool, id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM managed_secrets WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// OVERDUE active/expired/failed secrets are enqueued; FUTURE/retired/rotating are
+    /// NOT; the enqueued item carries the right fields and NO vault_path; the detail is
+    /// the aggregate two-count format.
+    #[tokio::test]
+    async fn secret_rotation_scan_enqueues_overdue_and_filters() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let overdue_active = format!("sr-active-{suffix}");
+        let overdue_expired = format!("sr-expired-{suffix}");
+        let overdue_failed = format!("sr-failed-{suffix}");
+        let future_active = format!("sr-future-{suffix}");
+        let overdue_retired = format!("sr-retired-{suffix}");
+        let overdue_rotating = format!("sr-rotating-{suffix}");
+        seed_managed_secret(pool, &overdue_active, "active", &past).await;
+        seed_managed_secret(pool, &overdue_expired, "expired", &past).await;
+        seed_managed_secret(pool, &overdue_failed, "failed", &past).await;
+        seed_managed_secret(pool, &future_active, "active", &future).await;
+        seed_managed_secret(pool, &overdue_retired, "retired", &past).await;
+        seed_managed_secret(pool, &overdue_rotating, "rotating", &past).await;
+
+        let sched_id = seed_due_secret_scan(pool).await;
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted secret scan ran");
+
+        // Enqueued: overdue active/expired/failed — each exactly once.
+        for id in [&overdue_active, &overdue_expired, &overdue_failed] {
+            assert_eq!(
+                open_secret_item_count(pool, "secret-rotation-due", id).await,
+                1,
+                "overdue secret {id} must enqueue exactly one due item"
+            );
+        }
+        // NOT enqueued: future (not due), retired + rotating (filtered).
+        for id in [&future_active, &overdue_retired, &overdue_rotating] {
+            assert_eq!(
+                open_secret_item_count(pool, "secret-rotation-due", id).await,
+                0,
+                "secret {id} must NOT be enqueued"
+            );
+        }
+
+        // The enqueued item's exact fields + secret hygiene (NO vault_path key).
+        let (item_type, title, priority, reason, meta_key, vault_path): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT item_type, title, priority, metadata->>'reason', \
+                    metadata->>'source_ci_key', metadata->>'vault_path' \
+             FROM shift_queue \
+             WHERE item_type = 'secret-rotation-due' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&overdue_active)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(item_type, "secret-rotation-due", "item_type");
+        assert_eq!(
+            title,
+            format!("Secret rotation overdue: {overdue_active}"),
+            "title"
+        );
+        assert_eq!(priority, "P2", "priority");
+        assert_eq!(reason, "overdue", "metadata.reason");
+        assert_eq!(meta_key, overdue_active, "metadata.source_ci_key");
+        assert!(
+            vault_path.is_none(),
+            "vault_path must NEVER be surfaced in shift_queue metadata"
+        );
+
+        // Aggregate-only detail: EXACTLY "enqueued <O> overdue, <I> invalid secret
+        // rotation item(s)" — assert the FORMAT (the global overdue count is
+        // environment-dependent in a shared DB).
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'secret_rotation_due_scan' \
+               AND status = 'succeeded' ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let counts = detail
+            .strip_prefix("enqueued ")
+            .and_then(|s| s.strip_suffix(" invalid secret rotation item(s)"))
+            .and_then(|s| s.split_once(" overdue, "));
+        assert!(
+            counts.is_some_and(|(o, i)| o.parse::<u64>().is_ok() && i.parse::<u64>().is_ok()),
+            "detail must be 'enqueued <O> overdue, <I> invalid secret rotation item(s)': {detail:?}"
+        );
+
+        for id in [
+            &overdue_active,
+            &overdue_expired,
+            &overdue_failed,
+            &future_active,
+            &overdue_retired,
+            &overdue_rotating,
+        ] {
+            cleanup_secret_fixture(pool, id).await;
+        }
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_secret_scan(pool).await;
+    }
+
+    /// A malformed next_rotation_due is SURFACED as a secret-rotation-invalid-due item
+    /// (codex MAJOR) and does NOT abort the tick — no silent blind spot.
+    #[tokio::test]
+    async fn secret_rotation_scan_surfaces_malformed_without_aborting() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = format!("sr-malformed-{}", uuid::Uuid::new_v4());
+        seed_managed_secret(pool, &id, "active", "not-a-valid-rfc3339-date").await;
+
+        let sched_id = seed_due_secret_scan(pool).await;
+        let ran = tick_once(pool).await.unwrap();
+        assert!(
+            ran >= 1,
+            "the tick ran and did NOT abort on the malformed row"
+        );
+
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-invalid-due", &id).await,
+            1,
+            "a malformed next_rotation_due is surfaced as an invalid item"
+        );
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            0,
+            "a malformed secret is NOT counted as overdue"
+        );
+        let (reason, invalid_val, vault_path): (String, String, Option<String>) = sqlx::query_as(
+            "SELECT metadata->>'reason', metadata->>'invalid_next_rotation_due', \
+                    metadata->>'vault_path' FROM shift_queue \
+             WHERE item_type = 'secret-rotation-invalid-due' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(reason, "invalid-due-date", "metadata.reason");
+        assert_eq!(
+            invalid_val, "not-a-valid-rfc3339-date",
+            "the bad value is captured"
+        );
+        assert!(vault_path.is_none(), "vault_path must never be surfaced");
+
+        cleanup_secret_fixture(pool, &id).await;
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_secret_scan(pool).await;
+    }
+
+    /// A second tick (re-planted due) does NOT duplicate the open item (dedup). The
+    /// re-plant is REQUIRED because tick_once advances next_run_at (codex MAJOR).
+    #[tokio::test]
+    async fn secret_rotation_scan_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = format!("sr-dedup-{}", uuid::Uuid::new_v4());
+        let past = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        seed_managed_secret(pool, &id, "active", &past).await;
+
+        let sched1 = seed_due_secret_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            1,
+            "first tick enqueues one item"
+        );
+
+        // Re-plant a due schedule so the scan ACTUALLY runs again, then assert no dup.
+        let sched2 = seed_due_secret_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_secret_item_count(pool, "secret-rotation-due", &id).await,
+            1,
+            "a second tick does NOT duplicate the open item"
+        );
+
+        cleanup_secret_fixture(pool, &id).await;
+        for s in [&sched1, &sched2] {
+            sqlx::query("DELETE FROM schedules WHERE id = $1")
+                .bind(s)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        restore_migration_secret_scan(pool).await;
     }
 
     /// Seed one restore_request with EXPLICIT `updated_at` AND `created_at`

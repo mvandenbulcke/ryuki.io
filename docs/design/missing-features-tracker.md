@@ -208,6 +208,19 @@ Tombstone-rich audit. Codex plan(rd2)+impl APPROVE; impl-review MINORs both clos
 (audit before/after delta assertion; explicit DELETE route-gate test). See
 patch-wave-delete.md.
 
+**Secret-rotation-due scan** SHIPPED — `secret_rotation_due_scan` durable-scheduler job
+(verify-first swarm 2026-06-29 #7). `managed_secrets.next_rotation_due` existed but only
+the on-demand `GET /secrets/due` surfaced overdue secrets. New daily SAFE-INTERNAL-WRITE
+scan (mirrors `restore_overdue_scan`) enumerates secrets WHERE status NOT IN
+('retired','rotating'), classifies via pure `secrets_rotation::
+classify_secret_rotation_recency` (millis), and enqueues ONE deduped shift_queue item per
+OVERDUE secret. TWO-signal (codex MAJOR): a malformed `next_rotation_due` is SURFACED as a
+separate `secret-rotation-invalid-due` item (not silently skipped — no blind spot), and a
+bad row never aborts the tick. Secret-hygiene: NEVER selects/surfaces `vault_path`/
+`secret_type`; scheduler `detail` is aggregate-only. mig 125 seeds the schedule + two
+partial unique indexes. codex plan(NEEDS-CHANGES: 3 MAJOR+3 MINOR all folded in)+impl
+APPROVE. See secret-rotation-due-scan.md.
+
 **Approval-decisions ledger read** SHIPPED — `GET /api/requests/{id}/approval-decisions`
 (verify-first swarm 2026-06-29 #2). The audit-tier quorum endpoint returns only breadth
 AGGREGATES; the per-decision ledger (`request_approval_decisions`: role/decision/actor/

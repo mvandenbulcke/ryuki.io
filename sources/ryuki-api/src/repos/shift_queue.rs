@@ -28,6 +28,16 @@ pub const RESTORE_OVERDUE_ITEM_TYPE: &str = "restore-test-overdue";
 /// partial unique index always agree.
 pub const RESTORE_FAILED_ITEM_TYPE: &str = "restore-test-failed";
 
+/// The OVERDUE secret-rotation signal (#7). A secret whose `next_rotation_due` has
+/// passed. Fixed so the dedup key and the partial unique index always agree.
+pub const SECRET_ROTATION_DUE_ITEM_TYPE: &str = "secret-rotation-due";
+
+/// The INVALID secret-rotation-date signal (#7, codex MAJOR). A secret whose
+/// `next_rotation_due` is not parseable as RFC3339 — surfaced (not silently skipped) so
+/// the data-integrity problem is visible. Fixed so the dedup key and the partial unique
+/// index always agree.
+pub const SECRET_ROTATION_INVALID_ITEM_TYPE: &str = "secret-rotation-invalid-due";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

@@ -688,9 +688,75 @@ pub fn mark_rotation_failed(rotation_id: &str, error: &str) -> Result<Value, Str
     }))
 }
 
+/// Rotation recency for the `secret_rotation_due_scan` durable-scheduler job — the
+/// pure classifier that decides whether a secret's rotation is OVERDUE. Mirrors
+/// `backup_recency::RestoreTestRecency` (the restore-overdue scan's classifier). There
+/// is no `NeverTested` variant: `managed_secrets.next_rotation_due` is `TEXT NOT NULL`,
+/// always set at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretRotationRecency {
+    /// `next_rotation_due` is still in the future — not yet due.
+    Current,
+    /// `next_rotation_due` has been reached or passed — rotation is due.
+    Overdue,
+}
+
+impl SecretRotationRecency {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SecretRotationRecency::Current => "current",
+            SecretRotationRecency::Overdue => "overdue",
+        }
+    }
+    pub fn is_due(&self) -> bool {
+        matches!(self, SecretRotationRecency::Overdue)
+    }
+}
+
+/// Classify a secret's rotation recency from its `next_rotation_due` and the caller's
+/// "now", BOTH as epoch MILLISECONDS (so a fractional-second due time is not marked
+/// overdue up to ~1s early — codex). Reached/passed (`now >= due`) → `Overdue`; a future
+/// due → `Current`. Pure, no IO.
+pub fn classify_secret_rotation_recency(
+    next_due_unix_ms: i64,
+    now_unix_ms: i64,
+) -> SecretRotationRecency {
+    if now_unix_ms >= next_due_unix_ms {
+        SecretRotationRecency::Overdue
+    } else {
+        SecretRotationRecency::Current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_secret_rotation_recency_boundary_and_sides() {
+        // Future due → Current; reached/passed → Overdue; the boundary (now == due) is
+        // Overdue (inclusive), so a secret due exactly now is actionable immediately.
+        assert_eq!(
+            classify_secret_rotation_recency(1_000, 999),
+            SecretRotationRecency::Current,
+            "due in the future is not yet overdue"
+        );
+        assert_eq!(
+            classify_secret_rotation_recency(1_000, 1_000),
+            SecretRotationRecency::Overdue,
+            "now == due is overdue (boundary inclusive)"
+        );
+        assert_eq!(
+            classify_secret_rotation_recency(1_000, 1_001),
+            SecretRotationRecency::Overdue,
+            "past due is overdue"
+        );
+        assert!(classify_secret_rotation_recency(1_000, 2_000).is_due());
+        assert!(!classify_secret_rotation_recency(2_000, 1_000).is_due());
+        assert_eq!(SecretRotationRecency::Overdue.as_str(), "overdue");
+        assert_eq!(SecretRotationRecency::Current.as_str(), "current");
+    }
 
     #[test]
     fn next_rotation_due_from_reschedules_off_last_rotated() {

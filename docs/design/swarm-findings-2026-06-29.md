@@ -16,7 +16,7 @@ PARTIAL = some exists, a specific additive slice is missing.
 | 4 | H | M | CONFIRMED | Policy-driven required_approval_roles (the #4 quorum capstone) — needs a policy SOURCE; 2-part (criticality input + plan-time policy). See criticality-approval-policy-4.md (DEFERRED) |
 | 5 | H | M | CONFIRMED | Operator-initiated failed-job retry (non-dead-lettered) — only DeadLettered requeue exists; a Failed request can't re-execute without full rework |
 | 6 | H | M | CONFIRMED | Per-platform job-queue depth limit + backpressure — poll_job/create_agent_job have no depth check; no queue-depth metric |
-| 7 | H | M | CONFIRMED | Scheduled scan for secret rotation due-dates — GET /secrets/due is on-demand only; no scheduler job kind |
+| 7 | H | M | CONFIRMED | Scheduled scan for secret rotation due-dates — GET /secrets/due is on-demand only; no scheduler job kind. ✅ SHIPPED — `secret_rotation_due_scan` durable-scheduler job kind (two-signal: overdue + malformed-date), mig 125. codex plan(NEEDS-CHANGES→fixed)+impl APPROVE. See secret-rotation-due-scan.md. |
 | 8 | H | M | CONFIRMED | Certificate LIST endpoint (GET /api/maintain/certificates) — only GET /{id}, /inventory, /expiring; no paginated/filtered list |
 | 9 | H | M | CONFIRMED | Outbound alert notification delivery (email/webhook) — SmtpConfig is dead code; notifications are in-app read-receipts only; ~40 "notification-dispatch-disabled" blocked reasons |
 | 10 | H | M | CONFIRMED | Metric series aggregation/rollup (daily/weekly/monthly buckets) — /metrics/series returns raw 10k window only |
