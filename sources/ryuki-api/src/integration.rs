@@ -604,29 +604,34 @@ pub async fn integration_create(
                 let secret_id = format!("is-{}", uuid::Uuid::new_v4().simple());
 
                 // FIX-3: run in ONE transaction; insert connection BEFORE secret (FK order).
+                // The audit row commits with the inserts (atomic; mirrors DELETE), and its
+                // detail is built from the row the DB actually persisted (RETURNING), never
+                // caller-derived state — codex.
                 let mut tx = pool.begin().await.map_err(db_err)?;
-                sqlx::query(&format!(
-                    "INSERT INTO integration_connections ({CONN_COLUMNS}) \
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"
-                ))
-                .bind(&id)
-                .bind(&body.vendor_type)
-                .bind(&body.name)
-                .bind(&body.endpoint_url)
-                .bind(&body.site_scope)
-                .bind(source.as_str())
-                .bind(&secret_id) // FK placeholder — correct server-owned ref
-                .bind("configured")
-                .bind("configured")
-                .bind(ExecutionMode::StaticDryRun.as_str())
-                .bind(Option::<String>::None)
-                .bind(Option::<String>::None)
-                .bind(&created_by)
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+                let (ins_vendor, ins_site, ins_source): (String, Option<String>, String) =
+                    sqlx::query_as(&format!(
+                        "INSERT INTO integration_connections ({CONN_COLUMNS}) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                         RETURNING vendor_type, site_scope, credential_source"
+                    ))
+                    .bind(&id)
+                    .bind(&body.vendor_type)
+                    .bind(&body.name)
+                    .bind(&body.endpoint_url)
+                    .bind(&body.site_scope)
+                    .bind(source.as_str())
+                    .bind(&secret_id) // FK placeholder — correct server-owned ref
+                    .bind("configured")
+                    .bind("configured")
+                    .bind(ExecutionMode::StaticDryRun.as_str())
+                    .bind(Option::<String>::None)
+                    .bind(Option::<String>::None)
+                    .bind(&created_by)
+                    .bind(&now)
+                    .bind(&now)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
                 sqlx::query(
                     "INSERT INTO integration_secrets \
                      (id, connection_id, ciphertext, nonce, key_id, created_at, updated_at) \
@@ -640,6 +645,26 @@ pub async fn integration_create(
                 .bind(&now)
                 .bind(&now)
                 .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                // Detail carries only non-secret identity; keys are redaction-safe
+                // (`cred_source`, not `credential_source`) so the value survives the
+                // read-side redact_detail — #58 convention, codex.
+                audit::record_audit_tx(
+                    &mut tx,
+                    &session,
+                    &audit::security_audit(
+                        "integration.connection.created",
+                        None,
+                        "configured",
+                        json!({
+                            "connection_id": id,
+                            "vendor_type": ins_vendor,
+                            "site_scope": ins_site,
+                            "cred_source": ins_source,
+                        }),
+                    ),
+                )
                 .await
                 .map_err(db_err)?;
                 tx.commit().await.map_err(db_err)?;
@@ -676,28 +701,51 @@ pub async fn integration_create(
             }
         };
 
-        sqlx::query(&format!(
-            "INSERT INTO integration_connections ({CONN_COLUMNS}) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"
-        ))
-        .bind(&id)
-        .bind(&body.vendor_type)
-        .bind(&body.name)
-        .bind(&body.endpoint_url)
-        .bind(&body.site_scope)
-        .bind(source.as_str())
-        .bind(&credential_ref)
-        .bind("configured")
-        .bind("configured")
-        .bind(ExecutionMode::StaticDryRun.as_str())
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(&created_by)
-        .bind(&now)
-        .bind(&now)
-        .execute(pool)
+        // INSERT + audit commit atomically (one tx; mirrors DELETE). The audit detail
+        // is built from the persisted row (RETURNING), with redaction-safe keys — codex.
+        let mut tx = pool.begin().await.map_err(db_err)?;
+        let (ins_vendor, ins_site, ins_source): (String, Option<String>, String) =
+            sqlx::query_as(&format!(
+                "INSERT INTO integration_connections ({CONN_COLUMNS}) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                 RETURNING vendor_type, site_scope, credential_source"
+            ))
+            .bind(&id)
+            .bind(&body.vendor_type)
+            .bind(&body.name)
+            .bind(&body.endpoint_url)
+            .bind(&body.site_scope)
+            .bind(source.as_str())
+            .bind(&credential_ref)
+            .bind("configured")
+            .bind("configured")
+            .bind(ExecutionMode::StaticDryRun.as_str())
+            .bind(Option::<String>::None)
+            .bind(Option::<String>::None)
+            .bind(&created_by)
+            .bind(&now)
+            .bind(&now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "integration.connection.created",
+                None,
+                "configured",
+                json!({
+                    "connection_id": id,
+                    "vendor_type": ins_vendor,
+                    "site_scope": ins_site,
+                    "cred_source": ins_source,
+                }),
+            ),
+        )
         .await
         .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
 
         let conn = IntegrationConnection {
             id,
@@ -749,6 +797,23 @@ pub async fn integration_create(
         &created_by,
     )
     .map_err(|e| integration_400(&e))?;
+    // Best-effort audit (no DB → no tx). record_audit_local returns unit; it can
+    // never fail the already-applied in-memory create — codex nit 4.
+    audit::record_audit_local(
+        &session,
+        &audit::security_audit(
+            "integration.connection.created",
+            None,
+            "configured",
+            json!({
+                "connection_id": conn.id,
+                "vendor_type": conn.vendor_type,
+                "site_scope": conn.site_scope,
+                "cred_source": conn.credential_source.as_str(),
+            }),
+        ),
+    )
+    .await;
     Ok(Json(json!({
         "source": "in-memory",
         "connection": IntegrationConnectionRow::to_json(&conn),
@@ -952,11 +1017,11 @@ pub async fn integration_update(
             }
 
             conn.updated_at = now.clone();
-            sqlx::query(
+            let updated: Option<(String, Option<String>, String)> = sqlx::query_as(
                 "UPDATE integration_connections \
                  SET vendor_type=$1, name=$2, endpoint_url=$3, site_scope=$4, \
                      credential_source=$5, credential_ref=$6, updated_at=$7 \
-                 WHERE id=$8",
+                 WHERE id=$8 RETURNING vendor_type, site_scope, credential_source",
             )
             .bind(&conn.vendor_type)
             .bind(&conn.name)
@@ -966,10 +1031,34 @@ pub async fn integration_update(
             .bind(&conn.credential_ref)
             .bind(&now)
             .bind(&conn.id)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-
+            // The connection vanished mid-tx (concurrent delete after the pre-read
+            // SELECT) → 404; the whole tx (incl. the secret write) rolls back, no audit.
+            let Some((u_vendor, u_site, u_source)) = updated else {
+                return Err(integration_not_found(&id));
+            };
+            // Secret was rotated on this path → cred_rotated: true. Redaction-safe keys,
+            // detail from the persisted row, audit + mutation commit atomically — codex.
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "integration.connection.updated",
+                    None,
+                    "configured",
+                    json!({
+                        "connection_id": conn.id,
+                        "vendor_type": u_vendor,
+                        "site_scope": u_site,
+                        "cred_source": u_source,
+                        "cred_rotated": true,
+                    }),
+                ),
+            )
+            .await
+            .map_err(db_err)?;
             tx.commit().await.map_err(db_err)?;
 
             return Ok(Json(json!({
@@ -978,12 +1067,16 @@ pub async fn integration_update(
             })));
         }
 
+        // UPDATE + audit commit atomically. RETURNING also closes a TOCTOU: if the row
+        // was concurrently deleted after the pre-read SELECT, fetch_optional yields None
+        // → clean 404 (the old `.execute(pool)` updated 0 rows yet still returned 200) — codex.
         let now = now_iso();
-        sqlx::query(
+        let mut tx = pool.begin().await.map_err(db_err)?;
+        let updated: Option<(String, Option<String>, String)> = sqlx::query_as(
             "UPDATE integration_connections \
              SET vendor_type=$1, name=$2, endpoint_url=$3, site_scope=$4, \
                  credential_source=$5, credential_ref=$6, updated_at=$7 \
-             WHERE id=$8",
+             WHERE id=$8 RETURNING vendor_type, site_scope, credential_source",
         )
         .bind(&conn.vendor_type)
         .bind(&conn.name)
@@ -993,9 +1086,32 @@ pub async fn integration_update(
         .bind(&conn.credential_ref)
         .bind(&now)
         .bind(&conn.id)
-        .execute(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
+        let Some((u_vendor, u_site, u_source)) = updated else {
+            return Err(integration_not_found(&id));
+        };
+        // No secret rotation on this path → cred_rotated: false.
+        audit::record_audit_tx(
+            &mut tx,
+            &session,
+            &audit::security_audit(
+                "integration.connection.updated",
+                None,
+                "configured",
+                json!({
+                    "connection_id": conn.id,
+                    "vendor_type": u_vendor,
+                    "site_scope": u_site,
+                    "cred_source": u_source,
+                    "cred_rotated": false,
+                }),
+            ),
+        )
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         conn.updated_at = now;
 
         return Ok(Json(json!({
@@ -1356,20 +1472,43 @@ pub async fn integration_set_credential_expiry(
     // UPDATE ... RETURNING makes existence + write atomic — no check-then-write
     // TOCTOU window. A missing row yields no RETURNING and is a clean 404. The
     // response reflects the PERSISTED value (the column, at its storage
-    // precision) rather than echoing the caller's input.
+    // precision) rather than echoing the caller's input. The UPDATE and its audit
+    // row commit together in one tx (mirrors DELETE); a 404 rolls back the empty tx
+    // with no audit row.
+    let mut tx = pool.begin().await.map_err(db_err)?;
     let updated: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
         "UPDATE integration_connections SET credential_expires_at = $1 \
          WHERE id = $2 RETURNING id, credential_expires_at",
     )
     .bind(expires_at)
     .bind(&id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_err)?;
 
     let Some((row_id, row_expires_at)) = updated else {
         return Err(integration_not_found(&id));
     };
+
+    // Redaction-safe keys (`cred_expires_at`, not `credential_expires_at`). The
+    // expiry timestamp is non-secret metadata; `cleared` flags an explicit null.
+    audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &audit::security_audit(
+            "integration.connection.credential_expiry_set",
+            None,
+            "configured",
+            json!({
+                "connection_id": row_id,
+                "cred_expires_at": row_expires_at.map(|d| d.to_rfc3339()),
+                "cleared": row_expires_at.is_none(),
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
 
     Ok(Json(json!({
         "connection_id": row_id,
@@ -4031,6 +4170,328 @@ pub mod integration_db_tests {
         cleanup_usage_audit(pool, &conn_id).await;
         cleanup_connection(pool, &conn_id).await;
         std::env::remove_var(env_key);
+    }
+
+    // -----------------------------------------------------------------------
+    // Mutation audit (create / update / set-credential-expiry) — these handlers
+    // read/write the GLOBAL get_db() pool, so the tests use global_pool() (an
+    // isolated test_pool() would not be visible to the handler). Each created
+    // connection has a UNIQUE generated id; audit_log is append-only so isolation
+    // is by that id, never by cleanup.
+    // -----------------------------------------------------------------------
+
+    /// Create a connection through the real handler and return its generated id.
+    async fn create_conn_via_handler(source: &str, inline_secret: &str, cred_ref: &str) -> String {
+        let body = CreateConnectionRequest {
+            vendor_type: "servicenow".to_string(),
+            name: "mutaudit-fixture".to_string(),
+            endpoint_url: "https://x.example".to_string(),
+            site_scope: Some("dc-fra".to_string()),
+            credential_source: source.to_string(),
+            credential_ref: cred_ref.to_string(),
+            inline_secret: inline_secret.to_string(),
+        };
+        let resp = integration_create(Extension(AuthSession::static_dry_run()), Json(body))
+            .await
+            .expect("create must succeed");
+        resp.0["connection"]["id"]
+            .as_str()
+            .expect("connection id in response")
+            .to_string()
+    }
+
+    /// Count the audit rows of one action for one connection (proves uniqueness —
+    /// `fetch_one` alone would silently tolerate a duplicate-audit bug).
+    async fn audit_count(pool: &PgPool, action: &str, conn_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = $1 AND detail->>'connection_id' = $2",
+        )
+        .bind(action)
+        .bind(conn_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// (cred_source, vendor_type, detail::text) of the single created audit row.
+    async fn created_audit(pool: &PgPool, conn_id: &str) -> (Option<String>, Option<String>, String) {
+        sqlx::query_as(
+            "SELECT detail->>'cred_source', detail->>'vendor_type', detail::text FROM audit_log \
+             WHERE action = 'integration.connection.created' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one created audit row")
+    }
+
+    /// Creating a db-encrypted connection writes exactly one created audit row whose
+    /// detail carries the redaction-safe source TYPE and NO secret material (the
+    /// inline plaintext, ciphertext, credential_ref, or inline_secret key).
+    #[tokio::test]
+    async fn integration_create_dbencrypted_writes_audit_without_secret() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+        let secret_plaintext = format!("super-secret-{}", uuid::Uuid::new_v4());
+        let conn_id = create_conn_via_handler("db-encrypted", &secret_plaintext, "").await;
+
+        assert_eq!(
+            audit_count(pool, "integration.connection.created", &conn_id).await,
+            1,
+            "exactly one created audit row"
+        );
+
+        let (cred_source, vendor_type, detail_text) = created_audit(pool, &conn_id).await;
+        assert_eq!(cred_source.as_deref(), Some("db-encrypted"), "source TYPE recorded");
+        assert_eq!(vendor_type.as_deref(), Some("servicenow"));
+        assert!(
+            !detail_text.contains(&secret_plaintext),
+            "the inline secret plaintext must NEVER be in the audit detail"
+        );
+        assert!(
+            !detail_text.contains("credential_ref") && !detail_text.contains("inline_secret"),
+            "no credential_ref / inline_secret key in detail"
+        );
+        assert!(
+            !detail_text.contains("ciphertext")
+                && !detail_text.contains("nonce")
+                && !detail_text.contains("key_id"),
+            "no ciphertext / nonce / key_id in detail"
+        );
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// Creating a vault connection writes a created audit row atomically, and the
+    /// vault PATH (credential_ref) never leaks into the detail.
+    #[tokio::test]
+    async fn integration_create_vault_writes_audit_without_path() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let vault_path = format!("secret/data/fixture-{}", uuid::Uuid::new_v4());
+        let conn_id = create_conn_via_handler("vault", "", &vault_path).await;
+
+        assert_eq!(
+            audit_count(pool, "integration.connection.created", &conn_id).await,
+            1,
+            "exactly one created audit row"
+        );
+        let (cred_source, _vendor, detail_text) = created_audit(pool, &conn_id).await;
+        assert_eq!(cred_source.as_deref(), Some("vault"));
+        assert!(
+            !detail_text.contains(&vault_path),
+            "the vault path must NOT leak into the audit detail"
+        );
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// Updating a db-encrypted connection WITH a new inline_secret writes an updated
+    /// audit row with cred_rotated=true and no secret material.
+    #[tokio::test]
+    async fn integration_update_secret_rotation_audits_rotated_true() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        std::env::set_var("RYUKI_INTEGRATION__ENCRYPTION_KEY", test_encryption_key());
+        let conn_id = create_conn_via_handler("db-encrypted", "orig-secret", "").await;
+
+        let new_secret = format!("rotated-secret-{}", uuid::Uuid::new_v4());
+        let upd = UpdateConnectionRequest {
+            vendor_type: None,
+            name: None,
+            endpoint_url: None,
+            site_scope: None,
+            credential_source: None,
+            credential_ref: None,
+            inline_secret: new_secret.clone(),
+        };
+        let _ = integration_update(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+            Json(upd),
+        )
+        .await
+        .expect("update must succeed");
+
+        assert_eq!(
+            audit_count(pool, "integration.connection.updated", &conn_id).await,
+            1,
+            "exactly one updated audit row"
+        );
+        let (cred_rotated, detail_text): (Option<bool>, String) = sqlx::query_as(
+            "SELECT (detail->>'cred_rotated')::bool, detail::text FROM audit_log \
+             WHERE action = 'integration.connection.updated' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one updated audit row");
+        assert_eq!(cred_rotated, Some(true), "secret rotation → cred_rotated true");
+        assert!(
+            !detail_text.contains(&new_secret),
+            "the rotated secret must NEVER be in the audit detail"
+        );
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// A plain update (no inline_secret) writes an updated audit row with
+    /// cred_rotated=false.
+    #[tokio::test]
+    async fn integration_update_plain_audits_rotated_false() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = create_conn_via_handler("vault", "", "secret/data/plain").await;
+
+        let upd = UpdateConnectionRequest {
+            vendor_type: None,
+            name: Some("renamed-fixture".to_string()),
+            endpoint_url: None,
+            site_scope: None,
+            credential_source: None,
+            credential_ref: None,
+            inline_secret: String::new(),
+        };
+        let _ = integration_update(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+            Json(upd),
+        )
+        .await
+        .expect("update must succeed");
+
+        assert_eq!(
+            audit_count(pool, "integration.connection.updated", &conn_id).await,
+            1,
+            "exactly one updated audit row"
+        );
+        let cred_rotated: Option<bool> = sqlx::query_scalar(
+            "SELECT (detail->>'cred_rotated')::bool FROM audit_log \
+             WHERE action = 'integration.connection.updated' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one updated audit row");
+        assert_eq!(cred_rotated, Some(false), "plain update → cred_rotated false");
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// Setting credential expiry writes one audit row (cleared=false, the timestamp
+    /// surfaced under the redaction-safe key); an unknown id is a 404 with NO audit
+    /// row (the empty tx rolls back).
+    #[tokio::test]
+    async fn integration_set_credential_expiry_audits_and_404_is_clean() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = create_conn_via_handler("vault", "", "secret/data/exp").await;
+
+        let req = CredentialExpiryRequest {
+            expires_at: Some(Some("2027-01-01T00:00:00Z".to_string())),
+        };
+        let _ = integration_set_credential_expiry(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+            Json(req),
+        )
+        .await
+        .expect("set expiry must succeed");
+
+        let (cleared, expires): (Option<bool>, Option<String>) = sqlx::query_as(
+            "SELECT (detail->>'cleared')::bool, detail->>'cred_expires_at' FROM audit_log \
+             WHERE action = 'integration.connection.credential_expiry_set' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .expect("one set-expiry audit row");
+        assert_eq!(cleared, Some(false), "an explicit timestamp is not a clear");
+        assert!(expires.is_some(), "the expiry timestamp is recorded");
+
+        // Unknown id → 404 and NO audit row.
+        let unknown = format!("ic-exp-missing-{}", uuid::Uuid::new_v4());
+        let req2 = CredentialExpiryRequest {
+            expires_at: Some(None),
+        };
+        let err = integration_set_credential_expiry(
+            Extension(AuthSession::static_dry_run()),
+            Path(unknown.clone()),
+            Json(req2),
+        )
+        .await
+        .expect_err("unknown id is a 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let missing_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'integration.connection.credential_expiry_set' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&unknown)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(missing_count, 0, "an unknown-id set-expiry writes no audit row");
+
+        cleanup_connection(pool, &conn_id).await;
+    }
+
+    /// Read-path redaction survival (codex blocker 1): the created audit row's
+    /// cred_source must come back through the REDACTED audit feed as its real value,
+    /// not `***REDACTED***` — proving the redaction-safe key choice on the read side,
+    /// not just the raw column.
+    #[tokio::test]
+    async fn integration_create_audit_cred_source_survives_redaction_on_read() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = create_conn_via_handler("vault", "", "secret/data/redact").await;
+
+        let feed = audit::audit_feed(Some(pool), 200, 0).await;
+        let entry = feed["entries"]
+            .as_array()
+            .expect("entries array")
+            .iter()
+            .find(|e| {
+                e["action"].as_str() == Some("integration.connection.created")
+                    && e["detail"]["connection_id"].as_str() == Some(conn_id.as_str())
+            })
+            .expect("the created entry is present in the redacted feed");
+
+        assert_eq!(
+            entry["detail"]["cred_source"].as_str(),
+            Some("vault"),
+            "cred_source survives redact_detail with its real value on read"
+        );
+        assert_ne!(
+            entry["detail"]["cred_source"].as_str(),
+            Some("***REDACTED***"),
+            "cred_source must NOT be blanked by redaction"
+        );
+
+        cleanup_connection(pool, &conn_id).await;
     }
 }
 

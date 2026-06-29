@@ -29,9 +29,14 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
   credential-bearing connections with NO forensic trail. ✅ DELETE SHIPPED (352c80b) — atomic
   DELETE+audit (tx + `DELETE … RETURNING` + record_audit_tx; engine `delete_connection_returning`
   fixes the no-DB TOCTOU; secret-safe detail). codex plan+impl APPROVE. See
-  integration-delete-audit.md. STILL OPEN: create/update/circuit_reset/set_credential_expiry
-  (multi-branch tx-bearing handlers — careful, separate work). (The companion "no site-scope guard"
-  finding is MOOT: admin = superuser in this RBAC.)
+  integration-delete-audit.md. ✅ CREATE / UPDATE / SET-CREDENTIAL-EXPIRY SHIPPED — atomic
+  mutation+audit per branch (all `INSERT/UPDATE … RETURNING` so the detail reflects the persisted
+  row; plain-update RETURNING also closed a latent TOCTOU); redaction-safe detail keys
+  (`cred_source`/`cred_rotated`/`cred_expires_at` — the #58 convention, with a read-path-redaction
+  test); 6 DB tests incl. no-secret-leak + read-path. codex plan+impl reviewed. See
+  integration-mutation-audit.md. STILL OPEN: `circuit_reset` only (operational breaker reset —
+  lower compliance value, separate follow-up). (The companion "no site-scope guard" finding is
+  MOOT: admin = superuser in this RBAC.)
 
 ## CONFIRMED, open — scheduled automation (the durable-scheduler scan pattern, now shipped 3×)
 Each is an on-demand `…/expiring` endpoint with NO proactive scan job — the exact pattern
