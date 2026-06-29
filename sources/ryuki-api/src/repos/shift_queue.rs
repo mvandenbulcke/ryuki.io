@@ -18,7 +18,7 @@
 //! single-leader scheduler tick the race is already impossible; the ON CONFLICT
 //! just makes it structurally safe.
 
-use sqlx::PgExecutor;
+use sqlx::{PgExecutor, PgPool};
 
 /// The overdue/never-tested restore signal (#52 slice 1). Fixed so the dedup key
 /// and the partial unique index always agree.
@@ -81,4 +81,77 @@ pub async fn enqueue_if_absent(
     .execute(executor)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Secret-safe triage projection for the operator list endpoint. `metadata` (jsonb)
+/// is DELIBERATELY excluded (the shift-contract's `no-raw-provider-payloads` rule;
+/// `/my-items` omits it too).
+#[derive(Debug, sqlx::FromRow)]
+pub struct ShiftQueueListRow {
+    pub id: String,
+    pub item_type: String,
+    pub title: String,
+    pub description: String,
+    pub priority: String,
+    pub assigned_to: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub acknowledged: bool,
+    pub escalated: bool,
+    pub resolved: bool,
+}
+
+/// Optional filters for [`list_filtered`]. Every field is `None` ⇒ "do not filter".
+#[derive(Debug, Default)]
+pub struct ShiftQueueFilter<'a> {
+    pub item_type: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    pub assigned_to: Option<&'a str>,
+    pub resolved: Option<bool>,
+    pub acknowledged: Option<bool>,
+    pub escalated: Option<bool>,
+    /// `Some(true)` ⇒ only UNASSIGNED (`assigned_to IS NULL`); `Some(false)` ⇒ only
+    /// assigned; `None` ⇒ no filter.
+    pub unassigned: Option<bool>,
+}
+
+/// Filtered + paginated operator triage list.
+///
+/// EVERY filter is a BOUND parameter applied via the `($N::type IS NULL OR
+/// col = $N)` pattern — an unset filter matches every row, and NO user input is ever
+/// concatenated into SQL (injection-safe). Ordered `priority ASC` (P1<P2<P3) then
+/// `created_at ASC` (oldest-waiting first — the triage backlog order) then `id ASC`
+/// as an IMMUTABLE tiebreaker, so offset pagination is deterministic even when
+/// priority + created_at tie. The caller passes `limit + 1` to derive `has_more`
+/// without a COUNT.
+pub async fn list_filtered(
+    pool: &PgPool,
+    filter: &ShiftQueueFilter<'_>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ShiftQueueListRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id::text AS id, item_type, title, description, priority, assigned_to, \
+                created_at, acknowledged, escalated, resolved \
+         FROM shift_queue \
+         WHERE ($1::text IS NULL OR item_type = $1) \
+           AND ($2::text IS NULL OR priority = $2) \
+           AND ($3::text IS NULL OR assigned_to = $3) \
+           AND ($4::bool IS NULL OR resolved = $4) \
+           AND ($5::bool IS NULL OR acknowledged = $5) \
+           AND ($6::bool IS NULL OR escalated = $6) \
+           AND ($7::bool IS NULL OR (assigned_to IS NULL) = $7) \
+         ORDER BY priority ASC, created_at ASC, id ASC \
+         LIMIT $8 OFFSET $9",
+    )
+    .bind(filter.item_type)
+    .bind(filter.priority)
+    .bind(filter.assigned_to)
+    .bind(filter.resolved)
+    .bind(filter.acknowledged)
+    .bind(filter.escalated)
+    .bind(filter.unassigned)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
 }

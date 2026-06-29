@@ -703,7 +703,23 @@ static SENSITIVE_READ_PREFIXES: &[&str] =
 /// `audit`. A logged-in Auditor (holds `audit`) reads ordinary GETs but 403s on
 /// the sensitive prefixes; a static-dry-run/PlatformAdmin session satisfies
 /// both via the superuser model, so the demo and mock mode keep reading.
+/// The shift queue (`/api/ops/shift/...`) is OPERATOR working data: every per-item
+/// read (summary/handover/my-items/stale/items) carries open-item descriptions +
+/// assignees, so it requires the `execute` (operator) tier — NOT the ordinary
+/// `audit` read tier that safe-method reads default to (a wedged auth gap: GETs use
+/// `read_permission_for`, and `route_permission_for`'s `/api/ops`→`execute` mapping
+/// applies only to UNSAFE methods). Without this, an `audit`/`request`-tier
+/// principal could read the whole operator queue. The static `/api/ops/shift-contract`
+/// advertisement (not under `/shift/`) stays ordinary-readable. `admin` satisfies it
+/// via the check_permission superuser rule.
+fn is_execute_read_path(path: &str) -> bool {
+    path == "/api/ops/shift" || path.starts_with("/api/ops/shift/")
+}
+
 fn read_permission_for(path: &str) -> &'static str {
+    if is_execute_read_path(path) {
+        return "execute";
+    }
     let sensitive = SENSITIVE_READ_PREFIXES
         .iter()
         .any(|p| path == *p || path.starts_with(&format!("{p}/")));
@@ -741,6 +757,9 @@ fn read_authorized(session: &AuthSession, path: &str) -> bool {
     }
     match read_permission_for(path) {
         "admin" => ryuki_engine::auth::check_permission(session, "admin"),
+        // Operator-data reads (the shift queue) require `execute` — admin still
+        // satisfies it via the superuser rule inside check_permission.
+        "execute" => ryuki_engine::auth::check_permission(session, "execute"),
         _ => {
             ryuki_engine::auth::check_permission(session, "audit")
                 || ryuki_engine::auth::check_permission(session, "request")
@@ -3813,6 +3832,64 @@ mod tests {
             "audit"
         );
         assert_eq!(read_permission_for("/api/ops/runbook/catalog"), "audit");
+    }
+
+    /// The shift queue is operator working data: its per-item reads require the
+    /// `execute` tier at the CENTRAL gate (open-item descriptions + assignees must
+    /// not be `audit`/`request`-readable). The static contract advertisement (not
+    /// under `/shift/`) stays ordinary-readable.
+    #[test]
+    fn test_shift_queue_reads_require_execute() {
+        let role = |r: &str| AuthSession {
+            user_id: "u".into(),
+            display_name: "u".into(),
+            roles: vec![r.to_string()],
+            token_valid: true,
+            provider_mode: "persisted-session".into(),
+            ..Default::default()
+        };
+        let operator = role(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR); // holds execute
+        let auditor = auditor_session(); // holds audit, not execute
+        let requester = role(ryuki_engine::auth::APP_ROLE_REQUESTER); // holds request only
+        for path in [
+            "/api/ops/shift/summary",
+            "/api/ops/shift/handover",
+            "/api/ops/shift/my-items",
+            "/api/ops/shift/stale",
+            "/api/ops/shift/items",
+        ] {
+            assert_eq!(
+                read_permission_for(path),
+                "execute",
+                "{path} is execute-tier"
+            );
+            assert!(read_authorized(&operator, path), "operator reads {path}");
+            assert!(!read_authorized(&auditor, path), "auditor refused {path}");
+            assert!(
+                !read_authorized(&requester, path),
+                "requester refused {path}"
+            );
+        }
+        // The static contract advertisement + a near-miss prefix (NOT under
+        // `/shift/`) stay ordinary-readable — the gate is not over-broad.
+        for ordinary in ["/api/ops/shift-contract", "/api/ops/shift-contract/foo"] {
+            assert_eq!(
+                read_permission_for(ordinary),
+                "audit",
+                "{ordinary} stays ordinary"
+            );
+            assert!(
+                read_authorized(&auditor, ordinary),
+                "auditor reads {ordinary}"
+            );
+        }
+        // The exact family root IS execute-gated.
+        assert_eq!(read_permission_for("/api/ops/shift"), "execute");
+        // admin superuser still reads everything.
+        assert!(read_authorized(
+            &AuthSession::static_dry_run(),
+            "/api/ops/shift/items"
+        ));
     }
 
     /// B3/B6 reconciliation: the login view fetches `/api/platform/summary`

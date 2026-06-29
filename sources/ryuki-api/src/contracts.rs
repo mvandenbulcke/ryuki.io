@@ -752,6 +752,7 @@ pub fn routes() -> Router {
         .route("/api/ops/shift/handover", get(shift_handover))
         .route("/api/ops/shift/my-items", get(shift_my_items))
         .route("/api/ops/shift/stale", get(shift_stale))
+        .route("/api/ops/shift/items", get(shift_list))
         .route("/api/ops/shift-contract", get(shift_contract))
         // ─── Emergency Change (Break-Glass) Engine ───
         // Break-glass initiation is irreversible and high-blast-radius, so the
@@ -6354,6 +6355,88 @@ async fn shift_stale() -> Json<Value> {
 
 async fn shift_contract() -> Json<Value> {
     Json(shift_queue::get_shift_contract())
+}
+
+/// Optional filters + pagination for the operator triage list. All filters are
+/// applied as BOUND params in the repo (injection-safe); an unset field matches all.
+#[derive(Debug, Deserialize, Default)]
+struct ShiftListParams {
+    item_type: Option<String>,
+    priority: Option<String>,
+    assigned_to: Option<String>,
+    resolved: Option<bool>,
+    acknowledged: Option<bool>,
+    escalated: Option<bool>,
+    /// `true` ⇒ only unassigned items; `false` ⇒ only assigned.
+    unassigned: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// GET /api/ops/shift/items — filtered + paginated operator triage list over the
+/// shift queue. Unlike `/summary` (aggregates), `/my-items` (one owner), and
+/// `/stale` (one hardcoded predicate), this lets an operator triage by item_type /
+/// priority / status / owner. DB-only (503 in no-DB — the engine store has no
+/// generic filtered list). `limit` defaults to 50 (clamped 1..=200); `has_more` is
+/// derived by over-fetching one row (no COUNT).
+///
+/// AUTHZ: the central gate maps SAFE-method reads through `read_permission_for`,
+/// which is only `audit`-tier for a non-sensitive path (`route_permission_for`'s
+/// `/api/ops`→`execute` mapping applies to UNSAFE methods only). The full triage
+/// list — every open item's description + assignee — is OPERATOR data, so this
+/// handler enforces `execute` explicitly (stricter than the audit-readable
+/// aggregate/scoped reads). Without this, an `audit`/`request`-tier principal could
+/// read the whole operator queue.
+async fn shift_list(
+    AuthExtractor(session): AuthExtractor,
+    Query(p): Query<ShiftListParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !check_permission(&session, "execute") {
+        return Err(status_403());
+    }
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let limit = p.limit.unwrap_or(50).clamp(1, 200);
+    let offset = p.offset.unwrap_or(0).max(0);
+    let filter = crate::repos::shift_queue::ShiftQueueFilter {
+        item_type: p.item_type.as_deref(),
+        priority: p.priority.as_deref(),
+        assigned_to: p.assigned_to.as_deref(),
+        resolved: p.resolved,
+        acknowledged: p.acknowledged,
+        escalated: p.escalated,
+        unassigned: p.unassigned,
+    };
+    // Over-fetch one row to derive has_more without a COUNT query.
+    let mut rows = crate::repos::shift_queue::list_filtered(pool, &filter, limit + 1, offset)
+        .await
+        .map_err(db_error)?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "item_type": r.item_type,
+                "title": r.title,
+                "description": r.description,
+                "priority": r.priority,
+                "assigned_to": r.assigned_to,
+                "created_at": r.created_at.to_rfc3339(),
+                "acknowledged": r.acknowledged,
+                "escalated": r.escalated,
+                "resolved": r.resolved,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "source": "database",
+        "items": items,
+        "count": items.len(),
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    })))
 }
 
 // ─── Emergency Change (Break-Glass) persistence row ───
@@ -48761,6 +48844,302 @@ mod shift_queue_db_tests {
         };
         assert_eq!(body["status"], "resolved");
         assert_eq!(body["source"], "database");
+    }
+
+    // ── GET /api/ops/shift/items — filtered + paginated triage list ──────────
+
+    /// Seed a shift_queue row with explicit created_at + resolved + assignment so the
+    /// list filters/order can be exercised deterministically.
+    async fn seed_full(
+        pool: &PgPool,
+        id: &str,
+        item_type: &str,
+        priority: &str,
+        assigned_to: Option<&str>,
+        created_at: &str,
+        resolved: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO shift_queue \
+             (id, item_type, title, description, priority, assigned_to, created_at, resolved) \
+             VALUES ($1::uuid, $2, $3, $4, $5, $6, $7::timestamptz, $8) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(format!("Test {id}"))
+        .bind("desc")
+        .bind(priority)
+        .bind(assigned_to)
+        .bind(created_at)
+        .bind(resolved)
+        .execute(pool)
+        .await
+        .expect("seed full shift item");
+    }
+
+    async fn list_body(params: super::ShiftListParams) -> serde_json::Value {
+        // static_dry_run holds admin → satisfies the handler's execute check.
+        let Json(body) = super::shift_list(
+            AuthExtractor(AuthSession::static_dry_run()),
+            super::Query(params),
+        )
+        .await
+        .expect("shift_list returns 200");
+        body
+    }
+
+    fn ids_of(body: &serde_json::Value) -> Vec<String> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_shift_list_filters_and_orders() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let t = format!("test-type-{}", uuid::Uuid::new_v4());
+        let (p1, p2, p3) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        // P2 (alice, open), P1 (bob, open), P3 (unassigned, resolved).
+        seed_full(
+            pool,
+            &p2,
+            &t,
+            "P2",
+            Some("alice"),
+            "2026-01-01T00:00:00Z",
+            false,
+        )
+        .await;
+        seed_full(
+            pool,
+            &p1,
+            &t,
+            "P1",
+            Some("bob"),
+            "2026-01-02T00:00:00Z",
+            false,
+        )
+        .await;
+        seed_full(pool, &p3, &t, "P3", None, "2026-01-03T00:00:00Z", true).await;
+        let only = |extra: ShiftListParams| ShiftListParams {
+            item_type: Some(t.clone()),
+            ..extra
+        };
+
+        // No extra filter → all three, ordered priority ASC (P1, P2, P3).
+        let all = list_body(only(ShiftListParams::default())).await;
+        assert_eq!(ids_of(&all), vec![p1.clone(), p2.clone(), p3.clone()]);
+        // The secret-safe projection carries description but NOT metadata.
+        let first = &all["items"].as_array().unwrap()[0];
+        assert!(
+            first.get("metadata").is_none(),
+            "metadata must not be exposed"
+        );
+        assert!(first["description"].is_string());
+
+        // priority=P1 → only p1.
+        let f = list_body(only(ShiftListParams {
+            priority: Some("P1".into()),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(ids_of(&f), vec![p1.clone()]);
+
+        // resolved=false → p1, p2 (not the resolved p3).
+        let f = list_body(only(ShiftListParams {
+            resolved: Some(false),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(ids_of(&f), vec![p1.clone(), p2.clone()]);
+
+        // assigned_to=alice → p2.
+        let f = list_body(only(ShiftListParams {
+            assigned_to: Some("alice".into()),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(ids_of(&f), vec![p2.clone()]);
+
+        // unassigned=true → only p3.
+        let f = list_body(only(ShiftListParams {
+            unassigned: Some(true),
+            ..Default::default()
+        }))
+        .await;
+        assert_eq!(ids_of(&f), vec![p3.clone()]);
+
+        for id in [&p1, &p2, &p3] {
+            cleanup_item(pool, id).await;
+        }
+    }
+
+    /// codex MAJOR: with priority AND created_at tied, the `id ASC` tiebreaker makes
+    /// offset pagination deterministic — paging limit=1 visits each row EXACTLY once
+    /// (no dup, no skip).
+    #[tokio::test]
+    async fn test_shift_list_paginates_deterministically_on_ties() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let t = format!("test-type-{}", uuid::Uuid::new_v4());
+        let mut seeded: Vec<String> = (0..3).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        for id in &seeded {
+            // SAME priority + SAME created_at for every row.
+            seed_full(
+                pool,
+                id,
+                &t,
+                "P2",
+                Some("op"),
+                "2026-02-02T00:00:00Z",
+                false,
+            )
+            .await;
+        }
+        // Page through one at a time, collecting ids.
+        let mut paged: Vec<String> = Vec::new();
+        for offset in 0..3 {
+            let body = list_body(ShiftListParams {
+                item_type: Some(t.clone()),
+                limit: Some(1),
+                offset: Some(offset),
+                ..Default::default()
+            })
+            .await;
+            let page = ids_of(&body);
+            assert_eq!(page.len(), 1, "limit=1 returns one row");
+            assert_eq!(
+                body["has_more"],
+                offset < 2,
+                "has_more accurate at offset {offset}"
+            );
+            paged.push(page[0].clone());
+        }
+        paged.sort();
+        seeded.sort();
+        assert_eq!(
+            paged, seeded,
+            "every row visited exactly once across pages (no dup/skip)"
+        );
+
+        for id in &seeded {
+            cleanup_item(pool, id).await;
+        }
+    }
+
+    /// limit clamps to 1..=200; an injection string in a filter is a bound param
+    /// (matches literally → 0 rows), never interpolated SQL.
+    #[tokio::test]
+    async fn test_shift_list_clamps_limit_and_is_injection_safe() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let t = format!("test-type-{}", uuid::Uuid::new_v4());
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_full(
+            pool,
+            &id,
+            &t,
+            "P2",
+            Some("op"),
+            "2026-03-03T00:00:00Z",
+            false,
+        )
+        .await;
+
+        // Clamp: 999 → 200, 0 → 1.
+        let hi = list_body(ShiftListParams {
+            limit: Some(999),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(hi["limit"], 200);
+        let lo = list_body(ShiftListParams {
+            limit: Some(0),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(lo["limit"], 1);
+
+        // Injection-safe: the filter is a BOUND param, so this matches no real
+        // assigned_to and returns zero rows (it does NOT execute as SQL).
+        let inj = list_body(ShiftListParams {
+            item_type: Some(t.clone()),
+            assigned_to: Some("' OR 1=1 --".into()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(
+            inj["count"], 0,
+            "injection string matches nothing (bound param)"
+        );
+        // The seeded row is still present under a normal filter (table intact).
+        let ok = list_body(ShiftListParams {
+            item_type: Some(t.clone()),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(ids_of(&ok), vec![id.clone()]);
+
+        cleanup_item(pool, &id).await;
+    }
+
+    /// codex MAJOR: the full triage list is execute-tier. SAFE-method reads only get
+    /// `audit`-tier centrally, so the handler enforces `execute` itself — an
+    /// `audit`-only auditor is 403; an `execute` operator passes the gate.
+    #[tokio::test]
+    async fn test_shift_list_requires_execute() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let role_session = |role: &str| {
+            let mut s = AuthSession::static_dry_run();
+            s.user_id = "shift-reader".into();
+            s.provider_mode = "local".into();
+            s.roles = vec![role.to_string()];
+            s
+        };
+
+        // Auditor (holds `audit`, not `execute`) → 403.
+        let Err((status, _)) = super::shift_list(
+            AuthExtractor(role_session(ryuki_engine::auth::APP_ROLE_AUDITOR)),
+            super::Query(ShiftListParams::default()),
+        )
+        .await
+        else {
+            panic!("an audit-only auditor must be forbidden from the triage list");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Operator (holds `execute`) passes the authz gate (reaches the DB → 200).
+        let ok = super::shift_list(
+            AuthExtractor(role_session(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR)),
+            super::Query(ShiftListParams::default()),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "an execute-tier operator must read the triage list: {ok:?}"
+        );
     }
 }
 
