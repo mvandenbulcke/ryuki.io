@@ -230,6 +230,23 @@ so they can only reduce the authorized set; env-scoped → empty + X-Total-Count
 sort/direction → 400; in-handler (no SQL-scope re-derivation = no multi-site leak). codex
 plan+impl APPROVE. See certificate-list-pagination.md.
 
+**Auth-gate fix: alert-ack + audit-verify were accidentally admin-only** SHIPPED (2nd
+verify-first analysis swarm, 2026-06-29 run 2 — an INTEGRATION-bug audit of this session's
+work). The auth middleware gates UNSAFE non-self-service methods via `route_permission_for`,
+which fail-closes to `admin` for any path family NOT in `ROUTE_PERMISSIONS`. `/api/events`
+and `/api/audit` (bare) were unclassified, so `POST /api/events/alerts/{id}/ack` + `/batch/ack`
+(handlers check `request`) and `POST /api/audit/log/verify` (handler checks `audit`) all
+resolved to `admin` at the gate — a non-admin principal was 403'd at the middleware and never
+reached the handler. Masked because handler-direct tests use the admin `static_dry_run` (which
+bypasses the middleware) and the routes weren't in MUTATING_ROUTES. The single-ack bug PREDATES
+this session's bulk-alert-ack. Fix: a tight SHAPE matcher `unclassified_family_mutation_
+permission` (mirrors `approval_signoff_permission`; NOT a method-agnostic prefix, so other
+`/api/events`/`/api/audit` mutations stay fail-closed) → acks `request`, verify `audit`. Tests:
+the explicit route_permission_for == assertions + fail-closed assertions (a non-ack/non-verify
+path still → admin) + the 3 paths added to MUTATING_ROUTES. codex (round 2 of the analysis)
+plan+impl APPROVE; codex swept for the same bug class and found NO others. See
+events-route-permission-fix.md.
+
 **Agent queue-depth visibility** SHIPPED — `GET /api/admin/agents/queue-depth` (verify-first
 swarm 2026-06-29 #6 READ slice; also the pending-jobs view deferred from #15). Operators had
 no view of the pending agent-job backlog per platform (admin_list_agents shows LEASED jobs).

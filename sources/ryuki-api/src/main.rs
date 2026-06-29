@@ -668,6 +668,24 @@ fn approval_signoff_permission(path: &str) -> Option<&'static str> {
     None
 }
 
+/// Mutations whose FAMILY ROOT is otherwise unclassified in `ROUTE_PERMISSIONS` (so the
+/// fail-closed `admin` default would apply) but whose handler intends a specific LOWER
+/// tier. Without these, the mutation is accidentally admin-only and the handler's looser
+/// check is unreachable for the intended principals. SHAPE-matched (NOT a method-agnostic
+/// `/api/events`/`/api/audit` prefix) so any OTHER future unsafe route under these families
+/// stays fail-closed to `admin` until explicitly classified.
+fn unclassified_family_mutation_permission(path: &str) -> Option<&'static str> {
+    // Alert acknowledgement — events_alert_ack / events_alert_batch_ack check `request`.
+    if path.starts_with("/api/events/alerts/") && path.ends_with("/ack") {
+        return Some("request");
+    }
+    // Audit hash-chain re-verify — audit_log_verify checks `audit`.
+    if path == "/api/audit/log/verify" {
+        return Some("audit");
+    }
+    None
+}
+
 /// Central resolver applied in `auth_middleware` for unsafe methods. `method`
 /// is accepted for forward-compatibility (per-method granularity is a later
 /// wave); this wave treats every unsafe method on a path family identically.
@@ -680,6 +698,11 @@ fn route_permission_for(_method: &Method, path: &str) -> &'static str {
     // be resolved BEFORE the prefix table, which would otherwise map them to
     // `execute` via their family root.
     if let Some(permission) = approval_signoff_permission(path) {
+        return permission;
+    }
+    // Lower-tier mutations whose family root is unclassified (would else fail-closed to
+    // admin) — alert ack (`request`), audit-chain verify (`audit`). Shape-matched.
+    if let Some(permission) = unclassified_family_mutation_permission(path) {
         return permission;
     }
     ROUTE_PERMISSIONS
@@ -3284,6 +3307,12 @@ mod tests {
     /// sync by hand with `contracts::routes()`; the coverage test below asserts
     /// every one resolves to a non-empty permission.
     const MUTATING_ROUTES: &[&str] = &[
+        // Lower-tier mutations whose family root is unclassified — see
+        // unclassified_family_mutation_permission. Without a classification these would
+        // fail-closed to admin and the request/audit-tier handlers would be unreachable.
+        "/api/events/alerts/00000000-0000-0000-0000-000000000000/ack",
+        "/api/events/alerts/batch/ack",
+        "/api/audit/log/verify",
         "/api/requests",
         "/api/requests/00000000-0000-0000-0000-000000000000/validate",
         "/api/requests/00000000-0000-0000-0000-000000000000/plan",
@@ -3523,9 +3552,10 @@ mod tests {
                 !permission.is_empty(),
                 "route {path} resolved to an empty permission"
             );
-            // Every resolved permission must be one the model recognizes.
+            // Every resolved permission must be one the model recognizes. `audit` is
+            // included for the audit-chain verify mutation (the first audit-tier mutation).
             assert!(
-                ["request", "execute", "approve", "admin"].contains(&permission),
+                ["request", "execute", "approve", "audit", "admin"].contains(&permission),
                 "route {path} resolved to unexpected permission {permission}"
             );
         }
@@ -3579,6 +3609,36 @@ mod tests {
                 "/api/maintain/patch/waves/cccccccc-0000-0000-0000-0000000000c1"
             ),
             "execute"
+        );
+        // Alert ack + audit-chain verify: lower-tier mutations whose family root is
+        // unclassified — must resolve to the handler's tier, NOT the admin fail-closed
+        // default (which silently made them admin-only before this fix).
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/events/alerts/e1/ack"),
+            "request",
+            "single alert ack is request-tier (matches the handler), not admin"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/events/alerts/batch/ack"),
+            "request",
+            "batch alert ack is request-tier"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/audit/log/verify"),
+            "audit",
+            "audit-chain verify is audit-tier (matches the handler), not admin"
+        );
+        // Fail-closed is PRESERVED: the shape matcher does NOT over-match — any OTHER
+        // unsafe route under these families still defaults to admin until classified.
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/events/alerts/e1/suppress"),
+            "admin",
+            "a non-ack /api/events mutation stays fail-closed"
+        );
+        assert_eq!(
+            route_permission_for(&Method::POST, "/api/audit/log/rotate"),
+            "admin",
+            "a non-verify /api/audit mutation stays fail-closed"
         );
         // request lifecycle split
         assert_eq!(
