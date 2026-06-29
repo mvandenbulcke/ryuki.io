@@ -150,6 +150,7 @@ pub fn routes() -> Router {
         .route("/api/requests/batch/reject", post(requests_batch_reject))
         .route("/api/requests/batch/rework", post(requests_batch_rework))
         .route("/api/requests/batch/fail", post(requests_batch_fail))
+        .route("/api/requests/batch/approve", post(requests_batch_approve))
         .route(
             "/api/requests/{id}/approve-live-apply",
             post(requests_approve_live_apply),
@@ -16299,8 +16300,23 @@ async fn requests_approve(
         record_transition_denied(&session, &request_id, "request.approve").await;
         return Err(status_403());
     }
+    approve_one(&session, &request_id).await.map(Json)
+}
+
+/// Record THIS approver's decision on a SINGLE request and enforce the multi-role
+/// quorum (DB) / single-approval (no-DB). Scope-guarded + SoD-gated. Returns the bare
+/// request JSON with a `quorum` sibling (flattened — top-level request fields incl.
+/// `status` stay in place), or an (status, body) error. The caller must already hold
+/// `approve` (NO capability check here). Extracted so the single + batch approve
+/// handlers share ONE quorum/SoD core — the batch loops this, so a batch can NEVER
+/// bypass the quorum (each id gets this approver's single decision; a
+/// required_approval_roles>1 request stays Planned until N distinct roles+approvers).
+async fn approve_one(
+    session: &AuthSession,
+    request_id: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
         ))
@@ -16308,15 +16324,15 @@ async fn requests_approve(
         .fetch_optional(pool)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
         // #2: by-id scope guard immediately after load (before SoD/engine logic)
         // so an out-of-scope request is a clean 404, never a state oracle.
-        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+        scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
         // Separation of duties: the approver must not be the request's creator.
         check_sod(
-            &session,
-            &request_id,
+            session,
+            request_id,
             "request.approve",
             current.created_by.as_deref(),
         )
@@ -16331,7 +16347,7 @@ async fn requests_approve(
         // distinct roles+approvers have approved; otherwise it stays Planned and the
         // decision is recorded (200 with quorum_met=false). The engine does NOT
         // decide advancement — that is the quorum helper's job.
-        let (row, quorum) = apply_approval_decision_audited(pool, &session, uid).await?;
+        let (row, quorum) = apply_approval_decision_audited(pool, session, uid).await?;
 
         // 200 body = the request JSON (rehydrated from the post-state row) with a
         // `quorum` sibling key. Flattened (not a {request,quorum} envelope) so the
@@ -16341,14 +16357,14 @@ async fn requests_approve(
         // 'planned', so callers MUST read `quorum.quorum_met` rather than assume
         // approval.
         let mut request_json =
-            serde_json::to_value(db_row_to_request(&row, &request_id)).unwrap_or_default();
+            serde_json::to_value(db_row_to_request(&row, request_id)).unwrap_or_default();
         if let Some(obj) = request_json.as_object_mut() {
             obj.insert(
                 "quorum".to_string(),
                 serde_json::to_value(&quorum).unwrap_or_else(|_| json!({})),
             );
         }
-        return Ok(Json(request_json));
+        return Ok(request_json);
     }
 
     // Separation of duties: the approver must not be the request's creator. Read
@@ -16361,12 +16377,12 @@ async fn requests_approve(
         let idx = store
             .iter()
             .position(|r| r.id == request_id)
-            .ok_or_else(|| status_404(&request_id))?;
+            .ok_or_else(|| status_404(request_id))?;
         store[idx].requester.clone()
     };
     check_sod(
-        &session,
-        &request_id,
+        session,
+        request_id,
         "request.approve",
         Some(requester.as_str()),
     )
@@ -16376,7 +16392,7 @@ async fn requests_approve(
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
 
     let approved = request_lifecycle::approve_request(&store[idx], &session.user_id)
         .map_err(map_engine_error)?;
@@ -16386,8 +16402,8 @@ async fn requests_approve(
     let from_stage = current_stage_name(&store[idx]);
     store[idx] = approved.clone();
     record_local_transition(
-        &session,
-        &request_id,
+        session,
+        request_id,
         "request.approve",
         Some(&from_status),
         Some(&from_stage),
@@ -16401,7 +16417,7 @@ async fn requests_approve(
     // quorum (one role, met) the dry-run path always represents.
     let quorum = ryuki_engine::approval_quorum::evaluate_quorum(
         &[ryuki_engine::approval_quorum::ApprovalDecision {
-            role: approval_role_for(&session),
+            role: approval_role_for(session),
             decision: "approved".to_string(),
             actor: session.user_id.clone(),
         }],
@@ -16415,7 +16431,7 @@ async fn requests_approve(
             serde_json::to_value(&quorum).unwrap_or_else(|_| json!({})),
         );
     }
-    Ok(Json(approved_json))
+    Ok(approved_json)
 }
 
 async fn requests_lock(
@@ -17976,6 +17992,101 @@ async fn requests_batch_fail(
         "results": results,
         "succeeded": succeeded,
         "failed": failed,
+    })))
+}
+
+/// Body for a batch approve: just the request ids (approve takes NO reason).
+#[derive(Debug, Deserialize)]
+struct BatchApproveRequest {
+    ids: Vec<String>,
+}
+
+/// POST /api/requests/batch/approve — record THIS approver's sign-off on up to 100
+/// requests in one call (#17, final slice). Each id goes through the SAME
+/// `approve_one` quorum/SoD core as a single approve, so a batch CANNOT bypass the
+/// multi-role quorum: a `required_approval_roles > 1` request gets this approver's
+/// ONE decision and stays `Planned` (`quorum_met=false`) until N distinct roles +
+/// approvers approve. Items are independent; partial success is normal; HTTP 200
+/// always (clients MUST inspect each result's `ok`/`quorum_met`). Duplicate ids are
+/// deduped.
+///
+/// `approve` is a FLAT capability, checked ONCE up front: a caller lacking it gets a
+/// single 403 for the WHOLE batch, audited EXACTLY ONCE with the non-id "batch"
+/// sentinel. `check_sod` (approver != creator) stays the PER-ITEM gate inside
+/// `approve_one`, so approving a request you created fails only that id.
+async fn requests_batch_approve(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<BatchApproveRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        record_transition_denied(&session, "batch", "request.approve").await;
+        return Err(status_403());
+    }
+    if b.ids.is_empty() {
+        return Err(status_400("ids cannot be empty"));
+    }
+    if b.ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    // Dedupe (preserving order) so the same request is never processed twice. Dedup
+    // on the CANONICAL UUID, not the raw string: UUIDs are case-insensitive and
+    // multi-form, so two spellings of one id must collapse to a single decision (a
+    // re-record would idempotent-short-circuit anyway, but it must not double-count
+    // the result). Non-UUID ids keep their raw text (approve_one 404s them).
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<&String> = b
+        .ids
+        .iter()
+        .filter(|id| {
+            let key = Uuid::parse_str(id)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| id.to_string());
+            seen.insert(key)
+        })
+        .collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    let mut approved = 0u64;
+    for id in unique_ids {
+        match approve_one(&session, id).await {
+            Ok(json) => {
+                succeeded += 1;
+                // approve_one returns the flattened request JSON (top-level fields +
+                // a `quorum` sibling), so `status` is the lifecycle status and
+                // `quorum.quorum_met` is the breadth verdict.
+                let quorum_met = json
+                    .get("quorum")
+                    .and_then(|q| q.get("quorum_met"))
+                    .and_then(|m| m.as_bool())
+                    .unwrap_or(false);
+                if quorum_met {
+                    approved += 1;
+                }
+                results.push(json!({
+                    "id": id,
+                    "ok": true,
+                    "request_status": json.get("status").cloned().unwrap_or(Value::Null),
+                    "quorum_met": quorum_met,
+                }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+        "approved": approved,
     })))
 }
 
@@ -46163,6 +46274,215 @@ mod quorum_enforcement_db_tests {
             final_req.approval_route
         );
         cleanup(pool, id).await;
+    }
+
+    // ── #17 final slice: batch approve (quorum-aware) ────────────────────────
+
+    /// Batch approve happy (required=1): two planned requests → both approved in one
+    /// call, each quorum_met=true with an applied request.approve audit row.
+    #[tokio::test]
+    async fn batch_approve_db_happy_required_1() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let a = seed_planned(pool, "ba-1").await;
+        let b = seed_planned(pool, "ba-2").await;
+        let approver = approver("dc-ba", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(out) = requests_batch_approve(
+            AuthExtractor(approver),
+            Json(BatchApproveRequest {
+                ids: vec![a.to_string(), b.to_string()],
+            }),
+        )
+        .await
+        .expect("batch approve returns 200");
+        assert_eq!(out["succeeded"], 2);
+        assert_eq!(out["approved"], 2);
+        for r in out["results"].as_array().unwrap() {
+            assert_eq!(r["ok"], true);
+            assert_eq!(r["quorum_met"], true);
+            assert_eq!(
+                r["request_status"], "Approved",
+                "flattened (PascalCase) request status is surfaced"
+            );
+        }
+        for id in [a, b] {
+            assert_eq!(read_row(pool, id).await.status, "approved");
+            assert_eq!(count_audit(pool, id, "request.approve").await, 1);
+            cleanup(pool, id).await;
+        }
+    }
+
+    /// THE security test (codex): a batch CANNOT bypass the multi-role quorum. A
+    /// required=2 request batch-approved by ONE approver stays Planned
+    /// (quorum_met=false) but its decision IS recorded; a DISTINCT second approver
+    /// then advances it to Approved. Proves both no-immediate-bypass AND that the
+    /// partial participates in the real quorum ledger.
+    #[tokio::test]
+    async fn batch_approve_db_cannot_bypass_quorum() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let id = seed_planned(pool, "ba-quorum").await;
+        set_required_roles(pool, id, 2).await;
+
+        // ONE approver via the BATCH endpoint → PARTIAL, still Planned, NOT approved.
+        let dc = approver("dc-ba2", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(first) = requests_batch_approve(
+            AuthExtractor(dc),
+            Json(BatchApproveRequest {
+                ids: vec![id.to_string()],
+            }),
+        )
+        .await
+        .expect("batch approve 200");
+        let r0 = &first["results"].as_array().unwrap()[0];
+        assert_eq!(r0["ok"], true);
+        assert_eq!(
+            r0["quorum_met"], false,
+            "one approver cannot meet a 2-role quorum"
+        );
+        assert_eq!(
+            r0["request_status"], "Planned",
+            "still Planned — NOT approved"
+        );
+        assert_eq!(first["approved"], 0);
+        assert_eq!(read_row(pool, id).await.status, "planned");
+        // The partial decision WAS recorded in the real ledger (codex MINOR).
+        assert_eq!(count_decisions(pool, id).await, 1);
+
+        // A DISTINCT second approver+role via the batch endpoint → quorum met.
+        let pa = approver("pa-ba2", ryuki_engine::auth::APP_ROLE_PLATFORM_ADMIN);
+        let Json(second) = requests_batch_approve(
+            AuthExtractor(pa),
+            Json(BatchApproveRequest {
+                ids: vec![id.to_string()],
+            }),
+        )
+        .await
+        .expect("batch approve 200");
+        let r1 = &second["results"].as_array().unwrap()[0];
+        assert_eq!(r1["quorum_met"], true);
+        assert_eq!(r1["request_status"], "Approved");
+        assert_eq!(second["approved"], 1);
+        assert_eq!(read_row(pool, id).await.status, "approved");
+        assert_eq!(count_decisions(pool, id).await, 2);
+        cleanup(pool, id).await;
+    }
+
+    /// Input validation + capability: empty/over-100 ids → 400; a non-approver
+    /// (operator, holds execute not approve) → a single 403 for the whole batch,
+    /// audited EXACTLY ONCE with the non-id "batch" sentinel.
+    #[tokio::test]
+    async fn batch_approve_db_validates_and_requires_approve() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let dc = || approver("dc-val", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        assert!(matches!(
+            requests_batch_approve(
+                AuthExtractor(dc()),
+                Json(BatchApproveRequest { ids: vec![] })
+            )
+            .await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        assert!(matches!(
+            requests_batch_approve(AuthExtractor(dc()), Json(BatchApproveRequest { ids: many }))
+                .await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+
+        let id = seed_planned(pool, "ba-forbid").await;
+        let actor = "op-ba-forbid";
+        let operator = approver(actor, ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR);
+        let denied = |a: &'static str| async move {
+            // request_id IS NULL asserts the denial used the non-id "batch" sentinel
+            // (a non-UUID that the durable audit parses to NULL), not a per-id row.
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'request.approve' AND outcome = 'denied' \
+                   AND actor_principal = $1 AND request_id IS NULL",
+            )
+            .bind(a)
+            .fetch_one(pool)
+            .await
+            .expect("count denied")
+        };
+        let before = denied(actor).await;
+        let Err((status, _)) = requests_batch_approve(
+            AuthExtractor(operator),
+            Json(BatchApproveRequest {
+                ids: vec![id.to_string()],
+            }),
+        )
+        .await
+        else {
+            cleanup(pool, id).await;
+            panic!("an operator (no approve) must get a 403 for the whole batch");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denied(actor).await - before, 1, "exactly one denial audit");
+        assert_eq!(
+            read_row(pool, id).await.status,
+            "planned",
+            "nothing approved"
+        );
+        cleanup(pool, id).await;
+    }
+
+    /// Dedup + partial: a duplicated id is acted on once; a non-existent id fails
+    /// per-item (404) while a valid one approves.
+    #[tokio::test]
+    async fn batch_approve_db_dedup_and_partial() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let valid = seed_planned(pool, "ba-dedup").await;
+        let missing = Uuid::new_v4();
+        let approver = approver("dc-dedup", ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER);
+        let Json(out) = requests_batch_approve(
+            AuthExtractor(approver),
+            Json(BatchApproveRequest {
+                // valid duplicated + a missing id.
+                // valid twice (incl. an UPPERCASE alias — codex: UUIDs are
+                // case-insensitive, so both spellings must dedup to ONE) + a missing id.
+                ids: vec![
+                    valid.to_string(),
+                    valid.to_string().to_uppercase(),
+                    missing.to_string(),
+                ],
+            }),
+        )
+        .await
+        .expect("batch approve 200");
+        // dedup: valid acted once → 2 unique results.
+        assert_eq!(out["results"].as_array().unwrap().len(), 2);
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 1);
+        let by_id = |id: &Uuid| {
+            out["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(&valid)["ok"], true);
+        assert_eq!(by_id(&missing)["ok"], false);
+        assert_eq!(by_id(&missing)["status"], 404);
+        assert_eq!(read_row(pool, valid).await.status, "approved");
+        cleanup(pool, valid).await;
     }
 
     /// Two approvers racing the SAME required=2 request must both end up on the
