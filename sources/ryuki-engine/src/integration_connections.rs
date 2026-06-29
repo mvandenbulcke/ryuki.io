@@ -206,6 +206,16 @@ pub fn delete_connection(id: &str) -> bool {
     store.len() < before
 }
 
+/// Remove the connection with `id` and RETURN it, atomically under one lock —
+/// so a caller that needs the removed connection's fields (e.g. for an audit
+/// detail) can never observe a concurrent update/delete/recreate between a
+/// separate read and remove (TOCTOU). `None` if no such connection existed.
+pub fn delete_connection_returning(id: &str) -> Option<IntegrationConnection> {
+    let mut store = connection_store().lock().unwrap();
+    let idx = store.iter().position(|c| c.id == id)?;
+    Some(store.remove(idx))
+}
+
 /// Generic test stub: validate that credentials appear resolvable and the
 /// endpoint URL is structurally valid. Does NOT make live vendor calls.
 pub fn test_connection_stub(conn: &IntegrationConnection) -> TestResult {
@@ -321,6 +331,29 @@ mod unit_tests {
             err.contains("vendor_type"),
             "error should mention vendor_type: {err}"
         );
+    }
+
+    #[test]
+    fn delete_connection_returning_removes_and_returns_atomically() {
+        let conn = create_connection(
+            "vmware",
+            "del-returning-test",
+            "https://example.com",
+            Some("GBLON".to_string()),
+            CredentialSource::EnvVar,
+            "MY_API_KEY",
+            "tester",
+        )
+        .expect("create");
+        let id = conn.id.clone();
+
+        let removed = delete_connection_returning(&id).expect("removes and returns the connection");
+        assert_eq!(removed.id, id);
+        assert_eq!(removed.vendor_type, "vmware");
+        assert_eq!(removed.site_scope.as_deref(), Some("GBLON"));
+        // Gone: a second remove returns None, and it is no longer readable.
+        assert!(delete_connection_returning(&id).is_none());
+        assert!(get_connection(&id).is_none());
     }
 
     #[test]

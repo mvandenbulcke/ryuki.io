@@ -1014,23 +1014,54 @@ pub async fn integration_delete(
 ) -> ApiResult {
     require_admin(&session)?;
 
+    // The deletion and its audit row commit TOGETHER (a destructive op must never
+    // leave the row gone with no trace). The audit detail carries only the deleted
+    // connection's NON-SECRET identity — never credential_ref / source value / vault.
+    let audit_for = |vendor_type: String, site_scope: Option<String>| audit::AuditRecord {
+        action: "integration.connection.deleted",
+        request_id: None,
+        from_status: None,
+        to_status: "deleted",
+        from_stage: None,
+        to_stage: "security",
+        detail: json!({
+            "connection_id": id,
+            "vendor_type": vendor_type,
+            "site_scope": site_scope,
+        }),
+        outcome: "success",
+    };
+
     if let Some(pool) = get_db() {
-        let rows = sqlx::query("DELETE FROM integration_connections WHERE id = $1")
-            .bind(&id)
-            .execute(pool)
-            .await
-            .map_err(db_err)?
-            .rows_affected();
-        if rows == 0 {
+        let mut tx = pool.begin().await.map_err(db_err)?;
+        // RETURNING the deleted row's non-secret identity for the audit detail; None
+        // (unknown id) rolls back the empty tx → 404 with no audit row.
+        let deleted: Option<(String, Option<String>)> = sqlx::query_as(
+            "DELETE FROM integration_connections WHERE id = $1 RETURNING vendor_type, site_scope",
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some((vendor_type, site_scope)) = deleted else {
             return Err(integration_not_found(&id));
-        }
+        };
+        // `?` aborts the tx (no committed delete without its audit row).
+        audit::record_audit_tx(&mut tx, &session, &audit_for(vendor_type, site_scope))
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         return Ok(Json(json!({"deleted": id})));
     }
 
-    if ryuki_engine::integration_connections::delete_connection(&id) {
-        Ok(Json(json!({"deleted": id})))
-    } else {
-        Err(integration_not_found(&id))
+    // No DB: remove-and-return atomically (one lock — no TOCTOU between read + remove).
+    match ryuki_engine::integration_connections::delete_connection_returning(&id) {
+        Some(conn) => {
+            audit::record_audit_local(&session, &audit_for(conn.vendor_type, conn.site_scope))
+                .await;
+            Ok(Json(json!({"deleted": id})))
+        }
+        None => Err(integration_not_found(&id)),
     }
 }
 
@@ -3561,6 +3592,106 @@ pub mod integration_db_tests {
         .fetch_one(pool)
         .await
         .unwrap()
+    }
+
+    async fn delete_audit_row(pool: &PgPool, conn_id: &str) -> Option<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT detail->>'vendor_type', detail->>'credential_ref' FROM audit_log \
+             WHERE action = 'integration.connection.deleted' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(conn_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    /// Deleting a connection writes exactly one audit row whose detail carries the
+    /// non-secret identity (vendor_type) and NO credential_ref / secret; the row is
+    /// gone; the delete + audit are one atomic unit.
+    #[tokio::test]
+    async fn integration_delete_writes_audit_without_secret() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let conn_id = format!("ic-del-audit-{}", uuid::Uuid::new_v4());
+        seed_env_var_connection(pool, &conn_id, "RYUKI_INTEGRATION__DELAUDIT").await;
+
+        let resp = integration_delete(
+            Extension(AuthSession::static_dry_run()),
+            Path(conn_id.clone()),
+        )
+        .await
+        .expect("delete must succeed");
+        assert_eq!(resp.0["deleted"], serde_json::json!(conn_id));
+
+        // The row is gone.
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM integration_connections WHERE id = $1")
+                .bind(&conn_id)
+                .fetch_optional(pool)
+                .await
+                .unwrap();
+        assert!(exists.is_none(), "the connection row is deleted");
+
+        // EXACTLY one audit row (prove uniqueness, not just presence — codex).
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'integration.connection.deleted' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(&conn_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "exactly one delete audit row");
+        // ...with vendor_type and NO credential_ref.
+        let row = delete_audit_row(pool, &conn_id)
+            .await
+            .expect("the delete audit row");
+        assert_eq!(row.0, "servicenow", "vendor_type is recorded");
+        assert!(
+            row.1.is_none(),
+            "credential_ref must NOT be in the audit detail"
+        );
+
+        cleanup_delete_audit(pool, &conn_id).await;
+    }
+
+    /// Deleting an unknown id → 404 and writes NO audit row (the empty tx rolls back).
+    #[tokio::test]
+    async fn integration_delete_unknown_id_404_no_audit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let unknown = format!("ic-del-missing-{}", uuid::Uuid::new_v4());
+        let err = integration_delete(
+            Extension(AuthSession::static_dry_run()),
+            Path(unknown.clone()),
+        )
+        .await
+        .expect_err("unknown id");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert!(
+            delete_audit_row(pool, &unknown).await.is_none(),
+            "an unknown-id delete writes no audit row"
+        );
+    }
+
+    async fn cleanup_delete_audit(pool: &PgPool, conn_id: &str) {
+        sqlx::query(
+            "DELETE FROM audit_log \
+             WHERE action = 'integration.connection.deleted' \
+               AND detail->>'connection_id' = $1",
+        )
+        .bind(conn_id)
+        .execute(pool)
+        .await
+        .ok();
     }
 
     /// 1. Success path: a resolvable env-var connection records exactly one row
