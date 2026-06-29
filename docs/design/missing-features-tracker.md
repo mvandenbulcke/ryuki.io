@@ -180,8 +180,15 @@ body now rejects unknown fields (422); codex plan(rd2)+impl APPROVE; router test
 prove the route builds, static siblings (at-risk/report) aren't shadowed, and the
 alias survives. Further small wins for follow-up: GET-by-id for /api/admin/tokens
 and /api/admin/agents (secret-hygiene: mirror each list's secret-safe projection).
-**DR-plan DELETE** designed + codex-reviewed but DEFERRED (needs the DR store made
-DB-authoritative — a startup-hydration refactor — see dr-plan-delete.md).
+**DR-plan DELETE** SHIPPED — `DELETE /api/protect/dr/plans/{id}` completes DR-plan
+CRUD. Included the prerequisite refactor making the DR store DB-authoritative
+(`replace_plans` reconcile at startup instead of upsert-on-top, so a deleted plan
+can't resurrect on restart) + a scoped `ON DELETE RESTRICT` FK on
+`dr_test_runs.plan_id` (mig 124) that blocks deleting a plan with history AND
+orphaning a run against a deleted plan, with the `dr_test_start` insert mapping the
+FK 23503 to 409. xmin CAS + NOT-EXISTS precheck in `repos::dr_plans::delete`
+(`DeleteOutcome`). Codex plan review 3 rounds + impl review 4 rounds. See
+dr-plan-delete.md.
 
 **Shipped (clean/additive + tracker features):** #2 site/env-scoped RBAC
 (33-commit sweep), #3 SoD (`aa0e188`), #5 audit hash chain (`6bcb231`),

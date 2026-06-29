@@ -1574,16 +1574,30 @@ async fn main() {
     if let Some(pool) = crate::database::get_db() {
         match crate::repos::dr_plans::list(pool).await {
             Ok(plans) => {
-                for plan in &plans {
-                    ryuki_engine::dr_testing::upsert_plan(plan);
-                }
-                tracing::info!(count = plans.len(), "dr plans hydrated from DB");
+                let count = plans.len();
+                // DB-authoritative: REPLACE the store's seed plans with the DB set
+                // (not upsert-on-top). seed_data() always seeds the demo plans into
+                // the store, so an upsert-on-top hydration would resurrect a plan
+                // DELETEd from the DB on the next restart. Replacing wholesale makes
+                // the store mirror the DB exactly — a deleted plan stays gone.
+                ryuki_engine::dr_testing::replace_plans(plans);
+                tracing::info!(count, "dr plans hydrated from DB (store reconciled)");
             }
             Err(e) => {
-                tracing::warn!(
+                // FATAL: the DB is configured (the pool connected and migrations ran
+                // at startup, so dr_plans exists) but the authoritative DR plan set
+                // could not be loaded. We must NOT serve the DR surface in an unknown
+                // state — neither stale seed plans (upsert-on-top would resurrect a
+                // deleted plan) nor an empty store (which would misreport due-tests
+                // and readiness as "0 due / fully ready"). Refuse to start so an
+                // operator resolves the DB fault, matching the other fatal startup
+                // conditions in this function.
+                tracing::error!(
                     error = %e,
-                    "dr plans hydration failed — falling back to seed defaults"
+                    "FATAL: dr plans hydration failed in DB mode — refusing to start \
+                     (cannot serve the DR surface without the authoritative plan set)"
                 );
+                std::process::exit(1);
             }
         }
     }

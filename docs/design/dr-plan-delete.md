@@ -1,13 +1,23 @@
 # DR-plan DELETE — CRUD completion (deferred half of dr-plan-update-delete)
 
-Status: design — codex plan-review round 1 NEEDS-CHANGES (1 blocker + 3 majors);
-fixes folded in below. DEFERRED IMPLEMENTATION: codex's two reviews (the PUT slice +
-this one) confirm DELETE is a MULTI-SYSTEM change — a live-data migration, a change
-to the live-execution-adjacent `dr_test_start`, and the store-vs-DB model — not the
-clean CRUD slice it appeared. The corrected design is captured here for a dedicated
-session; it is NOT a tail-of-session rush given the elevated blast radius (a live
-migration touching run history + a sensitive handler). Completes DR-plan CRUD
-(create/list/get/PUT shipped).
+Status: IMPLEMENTED (dedicated fresh-context session). Codex plan review = 3 rounds
+(1 blocker + majors + the store-model blocker, all folded in below); codex
+implementation review = 4 rounds (round 1: fail-open hydration + reconcile-test
+overclaim; round 2: "unknown ≠ empty" for the store-backed reads; round 3: scoped
+the FK pg_constraint guard + accurate lock comment; round 4: final APPROVE). The
+DEFERRAL reasoning below is retained as the historical record of WHY this was a
+multi-system change (live-data FK migration + the live-execution-adjacent
+`dr_test_start` + making the DR store DB-authoritative) rather than the clean CRUD
+slice it first appeared. Completes DR-plan CRUD (create/list/get/PUT/DELETE).
+
+What shipped: migration 124 (seed backfill → fail-loud orphan guard → scoped,
+NOT VALID/VALIDATE `ON DELETE RESTRICT` FK on `dr_test_runs.plan_id`);
+`dr_testing::remove_plan` (delete write-through) + `replace_plans` (DB-authoritative
+startup reconcile, replacing upsert-on-top so a deleted seed plan can't resurrect);
+`repos::dr_plans::delete` (xmin CAS + NOT-EXISTS precheck + 23503 backstop →
+`DeleteOutcome`); the `dr_plan_delete` handler + route + dr_contract entry; the
+`dr_test_start` 23503→409 catch; fatal-on-failure DB-mode hydration. 8 new DR
+DB-tests + 1 engine test, all green.
 
 ## Codex round-1 fixes (folded into the sections below)
 - BLOCKER (FK safety): migration 124 must BACKFILL the 3 migration-087 `dr_plans`

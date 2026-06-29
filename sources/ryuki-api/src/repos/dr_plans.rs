@@ -135,3 +135,83 @@ pub async fn transition(
     }
     Ok(true)
 }
+
+/// Outcome of a DR-plan delete attempt (xmin CAS + test-run history guard).
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The plan row was deleted.
+    Deleted,
+    /// No row with this id (already gone).
+    NotFound,
+    /// The plan has test-run history; the delete is refused to protect the runs.
+    HasHistory,
+    /// The row was modified concurrently (xmin moved); caller should reload.
+    StaleVersion,
+}
+
+/// Delete a DR plan IFF it still matches `expected_version` (xmin CAS) AND has no
+/// test-run history. The `NOT EXISTS` is the friendly common-case precheck; the
+/// `ON DELETE RESTRICT` FK (migration 124) is the structural race backstop — a
+/// concurrent `dr_test_start` that inserts a run AFTER the `NOT EXISTS` snapshot
+/// makes the DELETE itself error with FK `23503`, which we map to `HasHistory`.
+/// On 0 rows we re-read to disambiguate `NotFound` / `HasHistory` / `StaleVersion`.
+pub async fn delete(
+    executor: &mut sqlx::PgConnection,
+    id: &str,
+    expected_version: &str,
+) -> Result<DeleteOutcome, sqlx::Error> {
+    let res = sqlx::query(
+        "DELETE FROM dr_plans \
+         WHERE id = $1 AND xmin = $2::xid \
+           AND NOT EXISTS (SELECT 1 FROM dr_test_runs WHERE plan_id = $1)",
+    )
+    .bind(id)
+    .bind(expected_version)
+    .execute(&mut *executor)
+    .await;
+
+    match res {
+        Ok(r) if r.rows_affected() == 1 => Ok(DeleteOutcome::Deleted),
+        Ok(_) => {
+            // 0 rows: the row is gone, runs exist, or xmin moved. Re-read to
+            // disambiguate so the handler returns a precise status.
+            let current_version: Option<String> =
+                sqlx::query_scalar("SELECT xmin::text FROM dr_plans WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *executor)
+                    .await?;
+            match current_version {
+                None => Ok(DeleteOutcome::NotFound),
+                Some(version) => {
+                    let has_history: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM dr_test_runs WHERE plan_id = $1)",
+                    )
+                    .bind(id)
+                    .fetch_one(&mut *executor)
+                    .await?;
+                    if has_history {
+                        Ok(DeleteOutcome::HasHistory)
+                    } else {
+                        // Row present, no history: the 0-row delete can only be a
+                        // CAS miss (the row was modified between read and delete).
+                        let _ = version;
+                        Ok(DeleteOutcome::StaleVersion)
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // FK 23503: a run was inserted concurrently (after the NOT EXISTS
+            // snapshot), so ON DELETE RESTRICT blocked the delete — history exists.
+            if e.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c == "23503")
+                .unwrap_or(false)
+            {
+                Ok(DeleteOutcome::HasHistory)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}

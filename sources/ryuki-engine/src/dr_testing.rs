@@ -497,6 +497,32 @@ pub fn upsert_plan(plan: &DrPlan) {
     }
 }
 
+/// Remove a plan from the in-memory store by id (the DELETE counterpart of
+/// `upsert_plan`). After the DB row is deleted, the API calls this so the plan can
+/// no longer be resolved by `get_plan_from_store` — i.e. a subsequent `start_test`
+/// refuses it immediately, without waiting for a restart. No I/O.
+pub fn remove_plan(id: &str) {
+    let Ok(mut store) = dr_store().lock() else {
+        return;
+    };
+    store.0.retain(|p| p.id != id);
+}
+
+/// Replace the store's ENTIRE plan set with the DB-authoritative list at startup.
+/// `seed_data()` always seeds the three demo plans into the store, and the previous
+/// hydration only UPSERTED DB rows on top of them — so a plan DELETEd from the DB
+/// would be resurrected from the seed on the next restart and stay resolvable by
+/// `start_test`. In DB mode the DB is the source of truth for plans, so hydration
+/// REPLACES the store's plan vector wholesale, making the store mirror the DB
+/// exactly (a deleted plan stays gone). The store's test runs and scenarios are
+/// untouched. No I/O.
+pub fn replace_plans(plans: Vec<DrPlan>) {
+    let Ok(mut store) = dr_store().lock() else {
+        return;
+    };
+    store.0 = plans;
+}
+
 pub fn create_plan(
     name: &str,
     site: &str,
@@ -779,6 +805,40 @@ mod tests {
         assert!(
             start_test(&id, "Tabletop", "qa.operator").is_ok(),
             "an upserted plan must be startable"
+        );
+    }
+
+    /// `remove_plan` is the DELETE write-through: after a plan's DB row is deleted
+    /// the API calls it so the plan can no longer be resolved by the static store —
+    /// a subsequent start_test must refuse it immediately (without a restart). Uses
+    /// a unique id so it never disturbs sibling tests' store entries.
+    #[test]
+    fn test_remove_plan_makes_it_unresolvable() {
+        let plan = build_dr_plan(
+            "BEBRU remove DR",
+            "BEBRU",
+            "FRPAR",
+            vec!["bebru-app-01".into()],
+            25,
+            95,
+        )
+        .unwrap();
+        let id = plan.id.clone();
+
+        upsert_plan(&plan);
+        assert!(
+            get_plan_from_store(&id).is_some(),
+            "an upserted plan must be resolvable before removal"
+        );
+
+        remove_plan(&id);
+        assert!(
+            get_plan_from_store(&id).is_none(),
+            "a removed plan must no longer be resolvable"
+        );
+        assert!(
+            start_test(&id, "Tabletop", "qa.operator").is_err(),
+            "a removed plan must not be startable"
         );
     }
 

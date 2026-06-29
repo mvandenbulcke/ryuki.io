@@ -1506,6 +1506,7 @@ pub fn routes() -> Router {
         .route("/api/protect/dr/plans", post(dr_plan_create))
         .route("/api/protect/dr/plans/{id}", get(dr_plan_get))
         .route("/api/protect/dr/plans/{id}", put(dr_plan_update))
+        .route("/api/protect/dr/plans/{id}", delete(dr_plan_delete))
         .route(
             "/api/protect/dr/plans/{id}/rpo-rto",
             post(dr_plan_update_rpo_rto),
@@ -31425,6 +31426,62 @@ async fn dr_plan_update(
     dr_testing::upsert_plan(&updated);
     Ok(Json(serde_json::to_value(&updated).unwrap_or_default()))
 }
+async fn dr_plan_delete(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = get_db().ok_or_else(status_503_no_db)?;
+    let (plan, version) = crate::repos::dr_plans::get(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| status_404(&id))?;
+    // #2: a scoped principal may only delete a plan in its own site. The site is
+    // checked on the loaded row; the xmin CAS in the delete fails the write if the
+    // row changed concurrently, so there is no TOCTOU window.
+    guard_body_site_scope(&session, &plan.site)?;
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let outcome = crate::repos::dr_plans::delete(&mut tx, &id, &version)
+        .await
+        .map_err(db_error)?;
+    match outcome {
+        crate::repos::dr_plans::DeleteOutcome::Deleted => {
+            audit::record_audit_tx(
+                &mut tx,
+                &session,
+                &audit::security_audit(
+                    "dr-plan-delete",
+                    None,
+                    "deleted",
+                    json!({"plan_id": &id, "site": &plan.site}),
+                ),
+            )
+            .await
+            .map_err(db_error)?;
+            tx.commit().await.map_err(db_error)?;
+            // Write-through: drop the plan from the in-memory store so test-run
+            // creation (start_test resolves from the static store) refuses it
+            // immediately, without waiting for a restart.
+            dr_testing::remove_plan(&id);
+            Ok(Json(json!({"deleted": &id})))
+        }
+        crate::repos::dr_plans::DeleteOutcome::HasHistory => {
+            tx.rollback().await.ok();
+            Err(status_409(
+                "plan has test-run history; cannot delete (retire it instead)",
+            ))
+        }
+        crate::repos::dr_plans::DeleteOutcome::StaleVersion => {
+            tx.rollback().await.ok();
+            Err(status_409(
+                "plan was modified concurrently; reload and retry",
+            ))
+        }
+        crate::repos::dr_plans::DeleteOutcome::NotFound => {
+            tx.rollback().await.ok();
+            Err(status_404(&id))
+        }
+    }
+}
 async fn dr_test_start(
     AuthExtractor(session): AuthExtractor,
     Json(b): Json<DrTestStartRequest>,
@@ -31445,7 +31502,21 @@ async fn dr_test_start(
     let mut tx = pool.begin().await.map_err(db_error)?;
     crate::repos::dr_test_runs::insert(&mut *tx, &run)
         .await
-        .map_err(db_error)?;
+        .map_err(|e| {
+            // The plan may have been DELETEd concurrently (the store still resolved
+            // it, but the DB row is gone). Its run INSERT then fails the ON DELETE
+            // RESTRICT FK (migration 124) with 23503 — map that to 409 ("reload")
+            // instead of leaking a generic 500.
+            if e.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c == "23503")
+                .unwrap_or(false)
+            {
+                status_409("DR plan was deleted concurrently; reload and retry")
+            } else {
+                db_error(e)
+            }
+        })?;
     audit::record_audit_tx(
         &mut tx,
         &session,
@@ -31600,7 +31671,7 @@ async fn dr_scenarios(
 }
 async fn dr_contract() -> Json<Value> {
     Json(
-        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/dr/plans"},{"method":"POST","path":"/api/protect/dr/plans"},{"method":"GET","path":"/api/protect/dr/plans/{id}"},{"method":"PUT","path":"/api/protect/dr/plans/{id}"},{"method":"POST","path":"/api/protect/dr/plans/{id}/rpo-rto"},{"method":"POST","path":"/api/protect/dr/tests/start"},{"method":"POST","path":"/api/protect/dr/tests/complete"},{"method":"GET","path":"/api/protect/dr/tests/results/{id}"},{"method":"GET","path":"/api/protect/dr/due-tests"},{"method":"GET","path":"/api/protect/dr/readiness"},{"method":"GET","path":"/api/protect/dr/scenarios"}]}),
+        json!({"source":"static-seed","providerCallsEnabled":false,"liveExecutionEnabled":false,"endpoints":[{"method":"GET","path":"/api/protect/dr/plans"},{"method":"POST","path":"/api/protect/dr/plans"},{"method":"GET","path":"/api/protect/dr/plans/{id}"},{"method":"PUT","path":"/api/protect/dr/plans/{id}"},{"method":"DELETE","path":"/api/protect/dr/plans/{id}"},{"method":"POST","path":"/api/protect/dr/plans/{id}/rpo-rto"},{"method":"POST","path":"/api/protect/dr/tests/start"},{"method":"POST","path":"/api/protect/dr/tests/complete"},{"method":"GET","path":"/api/protect/dr/tests/results/{id}"},{"method":"GET","path":"/api/protect/dr/due-tests"},{"method":"GET","path":"/api/protect/dr/readiness"},{"method":"GET","path":"/api/protect/dr/scenarios"}]}),
     )
 }
 
@@ -61172,6 +61243,400 @@ mod dr_plans_db_tests {
         cleanup(pool, &id).await;
         assert!(res.is_ok(), "a no-op PUT must succeed: {res:?}");
     }
+
+    /// DELETE happy: a runless plan → 200 {"deleted": id}; a subsequent GET → 404;
+    /// the in-memory store no longer resolves it (write-through remove_plan); a
+    /// `dr-plan-delete` audit row exists.
+    #[tokio::test]
+    async fn test_dr_plan_delete_happy() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+        // Mirror the create handler's write-through so the store resolves it.
+        ryuki_engine::dr_testing::upsert_plan(&plan);
+
+        let res = super::dr_plan_delete(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+        )
+        .await;
+        let body = res.expect("delete of a runless plan must succeed");
+        assert_eq!(
+            body.0["deleted"].as_str(),
+            Some(id.as_str()),
+            "response echoes the deleted id"
+        );
+
+        // The row is gone.
+        let gone = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get must not error");
+        assert!(gone.is_none(), "the plan row must be deleted");
+
+        // The store no longer resolves it (write-through remove_plan).
+        assert!(
+            ryuki_engine::dr_testing::get_plan_from_store(&id).is_none(),
+            "the deleted plan must be removed from the in-memory store"
+        );
+
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM audit_log \
+             WHERE action = 'dr-plan-delete' AND detail->>'plan_id' = $1)",
+        )
+        .bind(&id)
+        .fetch_one(pool)
+        .await
+        .expect("query audit");
+        assert!(audited, "dr_plan_delete must write a durable audit row");
+    }
+
+    /// DELETE blocked by history: a plan WITH a test-run row → 409; the plan still
+    /// exists (GET → Some) and the run is intact (history protected, not dropped).
+    #[tokio::test]
+    async fn test_dr_plan_delete_blocked_by_history() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+        ryuki_engine::dr_testing::upsert_plan(&plan);
+
+        // Seed a test-run referencing the plan.
+        let run_id = format!("drt-hist-{suffix}");
+        sqlx::query(
+            "INSERT INTO dr_test_runs (id, plan_id, site, completed, run_json) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&run_id)
+        .bind(&id)
+        .bind("DEFRA")
+        .bind(true)
+        .bind(serde_json::json!({"id": run_id, "plan_id": id}))
+        .execute(pool)
+        .await
+        .expect("seed run must insert");
+
+        let err = super::dr_plan_delete(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path(id.clone()),
+        )
+        .await
+        .expect_err("delete of a plan with history must be refused");
+        assert_eq!(err.0, super::StatusCode::CONFLICT, "history block → 409");
+
+        // The plan still exists and the run is intact.
+        let still = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get must not error");
+        assert!(still.is_some(), "a blocked plan must NOT be deleted");
+        let run_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dr_test_runs WHERE id = $1)")
+                .bind(&run_id)
+                .fetch_one(pool)
+                .await
+                .expect("query run");
+        assert!(run_exists, "the test-run history must be intact");
+
+        // Cleanup: the run must go first (FK RESTRICT blocks the plan delete).
+        sqlx::query("DELETE FROM dr_test_runs WHERE id = $1")
+            .bind(&run_id)
+            .execute(pool)
+            .await
+            .ok();
+        cleanup(pool, &id).await;
+        ryuki_engine::dr_testing::remove_plan(&id);
+    }
+
+    /// DELETE unknown id → 404.
+    #[tokio::test]
+    async fn test_dr_plan_delete_unknown_id_404() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(_pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let err = super::dr_plan_delete(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Path("drp-does-not-exist-00000000".into()),
+        )
+        .await
+        .expect_err("unknown id must be 404");
+        assert_eq!(err.0, super::StatusCode::NOT_FOUND);
+    }
+
+    /// DELETE scope: an out-of-scope plan for a site-scoped session → 403,
+    /// mirroring `dr_plan_update`'s scope behavior.
+    #[tokio::test]
+    async fn test_dr_plan_delete_denies_out_of_scope() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        // A GBLON-scoped principal cannot delete a DEFRA plan.
+        let err = super::dr_plan_delete(
+            super::AuthExtractor(scoped_session(&["GBLON"])),
+            super::Path(id.clone()),
+        )
+        .await
+        .expect_err("out-of-scope DELETE must be 403");
+        assert_eq!(err.0, super::StatusCode::FORBIDDEN);
+
+        // The plan must still exist (the 403 precedes any write).
+        let still = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get must not error");
+        assert!(still.is_some(), "an out-of-scope DELETE must not delete the row");
+        cleanup(pool, &id).await;
+    }
+
+    /// DELETE stale version (repo-CAS regression): a delete with a stale `xmin`
+    /// (a concurrent write bumped the row) is a CAS miss → `DeleteOutcome::
+    /// StaleVersion`, the exact condition the handler maps to 409.
+    #[tokio::test]
+    async fn test_dr_plan_delete_stale_version() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "GBLON");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+
+        let (original, stale_version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+
+        // A concurrent write bumps xmin.
+        let bumped = ryuki_engine::dr_testing::update_dr_plan_pure(
+            &original,
+            "concurrent",
+            "FRPAR",
+            vec!["sys-z".into()],
+            10,
+            40,
+        )
+        .expect("pure fn must succeed");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let ok = crate::repos::dr_plans::transition(&mut tx, &id, &stale_version, &bumped)
+                .await
+                .expect("first transition must succeed");
+            assert!(ok);
+            tx.commit().await.expect("commit");
+        }
+
+        // A delete with the now-stale version must be a CAS miss.
+        let outcome = {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let o = crate::repos::dr_plans::delete(&mut tx, &id, &stale_version)
+                .await
+                .expect("delete query must not error");
+            tx.commit().await.expect("commit");
+            o
+        };
+
+        cleanup(pool, &id).await;
+        assert_eq!(
+            outcome,
+            crate::repos::dr_plans::DeleteOutcome::StaleVersion,
+            "a delete with a stale version must be a CAS miss (handler maps to 409)"
+        );
+    }
+
+    /// The migration-124 FK is present: inserting a `dr_test_runs` row referencing a
+    /// non-existent plan_id is rejected with FK violation 23503. This is what blocks
+    /// a concurrent `dr_test_start` from orphaning history against a deleted plan.
+    #[tokio::test]
+    async fn test_dr_plan_delete_fk_blocks_orphan_run() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let orphan = sqlx::query(
+            "INSERT INTO dr_test_runs (id, plan_id, site, completed, run_json) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(format!("drt-orphan-{suffix}"))
+        .bind(format!("drp-nonexistent-{suffix}"))
+        .bind("DEFRA")
+        .bind(false)
+        .bind(serde_json::json!({"id": "x"}))
+        .execute(pool)
+        .await;
+
+        let err = orphan.expect_err("FK must reject a run referencing a non-existent plan");
+        assert!(
+            err.as_database_error()
+                .and_then(|d| d.code())
+                .map(|c| c == "23503")
+                .unwrap_or(false),
+            "orphan run insert must fail with FK violation 23503, got: {err}"
+        );
+    }
+
+    /// Restart-reconcile regression (the store-authority blocker): a plan DELETEd
+    /// from the DB must NOT be resurrected when the store is rehydrated at startup.
+    /// `seed_data()` always seeds the store, so an upsert-on-top hydration would
+    /// bring a deleted plan back; `replace_plans` (DB-authoritative) must drop it
+    /// while still rehydrating plans that DO exist in the DB.
+    #[tokio::test]
+    async fn test_dr_store_reconcile_does_not_resurrect_deleted_plan() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+        // Put it in the store (standing in for the seed/write-through path).
+        ryuki_engine::dr_testing::upsert_plan(&plan);
+        assert!(ryuki_engine::dr_testing::get_plan_from_store(&id).is_some());
+
+        // Delete the DB row but DELIBERATELY do NOT call remove_plan — we are
+        // simulating a process that deleted the row and then RESTARTED (seed_data
+        // re-seeds the store, hydration runs). The store still holds the plan.
+        let (_p, version) = crate::repos::dr_plans::get(pool, &id)
+            .await
+            .expect("get failed")
+            .expect("not found");
+        {
+            let mut tx = pool.begin().await.expect("begin tx");
+            let outcome = crate::repos::dr_plans::delete(&mut tx, &id, &version)
+                .await
+                .expect("delete query");
+            assert_eq!(outcome, crate::repos::dr_plans::DeleteOutcome::Deleted);
+            tx.commit().await.expect("commit");
+        }
+        assert!(
+            ryuki_engine::dr_testing::get_plan_from_store(&id).is_some(),
+            "pre-restart store still holds the plan (the resurrection risk)"
+        );
+
+        // Also model seed_data() reintroducing a row absent from the DB: a "ghost"
+        // plan placed in the store but NEVER inserted to the DB. The reconcile must
+        // drop it too (it is not in the DB-authoritative list).
+        let ghost = make_plan(&format!("ghost-{suffix}"), "DEFRA");
+        let ghost_id = ghost.id.clone();
+        ryuki_engine::dr_testing::upsert_plan(&ghost);
+        assert!(ryuki_engine::dr_testing::get_plan_from_store(&ghost_id).is_some());
+
+        // Simulate restart hydration: reconcile the store to the DB-authoritative
+        // list (also restores the store to a DB-mirroring state for sibling tests).
+        let db_plans = crate::repos::dr_plans::list(pool).await.expect("list");
+        ryuki_engine::dr_testing::replace_plans(db_plans);
+
+        assert!(
+            ryuki_engine::dr_testing::get_plan_from_store(&id).is_none(),
+            "a DB-deleted plan must NOT resurrect after the reconcile"
+        );
+        assert!(
+            ryuki_engine::dr_testing::get_plan_from_store(&ghost_id).is_none(),
+            "a store-only plan absent from the DB (seed-like stale entry) must be dropped"
+        );
+        assert!(
+            ryuki_engine::dr_testing::get_plan_from_store("drp-defra-001").is_some(),
+            "a live DB plan must be rehydrated (replace repopulates, not just wipes)"
+        );
+    }
+
+    /// Concurrent test-start vs delete: a `dr_test_start` whose plan was deleted
+    /// after the store resolved it (the DB row gone) fails the FK on its run INSERT
+    /// — the handler must map 23503 to 409, NOT a generic 500.
+    #[tokio::test]
+    async fn test_dr_test_start_concurrent_delete_maps_to_409() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let plan = make_plan(&suffix, "DEFRA");
+        let id = plan.id.clone();
+        crate::repos::dr_plans::insert(pool, &plan)
+            .await
+            .expect("insert must succeed");
+        // Store resolves it (the race: start reads the store BEFORE the delete's
+        // write-through). Delete the DB row but leave the store entry behind.
+        ryuki_engine::dr_testing::upsert_plan(&plan);
+        sqlx::query("DELETE FROM dr_plans WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .expect("concurrent delete");
+
+        let err = super::dr_test_start(
+            super::AuthExtractor(ryuki_engine::auth::AuthSession::static_dry_run()),
+            super::Json(super::DrTestStartRequest {
+                plan_id: id.clone(),
+                scenario_type: "Tabletop".into(),
+                tester: "qa.op".into(),
+            }),
+        )
+        .await
+        .expect_err("a concurrently-deleted plan must not yield 500");
+
+        // The handler builds the run purely and only writes it inside the tx, which
+        // the FK failure rolls back — so NO orphan run may persist (the store is
+        // never mutated with a run either; build_test_run is pure).
+        let leaked: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dr_test_runs WHERE plan_id = $1)")
+                .bind(&id)
+                .fetch_one(pool)
+                .await
+                .expect("query runs");
+        // Restore store sanity for sibling tests.
+        ryuki_engine::dr_testing::remove_plan(&id);
+        assert!(
+            !leaked,
+            "a failed FK run insert must not persist an orphan run (tx rolled back)"
+        );
+        assert_eq!(
+            err.0,
+            super::StatusCode::CONFLICT,
+            "FK 23503 on the run insert must map to 409, not 500"
+        );
+    }
 }
 
 // Run with: RYUKI_DATABASE_URL=<url> cargo test -p ryuki-api --bins dr_test_runs_db_tests -- --test-threads=1
@@ -61218,6 +61683,13 @@ mod dr_test_runs_db_tests {
             .ok();
     }
     async fn cleanup_plan(pool: &PgPool, id: &str) {
+        // The migration-124 FK is ON DELETE RESTRICT, so child runs must go first
+        // or the plan delete is blocked (and silently leaked via `.ok()`).
+        sqlx::query("DELETE FROM dr_test_runs WHERE plan_id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
         sqlx::query("DELETE FROM dr_plans WHERE id = $1")
             .bind(id)
             .execute(pool)
