@@ -113,6 +113,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "legal_hold_expiry_scan"
                 | "recertification_overdue_scan"
                 | "certificate_expiry_scan"
+                | "job_executions_prune"
         )
 }
 
@@ -205,12 +206,15 @@ mod tests {
         assert!(!job_is_read_only("recertification_overdue_scan"));
         assert!(job_is_schedulable("certificate_expiry_scan"));
         assert!(!job_is_read_only("certificate_expiry_scan"));
+        assert!(job_is_schedulable("job_executions_prune"));
+        assert!(!job_is_read_only("job_executions_prune"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));
         assert!(!job_is_schedulable("legal_hold_expiry_scan_live"));
         assert!(!job_is_schedulable("recertification_overdue_scan_live"));
         assert!(!job_is_schedulable("certificate_expiry_scan_live"));
+        assert!(!job_is_schedulable("job_executions_prune_live"));
         assert!(!job_is_schedulable("destroy_everything"));
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));

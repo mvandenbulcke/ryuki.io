@@ -95,6 +95,42 @@ pub struct ExecutionView {
 /// (enqueues a deduped shift_queue item per overdue/never-tested system). Every
 /// write happens on `tx`, so a failure rolls back within the schedule's
 /// savepoint.
+///
+/// Retention prune for `job_executions`: keep the newest `keep_per_schedule` rows
+/// PER `schedule_id`, delete at most `max_per_run` of the GLOBALLY OLDEST over-cap
+/// rows this run. The per-run cap bounds the victim set so the first prune of a
+/// years-old backlog never does one giant DELETE (WAL/locks/timeout); a large
+/// backlog drains over several daily runs, then steady-state deletes only the
+/// day's new over-cap rows. Returns the number of rows deleted. Guards against a
+/// non-positive `keep`/`cap` (which would otherwise delete everything).
+async fn prune_job_executions(
+    conn: &mut sqlx::PgConnection,
+    keep_per_schedule: i64,
+    max_per_run: i64,
+) -> Result<u64, sqlx::Error> {
+    if keep_per_schedule <= 0 || max_per_run <= 0 {
+        return Ok(0);
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM job_executions WHERE id IN ( \
+            SELECT id FROM ( \
+                SELECT id, started_at, ROW_NUMBER() OVER ( \
+                    PARTITION BY schedule_id ORDER BY started_at DESC NULLS LAST, id DESC \
+                ) AS rn \
+                FROM job_executions \
+            ) ranked WHERE rn > $1 \
+            ORDER BY started_at ASC, id ASC \
+            LIMIT $2 \
+        )",
+    )
+    .bind(keep_per_schedule)
+    .bind(max_per_run)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -758,6 +794,21 @@ async fn run_job(
                 Some(format!(
                     "enqueued {enqueued} expiring/expired certificate(s)"
                 )),
+            ))
+        }
+        "job_executions_prune" => {
+            // Safe-internal write (run-3): bound the unbounded job_executions run history (a row
+            // per tick — the 5-min connection_health_sweep alone is 288/day) by keeping the newest
+            // KEEP_PER_SCHEDULE rows PER schedule. A PER-RUN CAP keeps the first prune of a years-old
+            // backlog from doing one giant DELETE; a large backlog drains over a few daily runs.
+            // KEEP is sized to the FASTEST cadence (5-min → ~35 days at 10000); slower schedules
+            // over-retain harmlessly (rows are tiny) but stay bounded.
+            const KEEP_PER_SCHEDULE: i64 = 10_000;
+            const MAX_PER_RUN: i64 = 20_000;
+            let pruned = prune_job_executions(tx, KEEP_PER_SCHEDULE, MAX_PER_RUN).await?;
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("pruned {pruned} old job_executions row(s)")),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -3550,6 +3601,209 @@ mod db_tests {
         cleanup_cert(pool, &expired).await;
         cleanup_cert(pool, &expiring).await;
         cleanup_cert(pool, &healthy).await;
+    }
+
+    // ---- run-3: job_executions retention prune ------------------------------
+
+    const PRUNE_SCAN_SEED_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+    async fn seed_schedule(pool: &PgPool, id: &str) {
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'prune-test', 'health_probe', 3600, FALSE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed schedule");
+    }
+
+    /// Insert a job_executions row for `schedule_id` aged `age_secs` in the past.
+    async fn seed_execution(pool: &PgPool, schedule_id: &str, age_secs: i64) -> String {
+        let id = format!("je-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO job_executions (id, schedule_id, job_kind, status, started_at) \
+             VALUES ($1, $2, 'health_probe', 'succeeded', NOW() - ($3 * INTERVAL '1 second'))",
+        )
+        .bind(&id)
+        .bind(schedule_id)
+        .bind(age_secs)
+        .execute(pool)
+        .await
+        .expect("seed execution");
+        id
+    }
+
+    async fn exec_count(pool: &PgPool, schedule_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE schedule_id = $1")
+            .bind(schedule_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Clear the whole run-history table for a deterministic prune test (DB tests are
+    /// serialized; job_executions is re-populated by later ticks).
+    async fn clear_job_executions(pool: &PgPool) {
+        sqlx::query("DELETE FROM job_executions")
+            .execute(pool)
+            .await
+            .expect("clear job_executions");
+    }
+
+    async fn prune(pool: &PgPool, keep: i64, max_per_run: i64) -> u64 {
+        let mut tx = pool.begin().await.unwrap();
+        let n = prune_job_executions(&mut tx, keep, max_per_run)
+            .await
+            .expect("prune");
+        tx.commit().await.unwrap();
+        n
+    }
+
+    #[tokio::test]
+    async fn migration_131_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Job-executions history prune (all schedules)', 'job_executions_prune', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(PRUNE_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(PRUNE_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            name, "Job-executions history prune (all schedules)",
+            "seed name"
+        );
+        assert_eq!(kind, "job_executions_prune", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_newest_n_per_schedule() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        clear_job_executions(pool).await;
+        let a = format!("sched-a-{}", uuid::Uuid::new_v4());
+        let b = format!("sched-b-{}", uuid::Uuid::new_v4());
+        seed_schedule(pool, &a).await;
+        seed_schedule(pool, &b).await;
+        // A: 5 rows aged 50,40,30,20,10s ago (10s = newest). B: 2 rows.
+        let mut a_ids = vec![];
+        for age in [50, 40, 30, 20, 10] {
+            a_ids.push(seed_execution(pool, &a, age).await);
+        }
+        seed_execution(pool, &b, 20).await;
+        seed_execution(pool, &b, 10).await;
+
+        // keep=3, a large cap so the per-run cap does not interfere.
+        let deleted = prune(pool, 3, 1_000_000).await;
+        assert_eq!(
+            deleted, 2,
+            "A's 2 oldest are deleted (5 - keep 3); B (2 <= 3) untouched"
+        );
+        assert_eq!(exec_count(pool, &a).await, 3, "A keeps its newest 3");
+        assert_eq!(exec_count(pool, &b).await, 2, "B is untouched");
+        // The survivors are the NEWEST (the two oldest, age 50 + 40, are gone).
+        for old in &a_ids[..2] {
+            let exists: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM job_executions WHERE id = $1")
+                    .bind(old)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(exists, 0, "an oldest A row was pruned");
+        }
+        // A second prune is a clean no-op.
+        assert_eq!(prune(pool, 3, 1_000_000).await, 0, "idempotent at the cap");
+
+        clear_job_executions(pool).await;
+    }
+
+    #[tokio::test]
+    async fn prune_per_run_cap_drains_over_runs() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        clear_job_executions(pool).await;
+        let a = format!("sched-cap-{}", uuid::Uuid::new_v4());
+        seed_schedule(pool, &a).await;
+        for age in [60, 50, 40, 30, 20, 10] {
+            seed_execution(pool, &a, age).await;
+        }
+        // keep=2, cap=2: 4 over-cap rows drain 2 at a time over two runs, then a no-op.
+        assert_eq!(prune(pool, 2, 2).await, 2, "first run deletes the 2 oldest");
+        assert_eq!(prune(pool, 2, 2).await, 2, "second run deletes the next 2");
+        assert_eq!(prune(pool, 2, 2).await, 0, "now at the cap — nothing more");
+        assert_eq!(exec_count(pool, &a).await, 2, "exactly keep=2 survive");
+
+        clear_job_executions(pool).await;
+    }
+
+    #[tokio::test]
+    async fn prune_tie_break_deterministic_and_guard() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        clear_job_executions(pool).await;
+        let a = format!("sched-tie-{}", uuid::Uuid::new_v4());
+        seed_schedule(pool, &a).await;
+        // Two rows with the EXACT SAME started_at (a fixed timestamp, not two separate
+        // NOW() calls) beyond keep=1 — so the id-DESC tiebreak is what decides.
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO job_executions (id, schedule_id, job_kind, status, started_at) \
+                 VALUES ($1, $2, 'health_probe', 'succeeded', '2026-01-01T00:00:00Z'::timestamptz)",
+            )
+            .bind(format!("je-{}", uuid::Uuid::new_v4()))
+            .bind(&a)
+            .execute(pool)
+            .await
+            .expect("seed tied execution");
+        }
+        // Deterministic (id DESC tiebreak): exactly one survives, no error.
+        assert_eq!(
+            prune(pool, 1, 100).await,
+            1,
+            "one of the tied rows is pruned"
+        );
+        assert_eq!(
+            exec_count(pool, &a).await,
+            1,
+            "the tiebreak leaves exactly one"
+        );
+
+        // Guard: a non-positive keep/cap deletes NOTHING.
+        assert_eq!(prune(pool, 0, 100).await, 0, "keep<=0 deletes nothing");
+        assert_eq!(prune(pool, 1, 0).await, 0, "cap<=0 deletes nothing");
+        assert_eq!(exec_count(pool, &a).await, 1, "the surviving row is intact");
+
+        clear_job_executions(pool).await;
     }
 
     // ---- #52 slice 2: FAILED-latest signal ----------------------------------
