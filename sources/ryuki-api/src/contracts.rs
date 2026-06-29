@@ -148,6 +148,8 @@ pub fn routes() -> Router {
         .route("/api/requests/{id}/cancel", post(requests_cancel))
         .route("/api/requests/batch/cancel", post(requests_batch_cancel))
         .route("/api/requests/batch/reject", post(requests_batch_reject))
+        .route("/api/requests/batch/rework", post(requests_batch_rework))
+        .route("/api/requests/batch/fail", post(requests_batch_fail))
         .route(
             "/api/requests/{id}/approve-live-apply",
             post(requests_approve_live_apply),
@@ -17272,9 +17274,21 @@ async fn requests_rework(
             "Rework reason is too long (max 2000 characters)",
         ));
     }
+    rework_one(&session, &request_id, reason).await.map(Json)
+}
 
+/// Rework a SINGLE request back to Intake: by-id scope-guarded, engine transition,
+/// persisted + audited. `reason` must already be validated non-empty and the
+/// caller must already hold `approve`. Returns the reworked entity JSON, or an
+/// (status, body) error. Extracted so the single-rework and batch-rework handlers
+/// share ONE copy of the scope guard + per-item transaction (mirrors `reject_one`).
+async fn rework_one(
+    session: &AuthSession,
+    request_id: &str,
+    reason: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
         ))
@@ -17282,20 +17296,20 @@ async fn requests_rework(
         .fetch_optional(pool)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
-        // #2: by-id scope guard immediately after load — before any engine/SoD
-        // logic — so an out-of-scope request is a clean 404 (no state oracle),
-        // never a cross-scope action. Unrestricted principals pass unchanged.
-        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+        .ok_or_else(|| status_404(request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine logic —
+        // so an out-of-scope request is a clean 404 (no state oracle), never a
+        // cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
-        let request = db_row_to_request(&current, &request_id);
+        let request = db_row_to_request(&current, request_id);
         let reworked = request_lifecycle::rework_request(&request, &session.user_id, reason)
             .map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&reworked.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Intake);
         apply_transition_audited(
             pool,
-            &session,
+            session,
             uid,
             &current,
             "request.rework",
@@ -17314,24 +17328,32 @@ async fn requests_rework(
             },
         )
         .await?;
-        return Ok(Json(serde_json::to_value(&reworked).unwrap_or_default()));
+        return Ok(serde_json::to_value(&reworked).unwrap_or_default());
     }
 
     let mut store = request_store().lock().await;
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
+    // #2 (no-DB scope hardening): the in-memory rework path must enforce the same
+    // by-id scope guard as the DB branch and as reject_one — an out-of-scope request
+    // 404s exactly like a missing one, so the dry-run rework path is never a
+    // cross-scope action or existence oracle. (Closes the lone no-DB rework gap.)
+    if is_scoped(session) && !row_scope_permits(session, &store[idx].site, &store[idx].environment)
+    {
+        return Err(status_404(request_id));
+    }
     let reworked = request_lifecycle::rework_request(&store[idx], &session.user_id, reason)
         .map_err(map_engine_error)?;
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
     store[idx] = reworked.clone();
     audit::record_audit_local(
-        &session,
+        session,
         &AuditRecord {
             action: "request.rework",
-            request_id: Some(&request_id),
+            request_id: Some(request_id),
             from_status: Some(&from_status),
             to_status: "intake",
             from_stage: Some(&from_stage),
@@ -17341,7 +17363,7 @@ async fn requests_rework(
         },
     )
     .await;
-    Ok(Json(serde_json::to_value(&reworked).unwrap_or_default()))
+    Ok(serde_json::to_value(&reworked).unwrap_or_default())
 }
 
 /// POST /api/requests/{id}/fail — mark a request terminally Failed (e.g. an
@@ -17365,9 +17387,22 @@ async fn requests_fail(
             "Failure reason is too long (max 2000 characters)",
         ));
     }
+    fail_one(&session, &request_id, reason).await.map(Json)
+}
 
+/// Mark a SINGLE request terminally Failed: by-id scope-guarded, engine transition,
+/// persisted + audited AT the request's current stage (NOT a hardcoded "execute" —
+/// a request can fail at validate/plan/approve/execute). `reason` must already be
+/// validated non-empty and the caller must already hold `execute`. Returns the
+/// failed entity JSON, or an (status, body) error. Extracted so the single-fail and
+/// batch-fail handlers share ONE copy of the scope guard + per-item transaction.
+async fn fail_one(
+    session: &AuthSession,
+    request_id: &str,
+    reason: &str,
+) -> Result<Value, (StatusCode, Json<Value>)> {
     if let Some(pool) = get_db() {
-        let uid = Uuid::parse_str(&request_id).map_err(|_| status_404(&request_id))?;
+        let uid = Uuid::parse_str(request_id).map_err(|_| status_404(request_id))?;
         let current: DbRequestRow = sqlx::query_as(&format!(
             "SELECT {REQUEST_COLUMNS} FROM requests WHERE id = $1"
         ))
@@ -17375,13 +17410,13 @@ async fn requests_fail(
         .fetch_optional(pool)
         .await
         .map_err(db_error)?
-        .ok_or_else(|| status_404(&request_id))?;
-        // #2: by-id scope guard immediately after load — before any engine/SoD
-        // logic — so an out-of-scope request is a clean 404 (no state oracle),
-        // never a cross-scope action. Unrestricted principals pass unchanged.
-        scope_guard_or_404(&session, &current.site, &current.environment, &request_id)?;
+        .ok_or_else(|| status_404(request_id))?;
+        // #2: by-id scope guard immediately after load — before any engine logic —
+        // so an out-of-scope request is a clean 404 (no state oracle), never a
+        // cross-scope action. Unrestricted principals pass unchanged.
+        scope_guard_or_404(session, &current.site, &current.environment, request_id)?;
 
-        let request = db_row_to_request(&current, &request_id);
+        let request = db_row_to_request(&current, request_id);
         let failed = request_lifecycle::fail_request(&request, reason).map_err(map_engine_error)?;
         let stages_json = serde_json::to_value(&failed.stages).unwrap_or_else(|_| json!([]));
         let db_status = request_status_to_db(&ryuki_engine::models::RequestStatus::Failed);
@@ -17390,7 +17425,7 @@ async fn requests_fail(
         let failed_stage = current_stage_name(&request);
         apply_transition_audited(
             pool,
-            &session,
+            session,
             uid,
             &current,
             "request.fail",
@@ -17409,23 +17444,31 @@ async fn requests_fail(
             },
         )
         .await?;
-        return Ok(Json(serde_json::to_value(&failed).unwrap_or_default()));
+        return Ok(serde_json::to_value(&failed).unwrap_or_default());
     }
 
     let mut store = request_store().lock().await;
     let idx = store
         .iter()
         .position(|r| r.id == request_id)
-        .ok_or_else(|| status_404(&request_id))?;
+        .ok_or_else(|| status_404(request_id))?;
+    // #2 (no-DB scope hardening): the in-memory fail path must enforce the same
+    // by-id scope guard as the DB branch and as reject_one — an out-of-scope request
+    // 404s exactly like a missing one, so the dry-run fail path is never a
+    // cross-scope action or existence oracle. (Closes the lone no-DB fail gap.)
+    if is_scoped(session) && !row_scope_permits(session, &store[idx].site, &store[idx].environment)
+    {
+        return Err(status_404(request_id));
+    }
     let failed = request_lifecycle::fail_request(&store[idx], reason).map_err(map_engine_error)?;
     let from_status = request_status_to_db(&store[idx].status).to_string();
     let from_stage = current_stage_name(&store[idx]);
     store[idx] = failed.clone();
     audit::record_audit_local(
-        &session,
+        session,
         &AuditRecord {
             action: "request.fail",
-            request_id: Some(&request_id),
+            request_id: Some(request_id),
             from_status: Some(&from_status),
             to_status: "failed",
             from_stage: Some(&from_stage),
@@ -17436,7 +17479,7 @@ async fn requests_fail(
         },
     )
     .await;
-    Ok(Json(serde_json::to_value(&failed).unwrap_or_default()))
+    Ok(serde_json::to_value(&failed).unwrap_or_default())
 }
 
 /// POST /api/requests/{id}/cancel — withdraw a request before execution begins.
@@ -17685,6 +17728,152 @@ async fn requests_batch_reject(
     let mut failed = 0u64;
     for id in unique_ids {
         match reject_one(&session, id, reason).await {
+            Ok(_) => {
+                succeeded += 1;
+                results.push(json!({ "id": id, "ok": true }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
+}
+
+/// Body for a batch rework: the request ids and a shared reason.
+#[derive(Debug, Deserialize)]
+struct BatchReworkRequest {
+    ids: Vec<String>,
+    reason: String,
+}
+
+/// POST /api/requests/batch/rework — send up to 100 requests back to Intake in one
+/// call (#17, slice 3). Each id is reworked INDEPENDENTLY through the same
+/// `rework_one` core (so the scope rule and per-item transaction are identical to a
+/// single rework); partial success is normal and the response reports a per-id
+/// outcome. Items are NOT atomic with each other. Even an all-failed batch returns
+/// HTTP 200; clients MUST inspect `failed`/`results`. Duplicate ids are deduped.
+///
+/// `approve` is a FLAT capability, checked ONCE up front: a caller lacking it gets a
+/// single 403 for the WHOLE batch, audited EXACTLY ONCE with a non-id "batch"
+/// sentinel (looping the ids would be wasteful and risk an existence oracle on a
+/// denied caller). rework has no SoD gate (matching the single handler).
+async fn requests_batch_rework(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<BatchReworkRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "approve") {
+        record_transition_denied(&session, "batch", "request.rework").await;
+        return Err(status_403());
+    }
+    reject_control_chars("rework reason", &b.reason)?;
+    let reason = b.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Rework reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Rework reason is too long (max 2000 characters)",
+        ));
+    }
+    if b.ids.is_empty() {
+        return Err(status_400("ids cannot be empty"));
+    }
+    if b.ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    // Dedupe (preserving order) so the same request is never processed twice.
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<&String> = b.ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for id in unique_ids {
+        match rework_one(&session, id, reason).await {
+            Ok(_) => {
+                succeeded += 1;
+                results.push(json!({ "id": id, "ok": true }));
+            }
+            Err((status, body)) => {
+                failed += 1;
+                results.push(json!({
+                    "id": id,
+                    "ok": false,
+                    "status": status.as_u16(),
+                    "error": body.0,
+                }));
+            }
+        }
+    }
+    Ok(Json(json!({
+        "results": results,
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
+}
+
+/// Body for a batch fail: the request ids and a shared reason.
+#[derive(Debug, Deserialize)]
+struct BatchFailRequest {
+    ids: Vec<String>,
+    reason: String,
+}
+
+/// POST /api/requests/batch/fail — terminally fail up to 100 requests in one call
+/// (#17, slice 3). Each id is failed INDEPENDENTLY through the same `fail_one` core
+/// (so the scope rule, the per-item transaction, AND the fails-at-its-current-stage
+/// behavior are identical to a single fail); partial success is normal and the
+/// response reports a per-id outcome. Items are NOT atomic with each other. Even an
+/// all-failed batch returns HTTP 200; clients MUST inspect `failed`/`results`.
+/// Duplicate ids are deduped.
+///
+/// `execute` is a FLAT capability, checked ONCE up front: a caller lacking it gets a
+/// single 403 for the WHOLE batch, audited EXACTLY ONCE with a non-id "batch"
+/// sentinel.
+async fn requests_batch_fail(
+    AuthExtractor(session): AuthExtractor,
+    Json(b): Json<BatchFailRequest>,
+) -> ApiResult {
+    if !check_permission(&session, "execute") {
+        record_transition_denied(&session, "batch", "request.fail").await;
+        return Err(status_403());
+    }
+    reject_control_chars("failure reason", &b.reason)?;
+    let reason = b.reason.trim();
+    if reason.is_empty() {
+        return Err(status_400("Failure reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(status_400(
+            "Failure reason is too long (max 2000 characters)",
+        ));
+    }
+    if b.ids.is_empty() {
+        return Err(status_400("ids cannot be empty"));
+    }
+    if b.ids.len() > 100 {
+        return Err(status_400("a batch may contain at most 100 ids"));
+    }
+    // Dedupe (preserving order) so the same request is never processed twice.
+    let mut seen = std::collections::HashSet::new();
+    let unique_ids: Vec<&String> = b.ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+
+    let mut results: Vec<Value> = Vec::with_capacity(unique_ids.len());
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for id in unique_ids {
+        match fail_one(&session, id, reason).await {
             Ok(_) => {
                 succeeded += 1;
                 results.push(json!({ "id": id, "ok": true }));
@@ -37206,6 +37395,343 @@ mod unit_tests {
         assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Planned);
     }
 
+    // ─── #17 slice 3: batch rework + fail (no-DB) ───
+
+    /// Both batch endpoints reject malformed input up front: empty ids, empty /
+    /// control-char / over-2000-char reason, and over-100 batches → 400.
+    #[tokio::test]
+    async fn requests_batch_rework_and_fail_validate_inputs() {
+        let approver = || {
+            single_role_session(
+                "approver-1",
+                ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+            )
+        };
+        let operator =
+            || single_role_session("operator-1", ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR);
+        // rework (approve-tier)
+        for (ids, reason) in [
+            (vec![], "fix"),
+            (vec!["x".to_string()], "   "),
+            (vec!["x".to_string()], "log\nforge"),
+            (vec!["x".to_string()], "y".repeat(2001).as_str()),
+        ] {
+            let r = requests_batch_rework(
+                AuthExtractor(approver()),
+                Json(BatchReworkRequest {
+                    ids,
+                    reason: reason.to_string(),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+                "rework input must 400"
+            );
+        }
+        let many: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+        assert!(matches!(
+            requests_batch_rework(
+                AuthExtractor(approver()),
+                Json(BatchReworkRequest {
+                    ids: many.clone(),
+                    reason: "fix".into()
+                }),
+            )
+            .await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+        // fail (execute-tier)
+        for (ids, reason) in [
+            (vec![], "boom"),
+            (vec!["x".to_string()], "  "),
+            (vec!["x".to_string()], "log\tforge"),
+            (vec!["x".to_string()], "y".repeat(2001).as_str()),
+        ] {
+            let r = requests_batch_fail(
+                AuthExtractor(operator()),
+                Json(BatchFailRequest {
+                    ids,
+                    reason: reason.to_string(),
+                }),
+            )
+            .await;
+            assert!(
+                matches!(r, Err((StatusCode::BAD_REQUEST, _))),
+                "fail input must 400"
+            );
+        }
+        assert!(matches!(
+            requests_batch_fail(
+                AuthExtractor(operator()),
+                Json(BatchFailRequest {
+                    ids: many,
+                    reason: "boom".into()
+                }),
+            )
+            .await,
+            Err((StatusCode::BAD_REQUEST, _))
+        ));
+    }
+
+    /// Capability tiers: rework needs `approve` (an OPERATOR with `execute` but not
+    /// `approve` is forbidden); fail needs `execute` (an APPROVER with `approve` but
+    /// not `execute` is forbidden). One 403 for the whole batch; nothing transitions.
+    #[tokio::test]
+    async fn requests_batch_rework_fail_enforce_their_tier() {
+        let id = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+
+        // OPERATOR (execute, NOT approve) cannot batch-rework.
+        let operator =
+            single_role_session("operator-1", ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR);
+        let Err((s1, _)) = requests_batch_rework(
+            AuthExtractor(operator),
+            Json(BatchReworkRequest {
+                ids: vec![id.clone()],
+                reason: "fix".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("an operator (no approve) must be forbidden from batch rework");
+        };
+        assert_eq!(s1, StatusCode::FORBIDDEN);
+
+        // APPROVER (approve, NOT execute) cannot batch-fail.
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Err((s2, _)) = requests_batch_fail(
+            AuthExtractor(approver),
+            Json(BatchFailRequest {
+                ids: vec![id.clone()],
+                reason: "boom".into(),
+            }),
+        )
+        .await
+        else {
+            panic!("an approver (no execute) must be forbidden from batch fail");
+        };
+        assert_eq!(s2, StatusCode::FORBIDDEN);
+
+        // Nothing transitioned — still Planned.
+        let store = request_store().lock().await;
+        assert_eq!(
+            store.iter().find(|r| r.id == id).unwrap().status,
+            ryuki_engine::models::RequestStatus::Planned
+        );
+    }
+
+    /// Happy + dedup (no-DB): three planned requests + a duplicate of the first →
+    /// rework sends all to Intake, dedup acts on the repeated id ONCE (2 unique →
+    /// succeeded=2, 2 results), and fail terminally fails them.
+    #[tokio::test]
+    async fn requests_batch_rework_happy_and_dedupes_no_db() {
+        let id_a = format!("req-test-{}", Uuid::new_v4());
+        let id_b = format!("req-test-{}", Uuid::new_v4());
+        seed_planned_request(&id_a, "requester-1").await;
+        seed_planned_request(&id_b, "requester-1").await;
+        let approver = single_role_session(
+            "approver-1",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        let Json(out) = requests_batch_rework(
+            AuthExtractor(approver),
+            Json(BatchReworkRequest {
+                ids: vec![id_a.clone(), id_b.clone(), id_a.clone()],
+                reason: "needs changes".into(),
+            }),
+        )
+        .await
+        .expect("batch rework returns 200");
+        assert_eq!(out["succeeded"], 2, "the duplicate is acted on once");
+        assert_eq!(out["failed"], 0);
+        assert_eq!(out["results"].as_array().unwrap().len(), 2);
+        let store = request_store().lock().await;
+        for id in [&id_a, &id_b] {
+            assert_eq!(
+                store.iter().find(|r| &r.id == id).unwrap().status,
+                ryuki_engine::models::RequestStatus::Intake
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_batch_fail_happy_no_db() {
+        let ids: Vec<String> = (0..3)
+            .map(|_| format!("req-test-{}", Uuid::new_v4()))
+            .collect();
+        for id in &ids {
+            seed_planned_request(id, "requester-1").await;
+        }
+        let operator =
+            single_role_session("operator-1", ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR);
+        let Json(out) = requests_batch_fail(
+            AuthExtractor(operator),
+            Json(BatchFailRequest {
+                ids: ids.clone(),
+                reason: "infeasible".into(),
+            }),
+        )
+        .await
+        .expect("batch fail returns 200");
+        assert_eq!(out["succeeded"], 3);
+        assert_eq!(out["failed"], 0);
+        let store = request_store().lock().await;
+        for id in &ids {
+            assert_eq!(
+                store.iter().find(|r| &r.id == id).unwrap().status,
+                ryuki_engine::models::RequestStatus::Failed
+            );
+        }
+    }
+
+    /// no-DB BATCH scope closure (codex): a site-scoped session batching one
+    /// in-scope + one out-of-scope id → the in-scope item transitions, the
+    /// out-of-scope item is a per-id 404, and the out-of-scope row is UNCHANGED.
+    /// Proves the batch wiring enforces the same guard `rework_one`/`fail_one` add.
+    #[tokio::test]
+    async fn requests_batch_rework_fail_no_db_are_site_scoped() {
+        let in_scope = format!("req-defra-{}", Uuid::new_v4());
+        let out_scope = format!("req-defra2-{}", Uuid::new_v4());
+        // seed_planned_request seeds DEFRA/production requests.
+        seed_planned_request(&in_scope, "requester-1").await;
+        seed_planned_request(&out_scope, "requester-1").await;
+
+        // rework: DEFRA-scoped approver; mark out_scope GBLON so it is out of scope.
+        request_store()
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.id == out_scope)
+            .unwrap()
+            .site = "GBLON".to_string();
+        let mut approver = single_role_session(
+            "approver-defra",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        approver.site_scope = vec!["DEFRA".into()];
+        let Json(out) = requests_batch_rework(
+            AuthExtractor(approver),
+            Json(BatchReworkRequest {
+                ids: vec![in_scope.clone(), out_scope.clone()],
+                reason: "fix".into(),
+            }),
+        )
+        .await
+        .expect("batch rework returns 200");
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 1);
+        {
+            let store = request_store().lock().await;
+            assert_eq!(
+                store.iter().find(|r| r.id == in_scope).unwrap().status,
+                ryuki_engine::models::RequestStatus::Intake
+            );
+            // The out-of-scope row was never touched (still Planned).
+            assert_eq!(
+                store.iter().find(|r| r.id == out_scope).unwrap().status,
+                ryuki_engine::models::RequestStatus::Planned
+            );
+        }
+
+        // fail half (codex): the SAME scope closure for batch fail. Fresh requests
+        // (the rework half already transitioned in_scope); execute-tier operator.
+        let f_in = format!("req-defra-{}", Uuid::new_v4());
+        let f_out = format!("req-defra2-{}", Uuid::new_v4());
+        seed_planned_request(&f_in, "requester-1").await;
+        seed_planned_request(&f_out, "requester-1").await;
+        request_store()
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.id == f_out)
+            .unwrap()
+            .site = "GBLON".to_string();
+        let mut operator = single_role_session(
+            "operator-defra",
+            ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR,
+        );
+        operator.site_scope = vec!["DEFRA".into()];
+        let Json(fout) = requests_batch_fail(
+            AuthExtractor(operator),
+            Json(BatchFailRequest {
+                ids: vec![f_in.clone(), f_out.clone()],
+                reason: "infeasible".into(),
+            }),
+        )
+        .await
+        .expect("batch fail returns 200");
+        assert_eq!(fout["succeeded"], 1);
+        assert_eq!(fout["failed"], 1);
+        let store = request_store().lock().await;
+        assert_eq!(
+            store.iter().find(|r| r.id == f_in).unwrap().status,
+            ryuki_engine::models::RequestStatus::Failed
+        );
+        // The out-of-scope row was never failed (still Planned).
+        assert_eq!(
+            store.iter().find(|r| r.id == f_out).unwrap().status,
+            ryuki_engine::models::RequestStatus::Planned
+        );
+    }
+
+    /// no-DB single-handler scope-gap closure (the latent gap this slice fixes): a
+    /// site-scoped principal calling the SINGLE rework/fail on an out-of-scope
+    /// in-memory request now gets a 404 (was a silent cross-scope action before).
+    #[tokio::test]
+    async fn requests_rework_fail_no_db_single_is_site_scoped() {
+        let id = format!("req-defra-{}", Uuid::new_v4());
+        seed_planned_request(&id, "requester-1").await;
+
+        // GBLON-scoped, but holding the right capability — so it reaches the scope
+        // guard rather than 403'ing on capability.
+        let mut gblon_approver = single_role_session(
+            "approver-gblon",
+            ryuki_engine::auth::APP_ROLE_DATACENTER_APPROVER,
+        );
+        gblon_approver.site_scope = vec!["GBLON".into()];
+        let rw = requests_rework(
+            Path(id.clone()),
+            AuthExtractor(gblon_approver),
+            Json(ReasonBody {
+                reason: "fix".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(rw, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope single rework must 404: {rw:?}"
+        );
+
+        let mut gblon_operator = single_role_session(
+            "operator-gblon",
+            ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR,
+        );
+        gblon_operator.site_scope = vec!["GBLON".into()];
+        let fl = requests_fail(
+            Path(id.clone()),
+            AuthExtractor(gblon_operator),
+            Json(ReasonBody {
+                reason: "boom".into(),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(fl, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope single fail must 404: {fl:?}"
+        );
+
+        // The request was never touched.
+        let store = request_store().lock().await;
+        assert_eq!(
+            store.iter().find(|r| r.id == id).unwrap().status,
+            ryuki_engine::models::RequestStatus::Planned
+        );
+    }
+
     #[tokio::test]
     async fn requests_cancel_by_owning_requester_succeeds_and_audits() {
         let id = format!("req-test-{}", Uuid::new_v4());
@@ -44714,6 +45240,239 @@ mod db_lifecycle_tests {
 
         assert_eq!(read_global_row(pool, in_scope).await.status, "rejected");
         // The out-of-scope request was never touched.
+        assert_eq!(read_global_row(pool, out_id).await.status, "planned");
+
+        cleanup_request(pool, in_scope).await;
+        cleanup_request(pool, out_id).await;
+    }
+
+    // ─── #17 slice 3: batch rework + fail (DB) ───
+
+    /// An execute-tier (operator) session for the fail DB tests — same scaffold as
+    /// `approver_session` but holding `execute` (VMwareOperator) instead of `approve`.
+    fn operator_session() -> AuthSession {
+        let mut s = approver_session();
+        s.user_id = "operator-db".into();
+        s.roles = vec![ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string()];
+        s
+    }
+
+    /// Happy batch rework: two planned DEFRA requests → all reworked back to Intake,
+    /// each row 'intake' with an applied `request.rework` audit row.
+    #[tokio::test]
+    async fn requests_batch_rework_db_happy_path() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(seed_request(pool, "planned", "approve").await);
+        }
+        let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
+        let Json(out) = requests_batch_rework(
+            AuthExtractor(approver_session()),
+            Json(BatchReworkRequest {
+                ids: id_strs,
+                reason: "needs changes".into(),
+            }),
+        )
+        .await
+        .expect("batch rework returns 200");
+        assert_eq!(out["succeeded"], 2);
+        assert_eq!(out["failed"], 0);
+        for id in &ids {
+            assert_eq!(read_global_row(pool, *id).await.status, "intake");
+            assert_eq!(count_audit(pool, *id, "request.rework", "applied").await, 1);
+            cleanup_request(pool, *id).await;
+        }
+    }
+
+    /// Per-item stage (codex): two failable requests at DIFFERENT current stages →
+    /// each row fails AT ITS OWN stage (never a hardcoded "execute" or item-0's
+    /// stage reused). The expected stage is computed exactly as the handler does
+    /// (db_row_to_request -> current_stage_name); the two MUST differ for the test
+    /// to be meaningful.
+    #[tokio::test]
+    async fn requests_batch_fail_db_per_item_stage() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // Two failable (non-concluded) rows whose current (first non-Completed)
+        // stage differs: "plan" vs "approve".
+        let seed_with_stage = |stage_name: &'static str| async move {
+            let id = Uuid::new_v4();
+            let stages = format!(
+                r#"[{{"name":"{stage_name}","status":"Pending","started_at":null,"completed_at":null,"evidence":[],"metadata":{{}}}}]"#
+            );
+            sqlx::query(
+                "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by, stages) \
+                 VALUES ($1, 'server-deployment', 'approved', $2, 'DEFRA', 'production', 'stage-test', 2, 4, 'requester-db', $3::jsonb)",
+            )
+            .bind(id)
+            .bind(stage_name)
+            .bind(&stages)
+            .execute(pool)
+            .await
+            .expect("seed staged request");
+            id
+        };
+        let a = seed_with_stage("plan").await;
+        let b = seed_with_stage("approve").await;
+
+        // Expected per-item stage, computed the SAME way fail_one does.
+        let exp = |id: Uuid| async move {
+            current_stage_name(&db_row_to_request(
+                &read_row(pool, id).await,
+                &id.to_string(),
+            ))
+        };
+        let exp_a = exp(a).await;
+        let exp_b = exp(b).await;
+        assert_ne!(
+            exp_a, exp_b,
+            "the two seeds must have different current stages (got {exp_a} / {exp_b})"
+        );
+
+        let Json(out) = requests_batch_fail(
+            AuthExtractor(operator_session()),
+            Json(BatchFailRequest {
+                ids: vec![a.to_string(), b.to_string()],
+                reason: "infeasible".into(),
+            }),
+        )
+        .await
+        .expect("batch fail returns 200");
+        assert_eq!(out["succeeded"], 2);
+
+        let stage_of = |id: Uuid| async move {
+            sqlx::query_scalar::<_, String>("SELECT stage FROM requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read stage")
+        };
+        assert_eq!(read_global_row(pool, a).await.status, "failed");
+        assert_eq!(read_global_row(pool, b).await.status, "failed");
+        // Each row failed at ITS OWN stage — not hardcoded, not shared.
+        assert_eq!(stage_of(a).await, exp_a);
+        assert_eq!(stage_of(b).await, exp_b);
+        assert_ne!(stage_of(a).await, stage_of(b).await);
+
+        cleanup_request(pool, a).await;
+        cleanup_request(pool, b).await;
+    }
+
+    /// Denial audited EXACTLY ONCE (codex): an approver (holds `approve`, NOT
+    /// `execute`) batch-failing gets a single 403 and the denial is written once
+    /// (the non-UUID "batch" sentinel parses to a NULL request_id, so the denial is
+    /// asserted by an action/outcome/actor count delta).
+    #[tokio::test]
+    async fn requests_batch_fail_db_forbidden_for_approver_audits_once() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        // TWO ids (codex): a per-id denial loop would write 2 audits; the
+        // once-up-front design must write EXACTLY ONE regardless of batch size.
+        let id1 = seed_request(pool, "planned", "approve").await;
+        let id2 = seed_request(pool, "planned", "approve").await;
+        let actor = "batch-fail-approver-p2";
+        let mut approver = approver_session();
+        approver.user_id = actor.into();
+
+        let denied_count = |actor: &'static str| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'request.fail' AND outcome = 'denied' AND actor_principal = $1",
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .expect("count denied")
+        };
+        let before = denied_count(actor).await;
+
+        let Err((status, _)) = requests_batch_fail(
+            AuthExtractor(approver),
+            Json(BatchFailRequest {
+                ids: vec![id1.to_string(), id2.to_string()],
+                reason: "no".into(),
+            }),
+        )
+        .await
+        else {
+            cleanup_request(pool, id1).await;
+            cleanup_request(pool, id2).await;
+            panic!("an approver (no execute) must get a 403 for the whole batch");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            denied_count(actor).await - before,
+            1,
+            "exactly one denial audit for the whole batch, regardless of id count"
+        );
+        assert_eq!(read_global_row(pool, id1).await.status, "planned");
+        assert_eq!(read_global_row(pool, id2).await.status, "planned");
+
+        cleanup_request(pool, id1).await;
+        cleanup_request(pool, id2).await;
+    }
+
+    /// DB scope: a DEFRA-scoped approver batch-reworking a mix of an in-scope and an
+    /// out-of-scope (GBLON) id → the out-of-scope id 404s (no oracle) while the
+    /// in-scope id is reworked to Intake.
+    #[tokio::test]
+    async fn requests_batch_rework_db_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let in_scope = seed_request(pool, "planned", "approve").await;
+        let out_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, status, stage, site, environment, name, cpu, memory_gb, created_by) \
+             VALUES ($1, 'server-deployment', 'planned', 'approve', 'GBLON', 'production', 'scope-test', 2, 4, 'requester-db')",
+        )
+        .bind(out_id)
+        .execute(pool)
+        .await
+        .expect("seed GBLON request");
+
+        let mut defra = approver_session();
+        defra.site_scope = vec!["DEFRA".into()];
+        defra.environment_scope = vec!["production".into()];
+        let Json(out) = requests_batch_rework(
+            AuthExtractor(defra),
+            Json(BatchReworkRequest {
+                ids: vec![in_scope.to_string(), out_id.to_string()],
+                reason: "fix".into(),
+            }),
+        )
+        .await
+        .expect("batch rework returns 200");
+        assert_eq!(out["succeeded"], 1);
+        assert_eq!(out["failed"], 1);
+        let by_id = |id: &Uuid| {
+            out["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            by_id(&out_id)["status"],
+            404,
+            "out-of-scope is a 404, no oracle"
+        );
+        assert_eq!(read_global_row(pool, in_scope).await.status, "intake");
         assert_eq!(read_global_row(pool, out_id).await.status, "planned");
 
         cleanup_request(pool, in_scope).await;
@@ -61411,7 +62170,10 @@ mod dr_plans_db_tests {
         let still = crate::repos::dr_plans::get(pool, &id)
             .await
             .expect("get must not error");
-        assert!(still.is_some(), "an out-of-scope DELETE must not delete the row");
+        assert!(
+            still.is_some(),
+            "an out-of-scope DELETE must not delete the row"
+        );
         cleanup(pool, &id).await;
     }
 
