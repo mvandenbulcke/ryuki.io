@@ -96,39 +96,81 @@ pub struct ExecutionView {
 /// write happens on `tx`, so a failure rolls back within the schedule's
 /// savepoint.
 ///
-/// Retention prune for `job_executions`: keep the newest `keep_per_schedule` rows
-/// PER `schedule_id`, delete at most `max_per_run` of the GLOBALLY OLDEST over-cap
-/// rows this run. The per-run cap bounds the victim set so the first prune of a
-/// years-old backlog never does one giant DELETE (WAL/locks/timeout); a large
-/// backlog drains over several daily runs, then steady-state deletes only the
-/// day's new over-cap rows. Returns the number of rows deleted. Guards against a
-/// non-positive `keep`/`cap` (which would otherwise delete everything).
+/// A history table that the newest-N-per-partition retention prune can target. A
+/// CLOSED SET (not a free string) so the table/partition/timestamp identifiers
+/// `format!`'d into the prune SQL can only ever be one of these hardcoded triples
+/// — never caller-supplied, so the dynamic SQL is injection-safe by construction.
+#[derive(Debug, Clone, Copy)]
+enum PruneTarget {
+    JobExecutions,
+    ConnectionHealthChecks,
+}
+
+impl PruneTarget {
+    /// `(table, partition_column, timestamp_column)` — all compile-time literals.
+    fn parts(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            PruneTarget::JobExecutions => ("job_executions", "schedule_id", "started_at"),
+            PruneTarget::ConnectionHealthChecks => {
+                ("connection_health_checks", "connection_id", "checked_at")
+            }
+        }
+    }
+}
+
+/// Generalized retention prune: keep the newest `keep_per_partition` rows PER the
+/// target's partition column, delete at most `max_per_run` of the GLOBALLY OLDEST
+/// over-cap rows this run. The per-run cap bounds the victim set so the first prune
+/// of a large backlog never does one giant DELETE (WAL/locks/timeout); the backlog
+/// drains over several runs, then steady-state deletes only the new over-cap rows.
+/// Returns the number of rows deleted. Guards against a non-positive `keep`/`cap`
+/// (which would otherwise delete everything). Identifiers come ONLY from the closed
+/// `PruneTarget` enum, so the `format!`'d SQL is injection-safe.
+async fn prune_history_newest_n(
+    conn: &mut sqlx::PgConnection,
+    target: PruneTarget,
+    keep_per_partition: i64,
+    max_per_run: i64,
+) -> Result<u64, sqlx::Error> {
+    if keep_per_partition <= 0 || max_per_run <= 0 {
+        return Ok(0);
+    }
+    let (table, partition_col, ts_col) = target.parts();
+    let sql = format!(
+        "DELETE FROM {table} WHERE id IN ( \
+            SELECT id FROM ( \
+                SELECT id, {ts_col}, ROW_NUMBER() OVER ( \
+                    PARTITION BY {partition_col} ORDER BY {ts_col} DESC NULLS LAST, id DESC \
+                ) AS rn \
+                FROM {table} \
+            ) ranked WHERE rn > $1 \
+            ORDER BY {ts_col} ASC, id ASC \
+            LIMIT $2 \
+        )"
+    );
+    let deleted = sqlx::query(&sql)
+        .bind(keep_per_partition)
+        .bind(max_per_run)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    Ok(deleted)
+}
+
+/// Thin wrapper over [`prune_history_newest_n`] for `job_executions` (keeps the
+/// existing prune tests + call site unchanged).
 async fn prune_job_executions(
     conn: &mut sqlx::PgConnection,
     keep_per_schedule: i64,
     max_per_run: i64,
 ) -> Result<u64, sqlx::Error> {
-    if keep_per_schedule <= 0 || max_per_run <= 0 {
-        return Ok(0);
-    }
-    let deleted = sqlx::query(
-        "DELETE FROM job_executions WHERE id IN ( \
-            SELECT id FROM ( \
-                SELECT id, started_at, ROW_NUMBER() OVER ( \
-                    PARTITION BY schedule_id ORDER BY started_at DESC NULLS LAST, id DESC \
-                ) AS rn \
-                FROM job_executions \
-            ) ranked WHERE rn > $1 \
-            ORDER BY started_at ASC, id ASC \
-            LIMIT $2 \
-        )",
+    prune_history_newest_n(
+        conn,
+        PruneTarget::JobExecutions,
+        keep_per_schedule,
+        max_per_run,
     )
-    .bind(keep_per_schedule)
-    .bind(max_per_run)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected();
-    Ok(deleted)
+    .await
 }
 
 async fn run_job(
@@ -809,6 +851,28 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("pruned {pruned} old job_executions row(s)")),
+            ))
+        }
+        "connection_health_checks_prune" => {
+            // Safe-internal write (run-3): bound the FASTEST-growing history table — the 5-min
+            // connection_health_sweep appends one row PER connection PER sweep (~288/day/connection).
+            // Keep the newest KEEP_PER_CONNECTION per connection_id. Runs HOURLY (NOT daily like the
+            // job_executions prune) so the per-run cap keeps up with per-connection growth
+            // (#connections × 12/hour ≤ cap covers ~1666 connections) with gentle per-run deletes.
+            const KEEP_PER_CONNECTION: i64 = 10_000;
+            const MAX_PER_RUN: i64 = 20_000;
+            let pruned = prune_history_newest_n(
+                tx,
+                PruneTarget::ConnectionHealthChecks,
+                KEEP_PER_CONNECTION,
+                MAX_PER_RUN,
+            )
+            .await?;
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "pruned {pruned} old connection_health_checks row(s)"
+                )),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -3804,6 +3868,148 @@ mod db_tests {
         assert_eq!(exec_count(pool, &a).await, 1, "the surviving row is intact");
 
         clear_job_executions(pool).await;
+    }
+
+    // ---- run-3: connection_health_checks prune (generalized helper) ----------
+
+    const CHC_PRUNE_SEED_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    async fn seed_connection_for_prune(pool: &PgPool, id: &str) {
+        sqlx::query(
+            "INSERT INTO integration_connections \
+             (id, vendor_type, name, endpoint_url, credential_source, credential_ref, \
+              status, readiness, execution_mode, created_by, created_at, updated_at) \
+             VALUES ($1, 'servicenow', 'chc', 'https://x.example', 'env-var', 'RYUKI_INTEGRATION__X', \
+                     'configured', 'configured', 'static-dry-run', 'sys', NOW(), NOW()) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed connection");
+    }
+
+    async fn seed_health_check(pool: &PgPool, connection_id: &str, age_secs: i64) -> String {
+        let id = format!("chc-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO connection_health_checks \
+             (id, connection_id, checked_at, endpoint_status, credential_status) \
+             VALUES ($1, $2, NOW() - ($3 * INTERVAL '1 second'), 'ok', 'resolved')",
+        )
+        .bind(&id)
+        .bind(connection_id)
+        .bind(age_secs)
+        .execute(pool)
+        .await
+        .expect("seed health check");
+        id
+    }
+
+    async fn chc_count(pool: &PgPool, connection_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM connection_health_checks WHERE connection_id = $1")
+            .bind(connection_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connection_health_checks_prune_keeps_newest_n_per_connection() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query("DELETE FROM connection_health_checks")
+            .execute(pool)
+            .await
+            .expect("clear chc");
+        let c1 = format!("ic-chc1-{}", uuid::Uuid::new_v4());
+        let c2 = format!("ic-chc2-{}", uuid::Uuid::new_v4());
+        seed_connection_for_prune(pool, &c1).await;
+        seed_connection_for_prune(pool, &c2).await;
+        // c1: 5 checks aged 50..10s (10s = newest); capture the 2 OLDEST ids (age 50, 40).
+        let mut c1_ids = vec![];
+        for age in [50, 40, 30, 20, 10] {
+            c1_ids.push(seed_health_check(pool, &c1, age).await);
+        }
+        seed_health_check(pool, &c2, 20).await;
+        seed_health_check(pool, &c2, 10).await;
+
+        // The generalized helper targets connection_health_checks, partitioned by connection_id.
+        let mut tx = pool.begin().await.unwrap();
+        let deleted =
+            prune_history_newest_n(&mut tx, PruneTarget::ConnectionHealthChecks, 3, 1_000_000)
+                .await
+                .expect("prune chc");
+        tx.commit().await.unwrap();
+        assert_eq!(
+            deleted, 2,
+            "c1's 2 oldest pruned (5 - keep 3); c2 (2 <= 3) untouched"
+        );
+        assert_eq!(chc_count(pool, &c1).await, 3, "c1 keeps its newest 3");
+        assert_eq!(chc_count(pool, &c2).await, 2, "c2 is untouched");
+        // The survivors are the NEWEST: the 2 OLDEST (age 50, 40) are the ones deleted (codex).
+        for old in &c1_ids[..2] {
+            let gone: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM connection_health_checks WHERE id = $1")
+                    .bind(old)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            assert_eq!(gone, 0, "an OLDEST c1 check was pruned (newest survive)");
+        }
+
+        sqlx::query("DELETE FROM connection_health_checks")
+            .execute(pool)
+            .await
+            .ok();
+        for id in [&c1, &c2] {
+            sqlx::query("DELETE FROM integration_connections WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_132_is_idempotent() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Connection health-checks history prune (all connections)', \
+                     'connection_health_checks_prune', 3600, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(CHC_PRUNE_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(CHC_PRUNE_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            name, "Connection health-checks history prune (all connections)",
+            "seed name"
+        );
+        assert_eq!(kind, "connection_health_checks_prune", "seed job_kind");
+        assert_eq!(
+            interval, 3600,
+            "seed interval_secs (HOURLY — keeps up with per-connection growth)"
+        );
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
     }
 
     // ---- #52 slice 2: FAILED-latest signal ----------------------------------

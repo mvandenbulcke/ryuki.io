@@ -48,8 +48,11 @@ secret-rotation/legal-hold/recertification filled (engine classifier + run_job a
 - **scheduler `job_executions` history prune** (M/S) — ✅ SHIPPED (720a1d0): `job_executions_prune`
   (mig 131) keeps newest-N-per-schedule (keep 10000, sized to the 5-min cadence) + a per-run batch
   cap so a years-old backlog drains over days. codex plan+impl APPROVE. See job-executions-prune.md.
-- **`connection_health_checks` history prune** (M/S) — same newest-N-per-connection shape; STILL
-  OPEN (its own change).
+- **`connection_health_checks` history prune** (M/S) — ✅ SHIPPED: `connection_health_checks_prune`
+  (mig 132) generalizes the prune helper (closed PruneTarget enum) for the fastest-growing table;
+  runs HOURLY (so the per-run cap keeps up with per-connection growth) + a retention index
+  (connection_id, checked_at DESC NULLS LAST, id DESC). codex plan+impl APPROVE. See
+  connection-health-checks-prune.md.
 
 ## CONFIRMED, open — portal (Leptos; backend exists, no UI surface)
 - **Request `rework`→Intake action absent from the portal** (H/S) — a near-twin of the already-wired
