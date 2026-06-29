@@ -1,0 +1,59 @@
+# Missing-features DISCOVERY swarm — 2026-06-29 (run 3)
+
+A 6-finder multi-modal discovery sweep (lifecycle / observability / security / data-integrity /
+scheduler-automation / portal) → 1 adversarial verifier per gap (17 candidates → 15 CONFIRMED).
+These are NEW gaps beyond the run-1/run-2 backlog (swarm-findings-2026-06-29.md) + the items shipped
+this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
+
+## Shipped from this swarm
+- ✅ **Fleet-wide circuit-breaker status list** (H/S) — `GET /api/integrations/circuits` (f667a63).
+  The one durable failing-integration signal that had no aggregate operator view.
+
+## CONFIRMED, open — agent/request lifecycle
+- **ReconcileRequired resolution endpoint** (H/M, product-ambiguous): `expire_leases` sets LiveApply
+  jobs to terminal-dead-end `ReconcileRequired` (agents.rs:1569) with NO route/handler to move them
+  off it — the highest-risk job mode has no governed closure (the inverse of DeadLettered→requeue).
+  Slice: `POST /api/admin/agents/jobs/{id}/reconcile` CAS `ReconcileRequired`→`Failed`, audited.
+- **ReconcileRequired emits no alert + strands the parent request** (H/S): unlike the dead-letter
+  branch (emits a Critical `job.dead_lettered` event, agents.rs:1520), the ReconcileRequired branch
+  emits NOTHING and never touches the requests row — the request sits in `Executing` silently.
+  Slice: emit a `job.reconcile_required` event in that branch, mirroring the dead-letter block.
+- **Cancel/abort a Pending agent job** (M/M, needs a `Cancelled` status + 1-line CHECK migration):
+  create/reprioritize/requeue exist but NO cancel — a job dispatched to a platform with no healthy
+  agent sits Pending forever (parent stuck Executing). Slice: `POST .../jobs/{id}/cancel` CAS
+  Pending→Cancelled, audited.
+
+## CONFIRMED, open — security / audit (NON-hot-path)
+- **Integration-connection MUTATION handlers write no audit_log row** (H/S): only `integration_test`
+  audits (integration.rs:1114); create/update/delete/circuit_reset/set_credential_expiry mutate
+  credential-bearing connections with NO forensic trail. Slice: add `audit::record_audit` to each
+  (richest for the destructive `integration_delete` via `DELETE … RETURNING` for the detail).
+  NOTE: create/update are multi-branch tx-bearing handlers — careful, separate work.
+  (The companion "no site-scope guard" finding is MOOT: admin = superuser in this RBAC.)
+
+## CONFIRMED, open — scheduled automation (the durable-scheduler scan pattern, now shipped 3×)
+Each is an on-demand `…/expiring` endpoint with NO proactive scan job — the exact pattern
+secret-rotation/legal-hold/recertification filled (engine classifier + run_job arm + seed migration
++ partial-unique-index dedup; instance-specific dedup key where the id may be reused):
+- **TLS certificate expiry scan** (M/S) — `certificate_lifecycle`. (migration check: a seed table.)
+- **OOB-management cert-endpoint expiry scan** (M/S) — `oob_endpoints`.
+- **gMSA service-account expiry scan** (M/S) — `gmsa_lifecycle::get_expiring`.
+
+## CONFIRMED, open — data retention (unbounded history once a sweep is scheduled)
+- **scheduler `job_executions` history prune** (M/S) — additive prune job-kind, leaf-table DELETE of
+  rows older than a window (no migration, no hot-path).
+- **`connection_health_checks` history prune** (M/S) — same shape; newest-N-per-connection window.
+
+## CONFIRMED, open — portal (Leptos; backend exists, no UI surface)
+- **Request `rework`→Intake action absent from the portal** (H/S) — a near-twin of the already-wired
+  reject button (both approve-tier, both →a non-running stage). Path: portal/portal-ui/src/.
+- **Approval quorum + decision ledger has no portal surface** (M/S) — two shipped scope-guarded GETs
+  (approval-decisions, approval-quorum) with no read-only UI panel.
+- **Per-request policy-readiness (policy-eval) not shown in request detail** (M/S) — single
+  scope-guarded GET, informational.
+
+## Adversarially DOWNGRADED (do NOT pursue as framed)
+- audit_retention "enforcement": audit_log/domain_events are append-only BY DESIGN (a BEFORE-DELETE
+  trigger raises) — there is nothing to "enforce"; not a real gap.
+- on-call contact global (NULL-site) lookup: changing the existing list filter is product-ambiguous
+  (could alter current admin-UI behavior) — defer.
