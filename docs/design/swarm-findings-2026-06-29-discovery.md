@@ -13,7 +13,7 @@ this session. `value`/`risk` are the ADVERSARIAL-adjusted figures.
 - **ReconcileRequired resolution endpoint** (H/M, product-ambiguous): `expire_leases` sets LiveApply
   jobs to terminal-dead-end `ReconcileRequired` (agents.rs:1569) with NO route/handler to move them
   off it — the highest-risk job mode has no governed closure (the inverse of DeadLettered→requeue).
-  Slice: `POST /api/admin/agents/jobs/{id}/reconcile` CAS `ReconcileRequired`→`Failed`, audited.
+  Slice: `POST /api/admin/agents/jobs/{id}/reconcile` CAS `ReconcileRequired`→`Failed`, audited. ✅ SHIPPED — admin CAS→Failed + audited reason + a non-alerting `job.reconcile_resolved` event; parent request left Executing (operator /fails separately). codex plan+impl APPROVE. See reconcile-required-resolve.md.
 - **ReconcileRequired emits no alert + strands the parent request** (H/S): unlike the dead-letter
   branch (emits a Critical `job.dead_lettered` event, agents.rs:1520), the ReconcileRequired branch
   emits NOTHING and never touches the requests row — the request sits in `Executing` silently.

@@ -2703,6 +2703,127 @@ pub async fn admin_requeue_dead_lettered_job(
     ))
 }
 
+/// Body for POST /api/admin/agents/jobs/{job_id}/reconcile.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileBody {
+    reason: String,
+}
+
+/// POST /api/admin/agents/jobs/{job_id}/reconcile
+///
+/// Resolves a terminal-dead-end `ReconcileRequired` agent job (a LiveApply whose
+/// lease expired mid-run, leaving real provider infra in an unknown state) to the
+/// terminal `Failed` once an operator has reconciled out-of-band. `Failed` is the
+/// conservative truth — the CP cannot verify the interrupted apply succeeded — and
+/// the operator's reconciliation is captured in the audited `reason`. Admin-only.
+/// A non-alerting `job.reconcile_resolved` domain event closes the
+/// reconcile-required alert lifecycle (it does NOT page). The STRANDED PARENT
+/// REQUEST is left `Executing` (job-scoped): the operator fails/retries it
+/// separately via `POST /api/requests/{id}/fail`.
+pub async fn admin_resolve_reconcile_required_job(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<ReconcileBody>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden(
+            "admin permission is required to resolve a reconcile-required job",
+        ));
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(bad_request("a reconciliation reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(bad_request("reason is too long (max 2000 characters)"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // CAS: only a ReconcileRequired job resolves. RETURNING the request_id + platform
+    // for the audit/event/response. A concurrent double-resolve collapses to one
+    // success (the second sees 'Failed' and 0 rows → 409).
+    let updated: Option<(String, String)> = sqlx::query_as(
+        "UPDATE agent_jobs SET status = 'Failed', updated_at = NOW() \
+         WHERE id = $1 AND status = 'ReconcileRequired' \
+         RETURNING request_id::text, platform",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some((request_id, platform)) = updated else {
+        // Distinguish not-found (404) from wrong-status (409) with a clean re-read.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        return match existing {
+            None => Err(not_found(format!("agent job '{job_id}' not found"))),
+            Some(status) => Err(conflict(format!(
+                "job is in status '{status}'; only ReconcileRequired jobs can be resolved"
+            ))),
+        };
+    };
+
+    // Audit the operator action — the free-text reason lives ONLY here.
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-job-reconcile-resolved",
+            Some("reconcile-required"),
+            "failed",
+            json!({
+                "job_id": &job_id,
+                "request_id": request_id,
+                "platform": platform,
+                "reason": reason,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+
+    // Close the reconcile-required alert lifecycle with a NON-ALERTING resolution
+    // event (to_status 'reconcile-resolved' is NOT in the alert classifier). NO
+    // free-text reason in the payload — only the static, secret-safe fields.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "job.reconcile_resolved",
+            aggregate_type: "agent_job",
+            aggregate_id: &job_id,
+            site: None,
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "to_status": "reconcile-resolved",
+                "platform": platform,
+                "request_id": request_id,
+                "note": "operator reconciled out-of-band; job closed as Failed",
+            }),
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::info!(job_id = %job_id, "reconcile-required agent job resolved to Failed by operator");
+    Ok(Json(json!({
+        "job_id": job_id,
+        "request_id": request_id,
+        "status": "Failed",
+        "resolved": true,
+        "note": "the parent request remains Executing; fail or retry it separately",
+    })))
+}
+
 /// Body for POST /api/admin/agents/jobs/{job_id}/priority (#15).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2949,6 +3070,10 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/result",
             get(admin_agent_job_result),
+        )
+        .route(
+            "/api/admin/agents/jobs/{job_id}/reconcile",
+            post(admin_resolve_reconcile_required_job),
         )
         // Static `queue-depth` in the `{agent_id}` slot (same matchit pattern).
         .route(
@@ -8391,6 +8516,173 @@ mod tests {
 
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
+    }
+
+    // ── ReconcileRequired resolution ──────────────────────────────────────────
+
+    async fn seed_reconcile_required_job(pool: &PgPool, platform: &str, request_id: Uuid) -> Uuid {
+        let spec = dead_letter_spec(request_id, JobMode::LiveApply);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, 'LiveApply', 'ReconcileRequired') RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(&spec_json)
+        .fetch_one(pool)
+        .await
+        .expect("seed reconcile-required job")
+    }
+
+    async fn resolve_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'agent-job-reconcile-resolved' AND detail->>'job_id' = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count resolve audit")
+    }
+
+    async fn reconcile_resolved_event_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_events \
+             WHERE event_type = 'job.reconcile_resolved' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count reconcile-resolved events")
+    }
+
+    /// Resolve a ReconcileRequired job → Failed: audited, a non-alerting resolution
+    /// event, the parent request left Executing; a second resolve 409s (no 2nd audit).
+    #[tokio::test]
+    async fn reconcile_resolve_happy_then_double_resolve_409() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-rec-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_reconcile_required_job(pool, &platform, req).await;
+
+        let Json(out) = admin_resolve_reconcile_required_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody {
+                reason: "reconciled the half-applied resources out-of-band".into(),
+            }),
+        )
+        .await
+        .expect("resolve must succeed");
+        assert_eq!(out["status"], json!("Failed"));
+        assert_eq!(out["resolved"], json!(true));
+        assert_eq!(out["request_id"], json!(req.to_string()));
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Failed", "the job is now terminal Failed");
+        // The parent request is NOT touched (job-scoped resolve).
+        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            req_status, "executing",
+            "the parent request stays Executing"
+        );
+        assert_eq!(resolve_audit_count(pool, job).await, 1, "one audit row");
+        assert_eq!(
+            reconcile_resolved_event_count(pool, job).await,
+            1,
+            "one non-alerting resolution event"
+        );
+
+        // A second resolve of the now-Failed job → 409, no second audit.
+        let again = admin_resolve_reconcile_required_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody {
+                reason: "again".into(),
+            }),
+        )
+        .await
+        .expect_err("a resolved job cannot be resolved again");
+        assert_eq!(again.0, StatusCode::CONFLICT);
+        assert_eq!(
+            resolve_audit_count(pool, job).await,
+            1,
+            "the failed second resolve writes no audit row"
+        );
+
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// Resolve rejects: a non-ReconcileRequired job → 409, an unknown id → 404, a
+    /// non-admin → 403, an empty reason → 400.
+    #[tokio::test]
+    async fn reconcile_resolve_rejects_wrong_status_unknown_nonadmin_empty() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-rec2-{}", Uuid::new_v4().simple());
+        // A Pending job is not ReconcileRequired → 409.
+        let pending = seed_pending_job(pool, &platform).await;
+        let conflict = admin_resolve_reconcile_required_job(
+            Path(pending.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("a Pending job is not resolvable");
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+
+        // Unknown id → 404.
+        let unknown = admin_resolve_reconcile_required_job(
+            Path(Uuid::new_v4().to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("unknown id");
+        assert_eq!(unknown.0, StatusCode::NOT_FOUND);
+
+        // Non-admin → 403 (before any DB work).
+        let denied = admin_resolve_reconcile_required_job(
+            Path(pending.to_string()),
+            Extension(non_admin_session()),
+            Json(ReconcileBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("non-admin");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+
+        // Empty reason → 400 (admin, before the CAS).
+        let empty = admin_resolve_reconcile_required_job(
+            Path(pending.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody {
+                reason: "   ".into(),
+            }),
+        )
+        .await
+        .expect_err("empty reason");
+        assert_eq!(empty.0, StatusCode::BAD_REQUEST);
+
+        cleanup_jobs_for_platform(pool, &platform).await;
     }
 
     /// #15: dispatch orders by priority DESC, then created_at (FIFO), then id — a higher-
