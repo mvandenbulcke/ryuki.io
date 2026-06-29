@@ -1,8 +1,9 @@
 use ryuki_engine::notifications::{
-    drafts_for_transition, Notification, NotificationDraft, RecipientKind, Severity,
+    drafts_for_transition, plan_dispatch, DispatchChannel, Notification, NotificationDraft,
+    RecipientKind, Severity,
 };
 use sqlx::types::Uuid;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 // ── DB row ───────────────────────────────────────────────────────────────────
 
@@ -129,9 +130,135 @@ pub async fn emit_for_transition(
         .bind(&draft.body)
         .execute(&mut *tx)
         .await?;
+        // Dry-run dispatch plan — best-effort + savepoint-isolated, so an outbox
+        // failure can never roll back the in-app notification just inserted.
+        record_dispatch_plan_best_effort(&mut tx, &id, &plan_dispatch(draft)).await;
+        // (`&mut tx` deref-coerces to `&mut PgConnection`; the helper opens a SAVEPOINT.)
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Record the dry-run dispatch plan for a just-inserted notification, BEST-EFFORT.
+///
+/// The dry-run outbox is STRICTLY SUBORDINATE to the in-app notification (and to
+/// any operational-alert tx it rides in): a failure here must NEVER roll back the
+/// notification. In Postgres a single failed statement aborts the entire
+/// surrounding transaction, so the inserts run inside a SAVEPOINT (sqlx nested
+/// tx) which is explicitly rolled back — and the failure swallowed + logged — on
+/// any error, leaving the outer tx (the notification/alert) intact. A
+/// connection-level failure or an already-aborted outer tx cannot be made
+/// fail-open here, by definition. `channels` empty (the common Info/Success path)
+/// opens no savepoint at all.
+async fn record_dispatch_plan_best_effort(
+    conn: &mut sqlx::PgConnection,
+    notification_id: &str,
+    channels: &[DispatchChannel],
+) {
+    if channels.is_empty() {
+        return;
+    }
+    let mut sp = match conn.begin().await {
+        Ok(sp) => sp,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                notification_id,
+                "dispatch-outbox: could not open savepoint; skipping plan (notification preserved)"
+            );
+            return;
+        }
+    };
+    for ch in channels {
+        let id = format!("ndo-{}", uuid::Uuid::new_v4());
+        if let Err(e) = sqlx::query(
+            "INSERT INTO notification_dispatch_outbox (id, notification_id, channel, status) \
+             VALUES ($1, $2, $3, 'dry_run_logged') \
+             ON CONFLICT (notification_id, channel) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(notification_id)
+        .bind(ch.as_db())
+        .execute(&mut *sp)
+        .await
+        {
+            tracing::warn!(
+                error = %e,
+                notification_id,
+                channel = ch.as_db(),
+                "dispatch-outbox: plan insert failed; rolling back savepoint (notification preserved)"
+            );
+            let _ = sp.rollback().await;
+            return;
+        }
+    }
+    if let Err(e) = sp.commit().await {
+        tracing::warn!(
+            error = %e,
+            notification_id,
+            "dispatch-outbox: savepoint release failed (notification preserved)"
+        );
+    }
+}
+
+// ── Dispatch outbox (dry-run telemetry) ────────────────────────────────────────
+
+#[derive(sqlx::FromRow)]
+struct DispatchOutboxRow {
+    id: String,
+    notification_id: String,
+    channel: String,
+    status: String,
+    planned_at: chrono::DateTime<chrono::Utc>,
+    dispatched_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// List notification-dispatch-outbox rows newest-first for the admin telemetry
+/// view. `status` filters when `Some` (the handler validates it against the
+/// allowlist first); `limit` is the handler's clamped cap. Returns ONLY the
+/// dispatch metadata — no notification body / recipient / target is joined, so
+/// nothing sensitive leaves through this view.
+pub async fn list_dispatch_outbox(
+    pool: &PgPool,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let rows: Vec<DispatchOutboxRow> = match status {
+        Some(s) => {
+            sqlx::query_as(
+                "SELECT id, notification_id, channel, status, planned_at, dispatched_at \
+             FROM notification_dispatch_outbox WHERE status = $1 \
+             ORDER BY planned_at DESC LIMIT $2",
+            )
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, notification_id, channel, status, planned_at, dispatched_at \
+             FROM notification_dispatch_outbox \
+             ORDER BY planned_at DESC LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "notification_id": r.notification_id,
+                "channel": r.channel,
+                "status": r.status,
+                "planned_at": r.planned_at.to_rfc3339(),
+                "dispatched_at": r.dispatched_at.map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect())
 }
 
 /// Persist one notification draft within the caller's transaction (#11 slice 2f).
@@ -159,6 +286,9 @@ pub async fn insert_draft_tx(
     .bind(&draft.body)
     .execute(&mut *conn)
     .await?;
+    // Dry-run dispatch plan — best-effort + savepoint-isolated, so an outbox
+    // failure can NEVER abort the caller's atomic alert+event transaction.
+    record_dispatch_plan_best_effort(conn, &id, &plan_dispatch(draft)).await;
     Ok(())
 }
 
@@ -546,6 +676,208 @@ mod notifications_db_tests {
 
         let after = unread_count(&pool, owner, &[]).await.expect("unread after");
         assert_eq!(after, 0, "unread count must be 0 after mark_all_read");
+
+        cleanup_recipient(&pool, owner).await;
+    }
+
+    // ── dispatch outbox (dry-run) ─────────────────────────────────────────────
+
+    /// Count the outbox rows planned for a given recipient's notifications, via a
+    /// join so the assertion is isolated to the test's own recipient_id.
+    async fn outbox_rows_for(pool: &PgPool, recipient_id: &str) -> Vec<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT o.channel, o.status FROM notification_dispatch_outbox o \
+             JOIN portal_notifications n ON n.id = o.notification_id \
+             WHERE n.recipient_id = $1 ORDER BY o.channel",
+        )
+        .bind(recipient_id)
+        .fetch_all(pool)
+        .await
+        .expect("outbox query")
+    }
+
+    #[tokio::test]
+    async fn reject_emits_webhook_dry_run_dispatch_plan() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-ndo-reject-001";
+        let rid = "00000000-0000-0000-0000-0000000000a1";
+
+        emit_for_transition(&pool, "request.reject", rid, Some(owner))
+            .await
+            .expect("emit reject");
+
+        let rows = outbox_rows_for(&pool, owner).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a Warning notification plans exactly one channel"
+        );
+        assert_eq!(rows[0].0, "webhook", "Warning routes to webhook");
+        assert_eq!(rows[0].1, "dry_run_logged", "slice 1 only records dry-run");
+
+        cleanup_recipient(&pool, owner).await;
+    }
+
+    #[tokio::test]
+    async fn approve_emits_no_dispatch_plan() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-ndo-approve-001";
+        let rid = "00000000-0000-0000-0000-0000000000a2";
+
+        emit_for_transition(&pool, "request.approve", rid, Some(owner))
+            .await
+            .expect("emit approve");
+
+        // Success severity → in-app only → zero outbox rows.
+        assert!(
+            outbox_rows_for(&pool, owner).await.is_empty(),
+            "a Success notification dispatches no external channel"
+        );
+
+        cleanup_recipient(&pool, owner).await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_is_idempotent_per_channel() {
+        use ryuki_engine::notifications::DispatchChannel;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-ndo-idem-001";
+        let nid = format!("pn-{}", uuid::Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO portal_notifications \
+             (id, recipient_kind, recipient_id, event, severity, title, body) \
+             VALUES ($1, 'User', $2, 'request.reject', 'Warning', 't', 'b')",
+        )
+        .bind(&nid)
+        .bind(recipient)
+        .execute(&pool)
+        .await
+        .expect("seed notification");
+
+        // Two plan-recordings for the same (notification, channel) → one row.
+        let mut tx = pool.begin().await.expect("tx");
+        record_dispatch_plan_best_effort(&mut tx, &nid, &[DispatchChannel::Webhook]).await;
+        record_dispatch_plan_best_effort(&mut tx, &nid, &[DispatchChannel::Webhook]).await;
+        tx.commit().await.expect("commit");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_dispatch_outbox WHERE notification_id = $1",
+        )
+        .bind(&nid)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(
+            count, 1,
+            "UNIQUE(notification_id, channel) + ON CONFLICT dedups"
+        );
+
+        cleanup_recipient(&pool, recipient).await;
+    }
+
+    /// FAIL-OPEN regression (codex BLOCKER): if the outbox insert fails inside the
+    /// helper, the SAVEPOINT rollback must keep the OUTER tx usable so the in-app
+    /// notification still commits. Force the failure with a bogus notification_id
+    /// (an FK violation on the outbox insert) while a REAL notification rides in
+    /// the same outer tx.
+    #[tokio::test]
+    async fn outbox_failure_does_not_roll_back_the_notification() {
+        use ryuki_engine::notifications::DispatchChannel;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let recipient = "test-recip-ndo-failopen-001";
+        let real_nid = format!("pn-{}", uuid::Uuid::new_v4());
+
+        let mut tx = pool.begin().await.expect("tx");
+        // A REAL notification in the outer tx.
+        sqlx::query(
+            "INSERT INTO portal_notifications \
+             (id, recipient_kind, recipient_id, event, severity, title, body) \
+             VALUES ($1, 'User', $2, 'request.reject', 'Warning', 't', 'b')",
+        )
+        .bind(&real_nid)
+        .bind(recipient)
+        .execute(&mut *tx)
+        .await
+        .expect("insert real notification");
+
+        // Plan against a NON-EXISTENT notification id → the outbox INSERT hits the
+        // FK and fails INSIDE the savepoint. The helper must swallow it.
+        record_dispatch_plan_best_effort(
+            &mut tx,
+            "pn-does-not-exist-00000000",
+            &[DispatchChannel::Webhook],
+        )
+        .await;
+
+        // The crux: the outer tx is still usable and COMMITS the real notification.
+        tx.commit()
+            .await
+            .expect("outer tx must still commit after the savepoint rollback");
+
+        let exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM portal_notifications WHERE id = $1")
+                .bind(&real_nid)
+                .fetch_one(&pool)
+                .await
+                .expect("count notification");
+        assert_eq!(
+            exists, 1,
+            "the in-app notification survived the outbox failure"
+        );
+
+        let bogus_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_dispatch_outbox WHERE notification_id = $1",
+        )
+        .bind("pn-does-not-exist-00000000")
+        .fetch_one(&pool)
+        .await
+        .expect("count bogus outbox");
+        assert_eq!(
+            bogus_rows, 0,
+            "the failed outbox row was rolled back, not written"
+        );
+
+        cleanup_recipient(&pool, recipient).await;
+    }
+
+    #[tokio::test]
+    async fn list_dispatch_outbox_filters_by_status() {
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let owner = "test-owner-ndo-list-001";
+        let rid = "00000000-0000-0000-0000-0000000000a3";
+        emit_for_transition(&pool, "request.reject", rid, Some(owner))
+            .await
+            .expect("emit reject");
+
+        // The dry-run row appears under its own status, and not under another.
+        let dry = list_dispatch_outbox(&pool, Some("dry_run_logged"), 50)
+            .await
+            .expect("list dry_run");
+        assert!(
+            dry.iter().any(|d| d["channel"] == "webhook"),
+            "the dry-run row is listed under dry_run_logged"
+        );
+        let sent = list_dispatch_outbox(&pool, Some("sent"), 50)
+            .await
+            .expect("list sent");
+        // None of THIS owner's rows are 'sent' (slice 1 never sends).
+        let sent_for_owner = outbox_rows_for(&pool, owner)
+            .await
+            .into_iter()
+            .filter(|(_, status)| status == "sent")
+            .count();
+        assert_eq!(sent_for_owner, 0, "slice 1 records no 'sent' rows");
+        let _ = sent; // the global 'sent' list may legitimately contain other tests' rows
 
         cleanup_recipient(&pool, owner).await;
     }

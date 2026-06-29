@@ -2064,6 +2064,12 @@ pub fn routes() -> Router {
             "/api/notifications/read-all",
             post(notifications_mark_all_read),
         )
+        // Admin telemetry: the dry-run dispatch outbox (gated at admin by the
+        // central /api/admin prefix).
+        .route(
+            "/api/admin/notifications/dispatch-outbox",
+            get(admin_notification_dispatch_outbox),
+        )
 }
 
 // ─── Shared data ───
@@ -62227,6 +62233,50 @@ async fn notifications_mark_all_read(AuthExtractor(session): AuthExtractor) -> A
         .await
         .map_err(db_error)?;
     Ok(Json(json!({ "source": "db", "marked": marked })))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DispatchOutboxQuery {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+/// The dispatch-outbox status values an operator may filter on (mirrors the
+/// migration 128 CHECK). A `?status=` outside this set is a 400, not a silent
+/// empty result.
+const DISPATCH_OUTBOX_STATUSES: &[&str] =
+    &["pending", "dry_run_logged", "sent", "failed", "skipped"];
+
+/// GET /api/admin/notifications/dispatch-outbox
+/// Admin telemetry: the dry-run notification-dispatch outbox, newest first.
+/// Optional `?status=` (validated) and `?limit=` (clamped 1..=200). Returns ONLY
+/// dispatch metadata — never a notification body/recipient/target. Admin-gated by
+/// the central `/api/admin` prefix; an explicit check is kept as defense-in-depth.
+/// Degrades to `{"source":"no-db","dispatches":[]}` without a DB.
+async fn admin_notification_dispatch_outbox(
+    AuthExtractor(session): AuthExtractor,
+    Query(q): Query<DispatchOutboxQuery>,
+) -> ApiResult {
+    if !check_permission(&session, "admin") {
+        return Err(status_403());
+    }
+    if let Some(s) = q.status.as_deref() {
+        if !DISPATCH_OUTBOX_STATUSES.contains(&s) {
+            return Err(status_400("Unknown dispatch-outbox status filter"));
+        }
+    }
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let (dispatches, source) = match get_db() {
+        Some(pool) => (
+            crate::repos::notifications::list_dispatch_outbox(pool, q.status.as_deref(), limit)
+                .await
+                .map_err(db_error)?,
+            "db",
+        ),
+        None => (vec![], "no-db"),
+    };
+    Ok(Json(json!({ "source": source, "dispatches": dispatches })))
 }
 
 // ─── VM Day-2 Operations — no-DB unit tests ───────────────────────────────────

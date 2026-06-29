@@ -153,6 +153,46 @@ pub fn draft_for_alert(
     }
 }
 
+/// An OUTBOUND delivery channel a notification can be dispatched to (beyond the
+/// in-app feed). Serialises lowercase ('email'/'webhook') to match both the DB
+/// CHECK values and [`DispatchChannel::as_db`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchChannel {
+    Email,
+    Webhook,
+}
+
+impl DispatchChannel {
+    /// The DB token for this channel (matches the migration 128 CHECK).
+    pub fn as_db(&self) -> &'static str {
+        match self {
+            DispatchChannel::Email => "email",
+            DispatchChannel::Webhook => "webhook",
+        }
+    }
+}
+
+/// Pure, total, deterministic: the OUTBOUND channels a notification warrants,
+/// beyond the in-app feed (which already happened — the `portal_notifications`
+/// row). This is a DRY-RUN TELEMETRY baseline keyed on `severity` only — the
+/// simplest coherent policy that needs no per-recipient target config:
+/// - `Critical` → email + webhook (page operators),
+/// - `Warning`  → webhook (ops channel),
+/// - `Info` / `Success` → none (in-app only).
+///
+/// NOT a send-ready policy: severity conflates lifecycle user-notifications
+/// (reject/cancel = Warning) with operational alerts, so the real-delivery slice
+/// MUST re-plan from the notification (event/recipient/role/target) at send time
+/// rather than promote the recorded dry-run rows.
+pub fn plan_dispatch(draft: &NotificationDraft) -> Vec<DispatchChannel> {
+    match draft.severity {
+        Severity::Critical => vec![DispatchChannel::Email, DispatchChannel::Webhook],
+        Severity::Warning => vec![DispatchChannel::Webhook],
+        Severity::Info | Severity::Success => vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +366,55 @@ mod tests {
         assert_eq!(d.severity, Severity::Critical);
         assert!(d.title.contains("slo.breach"));
         assert!(d.body.contains("slo-123"));
+    }
+
+    // ── plan_dispatch (dry-run channel routing) ───────────────────────────────
+
+    fn draft_with_severity(severity: Severity) -> NotificationDraft {
+        NotificationDraft {
+            recipient_kind: RecipientKind::Role,
+            recipient_id: "MonitoringOperator".to_string(),
+            event: "test.event".to_string(),
+            severity,
+            title: "t".to_string(),
+            body: "b".to_string(),
+        }
+    }
+
+    #[test]
+    fn plan_dispatch_routes_by_severity() {
+        assert_eq!(
+            plan_dispatch(&draft_with_severity(Severity::Critical)),
+            vec![DispatchChannel::Email, DispatchChannel::Webhook],
+            "Critical pages both channels"
+        );
+        assert_eq!(
+            plan_dispatch(&draft_with_severity(Severity::Warning)),
+            vec![DispatchChannel::Webhook],
+            "Warning goes to the webhook ops channel"
+        );
+        assert!(
+            plan_dispatch(&draft_with_severity(Severity::Info)).is_empty(),
+            "Info is in-app only"
+        );
+        assert!(
+            plan_dispatch(&draft_with_severity(Severity::Success)).is_empty(),
+            "Success is in-app only"
+        );
+    }
+
+    #[test]
+    fn dispatch_channel_db_tokens_match_the_migration_check() {
+        assert_eq!(DispatchChannel::Email.as_db(), "email");
+        assert_eq!(DispatchChannel::Webhook.as_db(), "webhook");
+    }
+
+    #[test]
+    fn dispatch_channel_serializes_lowercase_matching_as_db() {
+        // The serde repr must agree with as_db() and the DB CHECK ('email'/'webhook').
+        for ch in [DispatchChannel::Email, DispatchChannel::Webhook] {
+            let json = serde_json::to_string(&ch).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", ch.as_db()));
+        }
     }
 }
