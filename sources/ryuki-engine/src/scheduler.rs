@@ -114,6 +114,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "recertification_overdue_scan"
                 | "certificate_expiry_scan"
                 | "gmsa_expiry_scan"
+                | "oob_cert_expiry_scan"
                 | "job_executions_prune"
                 | "connection_health_checks_prune"
                 | "check_results_prune"
@@ -211,6 +212,8 @@ mod tests {
         assert!(!job_is_read_only("certificate_expiry_scan"));
         assert!(job_is_schedulable("gmsa_expiry_scan"));
         assert!(!job_is_read_only("gmsa_expiry_scan"));
+        assert!(job_is_schedulable("oob_cert_expiry_scan"));
+        assert!(!job_is_read_only("oob_cert_expiry_scan"));
         assert!(job_is_schedulable("job_executions_prune"));
         assert!(!job_is_read_only("job_executions_prune"));
         assert!(job_is_schedulable("connection_health_checks_prune"));
@@ -224,6 +227,7 @@ mod tests {
         assert!(!job_is_schedulable("recertification_overdue_scan_live"));
         assert!(!job_is_schedulable("certificate_expiry_scan_live"));
         assert!(!job_is_schedulable("gmsa_expiry_scan_live"));
+        assert!(!job_is_schedulable("oob_cert_expiry_scan_live"));
         assert!(!job_is_schedulable("job_executions_prune_live"));
         assert!(!job_is_schedulable("connection_health_checks_prune_live"));
         assert!(!job_is_schedulable("check_results_prune_live"));

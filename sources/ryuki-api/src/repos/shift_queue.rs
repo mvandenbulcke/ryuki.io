@@ -60,6 +60,13 @@ pub const CERTIFICATE_EXPIRY_ITEM_TYPE: &str = "certificate-expiring";
 /// overdue (+ P3→P2). Framed as "verify AD-side rotation", NOT manual rotation.
 pub const GMSA_EXPIRY_ITEM_TYPE: &str = "gmsa-expiring";
 
+/// The EXPIRING/EXPIRED out-of-band (iLO/iDRAC/IPMI) management-endpoint TLS-cert
+/// signal (run-3). An `oob_endpoints` row whose `cert_expiry` is within (or past) the
+/// actionable window. `source_ci_key` is the bare OOB endpoint id (a UUID, never
+/// reused). The open item is REFRESHED each scan so an expiring-soon item upgrades to
+/// expired (+ P3→P2). Reuses the cert expiry classifier (same TLS-cert-expiry shape).
+pub const OOB_CERT_EXPIRY_ITEM_TYPE: &str = "oob-cert-expiring";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

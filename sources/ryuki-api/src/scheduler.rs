@@ -956,6 +956,113 @@ async fn run_job(
                 )),
             ))
         }
+        "oob_cert_expiry_scan" => {
+            // Safe-internal write (run-3): surface out-of-band (iLO/iDRAC/IPMI) management endpoints
+            // whose TLS cert is within (or past) a 30-day window as deduped shift_queue work —
+            // mirrors certificate_expiry_scan and REUSES its pure classifier (same TLS-cert-expiry
+            // shape). Reads oob_endpoints, writes only shift_queue — NO OOB mutation. The surfaced
+            // fields are operational identity (no IPMI/cred), so all safe for the execute-tier queue.
+            #[derive(sqlx::FromRow)]
+            struct OobScanRow {
+                id: String,
+                endpoint_type: String,
+                hostname: String,
+                site: String,
+                cert_expiry: chrono::DateTime<chrono::Utc>,
+            }
+            // Predicate on cert_expiry (NOT the possibly-stale `certificate_valid` boolean — the
+            // cert-scan lesson). The SQL predicate (DB NOW(), 31-day window) is a COARSE PREFILTER
+            // that is a strict SUPERSET of the 30-day classifier window — so a ~1h DST drift can't
+            // drop a 30-day-actionable row (the gMSA lesson); the pure classifier (CP clock) is the
+            // authoritative guard, discarding the 30–31 day rows as Valid.
+            let rows: Vec<OobScanRow> = sqlx::query_as(
+                "SELECT id::text, endpoint_type, hostname, site, cert_expiry \
+                 FROM oob_endpoints \
+                 WHERE cert_expiry <= NOW() + INTERVAL '31 days' \
+                 ORDER BY cert_expiry",
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let soon_window_ms: i64 = 30 * 86_400_000;
+            let mut enqueued: u64 = 0;
+            for row in &rows {
+                if row.id.trim().is_empty() {
+                    continue;
+                }
+                let verdict = ryuki_engine::certificate_lifecycle::classify_certificate_expiry(
+                    row.cert_expiry.timestamp_millis(),
+                    now_ms,
+                    soon_window_ms,
+                );
+                if !verdict.is_actionable() {
+                    continue;
+                }
+                let state = verdict.as_str();
+                // Expired → P2, expiring-soon → P3. An OOB cert covers INTERNAL management access
+                // (a security/access degradation), NOT a user-facing outage like a public cert — so
+                // P2, not the cert scan's P1.
+                let priority = if matches!(
+                    verdict,
+                    ryuki_engine::certificate_lifecycle::CertificateExpiry::Expired
+                ) {
+                    "P2"
+                } else {
+                    "P3"
+                };
+                let title = format!("OOB cert {state}: {} ({})", row.hostname, row.endpoint_type);
+                let description = format!(
+                    "Out-of-band management endpoint '{}' ({}) at {} — TLS cert_expiry {}. Rotate \
+                     the OOB management certificate before secure access lapses.",
+                    row.hostname,
+                    row.endpoint_type,
+                    row.site,
+                    row.cert_expiry.to_rfc3339(),
+                );
+                let metadata = serde_json::json!({
+                    "source_ci_key": row.id,
+                    "endpoint_type": row.endpoint_type,
+                    "hostname": row.hostname,
+                    "site": row.site,
+                    "cert_expiry": row.cert_expiry.to_rfc3339(),
+                    "expiry_state": state,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::OOB_CERT_EXPIRY_ITEM_TYPE,
+                    &row.id,
+                    &title,
+                    &description,
+                    priority,
+                    &metadata,
+                )
+                .await?;
+                // REFRESH the OPEN item to the CURRENT state so an expiring-soon item upgrades to
+                // expired (and P3→P2) on a later scan — enqueue_if_absent's ON CONFLICT DO NOTHING
+                // would otherwise leave the first-seen label/priority stale (codex).
+                sqlx::query(
+                    "UPDATE shift_queue \
+                     SET title = $2, description = $3, priority = $4, metadata = $5::jsonb, \
+                         updated_at = NOW() \
+                     WHERE item_type = 'oob-cert-expiring' AND resolved = false \
+                       AND metadata->>'source_ci_key' = $1",
+                )
+                .bind(&row.id)
+                .bind(&title)
+                .bind(&description)
+                .bind(priority)
+                .bind(&metadata)
+                .execute(&mut **tx)
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "enqueued {enqueued} expiring/expired OOB management cert(s)"
+                )),
+            ))
+        }
         "job_executions_prune" => {
             // Safe-internal write (run-3): bound the unbounded job_executions run history (a row
             // per tick — the 5-min connection_health_sweep alone is 288/day) by keeping the newest
@@ -4034,6 +4141,195 @@ mod db_tests {
         assert!(
             dup.is_err(),
             "the gmsa-expiring index rejects a second OPEN duplicate"
+        );
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // ─── oob_cert_expiry_scan (run-3) ───────────────────────────────────────────
+
+    const OOB_SCAN_SEED_ID: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+
+    /// Seed an OOB endpoint with the given cert_expiry (rfc3339). Returns the new id.
+    async fn seed_oob(pool: &PgPool, cert_expiry: &str) -> String {
+        let host = format!("ilo-{}.mgmt.local", uuid::Uuid::new_v4().simple());
+        sqlx::query_scalar::<_, uuid::Uuid>(
+            "INSERT INTO oob_endpoints \
+             (endpoint_type, hostname, ip_address, site, firmware_version, certificate_valid, \
+              cert_expiry) \
+             VALUES ('iLO', $1, '10.0.0.1', 'GBLON', '2.50', true, $2::timestamptz) RETURNING id",
+        )
+        .bind(&host)
+        .bind(cert_expiry)
+        .fetch_one(pool)
+        .await
+        .expect("seed oob endpoint")
+        .to_string()
+    }
+
+    async fn open_oob_item(pool: &PgPool, oob_id: &str) -> Option<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT priority, metadata->>'expiry_state' FROM shift_queue \
+             WHERE item_type = 'oob-cert-expiring' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(oob_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup_oob(pool: &PgPool, oob_id: &str) {
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+            .bind(oob_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM oob_endpoints WHERE id = $1::uuid")
+            .bind(oob_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn oob_cert_scan_enqueues_by_state_and_refreshes() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let past = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let soon = (chrono::Utc::now() + chrono::Duration::days(10)).to_rfc3339();
+        let far = (chrono::Utc::now() + chrono::Duration::days(120)).to_rfc3339();
+        let expired = seed_oob(pool, &past).await;
+        let expiring = seed_oob(pool, &soon).await;
+        let healthy = seed_oob(pool, &far).await;
+
+        let run = |pool: &'static PgPool| async move {
+            let mut tx = pool.begin().await.unwrap();
+            let (status, _) = run_job(&mut tx, "oob_cert_expiry_scan").await.unwrap();
+            assert_eq!(status, "succeeded");
+            tx.commit().await.unwrap();
+        };
+        run(pool).await;
+
+        // Expired → P2/"expired"; expiring-soon → P3/"expiring-soon"; far-future → none.
+        assert_eq!(
+            open_oob_item(pool, &expired).await,
+            Some(("P2".into(), "expired".into())),
+            "an expired OOB cert is P2/expired"
+        );
+        assert_eq!(
+            open_oob_item(pool, &expiring).await,
+            Some(("P3".into(), "expiring-soon".into())),
+            "an expiring-soon OOB cert is P3/expiring-soon"
+        );
+        assert_eq!(
+            open_oob_item(pool, &healthy).await,
+            None,
+            "far-future not surfaced"
+        );
+
+        // REFRESH: move the expiring-soon endpoint's cert_expiry into the past, re-scan → the SAME
+        // open item upgrades to expired/P2 (no duplicate).
+        sqlx::query(
+            "UPDATE oob_endpoints SET cert_expiry = NOW() - INTERVAL '1 day' WHERE id = $1::uuid",
+        )
+        .bind(&expiring)
+        .execute(pool)
+        .await
+        .unwrap();
+        run(pool).await;
+        assert_eq!(
+            open_oob_item(pool, &expiring).await,
+            Some(("P2".into(), "expired".into())),
+            "the open item upgraded expiring-soon → expired (P3 → P2) on re-scan"
+        );
+        let cnt: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue WHERE item_type = 'oob-cert-expiring' \
+             AND resolved = false AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(&expiring)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(cnt, 1, "refresh upgrades in place — no duplicate item");
+
+        cleanup_oob(pool, &expired).await;
+        cleanup_oob(pool, &expiring).await;
+        cleanup_oob(pool, &healthy).await;
+    }
+
+    #[tokio::test]
+    async fn migration_135_is_idempotent_and_oob_index_dedups() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'OOB management cert expiry scan (all endpoints)', 'oob_cert_expiry_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(OOB_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(OOB_SCAN_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            name, "OOB management cert expiry scan (all endpoints)",
+            "seed name"
+        );
+        assert_eq!(kind, "oob_cert_expiry_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // Self-contained index (the local DB may be behind on migrations): same DDL as the
+        // migration (IF NOT EXISTS → a no-op once it has applied), then prove it dedups.
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_shift_queue_open_oob_cert_expiring \
+             ON shift_queue (item_type, (metadata->>'source_ci_key')) \
+             WHERE resolved = false AND item_type = 'oob-cert-expiring'",
+        )
+        .execute(pool)
+        .await
+        .expect("the oob-cert-expiring partial unique index DDL is valid");
+
+        let key = format!("oob-idx-{}", uuid::Uuid::new_v4());
+        let meta = serde_json::json!({ "source_ci_key": key }).to_string();
+        sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('oob-cert-expiring', 't', 'd', 'P2', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await
+        .expect("first oob-cert-expiring item inserts");
+        let dup = sqlx::query(
+            "INSERT INTO shift_queue (item_type, title, description, priority, metadata) \
+             VALUES ('oob-cert-expiring', 't2', 'd2', 'P3', $1::jsonb)",
+        )
+        .bind(&meta)
+        .execute(pool)
+        .await;
+        assert!(
+            dup.is_err(),
+            "the oob-cert-expiring index rejects a second OPEN duplicate"
         );
         sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
             .bind(&key)

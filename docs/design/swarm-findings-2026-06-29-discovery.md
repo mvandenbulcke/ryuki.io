@@ -49,7 +49,11 @@ secret-rotation/legal-hold/recertification filled (engine classifier + run_job a
   `certificate_expiry_scan` (mig 130); predicate on valid_to (not stale status); priority-by-state
   (Expired→P1, ExpiringSoon→P2) + open-item REFRESH so soon→expired upgrades in place. codex
   plan+impl APPROVE. See certificate-expiry-scan.md.
-- **OOB-management cert-endpoint expiry scan** (M/S) — `oob_endpoints`.
+- **OOB-management cert-endpoint expiry scan** (M/S) — `oob_endpoints`. ✅ SHIPPED — `oob_cert_expiry_scan`
+  (mig 135): REUSES the cert classifier on `oob_endpoints.cert_expiry`; 31/30 prefilter-superset;
+  Expired→P2/ExpiringSoon→P3 (internal mgmt access, not a public outage) + refresh. codex plan+impl
+  APPROVE. See oob-cert-expiry-scan.md. ✅ SCHEDULED-AUTOMATION THEME COMPLETE: all 6 expiry/overdue
+  scans shipped (secret-rotation / legal-hold / recertification / certificate / gMSA / OOB-cert).
 - **gMSA service-account expiry scan** (M/S) — `gmsa_lifecycle::get_expiring`. ✅ SHIPPED (7028d4b) —
   `gmsa_expiry_scan` (mig 134): pure `classify_gmsa_expiry` on the computed rotation deadline; 8-day
   SQL prefilter as a strict superset of the 7-day classifier window (DST-safe); Overdue→P2/DueSoon→P3
