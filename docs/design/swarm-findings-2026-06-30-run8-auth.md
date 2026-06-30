@@ -174,11 +174,38 @@ scope per-item; suppress_trigger CAS `WHERE status <> 'Suppressed'`; scheduler s
   suppress_until <= NOW(), matching the established restore_overdue_scan / legal_hold_expiry_scan pattern).
   Flagged as a low-priority scan-job feature — NOT the high "hidden detection" bug the finder claimed.
 
+---
+
+# run-8g — BACKUP / RESTORE / DR / PROTECT deep-dive
+
+Result: SOUND. No clean bug — the DATA-SAFETY-CRITICAL paths all verify clean: restore state machine
+(Planned->Approved->execute enforced + tested), retention boundaries (classify_restore_recency uses
+strict `>`, conservative), legal-hold state machine (release/extend guard Active; double-release
+rejected), classify_legal_hold_expiry boundaries, snapshot governance (stale `<` + eligible-status
+filter prevents re-flag loops), audit-retention `beyond` clamp to [0,total]. NO data-loss, legal-hold-
+bypass, or wrong-restore bug. (The decommission path doesn't call legal-hold check_compliance, but it's
+dry-run — no real purge to bypass.)
+
+The 3 findings were RE-VERIFIED as false-positives / by-design (NOT fixed):
+- **"DR test startable on a Draft plan"** — FALSE POSITIVE. build_dr_plan creates plans as Draft (line
+  445) and the existing tests (start_test on a fresh Draft plan) ASSERT SUCCESS — so the intended
+  workflow is create(Draft) -> TEST -> approve/activate based on results. Testing a Draft plan is the
+  whole point; a status guard (which I drafted then REVERTED) would break the established, tested
+  behavior. (Same false-positive shape as patch_reboot's status-agnostic planning endpoint.)
+- **get_expiring_holds includes already-expired holds** (no `> now` lower bound) — a SEMANTIC judgment
+  (is `/legal-hold/expiring` "approaching expiry" or "needs expiry attention incl. overdue"?). Changing
+  it risks HIDING overdue-but-Active holds if this is their only surface. Left unchanged (no unilateral
+  semantic change that could hide data).
+- **Backup coverage % is a hardcoded N*12 mock** — explicitly a dry-run/planning placeholder (no real
+  asset inventory in the control plane). Not a correctness bug; making the mock realistic is a feature.
+
 ## Conclusion (overall)
-Combined with run-5/6/7, bug-discovery is tapering but still productive — focused deep-dives split between
-isolated real bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation race + the
-next_ip CIDR bug, the overall_status health field) and SOUND results (patch/maintenance, most of auth,
-the alerting CORE). The discipline of RE-VERIFYING every finding matters: across run-8, several "findings"
-were deliberate design choices I correctly did NOT "fix". Remaining high-value: the owner-decision items
-(A0/B0 etc.), the flagged follow-ups, + larger data/execution-plane build-out. SESSION: 19 codex-reviewed
-commits across run-5/6/7/8.
+Combined with run-5/6/7, bug-discovery is tapering — focused deep-dives split between isolated real bugs
+(analytics always-expand, incident terminal-guard, IPAM double-allocation race + next_ip CIDR, the
+overall_status health field, ack_alert non-alert guard) and SOUND results (patch/maintenance, most of
+auth, the alerting CORE, the backup/restore/DR data-safety paths). The discipline of RE-VERIFYING every
+finding is the throughline: across run-8 MANY "findings" were deliberate design choices or false
+positives I correctly did NOT "fix" (the maintenance-window inclusive-end, patch_reboot status-agnostic,
+the noise-suppression detection claim, the DR-test-on-Draft workflow). Remaining high-value: the
+owner-decision items (A0/B0 etc.), the flagged follow-ups, + larger data/execution-plane build-out.
+SESSION: 21 codex-reviewed commits across run-5/6/7/8.
