@@ -89,12 +89,14 @@ job_spec_digest recomputed by CP; 10 MiB body limit).
   key (the old bind was untrimmed — a whitespace key would later fail the result-side decode). +test
   db_register_validates_ed25519_public_key (malformed -> 400 before INSERT; valid generated key
   accepted). codex review pending.
-- **DEFERRED (low)**: `JobResultStatus::Verified` is wire-deserializable + CP-accepted (maps to
-  Succeeded/verified) but the engine RunStatus has no Verified variant, so a legitimate agent can't
-  produce it — an enrolled/compromised agent could craft a signed result with status=verified and the
-  CP would record a verification step that never ran (misleading audit). Blast radius limited (needs an
-  approved agent + valid signature). Small follow-up: reject Verified at ingestion OR remove it from the
-  wire enum. (Not yet implemented — verify no legitimate path produces it first.)
+- ✅ **`JobResultStatus::Verified` accepted on the wire** — SHIPPED: it's deserializable + CP-accepted
+  (maps to Succeeded/"verified") but the engine RunStatus has no Verified variant and map_run_status
+  never produces it (VERIFIED: arms are Validated/CheckOk→CheckOk, Planned→Planned, Failed/RunnerUnavail/
+  WorkspaceError→Failed, Applied/Changed→Applied), so a legitimate agent can't send it. An enrolled/
+  compromised agent could craft a signed Verified result → false "verified" audit step. FIX: reject
+  `env.status == Verified` at ingestion (after sig-verify + status-match, before any DB write). +test
+  db_verified_status_is_not_agent_reportable (signed Verified result → 400, job stays Running). codex
+  review pending.
 - **DEFERRED (low, design, task_ca74b21a)**: no CP↔agent protocol VERSION field/negotiation anywhere in
   ryuki-protocol — schema evolution can silently mis-deserialize an old agent's payloads. Flagged.
 

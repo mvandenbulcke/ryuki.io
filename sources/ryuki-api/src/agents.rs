@@ -1147,6 +1147,16 @@ async fn post_job_result_with_pool(
             "outer result.status does not match envelope.status",
         ));
     }
+    // `Verified` is a CP-internal outcome: the engine's RunStatus has no Verified
+    // variant, so a LEGITIMATE agent (map_run_status) can never produce it. Reject it
+    // on the wire so a compromised-but-enrolled agent cannot stamp a result as a
+    // verification step that never ran — a misleading audit trail / false "verified"
+    // result_status. Every status an agent CAN legitimately report is still accepted.
+    if env.status == JobResultStatus::Verified {
+        return Err(bad_request(
+            "Verified is not an agent-reportable result status",
+        ));
+    }
     if result.evidence_digest != env.evidence_digest {
         return Err(bad_request(
             "outer result.evidence_digest does not match envelope.evidence_digest",
@@ -5415,6 +5425,70 @@ mod tests {
         assert!(db_row.result_id.is_some());
         assert!(db_row.evidence_digest.is_some());
         assert!(db_row.completed_at.is_some());
+
+        cleanup_jobs_for_platform(&pool, &platform).await;
+        cleanup_agent(&pool, &agent_id).await;
+        pool.close().await;
+    }
+
+    /// #run7 wire-contract: `Verified` is not an agent-reportable status — the engine's
+    /// RunStatus has no Verified variant, so map_run_status never produces it. A
+    /// CORRECTLY-SIGNED result from an enrolled agent carrying status=Verified must be
+    /// rejected at ingestion (so a compromised-but-enrolled agent can't forge a
+    /// "verified" audit step), and the job is left Running, not marked Succeeded.
+    #[tokio::test]
+    async fn db_verified_status_is_not_agent_reportable() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-{}", &Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let agent_id = format!("verified-agent-{}", Uuid::new_v4());
+        let (token, key) = seed_agent_with_key(&pool, &agent_id, &platform).await;
+        let _job_id = seed_pending_job(&pool, &platform).await;
+        let (attempt_id, fencing, nonce, gen, job_row) =
+            lease_job(&pool, &platform, &agent_id).await;
+        ack_to_running(&pool, job_row.id, attempt_id, &fencing).await;
+
+        let spec: JobSpec = serde_json::from_value(job_row.spec.0.clone()).expect("spec");
+        let (job_result, evidence_bytes) = make_job_result(
+            &agent_id,
+            &platform,
+            &job_row,
+            attempt_id,
+            &nonce,
+            gen as u64,
+            &key,
+            &spec,
+            b"verified evidence",
+            JobResultStatus::Verified,
+        );
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = post_job_result_with_pool(
+            agent_id.clone(),
+            job_row.id.to_string(),
+            hdrs,
+            ResultBody {
+                job_result,
+                evidence: evidence_bytes,
+                evidence_json: None,
+            },
+            &pool,
+        )
+        .await;
+
+        assert!(
+            matches!(resp, Err((StatusCode::BAD_REQUEST, _))),
+            "a correctly-signed Verified-status result must be rejected 400: {resp:?}"
+        );
+        // The job is NOT advanced to Succeeded by a rejected Verified result.
+        let db_row = read_job_result_row(&pool, job_row.id).await;
+        assert_eq!(
+            db_row.status, "Running",
+            "the job stays Running — a rejected Verified result does not advance it"
+        );
+        assert!(db_row.result_id.is_none(), "no terminal result recorded");
 
         cleanup_jobs_for_platform(&pool, &platform).await;
         cleanup_agent(&pool, &agent_id).await;

@@ -71,7 +71,11 @@ pub enum JobStatus {
 /// - `CheckOk`    — offline/dry-run validation passed (no platform access).
 /// - `Planned`    — live plan completed (read-only); plan artifact attached.
 /// - `Applied`    — live apply completed successfully.
-/// - `Verified`   — post-apply verification (e.g. idempotency re-plan) passed.
+/// - `Verified`   — post-apply verification passed. CP-INTERNAL: the engine's
+///   `RunStatus` has no `Verified` variant and `map_run_status` never produces it,
+///   so a first-party agent cannot report it. The CP REJECTS an inbound result
+///   carrying `Verified` (see `post_job_result_with_pool`) so a result cannot forge
+///   a verification step that never ran. Do NOT have an agent emit this.
 /// - `Failed`     — execution failed at any stage.
 /// - `LiveRefused`— agent refused `LiveApply` (missing grant / plan divergence /
 ///   `--allow-live` flag absent).
