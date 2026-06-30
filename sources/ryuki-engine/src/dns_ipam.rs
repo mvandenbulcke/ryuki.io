@@ -294,30 +294,46 @@ fn seed_data() -> DnsIpamStore {
 }
 
 fn next_ip(subnet: &IpamSubnet, reservations: &[IpReservation]) -> Result<String, String> {
-    let network = subnet
-        .cidr
-        .split('/')
-        .next()
-        .ok_or_else(|| format!("Invalid subnet CIDR '{}'", subnet.cidr))?;
-    let octets: Vec<&str> = network.split('.').collect();
-    if octets.len() != 4 {
-        return Err(format!(
-            "Cannot allocate mock IP from CIDR '{}'",
-            subnet.cidr
-        ));
+    use std::collections::HashSet;
+    use std::net::Ipv4Addr;
+    // Honor the REAL CIDR. The old allocator took only the first 3 octets and scanned
+    // a hardcoded `.10..=.254`, which (a) ignored the prefix entirely — so for any
+    // non-/24 subnet it could return an address OUTSIDE the range (e.g. a /30 or the
+    // wrong half of a /25), and (b) never offered `.2..=.9`. parse_cidr canonicalises
+    // the network address + prefix via Ipv4Addr.
+    let (addr, prefix) = parse_cidr(&subnet.cidr)?;
+    // /31 and /32 have no conventional usable host range (matches usable_hosts -> 0).
+    if prefix >= 31 {
+        return Err(format!("No allocatable IPs remain in subnet '{}'", subnet.id));
     }
+    let host_bits = 32 - prefix; // prefix is 0..=30 here, so host_bits is 2..=32
+    // Avoid an out-of-range shift for a /0 (host_bits == 32).
+    let mask: u32 = if host_bits >= 32 { 0 } else { u32::MAX << host_bits };
+    let base = u32::from(addr) & mask; // network base (also normalises a non-aligned CIDR)
+    let broadcast = base | !mask;
+    // Usable hosts are the addresses strictly between network and broadcast.
+    let first = base.wrapping_add(1);
+    let last = broadcast.wrapping_sub(1);
 
-    for host in 10..255_u16 {
-        let candidate = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], host);
-        if candidate != subnet.gateway
-            && !reservations
-                .iter()
-                .any(|reservation| reservation.ip_address == candidate)
-        {
-            return Ok(candidate);
+    // Skip the gateway and any already-reserved IP. A u32 HashSet gives O(1) membership
+    // so a large subnet doesn't re-scan the reservation list per candidate; the loop
+    // returns the FIRST free address (the first gap at or after `first`).
+    let gateway = subnet.gateway.parse::<Ipv4Addr>().map(u32::from).ok();
+    let reserved: HashSet<u32> = reservations
+        .iter()
+        .filter_map(|r| r.ip_address.parse::<Ipv4Addr>().ok().map(u32::from))
+        .collect();
+
+    let mut candidate = first;
+    loop {
+        if Some(candidate) != gateway && !reserved.contains(&candidate) {
+            return Ok(Ipv4Addr::from(candidate).to_string());
         }
+        if candidate == last {
+            break;
+        }
+        candidate = candidate.wrapping_add(1);
     }
-
     Err(format!(
         "No allocatable IPs remain in subnet '{}'",
         subnet.id
@@ -724,7 +740,10 @@ pub fn release_ip(reservation_id: &str) -> Result<Value, String> {
         .find(|subnet| subnet.id == reservation.subnet_id)
     {
         subnet.used_ips = subnet.used_ips.saturating_sub(1);
-        subnet.available_ips += 1;
+        // Saturating + clamped to capacity (matches the DB path's
+        // LEAST(available_ips + 1, total_ips)): a release can never push the counter
+        // past total_ips or wrap, symmetric with the used_ips saturating_sub above.
+        subnet.available_ips = subnet.available_ips.saturating_add(1).min(subnet.total_ips);
         if subnet.status == IpamSubnetStatus::Exhausted {
             subnet.status = IpamSubnetStatus::Available;
         }
@@ -943,8 +962,10 @@ mod tests {
         let reservation =
             build_reservation(&subnet, &existing, "host-a", "purpose", "tester", 7).unwrap();
         assert_eq!(reservation.subnet_id, "subnet-x-001");
-        // First host candidate is .10 (loop starts at 10), skipping the gateway.
-        assert_eq!(reservation.ip_address, "10.0.0.10");
+        // First usable host is network+1 = .1, which is the gateway, so the first
+        // OFFERED address is .2 (the allocator now honors the real host range and no
+        // longer skips .2..=.9 or hardcodes a .10 start).
+        assert_eq!(reservation.ip_address, "10.0.0.2");
         assert!(reservation.id.starts_with("res-x-"));
 
         // Empty required fields are rejected.
@@ -955,6 +976,57 @@ mod tests {
             ..subnet.clone()
         };
         assert!(build_reservation(&exhausted, &existing, "h", "p", "t", 7).is_err());
+    }
+
+    /// next_ip (via build_reservation) honors the REAL CIDR prefix — it never returns
+    /// an address outside the subnet, and allocates from the correct host range.
+    #[test]
+    fn next_ip_honors_the_cidr_prefix() {
+        let mk = |cidr: &str, gateway: &str| IpamSubnet {
+            id: "sn".into(),
+            cidr: cidr.into(),
+            gateway: gateway.into(),
+            vlan_id: 10,
+            site: "X".into(),
+            total_ips: 100,
+            used_ips: 0,
+            available_ips: 100,
+            status: IpamSubnetStatus::Available,
+        };
+        let alloc = |subnet: &IpamSubnet, existing: &[IpReservation]| {
+            build_reservation(subnet, existing, "h", "p", "t", 7).map(|r| r.ip_address)
+        };
+
+        // /25 upper half: the allocated IP must be in .129..=.254, NOT .10 (the old bug
+        // would have returned "10.0.0.10", which is in the OTHER /25).
+        let s25 = mk("10.0.0.128/25", "10.0.0.129");
+        let ip = alloc(&s25, &[]).unwrap();
+        let last_octet: u32 = ip.rsplit('.').next().unwrap().parse().unwrap();
+        assert!(
+            ip.starts_with("10.0.0.") && (130..=254).contains(&last_octet),
+            "/25 upper-half allocation must be within .130..=.254, got {ip}"
+        );
+
+        // /30 (10.0.0.0/30): usable .1/.2; gateway .1 -> only .2 is allocatable.
+        let s30 = mk("10.0.0.0/30", "10.0.0.1");
+        assert_eq!(alloc(&s30, &[]).unwrap(), "10.0.0.2", "/30 allocates the lone .2");
+        // With .2 reserved, the /30 is exhausted (NOT a bogus out-of-range .3+).
+        let r2 = IpReservation {
+            id: "r".into(),
+            ip_address: "10.0.0.2".into(),
+            subnet_id: "sn".into(),
+            hostname: "h".into(),
+            purpose: "p".into(),
+            reserved_by: "t".into(),
+            reserved_at: "x".into(),
+            expiry: "x".into(),
+        };
+        assert!(alloc(&s30, std::slice::from_ref(&r2)).is_err(), "/30 with .2 taken is exhausted");
+
+        // /16: allocates within the subnet (network+1 skipping the gateway), in range.
+        let s16 = mk("10.42.0.0/16", "10.42.0.1");
+        let ip16 = alloc(&s16, &[]).unwrap();
+        assert_eq!(ip16, "10.42.0.2", "/16 first offered host is network+2 (gateway is +1)");
     }
 
     #[test]
