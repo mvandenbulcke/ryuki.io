@@ -46,8 +46,21 @@ implementation.
   OR-NULL predicate (`$n IS NULL OR col=$n`) in requests_list can defeat idx_requests_site_env on a
   generic prepared plan; the real fix is dynamic SQL emitting only active predicates (task_02ed10ce).
 
+## Resilience sweep (single targeted agent, on retry after the opus-unavailable blip)
+1 confirmed finding (with a thorough "checked but sound" list — timeouts on all reqwest clients +
+subprocess loops, exponential backoff via background::run_bounded, audit/event inserts use `?` in-tx
+so no partial commit, etc.):
+- ✅ **Silenced idempotency seal write** — SHIPPED: idempotency.rs sealed the dedup record after a
+  successful handler with `let _ = UPDATE ... .await;` (and the cleanup DELETE on a buffer failure)
+  — error fully dropped, no log. On a DB error the record stays IN-FLIGHT (response_status NULL), so a
+  client RETRY of the same key gets a 409 InFlight until ~IN_FLIGHT_TTL_SECS (5 min) even though the
+  resource was created — invisibly to operators. FIX: `if let Err(error) = ... { tracing::warn!(...) }`
+  on BOTH writes — log-not-fail (the response is already buffered; the Ok-0-rows claim_id reclaim fence
+  stays silent). Behavior-preserving; 13/13 idempotency tests green. codex review pending.
+
 ## Not yet swept (run-8 — platform was unstable)
-concurrency-races, resilience-errors, protocol-contract, execution-agent-seam, portal-frontend.
+concurrency-races, protocol-contract, execution-agent-seam, portal-frontend.
+(schema-migration + resilience-errors now done above.)
 (schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
 low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
 causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors

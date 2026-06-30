@@ -284,7 +284,11 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
         // Location/Set-Cookie/ETag) — release the claim for anything else. The
         // claim_id fence means we only ever release OUR OWN claim.
         if status.is_server_error() || !is_replayable(&response) {
-            let _ = sqlx::query(
+            // If this release DELETE errors, the claim lingers in-flight and blocks
+            // retries of this key until it expires (~IN_FLIGHT_TTL_SECS) — which is
+            // exactly wrong for a transient 5xx we WANT retried. Log-not-fail (the
+            // response is returned regardless) so the stuck claim is visible.
+            if let Err(error) = sqlx::query(
                 "DELETE FROM idempotency_records \
                  WHERE user_scope = $1 AND key = $2 AND claim_id = $3",
             )
@@ -292,7 +296,14 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
             .bind(&key)
             .bind(&claim_id)
             .execute(pool)
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    "failed to release idempotency claim for a non-stored response; the \
+                     in-flight record will block retries of this key until it expires (~5 min)"
+                );
+            }
             return response;
         }
 
@@ -301,8 +312,11 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
             Ok(b) => b,
             Err(_) => {
                 // Could not buffer the response — drop the claim and return a
-                // fresh body-less error rather than a corrupt store.
-                let _ = sqlx::query(
+                // fresh body-less error rather than a corrupt store. If the release
+                // DELETE itself errors, the claim lingers in-flight and blocks retries
+                // of this key until it expires (~IN_FLIGHT_TTL_SECS); log it so that is
+                // visible rather than a silent lock-out.
+                if let Err(error) = sqlx::query(
                     "DELETE FROM idempotency_records \
                      WHERE user_scope = $1 AND key = $2 AND claim_id = $3",
                 )
@@ -310,15 +324,28 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
                 .bind(&key)
                 .bind(&claim_id)
                 .execute(pool)
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "failed to release idempotency claim after a response-buffering \
+                         error; the in-flight record will block retries of this key until \
+                         it expires (~5 min)"
+                    );
+                }
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
         let body_str = String::from_utf8_lossy(&resp_bytes).into_owned();
         // Fenced by claim_id: if our claim was reclaimed after the TTL while the
-        // handler ran, this affects 0 rows and we leave the newer owner's record
-        // untouched — our caller still gets a valid response.
-        let _ = sqlx::query(
+        // handler ran, this affects 0 rows (Ok) and we leave the newer owner's record
+        // untouched — our caller still gets a valid response. A DB ERROR is different:
+        // it leaves OUR record in-flight (response_status NULL), so a retry of this key
+        // hits the InFlight branch and gets a 409 until the record expires
+        // (~IN_FLIGHT_TTL_SECS). We must NOT fail the request here (the response is
+        // already buffered and the handler committed), but we LOG it so operators can
+        // see the dedup store is unhealthy rather than silently locking the client out.
+        if let Err(error) = sqlx::query(
             "UPDATE idempotency_records SET response_status = $1, response_body = $2 \
              WHERE user_scope = $3 AND key = $4 AND claim_id = $5",
         )
@@ -328,7 +355,14 @@ pub async fn idempotency_middleware(request: Request, next: Next) -> Response {
         .bind(&key)
         .bind(&claim_id)
         .execute(pool)
-        .await;
+        .await
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to seal idempotency result; the in-flight record will block \
+                 retries of this key until it expires (~5 min)"
+            );
+        }
 
         return Response::from_parts(resp_parts, Body::from(resp_bytes));
     }
