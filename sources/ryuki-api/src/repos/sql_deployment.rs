@@ -343,9 +343,11 @@ mod sql_deployment_db_tests {
     static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("RYUKI_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform".to_string()
-        });
+        // Fail closed: with no DB configured these DB tests SKIP (callers handle the
+        // None). The old hard-coded localhost fallback meant an unset RYUKI_DATABASE_URL
+        // silently ran these tests against whatever DB happened to live at the default
+        // URL — an unintended-DB hazard. (Same fail-closed fix as aiops_db_tests.)
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         if url.is_empty() {
             return None;
         }

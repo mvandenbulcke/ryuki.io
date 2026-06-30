@@ -40,14 +40,23 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   Completed stage's started_at == completed_at non-empty. codex impl APPROVE (no blocking; started_at
   hardening added). The `dry_run: true` metadata left unchanged (separate concern).
 
-### NEWLY FOUND while verifying (latent test-harness bug, NOT a snapshot regression)
-- **aiops `test_pool()` is not fail-closed / not drift-tolerant** (repos/aiops.rs ~292-306). When
-  `RYUKI_DATABASE_URL` is unset it falls back to a DEFAULT localhost URL instead of returning None,
-  then `run_migrations(&pool).await.expect("migrations must apply")` PANICS (8 aiops_db_tests fail) —
-  against a drifted local DB or in any no-DB run. Violates the documented conventions (no-DB tests
-  must fail-closed `if get_db().is_none() { return }`; drift-tolerant tests use `run_migrations().ok()`
-  not `.expect`). NOT a regression from the timestamp change (a broad no-DB pass: 1218 passed, only
-  these 8 aiops tests failed, all unrelated to stages). NEXT slice — small, convention-aligning fix.
+### NEWLY FOUND while verifying — test-harness fail-closed bug class (SWEPT)
+- ✅ **aiops `test_pool()` not fail-closed / not drift-tolerant** (repos/aiops.rs) — SHIPPED fe4ad3b.
+  When `RYUKI_DATABASE_URL` was unset it fell back to a DEFAULT localhost URL instead of None, then
+  `run_migrations(...).expect(...)` PANICKED (8 aiops_db_tests fail) against a drifted local DB / any
+  no-DB run. Fixed to `std::env::var(...).ok()?` + `run_migrations(...).ok()?`. codex APPROVE.
+- ✅ **sql_deployment `test_pool()` URL-fallback** (repos/sql_deployment.rs) — SHIPPED: same
+  hard-coded localhost fallback (unintended-DB hazard); it did NOT panic only because its migrations
+  already used `.ok()?` (so it skipped on the resulting drift). Fixed the fallback to fail-closed
+  `.ok()?`. Verified both ways (no-DB skip / fresh-DB pass). codex review pending.
+- **Bug-class scope** (swept, deliberately bounded): the URL-fallback anti-pattern existed in exactly
+  these two test helpers (rg `unwrap_or_else(...postgres://...)`); `config.rs default_database_url()`
+  is a PRODUCTION serde default (correctly left). The OTHER DB-test helpers that use
+  `run_migrations(...).expect(...)` (integration/os_baseline/agents/compliance_reporting/
+  container_namespace) do NOT have the URL fallback (they fail-closed on the env var first, so they
+  did NOT panic in the no-DB pass), and their `.expect` on a CONFIGURED DB is a deliberate fail-loud
+  choice (catches real migration breakage; e.g. os_baseline's message "must apply cleanly when
+  RYUKI_DATABASE_URL is set"). Left unchanged to avoid masking genuine migration regressions.
 
 ### SUSPECT — do NOT implement as proposed (re-verify / likely false or harmful)
 - **Dead-lettered job leaves parent request stuck `executing`** (agent-execution, claimed high/bug).
