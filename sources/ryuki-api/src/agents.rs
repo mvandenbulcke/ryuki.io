@@ -2881,12 +2881,16 @@ pub async fn admin_resolve_reconcile_required_job(
     // Close the reconcile-required alert lifecycle with a NON-ALERTING resolution
     // event (to_status 'reconcile-resolved' is NOT in the alert classifier). NO
     // free-text reason in the payload — only the static, secret-safe fields.
+    // aggregate_id is the CANONICAL uuid (not the raw path string), matching the
+    // sibling job.requeued/job.reprioritized events so an /api/events lookup by
+    // canonical id finds it even if the caller used a non-canonical uuid form.
+    let canonical_job_id = uid.to_string();
     crate::repos::domain_events::insert(
         &mut *tx,
         crate::repos::domain_events::NewEvent {
             event_type: "job.reconcile_resolved",
             aggregate_type: "agent_job",
-            aggregate_id: &job_id,
+            aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
             actor: &session.user_id,
@@ -2999,12 +3003,15 @@ pub async fn admin_cancel_pending_job(
     // event_alerts::alert_worthy_statuses(), so the alert feed's coarse SQL prefilter never
     // fetches it — a cancel can never page (robust vs relying on classify() to drop a
     // prefilter-matched 'cancelled'). NO free-text reason in the payload.
+    // aggregate_id is the CANONICAL uuid (mirrors job.requeued) so an /api/events
+    // lookup by canonical id matches even for a non-canonical uuid form.
+    let canonical_job_id = uid.to_string();
     crate::repos::domain_events::insert(
         &mut *tx,
         crate::repos::domain_events::NewEvent {
             event_type: "job.cancelled",
             aggregate_type: "agent_job",
-            aggregate_id: &job_id,
+            aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
             actor: &session.user_id,
@@ -3158,12 +3165,15 @@ pub async fn admin_force_fail_job(
     // NON-alerting lifecycle event. `to_status` 'admin-force-failed' is deliberately NOT in
     // event_alerts::alert_worthy_statuses(), so the alert feed's coarse SQL prefilter never
     // fetches it — a force-fail can never page. NO free-text reason in the payload.
+    // aggregate_id is the CANONICAL uuid (mirrors job.requeued) so an /api/events
+    // lookup by canonical id matches even for a non-canonical uuid form.
+    let canonical_job_id = uid.to_string();
     crate::repos::domain_events::insert(
         &mut *tx,
         crate::repos::domain_events::NewEvent {
             event_type: "job.force_failed",
             aggregate_type: "agent_job",
-            aggregate_id: &job_id,
+            aggregate_id: &canonical_job_id,
             site: None,
             environment: None,
             actor: &session.user_id,
