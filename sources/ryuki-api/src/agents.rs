@@ -1992,6 +1992,36 @@ pub enum CreateLiveApplyJobError {
 /// via `GET /api/agents/{id}/jobs`, verify the CP signature against the CP
 /// public key, and reject the apply if the signature is invalid.
 ///
+/// ## Lifecycle: ONE permanent LiveApply slot per request
+///
+/// Every request has exactly ONE LiveApply slot, enforced for all time by the
+/// partial unique index `idx_agent_jobs_unique_live_apply` (migration 057),
+/// which spans EVERY status. Once a LiveApply job exists for a request — in any
+/// state, INCLUDING a terminal non-Succeeded one (`Failed`,
+/// `ReconcileRequired`→`Failed`, `LiveRefused`, `DeadLettered`, `Cancelled`) —
+/// that slot is permanently consumed: the `ON CONFLICT … DO NOTHING` below
+/// inserts nothing and this fn returns `Invalid("a live-apply has already been
+/// approved for this request")`. This is deliberate and fail-closed — a
+/// half-applied apply must be reconciled, never blindly re-minted (the
+/// no-double-apply invariant; see migration 057 and execution-agent.md §5).
+///
+/// Consequence: a live-apply CANNOT be retried in place. When a LiveApply ends
+/// terminal-non-Succeeded the request either auto-concludes to `Failed` (an
+/// agent-reported `Failed`/`LiveRefused`, via `backlink_request_execution`) or
+/// is left `Executing` (lease-expiry→`ReconcileRequired`, `DeadLettered`,
+/// pending-cancel) for the operator to conclude with `POST
+/// /api/requests/{id}/fail`. Either way the slot stays consumed. RE-ATTEMPTING a
+/// live-apply requires a FRESH request — a brand-new lifecycle that re-plans and
+/// re-approves against the CURRENT infrastructure state — never a reuse of this
+/// request's grant or spec.
+///
+/// DEFERRED (owner decision): an operator-gated in-place re-dispatch after
+/// reconciliation (execution-agent.md §5's "explicitly re-dispatches" half) is
+/// NOT built. It overlaps the LiveRefused-recoverability / operator-re-approve
+/// decision and needs its own trust-model work (operator attestation that the
+/// prior apply left a known state, a new signed grant, a fresh plan-vs-current
+/// check). Until then the contract is fail-closed as above.
+///
 /// Note: the operator-facing HTTP approval endpoint (portal integration) is a
 /// later slice (S5c). This function is the signing core that all such endpoints
 /// will delegate to.
@@ -2096,7 +2126,10 @@ pub async fn create_live_apply_job(
     // simultaneous approvals safe — the loser inserts nothing and gets None.
     // A grant authorising infrastructure mutation can therefore never be minted
     // twice; a failed/expired apply goes through operator reconcile, not a
-    // re-mint.
+    // re-mint. The index spans ALL statuses, so a TERMINAL prior LiveApply
+    // (Failed/ReconcileRequired→Failed/LiveRefused/DeadLettered/Cancelled) also
+    // hits this conflict: the request's single LiveApply slot is permanently
+    // consumed and a re-attempt requires a fresh request (see the fn doc).
     let id: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO agent_jobs (request_id, platform, spec, mode, live_context) \
          VALUES ($1, $2, $3, 'LiveApply', $4::jsonb) \
@@ -2807,8 +2840,11 @@ pub struct ReconcileBody {
 /// the operator's reconciliation is captured in the audited `reason`. Admin-only.
 /// A non-alerting `job.reconcile_resolved` domain event closes the
 /// reconcile-required alert lifecycle (it does NOT page). The STRANDED PARENT
-/// REQUEST is left `Executing` (job-scoped): the operator fails/retries it
-/// separately via `POST /api/requests/{id}/fail`.
+/// REQUEST is left `Executing` (job-scoped): the operator concludes it with
+/// `POST /api/requests/{id}/fail`. There is NO in-place retry — the request's
+/// single LiveApply slot is permanently consumed (the no-double-apply index is
+/// all-statuses); re-attempting requires a fresh request (see
+/// `create_live_apply_job`).
 pub async fn admin_resolve_reconcile_required_job(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -2912,7 +2948,7 @@ pub async fn admin_resolve_reconcile_required_job(
         "request_id": request_id,
         "status": "Failed",
         "resolved": true,
-        "note": "the parent request remains Executing; fail or retry it separately",
+        "note": "the parent request remains Executing; conclude it with POST /api/requests/{id}/fail. A live-apply cannot be retried in place (its slot is permanently consumed); re-attempting requires a fresh request",
     })))
 }
 
@@ -2930,8 +2966,10 @@ pub struct CancelJobBody {
 /// once `Leased`/`Running` an agent owns the job (cancelling CP-side would split-brain),
 /// and a terminal job is already done — both → 409. Admin-only, audited; emits a
 /// NON-alerting `job.cancelled` event. JOB-SCOPED: the parent request stays `Executing`,
-/// and the operator fails/retries it separately via `POST /api/requests/{id}/fail`
-/// (identical to the reconcile-resolve contract).
+/// and the operator concludes it with `POST /api/requests/{id}/fail` (identical to the
+/// reconcile-resolve contract). A cancelled LiveApply still consumes the request's
+/// permanent LiveApply slot — there is no in-place retry; re-attempting needs a fresh
+/// request (see `create_live_apply_job`).
 pub async fn admin_cancel_pending_job(
     Path(job_id): Path<String>,
     Extension(session): Extension<AuthSession>,
@@ -3033,7 +3071,7 @@ pub async fn admin_cancel_pending_job(
         "request_id": request_id,
         "status": "Cancelled",
         "cancelled": true,
-        "note": "the parent request remains Executing; fail or retry it separately",
+        "note": "the parent request remains Executing; conclude it with POST /api/requests/{id}/fail",
     })))
 }
 
@@ -3195,7 +3233,7 @@ pub async fn admin_force_fail_job(
         "request_id": request_id,
         "status": "Failed",
         "force_failed": true,
-        "note": "the parent request remains Executing; fail or retry it separately",
+        "note": "the parent request remains Executing; conclude it with POST /api/requests/{id}/fail",
     })))
 }
 
@@ -9971,6 +10009,153 @@ mod tests {
         );
 
         cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// run-7 lifecycle contract: a TERMINAL non-Succeeded LiveApply PERMANENTLY
+    /// consumes the request's single live-apply slot. The all-statuses index
+    /// (`idx_agent_jobs_unique_live_apply`, migration 057) blocks a re-mint even
+    /// while the parent request is still `Executing` — so the block is the INDEX,
+    /// not the concluded-request gate. This is the assertion that would CATCH a
+    /// future "scope the index to non-terminal statuses" change (which would turn
+    /// the no-double-apply invariant fail-OPEN). Only AFTER the operator concludes
+    /// the request with `/fail` does the concluded gate ALSO refuse — a distinct
+    /// branch. There is no in-place retry; a re-attempt needs a fresh request.
+    #[tokio::test]
+    async fn db_live_apply_slot_permanent_after_terminal_apply() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        use std::collections::BTreeMap;
+
+        let cp_key = ensure_test_cp_key();
+        let platform = format!("plt-slot-{}", Uuid::new_v4().simple());
+        // The parent request is mid-apply: Executing (NOT concluded).
+        let req = seed_request_row(pool, "executing").await;
+
+        let spec = JobSpec {
+            request_id: req,
+            offering_id: Uuid::new_v4(),
+            iac_ref: "linux-server-deployment@v1".into(),
+            iac_digest: "0".repeat(64),
+            vars: BTreeMap::new(),
+            mode: JobMode::LiveApply,
+        };
+        let plan_digest = proto_sha256(b"approved-plan-bytes");
+        // create_live_apply_job borrows everything (request_id is Copy), so the
+        // same args drive all three mint attempts below.
+        let grant_expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        // 1. Mint the ONE LiveApply job for this request.
+        let job_id = create_live_apply_job(
+            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+        )
+        .await
+        .expect("first live-apply mint must succeed");
+
+        // 2. Drive it terminal via the REAL reconcile path: simulate a lease-expiry
+        //    → ReconcileRequired, then the operator resolves it to Failed.
+        sqlx::query(
+            "UPDATE agent_jobs SET status = 'ReconcileRequired', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("force job to ReconcileRequired");
+        let Json(_) = admin_resolve_reconcile_required_job(
+            Path(job_id.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ReconcileBody {
+                reason: "reconciled the half-applied resources out-of-band".into(),
+            }),
+        )
+        .await
+        .expect("resolve to Failed must succeed");
+
+        // 3. Job is terminal Failed; the parent request is STILL Executing (not
+        //    concluded), so the NEXT mint is gated by the INDEX, not the gate.
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Failed", "job is terminal Failed");
+        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            req_status, "executing",
+            "the parent request stays Executing (NOT concluded)"
+        );
+
+        // 4. Re-mint while Executing → blocked by the ALL-statuses INDEX
+        //    (Invalid "already approved"), NOT RequestConcluded. Catches a future
+        //    "scope the index to non-terminal statuses" regression.
+        let blocked_by_index = create_live_apply_job(
+            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+        )
+        .await;
+        assert!(
+            matches!(blocked_by_index, Err(CreateLiveApplyJobError::Invalid(_))),
+            "a terminal LiveApply must block re-mint via the permanent index while the \
+             request is still Executing; got {blocked_by_index:?}"
+        );
+
+        // 5. Operator concludes the request (the POST /api/requests/{id}/fail outcome).
+        sqlx::query("UPDATE requests SET status = 'failed', updated_at = NOW() WHERE id = $1")
+            .bind(req)
+            .execute(pool)
+            .await
+            .expect("conclude request as failed");
+
+        // 6. Now the concluded gate ALSO refuses — a DISTINCT branch from step 4.
+        let blocked_by_gate = create_live_apply_job(
+            pool, req, &platform, &spec, &plan_digest, "ops-alice", grant_expiry, &cp_key,
+        )
+        .await;
+        assert!(
+            matches!(blocked_by_gate, Err(CreateLiveApplyJobError::RequestConcluded)),
+            "after /fail the concluded-request gate refuses re-mint; got {blocked_by_gate:?}"
+        );
+
+        // Throughout, exactly ONE LiveApply row ever existed for the request.
+        let live_apply_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_jobs WHERE request_id = $1 AND mode = 'LiveApply'",
+        )
+        .bind(req)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live_apply_count, 1,
+            "no-double-apply held: one live-apply slot, ever"
+        );
+
+        // Schema-level guard: the unique index must remain ALL-statuses — its
+        // predicate is exactly `mode = 'LiveApply'` with NO status clause. This
+        // catches a future "scope the index to non-terminal statuses" edit at the
+        // catalog level, not just behaviorally.
+        let indexdef: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'idx_agent_jobs_unique_live_apply'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("the live-apply unique index must exist");
+        assert!(
+            indexdef.contains("mode = 'LiveApply'"),
+            "index predicate must be mode='LiveApply'; got {indexdef}"
+        );
+        assert!(
+            !indexdef.to_lowercase().contains("status"),
+            "index must span ALL statuses (no status predicate); got {indexdef}"
+        );
+
+        cleanup_dead_letter_events(pool, job_id).await;
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
     }
