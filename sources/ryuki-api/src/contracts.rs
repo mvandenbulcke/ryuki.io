@@ -15208,17 +15208,6 @@ fn request_sort_direction(direction: Option<&str>) -> &'static str {
     }
 }
 
-/// The shared WHERE clause for the request list — used by BOTH the page SELECT
-/// and the total COUNT so the two can never drift (a mismatched total would
-/// mislead pagination). Binds $1..$6 = status/site/environment/request_type/
-/// created_by/q(ILIKE); NULL = no filter on that column.
-const REQUESTS_LIST_WHERE: &str = "WHERE ($1::text IS NULL OR status = $1) \
-   AND ($2::text IS NULL OR site = $2) \
-   AND ($3::text IS NULL OR environment = $3) \
-   AND ($4::text IS NULL OR request_type = $4) \
-   AND ($5::text IS NULL OR created_by = $5) \
-   AND ($6::text IS NULL OR name ILIKE '%' || $6 || '%' ESCAPE '\\')";
-
 /// `X-Total-Count` header carrying the filtered total (before limit/offset) so a
 /// paginating client knows how many pages exist. #9: the body stays a bare array
 /// (backward-compatible with the portal consumer); the full `{items,total}`
@@ -15258,12 +15247,6 @@ async fn requests_list(
     let f_q = norm(&params.q);
 
     if let Some(pool) = get_db() {
-        // sort_col/dir are allowlisted constants (never client text); every
-        // value filter is a bound parameter, NULL = no filter on that column.
-        let sql = format!(
-            "SELECT {REQUEST_COLUMNS} FROM requests {REQUESTS_LIST_WHERE} \
-             ORDER BY {sort_col} {dir} LIMIT $7 OFFSET $8"
-        );
         // Escape LIKE metacharacters so `q` is a literal substring match, not a
         // wildcard pattern. The bound param keeps it injection-safe; ESCAPE '\'
         // makes the backslash the escape char. Order matters: escape '\' first.
@@ -15272,13 +15255,54 @@ async fn requests_list(
                 .replace('%', "\\%")
                 .replace('_', "\\_")
         });
-        let rows: Vec<DbRequestRow> = sqlx::query_as(&sql)
-            .bind(&f_status)
-            .bind(&f_site)
-            .bind(&f_env)
-            .bind(&f_type)
-            .bind(&f_creator)
-            .bind(&f_q_like)
+        // Build the WHERE from ONLY the active filters, so the planner always sees
+        // a clean, sargable predicate (e.g. `site = $1 AND environment = $2`) and
+        // reliably uses idx_requests_site_env_created_at (migration 138). The old
+        // `($n IS NULL OR col = $n)` shape could fall back to a sequential scan
+        // under a GENERIC prepared plan (sqlx caches prepared statements),
+        // defeating that index even though a custom plan would have used it. Only
+        // allowlisted column names are ever formatted into the SQL; every value
+        // stays a BOUND parameter (`$n`), so this is injection-safe. After each
+        // push, `binds.len()` is that parameter's 1-based `$n` position.
+        let mut preds: Vec<String> = Vec::new();
+        let mut binds: Vec<&str> = Vec::new();
+        for (col, val) in [
+            ("status", &f_status),
+            ("site", &f_site),
+            ("environment", &f_env),
+            ("request_type", &f_type),
+            ("created_by", &f_creator),
+        ] {
+            if let Some(v) = val {
+                binds.push(v.as_str());
+                preds.push(format!("{col} = ${}", binds.len()));
+            }
+        }
+        if let Some(v) = &f_q_like {
+            binds.push(v.as_str());
+            preds.push(format!("name ILIKE '%' || ${} || '%' ESCAPE '\\'", binds.len()));
+        }
+        // Shared by the page SELECT and the COUNT so the two can never drift (a
+        // mismatched total would mislead pagination).
+        let where_sql = if preds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", preds.join(" AND "))
+        };
+
+        // sort_col/dir are allowlisted constants (never client text). LIMIT/OFFSET
+        // take the next two placeholders after the active filters.
+        let sql = format!(
+            "SELECT {REQUEST_COLUMNS} FROM requests {where_sql} \
+             ORDER BY {sort_col} {dir} LIMIT ${} OFFSET ${}",
+            binds.len() + 1,
+            binds.len() + 2,
+        );
+        let mut list_q = sqlx::query_as::<_, DbRequestRow>(&sql);
+        for b in &binds {
+            list_q = list_q.bind(*b);
+        }
+        let rows: Vec<DbRequestRow> = list_q
             .bind(limit as i64)
             .bind(offset as i64)
             .fetch_all(pool)
@@ -15300,15 +15324,15 @@ async fn requests_list(
             })
             .collect();
         // Filtered total (same WHERE, no limit/offset) for pagination — exposed
-        // via X-Total-Count so the bare-array body stays backward-compatible.
-        let count_sql = format!("SELECT COUNT(*) FROM requests {REQUESTS_LIST_WHERE}");
-        let total: i64 = sqlx::query_scalar(&count_sql)
-            .bind(&f_status)
-            .bind(&f_site)
-            .bind(&f_env)
-            .bind(&f_type)
-            .bind(&f_creator)
-            .bind(&f_q_like)
+        // via X-Total-Count so the bare-array body stays backward-compatible. The
+        // identical active-only predicates mean the COUNT also uses
+        // idx_requests_site_env_created_at on the scoped path.
+        let count_sql = format!("SELECT COUNT(*) FROM requests {where_sql}");
+        let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds {
+            count_q = count_q.bind(*b);
+        }
+        let total: i64 = count_q
             .fetch_one(pool)
             .await
             .unwrap_or(summaries.len() as i64);
