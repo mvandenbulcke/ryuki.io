@@ -139,10 +139,36 @@ The deep-dive's two "high" findings were RE-VERIFIED as DELIBERATE DESIGN (not b
 - (minor) validate_patch_policy treats empty blackout_dates as INFO not FAIL — but it is NOT the
   authoritative path (validate_patch_wave re-implements checks inline); only an old test uses it. Low.
 
+---
+
+# run-8f — ALERT ROUTING / NOISE / SLO deep-dive
+
+3 findings amid a strong verified-clean list (classify/alert_worthy union + per-aggregate rules locked by
+test; resolve_alert_route is a unique 3-field key lookup — no precedence shadow; slo/budget breach-scan
+dedup via the breaching flag flipped atomically with the event; Above `>` / Below `<` thresholds; ack
+scope per-item; suppress_trigger CAS `WHERE status <> 'Suppressed'`; scheduler scans use enqueue_if_absent
++ prefilter-superset).
+
+## Shipped
+- ✅ **overall_status ignored breached_count** (slo_status + metrics_budget_status, contracts.rs ~21512 /
+  ~21033) — SHIPPED: `overall_status = if errored_count>0 {"degraded"} else {"ok"}` reported "ok" while
+  SLOs/budgets were actively breached (breached_count>0), so a health gate reading the field saw green.
+  FIX: 3-way `errored>0 -> degraded; breached>0 -> breached; else ok`. +test (a breaching SLO ->
+  breached_count>=1 AND overall_status != "ok"). codex review pending.
+
+## Flagged (task_9ca3ab76)
+- (med) ack_alert accepts ANY domain_event id — no alert-worthy guard — so acking a non-alert
+  ('completed'/'intake') event succeeds and writes a dangling alert_acks row. Add `payload->>'to_status'
+  = ANY(alert_worthy_statuses())` to the existence check.
+- (med) noise suppression never auto-expires: suppress_until is stored but never compared to NOW(), so a
+  Suppressed trigger past its deadline stays hidden from detection forever (seeded noise-004 is 15+ days
+  expired but still suppressed). Filter `status <> 'Suppressed' OR suppress_until <= NOW()`.
+
 ## Conclusion (overall)
-Combined with run-5/6/7, bug-discovery is tapering — focused deep-dives now split between isolated real
-bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation race) and SOUND results
-(patch/maintenance, most of auth). The discipline of RE-VERIFYING every finding matters: this run alone,
-3 "findings" were deliberate design choices I correctly did NOT "fix". Remaining high-value: the
-owner-decision items (A0/B0 etc.), the flagged follow-ups (IPAM next_ip especially), + larger
-data/execution-plane build-out. SESSION: 17 codex-reviewed commits across run-5/6/7/8.
+Combined with run-5/6/7, bug-discovery is tapering but still productive — focused deep-dives split between
+isolated real bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation race + the
+next_ip CIDR bug, the overall_status health field) and SOUND results (patch/maintenance, most of auth,
+the alerting CORE). The discipline of RE-VERIFYING every finding matters: across run-8, several "findings"
+were deliberate design choices I correctly did NOT "fix". Remaining high-value: the owner-decision items
+(A0/B0 etc.), the flagged follow-ups, + larger data/execution-plane build-out. SESSION: 19 codex-reviewed
+commits across run-5/6/7/8.

@@ -21030,7 +21030,16 @@ async fn metrics_budget_status(AuthExtractor(session): AuthExtractor) -> ApiResu
 
     // `degraded` whenever any budget could not be evaluated — the caller must not
     // read a clean `breached_count` as "all budgets are healthy".
-    let overall_status = if errored_count > 0 { "degraded" } else { "ok" };
+    // overall_status must reflect BREACHES, not just query/data errors — otherwise a
+    // health gate reading `overall_status == "ok"` sees green while SLOs/budgets are
+    // actively breached (breached_count > 0). errored (unevaluable) outranks breached.
+    let overall_status = if errored_count > 0 {
+        "degraded"
+    } else if breached_count > 0 {
+        "breached"
+    } else {
+        "ok"
+    };
     Ok(Json(json!({
         "budgets": results,
         "breached_count": breached_count,
@@ -21509,7 +21518,16 @@ async fn slo_status(AuthExtractor(session): AuthExtractor) -> ApiResult {
         }
     }
 
-    let overall_status = if errored_count > 0 { "degraded" } else { "ok" };
+    // overall_status must reflect BREACHES, not just query/data errors — otherwise a
+    // health gate reading `overall_status == "ok"` sees green while SLOs/budgets are
+    // actively breached (breached_count > 0). errored (unevaluable) outranks breached.
+    let overall_status = if errored_count > 0 {
+        "degraded"
+    } else if breached_count > 0 {
+        "breached"
+    } else {
+        "ok"
+    };
     Ok(Json(json!({
         "slos": results,
         "breached_count": breached_count,
@@ -42775,6 +42793,63 @@ mod db_lifecycle_tests {
             (attainment - 0.999).abs() < 1e-6,
             "attainment ~0.999, got {attainment}"
         );
+
+        // run-8: a BREACHED SLO must flip overall_status off "ok" — before the fix
+        // overall_status only reflected errored_count, so it stayed "ok" while SLOs
+        // were actively breached. Seed a clearly-breaching SLO (990/1000 = 0.99 < 0.999).
+        let bgood = "test.slo.breach.good.7p4";
+        let btotal = "test.slo.breach.total.7p4";
+        for (k, v) in [(bgood, 990.0f64), (btotal, 1000.0)] {
+            let _ = metrics_record_sample(
+                sess(),
+                Json(MetricSampleRequest {
+                    metric_key: k.to_string(),
+                    site: None,
+                    environment: None,
+                    value: v,
+                    observed_at: None,
+                }),
+            )
+            .await
+            .expect("record breach sample");
+        }
+        let _ = slo_create(
+            sess(),
+            Json(SloCreateRequest {
+                name: "test-slo-breach".to_string(),
+                target: 0.999,
+                window_days: Some(7),
+                good_metric_key: bgood.to_string(),
+                total_metric_key: btotal.to_string(),
+                site: None,
+                environment: None,
+            }),
+        )
+        .await
+        .expect("create breaching slo");
+
+        let Json(out2) = slo_status(sess()).await.expect("status 2");
+        assert!(
+            out2["breached_count"].as_i64().unwrap() >= 1,
+            "the breaching SLO is counted in breached_count"
+        );
+        assert_ne!(
+            out2["overall_status"], "ok",
+            "overall_status must reflect the breach, not report 'ok'"
+        );
+
+        for k in [bgood, btotal] {
+            sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
+                .bind(k)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM slo_definitions WHERE good_metric_key = $1")
+            .bind(bgood)
+            .execute(pool)
+            .await
+            .ok();
 
         for k in [good_key, total_key] {
             sqlx::query("DELETE FROM metric_samples WHERE metric_key = $1")
