@@ -111,8 +111,38 @@ all verified sound.
   skips .2-.9 always. Needs a proper CIDR-range rewrite. (Plus: release_ip uses non-saturating
   available_ips += 1, asymmetric with used_ips saturating_sub.)
 
+---
+
+# run-8e — PATCH / MAINTENANCE / REBOOT ORCHESTRATION deep-dive
+
+Result: SOUND. No clean bug. Verified: CAS optimistic-lock on wave transitions (UPDATE ... WHERE
+status=$ + rows_affected check); half-open `[)` overlap/conflict detection (engine `overlaps` + DB
+`tstzrange '[)'`); draft-only validate / validated-only approve / approved-only execute chain enforced
+in both the pure engine fns AND the DB CAS; reboot-policy guard (NoReboot/ScheduleOnly rejected); ISO
+parse returns None → no false conflict.
+
+The deep-dive's two "high" findings were RE-VERIFIED as DELIBERATE DESIGN (not bugs):
+- get_active uses inclusive `<= end` while the conflict checker uses half-open `[)`. This is defensible:
+  an inclusive "active" end is SAFER (the boundary instant is still treated as in-maintenance) while
+  half-open conflict detection deliberately allows back-to-back window scheduling. Different purposes,
+  not an inconsistency to "fix" (and the exact-end-instant edge has ~nil practical impact). LEFT.
+- patch_reboot has no wave-status guard — but it is PLANNING-ONLY ("evidence-only, does NOT transition
+  the wave") and is structurally IDENTICAL to the sibling planning endpoint patch_verify (also
+  status-agnostic). Only the state-TRANSITIONING patch_execute guards status. So patch_reboot is
+  consistent by design; the finder mis-compared it to execute. LEFT.
+
+## Flagged (feature, not a bug — task)
+- orchestrate_reboot emits ONE drain stage for ALL servers + per-server reboots + ONE final health
+  check — no batched/rolling rollout with inter-batch health gates (the reboot-orchestration contract
+  mentions rebootBatches). For a real rolling reboot this is all-at-once. It's a dry-run PLAN today, so
+  this is a missing FEATURE (batched rollout plan), not a correctness bug.
+- (minor) validate_patch_policy treats empty blackout_dates as INFO not FAIL — but it is NOT the
+  authoritative path (validate_patch_wave re-implements checks inline); only an old test uses it. Low.
+
 ## Conclusion (overall)
-Combined with run-5/6/7, bug-discovery is tapering but NOT zero — focused deep-dives on fresh subsystems
-still find isolated real bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation
-race). Remaining high-value: the owner-decision items (A0/B0 etc.), the flagged follow-ups (IPAM next_ip
-especially), + larger data/execution-plane build-out. SESSION: 17 codex-reviewed commits across run-5/6/7/8.
+Combined with run-5/6/7, bug-discovery is tapering — focused deep-dives now split between isolated real
+bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation race) and SOUND results
+(patch/maintenance, most of auth). The discipline of RE-VERIFYING every finding matters: this run alone,
+3 "findings" were deliberate design choices I correctly did NOT "fix". Remaining high-value: the
+owner-decision items (A0/B0 etc.), the flagged follow-ups (IPAM next_ip especially), + larger
+data/execution-plane build-out. SESSION: 17 codex-reviewed commits across run-5/6/7/8.
