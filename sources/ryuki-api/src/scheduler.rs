@@ -1575,6 +1575,17 @@ pub async fn list_recent_executions(
     .await
 }
 
+/// Heartbeat registry name for the durable-scheduler tick. Registering it makes
+/// the tick a first-class watched loop: the in-memory health probe
+/// (`/api/platform/health/loops`) and the wedge monitor both cover it, just like
+/// the standalone scans. A successful tick — INCLUDING a non-leader no-op tick —
+/// records a heartbeat, because the signal is "the tick task is alive and
+/// iterating", independent of whether THIS replica won leadership. This is
+/// complementary to `probe_scheduler_liveness` (a DB probe that catches "NO replica
+/// is advancing schedules"); the heartbeat catches "THIS replica's tick task is
+/// dead/hung".
+const DURABLE_SCHEDULER_NAME: &str = "durable_scheduler";
+
 /// Spawn the background scheduler tick. Call once at startup after the DB pool
 /// is available; the task runs until the runtime shuts down. Each tick is
 /// leader-elected and idempotent, so a duplicate spawn is harmless.
@@ -1592,6 +1603,7 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
     //   so an abort is safe and the next leader simply retries.
     let tick_timeout = Duration::from_secs(tick_secs.saturating_mul(4).max(300));
     tokio::spawn(async move {
+        crate::background::register_loop(DURABLE_SCHEDULER_NAME, tick_secs);
         let mut ticker = interval(Duration::from_secs(tick_secs));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await; // skip the immediate first tick (just started)
@@ -1599,9 +1611,14 @@ pub fn spawn_scheduler(pool: PgPool, tick_secs: u64) {
             ticker.tick().await;
             match tokio::time::timeout(tick_timeout, tick_once(&pool)).await {
                 Ok(Ok(ran)) if ran > 0 => {
+                    crate::background::record_loop_success(DURABLE_SCHEDULER_NAME);
                     tracing::info!(ran, "scheduler tick ran due jobs");
                 }
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => {
+                    // A successful no-op tick (nothing due, or a non-leader tick)
+                    // is still a live iteration — record the heartbeat.
+                    crate::background::record_loop_success(DURABLE_SCHEDULER_NAME);
+                }
                 Ok(Err(error)) => {
                     tracing::error!(error = %error, "scheduler tick failed");
                 }

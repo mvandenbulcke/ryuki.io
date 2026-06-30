@@ -90,6 +90,20 @@ pub fn severity_for_agent_job_status(to_status: &str) -> Option<AlertSeverity> {
     }
 }
 
+/// Classify a background-loop wedge event by its `to_status`. An `overdue` loop
+/// is CRITICAL — a wedged scheduler/scan tick has silently stopped scheduled work,
+/// the highest-impact operational failure (it ranks with a `failed` request and a
+/// `dead-lettered` job). `recovered` is good news, not an alert. UNLIKE the
+/// admin-cancel/force-fail statuses (deliberately kept OUT of the alert union to
+/// avoid paging on a human-initiated action), `overdue` is exactly what we WANT to
+/// page on — it is an unattended liveness failure.
+pub fn severity_for_background_loop_status(to_status: &str) -> Option<AlertSeverity> {
+    match to_status {
+        "overdue" => Some(AlertSeverity::Critical),
+        _ => None,
+    }
+}
+
 /// The UNION of every alert-worthy `to_status` across all aggregate types.
 /// Exposed so the alert feed can push this filter INTO its SQL query — alerts
 /// are rare relative to all events, so filtering a recent-N page in memory would
@@ -106,6 +120,7 @@ pub fn alert_worthy_statuses() -> &'static [&'static str] {
         "offline",
         "dead-lettered",
         "reconcile-required",
+        "overdue",
     ]
 }
 
@@ -119,6 +134,7 @@ pub fn classify(aggregate_type: &str, to_status: Option<&str>) -> Option<AlertSe
         "budget" => to_status.and_then(severity_for_budget_status),
         "agent" => to_status.and_then(severity_for_agent_status),
         "agent_job" => to_status.and_then(severity_for_agent_job_status),
+        "background_loop" => to_status.and_then(severity_for_background_loop_status),
         _ => None,
     }
 }
@@ -194,7 +210,8 @@ mod tests {
                     || severity_for_slo_status(s).is_some()
                     || severity_for_budget_status(s).is_some()
                     || severity_for_agent_status(s).is_some()
-                    || severity_for_agent_job_status(s).is_some(),
+                    || severity_for_agent_job_status(s).is_some()
+                    || severity_for_background_loop_status(s).is_some(),
                 "{s} is in the alert union but no aggregate classifies it as an alert"
             );
         }
@@ -233,6 +250,14 @@ mod tests {
             Some(AlertSeverity::Critical)
         );
         assert_eq!(classify("agent_job", Some("running")), None);
+        // A wedged background loop is critical (silent scheduling stop); recovery
+        // is good news, not an alert; a normal monitor tick has no to_status.
+        assert_eq!(
+            classify("background_loop", Some("overdue")),
+            Some(AlertSeverity::Critical)
+        );
+        assert_eq!(classify("background_loop", Some("recovered")), None);
+        assert_eq!(classify("background_loop", None), None);
         // Cross-aggregate spurious pairs never alert (a request can't be
         // 'dead-lettered', an agent_job can't be 'failed').
         assert_eq!(classify("request", Some("dead-lettered")), None);

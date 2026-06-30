@@ -1710,6 +1710,15 @@ async fn main() {
         // offline (agents heartbeat far more often than that).
         agents::spawn_agent_offline_scan(pool.clone(), 60, 180);
         tracing::info!("agent-offline scan started (interval: 60s, threshold: 180s)");
+        // run-5/B: the wedge monitor turns the in-memory loop-liveness registry into
+        // PUSHED, acknowledgeable `background_loop.overdue` domain events (edge-
+        // triggered), so a silently-wedged scheduler/scan pages an operator instead of
+        // only showing a 503 on /api/platform/health/loops. Spawned LAST so every loop
+        // it watches is already registering; independent of those loops (a wedged tick
+        // cannot self-report), and itself a registered loop so the health probe is its
+        // watchdog-of-watchdog. 60s cadence — overdue thresholds are >=660s.
+        crate::background::spawn_loop_monitor(pool.clone(), 60);
+        tracing::info!("background-loop wedge monitor started (interval: 60s)");
     }
 
     let rate_limiter = create_rate_limiter(&app_config.rate_limit);
