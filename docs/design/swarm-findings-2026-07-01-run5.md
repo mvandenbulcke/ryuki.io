@@ -62,15 +62,24 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 ### D. Unclamped numeric inputs → 500 / overflow (the validity_days bug class)
 - Unclamped `offset` → negative OFFSET 500 in requests_list + "various SQL queries" (high-medium/S).
   (Same class as the admin_platform_settings_history fix in 49979a0 — sweep ALL `?offset=` handlers.)
-- Unclamped `duration_minutes` → unbounded time arithmetic (medium/M).
-- subnet `total_ips` i32 without complete overflow guard (medium/M).
+- ~~Unclamped `duration_minutes` → unbounded time arithmetic~~ FALSE POSITIVE (verified): the
+  field is `u32` (max ~8167 years of minutes, within chrono's TimeDelta range) AND noise_suppress
+  uses `checked_add_signed` (returns None on overflow, no panic). Unlike validity_days (plain `+`,
+  `days` reaching year >262143). NOT a bug.
+- ~~subnet `total_ips` i32 without complete overflow guard~~ FALSE POSITIVE (verified): `usable_hosts`
+  computes in `u64` (`1u64 << 32` safe) + clamps to u32::MAX; validate_subnet_fields guards the
+  prefix==0 shift-by-32; the API guards `total_ips > i32::MAX` before the i32 bind. NOT a bug.
+  (Two false positives → the swarm verifier's confidence is imperfect; ALWAYS re-verify type bounds.)
 
 ### E. Admin/operator capabilities + API completeness
 - No admin capability to manually trigger/expedite the lease-expiry sweep (high/S).
 - No admin force-fail / force-complete for a stuck Running/Leased job (high/M) — complements the
   Pending-cancel just shipped (covers the OTHER end of the lifecycle).
 - No operator inspection endpoint for Leased/Running job state (only result retrieval) (high/M).
-- Compliance controls + findings missing individual GET endpoints (medium/S).
+- ✅ Compliance controls + findings missing individual GET endpoints (medium/S) — SHIPPED:
+  controls already had `compliance_control_get`; findings now have `GET /api/audit/compliance/findings/{id}`
+  (`compliance_finding_get` + repo `get_finding`), scoped on the parent report's site (findings have no
+  own site column), out-of-scope 404s like missing (no oracle). codex impl APPROVE; ran green on a fresh DB.
 
 ### F. Security — redaction
 - Audit redaction is key-pattern-only — free-text `reason`/`detail` values could carry a secret a
@@ -88,3 +97,8 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 7. ✅ Job inspection (E) — SHIPPED: GET /api/admin/agents/jobs/{job_id}/state (secret-safe lifecycle
    read; 5-seg path avoids the /jobs/approve 405 shadow; sentinel value-leak test + routing-dispatch
    regression). The A0 agent-job-admin scope-guard sweep + background-loop wedge event remain.
+8. ✅ Compliance finding GET-by-id (E) — SHIPPED: GET /api/audit/compliance/findings/{id}
+   (`compliance_finding_get` + repo `get_finding`); parent-report-site scope guard, out-of-scope 404s
+   like missing. codex impl APPROVE; new test green on a fresh DB alongside the 26 compliance tests.
+   Remaining run-5 backlog: A0 scope sweep (flagged), background-loop wedge event (flagged), B/B0
+   lifecycle events (blocked on the B0 scope-policy decision, flagged), F redaction (scope tightly).

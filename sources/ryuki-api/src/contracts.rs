@@ -474,6 +474,10 @@ pub fn routes() -> Router {
             get(compliance_findings_list),
         )
         .route(
+            "/api/audit/compliance/findings/{id}",
+            get(compliance_finding_get),
+        )
+        .route(
             "/api/audit/compliance/findings/{id}/resolve",
             post(compliance_finding_resolve),
         )
@@ -33145,6 +33149,55 @@ async fn compliance_findings_list(
     })))
 }
 
+/// GET /api/audit/compliance/findings/{id} — read ONE compliance finding (the read-by-id
+/// companion to the list + resolve/waive mutations, so an operator can inspect a finding
+/// before resolving/waiving it). Audit-tier (via the `/api/audit` route prefix). Findings
+/// have no own site column, so an out-of-scope finding is scoped on its parent report's
+/// site and reported identically to a missing one (the 404 body) — no existence oracle,
+/// mirroring `compliance_finding_resolve`.
+async fn compliance_finding_get(
+    AuthExtractor(session): AuthExtractor,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let pool = get_db().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Finding '{}' not found", id)})),
+        )
+    })?;
+    let finding = crate::repos::compliance_reporting::get_finding(pool, &id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Finding '{}' not found", id)})),
+            )
+        })?;
+    // #2: scope on the parent report's site (findings have no site column). An out-of-scope
+    // finding 404s like a missing one (no oracle, no cross-site read). Mirrors resolve.
+    if is_scoped(&session) {
+        let site: Option<String> = sqlx::query_scalar(
+            "SELECT cr.site FROM compliance_findings cf \
+             JOIN compliance_reports cr ON cf.report_id = cr.id WHERE cf.id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        if !site
+            .map(|s| row_scope_permits(&session, &s, ""))
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Finding '{}' not found", id)})),
+            ));
+        }
+    }
+    Ok(Json(json!({ "source": "db", "finding": finding })))
+}
+
 async fn compliance_finding_resolve(
     AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
@@ -44512,6 +44565,61 @@ mod db_lifecycle_tests {
                 "out-of-scope compliance_finding_resolve must 404: {resolved:?}"
             );
         }
+    }
+
+    /// #2 RBAC + read-by-id: `compliance_finding_get` returns ONE finding scoped on its
+    /// parent report's site (findings have no own site). A GBLON principal 404s reading a
+    /// DEFRA finding (same body as missing — no oracle); an unrestricted principal reads
+    /// it and gets the finding payload; an unknown id 404s. Ids resolved at runtime.
+    #[tokio::test]
+    async fn compliance_finding_get_is_site_scoped() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let defra_finding: Option<String> = sqlx::query_scalar(
+            "SELECT cf.id FROM compliance_findings cf \
+             JOIN compliance_reports cr ON cf.report_id = cr.id \
+             WHERE cr.site = 'DEFRA' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
+        let Some(id) = defra_finding else {
+            eprintln!("SKIP: no DEFRA compliance finding seeded");
+            return;
+        };
+
+        let mut gblon = AuthSession::static_dry_run();
+        gblon.site_scope = vec!["GBLON".into()];
+        let scoped = compliance_finding_get(AuthExtractor(gblon), Path(id.clone())).await;
+        assert!(
+            matches!(scoped, Err((StatusCode::NOT_FOUND, _))),
+            "out-of-scope compliance_finding_get must 404: {scoped:?}"
+        );
+
+        let open =
+            compliance_finding_get(AuthExtractor(AuthSession::static_dry_run()), Path(id.clone()))
+                .await;
+        match open {
+            Ok(Json(v)) => assert_eq!(
+                v["finding"]["id"].as_str(),
+                Some(id.as_str()),
+                "unrestricted compliance_finding_get must return the finding: {v}"
+            ),
+            other => panic!("unrestricted compliance_finding_get must pass: {other:?}"),
+        }
+
+        let missing = compliance_finding_get(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("no-such-finding-id".to_string()),
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown compliance_finding_get must 404: {missing:?}"
+        );
     }
 
     /// #2 RBAC: the noise-remediation handlers are site-scoped via the host-derived

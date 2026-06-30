@@ -359,6 +359,22 @@ pub async fn get_control(
     row.map(|r| r.into_model()).transpose()
 }
 
+/// Read ONE compliance finding by id (the read-by-id companion to `list_findings`
+/// and `resolve_finding`/`waive_finding`). `None` when missing. The caller scopes on
+/// the parent report's site (findings have no own site column), mirroring the resolve
+/// path — kept out of this query so the repo fn stays scope-agnostic.
+pub async fn get_finding(pool: &PgPool, id: &str) -> Result<Option<Finding>, sqlx::Error> {
+    let row: Option<FindingRow> = sqlx::query_as(
+        "SELECT f.id, f.report_id, f.control_id, f.severity, f.description, f.remediation, \
+                f.status \
+         FROM compliance_findings f WHERE f.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| r.into_model()).transpose()
+}
+
 /// Atomically assess a control — UPDATE...RETURNING in one round-trip.
 pub async fn assess_control(
     pool: &PgPool,
