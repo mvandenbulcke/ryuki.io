@@ -29940,15 +29940,22 @@ struct IpamSubnetRow {
 
 impl IpamSubnetRow {
     fn to_engine(&self) -> dns_ipam::IpamSubnet {
+        // Defense-in-depth on the READ path, mirroring the update handler's clamp
+        // ("so a corrupt DB value cannot wrap"): a row written OUTSIDE the API path
+        // (direct SQL / pre-CHECK legacy) could carry a negative or out-of-range value,
+        // and a raw `as u16`/`as u32` would silently WRAP it into a plausible-but-wrong
+        // number (e.g. total_ips -1 -> 4_294_967_295, misreporting capacity). vlan_id is
+        // CHECK-constrained since migration 099 (1..=4094); the IP counts have NO DB
+        // CHECK, so clamp negatives to 0. A valid row is unchanged.
         dns_ipam::IpamSubnet {
             id: self.id.clone(),
             cidr: self.cidr.clone(),
             gateway: self.gateway.clone(),
-            vlan_id: self.vlan_id as u16,
+            vlan_id: self.vlan_id.clamp(1, 4094) as u16,
             site: self.site.clone(),
-            total_ips: self.total_ips as u32,
-            used_ips: self.used_ips as u32,
-            available_ips: self.available_ips as u32,
+            total_ips: self.total_ips.max(0) as u32,
+            used_ips: self.used_ips.max(0) as u32,
+            available_ips: self.available_ips.max(0) as u32,
             status: parse_subnet_status(&self.status),
         }
     }
@@ -35878,6 +35885,45 @@ mod router_tests {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// run-7 hardening: `IpamSubnetRow::to_engine()` must CLAMP corrupt/out-of-range
+    /// DB values rather than silently WRAP them via `as u16`/`as u32` (mirroring the
+    /// update handler's defense). A negative IP count must floor to 0 (not wrap to
+    /// ~4.29e9) and an out-of-range vlan must clamp into 1..=4094.
+    #[test]
+    fn ipam_subnet_row_to_engine_clamps_corrupt_values() {
+        let row = IpamSubnetRow {
+            id: "sn-1".into(),
+            cidr: "10.0.0.0/24".into(),
+            gateway: "10.0.0.1".into(),
+            vlan_id: -1,
+            site: "DEFRA".into(),
+            total_ips: -5,
+            used_ips: -1,
+            available_ips: i32::MIN,
+            status: "Available".into(),
+        };
+        let eng = row.to_engine();
+        assert_eq!(eng.vlan_id, 1, "negative vlan clamps into range, not wraps to 65535");
+        assert_eq!(eng.total_ips, 0, "negative total_ips floors to 0, not wraps to a huge u32 (~4.29e9)");
+        assert_eq!(eng.used_ips, 0, "negative used_ips floors to 0");
+        assert_eq!(eng.available_ips, 0, "i32::MIN available_ips floors to 0");
+
+        // A valid row is unchanged by the clamps.
+        let ok = IpamSubnetRow {
+            vlan_id: 110,
+            total_ips: 254,
+            used_ips: 60,
+            available_ips: 194,
+            ..row
+        };
+        let eng_ok = ok.to_engine();
+        assert_eq!(
+            (eng_ok.vlan_id, eng_ok.total_ips, eng_ok.used_ips, eng_ok.available_ips),
+            (110, 254, 60, 194),
+            "a valid row passes through the clamps unchanged"
+        );
+    }
 
     /// `db_error` must never echo the raw error to the client — a sqlx Display
     /// can carry SQL fragments, column/constraint names, and driver internals.
