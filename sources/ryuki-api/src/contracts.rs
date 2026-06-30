@@ -10708,7 +10708,8 @@ async fn noise_detect(
             ));
         }
         let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
-            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC"
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC \
+             LIMIT {MAX_LIST_ROWS}"
         ))
         .fetch_all(pool)
         .await
@@ -10746,7 +10747,8 @@ async fn noise_flapping_detect(
             ));
         }
         let rows: Vec<NoisyTriggerRow> = sqlx::query_as(&format!(
-            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC"
+            "SELECT {NOISE_COLUMNS} FROM noisy_triggers ORDER BY event_count_last_24h DESC \
+             LIMIT {MAX_LIST_ROWS}"
         ))
         .fetch_all(pool)
         .await
@@ -14159,6 +14161,15 @@ fn status_404(id: &str) -> (StatusCode, Json<Value>) {
 fn clamp_offset_usize(offset: usize) -> usize {
     offset.min(i64::MAX as usize)
 }
+
+/// A bounded cap for list reads that have no pagination params and currently
+/// `fetch_all` (then filter in Rust). It is defense-in-depth against an unbounded
+/// fetch/response (a DoS class) on a pathologically large table — these are config /
+/// detected-noise / execution tables that realistically stay far below this, so the
+/// ORDER BY keeps the most-relevant rows and the in-Rust scope filter is unaffected
+/// in practice. (A future improvement is pushing the scope/active filters into SQL so
+/// the cap counts only visible rows.)
+const MAX_LIST_ROWS: i64 = 1000;
 
 fn status_403() -> (StatusCode, Json<Value>) {
     (
@@ -21342,7 +21353,7 @@ async fn slo_list(AuthExtractor(session): AuthExtractor) -> ApiResult {
         return Ok(Json(json!({"slos": [], "durable": false})));
     };
     let rows: Vec<SloDefRow> = match sqlx::query_as(&format!(
-        "SELECT {SLO_COLUMNS} FROM slo_definitions ORDER BY created_at DESC"
+        "SELECT {SLO_COLUMNS} FROM slo_definitions ORDER BY created_at DESC LIMIT {MAX_LIST_ROWS}"
     ))
     .fetch_all(pool)
     .await
@@ -25149,7 +25160,8 @@ async fn alert_routes_create(
 async fn alert_routes_list() -> ApiResult {
     if let Some(pool) = get_db() {
         let rows: Vec<AlertRouteRow> = sqlx::query_as(&format!(
-            "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes ORDER BY created_at, id"
+            "SELECT {ALERT_ROUTE_COLUMNS} FROM alert_routes ORDER BY created_at, id \
+             LIMIT {MAX_LIST_ROWS}"
         ))
         .fetch_all(pool)
         .await
@@ -28769,8 +28781,17 @@ async fn runbook_active(AuthExtractor(session): AuthExtractor) -> ApiResult {
     // which executions are active. We query all rows and filter in Rust.
     let rows: Vec<ryuki_engine::runbook_execution::RunbookExecution> =
         sqlx::query_as::<_, crate::repos::runbook_executions::RunbookExecutionRow>(&format!(
-            "SELECT {} FROM runbook_executions ORDER BY created_at DESC, id DESC",
-            crate::repos::runbook_executions::COLUMNS
+            // Push the ACTIVE (non-terminal) filter into SQL so we never fetch the
+            // unbounded terminal-execution HISTORY just to discard it in Rust — bounds
+            // the read to the (small, transient) active set. The terminal string set
+            // mirrors the engine's is_terminal classifier (Completed/Failed/RolledBack);
+            // the Rust filter below re-confirms it (a no-op backstop). The LIMIT is a
+            // final cap.
+            "SELECT {} FROM runbook_executions \
+             WHERE status NOT IN ('completed', 'failed', 'rolled-back') \
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            crate::repos::runbook_executions::COLUMNS,
+            MAX_LIST_ROWS
         ))
         .fetch_all(pool)
         .await
@@ -63596,6 +63617,57 @@ mod runbook_executions_db_tests {
             &format!("test.engineer-{suffix}"),
         )
         .expect("build_execution must succeed for known inputs")
+    }
+
+    /// run-5: runbook_active pushes the active (non-terminal) filter into SQL so it no
+    /// longer fetches the unbounded terminal-execution history. A RUNNING execution
+    /// appears; a COMPLETED (terminal) one does NOT (and is never fetched).
+    #[tokio::test]
+    async fn runbook_active_excludes_terminal_executions() {
+        use crate::contracts::{runbook_active, AuthExtractor};
+        use axum::Json;
+        use ryuki_engine::auth::AuthSession;
+        let _serial = DB_TEST_SERIAL.lock().await;
+        // Drift-tolerant connect: runbook_executions predates the local DB migration drift.
+        let Some(url) = std::env::var("RYUKI_DATABASE_URL").ok().filter(|u| !u.is_empty()) else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let Some(pool) = crate::database::get_db() else {
+            eprintln!("SKIP: DB connect failed");
+            return;
+        };
+        let _ = crate::database::run_migrations(pool).await; // tolerate drift
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let active = make_exec(&suffix, "restart-service", "DEFRA"); // built non-terminal
+        let active_id = active.id.clone();
+        let mut done = make_exec(&format!("{suffix}-done"), "restart-service", "DEFRA");
+        done.status = ryuki_engine::runbook_execution::ExecutionStatus::Completed; // terminal
+        let done_id = done.id.clone();
+        crate::repos::runbook_executions::insert(pool, &active)
+            .await
+            .expect("insert active");
+        crate::repos::runbook_executions::insert(pool, &done)
+            .await
+            .expect("insert completed");
+
+        let Json(out) = runbook_active(AuthExtractor(AuthSession::static_dry_run()))
+            .await
+            .expect("runbook_active must succeed");
+        let body = out.to_string();
+        assert!(
+            body.contains(&active_id),
+            "a non-terminal (active) execution is listed"
+        );
+        assert!(
+            !body.contains(&done_id),
+            "a terminal (completed) execution is NOT listed (and not fetched)"
+        );
+
+        cleanup(pool, &active_id).await;
+        cleanup(pool, &done_id).await;
     }
 
     /// Full lifecycle: start -> approve -> complete.

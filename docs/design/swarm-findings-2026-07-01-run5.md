@@ -54,7 +54,10 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 - `shift_queue` grows unbounded — no prune (the 3 prunes covered job_executions/connection_health
   /check_results but NOT shift_queue). (high/M) — note: resolved items accumulate.
 - No-LIMIT list reads: `noise_detect()` noisy_triggers, `alert_routes_list()`, `slo_list()`,
-  `runbook_active()` — fetch ALL rows (medium-high/S-M).
+  `runbook_active()` — fetch ALL rows (medium-high/S-M). ✅ SHIPPED: `MAX_LIST_ROWS=1000` cap
+  (defense-in-depth) on all 4; runbook_active ALSO pushes the active (non-terminal) filter into SQL
+  (`WHERE status NOT IN ('completed','failed','rolled-back')`) so it no longer fetches the unbounded
+  terminal-execution history. codex plan+impl APPROVE.
 
 ### D. Unclamped numeric inputs → 500 / overflow (the validity_days bug class)
 - Unclamped `offset` → negative OFFSET 500 in requests_list + "various SQL queries" (high-medium/S).
