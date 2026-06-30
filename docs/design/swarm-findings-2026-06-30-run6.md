@@ -20,12 +20,15 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   left unchanged.)
 
 ### NEXT (clean, actionable, NOT blocked)
-- **Agent-job admin domain events** (observability) — `admin_requeue_dead_lettered_job` (high) and
-  `admin_set_job_priority` (medium) mutate job state/queue-order but emit NO domain event, unlike the
-  shipped `admin_cancel_pending_job` / `admin_force_fail_job` which DO. These are `agent_job`
-  aggregate events = PLATFORM-GLOBAL (site=NULL, env=NULL) → they do NOT hit the B0 event-feed leak,
-  so they ARE shippable. Mirror the cancel/force-fail emission pattern. Need a NON-alerting event
-  type ('job.requeued' / 'job.reprioritized') — confirm `to_status`/classify isn't alert-worthy.
+- ✅ **Agent-job admin domain events** (observability) — SHIPPED: `admin_requeue_dead_lettered_job`
+  (`job.requeued`) and `admin_set_job_priority` (`job.reprioritized`) now emit a NON-alerting
+  domain event atomically (inside the tx, after audit, before commit), mirroring the cancel/
+  force-fail pattern. `to_status` sentinels 'admin-requeued'/'admin-reprioritized' are NOT in
+  alert_worthy_statuses() so they never page (codex verified vs the `to_status = ANY($1)` prefilter
+  + classify). Platform-global (site/env None → no B0 leak). aggregate_id is the CANONICAL uuid
+  (codex Low finding — raw path string could miss /api/events lookups; siblings flagged as a
+  follow-up task). priority UPDATE RETURNING extended to include platform. +event assertions on the
+  requeue/reprioritize happy tests. codex impl APPROVE (1 Low fixed); green on a fresh DB.
 - **Stage completion timestamps** (request-lifecycle, high) — `completed_request_stage()`
   (contracts.rs ~14856) sets `started_at: None, completed_at: None`, so post-completion stages
   (verify/protect/publish/retire + validate/execute) persist NULL timestamps in the stages JSONB,

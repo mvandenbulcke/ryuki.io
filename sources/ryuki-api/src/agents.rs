@@ -2695,6 +2695,34 @@ pub async fn admin_requeue_dead_lettered_job(
     )
     .await
     .map_err(db_err)?;
+
+    // NON-alerting lifecycle event so a job re-entering the queue is observable on the
+    // /api/events feed (mirrors job.cancelled / job.force_failed). `to_status`
+    // 'admin-requeued' is deliberately NOT in event_alerts::alert_worthy_statuses(), so
+    // the alert feed's coarse SQL prefilter never fetches it — a requeue can never page.
+    // Platform-global (site/env None) — an agent_job carries no site/env axis.
+    // aggregate_id is the CANONICAL uuid (not the raw path string) so an /api/events
+    // lookup by canonical id finds it even if the caller used a non-canonical uuid form.
+    let canonical_job_id = uid.to_string();
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "job.requeued",
+            aggregate_type: "agent_job",
+            aggregate_id: &canonical_job_id,
+            site: None,
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "to_status": "admin-requeued",
+                "platform": platform,
+                "request_id": exec_request_id.to_string(),
+                "note": "admin requeued a dead-lettered job to Pending",
+            }),
+        },
+    )
+    .await
+    .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
 
     tracing::info!(job_id = %job_id, "dead-lettered agent job requeued to Pending");
@@ -3129,10 +3157,11 @@ pub async fn admin_set_job_priority(
     let uid = Uuid::parse_str(&job_id)
         .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
     let mut tx = pool.begin().await.map_err(db_err)?;
-    // Status CAS: only a pending job is reprioritizable.
-    let updated: Option<(String, i32)> = sqlx::query_as(
+    // Status CAS: only a pending job is reprioritizable. Return `platform` too so the
+    // domain event carries it (consistent with the other agent_job events).
+    let updated: Option<(String, i32, String)> = sqlx::query_as(
         "UPDATE agent_jobs SET priority = $1, updated_at = NOW() \
-         WHERE id = $2 AND status = 'Pending' RETURNING status, priority",
+         WHERE id = $2 AND status = 'Pending' RETURNING status, priority, platform",
     )
     .bind(body.priority)
     .bind(uid)
@@ -3140,7 +3169,7 @@ pub async fn admin_set_job_priority(
     .await
     .map_err(db_err)?;
     match updated {
-        Some((status, priority)) => {
+        Some((status, priority, platform)) => {
             crate::audit::record_audit_tx(
                 &mut tx,
                 &session,
@@ -3150,6 +3179,34 @@ pub async fn admin_set_job_priority(
                     "reprioritized",
                     json!({ "job_id": &job_id, "priority": priority }),
                 ),
+            )
+            .await
+            .map_err(db_err)?;
+
+            // NON-alerting lifecycle event so a queue-priority change is observable on the
+            // /api/events feed (mirrors the other agent_job admin events). `to_status`
+            // 'admin-reprioritized' is deliberately NOT in alert_worthy_statuses(), so the
+            // alert feed's coarse SQL prefilter never fetches it — it can never page.
+            // Platform-global (site/env None) — an agent_job carries no site/env axis.
+            // aggregate_id is the CANONICAL uuid (not the raw path string) so an
+            // /api/events lookup by canonical id finds it for any parseable uuid form.
+            let canonical_job_id = uid.to_string();
+            crate::repos::domain_events::insert(
+                &mut *tx,
+                crate::repos::domain_events::NewEvent {
+                    event_type: "job.reprioritized",
+                    aggregate_type: "agent_job",
+                    aggregate_id: &canonical_job_id,
+                    site: None,
+                    environment: None,
+                    actor: &session.user_id,
+                    payload: json!({
+                        "to_status": "admin-reprioritized",
+                        "platform": platform,
+                        "to_priority": priority,
+                        "note": "admin changed a pending job's queue priority",
+                    }),
+                },
             )
             .await
             .map_err(db_err)?;
@@ -9844,6 +9901,27 @@ mod tests {
         .unwrap();
         assert!(audited, "a reprioritize audit row must exist");
 
+        // A NON-alerting reprioritize event carries the new priority + the non-prefilter
+        // marker (queue-priority changes are observable on /api/events but never page).
+        let evt: Option<(String, i64)> = sqlx::query_as(
+            "SELECT payload->>'to_status', (payload->>'to_priority')::bigint FROM domain_events \
+             WHERE event_type = 'job.reprioritized' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("query reprioritize event");
+        assert_eq!(
+            evt.as_ref().map(|(s, p)| (s.as_str(), *p)),
+            Some(("admin-reprioritized", 9)),
+            "one non-alerting reprioritize event carrying the new priority"
+        );
+        assert!(
+            !ryuki_engine::event_alerts::alert_worthy_statuses().contains(&"admin-reprioritized"),
+            "admin-reprioritized must NOT be in the alert prefilter — it can never page"
+        );
+
         // A NON-pending (Leased) job → 409 (the status CAS misses).
         let leased = seed_pending_job(pool, &platform).await;
         sqlx::query("UPDATE agent_jobs SET status = 'Leased', agent_id = 'a' WHERE id = $1")
@@ -10189,6 +10267,27 @@ mod tests {
                 .expect("read agent_id");
         assert!(agent_id.is_none(), "lease state cleared");
         assert_eq!(requeue_audit_count(pool, job).await, 1, "one requeue audit");
+
+        // A NON-alerting requeue event with the robust non-prefilter marker (so a job
+        // re-entering the queue is observable on /api/events but can never page).
+        let to_status: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'to_status' FROM domain_events \
+             WHERE event_type = 'job.requeued' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("query requeue event");
+        assert_eq!(
+            to_status.as_deref(),
+            Some("admin-requeued"),
+            "one non-alerting requeue event with the non-prefilter marker"
+        );
+        assert!(
+            !ryuki_engine::event_alerts::alert_worthy_statuses().contains(&"admin-requeued"),
+            "admin-requeued must NOT be in the alert prefilter — a requeue can never page"
+        );
 
         cleanup_jobs_for_platform(pool, &platform).await;
         cleanup_request_row(pool, req).await;
