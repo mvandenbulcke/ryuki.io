@@ -66,6 +66,8 @@ guarded). See no-db-scope-guard-sweep.md. MEDIUM (no-DB-only). → **being fixed
 3. ✅ Offset-clamp sweep (D) — SHIPPED 9f6b8ab (clamp_offset_usize at 3 sites).
 4. shift_queue prune (C) — extends the proven prune pattern. ← NEXT
 5. Lifecycle domain events (B: decommission/AD/incident) — proven event pattern.
-6. ✅ Stuck-job force-fail (E) — SHIPPED: admin force-fail of a Leased non-LiveApply job (spec.mode
-   authoritative; LiveApply → reconcile path). Job inspection endpoint + the A0 scope-guard sweep
-   remain.
+6. ✅ Stuck-job force-fail (E) — SHIPPED (eed6c01): admin force-fail of a Leased non-LiveApply job
+   (spec.mode authoritative; LiveApply → reconcile path).
+7. ✅ Job inspection (E) — SHIPPED: GET /api/admin/agents/jobs/{job_id}/state (secret-safe lifecycle
+   read; 5-seg path avoids the /jobs/approve 405 shadow; sentinel value-leak test + routing-dispatch
+   regression). The A0 agent-job-admin scope-guard sweep + background-loop wedge event remain.

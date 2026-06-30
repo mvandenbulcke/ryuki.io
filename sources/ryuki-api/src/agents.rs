@@ -3305,6 +3305,76 @@ pub async fn admin_agent_job_result(
     })))
 }
 
+/// Non-secret operational state for the inspection endpoint. DELIBERATELY excludes every
+/// secret/large column: `spec` (vars), `fencing_token`, `cp_nonce`, `live_context` (the
+/// CP-signed grant), `evidence_json`, `signed_envelope`, `attempt_id`/`lease_generation`
+/// (fencing internals). The attestation lives behind GET .../result.
+#[derive(sqlx::FromRow)]
+struct JobInspectRow {
+    id: String,
+    request_id: String,
+    platform: String,
+    mode: String,
+    status: String,
+    result_status: Option<String>,
+    agent_id: Option<String>,
+    lease_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    delivery_attempts: i32,
+    evidence_digest: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// GET /api/admin/agents/jobs/{job_id}/state — an operator's read-only view of ONE agent
+/// job's LIFECYCLE state (status, mode, the holding agent, lease deadline, redispatch
+/// attempts), so an operator can SEE a stuck Leased/Running job before deciding to force-fail
+/// / cancel / reconcile it. Admin-only. SECRET-SAFE: never returns spec / fencing_token /
+/// cp_nonce / live_context / raw evidence / the signed envelope (the attestation is
+/// GET .../result). The 5-segment `…/state` path (vs a bare 4-segment `…/jobs/{job_id}`)
+/// avoids shadowing `…/agents/{agent_id}/approve|revoke` for an agent literally named
+/// "jobs" — a bare GET there would 405 the agent's approve/revoke (codex).
+pub async fn admin_agent_job_get(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission is required to inspect an agent job"));
+    }
+    // Parse the id BEFORE get_db (codex) so a malformed id 404s even during a DB outage.
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let row: Option<JobInspectRow> = sqlx::query_as(
+        "SELECT id::text AS id, request_id::text AS request_id, platform, mode, status, \
+                result_status, agent_id, lease_deadline, delivery_attempts, evidence_digest, \
+                created_at, updated_at, completed_at \
+         FROM agent_jobs WHERE id = $1",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let Some(r) = row else {
+        return Err(not_found(format!("agent job '{job_id}' not found")));
+    };
+    Ok(Json(json!({
+        "job_id": r.id,
+        "request_id": r.request_id,
+        "platform": r.platform,
+        "mode": r.mode,
+        "status": r.status,
+        "result_status": r.result_status,
+        "agent_id": r.agent_id,
+        "lease_deadline": r.lease_deadline.map(|d| d.to_rfc3339()),
+        "delivery_attempts": r.delivery_attempts,
+        "evidence_digest": r.evidence_digest,
+        "created_at": r.created_at.to_rfc3339(),
+        "updated_at": r.updated_at.to_rfc3339(),
+        "completed_at": r.completed_at.map(|d| d.to_rfc3339()),
+    })))
+}
+
 /// Admin route: sits under `/api/admin/agents/` so the human RBAC middleware
 /// enforces `admin` permission. Agent tokens can never reach this path because
 /// the `/api/agents/` exemption in `is_agent_exempt_path` is path-specific and
@@ -3347,6 +3417,10 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/result",
             get(admin_agent_job_result),
+        )
+        .route(
+            "/api/admin/agents/jobs/{job_id}/state",
+            get(admin_agent_job_get),
         )
         .route(
             "/api/admin/agents/jobs/{job_id}/reconcile",
@@ -9327,6 +9401,103 @@ mod tests {
         let _ = pool;
     }
 
+    // ── Admin job inspection (read-only operational state) ─────────────────────
+
+    /// Inspecting a job returns its operational state and NO secret/large columns
+    /// (spec / fencing_token / cp_nonce / live_context / signed_envelope / evidence_json).
+    #[tokio::test]
+    async fn inspect_job_returns_state_without_secrets() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-insp-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        // Bury a recognizable SENTINEL in the SECRET columns (spec vars, live_context,
+        // fencing_token, cp_nonce) so the test proves no VALUE leaks — not just no key (codex).
+        let sentinel = format!("SENTINEL-SECRET-{}", Uuid::new_v4().simple());
+        let mut spec = dead_letter_spec(req, JobMode::OfflineDryRun);
+        spec.vars.insert("secret_var".into(), sentinel.clone());
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        let live_context = serde_json::json!({ "grant_token": sentinel.clone() });
+        let evidence_json = serde_json::json!({ "raw_evidence": sentinel.clone() });
+        let signed_envelope = serde_json::json!({ "attestation": sentinel.clone() });
+        let job: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs \
+             (request_id, platform, spec, mode, status, live_context, fencing_token, cp_nonce, \
+              evidence_json, signed_envelope) \
+             VALUES ($1, $2, $3, 'OfflineDryRun', 'Leased', $4, $5, $6, $7, $8) RETURNING id",
+        )
+        .bind(req)
+        .bind(&platform)
+        .bind(&spec_json)
+        .bind(&live_context)
+        .bind(&sentinel)
+        .bind(&sentinel)
+        .bind(&evidence_json)
+        .bind(&signed_envelope)
+        .fetch_one(pool)
+        .await
+        .expect("seed sentinel-bearing job");
+
+        let Json(out) =
+            admin_agent_job_get(Path(job.to_string()), Extension(AuthSession::static_dry_run()))
+                .await
+                .expect("inspect must succeed");
+        assert_eq!(out["job_id"], json!(job.to_string()));
+        assert_eq!(out["status"], json!("Leased"));
+        assert_eq!(out["mode"], json!("OfflineDryRun"));
+        assert_eq!(out["platform"], json!(platform));
+        assert_eq!(out["delivery_attempts"], json!(0));
+        assert!(out["created_at"].is_string(), "created_at is present");
+
+        // Secret hygiene: NO secret/large column names appear anywhere in the response.
+        let body = out.to_string();
+        for forbidden in [
+            "spec",
+            "fencing_token",
+            "cp_nonce",
+            "live_context",
+            "signed_envelope",
+            "evidence_json",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the inspection response must not expose `{forbidden}`: {body}"
+            );
+        }
+        // And no VALUE from the secret columns leaks.
+        assert!(
+            !body.contains(&sentinel),
+            "a secret-column sentinel value must NEVER appear in the inspection response"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// unknown id → 404; non-admin → 403.
+    #[tokio::test]
+    async fn inspect_unknown_404_and_non_admin_403() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let unknown = Uuid::new_v4();
+        let e =
+            admin_agent_job_get(Path(unknown.to_string()), Extension(AuthSession::static_dry_run()))
+                .await
+                .expect_err("unknown id is a 404");
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        let d = admin_agent_job_get(Path(unknown.to_string()), Extension(non_admin_session()))
+            .await
+            .expect_err("a non-admin is forbidden");
+        assert_eq!(d.0, StatusCode::FORBIDDEN);
+        let _ = pool;
+    }
+
     async fn requeue_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_log \
@@ -10305,5 +10476,31 @@ mod tests {
     #[test]
     fn admin_routes_build_with_dead_letter_paths() {
         let _router = admin_routes();
+    }
+
+    /// Routing regression (codex): the job-state read is a 5-segment `jobs/{job_id}/state`
+    /// route, so it must NOT shadow `POST /api/admin/agents/{agent_id}/approve` for an agent
+    /// literally named "jobs". matchit must still dispatch `POST /agents/jobs/approve` to the
+    /// approve route (the handler then fails extraction without the auth middleware — a 4xx/5xx,
+    /// NOT a 405 from the jobs namespace). A bare 4-segment `jobs/{job_id}` GET would 405 it.
+    #[tokio::test]
+    async fn admin_jobs_namespace_does_not_shadow_agent_approve() {
+        use tower::ServiceExt;
+        let resp = admin_routes()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/agents/jobs/approve")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router dispatch");
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /agents/jobs/approve must reach the agent approve route, not 405 via the \
+             jobs/{{job_id}}/state namespace"
+        );
     }
 }
