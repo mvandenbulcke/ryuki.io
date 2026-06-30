@@ -28,7 +28,20 @@ guarded). See no-db-scope-guard-sweep.md. MEDIUM (no-DB-only). → **being fixed
   site-scope" — LIKELY MOOT: those are admin-only and admin-with-no-scope is unrestricted. VERIFY the
   admin=superuser assumption before acting (the run-3 doc already flagged the integration one moot).
 
+### B0. NEW (codex, decommission-event review): event-feed scope leak for site-only aggregates
+The /api/events feed scope predicate (repos/domain_events.rs:82-83) makes `environment IS NULL` rows
+visible to ANY env-scoped principal (the deliberate permissive policy). A SITE-ONLY aggregate's
+events (site=Some, env=NULL — e.g. decommission, and site-only SLO/budget) therefore leak to an
+env-ONLY-scoped principal (site_scope=[], env_scope=[…]) who is UNRESTRICTED on site and passes the
+env axis via NULL — even though the site-only handlers (site_scope_guard_or_404) FAIL CLOSED for that
+principal. The decommission observability events (B below) were implemented + REVERTED for this
+reason. Resolving it is a cross-cutting decision (the deliberate permissive policy vs site-only-handler
+strictness; affects SLO/budget too) — flagged as a spawn_task. Until then, the decommission/AD/incident
+lifecycle events (B) are BLOCKED on this decision (they'd hit the same leak).
+
 ### B. Observability — lifecycle transitions emitting NO domain event (can't alert/observe)
+NOTE: decommission/AD/incident are site-scoped aggregates → their events hit the B0 leak → BLOCKED on
+the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 - **Background scheduler loop wedge emits no domain event** (CRITICAL/M) — a wedged loop only shows
   a 503 on /api/platform/health/loops; no queryable/acknowledgeable event. event_alerts has no
   `background_loop`/`platform` aggregate. HIGH real-world impact (silent scheduling stop).
