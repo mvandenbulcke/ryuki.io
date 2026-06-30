@@ -77,7 +77,8 @@ the B0 scope-policy decision. Do NOT ship these events until B0 is resolved.
 1. ✅ No-DB scope guard sweep (A) — SHIPPED a08f1ac (6 handlers).
 2. Background-loop wedge domain event (B, CRITICAL).
 3. ✅ Offset-clamp sweep (D) — SHIPPED 9f6b8ab (clamp_offset_usize at 3 sites).
-4. shift_queue prune (C) — extends the proven prune pattern. ← NEXT
+4. ✅ shift_queue prune (C) — SHIPPED: resolved+age prune (a NEW shape — open items never pruned),
+   90-day retention, daily, capped; mig 137 (seed ffff + retention index). codex plan+impl APPROVE.
 5. Lifecycle domain events (B: decommission/AD/incident) — proven event pattern.
 6. ✅ Stuck-job force-fail (E) — SHIPPED (eed6c01): admin force-fail of a Leased non-LiveApply job
    (spec.mode authoritative; LiveApply → reconcile path).

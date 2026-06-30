@@ -118,6 +118,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "job_executions_prune"
                 | "connection_health_checks_prune"
                 | "check_results_prune"
+                | "shift_queue_prune"
         )
 }
 
@@ -220,6 +221,8 @@ mod tests {
         assert!(!job_is_read_only("connection_health_checks_prune"));
         assert!(job_is_schedulable("check_results_prune"));
         assert!(!job_is_read_only("check_results_prune"));
+        assert!(job_is_schedulable("shift_queue_prune"));
+        assert!(!job_is_read_only("shift_queue_prune"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));
@@ -231,6 +234,7 @@ mod tests {
         assert!(!job_is_schedulable("job_executions_prune_live"));
         assert!(!job_is_schedulable("connection_health_checks_prune_live"));
         assert!(!job_is_schedulable("check_results_prune_live"));
+        assert!(!job_is_schedulable("shift_queue_prune_live"));
         assert!(!job_is_schedulable("destroy_everything"));
         assert!(!job_is_schedulable("synthetic_health_run_live"));
         assert!(!job_is_schedulable("maintain_review_scan_live"));

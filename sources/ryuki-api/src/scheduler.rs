@@ -175,6 +175,44 @@ async fn prune_job_executions(
     .await
 }
 
+/// Prune RESOLVED `shift_queue` items older than `retention_days`, capped at
+/// `max_per_run`. A DIFFERENT shape than [`prune_history_newest_n`] (newest-N): an OPEN
+/// item (`resolved = false`) is LIVE work and is NEVER pruned regardless of count or age.
+/// `resolved = true AND resolved_at IS NULL` (a resolved row with no timestamp) is also
+/// kept — there is no age anchor. The OUTER DELETE re-asserts the full predicate (not just
+/// `id IN`) so the invariant holds even under a concurrent re-open. The per-run cap bounds
+/// the DELETE so the first prune of a years-old backlog drains over several daily runs.
+/// `shift_queue` has no append-only trigger and no inbound FK, so the DELETE is safe.
+/// All SQL is constant; `retention_days`/`max_per_run` are bound params (no injection).
+async fn prune_resolved_shift_queue(
+    conn: &mut sqlx::PgConnection,
+    retention_days: i64,
+    max_per_run: i64,
+) -> Result<u64, sqlx::Error> {
+    if retention_days <= 0 || max_per_run <= 0 {
+        return Ok(0);
+    }
+    let deleted = sqlx::query(
+        "DELETE FROM shift_queue \
+         WHERE resolved = true \
+           AND resolved_at IS NOT NULL \
+           AND resolved_at < NOW() - ($1::bigint * INTERVAL '1 day') \
+           AND id IN ( \
+               SELECT id FROM shift_queue \
+               WHERE resolved = true AND resolved_at IS NOT NULL \
+                 AND resolved_at < NOW() - ($1::bigint * INTERVAL '1 day') \
+               ORDER BY resolved_at ASC, id ASC \
+               LIMIT $2 \
+           )",
+    )
+    .bind(retention_days)
+    .bind(max_per_run)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 async fn run_job(
     tx: &mut Transaction<'_, Postgres>,
     job_kind: &str,
@@ -1113,6 +1151,18 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("pruned {pruned} old check_results row(s)")),
+            ))
+        }
+        "shift_queue_prune" => {
+            // Safe-internal write (run-5): bound the unbounded RESOLVED shift_queue history. OPEN
+            // items (resolved=false) are live work and are NEVER pruned; only resolved items older
+            // than the retention window. Slow-growing (deduped one-per-asset), so DAILY suffices.
+            const RETENTION_DAYS: i64 = 90;
+            const MAX_PER_RUN: i64 = 20_000;
+            let pruned = prune_resolved_shift_queue(tx, RETENTION_DAYS, MAX_PER_RUN).await?;
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("pruned {pruned} resolved shift_queue row(s)")),
             ))
         }
         // Unreachable: job_is_schedulable gated above. Kept exhaustive and safe.
@@ -4336,6 +4386,137 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    // ---- run-5: shift_queue resolved-history prune --------------------------
+
+    const SHIFT_QUEUE_PRUNE_SEED_ID: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+
+    /// Seed a `sqprune-test` shift_queue item keyed by source_ci_key, with an explicit
+    /// resolved flag + a raw `resolved_at` SQL expression (test-controlled literal).
+    async fn seed_shift_item(pool: &PgPool, key: &str, resolved: bool, resolved_at_sql: &str) {
+        sqlx::query(&format!(
+            "INSERT INTO shift_queue \
+             (item_type, title, description, priority, metadata, resolved, resolved_at) \
+             VALUES ('sqprune-test', 't', 'd', 'P3', $1::jsonb, $2, {resolved_at_sql})"
+        ))
+        .bind(serde_json::json!({ "source_ci_key": key }).to_string())
+        .bind(resolved)
+        .execute(pool)
+        .await
+        .expect("seed shift_queue item");
+    }
+
+    async fn shift_item_exists(pool: &PgPool, key: &str) -> bool {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'sqprune-test' AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        n > 0
+    }
+
+    #[tokio::test]
+    async fn shift_queue_prune_deletes_old_resolved_keeps_the_rest() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let t = uuid::Uuid::new_v4().simple().to_string();
+        let old = format!("old-{t}");
+        let recent = format!("recent-{t}");
+        let open = format!("open-{t}");
+        let reopened = format!("reopened-{t}");
+        let nullres = format!("nullres-{t}");
+
+        seed_shift_item(pool, &old, true, "NOW() - INTERVAL '200 days'").await; // → pruned
+        seed_shift_item(pool, &recent, true, "NOW() - INTERVAL '5 days'").await; // keep (recent)
+        seed_shift_item(pool, &open, false, "NULL").await; // keep (OPEN = live work)
+        // A REOPENED item: resolved=false but with an OLD non-null resolved_at — the
+        // resolved=true predicate must still exclude it (codex).
+        seed_shift_item(pool, &reopened, false, "NOW() - INTERVAL '300 days'").await;
+        seed_shift_item(pool, &nullres, true, "NULL").await; // keep (no age anchor)
+
+        let mut tx = pool.begin().await.unwrap();
+        let (status, _) = run_job(&mut tx, "shift_queue_prune").await.unwrap();
+        assert_eq!(status, "succeeded");
+        tx.commit().await.unwrap();
+
+        assert!(
+            !shift_item_exists(pool, &old).await,
+            "a resolved item older than the retention window is pruned"
+        );
+        assert!(
+            shift_item_exists(pool, &recent).await,
+            "a recently-resolved item (within retention) survives"
+        );
+        assert!(
+            shift_item_exists(pool, &open).await,
+            "an OPEN item (resolved=false) is NEVER pruned — live work"
+        );
+        assert!(
+            shift_item_exists(pool, &reopened).await,
+            "a REOPENED item (resolved=false with an old resolved_at) is NEVER pruned"
+        );
+        assert!(
+            shift_item_exists(pool, &nullres).await,
+            "a resolved item with NULL resolved_at survives (no age anchor)"
+        );
+
+        for k in [&old, &recent, &open, &reopened, &nullres] {
+            sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' = $1")
+                .bind(k)
+                .execute(pool)
+                .await
+                .ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_137_is_idempotent_and_index_valid() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Shift-queue resolved-history prune', 'shift_queue_prune', 86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(SHIFT_QUEUE_PRUNE_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, enabled, created_by): (String, String, i64, bool, String) =
+            sqlx::query_as(
+                "SELECT name, job_kind, interval_secs, enabled, created_by FROM schedules \
+                 WHERE id = $1",
+            )
+            .bind(SHIFT_QUEUE_PRUNE_SEED_ID)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "Shift-queue resolved-history prune", "seed name");
+        assert_eq!(kind, "shift_queue_prune", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert!(enabled, "seed ships enabled");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // Self-contained retention index (the local DB may be behind on migrations); same DDL
+        // as the migration (IF NOT EXISTS → a no-op once it has applied).
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shift_queue_resolved_prune \
+             ON shift_queue (resolved_at ASC NULLS LAST, id ASC) \
+             WHERE resolved = true AND resolved_at IS NOT NULL",
+        )
+        .execute(pool)
+        .await
+        .expect("the shift_queue retention index DDL is valid");
     }
 
     // ---- run-3: job_executions retention prune ------------------------------
