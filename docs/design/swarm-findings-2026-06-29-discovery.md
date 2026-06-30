@@ -77,6 +77,14 @@ secret-rotation/legal-hold/recertification filled (engine classifier + run_job a
 - **Per-request policy-readiness (policy-eval) not shown in request detail** (M/S) — single
   scope-guarded GET, informational.
 
+## CONFIRMED, open — agent-job lifecycle
+- **Pending agent-job cancel** (M/M) — no way for an admin to cancel a queued job. ✅ SHIPPED —
+  `POST /api/admin/agents/jobs/{job_id}/cancel` (mig 136 adds terminal `Cancelled`): admin-gated CAS
+  on `status='Pending'` (409 for leased/running/terminal — safe, no split-brain), audited, a
+  NON-alerting `job.cancelled` event (to_status `admin-cancelled`, NOT in the alert prefilter), and
+  job-scoped (parent request left actionable; operator fails it via the existing `/fail`). codex
+  plan(2 blockers→fixed)+impl APPROVE. See pending-job-cancel.md.
+
 ## Adversarially DOWNGRADED (do NOT pursue as framed)
 - audit_retention "enforcement": audit_log/domain_events are append-only BY DESIGN (a BEFORE-DELETE
   trigger raises) — there is nothing to "enforce"; not a real gap.

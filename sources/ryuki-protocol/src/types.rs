@@ -28,8 +28,12 @@ pub enum JobMode {
 // ---------------------------------------------------------------------------
 
 /// Lifecycle status of a job, as tracked by the control plane.
-/// This is the CP-side state machine; agents MUST NOT report these values —
-/// use [`JobResultStatus`] for agent-reported terminal outcomes.
+/// This is the agent-DISPATCHABLE subset of the CP-side state machine; agents MUST
+/// NOT report these values — use [`JobResultStatus`] for agent-reported terminal
+/// outcomes. Some CP-INTERNAL terminal statuses (`DeadLettered`, `Cancelled`) exist
+/// in the `agent_jobs.status` DB CHECK but are intentionally NOT modelled here: they
+/// are never dispatched (poll filters `status = 'Pending'`) and admin reads carry
+/// `status` as a String, so they never decode into this enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {

@@ -2824,6 +2824,124 @@ pub async fn admin_resolve_reconcile_required_job(
     })))
 }
 
+/// Body for POST /api/admin/agents/jobs/{job_id}/cancel.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelJobBody {
+    reason: String,
+}
+
+/// POST /api/admin/agents/jobs/{job_id}/cancel
+///
+/// Cancels a PENDING (not-yet-leased) agent job — one created in error or no longer
+/// wanted — instead of letting an agent lease and run it. CASes on `status = 'Pending'`:
+/// once `Leased`/`Running` an agent owns the job (cancelling CP-side would split-brain),
+/// and a terminal job is already done — both → 409. Admin-only, audited; emits a
+/// NON-alerting `job.cancelled` event. JOB-SCOPED: the parent request stays `Executing`,
+/// and the operator fails/retries it separately via `POST /api/requests/{id}/fail`
+/// (identical to the reconcile-resolve contract).
+pub async fn admin_cancel_pending_job(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<CancelJobBody>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission is required to cancel a job"));
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(bad_request("a cancellation reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(bad_request("reason is too long (max 2000 characters)"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // CAS: only a Pending job cancels. RETURNING request_id + platform for the audit/event/
+    // response. A job leased concurrently → 0 rows → 409 (poll won the race); a concurrent
+    // double-cancel → the second sees 'Cancelled' → 409.
+    let updated: Option<(String, String)> = sqlx::query_as(
+        "UPDATE agent_jobs SET status = 'Cancelled', updated_at = NOW() \
+         WHERE id = $1 AND status = 'Pending' \
+         RETURNING request_id::text, platform",
+    )
+    .bind(uid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some((request_id, platform)) = updated else {
+        // Distinguish not-found (404) from wrong-status (409) with a clean re-read.
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+                .bind(uid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        return match existing {
+            None => Err(not_found(format!("agent job '{job_id}' not found"))),
+            Some(status) => Err(conflict(format!(
+                "job is in status '{status}'; only Pending jobs can be cancelled"
+            ))),
+        };
+    };
+
+    // Audit the operator action — the free-text reason lives ONLY here.
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-job-cancelled",
+            Some("pending"),
+            "cancelled",
+            json!({
+                "job_id": &job_id,
+                "request_id": request_id,
+                "platform": platform,
+                "reason": reason,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+
+    // NON-alerting lifecycle event. `to_status` 'admin-cancelled' is deliberately NOT in
+    // event_alerts::alert_worthy_statuses(), so the alert feed's coarse SQL prefilter never
+    // fetches it — a cancel can never page (robust vs relying on classify() to drop a
+    // prefilter-matched 'cancelled'). NO free-text reason in the payload.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "job.cancelled",
+            aggregate_type: "agent_job",
+            aggregate_id: &job_id,
+            site: None,
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "to_status": "admin-cancelled",
+                "platform": platform,
+                "request_id": request_id,
+                "note": "admin cancelled a pending job before dispatch",
+            }),
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::info!(job_id = %job_id, "pending agent job cancelled by admin");
+    Ok(Json(json!({
+        "job_id": job_id,
+        "request_id": request_id,
+        "status": "Cancelled",
+        "cancelled": true,
+        "note": "the parent request remains Executing; fail or retry it separately",
+    })))
+}
+
 /// Body for POST /api/admin/agents/jobs/{job_id}/priority (#15).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3074,6 +3192,10 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/reconcile",
             post(admin_resolve_reconcile_required_job),
+        )
+        .route(
+            "/api/admin/agents/jobs/{job_id}/cancel",
+            post(admin_cancel_pending_job),
         )
         // Static `queue-depth` in the `{agent_id}` slot (same matchit pattern).
         .route(
@@ -8465,6 +8587,237 @@ mod tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    // ── Admin cancel of a Pending job ─────────────────────────────────────────
+
+    /// Like `handler_pool` but TOLERANT of a behind-migrations local DB (mirrors the
+    /// scheduler db_tests' `global_pool`): it does NOT bail when `run_migrations` reports a
+    /// checksum drift, so the cancel tests run on a drifted local DB and on a fresh CI DB.
+    async fn handler_pool_lenient() -> Option<&'static PgPool> {
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
+        if url.is_empty() {
+            return None;
+        }
+        crate::database::try_connect_with_url(&url, 5, 1, 300, 30, 1800).await;
+        let pool = crate::database::get_db()?;
+        let _ = crate::database::run_migrations(pool).await; // tolerate drift
+        Some(pool)
+    }
+
+    /// Ensure the `agent_jobs` status CHECK admits `'Cancelled'` (mig 136), self-applied
+    /// with the SAME DDL as the migration so the happy test writes `'Cancelled'` even on a
+    /// behind-migrations local DB; on CI the migration already did this, so the guarded
+    /// DROP/ADD is an idempotent re-apply (a superset — existing statuses still allowed).
+    async fn ensure_cancelled_status_allowed(pool: &PgPool) {
+        sqlx::query("ALTER TABLE agent_jobs DROP CONSTRAINT IF EXISTS agent_jobs_status_check")
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "ALTER TABLE agent_jobs ADD CONSTRAINT agent_jobs_status_check \
+             CHECK (status IN ('Pending','Leased','Running','Succeeded','Failed','Expired',\
+             'ReconcileRequired','LiveRefused','DeadLettered','Cancelled'))",
+        )
+        .execute(pool)
+        .await
+        .expect("widen agent_jobs status CHECK to admit 'Cancelled'");
+    }
+
+    /// Seed an agent job in a given status (Pending / Leased) for the cancel tests.
+    async fn seed_job_in_status(
+        pool: &PgPool,
+        platform: &str,
+        request_id: Uuid,
+        status: &str,
+    ) -> Uuid {
+        let spec = dead_letter_spec(request_id, JobMode::OfflineDryRun);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, 'OfflineDryRun', $4) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(&spec_json)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("seed agent job")
+    }
+
+    async fn cancel_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'agent-job-cancelled' AND detail->>'job_id' = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count cancel audit")
+    }
+
+    /// The `to_status` of the job's `job.cancelled` event, or None if absent.
+    async fn cancelled_event_to_status(pool: &PgPool, job_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'to_status' FROM domain_events \
+             WHERE event_type = 'job.cancelled' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("query cancel event")
+    }
+
+    /// Cancel a Pending job → Cancelled: audited, a NON-alerting cancel event, the parent
+    /// request left actionable; a second cancel 409s (no 2nd audit).
+    #[tokio::test]
+    async fn cancel_pending_happy_then_double_cancel_409() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        ensure_cancelled_status_allowed(pool).await;
+        let platform = format!("plt-cxl-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_job_in_status(pool, &platform, req, "Pending").await;
+
+        let Json(out) = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(CancelJobBody {
+                reason: "created in error; platform decommissioned".into(),
+            }),
+        )
+        .await
+        .expect("cancel must succeed");
+        assert_eq!(out["status"], json!("Cancelled"));
+        assert_eq!(out["cancelled"], json!(true));
+        assert_eq!(out["request_id"], json!(req.to_string()));
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Cancelled", "the job is now terminal Cancelled");
+        // Parent request remains actionable — NOT stranded into an invalid state (codex B2).
+        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            req_status, "executing",
+            "the parent request stays Executing (operator fails it separately)"
+        );
+        assert_eq!(cancel_audit_count(pool, job).await, 1, "one cancel audit row");
+        // The event uses the robust non-prefilter marker (codex B1).
+        assert_eq!(
+            cancelled_event_to_status(pool, job).await.as_deref(),
+            Some("admin-cancelled"),
+            "one non-alerting cancel event with the non-prefilter marker"
+        );
+        assert!(
+            !ryuki_engine::event_alerts::alert_worthy_statuses().contains(&"admin-cancelled"),
+            "admin-cancelled must NOT be in the alert prefilter — a cancel can never page"
+        );
+
+        // A second cancel of the now-Cancelled job → 409, no second audit.
+        let again = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(CancelJobBody {
+                reason: "again".into(),
+            }),
+        )
+        .await
+        .expect_err("a cancelled job cannot be cancelled again");
+        assert_eq!(again.0, StatusCode::CONFLICT);
+        assert_eq!(
+            cancel_audit_count(pool, job).await,
+            1,
+            "the failed second cancel writes no audit row"
+        );
+
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// A Leased job cannot be cancelled → 409; the job stays Leased and no audit is written.
+    #[tokio::test]
+    async fn cancel_leased_job_409() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-cxl-leased-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_job_in_status(pool, &platform, req, "Leased").await;
+
+        let err = admin_cancel_pending_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(CancelJobBody {
+                reason: "too late".into(),
+            }),
+        )
+        .await
+        .expect_err("only a Pending job can be cancelled");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Leased", "the leased job is untouched");
+        assert_eq!(
+            cancel_audit_count(pool, job).await,
+            0,
+            "a wrong-status cancel writes no audit row"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// An unknown job id → 404; a non-admin → 403.
+    #[tokio::test]
+    async fn cancel_unknown_404_and_non_admin_403() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let unknown = Uuid::new_v4();
+        let err = admin_cancel_pending_job(
+            Path(unknown.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(CancelJobBody {
+                reason: "nope".into(),
+            }),
+        )
+        .await
+        .expect_err("unknown id is a 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+
+        let denied = admin_cancel_pending_job(
+            Path(unknown.to_string()),
+            Extension(non_admin_session()),
+            Json(CancelJobBody {
+                reason: "nope".into(),
+            }),
+        )
+        .await
+        .expect_err("a non-admin is forbidden");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+
+        let _ = pool; // pool only needed to gate on RYUKI_DATABASE_URL availability
     }
 
     async fn requeue_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
