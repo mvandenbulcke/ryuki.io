@@ -30652,11 +30652,34 @@ async fn ipam_reserve_ip(
         // #2: fast pre-check — a scoped principal may only reserve an IP in its
         // own site (the authoritative re-check happens under the row lock below).
         guard_body_site_scope(&session, &subnet.site)?;
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        // Authoritative work UNDER the subnet's row lock — this also closes a
+        // double-allocation race. Re-read the FULL locked subnet (fresh counters +
+        // site) AND the current reservations IN-TX, then pick the IP and compute the
+        // counters from that fresh snapshot. The unlocked pre-read above is ONLY a fast
+        // not-found / scope pre-check. Doing the selection here means two concurrent
+        // reserves (serialized by this FOR UPDATE on the subnet) cannot both pick the
+        // same IP, nor both decrement from the same stale counter (the old code read the
+        // reservations + computed counters OUTSIDE the tx, so the second reserve
+        // re-inserted the first's IP and overwrote the counter).
+        let locked_subnet_row: Option<IpamSubnetRow> = sqlx::query_as(&format!(
+            "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(&b.subnet_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        // A concurrent delete between the unlocked pre-read and this lock yields a
+        // clean 400 (same as the pre-read's not-found), not a 500.
+        let Some(locked_subnet) = locked_subnet_row.map(|r| r.to_engine()) else {
+            return Err(status_400(&format!("Subnet '{}' not found", b.subnet_id)));
+        };
+        guard_body_site_scope(&session, &locked_subnet.site)?;
         let existing_rows: Vec<IpReservationRow> = sqlx::query_as(&format!(
             "SELECT {IP_RESERVATION_COLUMNS} FROM ip_reservations WHERE subnet_id = $1"
         ))
         .bind(&b.subnet_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(db_error)?;
         let existing: Vec<dns_ipam::IpReservation> = existing_rows
@@ -30664,7 +30687,7 @@ async fn ipam_reserve_ip(
             .map(IpReservationRow::to_engine)
             .collect();
         let reservation = dns_ipam::build_reservation(
-            &subnet,
+            &locked_subnet,
             &existing,
             &b.hostname,
             &b.purpose,
@@ -30675,30 +30698,14 @@ async fn ipam_reserve_ip(
 
         // Mirror the engine's counter mutation: one IP consumed; mark Exhausted
         // when the last one goes (existing status is otherwise preserved).
-        let new_used = subnet.used_ips + 1;
-        let new_available = subnet.available_ips - 1;
+        let new_used = locked_subnet.used_ips + 1;
+        let new_available = locked_subnet.available_ips.saturating_sub(1);
         let new_status = if new_available == 0 {
             dns_ipam::IpamSubnetStatus::Exhausted
         } else {
-            subnet.status.clone()
+            locked_subnet.status.clone()
         };
-
-        let mut tx = pool.begin().await.map_err(db_error)?;
-        // #2: authoritative re-check under the parent subnet's row lock, so a
-        // concurrent re-home cannot slip an out-of-scope reservation through the
-        // window between the unlocked load and these writes.
-        let locked_site: Option<String> =
-            sqlx::query_scalar("SELECT site FROM ipam_subnets WHERE id = $1 FOR UPDATE")
-                .bind(&b.subnet_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_error)?;
-        // A concurrent delete between the unlocked pre-read and this lock yields a
-        // clean 400 (same as the pre-read's not-found), not a 500.
-        let Some(locked_site) = locked_site else {
-            return Err(status_400(&format!("Subnet '{}' not found", b.subnet_id)));
-        };
-        guard_body_site_scope(&session, &locked_site)?;
+        let locked_site = locked_subnet.site.clone();
         sqlx::query(&format!(
             "INSERT INTO ip_reservations ({IP_RESERVATION_COLUMNS}) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
@@ -30746,7 +30753,7 @@ async fn ipam_reserve_ip(
             used_ips: new_used,
             available_ips: new_available,
             status: new_status,
-            ..subnet
+            ..locked_subnet
         };
         return Ok(Json(json!({
             "source": "database",
@@ -30800,15 +30807,26 @@ async fn ipam_release_ip(
             )));
         };
         guard_body_site_scope(&session, &subnet_site)?;
-        sqlx::query("DELETE FROM ip_reservations WHERE id = $1")
+        // The DELETE is AUTHORITATIVE: only credit the counter back if THIS call
+        // actually removed the row. Two concurrent releases of the same reservation
+        // both pre-read it (unlocked) and serialize on the subnet lock; without this
+        // check the second would DELETE 0 rows yet still increment available_ips,
+        // over-crediting the counter. 0 rows -> the reservation was already freed ->
+        // not-found (and the tx rolls back, leaving the counter untouched).
+        let deleted = sqlx::query("DELETE FROM ip_reservations WHERE id = $1")
             .bind(&id)
             .execute(&mut *tx)
             .await
-            .map_err(db_error)?;
+            .map_err(db_error)?
+            .rows_affected();
+        if deleted == 0 {
+            return Err(ipam_not_found(format!("Reservation '{id}' not found")));
+        }
+        // Clamp the credit at total_ips so the counter can never exceed capacity.
         sqlx::query(
             "UPDATE ipam_subnets \
              SET used_ips = GREATEST(used_ips - 1, 0), \
-                 available_ips = available_ips + 1, \
+                 available_ips = LEAST(available_ips + 1, total_ips), \
                  status = CASE WHEN status = 'Exhausted' THEN 'Available' ELSE status END \
              WHERE id = $1",
         )
@@ -42171,6 +42189,136 @@ mod db_lifecycle_tests {
             .execute(pool)
             .await
             .ok();
+    }
+
+    /// #run8: the ipam_reserve_ip HANDLER reserves a DISTINCT IP each call and
+    /// decrements the subnet counters atomically. Two sequential reserves must yield
+    /// two different IPs and used/available moving by exactly 2 — the new in-tx,
+    /// under-the-subnet-lock read+pick path (which closes the double-allocation race).
+    #[tokio::test]
+    async fn test_ipam_reserve_ip_handler_allocates_distinct_ips() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Json(created) = ipam_subnet_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(IpamSubnetCreateRequest {
+                cidr: "10.77.0.0/24".to_string(),
+                gateway: "10.77.0.1".to_string(),
+                vlan_id: 777,
+                site: "TESTSITE".to_string(),
+            }),
+        )
+        .await
+        .expect("create subnet");
+        let id = created["subnet"]["id"].as_str().unwrap().to_string();
+
+        let reserve = |hostname: &str| {
+            let id = id.clone();
+            let hostname = hostname.to_string();
+            async move {
+                ipam_reserve_ip(
+                    Extension(AuthSession::static_dry_run()),
+                    Json(IpamReserveRequest {
+                        subnet_id: id,
+                        hostname,
+                        purpose: "test".to_string(),
+                        ttl_days: 30,
+                    }),
+                )
+                .await
+            }
+        };
+
+        let Json(r1) = reserve("host-a").await.expect("reserve 1");
+        let Json(r2) = reserve("host-b").await.expect("reserve 2");
+        let ip1 = r1["reservation"]["ip_address"].as_str().unwrap().to_string();
+        let ip2 = r2["reservation"]["ip_address"].as_str().unwrap().to_string();
+
+        // Cleanup before asserting.
+        sqlx::query("DELETE FROM ip_reservations WHERE subnet_id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+
+        assert_ne!(ip1, ip2, "two reserves must hand out DISTINCT IPs");
+        assert_eq!(r2["subnet"]["used_ips"], 2, "used_ips moved by exactly 2");
+        assert_eq!(
+            r2["subnet"]["available_ips"], 252,
+            "available_ips decremented by exactly 2 (no stale-counter overwrite)"
+        );
+    }
+
+    /// #run8: ipam_release_ip is AUTHORITATIVE — a double-release of the same
+    /// reservation returns not-found on the second call and does NOT over-credit
+    /// available_ips (the counter is credited only when the DELETE removes the row).
+    #[tokio::test]
+    async fn test_ipam_release_is_idempotent_no_over_credit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Json(created) = ipam_subnet_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(IpamSubnetCreateRequest {
+                cidr: "10.88.0.0/24".to_string(),
+                gateway: "10.88.0.1".to_string(),
+                vlan_id: 888,
+                site: "TESTSITE".to_string(),
+            }),
+        )
+        .await
+        .expect("create subnet");
+        let subnet_id = created["subnet"]["id"].as_str().unwrap().to_string();
+
+        let Json(r) = ipam_reserve_ip(
+            Extension(AuthSession::static_dry_run()),
+            Json(IpamReserveRequest {
+                subnet_id: subnet_id.clone(),
+                hostname: "h".to_string(),
+                purpose: "test".to_string(),
+                ttl_days: 30,
+            }),
+        )
+        .await
+        .expect("reserve");
+        let res_id = r["reservation"]["id"].as_str().unwrap().to_string();
+
+        let Json(_) = ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id.clone()))
+            .await
+            .expect("first release");
+        let second =
+            ipam_release_ip(Extension(AuthSession::static_dry_run()), Path(res_id)).await;
+
+        let available: i32 =
+            sqlx::query_scalar("SELECT available_ips FROM ipam_subnets WHERE id = $1")
+                .bind(&subnet_id)
+                .fetch_one(pool)
+                .await
+                .expect("read available");
+        sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+            .bind(&subnet_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        assert!(
+            second.is_err(),
+            "a second release of the same reservation must be not-found"
+        );
+        assert_eq!(
+            available, 254,
+            "available_ips restored to capacity, NOT over-credited to 255"
+        );
     }
 
     /// #56: IPAM subnet CRUD — create (counters derived from the CIDR), update

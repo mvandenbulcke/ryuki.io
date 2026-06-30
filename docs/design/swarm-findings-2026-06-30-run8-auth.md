@@ -87,8 +87,32 @@ guards). Only the INCIDENT machine had a real gap.
   (vs the fail-closed hard-error decode the AD/cert repos use). Not exploitable without a corrupt DB
   value.
 
+---
+
+# run-8d — IPAM / DNS ALLOCATION deep-dive
+
+HIGH-yield area (3 findings). usable_hosts /31//32//0 edges, gateway=network/broadcast rejection,
+DNS TTL>i32::MAX rejection, record-type closed match, VLAN 4095 rejection, DB-path counter atomicity
+all verified sound.
+
+## Shipped
+- ✅ **Double-allocation TOCTOU race in ipam_reserve_ip** (HIGH) — SHIPPED: the DB handler read the
+  reservations + computed counters OUTSIDE the tx and only locked the subnet's `site` FOR UPDATE, so two
+  concurrent reserves both picked the SAME IP (no UNIQUE on ip_reservations) AND both wrote
+  available=N-1 (the second overwriting the first → duplicate IP + wrong counter). FIX: moved the FULL
+  locked-subnet re-read + reservation re-read + build_reservation + counter compute INSIDE the tx under
+  the subnet FOR UPDATE (the unlocked pre-read is now only a fast not-found/scope check); decrement via
+  saturating_sub. +handler test (two reserves → distinct IPs, counters move by exactly 2). codex review
+  pending.
+
+## Flagged (task_3c4259be)
+- **next_ip ignores the CIDR prefix** (high/med) — `for host in 10..255` on the first 3 octets, so for any
+  non-/24 subnet it allocates IPs OUTSIDE the range (10.0.0.0/30 → "10.0.0.10") and misses valid IPs;
+  skips .2-.9 always. Needs a proper CIDR-range rewrite. (Plus: release_ip uses non-saturating
+  available_ips += 1, asymmetric with used_ips saturating_sub.)
+
 ## Conclusion (overall)
-Combined with run-5/6/7, bug-discovery is at clear diminishing returns — most machines/subsystems verify
-clean; the few remaining finds are isolated (the analytics always-expand recommendation, the incident
-terminal-guard gap). Remaining high-value work is the owner-decision items (A0/B0 etc.) + larger
-data/execution-plane feature build-out. SESSION: 16 codex-reviewed commits across run-5/6/7/8.
+Combined with run-5/6/7, bug-discovery is tapering but NOT zero — focused deep-dives on fresh subsystems
+still find isolated real bugs (analytics always-expand, incident terminal-guard, IPAM double-allocation
+race). Remaining high-value: the owner-decision items (A0/B0 etc.), the flagged follow-ups (IPAM next_ip
+especially), + larger data/execution-plane build-out. SESSION: 17 codex-reviewed commits across run-5/6/7/8.
