@@ -61,7 +61,34 @@ TB→GB conversion, centered projection, commitment savings, compliance % div-by
   storage computation removed. +strengthened test (recommendation.contains("expansion") == cpu||mem).
   No portal/handler consumer of storage_at_risk. codex plan+impl reviewed.
 
+---
+
+# run-8c — LIFECYCLE STATE MACHINES deep-dive
+
+Deep-dive on the non-request lifecycle machines. Decommission / AD-computer / certificate /
+firmware-golden-image all VERIFIED CLEAN (hard-error decode on unknown status — NOT a fallback default;
+two-token CAS — status + updated_at or valid_to; FOR UPDATE on golden-image promote; proper terminal
+guards). Only the INCIDENT machine had a real gap.
+
+## Shipped
+- ✅ **Incident "resolved" was not a terminal state** (ryuki-engine/src/incident_context.rs) — SHIPPED:
+  resolve_incident_pure / add_affected_ci_pure / escalate_pure had NO status guard, so a RESOLVED
+  incident could be re-resolved (silently overwriting the resolution — the xmin CAS doesn't prevent it,
+  xmin advances on every UPDATE) or have a CI appended / its escalation mutated post-closure
+  (contaminating the compliance/review record). Unlike decommission/AD/cert, which all guard their
+  terminal states. FIX: fail-closed guard `if ctx.status != "active" { Err }` in all three pure fns
+  (only an active incident is mutable). +unit test test_resolved_incident_is_terminal_and_immutable.
+  15 incident engine tests + 7 incident DB tests green. codex review pending.
+
+## Flagged (low, task_7981ce77)
+- secrets_deregister hardcodes audit from_status="active" regardless of the real prior status, and its
+  UPDATE has no `WHERE status<>'retired'` guard (a re-deregister is a silent no-op that still writes a
+  misleading audit row). Plus a latent ManagedSecretRow::to_engine() unknown-status → Active fallback
+  (vs the fail-closed hard-error decode the AD/cert repos use). Not exploitable without a corrupt DB
+  value.
+
 ## Conclusion (overall)
-Combined with run-5/6/7, bug-discovery is at clear diminishing returns — most findings are now
-defense-in-depth/cosmetic amid extensive verified-clean lists. Remaining high-value work is the
-owner-decision items (A0/B0 etc.) + larger data/execution-plane feature build-out.
+Combined with run-5/6/7, bug-discovery is at clear diminishing returns — most machines/subsystems verify
+clean; the few remaining finds are isolated (the analytics always-expand recommendation, the incident
+terminal-guard gap). Remaining high-value work is the owner-decision items (A0/B0 etc.) + larger
+data/execution-plane feature build-out. SESSION: 16 codex-reviewed commits across run-5/6/7/8.

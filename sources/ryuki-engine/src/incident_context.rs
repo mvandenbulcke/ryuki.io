@@ -247,6 +247,17 @@ pub fn resolve_incident_pure(
     ctx: &IncidentContext,
     resolution: &str,
 ) -> Result<IncidentContext, String> {
+    // `resolved` is terminal: only an ACTIVE incident can be resolved. Check this BEFORE
+    // input validation so a resolved incident reports the terminal-state reason rather
+    // than an input error. Fail closed on any non-active status so a second resolve
+    // cannot silently overwrite the first resolution (the xmin CAS does NOT prevent this
+    // — xmin advances on every UPDATE).
+    if ctx.status != "active" {
+        return Err(format!(
+            "only an active incident can be resolved (status is '{}')",
+            ctx.status
+        ));
+    }
     if resolution.trim().is_empty() {
         return Err("resolution cannot be empty".into());
     }
@@ -268,6 +279,14 @@ pub fn add_affected_ci_pure(
     if ci_type.trim().is_empty() {
         return Err("ci_type cannot be empty".into());
     }
+    // Only an ACTIVE incident is mutable — a resolved (terminal) incident's record must
+    // not be contaminated post-closure (it is compliance/review evidence).
+    if ctx.status != "active" {
+        return Err(format!(
+            "cannot add a CI to a non-active incident (status is '{}')",
+            ctx.status
+        ));
+    }
     let site = ctx
         .affected_ci
         .first()
@@ -287,6 +306,13 @@ pub fn add_affected_ci_pure(
 pub fn escalate_pure(ctx: &IncidentContext, reason: &str) -> Result<IncidentContext, String> {
     if reason.trim().is_empty() {
         return Err("reason cannot be empty".into());
+    }
+    // Only an ACTIVE incident is mutable — do not escalate a resolved (terminal) one.
+    if ctx.status != "active" {
+        return Err(format!(
+            "cannot escalate a non-active incident (status is '{}')",
+            ctx.status
+        ));
     }
     let mut updated = ctx.clone();
     updated.on_call.escalation = format!("{} | escalated: {}", ctx.on_call.escalation, reason);
@@ -532,6 +558,45 @@ mod tests {
 
         let context = get_context(&incident_id).unwrap();
         assert_eq!(context["context"]["status"], "resolved");
+    }
+
+    /// `resolved` is a TERMINAL state: a resolved incident must not be re-resolved,
+    /// have a CI appended, or be escalated (it is compliance/review evidence). An
+    /// ACTIVE incident permits all three. (Pure fns — no store.)
+    #[test]
+    fn test_resolved_incident_is_terminal_and_immutable() {
+        let active =
+            build_incident_context("term-test", "sev2", vec!["ci-1".into()], "DEFRA").unwrap();
+        assert_eq!(active.status, "active");
+        // Active: all three transitions are permitted.
+        assert!(resolve_incident_pure(&active, "fixed").is_ok());
+        assert!(add_affected_ci_pure(&active, "ci-2", "server").is_ok());
+        assert!(escalate_pure(&active, "paged on-call").is_ok());
+
+        let resolved = resolve_incident_pure(&active, "service restored").unwrap();
+        assert_eq!(resolved.status, "resolved");
+
+        // Resolved (terminal): every mutating transition is rejected.
+        assert!(
+            resolve_incident_pure(&resolved, "again").is_err(),
+            "a resolved incident must not be re-resolved (no silent overwrite)"
+        );
+        assert!(
+            add_affected_ci_pure(&resolved, "ci-3", "server").is_err(),
+            "a resolved incident must not accept a new CI"
+        );
+        assert!(
+            escalate_pure(&resolved, "late escalation").is_err(),
+            "a resolved incident must not be escalated"
+        );
+
+        // Fail-closed is an ALLOWLIST: any non-"active" status (not just "resolved")
+        // is rejected, so a future/unknown status can never be silently mutated.
+        let mut weird = active.clone();
+        weird.status = "paused".into();
+        assert!(resolve_incident_pure(&weird, "x").is_err());
+        assert!(add_affected_ci_pure(&weird, "ci-x", "server").is_err());
+        assert!(escalate_pure(&weird, "x").is_err());
     }
 
     #[test]
