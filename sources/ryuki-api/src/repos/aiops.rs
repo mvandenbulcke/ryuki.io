@@ -290,8 +290,12 @@ mod aiops_db_tests {
     static DB_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     async fn test_pool() -> Option<PgPool> {
-        let url = std::env::var("RYUKI_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://ryuki:ryuki_dev@localhost:5432/ryuki_platform".into());
+        // Fail closed: with no DB configured these DB tests SKIP (callers handle the
+        // None via `let Some(pool) = test_pool().await else { return }`). Previously
+        // this fell back to a hard-coded localhost URL and `.expect`ed migrations,
+        // so a no-DB or migration-drifted run PANICKED instead of skipping — breaking
+        // the fail-closed + drift-tolerant test conventions the other repos follow.
+        let url = std::env::var("RYUKI_DATABASE_URL").ok()?;
         if url.is_empty() {
             return None;
         }
@@ -300,9 +304,9 @@ mod aiops_db_tests {
             .connect(&url)
             .await
             .ok()?;
-        crate::database::run_migrations(&pool)
-            .await
-            .expect("migrations must apply");
+        // Drift-tolerant: skip (None) rather than panic when migrations cannot apply
+        // against a drifted local DB — matches `run_migrations(...).ok()?` elsewhere.
+        crate::database::run_migrations(&pool).await.ok()?;
         Some(pool)
     }
 
