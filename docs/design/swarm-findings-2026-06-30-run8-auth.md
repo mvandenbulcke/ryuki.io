@@ -156,13 +156,23 @@ scope per-item; suppress_trigger CAS `WHERE status <> 'Suppressed'`; scheduler s
   FIX: 3-way `errored>0 -> degraded; breached>0 -> breached; else ok`. +test (a breaching SLO ->
   breached_count>=1 AND overall_status != "ok"). codex review pending.
 
-## Flagged (task_9ca3ab76)
-- (med) ack_alert accepts ANY domain_event id — no alert-worthy guard — so acking a non-alert
-  ('completed'/'intake') event succeeds and writes a dangling alert_acks row. Add `payload->>'to_status'
-  = ANY(alert_worthy_statuses())` to the existence check.
-- (med) noise suppression never auto-expires: suppress_until is stored but never compared to NOW(), so a
-  Suppressed trigger past its deadline stays hidden from detection forever (seeded noise-004 is 15+ days
-  expired but still suppressed). Filter `status <> 'Suppressed' OR suppress_until <= NOW()`.
+## Shipped (2/2 confirmed)
+- ✅ **ack_alert accepts ANY domain_event id** (med) — SHIPPED (commit 1c5b367): no alert-worthy guard, so
+  acking a non-alert ('completed'/'intake') event succeeded + wrote a dangling alert_acks row. FIX:
+  ack_alert takes `alert_statuses: &[String]` + gates on `payload->>'to_status' = ANY($2)` (the same
+  alert_worthy set list_alerts uses); a non-alert id 404s like a missing one. Both single + batch paths
+  covered via ack_alert_one. +test (platform-wide non-alert event -> 404 + no alert_acks row). codex APPROVE.
+
+## Re-verified FALSE POSITIVE (the finder's main claim was wrong)
+- **"noise suppression never auto-expires -> hidden from detection forever"** — RE-VERIFIED FALSE on the
+  detection claim. BOTH detect_noise (noise_remediation.rs:148) and the DB-path noise_detect
+  (contracts.rs:10723) filter ONLY on `event_count_last_24h > 10` (+ site) with NO status filter — so a
+  Suppressed trigger IS still returned by detection (noise-004 with event_count 89 is NOT hidden). The
+  only residual is a stale STATUS LABEL: a Suppressed trigger's status never auto-reverts to Active past
+  suppress_until, so noise_suppressed_list / the status-summary counts show it as still-suppressed. That
+  is a LOW data-accuracy issue, cleanly fixable with a daily expiry SCAN JOB (flip Suppressed->Active when
+  suppress_until <= NOW(), matching the established restore_overdue_scan / legal_hold_expiry_scan pattern).
+  Flagged as a low-priority scan-job feature — NOT the high "hidden detection" bug the finder claimed.
 
 ## Conclusion (overall)
 Combined with run-5/6/7, bug-discovery is tapering but still productive — focused deep-dives split between
