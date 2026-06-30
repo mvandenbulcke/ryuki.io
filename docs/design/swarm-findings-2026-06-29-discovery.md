@@ -50,7 +50,10 @@ secret-rotation/legal-hold/recertification filled (engine classifier + run_job a
   (Expired→P1, ExpiringSoon→P2) + open-item REFRESH so soon→expired upgrades in place. codex
   plan+impl APPROVE. See certificate-expiry-scan.md.
 - **OOB-management cert-endpoint expiry scan** (M/S) — `oob_endpoints`.
-- **gMSA service-account expiry scan** (M/S) — `gmsa_lifecycle::get_expiring`.
+- **gMSA service-account expiry scan** (M/S) — `gmsa_lifecycle::get_expiring`. ✅ SHIPPED (7028d4b) —
+  `gmsa_expiry_scan` (mig 134): pure `classify_gmsa_expiry` on the computed rotation deadline; 8-day
+  SQL prefilter as a strict superset of the 7-day classifier window (DST-safe); Overdue→P2/DueSoon→P3
+  + refresh; framed as "verify AD-side rotation". codex plan+impl APPROVE. See gmsa-expiry-scan.md.
 
 ## CONFIRMED, open — data retention (unbounded history once a sweep is scheduled)
 - **scheduler `job_executions` history prune** (M/S) — ✅ SHIPPED (720a1d0): `job_executions_prune`
