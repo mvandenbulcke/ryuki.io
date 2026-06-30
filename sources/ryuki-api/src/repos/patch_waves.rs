@@ -32,6 +32,35 @@ pub const COLUMNS: &str = "id::text AS id, \
      status, \
      metadata::text AS metadata";
 
+// ─── Overdue-scan projection (#59) ─────────────────────────────────────────────
+
+/// Minimal projection for `patch_wave_overdue_scan`: just the wave id, name, and its
+/// committed window start extracted from the `schedule` JSONB (`schedule->>'start'`).
+/// Scalar extraction — no full-model deserialization — so a single corrupt `schedule`
+/// blob cannot fail the scan; a missing/empty start is returned as `""` (the caller
+/// skips it). Independent of the full `PatchWaveRow`.
+#[derive(sqlx::FromRow)]
+pub struct ScheduledWaveRow {
+    pub id: String,
+    pub name: String,
+    pub scheduled_start: String,
+}
+
+/// Fetch every patch wave in status 'Scheduled' (committed to start at
+/// `schedule->>'start'`) for the overdue scan. Only 'Scheduled' waves are considered —
+/// a wave that has already moved to 'InProgress'/'Completed'/'Failed' has acted on its
+/// window, and Draft/Validated/Approved waves are not yet committed to a start.
+pub async fn scheduled_waves_for_overdue_scan(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<ScheduledWaveRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id::text AS id, name, COALESCE(schedule->>'start', '') AS scheduled_start \
+         FROM patch_waves WHERE status = 'Scheduled' ORDER BY id",
+    )
+    .fetch_all(executor)
+    .await
+}
+
 // ─── Row struct ──────────────────────────────────────────────────────────────
 
 /// The DB-managed `created_at`/`updated_at` columns are not part of the

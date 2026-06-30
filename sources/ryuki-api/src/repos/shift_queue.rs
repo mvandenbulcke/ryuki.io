@@ -73,6 +73,12 @@ pub const OOB_CERT_EXPIRY_ITEM_TYPE: &str = "oob-cert-expiring";
 /// overdue on the next daily scan (migration 139).
 pub const DR_TEST_OVERDUE_ITEM_TYPE: &str = "dr-test-overdue";
 
+/// The MISSED-patch-window signal (#59). A patch wave in status 'Scheduled' whose
+/// committed window start (`schedule->>'start'`) has passed without the wave moving to
+/// 'InProgress'. `source_ci_key` is the bare wave id. One deduped OPEN item per wave;
+/// re-enqueued after resolution if still overdue on the next daily scan (migration 140).
+pub const PATCH_WAVE_OVERDUE_ITEM_TYPE: &str = "patch-wave-overdue";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

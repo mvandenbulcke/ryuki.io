@@ -107,6 +107,12 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// is in the past, and enqueues ONE deduped `shift_queue` item per overdue
 /// plan — reads dr_plans, writes only shift_queue, NO provider/live/destructive
 /// call.
+///
+/// `patch_wave_overdue_scan` (#59) also qualifies: it reads `patch_waves` in
+/// status 'Scheduled', flags any whose committed window start (`schedule->>'start'`)
+/// is in the past (a MISSED patch window), and enqueues ONE deduped `shift_queue`
+/// item per missed wave — reads patch_waves, writes only shift_queue, NO
+/// provider/live/destructive call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
@@ -126,6 +132,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "check_results_prune"
                 | "shift_queue_prune"
                 | "dr_test_overdue_scan"
+                | "patch_wave_overdue_scan"
         )
 }
 
@@ -232,6 +239,8 @@ mod tests {
         assert!(!job_is_read_only("shift_queue_prune"));
         assert!(job_is_schedulable("dr_test_overdue_scan"));
         assert!(!job_is_read_only("dr_test_overdue_scan"));
+        assert!(job_is_schedulable("patch_wave_overdue_scan"));
+        assert!(!job_is_read_only("patch_wave_overdue_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));

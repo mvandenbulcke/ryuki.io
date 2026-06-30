@@ -555,6 +555,73 @@ async fn run_job(
                 Some(format!("{overdue} DR plan(s) overdue, {enqueued} enqueued")),
             ))
         }
+        "patch_wave_overdue_scan" => {
+            // Safe-internal write (#59): READ patch_waves in status 'Scheduled' (each
+            // committed to start at schedule->>'start'), flag any whose start is in the
+            // PAST — a MISSED patch window (scheduled but never moved to InProgress) —
+            // and enqueue ONE deduped shift_queue item per missed wave. Reads patch_waves
+            // and writes only our own shift_queue — NO provider/live/destructive call.
+            // All on `tx`, so a failure rolls back with this schedule's savepoint.
+            // `detail` is aggregate-only (counts, never per-wave ids) because it is
+            // surfaced via /api/ops/scheduler/executions.
+            let waves =
+                crate::repos::patch_waves::scheduled_waves_for_overdue_scan(&mut **tx).await?;
+            let now = chrono::Utc::now();
+            let mut overdue: u64 = 0;
+            let mut enqueued: u64 = 0;
+            for wave in waves {
+                // A blank id can't be a dedup key (enqueue_if_absent rejects it) — skip it.
+                if wave.id.trim().is_empty() {
+                    continue;
+                }
+                // Fail-safe per-row: a missing/unparseable schedule start is SKIPPED so
+                // one bad row can never abort the scan (mirrors dr_test_overdue_scan).
+                let Ok(start) = chrono::DateTime::parse_from_rfc3339(wave.scheduled_start.trim())
+                else {
+                    continue;
+                };
+                if start.with_timezone(&chrono::Utc) > now {
+                    continue; // window not yet reached
+                }
+                overdue += 1;
+                // Wave name defaults to '' in the schema — fall back to the id for a
+                // legible work-item title.
+                let label = if wave.name.trim().is_empty() {
+                    wave.id.as_str()
+                } else {
+                    wave.name.as_str()
+                };
+                let title = format!("Patch wave overdue: {label}");
+                let description = format!(
+                    "Patch wave '{label}' was scheduled to start at {} but is still in \
+                     status 'Scheduled' — its maintenance window has passed. Investigate \
+                     or reschedule.",
+                    wave.scheduled_start
+                );
+                // `source_ci_key` is the wave id — the enqueue_if_absent dedup predicate
+                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
+                // partial unique index (uq_shift_queue_open_patch_wave_overdue) to agree.
+                let metadata = serde_json::json!({
+                    "source_ci_key": wave.id,
+                    "scheduled_start": wave.scheduled_start,
+                })
+                .to_string();
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::PATCH_WAVE_OVERDUE_ITEM_TYPE,
+                    &wave.id,
+                    &title,
+                    &description,
+                    "P2",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!("{overdue} patch wave(s) overdue, {enqueued} enqueued")),
+            ))
+        }
         "secret_rotation_due_scan" => {
             // Safe-internal write (#7): READ secret rotation metadata across ALL sites
             // (platform-wide internal principal — not scoped), classify each with the
@@ -5648,5 +5715,178 @@ mod db_tests {
             .await
             .ok();
         restore_migration_dr_scan(pool).await;
+    }
+
+    // ---- #59 patch_wave_overdue_scan ---------------------------------------
+
+    /// The migration-140-seeded patch_wave_overdue_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (mirrors DR_SCAN_SEED_ID pattern).
+    const PATCH_SCAN_SEED_ID: &str = "b0b0b0b0-b0b0-4b0b-8b0b-b0b0b0b0b0b0";
+
+    /// Seed a patch_waves row in status 'Scheduled' with the given window start.
+    async fn seed_patch_wave(pool: &PgPool, id: &str, name: &str, start: &str) {
+        sqlx::query(
+            "INSERT INTO patch_waves (id, site, os_family, status, name, schedule) \
+             VALUES ($1::uuid, 'TESTSITE', 'Linux', 'Scheduled', $2, \
+                     jsonb_build_object('start', $3::text)) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(start)
+        .execute(pool)
+        .await
+        .expect("seed patch_wave");
+    }
+
+    /// Plant a guaranteed-due `patch_wave_overdue_scan` schedule. Disables the
+    /// migration-seeded scan first so EXACTLY ONE is due. Returns the planted id.
+    async fn seed_due_patch_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(PATCH_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-patchscan-due-9c2";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test patch wave scan', 'patch_wave_overdue_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_patch_scan`] disabled.
+    async fn restore_migration_patch_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(PATCH_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN patch-wave-overdue shift_queue items for a wave id.
+    async fn open_patch_overdue_count(pool: &PgPool, wave_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'patch-wave-overdue' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(wave_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A Scheduled wave with a past window start enqueues exactly one item; a
+    /// future-start wave does not. A second run dedups. Detail is aggregate-only.
+    #[tokio::test]
+    async fn patch_wave_overdue_scan_enqueues_missed_windows() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let overdue_id = uuid::Uuid::new_v4().to_string();
+        let future_id = uuid::Uuid::new_v4().to_string();
+        let past = (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+
+        seed_patch_wave(pool, &overdue_id, &format!("patch overdue {suffix}"), &past).await;
+        seed_patch_wave(pool, &future_id, &format!("patch future {suffix}"), &future).await;
+
+        let sched_id = seed_due_patch_scan(pool).await;
+
+        // Cleanup shift_queue + job_executions BEFORE asserting (mirrors sibling
+        // tests' cleanup-before-assert discipline).
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&overdue_id)
+            .bind(&future_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: overdue wave enqueued, future wave skipped.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted patch scan ran");
+        assert_eq!(
+            open_patch_overdue_count(pool, &overdue_id).await,
+            1,
+            "missed-window wave gets exactly one open patch-wave-overdue item"
+        );
+        assert_eq!(
+            open_patch_overdue_count(pool, &future_id).await,
+            0,
+            "a wave whose window has not arrived is not enqueued"
+        );
+
+        // Detail is aggregate-only: "<N> patch wave(s) overdue, <M> enqueued".
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'patch_wave_overdue_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let parsed = detail
+            .split_once(" patch wave(s) overdue, ")
+            .and_then(|(o, rest)| {
+                let m = rest.strip_suffix(" enqueued")?;
+                Some((o.parse::<u64>().ok()?, m.parse::<u64>().ok()?))
+            });
+        assert!(
+            parsed.is_some_and(|(o, e)| o >= 1 && e >= 1),
+            "detail must be '<N> patch wave(s) overdue, <M> enqueued': {detail:?}"
+        );
+
+        // Second tick: dedup holds — still exactly one open item.
+        let sched_id2 = seed_due_patch_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_patch_overdue_count(pool, &overdue_id).await,
+            1,
+            "a second tick does not duplicate the open item"
+        );
+
+        // Final cleanup.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&overdue_id)
+            .bind(&future_id)
+            .execute(pool)
+            .await
+            .ok();
+        for id in [&overdue_id, &future_id] {
+            sqlx::query("DELETE FROM patch_waves WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_patch_scan(pool).await;
     }
 }
