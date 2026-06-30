@@ -8661,10 +8661,13 @@ async fn patch_verify(
 }
 
 /// Produce the dry-run reboot-orchestration plan for a persisted wave. Like
-/// verify, this is evidence-only: it computes the staged reboot plan (backup
-/// verify -> drain -> per-server reboots -> post-checks, all simulated) and
-/// does NOT transition the wave. 503 without a database, 404 when the wave is
-/// absent, 409 when the engine rejects the wave (e.g. zero servers).
+/// verify, this is evidence-only: it computes the staged, BATCHED (rolling)
+/// reboot plan (backup verify -> per batch: drain-batch -> reboot-batch
+/// servers -> health-check-batch gate -> final fleet-wide check, all simulated)
+/// and does NOT transition the wave. Batch size comes from the wave's
+/// `reboot_batch_size` / `reboot_batch_percent` metadata (default: one server
+/// per batch). 503 without a database, 404 when the wave is absent, 409 when
+/// the engine rejects the wave (e.g. zero servers).
 async fn patch_reboot(
     AuthExtractor(session): AuthExtractor,
     Json(body): Json<PatchActionRequest>,

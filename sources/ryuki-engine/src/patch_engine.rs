@@ -143,6 +143,90 @@ pub fn validate_patch_policy(wave: &PatchWave) -> Result<Vec<String>, String> {
     Ok(results)
 }
 
+/// Resolve the rolling-reboot batch size from wave metadata.
+///
+/// Precedence (first matching knob wins):
+///   1. `reboot_batch_size` — a fixed batch size (>= 1). If the key is PRESENT
+///      but unparseable or zero, we default to 1 and do NOT fall through to a
+///      percentage. This is deliberate: a typo in a fixed-size knob must never
+///      silently become a percentage-based (potentially all-at-once) batch.
+///   2. `reboot_batch_percent` — a percentage of the wave ("25" or "25%"). The
+///      size is `ceil(total * pct / 100)`. Values outside `(0, 100]`, or
+///      non-finite, are REJECTED (default 1) rather than clamped, so an
+///      out-of-range percentage can never recreate an all-at-once reboot.
+///   3. default — 1 server per batch (the safest true one-at-a-time rolling).
+///
+/// The returned size is always in `[1, total]` (for `total >= 1`), so callers
+/// never produce a zero-size or oversized batch. The second tuple element is a
+/// human-readable policy description for plan evidence/metadata; it also records
+/// when an invalid knob was ignored, so an operator can see what was honored.
+fn resolve_reboot_batch_size(total: usize, metadata: &HashMap<String, String>) -> (usize, String) {
+    // `total` is guaranteed >= 1 by orchestrate_reboot's empty-servers guard,
+    // but clamp defensively so the helper is correct in isolation (and tests).
+    let clamp = |n: usize| n.min(total.max(1)).max(1);
+
+    if let Some(raw) = metadata.get("reboot_batch_size") {
+        let trimmed = raw.trim();
+        return match trimmed.parse::<usize>() {
+            Ok(n) if n >= 1 => {
+                let size = clamp(n);
+                (
+                    size,
+                    format!("fixed {size} server(s) per batch (reboot_batch_size={trimmed})"),
+                )
+            }
+            _ => (
+                clamp(1),
+                format!(
+                    "reboot_batch_size '{trimmed}' is invalid; defaulting to 1 server per batch"
+                ),
+            ),
+        };
+    }
+
+    if let Some(raw) = metadata.get("reboot_batch_percent") {
+        let trimmed = raw.trim();
+        let numeric = trimmed.strip_suffix('%').unwrap_or(trimmed).trim();
+        return match numeric.parse::<f64>() {
+            Ok(pct) if pct.is_finite() && pct > 0.0 && pct <= 100.0 => {
+                let size = clamp((total as f64 * pct / 100.0).ceil() as usize);
+                (
+                    size,
+                    format!(
+                        "{pct}% of {total} servers -> {size} server(s) per batch (reboot_batch_percent={trimmed})"
+                    ),
+                )
+            }
+            _ => (
+                clamp(1),
+                format!(
+                    "reboot_batch_percent '{trimmed}' is invalid (must be in (0, 100]); defaulting to 1 server per batch"
+                ),
+            ),
+        };
+    }
+
+    (
+        clamp(1),
+        "default 1 server per batch (no batch policy set)".to_string(),
+    )
+}
+
+/// Build a dry-run, BATCHED (rolling) reboot-orchestration plan for a wave.
+///
+/// Rather than draining every server at once and rebooting them all behind a
+/// single trailing health check, the plan groups `wave.servers` into batches
+/// (sized by [`resolve_reboot_batch_size`]) and, for each batch, emits a
+/// drain -> per-server reboot -> health-check gate sequence. The gate encodes
+/// "proceed to the next batch ONLY if every member of this batch is healthy,
+/// otherwise HALT the rollout" via stage metadata (`gate`, `gate_condition`,
+/// `on_failure`, `proceed_to`, `depends_on`). Because this is a PLAN-ONLY
+/// orchestrator (operators / external automation execute it), the halt is a
+/// plan contract the executor honors, not in-process control flow.
+///
+/// Every emitted stage is marked `dry_run=true`; the batch stages also carry
+/// `plan_section=rebootBatches`, tying them to the reboot-orchestration
+/// contract's `rebootBatches` plan section.
 pub fn orchestrate_reboot(wave: &PatchWave) -> Result<Vec<Stage>, String> {
     if wave.servers.is_empty() {
         return Err("Cannot orchestrate reboot with zero servers".into());
@@ -165,8 +249,14 @@ pub fn orchestrate_reboot(wave: &PatchWave) -> Result<Vec<Stage>, String> {
         }
     }
 
+    let total = wave.servers.len();
+    let (batch_size, batch_policy) = resolve_reboot_batch_size(total, &wave.metadata);
+    let batches: Vec<&[String]> = wave.servers.chunks(batch_size).collect();
+    let batch_count = batches.len();
+
     let mut stages: Vec<Stage> = Vec::new();
 
+    // 1. Backup verification (once, before any batch).
     stages.push(Stage {
         name: "pre-reboot-backup-verify".into(),
         status: StageStatus::Pending,
@@ -175,58 +265,143 @@ pub fn orchestrate_reboot(wave: &PatchWave) -> Result<Vec<Stage>, String> {
         evidence: vec![EvidenceItem {
             key: "backup-verification".into(),
             value: format!(
-                "DRY-RUN: Verified backup status for {} servers (simulated, no Veeam calls)",
-                wave.servers.len()
+                "DRY-RUN: Verified backup status for {total} servers (simulated, no Veeam calls)"
             ),
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
         }],
-        metadata: HashMap::from([("dry_run".into(), "true".into())]),
+        metadata: HashMap::from([
+            ("dry_run".into(), "true".into()),
+            ("server_count".into(), total.to_string()),
+            ("batch_count".into(), batch_count.to_string()),
+            ("batch_size".into(), batch_size.to_string()),
+            ("batch_policy".into(), batch_policy),
+        ]),
     });
 
-    stages.push(Stage {
-        name: "drain-workloads".into(),
-        status: StageStatus::Pending,
-        started_at: None,
-        completed_at: None,
-        evidence: vec![EvidenceItem {
-            key: "drain-plan".into(),
-            value: format!(
-                "DRY-RUN: Planned drain for {} servers across sites {:?} (simulated)",
-                wave.servers.len(),
-                wave.site_scope
-            ),
-            redacted_value: None,
-            redacted: false,
-            evidence_type: EvidenceType::Plan,
-        }],
-        metadata: HashMap::from([("dry_run".into(), "true".into())]),
-    });
+    // 2. One drain -> reboot -> health-check gate sequence per batch. Batches
+    //    are strictly sequential: each drain depends on the previous batch's
+    //    health gate, so an unhealthy batch halts the rollout before the next
+    //    batch is touched.
+    for (bi, batch) in batches.iter().enumerate() {
+        let b = bi + 1; // 1-based batch number for human-facing names
+        let drain_name = format!("drain-batch-{b}");
+        let reboot_group = format!("reboot-batch-{b}");
 
-    for (i, server_id) in wave.servers.iter().enumerate() {
+        // The first batch gates on the backup verification; every later batch
+        // gates on the prior batch's health check (the halt-on-unhealthy gate).
+        let drain_depends_on = if b > 1 {
+            format!("health-check-batch-{}", b - 1)
+        } else {
+            "pre-reboot-backup-verify".to_string()
+        };
+
+        // 2a. Drain only THIS batch's workloads.
         stages.push(Stage {
-            name: format!("reboot-server-{}", i + 1),
+            name: drain_name.clone(),
             status: StageStatus::Pending,
             started_at: None,
             completed_at: None,
             evidence: vec![EvidenceItem {
-                key: format!("reboot-server-{}", server_id),
+                key: format!("drain-plan-batch-{b}"),
                 value: format!(
-                    "DRY-RUN: Planned reboot for server {} (simulated, no hypervisor calls)",
-                    server_id
+                    "DRY-RUN: Planned drain for batch {b}/{batch_count} ({} server(s)) across sites {:?} (simulated)",
+                    batch.len(),
+                    wave.site_scope
                 ),
-                redacted_value: Some("***DRY-RUN***".into()),
-                redacted: true,
-                evidence_type: EvidenceType::ExecutionLog,
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Plan,
             }],
             metadata: HashMap::from([
-                ("server_id".into(), server_id.clone()),
                 ("dry_run".into(), "true".into()),
+                ("plan_section".into(), "rebootBatches".into()),
+                ("batch_index".into(), b.to_string()),
+                ("batch_count".into(), batch_count.to_string()),
+                ("batch_member_count".into(), batch.len().to_string()),
+                ("depends_on".into(), drain_depends_on),
+            ]),
+        });
+
+        // 2b. Per-server reboot stages. Members of a batch form one group
+        //     (`batch_group`) and may reboot together; batches themselves are
+        //     serial, gated by the per-batch health check below.
+        for (si, server_id) in batch.iter().enumerate() {
+            stages.push(Stage {
+                name: format!("reboot-batch-{b}-server-{}", si + 1),
+                status: StageStatus::Pending,
+                started_at: None,
+                completed_at: None,
+                evidence: vec![EvidenceItem {
+                    key: format!("reboot-server-{server_id}"),
+                    value: format!(
+                        "DRY-RUN: Planned reboot for server {server_id} in batch {b}/{batch_count} (simulated, no hypervisor calls)"
+                    ),
+                    redacted_value: Some("***DRY-RUN***".into()),
+                    redacted: true,
+                    evidence_type: EvidenceType::ExecutionLog,
+                }],
+                metadata: HashMap::from([
+                    ("server_id".into(), server_id.clone()),
+                    ("dry_run".into(), "true".into()),
+                    ("plan_section".into(), "rebootBatches".into()),
+                    ("batch_index".into(), b.to_string()),
+                    ("server_index".into(), (si + 1).to_string()),
+                    ("batch_group".into(), reboot_group.clone()),
+                    ("depends_on".into(), drain_name.clone()),
+                ]),
+            });
+        }
+
+        // 2c. Health-check gate. The rollout proceeds to the next batch ONLY if
+        //     every member of this batch is healthy; otherwise the executor
+        //     halts (`on_failure=halt`). The last batch's gate hands off to the
+        //     final fleet-wide check.
+        let proceed_to = if b < batch_count {
+            format!("drain-batch-{}", b + 1)
+        } else {
+            "post-reboot-health-check".to_string()
+        };
+        stages.push(Stage {
+            name: format!("health-check-batch-{b}"),
+            status: StageStatus::Pending,
+            started_at: None,
+            completed_at: None,
+            evidence: vec![EvidenceItem {
+                key: format!("health-check-batch-{b}"),
+                value: format!(
+                    "DRY-RUN: Planned health check for batch {b}/{batch_count} ({} server(s)); proceed to '{proceed_to}' only if all members healthy, otherwise HALT rollout (simulated)",
+                    batch.len()
+                ),
+                redacted_value: None,
+                redacted: false,
+                evidence_type: EvidenceType::Plan,
+            }],
+            metadata: HashMap::from([
+                ("dry_run".into(), "true".into()),
+                ("plan_section".into(), "rebootBatches".into()),
+                ("batch_index".into(), b.to_string()),
+                ("gate".into(), "halt-on-unhealthy".into()),
+                ("gate_condition".into(), "all_batch_members_healthy".into()),
+                ("on_failure".into(), "halt".into()),
+                ("proceed_to".into(), proceed_to),
+                // `depends_on` always names a real emitted stage (the batch's
+                // last reboot member), keeping it a single-stage reference like
+                // every other stage. The full-set dependency on every member of
+                // the batch is expressed separately via `depends_on_group`.
+                (
+                    "depends_on".into(),
+                    format!("reboot-batch-{b}-server-{}", batch.len()),
+                ),
+                ("depends_on_group".into(), reboot_group),
             ]),
         });
     }
 
+    // 3. Final fleet-wide health check. This is a non-gating summary over all
+    //    batches (the per-batch gates are what actually halt the rollout), so
+    //    it carries `gate=none` and depends on the last batch's gate.
     stages.push(Stage {
         name: "post-reboot-health-check".into(),
         status: StageStatus::Pending,
@@ -235,14 +410,21 @@ pub fn orchestrate_reboot(wave: &PatchWave) -> Result<Vec<Stage>, String> {
         evidence: vec![EvidenceItem {
             key: "health-check".into(),
             value: format!(
-                "DRY-RUN: Planned health checks for {} servers (simulated, no monitoring calls)",
-                wave.servers.len()
+                "DRY-RUN: Planned fleet-wide final verification for {total} servers across {batch_count} batch(es) (simulated, no monitoring calls)"
             ),
             redacted_value: None,
             redacted: false,
             evidence_type: EvidenceType::Plan,
         }],
-        metadata: HashMap::from([("dry_run".into(), "true".into())]),
+        metadata: HashMap::from([
+            ("dry_run".into(), "true".into()),
+            ("stage_role".into(), "final-summary".into()),
+            ("gate".into(), "none".into()),
+            (
+                "depends_on".into(),
+                format!("health-check-batch-{batch_count}"),
+            ),
+        ]),
     });
 
     Ok(stages)
@@ -707,6 +889,39 @@ mod tests {
         assert!(results.iter().any(|r| r.contains("no servers")));
     }
 
+    /// Build a reboot wave with an exact server count and optional batch-policy
+    /// metadata. Servers are simple synthetic ids; only their count matters for
+    /// batch grouping.
+    fn make_reboot_wave(server_count: usize, batch_meta: &[(&str, &str)]) -> PatchWave {
+        let servers: Vec<String> = (1..=server_count).map(|i| format!("srv-{i:03}")).collect();
+        let mut metadata = HashMap::new();
+        for (k, v) in batch_meta {
+            metadata.insert((*k).to_string(), (*v).to_string());
+        }
+        PatchWave {
+            id: "pw-reboot-test".into(),
+            name: "Reboot Test Wave".into(),
+            servers,
+            site_scope: vec!["DEFRA".into()],
+            environment_scope: vec!["production".into()],
+            schedule: PatchSchedule {
+                start: "2026-06-15T22:00:00Z".into(),
+                end: "2026-06-16T06:00:00Z".into(),
+                maintenance_window: "EU-Overnight".into(),
+                patch_group: Some("Group-A".into()),
+            },
+            reboot_policy: RebootPolicy::RebootIfRequired,
+            blackout_dates: Vec::new(),
+            validation_errors: Vec::new(),
+            status: PatchWaveStatus::Draft,
+            metadata,
+        }
+    }
+
+    fn count_with_prefix(stages: &[Stage], prefix: &str) -> usize {
+        stages.iter().filter(|s| s.name.starts_with(prefix)).count()
+    }
+
     #[test]
     fn test_orchestrate_reboot_generates_stages() {
         let servers = vec![
@@ -716,16 +931,14 @@ mod tests {
         let wave = plan_patch_wave_from_servers(&servers).unwrap();
         let stages = orchestrate_reboot(&wave).unwrap();
 
+        // Backup verify and the final fleet-wide check bookend the plan.
         assert!(stages.iter().any(|s| s.name == "pre-reboot-backup-verify"));
-        assert!(stages.iter().any(|s| s.name == "drain-workloads"));
         assert!(stages.iter().any(|s| s.name == "post-reboot-health-check"));
-        assert_eq!(
-            stages
-                .iter()
-                .filter(|s| s.name.starts_with("reboot-server-"))
-                .count(),
-            2
-        );
+        // Default policy is one server per batch -> 2 servers -> 2 batches,
+        // each with its own drain, reboot, and health-check gate.
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 2);
+        assert_eq!(count_with_prefix(&stages, "reboot-batch-"), 2);
+        assert_eq!(count_with_prefix(&stages, "health-check-batch-"), 2);
     }
 
     #[test]
@@ -771,12 +984,13 @@ mod tests {
         wave.reboot_policy = RebootPolicy::ScheduleOnly;
         assert!(orchestrate_reboot(&wave).is_err());
 
-        // The two rebooting policies still produce per-server reboot stages.
+        // The two rebooting policies still produce per-server reboot stages
+        // (now namespaced under their batch).
         for policy in [RebootPolicy::RebootIfRequired, RebootPolicy::RebootAlways] {
             wave.reboot_policy = policy;
             let stages = orchestrate_reboot(&wave).unwrap();
             assert!(
-                stages.iter().any(|s| s.name.starts_with("reboot-server-")),
+                stages.iter().any(|s| s.name.starts_with("reboot-batch-")),
                 "policy {:?} should still emit per-server reboot stages",
                 wave.reboot_policy
             );
@@ -804,6 +1018,275 @@ mod tests {
             assert!(
                 is_dry_run,
                 "Stage '{}' should be marked dry_run=true",
+                stage.name
+            );
+        }
+    }
+
+    // ─── Batched / rolling reboot ────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_reboot_batch_size_policies() {
+        let meta = |pairs: &[(&str, &str)]| {
+            let mut m = HashMap::new();
+            for (k, v) in pairs {
+                m.insert((*k).to_string(), (*v).to_string());
+            }
+            m
+        };
+
+        // Default: one server per batch when no policy is set.
+        assert_eq!(resolve_reboot_batch_size(5, &meta(&[])).0, 1);
+
+        // Fixed size honored, trimmed, and clamped to the total.
+        assert_eq!(
+            resolve_reboot_batch_size(5, &meta(&[("reboot_batch_size", " 2 ")])).0,
+            2
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(3, &meta(&[("reboot_batch_size", "100")])).0,
+            3
+        );
+
+        // Invalid fixed size -> default 1, and MUST NOT fall through to percent.
+        assert_eq!(
+            resolve_reboot_batch_size(5, &meta(&[("reboot_batch_size", "0")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(5, &meta(&[("reboot_batch_size", "abc")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(
+                10,
+                &meta(&[
+                    ("reboot_batch_size", "garbage"),
+                    ("reboot_batch_percent", "100")
+                ])
+            )
+            .0,
+            1,
+            "an invalid fixed size must not silently become a percentage-based all-at-once batch"
+        );
+
+        // Fixed wins over percent when both are valid.
+        assert_eq!(
+            resolve_reboot_batch_size(
+                10,
+                &meta(&[("reboot_batch_size", "3"), ("reboot_batch_percent", "50")])
+            )
+            .0,
+            3
+        );
+
+        // Percent: ceil, accepts "%" and whitespace, fractional ok.
+        assert_eq!(
+            resolve_reboot_batch_size(4, &meta(&[("reboot_batch_percent", "50")])).0,
+            2
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(4, &meta(&[("reboot_batch_percent", " 50 % ")])).0,
+            2
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(3, &meta(&[("reboot_batch_percent", "10")])).0,
+            1,
+            "10% of 3 rounds up to 1, never 0"
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(100, &meta(&[("reboot_batch_percent", "25.5%")])).0,
+            26
+        );
+
+        // Percent out of range / non-finite -> default 1 (rejected, not clamped).
+        assert_eq!(
+            resolve_reboot_batch_size(8, &meta(&[("reboot_batch_percent", "150")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(8, &meta(&[("reboot_batch_percent", "0")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(8, &meta(&[("reboot_batch_percent", "-1")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(8, &meta(&[("reboot_batch_percent", "NaN")])).0,
+            1
+        );
+        assert_eq!(
+            resolve_reboot_batch_size(8, &meta(&[("reboot_batch_percent", "inf")])).0,
+            1
+        );
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_default_one_per_batch() {
+        let wave = make_reboot_wave(3, &[]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+
+        // 3 servers, default size 1 -> 3 batches.
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 3);
+        assert_eq!(count_with_prefix(&stages, "reboot-batch-"), 3);
+        assert_eq!(count_with_prefix(&stages, "health-check-batch-"), 3);
+        // batch_count is surfaced on the plan header.
+        let header = stages
+            .iter()
+            .find(|s| s.name == "pre-reboot-backup-verify")
+            .unwrap();
+        assert_eq!(header.metadata.get("batch_count").unwrap(), "3");
+        assert_eq!(header.metadata.get("batch_size").unwrap(), "1");
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_fixed_size_with_remainder() {
+        // 5 servers, size 2 -> batches of 2, 2, 1 (3 batches, 5 reboots).
+        let wave = make_reboot_wave(5, &[("reboot_batch_size", "2")]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 3);
+        assert_eq!(count_with_prefix(&stages, "reboot-batch-"), 5);
+        assert_eq!(count_with_prefix(&stages, "health-check-batch-"), 3);
+
+        // First two batches have 2 members, the last has the remainder of 1.
+        let member_count = |b: usize| {
+            stages
+                .iter()
+                .find(|s| s.name == format!("drain-batch-{b}"))
+                .unwrap()
+                .metadata
+                .get("batch_member_count")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(member_count(1), "2");
+        assert_eq!(member_count(2), "2");
+        assert_eq!(member_count(3), "1");
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_percent_rounds_up() {
+        // 4 servers, 50% -> 2 per batch -> 2 batches.
+        let wave = make_reboot_wave(4, &[("reboot_batch_percent", "50")]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 2);
+        assert_eq!(count_with_prefix(&stages, "reboot-batch-"), 4);
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_invalid_policy_defaults_to_one_per_batch() {
+        // Invalid fixed size must not become an all-at-once batch via percent.
+        let wave = make_reboot_wave(
+            4,
+            &[("reboot_batch_size", "0"), ("reboot_batch_percent", "100")],
+        );
+        let stages = orchestrate_reboot(&wave).unwrap();
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 4);
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_size_clamped_to_total_is_single_batch() {
+        let wave = make_reboot_wave(3, &[("reboot_batch_size", "100")]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+        assert_eq!(count_with_prefix(&stages, "drain-batch-"), 1);
+        assert_eq!(count_with_prefix(&stages, "reboot-batch-"), 3);
+        assert_eq!(count_with_prefix(&stages, "health-check-batch-"), 1);
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_halt_gate_chain() {
+        // 5 servers, size 2 -> 3 batches. Verify the gate metadata wires each
+        // batch's health check to the next batch's drain (halt-on-unhealthy).
+        let wave = make_reboot_wave(5, &[("reboot_batch_size", "2")]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+
+        let stage = |name: &str| stages.iter().find(|s| s.name == name).unwrap();
+
+        // Batch 1 gate halts on unhealthy and otherwise proceeds to batch 2.
+        let gate1 = stage("health-check-batch-1");
+        assert_eq!(gate1.metadata.get("gate").unwrap(), "halt-on-unhealthy");
+        assert_eq!(gate1.metadata.get("on_failure").unwrap(), "halt");
+        assert_eq!(
+            gate1.metadata.get("gate_condition").unwrap(),
+            "all_batch_members_healthy"
+        );
+        assert_eq!(gate1.metadata.get("proceed_to").unwrap(), "drain-batch-2");
+        // `depends_on` names a REAL stage (the batch's last reboot member);
+        // the full-set dependency is carried separately by `depends_on_group`.
+        assert_eq!(
+            gate1.metadata.get("depends_on").unwrap(),
+            "reboot-batch-1-server-2"
+        );
+        assert_eq!(
+            gate1.metadata.get("depends_on_group").unwrap(),
+            "reboot-batch-1"
+        );
+        assert!(
+            stages
+                .iter()
+                .any(|s| &s.name == gate1.metadata.get("depends_on").unwrap()),
+            "health-check depends_on must reference a real emitted stage"
+        );
+
+        // Batch 2's drain depends on batch 1's gate; batch 3 on batch 2's gate.
+        assert_eq!(
+            stage("drain-batch-2").metadata.get("depends_on").unwrap(),
+            "health-check-batch-1"
+        );
+        assert_eq!(
+            stage("drain-batch-3").metadata.get("depends_on").unwrap(),
+            "health-check-batch-2"
+        );
+        // The first batch gates on the backup verification.
+        assert_eq!(
+            stage("drain-batch-1").metadata.get("depends_on").unwrap(),
+            "pre-reboot-backup-verify"
+        );
+
+        // The last batch hands off to the final fleet-wide check, which is a
+        // non-gating summary depending on the last gate.
+        let last_gate = stage("health-check-batch-3");
+        assert_eq!(
+            last_gate.metadata.get("proceed_to").unwrap(),
+            "post-reboot-health-check"
+        );
+        let final_check = stage("post-reboot-health-check");
+        assert_eq!(final_check.metadata.get("gate").unwrap(), "none");
+        assert_eq!(
+            final_check.metadata.get("stage_role").unwrap(),
+            "final-summary"
+        );
+        assert_eq!(
+            final_check.metadata.get("depends_on").unwrap(),
+            "health-check-batch-3"
+        );
+
+        // Reboot stages depend on their own batch's drain.
+        let reboot = stage("reboot-batch-2-server-1");
+        assert_eq!(reboot.metadata.get("depends_on").unwrap(), "drain-batch-2");
+        assert_eq!(
+            reboot.metadata.get("batch_group").unwrap(),
+            "reboot-batch-2"
+        );
+    }
+
+    #[test]
+    fn test_orchestrate_reboot_batch_stages_tagged_plan_section() {
+        let wave = make_reboot_wave(2, &[]);
+        let stages = orchestrate_reboot(&wave).unwrap();
+        // Every batch stage (drain/reboot/health-check) is tied to the
+        // contract's rebootBatches plan section.
+        for stage in stages.iter().filter(|s| {
+            s.name.starts_with("drain-batch-")
+                || s.name.starts_with("reboot-batch-")
+                || s.name.starts_with("health-check-batch-")
+        }) {
+            assert_eq!(
+                stage.metadata.get("plan_section").map(String::as_str),
+                Some("rebootBatches"),
+                "stage '{}' should be tagged plan_section=rebootBatches",
                 stage.name
             );
         }
