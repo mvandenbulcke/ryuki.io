@@ -77,10 +77,31 @@ idempotent outbox replay returns 200 only on matching result_id+attempt_id). The
   stuck with no apply-retry path. Overlaps the deferred LiveRefused-recoverability trust-model decision;
   owner-owned.
 
+## Protocol-contract sweep (single targeted agent)
+3 findings amid a strong verified-clean list (Ed25519 verify_strict rejects weak/malleable; cp_nonce
+constant-time; VLC expiry + plan-digest + request-id binding + CP re-signature; redaction_policy_version
+gate; approved_plan_digest hex check; fencing/lease_generation/attempt_id binding; evidence_digest +
+job_spec_digest recomputed by CP; 10 MiB body limit).
+- ✅ **register_agent stored public_key without Ed25519 validation** — SHIPPED: only checked
+  `.trim().is_empty()`, deferring the decode to result-submission. So an agent could register + be
+  APPROVED with a garbage key, then every result 400s on decode → silent per-slot DoS surfacing only
+  post-approval. FIX: `decode_verifying_key(public_key)` at registration (reject 400), store the TRIMMED
+  key (the old bind was untrimmed — a whitespace key would later fail the result-side decode). +test
+  db_register_validates_ed25519_public_key (malformed -> 400 before INSERT; valid generated key
+  accepted). codex review pending.
+- **DEFERRED (low)**: `JobResultStatus::Verified` is wire-deserializable + CP-accepted (maps to
+  Succeeded/verified) but the engine RunStatus has no Verified variant, so a legitimate agent can't
+  produce it — an enrolled/compromised agent could craft a signed result with status=verified and the
+  CP would record a verification step that never ran (misleading audit). Blast radius limited (needs an
+  approved agent + valid signature). Small follow-up: reject Verified at ingestion OR remove it from the
+  wire enum. (Not yet implemented — verify no legitimate path produces it first.)
+- **DEFERRED (low, design, task_ca74b21a)**: no CP↔agent protocol VERSION field/negotiation anywhere in
+  ryuki-protocol — schema evolution can silently mis-deserialize an old agent's payloads. Flagged.
+
 ## Not yet swept (run-8 — platform was unstable)
-concurrency-races, protocol-contract, portal-frontend.
-(schema-migration + resilience-errors + execution-agent-seam now done above. concurrency-races was
-manually probed on scheduler.rs — only low-severity nuances.)
+portal-frontend.
+(schema-migration + resilience-errors + execution-agent-seam + protocol-contract now done. concurrency-
+races manually probed on scheduler.rs — only low-severity nuances.)
 (schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
 low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
 causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors

@@ -286,8 +286,26 @@ pub async fn register_agent(
     if body.platform.trim().is_empty() {
         return Err(bad_request("platform must not be empty"));
     }
-    if body.public_key.trim().is_empty() {
+    let public_key = body.public_key.trim();
+    if public_key.is_empty() {
         return Err(bad_request("public_key must not be empty"));
+    }
+    // Validate the Ed25519 verifying key AT REGISTRATION, not lazily at first result
+    // submission. Otherwise an agent can register (and be admin-approved) with a
+    // malformed/garbage key, and every result it later submits fails the decode at
+    // ingestion (agents.rs result path) — a silent per-slot DoS that only surfaces
+    // AFTER approval. Storing the trimmed value also avoids a whitespace-laden key
+    // that the result-side decode would then reject.
+    let vk = ryuki_protocol::crypto::decode_verifying_key(public_key)
+        .map_err(|_| bad_request("public_key must be a valid base64-encoded Ed25519 verifying key"))?;
+    // Also reject WEAK (small-order) keys here: `decode_verifying_key` accepts them, but
+    // result verification uses `verify_strict`, which rejects weak keys — so without this
+    // check a weak key would register/approve yet never verify a result (the same DoS,
+    // narrowed to weak keys). This makes registration agree with result verification.
+    if vk.is_weak() {
+        return Err(bad_request(
+            "public_key must not be a weak (small-order) Ed25519 key",
+        ));
     }
 
     let token = generate_agent_token();
@@ -302,7 +320,7 @@ pub async fn register_agent(
     .bind(&body.agent_id)
     .bind(&body.platform)
     .bind(&capabilities_json)
-    .bind(&body.public_key)
+    .bind(public_key)
     .bind(&hash)
     .execute(pool)
     .await
@@ -3921,6 +3939,74 @@ mod tests {
 
         cleanup_agent(&pool, &id).await;
         pool.close().await;
+    }
+
+    /// #run7 wire-contract: register_agent VALIDATES the Ed25519 public_key AT
+    /// REGISTRATION. A malformed key is rejected 400 (so an agent can't be approved
+    /// with a key it could never sign-verify with — a silent per-slot DoS that would
+    /// otherwise only surface at first result submission); a valid generated key is
+    /// accepted into 'pending'.
+    #[tokio::test]
+    async fn db_register_validates_ed25519_public_key() {
+        // handler_pool() uses the process-global get_db() singleton — serialize with
+        // the other handler tests.
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let mk_body = |agent_id: String, public_key: &str| RegisterBody {
+            agent_id,
+            platform: "ci".to_string(),
+            capabilities: Capabilities::default(),
+            public_key: public_key.to_string(),
+        };
+
+        // Malformed key -> 400 (rejected before any INSERT).
+        let bad_id = format!("badkey-{}", Uuid::new_v4());
+        let bad = register_agent(
+            HeaderMap::new(),
+            Json(mk_body(bad_id.clone(), "not-a-valid-ed25519-key!!")),
+        )
+        .await;
+        assert!(
+            matches!(bad, Err((StatusCode::BAD_REQUEST, _))),
+            "a malformed public_key must be rejected 400: {bad:?}"
+        );
+        let bad_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE agent_id = $1)")
+                .bind(&bad_id)
+                .fetch_one(pool)
+                .await
+                .expect("query");
+        assert!(!bad_exists, "a rejected registration must NOT have inserted a row");
+
+        // WEAK (small-order) key -> 400: it decodes fine but verify_strict would reject
+        // it at result time, so registration must reject it too. The all-zeros encoding
+        // (y = 0, sign 0) decompresses to a LOW-ORDER point, for which is_weak() is true.
+        let weak = ed25519_dalek::VerifyingKey::from_bytes(&[0u8; 32]).expect("low-order point decodes");
+        let weak_b64 = encode_verifying_key(&weak);
+        let weak_resp = register_agent(
+            HeaderMap::new(),
+            Json(mk_body(format!("weak-{}", Uuid::new_v4()), &weak_b64)),
+        )
+        .await;
+        assert!(
+            matches!(weak_resp, Err((StatusCode::BAD_REQUEST, _))),
+            "a weak (small-order) public_key must be rejected 400: {weak_resp:?}"
+        );
+
+        // Valid generated Ed25519 key -> accepted (pending).
+        let key = generate_keypair(&mut OsRng);
+        let pubkey = encode_verifying_key(&key.verifying_key());
+        let good_id = format!("goodkey-{}", Uuid::new_v4());
+        let ok = register_agent(HeaderMap::new(), Json(mk_body(good_id.clone(), &pubkey))).await;
+        let Ok(Json(resp)) = &ok else {
+            panic!("a valid public_key must register: {ok:?}");
+        };
+        assert_eq!(resp.agent_id, good_id, "the valid registration returns the agent id");
+
+        cleanup_agent(pool, &good_id).await;
     }
 
     // ── pending agent poll → 403 ─────────────────────────────────────────
