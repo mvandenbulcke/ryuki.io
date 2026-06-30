@@ -2942,6 +2942,165 @@ pub async fn admin_cancel_pending_job(
     })))
 }
 
+/// Body for POST /api/admin/agents/jobs/{job_id}/force-fail.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForceFailJobBody {
+    reason: String,
+}
+
+/// POST /api/admin/agents/jobs/{job_id}/force-fail
+///
+/// Terminally fails a STUCK `Leased` agent job (leased to an agent that died / never
+/// acked) without waiting out the lease-expiry + dead-letter cycles. Scoped to
+/// `Leased` jobs whose mode is `OfflineDryRun` / `LivePlan` — modes that NEVER touch
+/// real infrastructure, so `Failed` is safe and a late ack/result is rejected by the
+/// result CAS (`status IN ('Leased','Running')`). A `Leased` `LiveApply` is EXCLUDED
+/// (409): with out-of-order delivery the agent may have started applying real infra, so
+/// it must go through the lease-expiry path → `ReconcileRequired` (this endpoint never
+/// sets `ReconcileRequired`). `Pending` uses cancel; a `Running` job belongs on the
+/// lease-expiry/reconcile path. Admin-only, audited; emits a NON-alerting
+/// `job.force_failed` event. JOB-SCOPED: the parent request is left for the operator's
+/// `POST /api/requests/{id}/fail` (identical to the cancel/reconcile contract).
+pub async fn admin_force_fail_job(
+    Path(job_id): Path<String>,
+    Extension(session): Extension<AuthSession>,
+    Json(body): Json<ForceFailJobBody>,
+) -> ApiResult<Json<Value>> {
+    if !check_permission(&session, "admin") {
+        return Err(forbidden("admin permission is required to force-fail a job"));
+    }
+    let reason = body.reason.trim();
+    if reason.is_empty() {
+        return Err(bad_request("a force-fail reason is required"));
+    }
+    if reason.len() > 2000 {
+        return Err(bad_request("reason is too long (max 2000 characters)"));
+    }
+    let pool = get_db().ok_or_else(|| service_unavailable("database unavailable"))?;
+    let uid = Uuid::parse_str(&job_id)
+        .map_err(|_| not_found(format!("agent job '{job_id}' not found")))?;
+    let mut tx = pool.begin().await.map_err(db_err)?;
+
+    // Load + LOCK the row. The dispatched `spec.mode` is the AUTHORITATIVE mode — the scalar
+    // `mode` column is NOT load-bearing (the agent routes by spec.mode, and a row can carry
+    // spec.mode=LiveApply with a different column mode — codex). The safety decision is on
+    // spec.mode so a LiveApply job can NEVER be force-failed to Failed (it must go through the
+    // lease-expiry path → ReconcileRequired to protect real infra). spec.request_id is the
+    // authoritative parent request. FOR UPDATE holds the row so its status cannot change
+    // between this read and the CAS below.
+    let row: Option<(String, String, Value)> =
+        sqlx::query_as("SELECT status, platform, spec FROM agent_jobs WHERE id = $1 FOR UPDATE")
+            .bind(uid)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let Some((status, platform, spec_json)) = row else {
+        return Err(not_found(format!("agent job '{job_id}' not found")));
+    };
+    let spec: JobSpec = serde_json::from_value(spec_json).map_err(|e| {
+        tracing::error!(error = %e, job_id = %job_id, "agent job has a malformed stored spec");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "agent job has a malformed spec"})),
+        )
+    })?;
+
+    // Only a Leased job whose SPEC mode is non-LiveApply force-fails.
+    if status != "Leased" {
+        return Err(conflict(match status.as_str() {
+            "Pending" => "a pending job is not yet leased; cancel it instead".to_string(),
+            "Running" => "a running job must be left to the lease-expiry / reconcile path, \
+                          not force-failed"
+                .to_string(),
+            other => format!("job is already in terminal status '{other}'; cannot force-fail"),
+        }));
+    }
+    // Exhaustive on JobMode so a FUTURE variant can never become implicitly force-failable
+    // (it would be a compile error here, forcing a deliberate safety decision) — codex.
+    match spec.mode {
+        JobMode::OfflineDryRun | JobMode::LivePlan => {}
+        JobMode::LiveApply => {
+            return Err(conflict(
+                "a leased live-apply job must go through the lease-expiry / reconcile path to \
+                 protect real infrastructure; it cannot be force-failed"
+                    .to_string(),
+            ));
+        }
+    }
+    let request_id = spec.request_id.to_string();
+
+    // CAS within the row lock — status is still Leased (FOR UPDATE prevents a concurrent
+    // ack / lease-expiry from changing it between the read and here).
+    let affected = sqlx::query(
+        "UPDATE agent_jobs SET status = 'Failed', updated_at = NOW() \
+         WHERE id = $1 AND status = 'Leased'",
+    )
+    .bind(uid)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    if affected == 0 {
+        // Unreachable under FOR UPDATE, but fail safe rather than emit a phantom audit/event.
+        return Err(conflict(
+            "the job changed state concurrently; retry".to_string(),
+        ));
+    }
+
+    // Audit the operator action — the free-text reason lives ONLY here.
+    crate::audit::record_audit_tx(
+        &mut tx,
+        &session,
+        &crate::audit::security_audit(
+            "agent-job-force-failed",
+            Some("leased"),
+            "failed",
+            json!({
+                "job_id": &job_id,
+                "request_id": request_id,
+                "platform": platform,
+                "reason": reason,
+            }),
+        ),
+    )
+    .await
+    .map_err(db_err)?;
+
+    // NON-alerting lifecycle event. `to_status` 'admin-force-failed' is deliberately NOT in
+    // event_alerts::alert_worthy_statuses(), so the alert feed's coarse SQL prefilter never
+    // fetches it — a force-fail can never page. NO free-text reason in the payload.
+    crate::repos::domain_events::insert(
+        &mut *tx,
+        crate::repos::domain_events::NewEvent {
+            event_type: "job.force_failed",
+            aggregate_type: "agent_job",
+            aggregate_id: &job_id,
+            site: None,
+            environment: None,
+            actor: &session.user_id,
+            payload: json!({
+                "to_status": "admin-force-failed",
+                "platform": platform,
+                "request_id": request_id,
+                "note": "admin force-failed a stuck leased job",
+            }),
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+
+    tracing::info!(job_id = %job_id, "stuck leased agent job force-failed by admin");
+    Ok(Json(json!({
+        "job_id": job_id,
+        "request_id": request_id,
+        "status": "Failed",
+        "force_failed": true,
+        "note": "the parent request remains Executing; fail or retry it separately",
+    })))
+}
+
 /// Body for POST /api/admin/agents/jobs/{job_id}/priority (#15).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3196,6 +3355,10 @@ pub fn admin_routes() -> Router {
         .route(
             "/api/admin/agents/jobs/{job_id}/cancel",
             post(admin_cancel_pending_job),
+        )
+        .route(
+            "/api/admin/agents/jobs/{job_id}/force-fail",
+            post(admin_force_fail_job),
         )
         // Static `queue-depth` in the `{agent_id}` slot (same matchit pattern).
         .route(
@@ -8818,6 +8981,350 @@ mod tests {
         assert_eq!(denied.0, StatusCode::FORBIDDEN);
 
         let _ = pool; // pool only needed to gate on RYUKI_DATABASE_URL availability
+    }
+
+    // ── Admin force-fail of a stuck Leased job ────────────────────────────────
+
+    /// Seed a job in a given status AND mode (the force-fail path is mode-aware).
+    async fn seed_job_with_mode(
+        pool: &PgPool,
+        platform: &str,
+        request_id: Uuid,
+        status: &str,
+        mode: JobMode,
+    ) -> Uuid {
+        // Compute the label BEFORE moving `mode` into the spec (JobMode is not Copy;
+        // the unit-variant match does not move it).
+        let mode_label = match mode {
+            JobMode::OfflineDryRun => "OfflineDryRun",
+            JobMode::LivePlan => "LivePlan",
+            JobMode::LiveApply => "LiveApply",
+        };
+        let spec = dead_letter_spec(request_id, mode);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(platform)
+        .bind(&spec_json)
+        .bind(mode_label)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .expect("seed agent job with mode")
+    }
+
+    async fn force_fail_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE action = 'agent-job-force-failed' AND detail->>'job_id' = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("count force-fail audit")
+    }
+
+    async fn force_failed_event_to_status(pool: &PgPool, job_id: Uuid) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT payload->>'to_status' FROM domain_events \
+             WHERE event_type = 'job.force_failed' AND aggregate_type = 'agent_job' \
+               AND aggregate_id = $1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .expect("query force-fail event")
+    }
+
+    /// Force-fail a stuck Leased dry-run job → Failed: audited, a NON-alerting event,
+    /// parent request left actionable; status is now Failed so a late result CAS rejects.
+    #[tokio::test]
+    async fn force_fail_leased_dryrun_happy() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-ff-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        let job = seed_job_in_status(pool, &platform, req, "Leased").await; // OfflineDryRun
+
+        let Json(out) = admin_force_fail_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody {
+                reason: "agent host is dead; killing the stuck job".into(),
+            }),
+        )
+        .await
+        .expect("force-fail must succeed");
+        assert_eq!(out["status"], json!("Failed"));
+        assert_eq!(out["force_failed"], json!(true));
+        assert_eq!(out["request_id"], json!(req.to_string()));
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            job_status, "Failed",
+            "the job is now terminal Failed (a late result CAS on Leased/Running rejects)"
+        );
+        let req_status: String = sqlx::query_scalar("SELECT status FROM requests WHERE id = $1")
+            .bind(req)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(req_status, "executing", "the parent request stays actionable");
+        assert_eq!(force_fail_audit_count(pool, job).await, 1, "one force-fail audit row");
+        assert_eq!(
+            force_failed_event_to_status(pool, job).await.as_deref(),
+            Some("admin-force-failed"),
+            "one non-alerting force-fail event"
+        );
+        assert!(
+            !ryuki_engine::event_alerts::alert_worthy_statuses().contains(&"admin-force-failed"),
+            "admin-force-failed must NOT be in the alert prefilter — a force-fail can never page"
+        );
+        // Secret hygiene: the reason is audit-only — absent from the response + the event.
+        assert!(
+            !out.to_string().contains("agent host is dead"),
+            "the reason must NOT be echoed in the response"
+        );
+        let event_payload: Option<String> = sqlx::query_scalar(
+            "SELECT payload::text FROM domain_events \
+             WHERE event_type = 'job.force_failed' AND aggregate_id = $1",
+        )
+        .bind(job.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        assert!(
+            event_payload.is_some_and(|p| !p.contains("agent host is dead")),
+            "the reason must NOT be in the domain-event payload"
+        );
+
+        // A Leased LivePlan job force-fails too (LivePlan never touches real infra).
+        let lp = seed_job_with_mode(pool, &platform, req, "Leased", JobMode::LivePlan).await;
+        let _ = admin_force_fail_job(
+            Path(lp.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody {
+                reason: "stuck live-plan".into(),
+            }),
+        )
+        .await
+        .expect("force-fail of a leased live-plan must succeed");
+        let lp_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(lp)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(lp_status, "Failed", "a leased live-plan job force-fails to Failed");
+
+        cleanup_dead_letter_events(pool, lp).await;
+        cleanup_dead_letter_events(pool, job).await;
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// B1 regression (codex): the SPEC mode is authoritative, NOT the scalar `mode`
+    /// column. A Leased job with column `mode='OfflineDryRun'` but `spec.mode=LiveApply`
+    /// must be REFUSED (409) — the old column-based CAS would have force-failed it.
+    #[tokio::test]
+    async fn force_fail_decides_on_spec_mode_not_column() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-ff-spec-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        // column mode = OfflineDryRun (the non-load-bearing scalar) but the dispatched
+        // spec.mode = LiveApply (what the agent actually acts on).
+        let spec = dead_letter_spec(req, JobMode::LiveApply);
+        let spec_json = serde_json::to_value(&spec).expect("spec serialises");
+        let job: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, $3, 'OfflineDryRun', 'Leased') RETURNING id",
+        )
+        .bind(req)
+        .bind(&platform)
+        .bind(&spec_json)
+        .fetch_one(pool)
+        .await
+        .expect("seed mismatched-mode job");
+
+        let err = admin_force_fail_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody {
+                reason: "should be refused".into(),
+            }),
+        )
+        .await
+        .expect_err("a job whose SPEC mode is LiveApply must not be force-failed");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Leased", "the live-apply-spec job is untouched");
+        assert_eq!(
+            force_fail_audit_count(pool, job).await,
+            0,
+            "no audit on a refused force-fail"
+        );
+        assert!(
+            force_failed_event_to_status(pool, job).await.is_none(),
+            "no domain event on a refused force-fail"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// A Leased job with a malformed stored spec fails CLOSED → 500 (never force-failed
+    /// on undecodable mode), and the row is untouched.
+    #[tokio::test]
+    async fn force_fail_malformed_spec_is_500_fail_closed() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-ff-bad-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+        // A Leased job whose `spec` is not a valid JobSpec (empty object).
+        let job: Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_jobs (request_id, platform, spec, mode, status) \
+             VALUES ($1, $2, '{}'::jsonb, 'OfflineDryRun', 'Leased') RETURNING id",
+        )
+        .bind(req)
+        .bind(&platform)
+        .fetch_one(pool)
+        .await
+        .expect("seed malformed-spec job");
+
+        let err = admin_force_fail_job(
+            Path(job.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody {
+                reason: "bad spec".into(),
+            }),
+        )
+        .await
+        .expect_err("a malformed spec fails closed");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let job_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(job_status, "Leased", "a malformed-spec job is never mutated");
+        assert_eq!(
+            force_fail_audit_count(pool, job).await,
+            0,
+            "no audit on a fail-closed force-fail"
+        );
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// A Leased LiveApply job is EXCLUDED (409 — it must go through lease-expiry →
+    /// ReconcileRequired to protect real infra). A Running / Pending job also 409s.
+    #[tokio::test]
+    async fn force_fail_rejects_leased_liveapply_running_and_pending() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let platform = format!("plt-ff-rej-{}", Uuid::new_v4().simple());
+        let req = seed_request_row(pool, "executing").await;
+
+        // Leased LiveApply → 409; row stays Leased, no audit (codex: protect real infra).
+        let la = seed_job_with_mode(pool, &platform, req, "Leased", JobMode::LiveApply).await;
+        let e1 = admin_force_fail_job(
+            Path(la.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("a leased live-apply job is 409");
+        assert_eq!(e1.0, StatusCode::CONFLICT);
+        let la_status: String = sqlx::query_scalar("SELECT status FROM agent_jobs WHERE id = $1")
+            .bind(la)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(la_status, "Leased", "the leased live-apply job is untouched");
+        assert_eq!(
+            force_fail_audit_count(pool, la).await,
+            0,
+            "a rejected force-fail writes no audit row"
+        );
+
+        // Running (dry-run) → 409.
+        let run = seed_job_in_status(pool, &platform, req, "Running").await;
+        let e2 = admin_force_fail_job(
+            Path(run.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("a running job is 409");
+        assert_eq!(e2.0, StatusCode::CONFLICT);
+
+        // Pending → 409 (use cancel instead).
+        let pend = seed_job_in_status(pool, &platform, req, "Pending").await;
+        let e3 = admin_force_fail_job(
+            Path(pend.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("a pending job is 409");
+        assert_eq!(e3.0, StatusCode::CONFLICT);
+
+        cleanup_jobs_for_platform(pool, &platform).await;
+        cleanup_request_row(pool, req).await;
+    }
+
+    /// unknown id → 404; non-admin → 403.
+    #[tokio::test]
+    async fn force_fail_unknown_404_and_non_admin_403() {
+        let _serial = crate::database::DB_TEST_SERIAL.lock().await;
+        let Some(pool) = handler_pool_lenient().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let unknown = Uuid::new_v4();
+        let e = admin_force_fail_job(
+            Path(unknown.to_string()),
+            Extension(AuthSession::static_dry_run()),
+            Json(ForceFailJobBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("unknown id is a 404");
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        let d = admin_force_fail_job(
+            Path(unknown.to_string()),
+            Extension(non_admin_session()),
+            Json(ForceFailJobBody { reason: "x".into() }),
+        )
+        .await
+        .expect_err("a non-admin is forbidden");
+        assert_eq!(d.0, StatusCode::FORBIDDEN);
+        let _ = pool;
     }
 
     async fn requeue_audit_count(pool: &PgPool, job_id: Uuid) -> i64 {

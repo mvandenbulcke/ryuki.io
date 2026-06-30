@@ -9,6 +9,16 @@ independently re-verifies before implementing — and ALREADY corrected one (the
 
 ## Clusters (confirmed)
 
+### A0. NEW (codex, force-fail review): execution-plane admin surface is NOT site-scoped
+`agents.rs` does not import `scope_guard_or_404`; NONE of its ~13 admin handlers (reconcile, cancel,
+priority, dead-letter requeue, queue-depth, result, force-fail, …) scope-guard the parent request —
+admin is treated as platform-global. A SCOPED admin (admin role + a `site_scope`) can mutate/
+state-oracle an out-of-scope job. DESIGN DECISION: is the execution-plane admin surface meant to be
+site-scoped? If yes → a dedicated sweep across ALL agent-job admin handlers (incl. the shipped
+cancel/reconcile/force-fail), resolving the parent request from `spec.request_id` + `scope_guard_or_404`.
+HIGH value if scoped-admin tokens are a real deployment. (Deferred from the force-fail slice — fixing
+one handler in isolation is inconsistent.)
+
 ### A. No-DB-branch scope guard (the IN-PROGRESS sweep)
 Request-lifecycle mutation handlers whose **no-DB** branch lacks the scope guard their DB branch has
 (cross-scope mutation in DB-less mode). Hand audit: **8** handlers (validate/plan/lock/execute/verify
@@ -51,9 +61,11 @@ guarded). See no-db-scope-guard-sweep.md. MEDIUM (no-DB-only). → **being fixed
   user typed (medium/M). (Careful: high false-positive risk; scope tightly.)
 
 ## Suggested order (backend-verifiable, impact × confidence)
-1. No-DB scope guard sweep (A) — IN PROGRESS.
+1. ✅ No-DB scope guard sweep (A) — SHIPPED a08f1ac (6 handlers).
 2. Background-loop wedge domain event (B, CRITICAL).
-3. Offset-clamp sweep (D) — quick, closes a 500 class.
-4. shift_queue prune (C) — extends the proven prune pattern.
+3. ✅ Offset-clamp sweep (D) — SHIPPED 9f6b8ab (clamp_offset_usize at 3 sites).
+4. shift_queue prune (C) — extends the proven prune pattern. ← NEXT
 5. Lifecycle domain events (B: decommission/AD/incident) — proven event pattern.
-6. Stuck-job force-fail/complete + job inspection (E) — completes the agent-job lifecycle.
+6. ✅ Stuck-job force-fail (E) — SHIPPED: admin force-fail of a Leased non-LiveApply job (spec.mode
+   authoritative; LiveApply → reconcile path). Job inspection endpoint + the A0 scope-guard sweep
+   remain.
