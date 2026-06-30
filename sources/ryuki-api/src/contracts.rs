@@ -33880,6 +33880,17 @@ async fn secrets_deregister(
     // Wrap mutation + audit in a tx (#7). 404 rolls back with no audit row.
     // Detail carries references only — NEVER vault_path or credential values.
     let mut tx = pool.begin().await.map_err(db_error)?;
+    // Capture the REAL prior status BEFORE the UPDATE — the UPDATE's RETURNING yields the
+    // NEW (retired) status, so the old code hardcoded `from = "active"`, mislabelling a
+    // deregister of an already-retired/expired/rotating/failed secret in the audit trail.
+    // FOR UPDATE locks the row so a concurrent rotation/status write can't change it
+    // between this read and the UPDATE below (else the audit label could go stale).
+    let prior_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM managed_secrets WHERE id = $1 FOR UPDATE")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
     let row: Option<ManagedSecretRow> = sqlx::query_as(&format!(
         "UPDATE managed_secrets SET status = $1 WHERE id = $2 \
          RETURNING {MANAGED_SECRET_COLUMNS}"
@@ -33901,7 +33912,11 @@ async fn secrets_deregister(
                 &session,
                 &audit::security_audit(
                     "secret-deregister",
-                    Some("active"),
+                    // The REAL prior status (kebab-case DB string), not a hardcoded
+                    // "active" — so the audit trail reflects what the secret actually
+                    // was (e.g. expired/rotating/failed, or 'retired' on an idempotent
+                    // re-deregister) rather than a fabricated active->retired transition.
+                    Some(prior_status.as_deref().unwrap_or("active")),
                     "retired",
                     json!({ "secret_id": &id }),
                 ),
@@ -52547,6 +52562,55 @@ mod secrets_rotation_db_tests {
             .fetch_optional(pool)
             .await
             .expect("read managed_secret status")
+    }
+
+    /// run-8: the deregister audit records the REAL prior status, not a hardcoded
+    /// "active". Seed an EXPIRED secret, deregister it, and assert the audit_log
+    /// from_status is 'expired' (the old code always logged 'active').
+    #[tokio::test]
+    async fn secrets_deregister_audit_records_real_prior_status() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let id = "sr-dbtest-priorstatus-1";
+        cleanup_secret(pool, id).await;
+        sqlx::query(
+            "INSERT INTO managed_secrets \
+             (id, name, secret_type, vault_path, rotation_interval_days, last_rotated, \
+              next_rotation_due, status, owner, site) \
+             VALUES ($1, 'prior-status-test', 'token', 'vault/p', 30, \
+                     '2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', \
+                     'expired', 'tester', 'PRIORTEST-q3')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("seed expired secret");
+
+        let res = secrets_deregister(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(id.into()),
+        )
+        .await;
+        let from_status: Option<String> = sqlx::query_scalar(
+            "SELECT from_status FROM audit_log \
+             WHERE action = 'secret-deregister' AND detail->>'secret_id' = $1 \
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("query audit");
+        cleanup_secret(pool, id).await;
+
+        assert!(res.is_ok(), "deregister of an expired secret must succeed: {res:?}");
+        assert_eq!(
+            from_status.as_deref(),
+            Some("expired"),
+            "the audit must record the REAL prior status ('expired'), not a hardcoded 'active'"
+        );
     }
 
     /// #49 deregister: DELETE soft-retires a secret — status becomes `retired`,
