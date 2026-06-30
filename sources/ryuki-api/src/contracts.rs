@@ -30923,10 +30923,40 @@ async fn ipam_summary(
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))
 }
 async fn ipam_check_availability(
+    AuthExtractor(session): AuthExtractor,
     Path(id): Path<String>,
     Query(q): Query<IpamAvailabilityQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    dns_ipam::check_ip_availability(&id, q.count.unwrap_or(1))
+    let count = q.count.unwrap_or(1);
+    if let Some(pool) = get_db() {
+        // Durable path: availability is read from the authoritative `available_ips`
+        // column on ipam_subnets — the value maintained by ipam_reserve_ip /
+        // ipam_release_ip. The engine's in-memory store (the no-DB fallback below)
+        // resets on restart and never reflects DB-path reservations, so reading it on
+        // a DB deployment returns a STALE (seed-only) availability count.
+        let subnet_row: Option<IpamSubnetRow> = sqlx::query_as(&format!(
+            "SELECT {IPAM_SUBNET_COLUMNS} FROM ipam_subnets WHERE id = $1"
+        ))
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let subnet = match subnet_row {
+            Some(row) => row.to_engine(),
+            None => return Err(ipam_not_found(format!("Subnet '{id}' not found"))),
+        };
+        // #2: a scoped principal may only read a subnet in its own site (mirrors
+        // ipam_subnet_get — availability-by-id is a read of the same subnet resource).
+        guard_body_site_scope(&session, &subnet.site)?;
+        return Ok(Json(json!({
+            "source": "database",
+            "subnet_id": id,
+            "requested_ips": count,
+            "available_ips": subnet.available_ips,
+            "can_allocate": subnet.available_ips >= count,
+        })));
+    }
+    dns_ipam::check_ip_availability(&id, count)
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))
 }
@@ -42299,6 +42329,98 @@ mod db_lifecycle_tests {
         assert_eq!(
             r2["subnet"]["available_ips"], 252,
             "available_ips decremented by exactly 2 (no stale-counter overwrite)"
+        );
+    }
+
+    /// #P2-12: ipam_check_availability reads the AUTHORITATIVE `available_ips` column
+    /// (maintained by ipam_reserve_ip / ipam_release_ip), NOT the in-memory engine
+    /// seed — so after two reserves it reports the DECREMENTED count, and an unknown
+    /// subnet id is a 404. Before this fix the handler read the engine store, which on
+    /// a DB deployment returns a STALE seed-only count and never reflects reservations.
+    #[tokio::test]
+    async fn test_ipam_check_availability_reads_live_db_counter() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+        let Json(created) = ipam_subnet_create(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Json(IpamSubnetCreateRequest {
+                cidr: "10.78.0.0/24".to_string(),
+                gateway: "10.78.0.1".to_string(),
+                vlan_id: 778,
+                site: "TESTSITE".to_string(),
+            }),
+        )
+        .await
+        .expect("create subnet");
+        let id = created["subnet"]["id"].as_str().unwrap().to_string();
+
+        let check = |count: u32| {
+            let id = id.clone();
+            async move {
+                ipam_check_availability(
+                    AuthExtractor(AuthSession::static_dry_run()),
+                    Path(id),
+                    Query(IpamAvailabilityQuery { count: Some(count) }),
+                )
+                .await
+            }
+        };
+
+        // Fresh /24: 254 usable hosts, all available on the DB path.
+        let Json(before) = check(254).await.expect("availability before");
+        // Reserve two IPs, decrementing the authoritative counter to 252.
+        for hostname in ["avail-a", "avail-b"] {
+            let Json(_) = ipam_reserve_ip(
+                Extension(AuthSession::static_dry_run()),
+                Json(IpamReserveRequest {
+                    subnet_id: id.clone(),
+                    hostname: hostname.to_string(),
+                    purpose: "test".to_string(),
+                    ttl_days: 30,
+                }),
+            )
+            .await
+            .expect("reserve");
+        }
+        let Json(after) = check(252).await.expect("availability after");
+        let Json(over) = check(253).await.expect("availability over");
+        let missing = ipam_check_availability(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path("subnet-does-not-exist".to_string()),
+            Query(IpamAvailabilityQuery { count: Some(1) }),
+        )
+        .await;
+
+        // Cleanup BEFORE asserting (a failed assert must not leak the test subnet).
+        sqlx::query("DELETE FROM ip_reservations WHERE subnet_id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM ipam_subnets WHERE id = $1")
+            .bind(&id)
+            .execute(pool)
+            .await
+            .ok();
+
+        assert_eq!(before["source"], "database", "DB path, not the in-memory seed");
+        assert_eq!(before["available_ips"], 254);
+        assert_eq!(before["can_allocate"], true);
+        assert_eq!(
+            after["available_ips"], 252,
+            "availability tracks live DB reservations, not the stale seed"
+        );
+        assert_eq!(after["can_allocate"], true, "252 requested <= 252 available");
+        assert_eq!(
+            over["can_allocate"], false,
+            "253 requested > 252 available → cannot allocate"
+        );
+        assert!(
+            matches!(missing, Err((StatusCode::NOT_FOUND, _))),
+            "unknown subnet id is a 404 on the DB path"
         );
     }
 
