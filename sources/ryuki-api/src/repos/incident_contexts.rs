@@ -85,10 +85,19 @@ pub async fn list(pool: &PgPool) -> Result<Vec<IncidentContext>, sqlx::Error> {
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
-pub async fn list_active(pool: &PgPool) -> Result<Vec<IncidentContext>, sqlx::Error> {
+/// Return active incident contexts, newest first, capped at `limit` rows. The
+/// `limit` is a defense-in-depth bound (callers pass the shared `MAX_LIST_ROWS`)
+/// so a sustained-incident burst can never return an unbounded result set —
+/// mirroring the other capped list reads.
+pub async fn list_active(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<IncidentContext>, sqlx::Error> {
     let rows: Vec<IncidentContextRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM incident_contexts WHERE status = 'active' ORDER BY created_at DESC, incident_id DESC"
+        "SELECT {COLUMNS} FROM incident_contexts WHERE status = 'active' \
+         ORDER BY created_at DESC, incident_id DESC LIMIT $1"
     ))
+    .bind(limit)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(|r| r.into_model()).collect()

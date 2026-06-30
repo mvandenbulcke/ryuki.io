@@ -28760,6 +28760,9 @@ async fn runbook_rollback(
 }
 
 /// List runbook executions for a given site. 503 when no database is configured.
+/// List runbook executions for a site, newest first. Capped at the latest
+/// `MAX_LIST_ROWS` (1000) rows — a defense-in-depth bound, not full pagination;
+/// a site with a deeper history returns only its most recent executions.
 async fn runbook_executions_list(
     AuthExtractor(session): AuthExtractor,
     Query(params): Query<RunbookListQuery>,
@@ -28769,7 +28772,7 @@ async fn runbook_executions_list(
     let site_scoped = enforce_site_scope(&session, params.site.as_deref(), "")?;
     let site = site_scoped.as_str();
 
-    let executions = crate::repos::runbook_executions::list(pool, site)
+    let executions = crate::repos::runbook_executions::list(pool, site, MAX_LIST_ROWS)
         .await
         .map_err(db_error)?;
 
@@ -29293,9 +29296,12 @@ async fn incident_get(Path(id): Path<String>) -> ApiResult {
     Ok(Json(serde_json::to_value(&ctx).unwrap_or_default()))
 }
 
+/// List active incident contexts, newest first. Capped at the latest
+/// `MAX_LIST_ROWS` (1000) rows — a defense-in-depth bound against a
+/// sustained-incident burst, not full pagination.
 async fn incident_active() -> ApiResult {
     let pool = get_db().ok_or_else(status_503_no_db)?;
-    let incidents = crate::repos::incident_contexts::list_active(pool)
+    let incidents = crate::repos::incident_contexts::list_active(pool, MAX_LIST_ROWS)
         .await
         .map_err(db_error)?;
     Ok(Json(serde_json::to_value(&incidents).unwrap_or_default()))
@@ -64115,7 +64121,7 @@ mod runbook_executions_db_tests {
             .await
             .expect("insert exec2 must succeed");
 
-        let listed = crate::repos::runbook_executions::list(pool, "DEFRA")
+        let listed = crate::repos::runbook_executions::list(pool, "DEFRA", super::MAX_LIST_ROWS)
             .await
             .expect("list must succeed");
 
@@ -64133,6 +64139,46 @@ mod runbook_executions_db_tests {
         assert!(
             listed.iter().all(|e| e.site == "DEFRA"),
             "all listed executions must be for DEFRA"
+        );
+    }
+
+    /// The repo `list` LIMIT is wired and bounds the result-set CARDINALITY:
+    /// insert two executions for one site, list with `limit = 1`, assert exactly
+    /// one row comes back. Proves the unbounded read (run-6 finding) is now
+    /// capped. (Newest-first ORDER BY is enforced in SQL and unchanged here.)
+    #[tokio::test]
+    async fn test_list_respects_limit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let exec1 = make_exec(&format!("{suffix}-a"), "restart-service", "GBLON");
+        let exec2 = make_exec(&format!("{suffix}-b"), "certificate-renewal", "GBLON");
+        let id1 = exec1.id.clone();
+        let id2 = exec2.id.clone();
+
+        crate::repos::runbook_executions::insert(pool, &exec1)
+            .await
+            .expect("insert exec1 must succeed");
+        crate::repos::runbook_executions::insert(pool, &exec2)
+            .await
+            .expect("insert exec2 must succeed");
+
+        let listed = crate::repos::runbook_executions::list(pool, "GBLON", 1)
+            .await
+            .expect("list must succeed");
+
+        cleanup(pool, &id1).await;
+        cleanup(pool, &id2).await;
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "limit = 1 must bound the result to a single row, got {}",
+            listed.len()
         );
     }
 }
@@ -64170,6 +64216,47 @@ mod incident_contexts_db_tests {
             site,
         )
         .expect("build_incident_context must succeed")
+    }
+
+    /// The `list_active` LIMIT is wired and bounds the result set: insert two
+    /// active incidents, list with `limit = 1`, assert exactly one row comes
+    /// back. Proves the unbounded active-incident read (run-6 finding) is now
+    /// capped even under a sustained-incident burst.
+    #[tokio::test]
+    async fn test_list_active_respects_limit() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set / DB unavailable");
+            return;
+        };
+
+        let suffix = uuid::Uuid::new_v4().to_string();
+        let a = make_incident(&format!("{suffix}-a"), "DEFRA");
+        let b = make_incident(&format!("{suffix}-b"), "DEFRA");
+        let id_a = a.incident_id.clone();
+        let id_b = b.incident_id.clone();
+
+        crate::repos::incident_contexts::insert(pool, &a)
+            .await
+            .expect("insert a must succeed");
+        crate::repos::incident_contexts::insert(pool, &b)
+            .await
+            .expect("insert b must succeed");
+
+        // ≥2 active incidents exist now; LIMIT 1 must return exactly one.
+        let listed = crate::repos::incident_contexts::list_active(pool, 1)
+            .await
+            .expect("list_active must succeed");
+
+        cleanup(pool, &id_a).await;
+        cleanup(pool, &id_b).await;
+
+        assert_eq!(
+            listed.len(),
+            1,
+            "limit = 1 must bound the active list to a single row, got {}",
+            listed.len()
+        );
     }
 
     /// #7 audit: the outage_notices_create HANDLER writes a durable audit row

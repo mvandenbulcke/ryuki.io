@@ -136,13 +136,21 @@ pub async fn get(
     }
 }
 
-/// Return all runbook executions for a given site, ordered by creation time
-/// descending.
-pub async fn list(pool: &PgPool, site: &str) -> Result<Vec<RunbookExecution>, sqlx::Error> {
+/// Return runbook executions for a given site, newest first, capped at `limit`
+/// rows. The `limit` is a defense-in-depth bound (callers pass the shared
+/// `MAX_LIST_ROWS`) so a site with a large execution history never returns an
+/// unbounded result set — mirroring `runbook_active`'s `LIMIT MAX_LIST_ROWS`.
+pub async fn list(
+    pool: &PgPool,
+    site: &str,
+    limit: i64,
+) -> Result<Vec<RunbookExecution>, sqlx::Error> {
     let rows: Vec<RunbookExecutionRow> = sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM runbook_executions WHERE site = $1 ORDER BY created_at DESC, id DESC"
+        "SELECT {COLUMNS} FROM runbook_executions WHERE site = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2"
     ))
     .bind(site)
+    .bind(limit)
     .fetch_all(pool)
     .await?;
 
