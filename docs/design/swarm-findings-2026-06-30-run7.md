@@ -100,10 +100,31 @@ job_spec_digest recomputed by CP; 10 MiB body limit).
 - **DEFERRED (low, design, task_ca74b21a)**: no CP↔agent protocol VERSION field/negotiation anywhere in
   ryuki-protocol — schema evolution can silently mis-deserialize an old agent's payloads. Flagged.
 
-## Not yet swept (run-8 — platform was unstable)
-portal-frontend.
-(schema-migration + resilience-errors + execution-agent-seam + protocol-contract now done. concurrency-
-races manually probed on scheduler.rs — only low-severity nuances.)
+## Portal-frontend sweep (single targeted agent) — ALL run-7 dimensions now swept
+4 findings (portal/portal-ui/src/views/). RBAC nav gating + form required-field validation + integration
+list-refresh all verified SOUND.
+- ✅ **execution_job_resource never refetched after lifecycle actions** (request_detail.rs) — SHIPPED:
+  all 13 Action handlers refetched detail_resource + audit_resource but NOT execution_job_resource, so
+  after `execute` dispatched a job the "Execution Job" panel stayed stale until a hard reload. FIX: add
+  `execution_job_resource.refetch()` to all 13 handlers (consistent: any lifecycle action refreshes all
+  3 panels). cargo check + clippy clean. codex review pending. (Verification: compile + codex — browser
+  verification needs the full stack [portal dev server + API + the locally-drifted DB], disproportionate
+  for a refetch identical to the 13 existing working ones.)
+- **FLAGGED (task) — the other 3 portal findings** (need the full-stack browser-verify path, batched for
+  a dedicated portal session):
+  - (med) notifications.rs mark_all/mark_one DISCARD errors with `let _ =` — a failed POST silently
+    "refreshes" with no user feedback. Surface a mutation_error (mirror integrations.rs:147).
+  - (med) request_detail.rs show_approve_apply uses the SAME gate as show_live_plan, so "Approve & apply"
+    shows even with no completed live plan → admin clicks → 409. Gate on has-live-plan.
+  - (low) workspaces.rs Request-Intake-Preview has a hardcoded "available in next release" banner though
+    POST /api/requests + RequestCreate work — replace with a live link to /requests/new.
+
+## run-7 COMPLETE
+All 7 dimensions swept (concurrency-races manually probed — only low-severity nuances). Shipped this
+run: IPAM clamp (0735235), migration-138 indexes (780cb5b), idempotency logging (47e2c92), backlink
+stage-wipe (aee9f55), register key validation (a42c3c9), Verified rejection (d2210a3), portal refetch.
+Owner-decision/follow-up tasks: A0 scope, B0 event-feed, background-loop event, sibling aggregate_id,
+requests dynamic-SQL, status index, LiveApply re-mint, protocol versioning, the 3 portal UX items above.
 (schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
 low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
 causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors

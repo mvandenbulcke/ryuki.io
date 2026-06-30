@@ -321,6 +321,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -344,6 +345,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -367,6 +369,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -390,6 +393,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -413,6 +417,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -436,6 +441,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -459,6 +465,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -482,6 +489,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -507,6 +515,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -530,6 +539,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -553,6 +563,7 @@ pub fn RequestDetail() -> impl IntoView {
                     if succeeded {
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -582,6 +593,7 @@ pub fn RequestDetail() -> impl IntoView {
                         set_reason_error.set(String::new());
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
@@ -608,6 +620,7 @@ pub fn RequestDetail() -> impl IntoView {
                         set_reason_error.set(String::new());
                         detail_resource.refetch();
                         audit_resource.refetch();
+                        execution_job_resource.refetch();
                     }
                 }
                 Err(e) => {
