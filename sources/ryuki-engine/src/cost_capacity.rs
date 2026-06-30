@@ -313,26 +313,24 @@ pub fn forecast_capacity(site: &str, months: u32, vms: &[VmUtilization]) -> Resu
     let capacity = get_site_capacity(site, vms)?;
     let current_cpu = capacity["cpu_utilization_pct"].as_f64().unwrap_or(0.0);
     let current_mem = capacity["memory_utilization_pct"].as_f64().unwrap_or(0.0);
-    let total_storage = capacity["total_storage_gb"].as_u64().unwrap_or(0);
-    let used_storage = capacity["used_storage_gb"].as_u64().unwrap_or(0);
-    let current_storage_pct = if total_storage > 0 {
-        (used_storage as f64 / total_storage as f64) * 100.0
-    } else {
-        0.0
-    };
 
     let monthly_growth_cpu = 1.8;
     let monthly_growth_mem = 1.5;
-    let monthly_growth_storage = 2.2;
 
     let projected_cpu = current_cpu + monthly_growth_cpu * months as f64;
     let projected_mem = current_mem + monthly_growth_mem * months as f64;
-    let projected_storage = current_storage_pct + monthly_growth_storage * months as f64;
 
     let at_risk_cpu = projected_cpu > 80.0;
     let at_risk_mem = projected_mem > 80.0;
-    let at_risk_storage = projected_storage > 80.0;
 
+    // Storage usage is NOT TRACKED: VmUtilization carries only the provisioned
+    // `storage_gb`, and get_site_capacity sets used_storage = total_storage, so
+    // used/total is always 100%. Any "storage utilization %" or risk derived from it
+    // is fictional (the old code computed at_risk_storage = (100 + 2.2*months) > 80,
+    // which was ALWAYS true and forced `recommendation` to always say "expand"
+    // regardless of real CPU/memory state). Report storage as a distinct NOT-ASSESSED
+    // state — neither at-risk nor silently "safe" — and never base risk/recommendation
+    // on it. The utilization numbers are null (no fabricated value).
     Ok(json!({
         "source": "dry-run",
         "site": site,
@@ -340,19 +338,22 @@ pub fn forecast_capacity(site: &str, months: u32, vms: &[VmUtilization]) -> Resu
         "current": {
             "cpu_utilization_pct": current_cpu,
             "memory_utilization_pct": current_mem,
-            "storage_utilization_pct": (current_storage_pct * 10.0).round() / 10.0
+            "storage_utilization_pct": null
         },
         "projected": {
             "cpu_utilization_pct": (projected_cpu * 10.0).round() / 10.0,
             "memory_utilization_pct": (projected_mem * 10.0).round() / 10.0,
-            "storage_utilization_pct": (projected_storage * 10.0).round() / 10.0
+            "storage_utilization_pct": null
         },
         "risk_flags": {
             "cpu_at_risk": at_risk_cpu,
             "memory_at_risk": at_risk_mem,
-            "storage_at_risk": at_risk_storage
+            "storage_at_risk": false,
+            "storage_risk_assessed": false
         },
-        "recommendation": if at_risk_cpu || at_risk_mem || at_risk_storage {
+        "storage_note": "Storage usage is not tracked; only provisioned capacity is \
+                         known, so storage risk is not assessed.",
+        "recommendation": if at_risk_cpu || at_risk_mem {
             "Capacity expansion recommended within forecast window"
         } else {
             "Current growth trajectory is sustainable within forecast window"
@@ -783,6 +784,58 @@ mod tests {
         assert!(projected_cpu > current_cpu);
         // cpu_at_risk field must be present and parseable as bool (may be true or false)
         assert!(result["risk_flags"]["cpu_at_risk"].as_bool().is_some());
+
+        // Storage usage is NOT TRACKED — it must be reported as a distinct
+        // not-assessed state (never silently at-risk OR silently safe), and must
+        // NEVER influence the recommendation (the bug: at_risk_storage was always
+        // true and forced "expansion recommended" regardless of cpu/mem).
+        assert_eq!(result["risk_flags"]["storage_at_risk"], false);
+        assert_eq!(result["risk_flags"]["storage_risk_assessed"], false);
+        assert!(result["current"]["storage_utilization_pct"].is_null());
+        assert!(result["projected"]["storage_utilization_pct"].is_null());
+        assert!(result["storage_note"].as_str().is_some());
+
+        // The recommendation is driven ONLY by cpu/mem risk, not storage: it says
+        // "expansion recommended" IFF a cpu or memory risk exists.
+        let cpu_risk = result["risk_flags"]["cpu_at_risk"].as_bool().unwrap();
+        let mem_risk = result["risk_flags"]["memory_at_risk"].as_bool().unwrap();
+        let rec = result["recommendation"].as_str().unwrap();
+        assert_eq!(
+            rec.contains("expansion recommended"),
+            cpu_risk || mem_risk,
+            "recommendation must reflect ONLY cpu/memory risk, not storage: {rec}"
+        );
+    }
+
+    /// Airtight regression for the storage-forced-expansion bug: a clearly LOW-util
+    /// site (cpu/mem ~10%) WITH provisioned storage. The OLD code forced
+    /// "expansion recommended" because at_risk_storage was always true; the fix yields
+    /// "sustainable" because cpu/mem are safe and storage no longer drives it.
+    #[test]
+    fn test_forecast_low_util_is_sustainable_not_forced_by_storage() {
+        let vms = vec![VmUtilization {
+            vm_name: "low-01".into(),
+            site: "LOWSITE".into(),
+            cluster: "c1".into(),
+            cpu_cores: 8,
+            memory_gb: 32,
+            storage_gb: 500, // provisioned storage present — would trip the old bug
+            cpu_usage_pct: 10.0,
+            memory_usage_pct: 10.0,
+            monthly_cost: 100.0,
+            idle: false,
+            oversized: false,
+            orphaned_disk_gb: 0,
+        }];
+        let result = forecast_capacity("LOWSITE", 6, &vms).unwrap();
+        assert_eq!(result["risk_flags"]["cpu_at_risk"], false);
+        assert_eq!(result["risk_flags"]["memory_at_risk"], false);
+        assert_eq!(result["risk_flags"]["storage_at_risk"], false);
+        assert_eq!(
+            result["recommendation"].as_str().unwrap(),
+            "Current growth trajectory is sustainable within forecast window",
+            "low cpu/mem must be sustainable — storage must NOT force expansion (the fixed bug)"
+        );
     }
 
     #[test]

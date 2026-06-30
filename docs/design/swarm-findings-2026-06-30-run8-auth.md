@@ -37,6 +37,31 @@ Verified by reading the real code — recorded here so a future session does NOT
   revocation mean there is NO bypass (deleted row → fetch None → 403). Only a design asymmetry (no
   audit trail of post-revocation auth attempts); not a defect.
 
-## Conclusion
-The control plane's auth surface is thoroughly hardened. Combined with run-5/6/7, bug-discovery is at
-clear diminishing returns — remaining high-value work is the owner-decision items (A0/B0 etc.).
+## Conclusion (auth)
+The control plane's auth surface is thoroughly hardened.
+
+---
+
+# run-8b — NUMERIC / ANALYTICS correctness deep-dive
+
+A second focused deep-dive on the analytics/aggregate math (the area that previously had the
+mean-formula under-count). The math is otherwise SOUND (verified clean: per-VM utilization sum,
+sane_pct NaN/Inf clamp, util_pct div-by-zero guard, SLO attainment/error-budget with all guards,
+budget breach operators >/<, metric_series_step span/(n-1), leave-one-out variance, repository
+TB→GB conversion, centered projection, commitment savings, compliance % div-by-zero guards).
+
+## Shipped
+- ✅ **forecast_capacity storage_at_risk was ALWAYS true** (cost_capacity.rs ~312) — SHIPPED:
+  storage USAGE isn't tracked (VmUtilization has only provisioned storage_gb; get_site_capacity sets
+  used_storage = total_storage), so current_storage_pct was always 100%, projected = 100+2.2*months
+  always > 80, at_risk_storage always true → the recommendation ALWAYS said "Capacity expansion
+  recommended" regardless of real CPU/memory. FIX (codex plan-reviewed — three states risky/not-risky/
+  NOT-MEASURABLE): storage_at_risk=false + storage_risk_assessed=false + a storage_note, storage
+  utilization %s set to null (no fabricated value), recommendation driven by cpu||mem ONLY, dead
+  storage computation removed. +strengthened test (recommendation.contains("expansion") == cpu||mem).
+  No portal/handler consumer of storage_at_risk. codex plan+impl reviewed.
+
+## Conclusion (overall)
+Combined with run-5/6/7, bug-discovery is at clear diminishing returns — most findings are now
+defense-in-depth/cosmetic amid extensive verified-clean lists. Remaining high-value work is the
+owner-decision items (A0/B0 etc.) + larger data/execution-plane feature build-out.
