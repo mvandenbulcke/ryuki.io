@@ -58,9 +58,29 @@ so no partial commit, etc.):
   on BOTH writes — log-not-fail (the response is already buffered; the Ok-0-rows claim_id reclaim fence
   stays silent). Behavior-preserving; 13/13 idempotency tests green. codex review pending.
 
+## Execution-agent-seam sweep (single targeted agent)
+2 findings amid a strong verified-clean list (result-CAS double-accept guarded on attempt_id +
+lease_generation + status; grant/VLC verified both CP- and agent-side with expiry + plan-digest +
+request-id binding; cp_nonce constant-time per-lease replay protection; agent platform isolation;
+idempotent outbox replay returns 200 only on matching result_id+attempt_id). The path IS well-hardened.
+- ✅ **backlink_request_execution silently WIPED stage history on unparseable stages** — SHIPPED:
+  `serde_json::from_value(stages_val).unwrap_or_default()` turned an undeserializable `requests.stages`
+  (schema skew / corruption) into `[]`, and the UPDATE wrote `stages='[]'`, destroying intake/plan/
+  approve/lock history + breaking later stage gates. FIX: match the parse — Ok enriches the execute
+  stage (unchanged); Err LOGS + writes the ORIGINAL stages JSONB back UNTOUCHED (never wipe), still
+  advancing status. Deliberately NOT returning Err (backlink is in the result tx; Err would roll back
+  and the agent's at-least-once retry would re-hit the parse failure forever). + regression test
+  (db_backlink_preserves_unparseable_stages). codex review pending.
+- **DESIGN (flagged, task_6456e60c)**: create_live_apply_job's all-status partial unique index
+  (mig 057) permanently blocks re-minting a LiveApply once one reaches a TERMINAL non-Succeeded state
+  (Failed/ReconcileRequired/LiveRefused/DeadLettered) — no operator escape hatch → a request can be
+  stuck with no apply-retry path. Overlaps the deferred LiveRefused-recoverability trust-model decision;
+  owner-owned.
+
 ## Not yet swept (run-8 — platform was unstable)
-concurrency-races, protocol-contract, execution-agent-seam, portal-frontend.
-(schema-migration + resilience-errors now done above.)
+concurrency-races, protocol-contract, portal-frontend.
+(schema-migration + resilience-errors + execution-agent-seam now done above. concurrency-races was
+manually probed on scheduler.rs — only low-severity nuances.)
 (schema-migration now done above. A quick manual probe of scheduler.rs concurrency found only
 low-severity nuances — a refresh-UPDATE that runs every scan, and a once-per-scan now_ms snapshot
 causing ≤1-interval classification delay — neither compelling enough to action. The resilience-errors

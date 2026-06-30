@@ -873,23 +873,52 @@ async fn backlink_request_execution(
     );
     let now = chrono::Utc::now().to_rfc3339();
 
-    let mut stages: Vec<ryuki_engine::models::Stage> =
-        serde_json::from_value(stages_val).unwrap_or_default();
-    if let Some(st) = stages.iter_mut().find(|s| s.name == "execute") {
-        st.status = if success {
-            ryuki_engine::models::StageStatus::Completed
-        } else {
-            ryuki_engine::models::StageStatus::Failed
-        };
-        st.completed_at = Some(now);
-        st.metadata
-            .insert("agent_job_id".into(), job_id.to_string());
-        st.metadata
-            .insert("result_status".into(), result_status_str.to_string());
-        st.metadata
-            .insert("evidence_digest".into(), evidence_digest.to_string());
-    }
-    let stages_json = serde_json::to_value(&stages).unwrap_or_else(|_| serde_json::json!([]));
+    // Enrich the `execute` stage with the agent result, PRESERVING the existing
+    // history. Critically, a parse failure must NOT wipe the stages: the old
+    // `unwrap_or_default()` turned an undeserializable `requests.stages` (e.g. a
+    // Stage schema skew) into an empty vec, and the UPDATE below then wrote
+    // `stages = '[]'`, destroying the intake/plan/approve/lock history and breaking
+    // every later stage-gate check. On a parse failure we instead advance the
+    // request status but write the ORIGINAL stages JSONB back untouched, and log the
+    // skew so it is visible. (We do NOT return Err: that would roll back the result
+    // tx, and the agent's at-least-once retry would hit the same parse failure
+    // forever — better to record the result + preserve history + surface the anomaly.)
+    let stages_json = match serde_json::from_value::<Vec<ryuki_engine::models::Stage>>(
+        stages_val.clone(),
+    ) {
+        Ok(mut stages) => {
+            if let Some(st) = stages.iter_mut().find(|s| s.name == "execute") {
+                st.status = if success {
+                    ryuki_engine::models::StageStatus::Completed
+                } else {
+                    ryuki_engine::models::StageStatus::Failed
+                };
+                st.completed_at = Some(now);
+                st.metadata
+                    .insert("agent_job_id".into(), job_id.to_string());
+                st.metadata
+                    .insert("result_status".into(), result_status_str.to_string());
+                st.metadata
+                    .insert("evidence_digest".into(), evidence_digest.to_string());
+            }
+            // Serialization of a valid Vec<Stage> cannot realistically fail; if it
+            // somehow did, keep the original rather than wiping to [].
+            serde_json::to_value(&stages).unwrap_or(stages_val)
+        }
+        Err(error) => {
+            // Log the value-free error CATEGORY (Syntax/Data/Eof/Io), NOT the full
+            // serde Display — the Display can echo the offending value, and stages
+            // metadata/evidence may carry user-controlled strings.
+            tracing::warn!(
+                parse_error = ?error.classify(),
+                request_id = %request_id,
+                "request.stages could not be parsed into Vec<Stage> during execution \
+                 backlink; advancing status but preserving the existing stages JSONB \
+                 untouched (NOT wiping history)"
+            );
+            stages_val
+        }
+    };
     let (new_status, new_stage) = if success {
         ("verifying", "verify")
     } else {
@@ -8803,6 +8832,62 @@ mod tests {
             .await
             .ok();
         pool.close().await;
+    }
+
+    /// Regression: if `requests.stages` cannot be parsed into `Vec<Stage>` (a schema
+    /// skew / corruption), the execution backlink must PRESERVE the existing stages
+    /// JSONB rather than wiping it to `[]`. The status still advances; the history is
+    /// not destroyed.
+    #[tokio::test]
+    async fn db_backlink_preserves_unparseable_stages() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let req_id = Uuid::new_v4();
+        // An OBJECT, not a Vec<Stage> array → serde_json::from_value::<Vec<Stage>> fails.
+        let corrupt = serde_json::json!({"legacy_shape": true, "stages": ["x"]});
+        sqlx::query(
+            "INSERT INTO requests (id, request_type, site, environment, name, status, stage, stages) \
+             VALUES ($1, 'server-deployment', 'DEFRA', 'prod', 'backlink-corrupt', 'executing', 'execute', $2::jsonb)",
+        )
+        .bind(req_id)
+        .bind(&corrupt)
+        .execute(&pool)
+        .await
+        .expect("insert executing request with unparseable stages");
+
+        let mut tx = pool.begin().await.unwrap();
+        backlink_request_execution(
+            &mut tx,
+            req_id,
+            &JobResultStatus::Planned,
+            "planned",
+            "deadbeefdeadbeef",
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("backlink must not error on unparseable stages");
+        tx.commit().await.unwrap();
+
+        let (status, stages_after): (String, serde_json::Value) =
+            sqlx::query_as("SELECT status, stages FROM requests WHERE id = $1")
+                .bind(req_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read back");
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(req_id)
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+
+        assert_eq!(status, "verifying", "status still advances on a success result");
+        assert_eq!(
+            stages_after, corrupt,
+            "unparseable stages are PRESERVED untouched, NOT wiped to []"
+        );
     }
 
     // ── #23 follow-up: dead-lettered job list + requeue ──────────────────────
