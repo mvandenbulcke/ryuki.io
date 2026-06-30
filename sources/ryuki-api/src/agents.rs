@@ -195,9 +195,12 @@ fn parse_agent_job_id(id: &str) -> ApiResult<Uuid> {
 pub const AGENT_TOKEN_PREFIX: &str = "rya_";
 
 fn generate_agent_token() -> String {
-    use rand::RngCore;
+    use rand::{RngCore, rngs::OsRng};
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    // Use OsRng directly to match the rest of the auth/crypto surface (OIDC
+    // state/nonce + the CP keypair). `thread_rng()` is also a CSPRNG, so this is a
+    // consistency / defense-in-depth alignment for the agent bearer token, not a fix.
+    OsRng.fill_bytes(&mut bytes);
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("{AGENT_TOKEN_PREFIX}{hex}")
 }
