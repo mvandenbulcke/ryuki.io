@@ -19074,9 +19074,21 @@ async fn ack_alert_one(
         }
         None => return Err(status_404(&event_id.to_string())),
     }
-    if !crate::repos::domain_events::ack_alert(pool, event_id, &session.user_id, note)
-        .await
-        .map_err(db_error)?
+    // Only an alert-worthy event is ackable — pass the SAME engine status set the feed
+    // uses so a non-alert id 404s like a missing one (not a dangling alert_acks row).
+    let alert_statuses: Vec<String> = ryuki_engine::event_alerts::alert_worthy_statuses()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if !crate::repos::domain_events::ack_alert(
+        pool,
+        event_id,
+        &session.user_id,
+        note,
+        &alert_statuses,
+    )
+    .await
+    .map_err(db_error)?
     {
         return Err(status_404(&event_id.to_string()));
     }
@@ -46804,6 +46816,44 @@ mod db_lifecycle_tests {
             matches!(missing, Err((StatusCode::NOT_FOUND, _))),
             "an unknown event id must 404: {missing:?}"
         );
+
+        // run-8: a NON-ALERT event (to_status not in the alert-worthy set) must 404 on
+        // ack and must NOT write a dangling alert_acks row. Seed a 'completed' event
+        // that is PLATFORM-WIDE (site/env None) so the unrestricted dry-run session
+        // passes the scope check — the 404 therefore proves the alert-worthiness gate,
+        // not a scope rejection.
+        let nonalert_agg = format!("nonalert-{}", Uuid::new_v4());
+        let nonalert_id = crate::repos::domain_events::insert(
+            pool,
+            crate::repos::domain_events::NewEvent {
+                event_type: "request.complete",
+                aggregate_type: "request",
+                aggregate_id: &nonalert_agg,
+                site: None,
+                environment: None,
+                actor: "creator",
+                payload: json!({ "to_status": "completed" }),
+            },
+        )
+        .await
+        .expect("insert non-alert event");
+        let na = events_alert_ack(
+            AuthExtractor(AuthSession::static_dry_run()),
+            Path(nonalert_id),
+            Json(AlertAckBody::default()),
+        )
+        .await;
+        assert!(
+            matches!(na, Err((StatusCode::NOT_FOUND, _))),
+            "acking a non-alert event must 404: {na:?}"
+        );
+        let acked: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM alert_acks WHERE event_id = $1)")
+                .bind(nonalert_id)
+                .fetch_one(pool)
+                .await
+                .expect("query acks");
+        assert!(!acked, "a non-alert event must NOT get an alert_acks row");
 
         // alert_acks is mutable; clean it (domain_events is append-only, kept).
         sqlx::query("DELETE FROM alert_acks WHERE event_id = $1")

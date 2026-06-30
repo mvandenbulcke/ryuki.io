@@ -153,11 +153,21 @@ pub async fn ack_alert(
     event_id: i64,
     actor: &str,
     note: Option<&str>,
+    alert_statuses: &[String],
 ) -> Result<bool, sqlx::Error> {
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM domain_events WHERE id = $1")
-        .bind(event_id)
-        .fetch_optional(pool)
-        .await?;
+    // Only an ALERT-WORTHY event may be acked. A bare existence check let an operator
+    // ack ANY domain event (an 'intake'/'completed' normal-flow row), writing a dangling
+    // alert_acks row for something the alert feed never surfaces. Gate on the SAME
+    // alert_worthy set list_alerts uses (so ack and the feed cannot drift); a non-alert
+    // id returns false (caller -> 404), identical to a missing one.
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM domain_events \
+         WHERE id = $1 AND payload->>'to_status' = ANY($2)",
+    )
+    .bind(event_id)
+    .bind(alert_statuses)
+    .fetch_optional(pool)
+    .await?;
     if exists.is_none() {
         return Ok(false);
     }
