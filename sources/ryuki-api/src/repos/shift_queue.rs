@@ -79,6 +79,12 @@ pub const DR_TEST_OVERDUE_ITEM_TYPE: &str = "dr-test-overdue";
 /// re-enqueued after resolution if still overdue on the next daily scan (migration 140).
 pub const PATCH_WAVE_OVERDUE_ITEM_TYPE: &str = "patch-wave-overdue";
 
+/// The STALE-golden-image signal (#60). A promoted golden image whose `build_date` is
+/// older than the monthly refresh window — the live base image is missing recent patches.
+/// `source_ci_key` is the bare image id. One deduped OPEN item per image; re-enqueued
+/// after resolution if still stale on the next daily scan (migration 141).
+pub const GOLDEN_IMAGE_STALE_ITEM_TYPE: &str = "golden-image-stale";
+
 /// Enqueue ONE open `item_type` work item for `source_ci_key` iff no OPEN
 /// (`resolved = false`) item already exists for that system+type. Returns
 /// `rows_affected()` — `1` when a new item was inserted, `0` when one already

@@ -49,6 +49,12 @@ const MAINTAIN_REVIEW_BATCH: i64 = 100;
 /// easy to retune; the scan itself runs daily.
 const RESTORE_OVERDUE_DAYS: i64 = 90;
 
+/// Refresh window for `golden_image_stale_scan` (#60): a PROMOTED golden image whose
+/// last build is older than this is flagged as stale (a missed monthly rebuild = missing
+/// recent patches). 35 days = one month plus a few days of grace. A single const, easy to
+/// retune; the scan itself runs daily.
+const GOLDEN_IMAGE_STALE_DAYS: i32 = 35;
+
 /// A due schedule row claimed by the tick.
 #[derive(sqlx::FromRow)]
 struct DueSchedule {
@@ -620,6 +626,66 @@ async fn run_job(
             Ok((
                 "succeeded".to_string(),
                 Some(format!("{overdue} patch wave(s) overdue, {enqueued} enqueued")),
+            ))
+        }
+        "golden_image_stale_scan" => {
+            // Safe-internal write (#60): READ promoted golden images whose build_date is
+            // older than the monthly refresh window (GOLDEN_IMAGE_STALE_DAYS) — the live
+            // base image has missed its rebuild and lacks recent patches — and enqueue ONE
+            // deduped shift_queue item per stale image. Reads golden_images, writes only
+            // our own shift_queue — NO provider/live/destructive call. The SQL date filter
+            // does the staleness selection on the real build_date column (no parse). All on
+            // `tx` (rolls back with this schedule's savepoint). `detail` is aggregate-only
+            // (counts, never per-image ids) — surfaced via /api/ops/scheduler/executions.
+            let stale = crate::repos::golden_images::stale_promoted_images(
+                &mut **tx,
+                GOLDEN_IMAGE_STALE_DAYS,
+            )
+            .await?;
+            let mut enqueued: u64 = 0;
+            for img in &stale {
+                // A blank id can't be a dedup key (enqueue_if_absent rejects it) — skip it.
+                if img.id.trim().is_empty() {
+                    continue;
+                }
+                let title = format!("Golden image stale: {}", img.image_name);
+                let description = format!(
+                    "Golden image '{}' ({}) was last built {} — over {GOLDEN_IMAGE_STALE_DAYS} \
+                     days ago, past its monthly refresh window. Rebuild to pick up recent \
+                     patches.",
+                    img.image_name,
+                    img.site_scope,
+                    img.build_date.to_rfc3339()
+                );
+                // `source_ci_key` is the image id — the enqueue_if_absent dedup predicate
+                // checks `metadata->>'source_ci_key'`, so it MUST appear there too for the
+                // partial unique index (uq_shift_queue_open_golden_image_stale) to agree.
+                let metadata = serde_json::json!({
+                    "source_ci_key": img.id,
+                    "image_name": img.image_name,
+                    "site_scope": img.site_scope,
+                    "build_date": img.build_date.to_rfc3339(),
+                })
+                .to_string();
+                // P3: staleness is a refresh hygiene reminder, lower urgency than a missed
+                // maintenance window or overdue recoverability test (which are P2).
+                enqueued += crate::repos::shift_queue::enqueue_if_absent(
+                    &mut **tx,
+                    crate::repos::shift_queue::GOLDEN_IMAGE_STALE_ITEM_TYPE,
+                    &img.id,
+                    &title,
+                    &description,
+                    "P3",
+                    &metadata,
+                )
+                .await?;
+            }
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "{} golden image(s) stale, {enqueued} enqueued",
+                    stale.len()
+                )),
             ))
         }
         "secret_rotation_due_scan" => {
@@ -5888,5 +5954,178 @@ mod db_tests {
             .await
             .ok();
         restore_migration_patch_scan(pool).await;
+    }
+
+    // ---- #60 golden_image_stale_scan ---------------------------------------
+
+    /// The migration-141-seeded golden_image_stale_scan id. Tests disable it so
+    /// exactly ONE scan is due per tick (mirrors DR_SCAN_SEED_ID pattern).
+    const GIMG_SCAN_SEED_ID: &str = "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0c0c0";
+
+    /// Seed a PROMOTED golden_images row with the given build_date.
+    async fn seed_golden_image(pool: &PgPool, id: &str, name: &str, built: &str) {
+        sqlx::query(
+            "INSERT INTO golden_images \
+                 (id, image_name, os_family, os_version, distro, build_date, status, site_scope) \
+             VALUES ($1::uuid, $2, 'Linux', '24.04', 'ubuntu', $3::timestamptz, 'promoted', 'TESTSITE') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(built)
+        .execute(pool)
+        .await
+        .expect("seed golden_image");
+    }
+
+    /// Plant a guaranteed-due `golden_image_stale_scan` schedule. Disables the
+    /// migration-seeded scan first so EXACTLY ONE is due. Returns the planted id.
+    async fn seed_due_gimg_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(GIMG_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-gimgscan-due-7e1";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test golden image scan', 'golden_image_stale_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_gimg_scan`] disabled.
+    async fn restore_migration_gimg_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(GIMG_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Count OPEN golden-image-stale shift_queue items for an image id.
+    async fn open_gimg_stale_count(pool: &PgPool, image_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shift_queue \
+             WHERE item_type = 'golden-image-stale' AND resolved = false \
+               AND metadata->>'source_ci_key' = $1",
+        )
+        .bind(image_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A promoted image older than the refresh window enqueues exactly one item; a
+    /// freshly-built one does not. A second run dedups. Detail is aggregate-only.
+    #[tokio::test]
+    async fn golden_image_stale_scan_enqueues_stale_promoted_images() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4();
+        let stale_id = uuid::Uuid::new_v4().to_string();
+        let fresh_id = uuid::Uuid::new_v4().to_string();
+        // Stale: built 60 days ago (> GOLDEN_IMAGE_STALE_DAYS = 35). Fresh: 5 days ago.
+        let stale_built = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        let fresh_built = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+
+        seed_golden_image(pool, &stale_id, &format!("stale-img-{suffix}"), &stale_built).await;
+        seed_golden_image(pool, &fresh_id, &format!("fresh-img-{suffix}"), &fresh_built).await;
+
+        let sched_id = seed_due_gimg_scan(pool).await;
+
+        // Cleanup shift_queue + job_executions BEFORE asserting.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&stale_id)
+            .bind(&fresh_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: stale image enqueued, fresh image skipped.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted golden-image scan ran");
+        assert_eq!(
+            open_gimg_stale_count(pool, &stale_id).await,
+            1,
+            "stale promoted image gets exactly one open golden-image-stale item"
+        );
+        assert_eq!(
+            open_gimg_stale_count(pool, &fresh_id).await,
+            0,
+            "a freshly-built image is not enqueued"
+        );
+
+        // Detail is aggregate-only: "<N> golden image(s) stale, <M> enqueued".
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'golden_image_stale_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let parsed = detail
+            .split_once(" golden image(s) stale, ")
+            .and_then(|(o, rest)| {
+                let m = rest.strip_suffix(" enqueued")?;
+                Some((o.parse::<u64>().ok()?, m.parse::<u64>().ok()?))
+            });
+        assert!(
+            parsed.is_some_and(|(o, e)| o >= 1 && e >= 1),
+            "detail must be '<N> golden image(s) stale, <M> enqueued': {detail:?}"
+        );
+
+        // Second tick: dedup holds — still exactly one open item.
+        let sched_id2 = seed_due_gimg_scan(pool).await;
+        let _ = tick_once(pool).await.unwrap();
+        assert_eq!(
+            open_gimg_stale_count(pool, &stale_id).await,
+            1,
+            "a second tick does not duplicate the open item"
+        );
+
+        // Final cleanup.
+        sqlx::query("DELETE FROM shift_queue WHERE metadata->>'source_ci_key' IN ($1, $2)")
+            .bind(&stale_id)
+            .bind(&fresh_id)
+            .execute(pool)
+            .await
+            .ok();
+        for id in [&stale_id, &fresh_id] {
+            sqlx::query("DELETE FROM golden_images WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_gimg_scan(pool).await;
     }
 }

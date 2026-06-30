@@ -113,6 +113,12 @@ pub fn job_is_read_only(job_kind: &str) -> bool {
 /// is in the past (a MISSED patch window), and enqueues ONE deduped `shift_queue`
 /// item per missed wave — reads patch_waves, writes only shift_queue, NO
 /// provider/live/destructive call.
+///
+/// `golden_image_stale_scan` (#60) also qualifies: it reads `golden_images` in
+/// status 'promoted', flags any whose `build_date` is older than the monthly
+/// refresh window (a STALE base image missing recent patches), and enqueues ONE
+/// deduped `shift_queue` item per stale image — reads golden_images, writes only
+/// shift_queue, NO provider/live/destructive call.
 pub fn job_is_schedulable(job_kind: &str) -> bool {
     job_is_read_only(job_kind)
         || matches!(
@@ -133,6 +139,7 @@ pub fn job_is_schedulable(job_kind: &str) -> bool {
                 | "shift_queue_prune"
                 | "dr_test_overdue_scan"
                 | "patch_wave_overdue_scan"
+                | "golden_image_stale_scan"
         )
 }
 
@@ -241,6 +248,8 @@ mod tests {
         assert!(!job_is_read_only("dr_test_overdue_scan"));
         assert!(job_is_schedulable("patch_wave_overdue_scan"));
         assert!(!job_is_read_only("patch_wave_overdue_scan"));
+        assert!(job_is_schedulable("golden_image_stale_scan"));
+        assert!(!job_is_read_only("golden_image_stale_scan"));
         // Nothing else is admitted — no live/destructive kind, no prefix match.
         assert!(!job_is_schedulable("live_apply"));
         assert!(!job_is_schedulable("secret_rotation_due_scan_live"));

@@ -168,6 +168,39 @@ pub async fn list_promoted(pool: &PgPool, site: &str) -> Result<Vec<GoldenImage>
     rows.into_iter().map(|r| r.into_model()).collect()
 }
 
+// ─── Stale-scan projection (#60) ───────────────────────────────────────────────
+
+/// Minimal projection for `golden_image_stale_scan`: id, name, site, and build_date.
+/// Scalar columns only — no full-model deserialization — so the scan reads exactly what
+/// it needs from real typed columns (no JSONB blob to corrupt or parse).
+#[derive(sqlx::FromRow)]
+pub struct StalePromotedRow {
+    pub id: String,
+    pub image_name: String,
+    pub site_scope: String,
+    pub build_date: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fetch every PROMOTED golden image whose `build_date` is older than `stale_days` — the
+/// live base image has aged past its (monthly) refresh window and is missing recent
+/// patches. Only status='promoted' (the live image) is considered; superseded/building/
+/// testing/failed are excluded. The date filter runs in SQL on the real `build_date`
+/// column (no parse, no fail-safe needed).
+pub async fn stale_promoted_images(
+    executor: impl sqlx::PgExecutor<'_>,
+    stale_days: i32,
+) -> Result<Vec<StalePromotedRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id::text AS id, image_name, site_scope, build_date \
+         FROM golden_images \
+         WHERE status = 'promoted' AND build_date < NOW() - make_interval(days => $1) \
+         ORDER BY id",
+    )
+    .bind(stale_days)
+    .fetch_all(executor)
+    .await
+}
+
 /// Return all images with `status = 'superseded'`.
 pub async fn list_superseded(pool: &PgPool) -> Result<Vec<GoldenImage>, sqlx::Error> {
     let rows: Vec<GoldenImageRow> = sqlx::query_as(&format!(
