@@ -15769,6 +15769,11 @@ async fn requests_validate(
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
 
+    // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
+    // out-of-scope request 404s exactly like a missing one, never a cross-scope
+    // transition or an existence oracle. Unrestricted principals pass unchanged.
+    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
+
     let result = request_lifecycle::validate_request(&store[idx]).map_err(map_engine_error)?;
 
     if !result.passed {
@@ -16341,6 +16346,16 @@ async fn requests_plan(
         // guard drops here
     };
 
+    // #2 (no-DB scope hardening): guard the cloned request BEFORE the engine/enrich
+    // runs (mirrors the verify/protect no-DB branches) — an out-of-scope request 404s,
+    // never a cross-scope transition or an existence oracle.
+    scope_guard_or_404(
+        &session,
+        &cloned_request.site,
+        &cloned_request.environment,
+        &request_id,
+    )?;
+
     // Step 2: compute stages + enrich — no lock held across the subprocess.
     let mut stages = request_lifecycle::plan_request(&cloned_request).map_err(map_engine_error)?;
     enrich_plan_stages_with_terraform(&cloned_request, &mut stages).await;
@@ -16589,6 +16604,11 @@ async fn requests_lock(
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
 
+    // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
+    // out-of-scope request 404s exactly like a missing one, never a cross-scope
+    // transition or an existence oracle. Unrestricted principals pass unchanged.
+    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
+
     let locked = request_lifecycle::lock_request(&store[idx]).map_err(map_engine_error)?;
 
     // B8: snapshot prior status/stage before overwriting store[idx].
@@ -16777,6 +16797,11 @@ async fn requests_execute(
         .iter()
         .position(|r| r.id == request_id)
         .ok_or_else(|| status_404(&request_id))?;
+
+    // #2 (no-DB scope hardening): mirror the DB branch's scope_guard_or_404 — an
+    // out-of-scope request 404s exactly like a missing one, never a cross-scope
+    // transition or an existence oracle. Unrestricted principals pass unchanged.
+    scope_guard_or_404(&session, &store[idx].site, &store[idx].environment, &request_id)?;
 
     let executed = request_lifecycle::execute_request(&store[idx]).map_err(map_engine_error)?;
 
@@ -17131,6 +17156,16 @@ async fn requests_publish(
         store[idx].clone()
     };
 
+    // #2 (no-DB scope hardening): guard the cloned request BEFORE the engine runs
+    // (mirrors the verify/protect no-DB branches) — an out-of-scope request 404s,
+    // never a cross-scope transition or an existence oracle.
+    scope_guard_or_404(
+        &session,
+        &cloned_request.site,
+        &cloned_request.environment,
+        &request_id,
+    )?;
+
     let evidence = request_lifecycle::publish_request(&cloned_request).map_err(map_engine_error)?;
     let mut published_request = cloned_request.clone();
     published_request
@@ -17243,6 +17278,16 @@ async fn requests_retire(
             .ok_or_else(|| status_404(&request_id))?;
         store[idx].clone()
     };
+
+    // #2 (no-DB scope hardening): guard the cloned request BEFORE the engine runs
+    // (mirrors the verify/protect no-DB branches) — an out-of-scope request 404s,
+    // never a cross-scope transition or an existence oracle.
+    scope_guard_or_404(
+        &session,
+        &cloned_request.site,
+        &cloned_request.environment,
+        &request_id,
+    )?;
 
     let evidence = request_lifecycle::retire_request(&cloned_request).map_err(map_engine_error)?;
     let mut retired_request = cloned_request.clone();
@@ -38303,6 +38348,84 @@ mod unit_tests {
         let store = request_store().lock().await;
         let stored = store.iter().find(|r| r.id == id).unwrap();
         assert_eq!(stored.status, ryuki_engine::models::RequestStatus::Planned);
+    }
+
+    /// run-5: the 6 request-lifecycle mutations whose NO-DB branch was missing the
+    /// scope guard (validate / plan / lock / execute / publish / retire) now 404 for an
+    /// out-of-scope scoped principal BEFORE any transition — never a cross-scope
+    /// mutation. (approve / verify / protect / reject / fail / cancel were already
+    /// guarded.) Runs meaningfully only in a no-DB process.
+    #[tokio::test]
+    async fn requests_lifecycle_mutations_no_db_are_site_scoped() {
+        // FAIL-CLOSED: get_db() reads the process-global pool, NOT the env var. If a
+        // prior DB test initialized it, these handlers take the DB branch and 404 as
+        // not-found — a false green. Only run (meaningfully) in a no-DB process.
+        if get_db().is_some() {
+            eprintln!("SKIP: no-DB scope test requires no-DB mode (run via `make test`)");
+            return;
+        }
+        let id = format!("req-scope-lifecycle-{}", Uuid::new_v4());
+        // Seeds a DEFRA/production Planned in-memory request.
+        seed_planned_request(&id, "requester-1").await;
+
+        // execute-tier (all 6 gate `execute`) GBLON-scoped principal — OUT of scope for
+        // the DEFRA request (VMwareOperator grants execute; site_scope makes it scoped).
+        let scoped = || {
+            let mut s = AuthSession::static_dry_run();
+            s.roles
+                .push(ryuki_engine::auth::APP_ROLE_VMWARE_OPERATOR.to_string());
+            s.site_scope = vec!["GBLON".into()];
+            s
+        };
+
+        macro_rules! assert_scoped_404 {
+            ($call:expr, $name:expr) => {{
+                let r = $call.await;
+                assert!(
+                    matches!(r, Err((StatusCode::NOT_FOUND, _))),
+                    "{} out-of-scope must 404 (no-DB scope guard): {:?}",
+                    $name,
+                    r
+                );
+            }};
+        }
+        assert_scoped_404!(
+            requests_validate(Path(id.clone()), AuthExtractor(scoped())),
+            "validate"
+        );
+        assert_scoped_404!(
+            requests_plan(Path(id.clone()), AuthExtractor(scoped())),
+            "plan"
+        );
+        assert_scoped_404!(
+            requests_lock(Path(id.clone()), AuthExtractor(scoped())),
+            "lock"
+        );
+        assert_scoped_404!(
+            requests_execute(
+                Path(id.clone()),
+                Query(ExecuteParams::default()),
+                AuthExtractor(scoped())
+            ),
+            "execute"
+        );
+        assert_scoped_404!(
+            requests_publish(Path(id.clone()), AuthExtractor(scoped())),
+            "publish"
+        );
+        assert_scoped_404!(
+            requests_retire(Path(id.clone()), AuthExtractor(scoped())),
+            "retire"
+        );
+
+        // The request was never mutated — still Planned in the store.
+        let store = request_store().lock().await;
+        let stored = store.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(
+            stored.status,
+            ryuki_engine::models::RequestStatus::Planned,
+            "no cross-scope mutation occurred"
+        );
     }
 
     // ─── #17 slice 3: batch rework + fail (no-DB) ───
