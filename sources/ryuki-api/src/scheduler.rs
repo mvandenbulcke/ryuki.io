@@ -688,6 +688,36 @@ async fn run_job(
                 )),
             ))
         }
+        "noise_suppression_expiry_scan" => {
+            // Safe-internal write (#61): a suppression is a TIME-BOXED mute — once its
+            // `suppress_until` window elapses the trigger must return to the active board
+            // so its noise is visible again. Flip every noisy_trigger that is status
+            // 'Suppressed' AND whose `suppress_until` is in the PAST (<= NOW()) back to
+            // 'Active', clearing `suppress_until`. Mutates ONLY our own noisy_triggers
+            // table — NO provider/live/destructive call. The expiry predicate runs in SQL
+            // on the real `suppress_until` TIMESTAMPTZ column (no string parse, no per-row
+            // fail-safe needed: the UPDATE touches only already-expired rows and is
+            // naturally idempotent — once 'Active' a row never re-matches). `suppress_until
+            // IS NOT NULL` is semantically redundant with `<= NOW()` (NULL never compares
+            // true) but documents that indefinite suppressions are deliberately left alone.
+            // All on `tx`, so a failure rolls back with this schedule's savepoint. `detail`
+            // is aggregate-only (a count) — surfaced via /api/ops/scheduler/executions.
+            let reverted = sqlx::query(
+                "UPDATE noisy_triggers \
+                 SET status = 'Active', suppress_until = NULL, updated_at = NOW() \
+                 WHERE status = 'Suppressed' AND suppress_until IS NOT NULL \
+                   AND suppress_until <= NOW()",
+            )
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+            Ok((
+                "succeeded".to_string(),
+                Some(format!(
+                    "{reverted} expired suppression(s) reverted to Active"
+                )),
+            ))
+        }
         "secret_rotation_due_scan" => {
             // Safe-internal write (#7): READ secret rotation metadata across ALL sites
             // (platform-wide internal principal — not scoped), classify each with the
@@ -6127,5 +6157,248 @@ mod db_tests {
             .await
             .ok();
         restore_migration_gimg_scan(pool).await;
+    }
+
+    // ---- #61 noise_suppression_expiry_scan ---------------------------------
+
+    /// The migration-142-seeded noise_suppression_expiry_scan id. Tests disable it
+    /// so exactly ONE scan is due per tick (mirrors GIMG_SCAN_SEED_ID pattern).
+    const NOISE_SCAN_SEED_ID: &str = "d0d0d0d0-d0d0-4d0d-8d0d-d0d0d0d0d0d0";
+
+    /// Seed a Suppressed `noisy_triggers` row whose `suppress_until` is `until` (an
+    /// rfc3339 string bound as timestamptz). Host drives the derived site; the
+    /// severity/count fields are filler — the scan keys only on status + suppress_until.
+    async fn seed_suppressed_trigger(pool: &PgPool, id: &str, host: &str, until: &str) {
+        sqlx::query(
+            "INSERT INTO noisy_triggers \
+                 (id, trigger_name, host, severity, event_count_last_24h, avg_interval_minutes, \
+                  flapping, suggested_action, status, suppress_until, suppress_reason) \
+             VALUES ($1::uuid, 'test trigger', $2, 'warning', 42, 12.0, false, 'tune', \
+                     'Suppressed', $3::timestamptz, 'test suppression') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(host)
+        .bind(until)
+        .execute(pool)
+        .await
+        .expect("seed suppressed noisy_trigger");
+    }
+
+    /// Plant a guaranteed-due `noise_suppression_expiry_scan` schedule. Disables the
+    /// migration-seeded scan first so EXACTLY ONE is due. Returns the planted id.
+    async fn seed_due_noise_scan(pool: &PgPool) -> String {
+        sqlx::query("UPDATE schedules SET enabled = FALSE WHERE id = $1")
+            .bind(NOISE_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+        let id = "sched-test-noisescan-due-7e1";
+        sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at) \
+             VALUES ($1, 'test noise suppression scan', 'noise_suppression_expiry_scan', 86400, TRUE, \
+             NOW() - INTERVAL '1 minute')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Re-enable the migration-seeded scan that [`seed_due_noise_scan`] disabled.
+    async fn restore_migration_noise_scan(pool: &PgPool) {
+        sqlx::query("UPDATE schedules SET enabled = TRUE WHERE id = $1")
+            .bind(NOISE_SCAN_SEED_ID)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    /// Read (status, suppress_until-is-null, updated_at) for one trigger id.
+    async fn trigger_state(
+        pool: &PgPool,
+        id: &str,
+    ) -> (String, bool, chrono::DateTime<chrono::Utc>) {
+        sqlx::query_as(
+            "SELECT status, suppress_until IS NULL, updated_at \
+             FROM noisy_triggers WHERE id = $1::uuid",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// An EXPIRED suppression (suppress_until in the past) flips to Active with
+    /// suppress_until cleared; a still-active suppression (future window) is left
+    /// untouched. A second tick does not re-touch the already-reverted row.
+    #[tokio::test]
+    async fn noise_suppression_expiry_scan_reverts_expired_suppressions() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        let expired_id = uuid::Uuid::new_v4().to_string();
+        let active_id = uuid::Uuid::new_v4().to_string();
+        // Expired: window closed 2 days ago. Active: window closes in 2 days.
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339();
+
+        for id in [&expired_id, &active_id] {
+            sqlx::query("DELETE FROM noisy_triggers WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        seed_suppressed_trigger(pool, &expired_id, "srv-frpar-web01.example.local", &past).await;
+        seed_suppressed_trigger(pool, &active_id, "srv-gblon-net01.example.local", &future).await;
+
+        let sched_id = seed_due_noise_scan(pool).await;
+        sqlx::query("DELETE FROM job_executions WHERE schedule_id = $1")
+            .bind(&sched_id)
+            .execute(pool)
+            .await
+            .ok();
+
+        // First tick: the expired suppression flips, the active one is untouched.
+        let ran = tick_once(pool).await.unwrap();
+        assert!(ran >= 1, "at least the planted noise scan ran");
+
+        let (e_status, e_null, e_updated) = trigger_state(pool, &expired_id).await;
+        assert_eq!(e_status, "Active", "expired suppression reverts to Active");
+        assert!(e_null, "expired suppression clears suppress_until");
+
+        let (a_status, a_null, _) = trigger_state(pool, &active_id).await;
+        assert_eq!(
+            a_status, "Suppressed",
+            "an unexpired suppression is left Suppressed"
+        );
+        assert!(!a_null, "an unexpired suppression keeps its suppress_until");
+
+        // Detail is aggregate-only: "<N> expired suppression(s) reverted to Active", N >= 1.
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'noise_suppression_expiry_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let detail = detail.unwrap_or_default();
+        let parsed = detail
+            .strip_suffix(" expired suppression(s) reverted to Active")
+            .and_then(|n| n.parse::<u64>().ok());
+        assert!(
+            parsed.is_some_and(|n| n >= 1),
+            "detail must be '<N> expired suppression(s) reverted to Active': {detail:?}"
+        );
+
+        // Second tick (re-plant — the first advanced next_run_at): the scan runs AGAIN,
+        // finds nothing left to revert (tick 1 already flipped every expired row
+        // table-wide), and does NOT re-touch the already-reverted row. Idempotency is
+        // proven three ways: the second job actually executed (ran2 >= 1), its detail
+        // reports 0 reverted, and the row's updated_at is byte-identical.
+        let sched_id2 = seed_due_noise_scan(pool).await;
+        let ran2 = tick_once(pool).await.unwrap();
+        assert!(ran2 >= 1, "the re-planted noise scan ran a second time");
+        let (e_status2, _, e_updated2) = trigger_state(pool, &expired_id).await;
+        assert_eq!(e_status2, "Active", "already-reverted row stays Active");
+        assert_eq!(
+            e_updated, e_updated2,
+            "scan does not re-touch an already-Active row"
+        );
+        let detail2: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM job_executions \
+             WHERE schedule_id = $1 AND job_kind = 'noise_suppression_expiry_scan' \
+               AND status = 'succeeded' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(&sched_id2)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            detail2.unwrap_or_default(),
+            "0 expired suppression(s) reverted to Active",
+            "a second scan finds nothing left to revert (tick 1 cleared every expired row)"
+        );
+
+        // Cleanup.
+        for id in [&expired_id, &active_id] {
+            sqlx::query("DELETE FROM noisy_triggers WHERE id = $1::uuid")
+                .bind(id)
+                .execute(pool)
+                .await
+                .ok();
+        }
+        sqlx::query("DELETE FROM schedules WHERE id IN ($1, $2)")
+            .bind(&sched_id)
+            .bind(&sched_id2)
+            .execute(pool)
+            .await
+            .ok();
+        restore_migration_noise_scan(pool).await;
+    }
+
+    /// Migration 142's seed is idempotent (re-running ON CONFLICT is a clean no-op
+    /// whose row matches the contract) AND its lookup index exists.
+    #[tokio::test]
+    async fn migration_142_is_idempotent_and_seeds_noise_scan() {
+        let _serial = DB_TEST_SERIAL.lock().await;
+        let Some(pool) = global_pool().await else {
+            eprintln!("SKIP: RYUKI_DATABASE_URL not set");
+            return;
+        };
+        sqlx::query(
+            "INSERT INTO schedules (id, name, job_kind, interval_secs, enabled, next_run_at, created_by) \
+             VALUES ($1, 'Noise suppression expiry scan (all sites)', 'noise_suppression_expiry_scan', \
+                     86400, TRUE, NOW(), 'system') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(NOISE_SCAN_SEED_ID)
+        .execute(pool)
+        .await
+        .expect("seed INSERT ON CONFLICT re-runs cleanly");
+        let (name, kind, interval, created_by): (String, String, i64, String) = sqlx::query_as(
+            "SELECT name, job_kind, interval_secs, created_by FROM schedules WHERE id = $1",
+        )
+        .bind(NOISE_SCAN_SEED_ID)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            name, "Noise suppression expiry scan (all sites)",
+            "seed name"
+        );
+        assert_eq!(kind, "noise_suppression_expiry_scan", "seed job_kind");
+        assert_eq!(interval, 86400, "seed interval_secs (daily)");
+        assert_eq!(created_by, "system", "seed created_by");
+
+        // Assert the index DEFINITION, not just its name: the scan relies on the PARTIAL
+        // predicate (status='Suppressed' AND suppress_until IS NOT NULL) to keep the daily
+        // probe tight, so a future edit that drops the partial clause must fail this test.
+        let indexdef: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE indexname = 'idx_noisy_triggers_suppress_expiry'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        let indexdef = indexdef.expect("migration 142 creates idx_noisy_triggers_suppress_expiry");
+        assert!(
+            indexdef.contains("status = 'Suppressed'")
+                && indexdef.contains("suppress_until IS NOT NULL"),
+            "the suppress-expiry index must be PARTIAL on the scan predicate: {indexdef:?}"
+        );
     }
 }
