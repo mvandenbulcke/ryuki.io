@@ -29,12 +29,25 @@ proposed fix would BREAK an existing recovery path. ALWAYS re-verify swarm outpu
   (codex Low finding — raw path string could miss /api/events lookups; siblings flagged as a
   follow-up task). priority UPDATE RETURNING extended to include platform. +event assertions on the
   requeue/reprioritize happy tests. codex impl APPROVE (1 Low fixed); green on a fresh DB.
-- **Stage completion timestamps** (request-lifecycle, high) — `completed_request_stage()`
-  (contracts.rs ~14856) sets `started_at: None, completed_at: None`, so post-completion stages
-  (verify/protect/publish/retire + validate/execute) persist NULL timestamps in the stages JSONB,
-  unlike the engine which always stamps them. Audit/temporal-ordering gap. FIX: stamp both to
-  `Utc::now().to_rfc3339()` in the helper. RE-VERIFY first: confirm no caller relies on None and the
-  engine-vs-handler asymmetry is unintended (the swarm says it is).
+- ✅ **Stage completion timestamps** (request-lifecycle, high) — SHIPPED: `completed_request_stage()`
+  (contracts.rs ~14856) set `started_at/completed_at: None` on a `Completed` stage, persisting NULL
+  timestamps in the stages JSONB (audit/temporal gap) — inconsistent with the engine, which stamps
+  every Completed stage and reserves None for Pending. FIX: stamp both to `Utc::now().to_rfc3339()`
+  (computed once → equal; instantaneous control-plane stage). RE-VERIFIED: the engine's plan scaffold
+  pre-creates Pending placeholders for protect/publish (null by design); the real transition APPENDS
+  a Completed stage of the same name — the DB confirmed the Completed protect/publish now carry a
+  timestamp while the Pending placeholder stays null. Strengthened the persistence test to assert the
+  Completed stage's started_at == completed_at non-empty. codex impl APPROVE (no blocking; started_at
+  hardening added). The `dry_run: true` metadata left unchanged (separate concern).
+
+### NEWLY FOUND while verifying (latent test-harness bug, NOT a snapshot regression)
+- **aiops `test_pool()` is not fail-closed / not drift-tolerant** (repos/aiops.rs ~292-306). When
+  `RYUKI_DATABASE_URL` is unset it falls back to a DEFAULT localhost URL instead of returning None,
+  then `run_migrations(&pool).await.expect("migrations must apply")` PANICS (8 aiops_db_tests fail) —
+  against a drifted local DB or in any no-DB run. Violates the documented conventions (no-DB tests
+  must fail-closed `if get_db().is_none() { return }`; drift-tolerant tests use `run_migrations().ok()`
+  not `.expect`). NOT a regression from the timestamp change (a broad no-DB pass: 1218 passed, only
+  these 8 aiops tests failed, all unrelated to stages). NEXT slice — small, convention-aligning fix.
 
 ### SUSPECT — do NOT implement as proposed (re-verify / likely false or harmful)
 - **Dead-lettered job leaves parent request stuck `executing`** (agent-execution, claimed high/bug).

@@ -14857,11 +14857,19 @@ fn completed_request_stage(
     name: &str,
     evidence: Vec<ryuki_engine::models::EvidenceItem>,
 ) -> ryuki_engine::models::Stage {
+    // A Completed stage MUST carry a completion timestamp — the engine stamps every
+    // Completed stage it builds (request_lifecycle.rs) and reserves None for Pending
+    // stages. This helper builds the post-completion lifecycle stages (verify/protect/
+    // publish/retire/validate/execute) that are persisted via apply_transition_audited,
+    // so leaving the timestamps None left a permanent audit gap: a Completed stage with
+    // no time. These are instantaneous control-plane bookkeeping stages, so started_at
+    // and completed_at are the same point in time (computed once).
+    let now = chrono::Utc::now().to_rfc3339();
     ryuki_engine::models::Stage {
         name: name.into(),
         status: ryuki_engine::models::StageStatus::Completed,
-        started_at: None,
-        completed_at: None,
+        started_at: Some(now.clone()),
+        completed_at: Some(now),
         evidence,
         metadata: std::collections::HashMap::from([("dry_run".into(), "true".into())]),
     }
@@ -47145,6 +47153,35 @@ mod db_lifecycle_tests {
             names.contains(&"protect") && names.contains(&"publish"),
             "post-completion stages persisted; got {names:?}"
         );
+        // run-6: a Completed post-completion stage must carry a completion timestamp
+        // (no permanent audit gap). NOTE the engine's plan scaffold pre-creates a
+        // PENDING placeholder for protect/publish (null timestamps by design), then
+        // the real transition APPENDS a Completed stage of the same name — so assert on
+        // the COMPLETED one, which the helper now stamps (matching the engine).
+        use ryuki_engine::models::StageStatus;
+        for stage_name in ["protect", "publish"] {
+            let completed = rehydrated
+                .stages
+                .iter()
+                .find(|s| s.name == stage_name && s.status == StageStatus::Completed)
+                .unwrap_or_else(|| panic!("a Completed {stage_name} stage must be present"));
+            assert!(
+                completed.completed_at.as_deref().is_some_and(|t| !t.is_empty()),
+                "the Completed {stage_name} stage must persist a completed_at timestamp, got {:?}",
+                completed.completed_at
+            );
+            // The helper stamps started_at == completed_at (one instantaneous point);
+            // assert both so a regression that drops either is caught.
+            assert!(
+                completed.started_at.as_deref().is_some_and(|t| !t.is_empty()),
+                "the Completed {stage_name} stage must persist a started_at timestamp, got {:?}",
+                completed.started_at
+            );
+            assert_eq!(
+                completed.started_at, completed.completed_at,
+                "{stage_name}: started_at and completed_at are the same instant"
+            );
+        }
 
         // From Operational, publish is no longer valid (engine guard -> 400).
         let Err((st, _)) = requests_publish(p(&id_str), AuthExtractor(session.clone())).await
