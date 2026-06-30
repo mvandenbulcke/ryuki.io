@@ -42,9 +42,12 @@ implementation.
   index scan no-sort; domain_events = bitmap scan of only the alert rows + a small sort, since a
   multi-value `= ANY` can't be an ordered btree scan).
 - **Deferred (codex)**: (a) the `(status, created_at)` requests index — highest write-amplification
-  (status changes every transition), uncertain benefit → measure first (task_53bc69da). (b) the
-  OR-NULL predicate (`$n IS NULL OR col=$n`) in requests_list can defeat idx_requests_site_env on a
-  generic prepared plan; the real fix is dynamic SQL emitting only active predicates (task_02ed10ce).
+  (status changes every transition), uncertain benefit → measure first (task_53bc69da).
+  **RESOLVED → DEFER (do not add): see `docs/design/requests-status-index-decision.md`** (codex-reviewed;
+  read benefit narrow + unproven, no-site path is an operator minority, and the OR-NULL caveat below
+  blocks it until (b) lands). (b) the OR-NULL predicate (`$n IS NULL OR col=$n`) in requests_list can
+  defeat idx_requests_site_env on a generic prepared plan; the real fix is dynamic SQL emitting only
+  active predicates (task_02ed10ce) — STILL OPEN, and a prerequisite for ever revisiting (a).
 
 ## Resilience sweep (single targeted agent, on retry after the opus-unavailable blip)
 1 confirmed finding (with a thorough "checked but sound" list — timeouts on all reqwest clients +
